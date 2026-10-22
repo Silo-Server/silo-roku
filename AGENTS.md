@@ -14,13 +14,19 @@ wire behavior, platform floor, or certification plan.
 
 ## Product boundaries
 
-- Movies and episodic TV are the proposed first playable scope.
+- The first release is sign-in, profiles, browse, search, and playback of
+  movies and episodic TV. Section 3 of `docs/spec.md` lists what is deferred;
+  do not add deferred features without updating it.
 - Ebooks, offline downloads, server administration, library management, and
   Watch Together are not part of the first release.
 - Live TV, OTA/DVB tuners, IPTV, EPG/XMLTV, DVR, `.strm` files, and equivalent
   arbitrary remote-stream shortcuts are permanent Silo non-goals. Do not add
   them here or expose them through a Roku-only path.
-- Use Silo's native `/api/v1` API. Do not build this client on jellycompat.
+- Use Silo's native `/api/v2` API. Never call `/api/v1`, which retires at Silo
+  1.0, and never add a v1 fallback. Do not build this client on jellycompat.
+- Match the existing Silo TV apps (tvOS and Android TV) in layout, navigation,
+  focus, and player behavior, using the design reference in `docs/spec.md`.
+  Record every Roku-specific deviation, with its reason, in that document.
 
 ## Architecture rules
 
@@ -35,6 +41,8 @@ wire behavior, platform floor, or certification plan.
   IDs, or attempted-plan keys in the client.
 - Probe the actual Roku and connected display. Advertise conservative playback
   capabilities and never infer support from model names alone.
+- Send account credentials only to the configured Silo server's origin, never
+  to a proxy or other origin named in a playback plan.
 - Never log access tokens, refresh tokens, profile tokens, device-login codes,
   signed stream URLs, credentials, or server responses that contain them.
 
