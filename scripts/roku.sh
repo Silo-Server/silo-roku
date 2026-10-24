@@ -3,8 +3,10 @@
 # Reads ROKU_HOST, ROKU_PASSWORD, and optional ROKU_DEPLOY_VIA from .env.
 #
 #   roku.sh key Home Down Select   press remote keys in order
+#   roku.sh hold Right 2.5         hold a key down for some seconds, then release it
 #   roku.sh text "query"           type text into the focused field
 #   roku.sh launch [app-id] [k=v]  launch an app (default: dev) with optional params
+#   roku.sh input k=v [k=v ...]    send an input event to the running app
 #   roku.sh active                 print the foreground app
 #   roku.sh query <path>           print an ECP query, e.g. device-info or apps
 #   roku.sh screenshot <file.jpg>  save a screenshot of the dev app
@@ -13,7 +15,7 @@ cd "$(dirname "$0")/.."
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
 : "${ROKU_HOST:?set ROKU_HOST in .env}"
 
-usage() { sed -n '5,10s/^# *//p' "$0" >&2; exit 2; }
+usage() { sed -n '5,12s/^# *//p' "$0" >&2; exit 2; }
 
 # Run a shell script on the host that can reach the Roku. Stdin passes through.
 remote() {
@@ -50,6 +52,22 @@ key)
     for key in "$@"; do paths+=("keypress/$(urlencode "$key")"); done
     ecp_post "${paths[@]}"
     ;;
+hold)
+    # ECP keydown and keyup reach onKeyEvent as a press and a release, so the
+    # player's hold timing (the rate ladder) can be tried without a remote.
+    [ $# -eq 2 ] || usage
+    case "$2" in ''|*[!0-9.]*) usage ;; esac
+    printf -v down '%q' "keydown/$(urlencode "$1")"
+    printf -v up '%q' "keyup/$(urlencode "$1")"
+    remote "set -eu
+post() {
+    code=\$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -X POST \"http://\${ROKU_HOST}:8060/\$1\")
+    case \"\$code\" in 2??) ;; *) { echo \"ECP \$1 failed: HTTP \$code\" >&2; exit 1; }; esac
+}
+post $down
+sleep $2
+post $up"
+    ;;
 text)
     [ $# -eq 1 ] || usage
     paths=()
@@ -67,6 +85,14 @@ launch)
         query+="${query:+&}$(urlencode "${param%%=*}")=$(urlencode "${param#*=}")"
     done
     ecp_post "launch/$(urlencode "$app")${query:+?$query}"
+    ;;
+input)
+    [ $# -gt 0 ] || usage
+    query=""
+    for param in "$@"; do
+        query+="${query:+&}$(urlencode "${param%%=*}")=$(urlencode "${param#*=}")"
+    done
+    ecp_post "input?$query"
     ;;
 active)
     remote 'curl -sS -m 10 "http://${ROKU_HOST}:8060/query/active-app"' | sed -n 's/.*<app id="\([^"]*\)"[^>]*>\([^<]*\)<\/app>.*/\1 \2/p'

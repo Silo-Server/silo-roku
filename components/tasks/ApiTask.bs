@@ -1,0 +1,569 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/api/response.bs"
+import "pkg:/source/api/scheduler.bs"
+import "pkg:/source/auth/coordinator.bs"
+import "pkg:/source/auth/headers.bs"
+import "pkg:/source/playback/worker.bs"
+import "pkg:/source/catalog/map.bs"
+import "pkg:/source/storage/registry.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' Every HTTP request runs here (plan sections 4.1 and 4.2). One loop waits on one
+' port for AppScene's field sets and for transfer events, until the nearest
+' deadline. The scheduler (source/api/scheduler.bs) decides what to start,
+' cancel, time out, and deliver; the account session
+' (source/auth/coordinator.bs) decides credentials, token refreshes, and
+' session operations; the playback worker (source/playback/worker.bs) builds
+' the player's start, replan, progress, and route-event requests and keeps
+' the durable playback jobs. This file executes all three and sends each
+' request's one result envelope (source/api/response.bs) to the render
+' thread. After Main's registry snapshot it is the only registry writer (plan
+' section 4.3).
+
+' A transfer that moves less than this for api.request.stallSeconds has
+' stalled and fails as a timeout; request deadlines bound the total time.
+const MIN_RATE_BYTES_PER_SECOND = 1
+const CA_BUNDLE = "common:/certs/ca-bundle.crt"
+' Response bodies, and request bodies without secrets, pass through files here
+' so the 2 MiB budget holds before a body is read (plan section 4.8).
+' Downloads have their own budget (api.response.limit).
+const BODY_DIR = "tmp:/api"
+' Downloads (subtitle sidecars) are kept here for their requester, which
+' deletes each; at most MAX_DOWNLOADS stay, the oldest deleted first.
+const DOWNLOAD_DIR = "tmp:/downloads"
+const MAX_DOWNLOADS = 4
+' While transfers run, the loop wakes at least this often to check the size of
+' their response files.
+const SIZE_CHECK_MS = 250
+
+sub init()
+    m.top.functionName = "serve"
+end sub
+
+sub serve()
+    m.port = CreateObject("roMessagePort")
+    for each field in ["request", "cancel", "config", "shedPrefetch"]
+        m.top.observeFieldScopedEx(field, m.port)
+    end for
+    m.clock = CreateObject("roTimespan")
+    m.wallClock = CreateObject("roDateTime")
+    m.scheduler = api.scheduler.create()
+    ' In-flight transfers by GetIdentity(), and each running request's identity.
+    m.transfers = {}
+    m.identities = {}
+    m.files = CreateObject("roFileSystem")
+    m.fileCount = 0
+    m.downloads = []
+    clearBodyFiles()
+    ' The worker's clock is never reset: its jobs keep absolute times.
+    m.worker = playback.worker.create()
+    m.workerClock = CreateObject("roTimespan")
+    m.device = CreateObject("roDeviceInfo")
+    #if api_field_delivery
+    #else
+        m.queue = CreateObject("roRenderThreadQueue")
+    #end if
+    startSession()
+    while true
+        msg = wait(waitMs(), m.port)
+        ' Deadlines first, so an event cannot deliver or start a request whose
+        ' deadline passed while the Task waited.
+        execute(api.scheduler.tick(m.scheduler, clockMs()))
+        msgType = type(msg)
+        if msgType = "roUrlEvent"
+            onTransfer(msg)
+        else if msgType = "roSGNodeEvent"
+            onField(msg.getField(), msg.getData())
+        end if
+        checkSizes()
+        ' Due playback jobs, expiries, and session operations that waited.
+        runWorker(playback.worker.tick(m.worker, workerEnv()))
+    end while
+end sub
+
+' Starts the session from the registry snapshot AppScene set before running
+' this Task, then clears the field. The stored server becomes the base URL,
+' and its origin is checked before any credential goes to it; an
+' installation ID is generated and written the first time. The first session
+' published is the readiness signal: the fields are observed and the state is
+' set, so AppScene sends the field sets it kept until now. Only debug builds
+' send credentials to a server that does not confirm its origin.
+sub startSession()
+    record = storage.decode(storage.encode(m.top.snapshot))
+    m.top.snapshot = {}
+    m.section = CreateObject("roRegistrySection", storage.SECTION_NAME)
+    info = CreateObject("roDeviceInfo")
+    generated = record.deviceId = ""
+    if generated then record.deviceId = LCase(info.GetRandomUUID())
+    appInfo = CreateObject("roAppInfo")
+    isDebug = false
+    #if debug
+        isDebug = true
+    #end if
+    channel = api.auth.headers.channel(isDebug, appInfo.IsDev())
+    facts = api.auth.headers.facts(appInfo.GetVersion(), appInfo.GetValue("build_version"), channel, record.deviceId, info.GetModelDisplayName())
+    m.session = api.auth.coordinator.create(record, facts, isDebug)
+    m.baseUrl = record.origin
+    if generated then persist()
+    apply(api.auth.coordinator.start(m.session))
+    publish()
+end sub
+
+function clockMs() as Integer
+    return m.clock.TotalMilliseconds()
+end function
+
+' Wall-clock seconds, the clock token expiry is kept in.
+function nowSeconds() as Integer
+    m.wallClock.Mark()
+    return m.wallClock.AsSeconds()
+end function
+
+' Milliseconds until the nearest deadline or playback job, or the next size
+' check while transfers run, or 0 (wait for a message) when nothing is pending.
+function waitMs() as Integer
+    remaining = invalid
+    deadline = api.scheduler.nextDeadline(m.scheduler)
+    if deadline = invalid
+        ' No deadline refers to the clock now, so restart it before its
+        ' milliseconds wrap (after 24 days).
+        m.clock.Mark()
+    else
+        remaining = deadline - clockMs()
+    end if
+    wake = playback.worker.nextWake(m.worker)
+    if wake <> invalid and (remaining = invalid or wake - workerMs() < remaining) then remaining = wake - workerMs()
+    if remaining = invalid then return 0
+    if remaining < 1 then remaining = 1
+    if remaining > SIZE_CHECK_MS and not m.transfers.IsEmpty() then remaining = SIZE_CHECK_MS
+    return remaining
+end function
+
+function workerMs() as Integer
+    return m.workerClock.TotalMilliseconds()
+end function
+
+' What the playback worker reads from this Task (playback.worker).
+function workerEnv() as Object
+    facts = m.session.facts
+    return { now: workerMs(), device: m.device, identity: api.auth.coordinator.identity(m.session), app: { version: facts.version, build: facts.build, channel: facts.channel }, gates: invalid, uuid: randomUuid }
+end function
+
+function randomUuid() as String
+    return CreateObject("roDeviceInfo").GetRandomUUID()
+end function
+
+sub onField(field as String, data as Dynamic)
+    if field = "request"
+        submit(data)
+    else if field = "cancel"
+        if type(data) <> "roAssociativeArray" then return
+        ' Session operations waiting in the worker are cancelled too, and a
+        ' released owner's starts pass to it (playback.worker.cancel).
+        runWorker(playback.worker.cancel(m.worker, data, workerEnv()))
+        if api.request.isString(data.owner)
+            execute(api.scheduler.cancelOwner(m.scheduler, data.owner, clockMs()))
+        else if api.request.isString(data.requestId)
+            execute(api.scheduler.cancelRequest(m.scheduler, data.requestId, clockMs()))
+        end if
+    else if field = "config"
+        configure(data)
+    else if field = "shedPrefetch"
+        execute(api.scheduler.setShedding(m.scheduler, data = true, clockMs()))
+    end if
+end sub
+
+sub submit(input as Dynamic)
+    if type(input) <> "roAssociativeArray" or not api.request.isString(input.requestId)
+        log.warn("api", "dropped a request without a request ID")
+        return
+    end if
+    #if debug
+        ' components/dev/DevApiTask answers the threading spike's requests.
+        if m.devRequest <> invalid
+            spike = m.devRequest(input)
+            if spike <> invalid
+                deliver(catalog.map.apply(input, spike))
+                return
+            end if
+        end if
+    #end if
+    if util.isString(input.session)
+        log.debug("api", "session operation", { requestId: input.requestId, operation: input.session })
+        ' An identity change waits for the current identity's playback jobs.
+        if playback.worker.deferSession(m.worker, input, workerEnv())
+            log.info("api", "session operation waits for playback jobs", { requestId: input.requestId })
+            return
+        end if
+        apply(api.auth.coordinator.operation(m.session, input, nowSeconds()))
+        return
+    end if
+    if util.isString(input.playback)
+        runWorker(playback.worker.operation(m.worker, input, workerEnv()))
+        return
+    end if
+    request = api.request.normalize(input)
+    if request = invalid
+        log.warn("api", "invalid request", { requestId: input.requestId })
+        deliver(api.response.failure(input, "invalid_request"))
+        return
+    end if
+    apply(api.auth.coordinator.submitted(m.session, request, nowSeconds()))
+    execute(api.scheduler.submit(m.scheduler, request, clockMs()))
+end sub
+
+' { maxConcurrent }. Debug builds also take baseUrl for the threading spike:
+' a server used without the setup check, which ends the session when it
+' changes. Release builds change servers only through the session's check.
+sub configure(config as Dynamic)
+    if type(config) <> "roAssociativeArray" then return
+    if config.DoesExist("baseUrl")
+        #if debug
+            base = api.request.baseUrl(config.baseUrl)
+            if base = invalid
+                log.warn("api", "ignored an invalid baseUrl")
+            else
+                apply(api.auth.coordinator.useServer(m.session, base))
+            end if
+        #else
+            log.warn("api", "ignored baseUrl; servers change through the session's server check")
+        #end if
+    end if
+    if config.DoesExist("maxConcurrent") then execute(api.scheduler.setLimit(m.scheduler, config.maxConcurrent, clockMs()))
+end sub
+
+' Runs the scheduler's decisions in order. result is the envelope a deliver
+' decision sends.
+sub execute(decisions as Object, result = invalid as Dynamic)
+    for each decision in decisions
+        kind = decision.kind
+        if kind = "start"
+            start(decision.request)
+        else if kind = "deliver"
+            settle(decision.request, result)
+        else if kind = "reject"
+            log.warn("api", "dropped a reused request ID", { requestId: decision.requestId })
+        else
+            if decision.running then abort(decision.requestId)
+            if kind = "timeout"
+                log.warn("api", "request timed out", { requestId: decision.requestId, running: decision.running })
+                settle(decision.request, api.response.failure(decision.request, "timeout"))
+            else
+                log.debug("api", "request cancelled", { requestId: decision.requestId, reason: decision.reason })
+                settle(decision.request, api.response.failure(decision.request, "cancelled", decision.reason))
+            end if
+        end if
+    end for
+end sub
+
+' Runs the playback worker's decisions in order (source/playback/worker.bs).
+' Its requests go through the session like the render thread's, for refresh.
+sub runWorker(decisions as Object)
+    for each decision in decisions
+        kind = decision.kind
+        if kind = "submit"
+            request = decision.request
+            apply(api.auth.coordinator.submitted(m.session, request, nowSeconds()))
+            execute(api.scheduler.submit(m.scheduler, request, clockMs()))
+        else if kind = "reply"
+            deliver(decision.result)
+        else if kind = "session"
+            apply(api.auth.coordinator.operation(m.session, decision.input, nowSeconds()))
+        else if kind = "log"
+            if decision.level = "debug"
+                log.debug("playback", decision.message, decision.fields)
+            else if decision.level = "info"
+                log.info("playback", decision.message, decision.fields)
+            else
+                log.warn("playback", decision.message, decision.fields)
+            end if
+        end if
+    end for
+end sub
+
+' Runs the session's decisions in order (source/auth/coordinator.bs).
+sub apply(decisions as Object)
+    for each decision in decisions
+        kind = decision.kind
+        if kind = "submit"
+            execute(api.scheduler.submit(m.scheduler, decision.request, clockMs()))
+        else if kind = "finish"
+            execute(api.scheduler.finish(m.scheduler, decision.result.requestId, clockMs()), decision.result)
+        else if kind = "reply"
+            deliver(decision.result)
+        else if kind = "requeue"
+            log.debug("api", "request waits for a token refresh", { requestId: decision.requestId })
+            execute(api.scheduler.requeue(m.scheduler, decision.requestId, clockMs()))
+        else if kind = "hold"
+            execute(api.scheduler.holdCredentials(m.scheduler, decision.held, clockMs()))
+        else if kind = "holdOrigin"
+            execute(api.scheduler.holdConfidential(m.scheduler, decision.held, clockMs()))
+        else if kind = "warn"
+            log.warn("api", decision.message, decision.fields)
+        else if kind = "promote"
+            execute(api.scheduler.promote(m.scheduler, decision.requestId, clockMs()))
+        else if kind = "persist"
+            persist()
+        else if kind = "publish"
+            publish()
+        else if kind = "server"
+            m.baseUrl = decision.origin
+            log.info("api", "server changed", { origin: decision.origin })
+            execute(api.scheduler.cancelAll(m.scheduler, clockMs()))
+        end if
+    end for
+end sub
+
+sub start(request as Object)
+    ' A decision earlier in the same list may have ended the request, and its
+    ' deadline may have passed while decisions ran; tick answers the latter.
+    if not api.scheduler.isLive(m.scheduler, request.requestId, clockMs())
+        execute(api.scheduler.tick(m.scheduler, clockMs()))
+        return
+    end if
+    url = api.request.url(m.baseUrl, request)
+    if url = invalid
+        if m.baseUrl = "" and not api.request.isString(request.url)
+            fail(request, "no_server")
+        else
+            fail(request, "invalid_request")
+        end if
+        return
+    end if
+    ' Credentials go only to the configured server's origin (AGENTS.md); the
+    ' session refuses a request that would send them elsewhere.
+    credentials = api.auth.coordinator.credentials(m.session, request, url)
+    if credentials.error <> invalid
+        fail(request, credentials.error)
+        return
+    end if
+
+    transfer = CreateObject("roUrlTransfer")
+    transfer.SetMessagePort(m.port)
+    transfer.SetUrl(url)
+    transfer.SetCertificatesFile(CA_BUNDLE)
+    transfer.EnableEncodings(true)
+    transfer.RetainBodyOnError(true)
+    transfer.SetMinimumTransferRate(MIN_RATE_BYTES_PER_SECOND, api.request.stallSeconds(request))
+    ' The full map on a new object; never AddHeader (plan section 4.2).
+    transfer.SetHeaders(api.request.headers(request, credentials.headers))
+    if request.method <> "GET" and request.method <> "POST" then transfer.SetRequest(request.method)
+    ' bodyFile and responseFile are "" for a transfer that does not use one;
+    ' keep is true for a download, whose file goes to the requester.
+    entry = { request: request, transfer: transfer, startedAt: clockMs(), bodyFile: "", responseFile: "", keep: false, budget: api.response.MAX_BODY_BYTES }
+    mode = api.request.transport(request, api.auth.coordinator.sendsSecret(m.session, request.requestId))
+    if mode = "memory"
+        issued = transfer.AsyncPostFromString(api.request.bodyText(request))
+    else
+        m.fileCount = m.fileCount + 1
+        name = BODY_DIR + "/" + m.fileCount.ToStr()
+        entry.responseFile = name + ".response"
+        if mode = "download"
+            entry.responseFile = DOWNLOAD_DIR + "/" + m.fileCount.ToStr() + "." + request.download
+            entry.keep = true
+            entry.budget = downloadBudget(request)
+            issued = transfer.AsyncGetToFile(entry.responseFile)
+        else if mode = "file"
+            issued = transfer.AsyncGetToFile(entry.responseFile)
+        else
+            entry.bodyFile = name + ".body"
+            issued = WriteAsciiFile(entry.bodyFile, api.request.bodyText(request)) and transfer.AsyncPostFromFileToFile(entry.bodyFile, entry.responseFile)
+        end if
+    end if
+    if not issued
+        deleteFiles(entry)
+        fail(request, "network")
+        return
+    end if
+
+    key = transfer.GetIdentity().ToStr()
+    m.transfers[key] = entry
+    m.identities[request.requestId] = key
+    log.debug("api", "start", { requestId: request.requestId, method: request.method, url: url, lane: request.lane })
+end sub
+
+' A request that could not be issued: answer it and free its slot.
+sub fail(request as Object, kind as String)
+    log.warn("api", "request failed", { requestId: request.requestId, kind: kind })
+    execute(api.scheduler.finish(m.scheduler, request.requestId, clockMs()), api.response.failure(request, kind))
+end sub
+
+' Cancels a running transfer and forgets it, without waiting for its event.
+sub abort(requestId as String)
+    key = m.identities[requestId]
+    if key = invalid then return
+    m.identities.Delete(requestId)
+    entry = m.transfers[key]
+    m.transfers.Delete(key)
+    if entry = invalid then return
+    entry.transfer.AsyncCancel()
+    deleteFiles(entry)
+end sub
+
+' Stops a running transfer whose body is over its budget, answering too_large
+' with status, or 0 before the response status is known; size is the bytes
+' received, or the length the response declared.
+sub cutOff(request as Object, status as Integer, size as Dynamic)
+    abort(request.requestId)
+    log.warn("api", "response too large", { requestId: request.requestId, status: status, size: size })
+    execute(api.scheduler.finish(m.scheduler, request.requestId, clockMs()), api.response.tooLarge(request, status))
+end sub
+
+' Cuts off each running transfer whose response file has grown past its
+' budget, whether or not the response declared a length.
+sub checkSizes()
+    over = []
+    for each key in m.transfers
+        entry = m.transfers[key]
+        if entry.responseFile <> ""
+            size = fileSize(entry.responseFile)
+            if api.response.exceedsBudget(size, entry.budget) then over.Push({ request: entry.request, size: size })
+        end if
+    end for
+    for each cut in over
+        cutOff(cut.request, 0, cut.size)
+    end for
+end sub
+
+sub onTransfer(event as Object)
+    key = event.GetSourceIdentity().ToStr()
+    entry = m.transfers[key]
+    ' A cancelled or timed-out transfer was answered when it ended.
+    if entry = invalid then return
+    request = entry.request
+    code = event.GetResponseCode()
+    headers = event.GetResponseHeadersArray()
+    if event.GetInt() <> 1
+        ' Roku's transfer-started event, when it comes, has the headers: a body
+        ' declared over its budget is refused before it downloads.
+        if api.response.declaresTooLarge(headers, entry.budget) then cutOff(request, code, api.problem.header(headers, "content-length"))
+        return
+    end if
+    m.transfers.Delete(key)
+    m.identities.Delete(request.requestId)
+
+    body = ""
+    size = invalid
+    if entry.keep and code >= 200 and code < 300
+        size = fileSize(entry.responseFile)
+        result = api.response.saved(request, { code: code, headers: headers, path: entry.responseFile, size: size, budget: entry.budget })
+        if result.ok
+            keepDownload(entry.responseFile)
+        else
+            deleteFiles(entry)
+        end if
+    else
+        if entry.responseFile = ""
+            body = event.GetString()
+        else if code > 0
+            size = fileSize(entry.responseFile)
+            if size > 0 and not api.response.exceedsBudget(size, api.response.MAX_BODY_BYTES) then body = ReadAsciiFile(entry.responseFile)
+        end if
+        deleteFiles(entry)
+        result = api.response.fromTransfer(request, { code: code, body: body, headers: headers, size: size })
+    end if
+    ms = clockMs() - entry.startedAt
+    if result.ok
+        log.debug("api", "done", { requestId: request.requestId, status: result.status, ms: ms })
+    else
+        reason = invalid
+        if result.status = 0 then reason = event.GetFailureReason()
+        log.warn("api", "request failed", { requestId: request.requestId, status: result.status, ms: ms, kind: result.error.kind, problemType: result.error.problemType, reason: reason, size: size })
+    end if
+    ' A 401 may send the request back to wait for a token refresh.
+    apply(api.auth.coordinator.answered(m.session, request, result, nowSeconds()))
+end sub
+
+' A request's one result: to the session or the playback worker when it
+' built the request, otherwise to the render thread, after the map step builds
+' a catalog request's nodes (source/catalog/map.bs).
+sub settle(request as Object, result as Object)
+    if api.auth.coordinator.owns(m.session, request.requestId)
+        apply(api.auth.coordinator.settled(m.session, request, result, nowSeconds()))
+    else if playback.worker.owns(m.worker, request.requestId)
+        runWorker(playback.worker.settled(m.worker, request, result, workerEnv()))
+    else
+        deliver(catalog.map.apply(request, result))
+    end if
+end sub
+
+' A download's budget (api.response.limit), from the memory the app has
+' free as it starts: tmp:/ files count as the app's memory (Roku's File
+' System page), whose free amount roAppMemoryMonitor reports, while
+' GetVolumeInfo answers only for external volumes. The debug line gives
+' both readings, so a device run shows what tmp:/ reports (assumption
+' AG-214).
+function downloadBudget(request as Object) as Integer
+    roomKb = invalid
+    monitor = CreateObject("roAppMemoryMonitor")
+    if type(monitor) = "roAppMemoryMonitor" then roomKb = monitor.GetChannelAvailableMemory()
+    budget = api.response.limit(request, roomKb)
+    log.debug("api", "download budget", { requestId: request.requestId, budget: budget, availableKb: roomKb, tmpFreeBytes: tmpFreeBytes() })
+    return budget
+end function
+
+' The free bytes GetVolumeInfo reports for tmp:/, or invalid without a
+' reading. Logged only: Roku documents the call for external volumes.
+function tmpFreeBytes() as Dynamic
+    info = m.files.GetVolumeInfo("tmp:/")
+    if type(info) <> "roAssociativeArray" then return invalid
+    blocks = info["free-blocks"]
+    if blocks = invalid then blocks = info.freeblocks
+    if not util.isNumber(blocks) or not util.isNumber(info.blocksize) or info.blocksize <= 0 then return invalid
+    return blocks * 1# * info.blocksize
+end function
+
+' Keeps a finished download for its requester, deleting the oldest kept one
+' past MAX_DOWNLOADS.
+sub keepDownload(path as String)
+    m.downloads.Push(path)
+    while m.downloads.Count() > MAX_DOWNLOADS
+        DeleteFile(m.downloads.Shift())
+    end while
+end sub
+
+' The size in bytes of a file, or 0 when it does not exist yet.
+function fileSize(path as String) as Dynamic
+    info = m.files.Stat(path)
+    if type(info) <> "roAssociativeArray" or not util.isNumber(info.size) then return 0
+    return info.size
+end function
+
+sub deleteFiles(entry as Object)
+    if entry.responseFile <> "" then DeleteFile(entry.responseFile)
+    if entry.bodyFile <> "" then DeleteFile(entry.bodyFile)
+end sub
+
+' Creates BODY_DIR and DOWNLOAD_DIR, emptied of files a previous run left.
+sub clearBodyFiles()
+    for each dir in [BODY_DIR, DOWNLOAD_DIR]
+        CreateDirectory(dir)
+        for each name in ListDir(dir)
+            DeleteFile(dir + "/" + name)
+        end for
+    end for
+end sub
+
+' Writes and flushes the session's record; the only registry write.
+sub persist()
+    if not storage.write(m.section, storage.encode(api.auth.coordinator.record(m.session)))
+        log.warn("storage", "registry flush failed")
+    end if
+end sub
+
+' The session as screens may know it, without tokens; only AppScene observes it.
+sub publish()
+    m.top.session = api.auth.coordinator.view(m.session)
+end sub
+
+' Sends one envelope to the render thread. PostMessage moves it without a
+' rendezvous; the field-set fallback is a bs_const away until hardware confirms
+' PostMessage (plan section 4.2).
+sub deliver(result as Object)
+    #if api_field_delivery
+        m.top.result = result
+    #else
+        m.queue.PostMessage(api.response.MESSAGE_ID, result)
+    #end if
+end sub

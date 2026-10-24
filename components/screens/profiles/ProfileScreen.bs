@@ -1,0 +1,398 @@
+import "pkg:/components/screens/firstRun.bs"
+import "pkg:/source/auth/profiles.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/focus.bs"
+import "pkg:/source/nav/textures.bs"
+import "pkg:/source/onboarding/profiles.bs"
+
+' The heading (spec section 5.4): the account line 14 px under the title,
+' the avatars 84 px under that.
+const ACCOUNT_GAP = 14
+const GRID_GAP = 84
+' At most this many rows show; more scroll.
+const VISIBLE_ROWS = 2
+' Change server and Sign out, compact buttons 20 px apart, pinned EDGE px
+' above the bottom; the heading and grid are centred between EDGE and them.
+const FOOTER_GAP = 20
+const EDGE = 60
+
+sub init()
+    m.mesh = m.top.findNode("mesh")
+    setUpMesh(m.mesh, theme.firstRunArt.MESH_PROFILES)
+    m.headline = m.top.findNode("headline")
+    m.headline.font = theme.font(theme.textStyle.PICKER_TITLE)
+    m.headline.color = theme.color.TEXT
+    m.headline.text = i18n.text("profiles.headline")
+    m.subtitle = m.top.findNode("subtitle")
+    m.subtitle.font = theme.font(theme.textStyle.ACCOUNT_LINE)
+    ' The account line keeps its height while the account loads.
+    m.subtitle.text = i18n.text("profiles.headline")
+    m.accountHeight = Int(m.subtitle.boundingRect().height)
+    m.subtitle.text = ""
+    m.accountText = ""
+    m.grid = m.top.findNode("grid")
+    m.grid.itemSize = [onboarding.profiles.COLUMN, onboarding.profiles.TILE_HEIGHT]
+    m.grid.itemSpacing = [0, onboarding.profiles.ROW_PITCH - onboarding.profiles.TILE_HEIGHT]
+    m.grid.observeField("itemSelected", "onProfileSelected")
+    m.status = m.top.findNode("status")
+    m.status.observeField("activated", "onRetry")
+    m.buttonRow = m.top.findNode("buttons")
+    m.changeServer = addFooterButton(i18n.text("common.changeServer"))
+    m.signOut = addFooterButton(i18n.text("common.signOut"))
+    m.footerHeight = Int(m.signOut.localBoundingRect().height)
+    m.spinner = m.top.findNode("spinner")
+    m.textures = nav.textures.create()
+    nav.textures.addPoster(m.textures, m.mesh)
+    nav.textures.addList(m.textures, m.grid)
+    m.profiles = []
+    ' "loading", "opening", "picking", or "error".
+    m.state = "loading"
+    m.errorKey = ""
+    m.request = invalid
+    m.dialog = invalid
+    m.choosing = false
+    ' The focus key a rebuilt picker returns to (Screen.xml onShow).
+    m.restore = invalid
+end sub
+
+function addFooterButton(label as String) as Object
+    button = m.buttonRow.createChild("CapsuleButton")
+    button.setFields({ variant: "compact", text: label })
+    return button
+end function
+
+sub onShow(event as Object)
+    if event.first
+        m.restore = event.restore
+        if isDeepLink()
+            ' AppScene opens a profile for the deep link without the picker
+            ' (source/deeplink/route.bs), or starts the picker over.
+            m.state = "opening"
+            refresh()
+        else
+            loadProfiles()
+        end if
+    else if nav.textures.restore(m.textures)
+        restoreTile(event.restore)
+    end if
+    m.top.prompting = m.state = "picking" or m.state = "error"
+    focusPicker()
+end sub
+
+function isDeepLink() as Boolean
+    params = m.top.entry.params
+    return util.isObject(params) and util.isTrue(params.deepLink)
+end function
+
+sub onHide()
+    m.top.prompting = false
+    nav.textures.hide(m.textures)
+end sub
+
+sub onPressure(_level as String)
+    nav.textures.detach(m.textures)
+end sub
+
+sub onRelease()
+    m.top.prompting = false
+    closeDialog()
+end sub
+
+' The viewer's way back from PIN, or the first focus: the grid when it
+' shows, Try again on an error, otherwise the buttons.
+sub focusPicker()
+    if m.state = "picking" and m.profiles.Count() > 0
+        highlightAt(invalid)
+        m.grid.setFocus(true)
+    else if m.state = "error" and m.status.action <> ""
+        highlightAt(invalid)
+        m.status.setFocus(true)
+    else
+        focusScreen()
+        lines = []
+        if m.state = "error" then lines = [m.status.message]
+        setControlRows(m.controlRows, true, lines)
+    end if
+end sub
+
+sub loadProfiles()
+    m.state = "loading"
+    m.errorKey = ""
+    m.top.prompting = false
+    send("onProfiles")
+    api.session.profiles(m.request)
+    refresh()
+end sub
+
+sub onRetry()
+    loadProfiles()
+    focusScreen()
+end sub
+
+sub onProfiles(event as Object)
+    result = takeResult(event)
+    if result = invalid then return
+    if not result.ok
+        showError(onboarding.profiles.loadErrorKey(result))
+        return
+    end if
+    m.profiles = api.auth.profiles.list(result.body)
+    if m.profiles.Count() = 0
+        showError("profiles.empty")
+        return
+    end if
+    session = api.session.current()
+    rememberedId = ""
+    if session <> invalid then rememberedId = session.rememberedProfileId
+    ' The open profile whose token the server refused reopens, which asks for
+    ' its PIN again.
+    if session <> invalid and util.isObject(session.verification) then rememberedId = session.verification.id
+    params = m.top.entry.params
+    m.choosing = util.isObject(params) and util.isTrue(params.choose)
+    ' A picker rebuilt under memory pressure (PIN cancelled) is still choosing.
+    choice = onboarding.profiles.onLoad(m.profiles, rememberedId, m.choosing or m.restore <> invalid)
+    if choice.action = onboarding.profiles.OPEN
+        openProfile(choice.profile, true)
+        return
+    end if
+    showPicker()
+    if m.restore <> invalid
+        restoreTile(m.restore)
+    else
+        m.grid.jumpToItem = onboarding.profiles.focusIndex(m.profiles, rememberedId)
+    end if
+    m.restore = invalid
+end sub
+
+' The focused tile, kept when PIN covers the picker (spec section 5.3).
+function focusKey() as Dynamic
+    index = m.grid.itemFocused
+    if m.state <> "picking" or index < 0 or index >= m.profiles.Count() then return invalid
+    return nav.focus.newKey("profiles", m.profiles[index].id, 0, index)
+end function
+
+' Focus on the tile key names, or on the same position when that profile has
+' gone.
+sub restoreTile(key as Dynamic)
+    ids = []
+    for each profile in m.profiles
+        ids.Push(profile.id)
+    end for
+    spot = nav.focus.target(key, { rows: [nav.focus.newRow("profiles", ids, true)], complete: true }, true)
+    m.grid.jumpToItem = spot.item
+end sub
+
+' Builds the grid, once, and shows it with Change server and Sign out.
+sub showPicker()
+    if m.grid.content = invalid
+        root = CreateObject("roSGNode", "ContentNode")
+        base = sessionOrigin()
+        for each profile in m.profiles
+            item = root.createChild("ProfileContent")
+            item.title = profile.name
+            item.initials = onboarding.profiles.initials(profile.name)
+            item.tint = onboarding.profiles.tintIndex(profile.id)
+            item.avatarUri = onboarding.profiles.avatarUri(profile.avatarUrl, base)
+            item.hasPin = profile.hasPin
+            item.isChild = profile.isChild
+            item.description = profileDescription(profile)
+        end for
+        grid = onboarding.profiles.gridLayout(m.profiles.Count())
+        m.grid.numColumns = grid.columns
+        rows = grid.rows
+        if rows > VISIBLE_ROWS then rows = VISIBLE_ROWS
+        m.grid.numRows = rows
+        m.grid.content = root
+        m.grid.translation = [grid.x, 0]
+        loadAccount()
+    end if
+    m.state = "picking"
+    refresh()
+    m.top.prompting = true
+    focusPicker()
+end sub
+
+' What the audio guide says for a tile, as the Android TV app describes it:
+' the name, then "PIN protected" and "Kids profile" where they apply.
+function profileDescription(profile as Object) as String
+    parts = [profile.name]
+    if profile.hasPin then parts.Push(i18n.text("profiles.pinProtected"))
+    if profile.isChild then parts.Push(i18n.text("profiles.kidsProfile"))
+    return parts.Join(", ")
+end function
+
+' "Signed in as" with the account's username, when the server says it.
+sub loadAccount()
+    m.accountRequest = api.newHandle(m.top.owner)
+    m.accountRequest.observeField("status", "onAccount")
+    api.session.validate(m.accountRequest)
+end sub
+
+sub onAccount(event as Object)
+    result = api.resultOf(event.getRoSGNode())
+    m.accountRequest = invalid
+    if result.ok and util.isObject(result.body) and util.isString(result.body.username)
+        m.accountText = i18n.text("profiles.signedInAs", { name: result.body.username })
+        showAccountLine(m.accountText, theme.color.MARQUEE_SECONDARY)
+    end if
+end sub
+
+sub showAccountLine(text as String, color as String)
+    m.subtitle.text = text
+    m.subtitle.color = color
+end sub
+
+sub showError(key as String)
+    m.state = "error"
+    m.errorKey = key
+    refresh()
+    m.top.prompting = true
+    focusPicker()
+end sub
+
+' Lays the screen out for its state: the heading and grid, or the error,
+' centred above the buttons pinned to the bottom.
+sub refresh()
+    picking = m.state = "picking"
+    failed = m.state = "error"
+    footerTop = 1080 - EDGE - m.footerHeight
+    m.grid.visible = picking
+    m.headline.visible = picking
+    m.subtitle.visible = picking
+    m.status.visible = failed
+    if failed
+        action = ""
+        if m.errorKey <> "profiles.error.passwordChange" then action = i18n.text("common.tryAgain")
+        m.status.setFields({ message: i18n.text(m.errorKey), action: action, centre: [960, (EDGE + footerTop) \ 2] })
+    end if
+    m.buttonRow.visible = picking or failed
+    width = placeInRow([m.changeServer, m.signOut], FOOTER_GAP)
+    m.buttonRow.translation = [(1920 - width) \ 2, footerTop]
+    if picking then placeHeading(footerTop)
+    rowsNow = []
+    if m.buttonRow.visible then rowsNow.Push([m.changeServer, m.signOut])
+    setControlRows(rowsNow, false)
+    spin(m.spinner, m.state = "loading" or m.state = "opening", [960, 540])
+end sub
+
+' The title, the account line, and the grid, centred between EDGE and the
+' buttons. The grid's height runs from its avatars' tops to a focused
+' name's foot.
+sub placeHeading(footerTop as Integer)
+    rows = m.grid.numRows
+    gridHeight = rows * onboarding.profiles.ROW_HEIGHT + (rows - 1) * (onboarding.profiles.ROW_PITCH - onboarding.profiles.ROW_HEIGHT) + onboarding.profiles.NAME_FOCUS_DROP
+    headlineHeight = Int(m.headline.boundingRect().height)
+    total = headlineHeight + ACCOUNT_GAP + m.accountHeight + GRID_GAP + gridHeight
+    top = EDGE + (footerTop - EDGE - total) \ 2
+    if top < EDGE then top = EDGE
+    m.headline.translation = [0, top]
+    m.subtitle.translation = [0, top + headlineHeight + ACCOUNT_GAP]
+    avatarTop = top + headlineHeight + ACCOUNT_GAP + m.accountHeight + GRID_GAP
+    m.grid.translation = [m.grid.translation[0], avatarTop - onboarding.profiles.AVATAR_TOP]
+end sub
+
+sub onProfileSelected()
+    if m.request <> invalid then return
+    ' A new choice clears the last one's error.
+    showAccountLine(m.accountText, theme.color.MARQUEE_SECONDARY)
+    openProfile(m.profiles[m.grid.itemSelected], false)
+end sub
+
+' Chooses the profile. The session answers pin_required when its PIN must
+' be entered first; a chosen profile moves the app on to Home.
+sub openProfile(profile as Object, automatic as Boolean)
+    m.opening = profile
+    m.openedAutomatically = automatic
+    if automatic
+        m.state = "opening"
+        refresh()
+    end if
+    send("onOpened")
+    api.session.selectProfile(profile, m.request)
+end sub
+
+sub onOpened(event as Object)
+    result = takeResult(event)
+    if result = invalid then return
+    if result.ok
+        ' The profile already open was chosen again: nothing changed, so the
+        ' app stays where it was.
+        if m.choosing then nav.pop()
+        return
+    end if
+    kind = ""
+    if result.error <> invalid then kind = result.error.kind
+    if kind = "pin_required"
+        if m.state <> "picking" then showPicker()
+        nav.push(nav.route.PIN, { profile: m.opening })
+        return
+    end if
+    if m.openedAutomatically
+        ' The remembered profile could not open: let the viewer choose.
+        showPicker()
+        m.grid.jumpToItem = onboarding.profiles.focusIndex(m.profiles, m.opening.id)
+        return
+    end if
+    ' In the account line's place until the next choice.
+    showAccountLine(i18n.text("profiles.error.select"), theme.color.ERROR)
+    speak(m.subtitle.text)
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if m.request <> invalid then return key <> "back"
+    if m.controlAt = invalid
+        ' The grid or Try again left a key unhandled.
+        if key = "down" and m.buttonRow.visible
+            focusScreen()
+            highlightAt({ row: 0, col: 0 })
+            return true
+        end if
+        return false
+    end if
+    if key = "up" and (m.state = "picking" or m.status.action <> "")
+        focusPicker()
+        return true
+    end if
+    if moveHighlight(key) then return true
+    if key <> "OK" then return false
+    control = highlightedControl()
+    if control.isSameNode(m.changeServer)
+        nav.push(nav.route.SETUP, { pushed: true })
+    else if control.isSameNode(m.signOut)
+        confirmSignOut()
+    end if
+    return true
+end function
+
+' "Sign out?" (spec section 5.4), as tvOS asks before signing out.
+sub confirmSignOut()
+    dialog = CreateObject("roSGNode", "StandardMessageDialog")
+    dialog.title = i18n.text("profiles.signOut.title")
+    dialog.message = [i18n.text("profiles.signOut.body")]
+    dialog.buttons = [i18n.text("profiles.signOut.confirm"), i18n.text("common.cancel")]
+    dialog.observeField("buttonSelected", "onSignOutAnswered")
+    dialog.observeField("wasClosed", "onSignOutAnswered")
+    m.dialog = dialog
+    m.top.getScene().dialog = dialog
+end sub
+
+sub onSignOutAnswered()
+    if m.dialog = invalid then return
+    agreed = m.dialog.wasClosed <> true and m.dialog.buttonSelected = 0
+    closeDialog()
+    focusScreen()
+    if agreed
+        ' Ends the session here at once, then tells the server; AppScene
+        ' starts over at sign-in.
+        api.session.signOut(api.newHandle(m.top.owner))
+    end if
+end sub
+
+sub closeDialog()
+    if m.dialog = invalid then return
+    m.dialog.unobserveField("buttonSelected")
+    m.dialog.unobserveField("wasClosed")
+    m.dialog.close = true
+    m.dialog = invalid
+end sub

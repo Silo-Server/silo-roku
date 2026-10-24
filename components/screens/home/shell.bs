@@ -1,0 +1,441 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/api/session.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/home/shell.bs"
+import "pkg:/source/library/page.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' The main shell of a page with the top bar (spec section 5.3), for screens
+' that import it: Home and the library tab pages. The screen has a
+' TopBar with id "bar", calls shellInit from init, shellStart on its first
+' onShow, shellRestore with mainShell.restoreTarget on every onShow, and
+' shellKey from onKeyEvent; it gives shellFocusKey its content's key, and
+' defines
+'
+'     shellContent()          the node that takes focus in its content, or
+'                             invalid
+'     shellToTop()            OK on the selected tab: back to the first item
+'     shellLibrariesKnown()   the tabs' libraries have arrived
+'
+' A library page sets m.shellShown to the { libraryId, mode } it shows.
+' The shell loads the library tabs, the server's name, and the profile's
+' title art preference (m.global.titleArt, which heroes and the detail page
+' read), moves focus between bar and content (dimming the bar while the
+' content has it), opens the avatar menu, its sign-out confirmation, and the
+' library tabs' lists, and answers AppScene's Back hooks (backContext,
+' onBack), which close an open menu, list, or confirmation, take Back from
+' content to the selected tab, from another item on Home's bar to its Home
+' tab, from a library tab's bar to Home, and from Home's tab out of the app
+' (nav.stack.back).
+
+sub shellInit()
+    m.bar = m.top.findNode("bar")
+    m.bar.observeField("activated", "onShellActivated")
+    m.bar.observeField("rested", "onShellRested")
+    m.bar.observeField("focused", "onShellHighlight")
+    ' The avatar menu or a library tab's list, open as a preview (without
+    ' focus) or entered, and the bar item it belongs to; and the sign-out
+    ' confirmation, while it shows.
+    m.menu = invalid
+    m.menuItem = ""
+    m.shellDialog = invalid
+    if not m.global.hasField("titleArt") then m.global.addFields({ titleArt: { profile: "", show: true } })
+    ' The bar item whose menu Back closed: resting there no longer opens
+    ' it, and Down goes to the content, until the highlight moves (as on
+    ' Android TV).
+    m.shellQuiet = ""
+    m.shellSelected = mainShell.barItem.HOME
+    m.shellShown = invalid
+    m.shellProfile = {}
+    ' The user/libraries summary, and the hidden library IDs once known.
+    m.shellLibraries = invalid
+    m.shellHidden = invalid
+end sub
+
+' The selected tab, the avatar, and the library tabs.
+sub shellStart()
+    entry = m.top.entry
+    m.shellSelected = mainShell.selectedTab(entry.route, entry.params)
+    m.bar.selected = m.shellSelected
+    session = api.session.current()
+    if session <> invalid and util.isObject(session.profile)
+        origin = util.text(session.origin)
+        badge = mainShell.profileBadge(session.profile, origin)
+        m.bar.avatar = badge
+        m.shellProfile = { server: mainShell.serverLabel(origin), origin: origin }
+        m.shellProfile.Append(badge)
+        ' Another profile's preference does not carry over while its own loads.
+        profile = origin + "|" + util.text(session.profile.id)
+        if m.global.titleArt.profile <> profile then m.global.titleArt = { profile: profile, show: true }
+    end if
+    shellSend(catalog.request.libraries(), "onShellLibraries")
+    shellSend(mainShell.settingsRequest(), "onShellSettings")
+    shellSend(catalog.request.branding(), "onShellBranding")
+end sub
+
+sub shellSend(request as Object, callback as String)
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", callback)
+    api.send(request, handle)
+end sub
+
+sub onShellLibraries(event as Object)
+    result = api.resultOf(event.getRoSGNode())
+    if result.ok then m.shellLibraries = result.body
+    shellApplyTabs()
+end sub
+
+' Without the preferences, nothing is hidden and title art shows.
+sub onShellSettings(event as Object)
+    result = api.resultOf(event.getRoSGNode())
+    m.shellHidden = {}
+    if result.ok
+        m.shellHidden = mainShell.hiddenLibraryIds(result.body)
+        titleArt = m.global.titleArt
+        show = mainShell.titleArtShown(result.body)
+        if show <> titleArt.show then m.global.titleArt = { profile: titleArt.profile, show: show }
+    end if
+    shellApplyTabs()
+end sub
+
+' The avatar menu names the server by its own name once known.
+sub onShellBranding(event as Object)
+    result = api.resultOf(event.getRoSGNode())
+    if not result.ok or not util.isObject(result.body) or m.shellProfile.origin = invalid then return
+    m.shellProfile.server = mainShell.serverLabel(m.shellProfile.origin, util.text(result.body.serverName))
+end sub
+
+' Shows the library tabs once both answers are in. A failed library list
+' keeps Home's tab alone. A library tab the profile no longer sees goes
+' back to Home, as on Android TV.
+sub shellApplyTabs()
+    if m.shellLibraries = invalid or m.shellHidden = invalid then return
+    tabs = mainShell.visibleTabs(m.shellLibraries, m.shellHidden)
+    m.bar.tabs = tabs
+    if (m.shellSelected = mainShell.barItem.MOVIES and not tabs.movies) or (m.shellSelected = mainShell.barItem.SERIES and not tabs.series)
+        nav.switchTab(nav.route.HOME, { bar: true })
+        return
+    end if
+    shellLibrariesKnown()
+end sub
+
+' The libraries a tab lists, once known ([] before).
+function shellTabLibraries(kind as String) as Object
+    if m.shellLibraries = invalid or m.shellHidden = invalid then return []
+    return libraryTab.visibleLibraries(m.shellLibraries, m.shellHidden, kind)
+end function
+
+' The library chosen last on a tab for this server and profile, kept in
+' m.global until the app closes, or "".
+function shellRemembered(kind as String) as String
+    if not m.global.hasField("libraryChoice") then return ""
+    return util.text(m.global.libraryChoice[shellChoiceKey(kind)])
+end function
+
+sub shellRemember(kind as String, libraryId as String)
+    if not m.global.hasField("libraryChoice") then m.global.addFields({ libraryChoice: {} })
+    choices = m.global.libraryChoice
+    choices[shellChoiceKey(kind)] = libraryId
+    m.global.libraryChoice = choices
+end sub
+
+function shellChoiceKey(kind as String) as String
+    origin = ""
+    profileId = ""
+    session = api.session.current()
+    if session <> invalid
+        origin = util.text(session.origin)
+        if util.isObject(session.profile) then profileId = util.text(session.profile.id)
+    end if
+    return libraryTab.choiceKey(origin, profileId, kind)
+end function
+
+' Where focus goes when the page is shown (mainShell.restoreTarget).
+sub shellRestore(target as Object)
+    if target.zone = nav.zone.BAR
+        shellFocusBar(target.barItem)
+    else
+        shellFocusContent()
+    end if
+end sub
+
+sub shellFocusBar(item as String)
+    m.bar.callFunc("focusItem", item)
+    m.bar.dimmed = false
+    if not m.bar.isInFocusChain() then m.bar.setFocus(true)
+end sub
+
+' Focus to the content, which dims the bar; a page without content keeps
+' focus on its bar.
+sub shellFocusContent()
+    content = shellContent()
+    if content = invalid
+        if not m.bar.isInFocusChain() then shellFocusBar(m.shellSelected)
+        return
+    end if
+    m.shellQuiet = ""
+    m.bar.dimmed = true
+    if not content.isInFocusChain() then content.setFocus(true)
+end sub
+
+' Whether focus is in the content, as opposed to the bar or the menu.
+function shellInContent() as Boolean
+    return m.top.isInFocusChain() and not m.bar.isInFocusChain() and not (m.menu <> invalid and m.menu.isInFocusChain()) and m.shellDialog = invalid
+end function
+
+' The bar or the content (nav.zone); the menu counts as content.
+function shellZone() as String
+    if m.bar.isInFocusChain() then return nav.zone.BAR
+    return nav.zone.CONTENT
+end function
+
+function shellFocusKey(contentKey as Dynamic) as Object
+    return mainShell.newKey(shellZone(), m.bar.focused, contentKey)
+end function
+
+' Keys the content and the bar left unhandled: Up from the content's top
+' goes to the selected tab, and Down from the bar into the avatar's menu or
+' a library tab's list, or else (and after Back closed it) to the content.
+function shellKey(key as String, press as Boolean) as Boolean
+    if not press or (m.menu <> invalid and m.menu.isInFocusChain()) or m.shellDialog <> invalid then return false
+    if m.bar.isInFocusChain()
+        if key <> "down" then return false
+        item = m.bar.focused
+        if item <> m.shellQuiet and shellHasMenu(item)
+            shellOpenMenu(item)
+        else
+            ' The page's first item, as on tvOS (A-B2).
+            shellToTop()
+            shellFocusContent()
+        end if
+        return true
+    end if
+    if key <> "up" then return false
+    shellFocusBar(m.shellSelected)
+    return true
+end function
+
+sub onShellActivated()
+    action = mainShell.barAction(m.bar.activated, m.shellSelected)
+    if action.kind = "content"
+        shellToTop()
+        shellFocusContent()
+    else if action.kind = "menu"
+        shellOpenMenu(mainShell.barItem.AVATAR)
+    else if action.kind = "push"
+        nav.push(action.route, action.params)
+    else
+        params = action.params
+        if action.route = nav.route.LIBRARY then params = shellTabParams(params)
+        nav.switchTab(action.route, params)
+    end if
+end sub
+
+' A library tab's page: the library chosen last, else its first, on the
+' sub-page the tab showed last in this session, else Recommended (as on
+' tvOS; the library page records it in m.global.libraryMode).
+function shellTabParams(params as Object) as Object
+    kind = util.text(params.type)
+    library = libraryTab.defaultLibrary(shellTabLibraries(kind), shellRemembered(kind))
+    if library = invalid then return params
+    modes = invalid
+    if m.global.hasField("libraryMode") then modes = m.global.libraryMode
+    return libraryTab.routeParams(kind, library, libraryTab.reopenMode(modes, shellChoiceKey(kind)))
+end function
+
+' Whether a bar item has a menu: the avatar, or a library tab with
+' libraries.
+function shellHasMenu(item as String) as Boolean
+    if item = mainShell.barItem.AVATAR then return true
+    if item <> mainShell.barItem.MOVIES and item <> mainShell.barItem.SERIES then return false
+    return shellTabLibraries(item).Count() > 0
+end function
+
+' Resting on the avatar or a library tab previews its menu, as on Android
+' TV; OK on the avatar, or Down, enters it.
+sub onShellRested()
+    item = m.bar.rested
+    if item <> m.shellQuiet and shellHasMenu(item) then shellPreviewMenu(item)
+end sub
+
+' Moving off an item closes its preview, and lets a quieted menu open again.
+sub onShellHighlight()
+    item = m.bar.focused
+    if item <> m.shellQuiet then m.shellQuiet = ""
+    if m.menu <> invalid and not m.menu.isInFocusChain() and item <> m.menuItem then shellCloseMenu(false)
+end sub
+
+sub shellOpenMenu(item as String)
+    shellPreviewMenu(item)
+    if m.menu <> invalid then m.menu.setFocus(true)
+end sub
+
+' Opens the item's menu without focus, closing another item's first.
+sub shellPreviewMenu(item as String)
+    if m.menu <> invalid
+        if m.menuItem = item then return
+        shellCloseMenu(false)
+    end if
+    if item = mainShell.barItem.AVATAR
+        shellPreviewAvatarMenu()
+    else
+        shellPreviewLibraries(item)
+    end if
+    if m.menu <> invalid then m.menuItem = item
+end sub
+
+' The tab's libraries, the page's own (or else the tab's default) marked
+' current, and each library's sections.
+sub shellPreviewLibraries(kind as String)
+    list = shellTabLibraries(kind)
+    if list.Count() = 0 then return
+    currentId = ""
+    if m.shellSelected = kind and util.isObject(m.shellShown) then currentId = util.text(m.shellShown.libraryId)
+    if libraryTab.find(list, currentId) = invalid
+        fallback = libraryTab.defaultLibrary(list, shellRemembered(kind))
+        currentId = fallback.id
+    end if
+    model = libraryTab.listModel(list, currentId)
+    sections = []
+    for each section in model.sections
+        sections.Push({ key: section, label: i18n.text("library." + section) })
+    end for
+    model.sections = sections
+    model.header = i18n.text("library.list." + kind)
+    m.menu = m.top.createChild("LibraryMenu")
+    m.menu.anchor = m.bar.callFunc("itemCentre", kind)
+    m.menu.menu = model
+    m.menu.observeField("chosen", "onShellLibraryChosen")
+    m.menu.observeField("exit", "onShellLibraryExit")
+end sub
+
+' Up past the list's first row closes it onto its tab; Down past its last
+' row closes it and enters the page's first item.
+sub onShellLibraryExit()
+    if m.menu.exit = "up"
+        shellCloseMenu(true)
+        return
+    end if
+    shellCloseMenu(false)
+    shellToTop()
+    shellFocusContent()
+end sub
+
+' A library or section chosen in a tab's list opens it as the tab's page,
+' or, when this page already shows it, returns focus to the content.
+sub onShellLibraryChosen()
+    choice = m.menu.chosen
+    kind = m.menuItem
+    library = libraryTab.find(shellTabLibraries(kind), util.text(choice.libraryId))
+    shellCloseMenu(library = invalid)
+    if library = invalid then return
+    shellRemember(kind, library.id)
+    shown = invalid
+    if m.shellSelected = kind then shown = m.shellShown
+    action = libraryTab.listAction(kind, library, util.text(choice.mode), shown)
+    if action.kind = "content"
+        shellFocusContent()
+    else
+        nav.switchTab(nav.route.LIBRARY, action.params)
+    end if
+end sub
+
+sub shellPreviewAvatarMenu()
+    debugBuild = false
+    #if debug
+        debugBuild = true
+    #end if
+    groups = []
+    for each group in mainShell.menuGroups(debugBuild)
+        items = []
+        for each key in group
+            items.Push({ key: key, label: i18n.text("menu." + key), destructive: key = mainShell.menuItem.SIGN_OUT })
+        end for
+        groups.Push(items)
+    end for
+    model = { groups: groups }
+    model.Append(m.shellProfile)
+    m.menu = m.top.createChild("AvatarMenu")
+    m.menu.menu = model
+    m.menu.observeField("chosen", "onShellMenuChosen")
+end sub
+
+' Closes the menu; toItem moves focus back to its bar item before it goes,
+' and quiets that item's menu, as Back does.
+sub shellCloseMenu(toItem as Boolean)
+    if m.menu = invalid then return
+    menu = m.menu
+    item = m.menuItem
+    m.menu = invalid
+    m.menuItem = ""
+    if toItem
+        shellFocusBar(item)
+        m.shellQuiet = item
+    end if
+    m.top.removeChild(menu)
+end sub
+
+' The menu closes first, so the page is covered from its avatar. Sign Out
+' asks first (tvOS's confirmation, without its Remove Server choice).
+sub onShellMenuChosen()
+    action = mainShell.menuAction(m.menu.chosen)
+    shellCloseMenu(true)
+    if action = invalid then return
+    if action.kind = "signOut"
+        shellConfirmSignOut()
+    else
+        nav.push(action.route, action.params)
+    end if
+end sub
+
+sub shellConfirmSignOut()
+    m.shellDialog = m.top.createChild("SignOutDialog")
+    m.shellDialog.observeField("choice", "onShellSignOutChoice")
+    m.shellDialog.setFocus(true)
+end sub
+
+' Confirmed, the session ends here at once and the server is told; AppScene
+' starts over at sign-in. Cancelled, focus returns to the avatar.
+sub onShellSignOutChoice()
+    confirmed = m.shellDialog.choice = "confirm"
+    shellCloseDialog()
+    if confirmed then api.session.signOut(api.newHandle(m.top.owner))
+end sub
+
+sub shellCloseDialog()
+    if m.shellDialog = invalid then return
+    dialog = m.shellDialog
+    m.shellDialog = invalid
+    shellFocusBar(mainShell.barItem.AVATAR)
+    ' Down opens the avatar's menu again (tvOS).
+    m.shellQuiet = ""
+    m.top.removeChild(dialog)
+end sub
+
+function backContext() as Object
+    return { overlay: m.menu <> invalid or m.shellDialog <> invalid, zone: shellZone(), barItem: m.bar.focused }
+end function
+
+function onBack(action as String) as Boolean
+    if action = nav.action.CLOSE_OVERLAY
+        if m.shellDialog <> invalid
+            shellCloseDialog()
+        else
+            shellCloseMenu(true)
+        end if
+    else if action = nav.action.FOCUS_BAR
+        ' As on Android TV, the tab Back reaches does not preview its list.
+        shellFocusBar(m.shellSelected)
+        m.shellQuiet = m.shellSelected
+    end if
+    return true
+end function
+
+' Says the empty or error state the content shows (StatusView announce),
+' once focus has settled: with its button when focus went to it.
+sub shellAnnounce(status as Object)
+    if status.visible and m.top.isInFocusChain() then status.callFunc("announce")
+end sub

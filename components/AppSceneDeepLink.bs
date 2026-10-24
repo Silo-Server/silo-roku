@@ -1,0 +1,149 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/auth/profiles.bs"
+import "pkg:/source/deeplink/parse.bs"
+import "pkg:/source/deeplink/route.bs"
+import "pkg:/source/nav/phase.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/nav/stack.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' AppScene's deep links (spec section 10.1, plan section 7). Main's launch
+' args and each roInput event reach deepLinkEvent from onPlatformEvent, and
+' each new phase or identity reaches deepLinkPhaseChanged from the screen
+' host. The reducer (source/deeplink/route.bs) decides; this file sends its
+' requests through the result router, moves the stack, and closes overlays.
+' The player is the nav.route.PLAYER entry (source/nav/player.bs).
+
+' The owner of the deep link's requests.
+const DEEP_LINK_OWNER = "deeplink"
+
+sub deepLinkInit()
+    m.deepLink = deeplink.route.create()
+    ' { kind, handle } for the request in flight, or invalid.
+    m.deepLinkRequest = invalid
+end sub
+
+' A launch or input platform event.
+sub deepLinkEvent(event as Object)
+    link = deeplink.parse(event)
+    if link = invalid then return
+    log.info("deeplink", "link", { source: event.type, valid: link.valid, reason: link.reason })
+    deepLinkRun(deeplink.route.onLink(m.deepLink, link, deepLinkContext()))
+end sub
+
+' Called by the screen host after the stack starts over for a new phase or
+' identity.
+sub deepLinkPhaseChanged()
+    deepLinkRun(deeplink.route.onPhase(m.deepLink, deepLinkContext()))
+end sub
+
+' The params for a new root entry: while a link is under way, the profile
+' phase shows a spinner in place of the picker (a deep link never shows it).
+function deepLinkRootParams(route as String) as Object
+    if route = nav.route.PROFILE and deeplink.route.busy(m.deepLink) then return { deepLink: true }
+    return {}
+end function
+
+function deepLinkContext() as Object
+    profileId = ""
+    rememberedId = ""
+    if m.apiSession <> invalid
+        rememberedId = util.text(m.apiSession.rememberedProfileId)
+        if util.isObject(m.apiSession.profile) then profileId = util.text(m.apiSession.profile.id)
+    end if
+    topRoute = ""
+    overlay = m.top.dialog <> invalid
+    top = nav.stack.topEntry(m.navStack)
+    if top <> invalid
+        topRoute = top.route
+        screen = m.navScreens[top.id]
+        if screen <> invalid and not overlay then overlay = util.isTrue(screen.callFunc("backContext").overlay)
+    end if
+    return deeplink.route.context(m.navShell.phase, profileId, rememberedId, topRoute, overlay)
+end function
+
+' Carries out the reducer's decisions in order (deeplink.step).
+sub deepLinkRun(decisions as Object)
+    for each decision in decisions
+        kind = decision.kind
+        if kind = deeplink.step.PROFILES
+            deepLinkSend(kind, { path: api.auth.profiles.LIST_PATH, auth: "account" })
+        else if kind = deeplink.step.SELECT
+            deepLinkSend(kind, { session: "selectProfile", profile: decision.profile })
+        else if kind = deeplink.step.RESOLVE
+            deepLinkSend(kind, { path: deeplink.route.itemPath(decision.contentId), auth: "profile" })
+        else if kind = deeplink.step.CANCEL
+            deepLinkDropRequest()
+        else if kind = deeplink.step.PICKER
+            deepLinkPicker(decision.deepLink)
+        else if kind = deeplink.step.CLOSE
+            deepLinkClose()
+        else if kind = deeplink.step.PLAY
+            log.info("deeplink", "play", { replace: decision.replace, startPositionRule: decision.intent.startPositionRule })
+            params = { intent: decision.intent }
+            if decision.replace
+                navReplace(nav.route.PLAYER, params)
+            else
+                navPush(nav.route.PLAYER, params)
+            end if
+        else if kind = deeplink.step.DROP
+            log.info("deeplink", "dropped", { reason: decision.reason })
+            navLaunchCheck()
+        end if
+    end for
+end sub
+
+' Sends one request in place of the one in flight.
+sub deepLinkSend(kind as String, request as Object)
+    deepLinkDropRequest()
+    handle = api.newHandle(DEEP_LINK_OWNER)
+    handle.observeField("status", "onDeepLinkAnswer")
+    m.deepLinkRequest = { kind: kind, handle: handle }
+    apiSend(request, handle)
+end sub
+
+sub deepLinkDropRequest()
+    pending = m.deepLinkRequest
+    if pending = invalid then return
+    m.deepLinkRequest = invalid
+    pending.handle.unobserveField("status")
+    apiCancel(pending.handle.requestId)
+end sub
+
+sub onDeepLinkAnswer(event as Object)
+    pending = m.deepLinkRequest
+    if pending = invalid or not pending.handle.isSameNode(event.getRoSGNode()) then return
+    m.deepLinkRequest = invalid
+    result = api.resultOf(pending.handle)
+    ctx = deepLinkContext()
+    if pending.kind = deeplink.step.PROFILES
+        decisions = deeplink.route.onProfiles(m.deepLink, result, ctx)
+    else if pending.kind = deeplink.step.SELECT
+        decisions = deeplink.route.onSelected(m.deepLink, result, ctx)
+    else
+        decisions = deeplink.route.onResolved(m.deepLink, result, ctx)
+    end if
+    deepLinkRun(decisions)
+end sub
+
+' Starts the profile phase over at its root, in deep-link mode or as the
+' ordinary picker. Already in deep-link mode at the root, it stays.
+sub deepLinkPicker(deepLinkMode as Boolean)
+    if m.navShell.phase <> nav.phase.PROFILE then return
+    entries = m.navStack.entries
+    if deepLinkMode and entries.Count() = 1 and util.isObject(entries[0].params) and util.isTrue(entries[0].params.deepLink) then return
+    params = {}
+    if deepLinkMode then params = { deepLink: true }
+    navApply(nav.stack.reset(m.navStack, nav.route.PROFILE, params))
+end sub
+
+' Closes the scene's dialog and the top screen's keyboard or overlay before
+' the player covers them.
+sub deepLinkClose()
+    if m.top.dialog <> invalid then m.top.dialog.close = true
+    top = nav.stack.topEntry(m.navStack)
+    if top = invalid then return
+    screen = m.navScreens[top.id]
+    if screen <> invalid and util.isTrue(screen.callFunc("backContext").overlay) then screen.callFunc("onBack", nav.action.CLOSE_OVERLAY)
+end sub

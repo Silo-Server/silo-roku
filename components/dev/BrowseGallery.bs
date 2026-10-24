@@ -1,0 +1,237 @@
+import "pkg:/components/theme/browse.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/grid.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/platform/topics.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Dev builds only: see BrowseGallery.xml. Every request goes through
+' ApiTask under OWNER, marked for components/dev/galleryData.bs unless the
+' gallery is live.
+const OWNER = "dev.browseGallery"
+const PAGES = "home|browse|states"
+
+sub init()
+    m.layer = m.top.findNode("page")
+    m.note = m.top.findNode("note")
+    m.note.font = theme.font(theme.textStyle.INFO_LINE)
+    m.note.color = theme.color.TEXT_SECONDARY
+    m.pageNames = PAGES.Split("|")
+    m.pageIndex = 0
+    m.live = false
+    m.lowTier = platform.current().memory.tier = "low"
+    platform.subscribe(OWNER, [platform.topic.MEMORY_LEVEL], "onMemoryLevel")
+    m.top.observeField("focusedChild", "onFocusedChild")
+    build()
+end sub
+
+' Focus given to the gallery, as when the diagnostic Home is shown again
+' after a detail page, goes to its page's content.
+sub onFocusedChild()
+    if not m.top.hasFocus() then return
+    if m.rows <> invalid
+        focusContent(m.rows)
+    else if m.grid <> invalid
+        focusContent(m.grid)
+    else if m.focusables.Count() > 0
+        m.focusables[m.focusAt].setFocus(true)
+    end if
+end sub
+
+function source() as Object
+    out = { surface: "home", lowTier: m.lowTier }
+    if not m.live then out.dev = "gallery"
+    return out
+end function
+
+' Rebuilds the current page, cancelling the old page's requests.
+sub build()
+    api.release(OWNER)
+    m.layer.removeChildrenIndex(m.layer.getChildCount(), 0)
+    m.bar = invalid
+    m.rows = invalid
+    m.grid = invalid
+    m.focusables = []
+    name = m.pageNames[m.pageIndex]
+    if name = "home"
+        buildHome()
+    else if name = "browse"
+        buildBrowse()
+    else
+        buildStates()
+    end if
+    showNote("")
+end sub
+
+sub buildHome()
+    hero = m.layer.createChild("Hero")
+    hero.lowTier = m.lowTier
+    hero.bandTop = theme.browse.BAND_TOP
+    m.hero = hero
+    m.bar = topBar("home")
+    m.rows = m.layer.createChild("BrowseRows")
+    m.rows.translation = [0, theme.browse.BAND_TOP]
+    m.rows.owner = OWNER
+    m.rows.observeField("focusedItem", "onRowsFocus")
+    m.rows.observeField("selectedItem", "onSelected")
+    m.rows.observeField("state", "onState")
+    m.rows.callFunc("load", source())
+    focusContent(m.rows)
+end sub
+
+sub buildBrowse()
+    m.bar = topBar("movies")
+    m.grid = m.layer.createChild("BrowseGrid")
+    m.grid.translation = [theme.size.SIDE_INSET, theme.browse.GRID_TOP]
+    m.grid.owner = OWNER
+    m.grid.pages = platform.current().memory.gridPages
+    m.grid.observeField("selectedItem", "onSelected")
+    m.grid.observeField("state", "onState")
+    m.grid.observeField("focusedItem", "onGridFocus")
+    options = source()
+    options.request = catalog.request.browse({ libraryId: "gallery", sort: catalog.sort.param("title", false) }, "", catalog.grid.PAGE_SIZE, m.lowTier)
+    m.grid.callFunc("load", options)
+    focusContent(m.grid)
+end sub
+
+sub buildStates()
+    spinner = m.layer.createChild("LoadingSpinner")
+    spinner.centre = [300, 300]
+    spinner.running = true
+    empty = m.layer.createChild("StatusView")
+    empty.centre = [1100, 210]
+    empty.message = i18n.text("home.empty")
+    empty.detail = i18n.text("home.emptyBody")
+    empty.action = i18n.text("states.refresh")
+    failed = m.layer.createChild("StatusView")
+    failed.centre = [1100, 500]
+    failed.message = i18n.text("browse.error.load")
+    failed.action = i18n.text("states.retry")
+    for each view in [empty, failed]
+        view.observeField("activated", "onStatusActivated")
+    end for
+    ' An episode row as series detail will show it.
+    m.episodes = m.layer.createChild("RowList")
+    m.episodes.setFields({ translation: [0, 720], itemComponentName: "CatalogCard", itemSize: [1920, 330], numRows: 1, focusXOffset: [theme.size.SIDE_INSET], rowLabelOffset: [[theme.size.SIDE_INSET, 8]], rowItemSize: [[theme.size.LANDSCAPE_WIDTH, theme.size.LANDSCAPE_HEIGHT]], rowItemSpacing: [[theme.size.CARD_GAP, 0]], showRowLabel: [true], rowFocusAnimationStyle: "fixedFocus", drawFocusFeedback: m.lowTier, focusBitmapUri: theme.art.FOCUS_RING, rowLabelFont: theme.font(theme.textStyle.ROW_TITLE), rowLabelColor: theme.color.TEXT })
+    m.episodeHandle = api.newHandle(OWNER)
+    m.episodeHandle.observeField("status", "onEpisodes")
+    request = catalog.request.episodes("series:gallery", 1, "")
+    if not m.live then request.dev = "gallery"
+    api.send(request, m.episodeHandle)
+    m.focusables = [empty, failed, m.episodes]
+    m.focusAt = 0
+    empty.setFocus(true)
+end sub
+
+sub onEpisodes()
+    row = m.episodeHandle.content
+    if row = invalid
+        showNote("episodes failed: " + api.resultOf(m.episodeHandle).error.kind)
+        return
+    end if
+    row.title = "Season 1"
+    row.lowTier = m.lowTier
+    root = CreateObject("roSGNode", "ContentNode")
+    root.appendChild(row)
+    m.episodes.content = root
+end sub
+
+function topBar(selected as String) as Object
+    bar = m.layer.createChild("TopBar")
+    bar.tabs = { movies: true, series: true }
+    bar.avatar = { initials: "G", name: "Gallery" }
+    bar.selected = selected
+    bar.observeField("activated", "onBarActivated")
+    bar.observeField("rested", "onBarRested")
+    return bar
+end function
+
+sub focusContent(content as Object)
+    content.setFocus(true)
+    if m.bar <> invalid then m.bar.dimmed = true
+end sub
+
+sub onRowsFocus()
+    m.hero.content = m.rows.focusedItem
+end sub
+
+sub onGridFocus()
+    item = m.grid.focusedItem
+    if item <> invalid then showNote(item.title + " · " + m.grid.total.ToStr() + " titles")
+end sub
+
+' OK on a card opens its detail page, answered from the same fixtures or
+' server as the gallery.
+sub onSelected(event as Object)
+    item = event.getData()
+    params = { itemId: item.id }
+    if not m.live then params.dev = "gallery"
+    nav.push(nav.route.DETAIL, params)
+end sub
+
+sub onState(event as Object)
+    node = event.getRoSGNode()
+    showNote("state " + event.getData() + " " + node.errorKind)
+end sub
+
+sub onBarActivated()
+    showNote("Top bar: " + m.bar.activated)
+end sub
+
+sub onBarRested()
+    showNote("Rested on " + m.bar.rested + " (previews its library list or menu)")
+end sub
+
+sub onStatusActivated(event as Object)
+    showNote("Activated: " + event.getRoSGNode().action)
+end sub
+
+function onMemoryLevel(event as Object) as Boolean
+    if m.grid <> invalid then m.grid.pages = event.gridPages
+    showNote("memory level " + util.text(event.level) + ", grid pages " + util.text(event.gridPages))
+    return true
+end function
+
+sub showNote(text as String)
+    mode = "fixtures"
+    if m.live then mode = "live server"
+    tier = "standard focus"
+    if m.lowTier then tier = "low-tier focus"
+    prefix = "Gallery: " + m.pageNames[m.pageIndex] + ", " + mode + ", " + tier + ".  Replay next page, Play data, * focus, Back closes.  "
+    m.note.text = prefix + text
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return true
+    if key = "back"
+        api.release(OWNER)
+        platform.unsubscribe(OWNER)
+        m.top.closed = true
+    else if key = "replay"
+        ' Lists take Fast Forward and Rewind for paging, so Replay turns pages.
+        m.pageIndex = (m.pageIndex + 1) mod m.pageNames.Count()
+        build()
+    else if key = "play"
+        m.live = not m.live
+        build()
+    else if key = "options"
+        m.lowTier = not m.lowTier
+        build()
+    else if key = "up" and m.bar <> invalid and not m.bar.isInFocusChain()
+        m.bar.dimmed = false
+        m.bar.setFocus(true)
+    else if key = "down" and m.bar <> invalid and m.bar.isInFocusChain()
+        if m.rows <> invalid then focusContent(m.rows)
+        if m.grid <> invalid then focusContent(m.grid)
+    else if (key = "up" or key = "down") and m.focusables.Count() > 0
+        if key = "down" and m.focusAt < m.focusables.Count() - 1 then m.focusAt = m.focusAt + 1
+        if key = "up" and m.focusAt > 0 then m.focusAt = m.focusAt - 1
+        m.focusables[m.focusAt].setFocus(true)
+    end if
+    return true
+end function

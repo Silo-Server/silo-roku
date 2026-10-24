@@ -1,0 +1,885 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/api/response.bs"
+import "pkg:/source/api/scheduler.bs"
+import "pkg:/source/auth/headers.bs"
+import "pkg:/source/auth/problems.bs"
+import "pkg:/source/auth/profiles.bs"
+import "pkg:/source/auth/server.bs"
+import "pkg:/source/storage/registry.bs"
+import "pkg:/source/util/values.bs"
+
+' The account session, run inside ApiTask (spec sections 6.3, 6.4, and 7; plan
+' sections 4.2, 4.3, and 5): server setup, sign-in, single-flight token
+' refresh, sign-out, profiles, and PIN checks. Pure: ApiTask passes the wall
+' clock in seconds and executes the decisions each call returns, in order:
+'   { kind: "submit", request }     queue a request built here
+'   { kind: "hold", held }          hold or release queued requests that carry
+'                                   account credentials (api.scheduler.holdCredentials)
+'   { kind: "holdOrigin", held }    hold or release every queued request that
+'                                   carries a credential in any form
+'                                   (api.scheduler.holdConfidential)
+'   { kind: "requeue", requestId }  send a running request back to the queue
+'   { kind: "promote", requestId }  move the queued refresh to the playback lane
+'   { kind: "finish", result }      end the transfer with this envelope
+'   { kind: "reply", result }       send this envelope to the requester now
+'   { kind: "persist" }             write and flush record(state)
+'   { kind: "publish" }             view(state) changed
+'   { kind: "server", origin }      the base URL changed: cancel every request
+'                                   but playback jobs
+'   { kind: "warn", message, fields }  log a warning
+'
+' Session operations arrive as requests with a `session` member:
+'   { session: "server", address, allowHttp }  check and store a server
+'   { session: "signIn", username, password }
+'   { session: "signOut" }
+'   { session: "selectProfile", profile }
+'   { session: "verifyPin", profile, pin }
+'   { session: "checkOrigin" }      check the configured origin again
+'   { session: "mediaHeaders", url, generation, refresh }  (mediaHeaders)
+' profile is an item of api.auth.profiles.list. Their envelopes carry no
+' tokens, but for mediaHeaders, whose lines the player sets on its Video
+' node's content. Tokens, the password, and PINs leave this state only as
+' headers and bodies of requests to the configured origin.
+'
+' Refresh: tokens have a generation, bumped whenever they change, and the
+' login session an epoch, bumped when it ends. A 401 on a
+' request sent with the current generation starts one refresh, or joins the
+' one running, and the request waits in the queue; a 401 on an older
+' generation retries at once. Each request is retried at most once. The new
+' tokens are persisted before the held requests are released. Only a refused
+' refresh signs out; an unavailable server keeps the tokens.
+'
+' Origin: credentials go only to the configured origin (AGENTS.md), and Roku
+' follows redirects without telling the app (assumption A-14), so nothing
+' that carries a credential (sign-in, refresh, PIN, sign-out, authenticated
+' requests, media headers) is sent until GET /api/v2/system/info has
+' confirmed in this run that its request reached that origin
+' (api.auth.server.checkInfo). The setup check confirms a new server; start()
+' checks a stored one at launch, a restored session included. While a check
+' runs, those requests wait; when it gets no answer they fail with
+' origin_unverified and the next one checks again; when the server is too
+' old to confirm the origin (release builds), reports another origin, or
+' does not serve /api/v2, they fail with that refusal, which the session view
+' reports until the viewer asks for another check or changes servers.
+namespace api.auth.coordinator
+    ' A refresh starts this long before expiry, or halfway through a shorter
+    ' token lifetime, while the token still works.
+    const PROACTIVE_SECONDS = 1800
+    ' Within this long of expiry the token counts as expired, and requests wait
+    ' for the refresh.
+    const EXPIRY_MARGIN_SECONDS = 30
+    ' After a refresh failed without a refusal, none starts for Retry-After
+    ' seconds, or this long without one, at most MAX_BACKOFF_SECONDS. A
+    ' backoff the server did not ask for ends at its next answer.
+    const BACKOFF_SECONDS = 30
+    const MAX_BACKOFF_SECONDS = 300
+    const LOGIN_PATH = "/api/v2/auth/login"
+    const REFRESH_PATH = "/api/v2/auth/refresh"
+    const LOGOUT_PATH = "/api/v2/auth/logout"
+    const LOGIN_TIMEOUT_MS = 30000
+    const REFRESH_TIMEOUT_MS = 15000
+    const LOGOUT_TIMEOUT_MS = 5000
+    const SERVER_TIMEOUT_MS = 10000
+    const PIN_TIMEOUT_MS = 15000
+    ' Request IDs of requests built here; router IDs start with "r".
+    const ID_PREFIX = "auth"
+
+    ' saved: storage.decode() with a device ID; facts: api.auth.headers.facts().
+    ' allowUnconfirmedOrigin (debug builds only) lets credentials go to a
+    ' server whose system/info has no request_origin, with a warning; a
+    ' mismatch is refused in every build.
+    ' verification is the open profile whose token the server refused, until
+    ' a new PIN is entered for it or another profile is chosen; proofs counts
+    ' the tokens stored for each profile ID, so a refusal of an older one
+    ' leaves a newer one alone. unanswered says the refresh backoff
+    ' (notBefore) began without an answer from the server (noteAnswer). originCheck is { status: "unverified" |
+    ' "checking" | "verified" | "refused", problem, url, requestId } for the
+    ' base URL url.
+    function create(saved as Object, facts as Object, allowUnconfirmedOrigin = false as Boolean) as Object
+        return { saved: saved, facts: facts, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
+    end function
+
+    ' The decisions to carry out once, at launch, before the first publish:
+    ' the check of a stored server's origin.
+    function start(state as Object) as Object
+        return confirmOrigin(state, false)
+    end function
+
+    ' What screens may know (api.session.current()):
+    '   { status: "no_server" | "signed_out" | "signed_in", origin, accountId,
+    '     rememberedProfileId,
+    '     profile: invalid | { id, name, hasPin, isChild, avatarUrl },
+    '     verification: invalid | { id, name, hasPin, isChild, avatarUrl },
+    '     originStatus: "unverified" | "checking" | "verified" | "refused",
+    '     originProblem: "" | "origin_unconfirmed" | "origin_mismatch" |
+    '       "server_update_required",
+    '     reason: "" | "expired" | "signed_out" | "server_changed" }
+    ' reason says why the last session ended. verification names the open
+    ' profile whose token the server refused: it needs its PIN again, and
+    ' until then no profile shows as open, so the app returns to the profile
+    ' step (spec section 7.3). originStatus is the configured origin's check;
+    ' originProblem says why it was refused.
+    function view(state as Object) as Object
+        status = "signed_in"
+        if state.saved.origin = ""
+            status = "no_server"
+        else if state.saved.accessToken = ""
+            status = "signed_out"
+        end if
+        active = invalid
+        if state.profile <> invalid and state.verification = invalid then active = profileView(state.profile)
+        check = currentOriginCheck(state)
+        return { status: status, origin: state.saved.origin, accountId: state.saved.accountId, rememberedProfileId: state.saved.profileId, profile: active, verification: state.verification, originStatus: check.status, originProblem: check.problem, reason: state.reason }
+    end function
+
+    ' The record to persist.
+    function record(state as Object) as Object
+        return state.saved
+    end function
+
+    ' The identity whose credentials requests carry now, { server, account,
+    ' profile }, with "" for a part not set. Playback jobs are fenced to it
+    ' (playback.jobs). A profile waiting for its PIN again stays the identity,
+    ' so its playback jobs go out with its new token, and with no other.
+    function identity(state as Object) as Object
+        profile = ""
+        if state.profile <> invalid then profile = state.profile.id
+        return { server: state.saved.origin, account: state.saved.accountId, profile: profile }
+    end function
+
+    ' Whether requestId is a request built here, whose result goes to settled()
+    ' rather than to the render thread.
+    function owns(state as Object, requestId as String) as Boolean
+        return state.ops.DoesExist(requestId)
+    end function
+
+    ' Whether requestId's body holds the password, a PIN, or a refresh token,
+    ' which ApiTask never writes to a file (api.request.transport).
+    function sendsSecret(state as Object, requestId as String) as Boolean
+        op = state.ops[requestId]
+        if op = invalid then return false
+        return op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "pin"
+    end function
+
+    ' A session operation from the render thread.
+    function operation(state as Object, input as Object, now as Integer) as Object
+        op = util.text(input.session)
+        if op = "server" then return checkServer(state, input)
+        if op = "signIn" then return signIn(state, input)
+        if op = "signOut" then return signOut(state, input, now)
+        if op = "selectProfile" then return selectProfile(state, input)
+        if op = "verifyPin" then return verifyPin(state, input)
+        if op = "checkOrigin" then return checkOrigin(state, input)
+        if op = "mediaHeaders" then return mediaHeaders(state, input, now)
+        return [reply(api.response.failure(input, "invalid_request"))]
+    end function
+
+    ' A request from the render thread, before it is queued: an authenticated
+    ' request waits for the origin check it needs, may start a refresh, and
+    ' waits for it when the token has expired. Markers this module sets on
+    ' requests are removed first.
+    function submitted(state as Object, request as Object, now as Integer) as Object
+        for each marker in ["authGeneration", "authRetried", "authProfileId", "authProof", "rotatesCredentials", "confidential"]
+            request.Delete(marker)
+        end for
+        if request.auth = "none" or state.saved.refreshToken = "" then return []
+        decisions = confirmOrigin(state)
+        if currentOriginCheck(state).status = "refused" then return decisions
+        isExpired = expired(state, now)
+        if state.refreshing <> invalid
+            if isExpired then decisions.Append(holdFor(state, request.lane))
+            return decisions
+        end if
+        if now < state.notBefore then return decisions
+        if isExpired
+            decisions.Append(startRefresh(state, request.lane, true))
+        else if state.saved.refreshAt > 0 and now >= state.saved.refreshAt
+            decisions.Append(startRefresh(state, api.scheduler.LANE_INTERACTIVE, false))
+        end if
+        return decisions
+    end function
+
+    ' The headers for a request about to start at url, as { headers, error }.
+    ' Identity headers go only to the configured origin, or to the origin a
+    ' setup check is probing; credentials, passwords, and PINs never leave it,
+    ' so such a request elsewhere fails with invalid_request, and they go only
+    ' once system/info has confirmed that origin (originError otherwise).
+    ' error may also be signed_out, profile_required, pin_required, or
+    ' identity_changed (a request fenced to another identity). Records on the
+    ' request the token generation it was sent with.
+    function credentials(state as Object, request as Object, url as String) as Object
+        ' A playback request fenced to an earlier identity never takes this
+        ' one's credentials (plan section 6.6).
+        if util.isObject(request.fence) and not sameIdentity(request.fence, identity(state)) then return { headers: {}, error: "identity_changed" }
+        op = state.ops[request.requestId]
+        expected = state.saved.origin
+        if op <> invalid and util.isString(op.origin) then expected = op.origin
+        sameOrigin = api.request.isSameOrigin(url, expected)
+        sensitive = request.auth <> "none" or (op <> invalid and op.kind <> "server" and op.kind <> "origin")
+        if sensitive and not sameOrigin then return { headers: {}, error: "invalid_request" }
+        if request.auth <> "none" and state.saved.accessToken = "" then return { headers: {}, error: "signed_out" }
+        if sensitive and not originConfirmed(state, expected) then return { headers: {}, error: originError(state) }
+        out = {}
+        if sameOrigin then out.Append(api.auth.headers.identity(state.facts, sensitive))
+        if op <> invalid and op.kind = "logout" then out.Append(api.auth.headers.account(op.accessToken))
+        if request.auth = "none" then return { headers: out, error: invalid }
+
+        out.Append(api.auth.headers.account(state.saved.accessToken))
+        request.authGeneration = state.generation
+        if request.auth = "profile"
+            if state.profile = invalid then return { headers: {}, error: "profile_required" }
+            pair = api.auth.headers.profile(state.profile, profileToken(state, state.profile.id))
+            if pair.error <> invalid then return { headers: {}, error: pair.error }
+            out.Append(pair.headers)
+            request.authProfileId = state.profile.id
+            request.authProof = proofSerial(state, state.profile.id)
+        end if
+        return { headers: out, error: invalid }
+    end function
+
+    ' A transfer completed, before it leaves the queue: a 401 on an
+    ' authenticated request goes through the refresh; a refused profile token is
+    ' forgotten, and the request is answered as it is, never replayed.
+    ' Everything else finishes as it is.
+    function answered(state as Object, request as Object, result as Object, now as Integer) as Object
+        noteAnswer(state, request, result)
+        if request.auth = "none" then return [finish(result)]
+        if result.status = 401 then return unauthorized(state, request, result, now)
+        if result.status = 403 and problemType(result) = "profile_verification_required" and util.isString(request.authProfileId)
+            decisions = refuseProof(state, request.authProfileId, request.authProof)
+            decisions.Unshift(finish(result))
+            return decisions
+        end if
+        return [finish(result)]
+    end function
+
+    ' A request built here ended (completed, timed out, cancelled, or never
+    ' issued).
+    function settled(state as Object, request as Object, result as Object, now as Integer) as Object
+        op = state.ops[request.requestId]
+        if op = invalid then return []
+        state.ops.Delete(request.requestId)
+        if op.kind = "refresh" then return refreshed(state, request, op, result, now)
+        if op.kind = "login" then return loggedIn(state, request, op, result, now)
+        if op.kind = "server" then return serverChecked(state, request, op, result)
+        if op.kind = "origin" then return originChecked(state, request, op, result)
+        if op.kind = "pin" then return pinChecked(state, request, op, result)
+        if op.kind = "logoutRefresh"
+            tokens = parseTokens(result)
+            if tokens = invalid then return []
+            return [submit(logoutRequest(state, op.origin, tokens.accessToken))]
+        end if
+        return []
+    end function
+
+    ' Debug builds' apiConfigure({ baseUrl }): use a server without the setup
+    ' check, ending the session when it changes.
+    ' Its origin is checked before the first credential goes there.
+    function useServer(state as Object, origin as String) as Object
+        if origin = state.saved.origin then return []
+        decisions = endSession(state, "server_changed")
+        state.saved.origin = origin
+        state.originCheck = originState("unverified", "", origin)
+        decisions.Append(setOriginHold(state, false))
+        decisions.Append([{ kind: "server", origin: origin }, persist(), publish()])
+        return decisions
+    end function
+
+    ' ---- Session operations
+
+    function checkServer(state as Object, input as Object) as Object
+        address = api.auth.server.normalize(input.address, util.isTrue(input.allowHttp))
+        if address.error <> invalid then return [reply(api.response.failure(input, address.error))]
+        request = build(state, input, { method: "GET", url: address.url + api.auth.server.INFO_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "server", origin: address.url })
+        return [submit(request)]
+    end function
+
+    function signIn(state as Object, input as Object) as Object
+        if state.saved.origin = "" then return [reply(api.response.failure(input, "no_server"))]
+        if not nonEmpty(input.username) or not nonEmpty(input.password) then return [reply(api.response.failure(input, "invalid_request"))]
+        body = { username: input.username, password: input.password }
+        request = build(state, input, { method: "POST", path: LOGIN_PATH, body: body, timeoutMs: LOGIN_TIMEOUT_MS }, { kind: "login", origin: state.saved.origin })
+        return submitConfidential(state, request)
+    end function
+
+    ' Clears the local session at once, whatever the server says, then asks
+    ' the server to end it: with the access token, or, when that has expired,
+    ' after a refresh with the captured refresh token, whose tokens are dropped.
+    function signOut(state as Object, input as Object, now as Integer) as Object
+        origin = state.saved.origin
+        access = state.saved.accessToken
+        refresh = state.saved.refreshToken
+        isExpired = expired(state, now)
+        decisions = endSession(state, "signed_out")
+        decisions.Append([persist(), publish(), reply(succeeded(input, {}))])
+        if access = "" or origin = "" then return decisions
+        if isExpired and refresh <> ""
+            decisions.Append(submitConfidential(state, build(state, { owner: "" }, { method: "POST", path: REFRESH_PATH, body: { refresh_token: refresh }, timeoutMs: LOGOUT_TIMEOUT_MS }, { kind: "logoutRefresh", origin: origin })))
+        else
+            decisions.Append(submitConfidential(state, logoutRequest(state, origin, access)))
+        end if
+        return decisions
+    end function
+
+    ' Chooses a profile from the account's list. A PIN-locked profile without a
+    ' token from this session answers pin_required; the screen then asks for
+    ' the PIN (verifyPin). A profile whose token the server refused counts as
+    ' PIN-locked whatever the screen says about it.
+    function selectProfile(state as Object, input as Object) as Object
+        if state.saved.accessToken = "" then return [reply(api.response.failure(input, "signed_out"))]
+        chosen = profileInput(input.profile)
+        if chosen = invalid then return [reply(api.response.failure(input, "invalid_request"))]
+        if state.verification <> invalid and state.verification.id = chosen.id then chosen.hasPin = true
+        if chosen.hasPin and profileToken(state, chosen.id) = "" then return [reply(api.response.failure(input, "pin_required"))]
+        state.profile = chosen
+        state.verification = invalid
+        state.saved.profileId = chosen.id
+        return [persist(), publish(), reply(succeeded(input, { profile: profileView(chosen) }))]
+    end function
+
+    ' POST /profiles/{id}/verify-pin, never retried: each check counts toward
+    ' the lockout. A match selects the profile.
+    function verifyPin(state as Object, input as Object) as Object
+        if state.saved.accessToken = "" then return [reply(api.response.failure(input, "signed_out"))]
+        chosen = profileInput(input.profile)
+        if chosen = invalid or not nonEmpty(input.pin) then return [reply(api.response.failure(input, "invalid_request"))]
+        request = build(state, input, { method: "POST", path: api.auth.profiles.verifyPath(chosen.id), body: { pin: input.pin }, auth: "account", timeoutMs: PIN_TIMEOUT_MS }, { kind: "pin", origin: state.saved.origin, profile: chosen, epoch: state.epoch })
+        return submitConfidential(state, request)
+    end function
+
+    ' The Video node's HttpHeaders for a plan's media URL (plan section 6.4),
+    ' body { httpHeaders, generation, credentialed }, and with credentials
+    ' the token's expiresAt and refreshAt (wall-clock seconds): "Name: value"
+    ' lines with Authorization and the profile headers when url is on the
+    ' configured origin, and none for any other origin, such as a proxy node,
+    ' whose signed URL is its own credential. Headers cannot change on a playing
+    ' stream, so this waits for a refresh when one is running, when the token
+    ' is inside the proactive refresh window, or when refresh is set after
+    ' the media answered 401 and the tokens are still those of generation
+    ' (the body of the headers that failed).
+    function mediaHeaders(state as Object, input as Object, now as Integer) as Object
+        if not api.request.isSameOrigin(util.text(input.url), state.saved.origin) then return [reply(succeeded(input, { httpHeaders: [], generation: state.generation, credentialed: false }))]
+        if state.saved.accessToken = "" then return [reply(api.response.failure(input, "signed_out"))]
+        if not originConfirmed(state, state.saved.origin)
+            decisions = confirmOrigin(state)
+            decisions.Push(reply(api.response.failure(input, originError(state))))
+            return decisions
+        end if
+        decisions = []
+        if state.refreshing = invalid and mediaRefreshDue(state, input, now) then decisions = startRefresh(state, api.scheduler.LANE_PLAYBACK, expired(state, now))
+        if state.refreshing = invalid
+            decisions.Push(mediaReply(state, input))
+            return decisions
+        end if
+        ' Answered when the refresh settles; it takes the playback slot.
+        state.mediaWaiters.Push(input)
+        if state.refreshing.lane <> api.scheduler.LANE_PLAYBACK
+            state.refreshing.lane = api.scheduler.LANE_PLAYBACK
+            decisions.Push({ kind: "promote", requestId: state.refreshing.requestId })
+        end if
+        return decisions
+    end function
+
+    function mediaRefreshDue(state as Object, input as Object, now as Integer) as Boolean
+        if state.saved.refreshToken = "" or now < state.notBefore then return false
+        if util.isTrue(input.refresh) and util.isNumber(input.generation) and input.generation = state.generation then return true
+        return expired(state, now) or (state.saved.refreshAt > 0 and now >= state.saved.refreshAt)
+    end function
+
+    function mediaReply(state as Object, input as Object) as Object
+        if state.saved.accessToken = "" then return reply(api.response.failure(input, "signed_out"))
+        if not originConfirmed(state, state.saved.origin) then return reply(api.response.failure(input, originError(state)))
+        if state.profile = invalid then return reply(api.response.failure(input, "profile_required"))
+        pair = api.auth.headers.profile(state.profile, profileToken(state, state.profile.id))
+        if pair.error <> invalid then return reply(api.response.failure(input, pair.error))
+        headers = api.auth.headers.account(state.saved.accessToken)
+        headers.Append(pair.headers)
+        lines = []
+        for each name in headers
+            lines.Push(name + ": " + headers[name])
+        end for
+        ' Not secret: when the token expires, and when this session would
+        ' refresh it, so playback can renew the content's headers in time.
+        return reply(succeeded(input, { httpHeaders: lines, generation: state.generation, credentialed: true, expiresAt: state.saved.expiresAt, refreshAt: state.saved.refreshAt }))
+    end function
+
+    ' Answers every mediaHeaders request waiting for the refresh that ended.
+    function answerMedia(state as Object) as Object
+        decisions = []
+        for each input in state.mediaWaiters
+            decisions.Push(mediaReply(state, input))
+        end for
+        state.mediaWaiters = []
+        return decisions
+    end function
+
+    ' Try again on the update screen: checks the configured origin again.
+    function checkOrigin(state as Object, input as Object) as Object
+        if currentOriginCheck(state).status = "refused" then state.originCheck = originState("unverified", "", state.saved.origin)
+        decisions = confirmOrigin(state)
+        decisions.Push(reply(succeeded(input, { originStatus: currentOriginCheck(state).status })))
+        return decisions
+    end function
+
+    ' ---- The configured origin
+
+    ' Starts the check of the configured origin unless it is confirmed, being
+    ' checked, or refused. While it runs, every request that carries a
+    ' credential waits (holdOrigin). announce publishes the new status.
+    function confirmOrigin(state as Object, announce = true as Boolean) as Object
+        base = state.saved.origin
+        if base = "" or currentOriginCheck(state).status <> "unverified" then return []
+        state.originChecks = state.originChecks + 1
+        request = build(state, { requestId: "origin" + state.originChecks.ToStr(), owner: "" }, { method: "GET", url: base + api.auth.server.INFO_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "origin", origin: base })
+        state.originCheck = originState("checking", "", base)
+        state.originCheck.requestId = request.requestId
+        decisions = setOriginHold(state, true)
+        decisions.Push(submit(request))
+        if announce then decisions.Push(publish())
+        return decisions
+    end function
+
+    ' A check of base answered (api.auth.server.checkInfo): confirmed; left
+    ' unverified, to be tried by the next request that needs it, when it got
+    ' no answer; otherwise refused. Waiting requests then start, and those
+    ' it did not confirm fail.
+    function originSettled(state as Object, base as String, check as Object) as Object
+        if check.ok
+            state.originCheck = originState("verified", "", base)
+        else if check.error = "unreachable" or check.error = "cancelled"
+            state.originCheck = originState("unverified", "", base)
+        else
+            state.originCheck = originState("refused", check.error, base)
+        end if
+        ' Published first, so screens hear of a refusal before their requests fail.
+        decisions = [publish()]
+        if check.warning <> invalid then decisions.Push({ kind: "warn", message: "the server does not confirm which origin a request reached; a debug build sends credentials to it anyway", fields: { problem: check.warning } })
+        decisions.Append(setOriginHold(state, false))
+        return decisions
+    end function
+
+    ' The check of the configured origin, unverified when it was for another.
+    function currentOriginCheck(state as Object) as Object
+        if state.originCheck.url <> state.saved.origin then return originState("unverified", "", state.saved.origin)
+        return state.originCheck
+    end function
+
+    function originConfirmed(state as Object, base as String) as Boolean
+        check = currentOriginCheck(state)
+        return base <> "" and check.status = "verified" and api.request.isSameOrigin(base, check.url)
+    end function
+
+    ' The error kind of a request refused for want of a confirmed origin:
+    ' the refusal, or origin_unverified while there is none.
+    function originError(state as Object) as String
+        check = currentOriginCheck(state)
+        if check.status = "refused" then return check.problem
+        return "origin_unverified"
+    end function
+
+    ' Whether error is one originError gave a request that was never sent.
+    function isOriginError(error as Dynamic) as Boolean
+        if not util.isObject(error) then return false
+        kind = util.text(error.kind)
+        return kind = "origin_unverified" or kind = "origin_unconfirmed" or kind = "origin_mismatch" or (kind = "server_update_required" and error.status = 0)
+    end function
+
+    function originState(status as String, problem as String, url as String) as Object
+        return { status: status, problem: problem, url: url, requestId: "" }
+    end function
+
+    function setOriginHold(state as Object, held as Boolean) as Object
+        if state.originHeld = held then return []
+        state.originHeld = held
+        return [{ kind: "holdOrigin", held: held }]
+    end function
+
+    ' A request built here that carries a credential, after the origin check
+    ' it needs has started.
+    function submitConfidential(state as Object, request as Object) as Object
+        decisions = confirmOrigin(state)
+        decisions.Push(submit(request))
+        return decisions
+    end function
+
+    ' ---- Results of requests built here
+
+    ' A check of the configured server itself also settles its origin.
+    function serverChecked(state as Object, request as Object, op as Object, result as Object) as Object
+        check = api.auth.server.checkInfo(result, op.origin, state.allowUnconfirmedOrigin)
+        changed = op.origin <> state.saved.origin
+        if not check.ok
+            decisions = []
+            ' Only a refusal says something new about a confirmed origin.
+            if not changed and check.error <> "unreachable" and check.error <> "cancelled" then decisions = originSettled(state, op.origin, check)
+            failed = api.response.failure(request, check.error)
+            failed.status = result.status
+            decisions.Push(reply(failed))
+            return decisions
+        end if
+        answer = succeeded(request, { origin: op.origin, changed: changed }, result.status)
+        decisions = []
+        if changed
+            decisions = endSession(state, "server_changed")
+            state.saved.origin = op.origin
+            decisions.Append([{ kind: "server", origin: op.origin }, persist()])
+        end if
+        decisions.Append(originSettled(state, op.origin, check))
+        decisions.Push(reply(answer))
+        return decisions
+    end function
+
+    ' The launch or on-demand check of the configured origin answered.
+    function originChecked(state as Object, request as Object, op as Object, result as Object) as Object
+        if state.originCheck.requestId <> request.requestId or op.origin <> state.saved.origin then return []
+        return originSettled(state, op.origin, api.auth.server.checkInfo(result, op.origin, state.allowUnconfirmedOrigin))
+    end function
+
+    ' A login never refreshes or retries: its 401 is a wrong username or
+    ' password (api.auth.problems INVALID_CREDENTIALS), and any other failure is
+    ' answered as it is.
+    function loggedIn(state as Object, request as Object, op as Object, result as Object, now as Integer) as Object
+        if not result.ok or op.origin <> state.saved.origin then return [reply(withoutBody(result))]
+        tokens = parseTokens(result)
+        user = invalid
+        if tokens <> invalid and util.isObject(result.body.user) then user = result.body.user
+        if user = invalid or not nonEmpty(user.id) then return [reply(withoutBody(api.response.failure(request, "parse")))]
+        accountId = user.id
+        decisions = endSession(state, "")
+        if accountId <> state.saved.accountId then state.saved.profileId = ""
+        state.saved.accountId = accountId
+        setTokens(state, tokens, now)
+        account = { id: accountId, username: util.text(user.username), role: util.text(user.role), passwordChangeRequired: util.isTrue(user.password_change_required) }
+        answer = succeeded(request, { account: account }, result.status)
+        decisions.Append([persist(), publish(), reply(answer)])
+        return decisions
+    end function
+
+    function pinChecked(state as Object, request as Object, op as Object, result as Object) as Object
+        outcome = api.auth.profiles.pinOutcome(result)
+        answer = withoutBody(result)
+        answer.body = { outcome: outcome.outcome, retryAfterSeconds: outcome.retryAfterSeconds }
+        if outcome.outcome <> "verified" then return [reply(answer)]
+        ' The token is bound to the login session that verified it.
+        if op.epoch <> state.epoch or state.saved.accessToken = ""
+            answer.ok = false
+            answer.body.outcome = "error"
+            answer.error = api.response.failure(request, "signed_out").error
+            return [reply(answer)]
+        end if
+        tokens = otherProfileTokens(state, op.profile.id)
+        tokens.Push({ id: op.profile.id, token: outcome.token })
+        state.saved.profileTokens = tokens
+        state.proofs[op.profile.id] = proofSerial(state, op.profile.id) + 1
+        ' A profile that took a PIN has one, whatever the screen passed.
+        op.profile.hasPin = true
+        state.profile = op.profile
+        state.verification = invalid
+        state.saved.profileId = op.profile.id
+        answer.body.profile = profileView(op.profile)
+        return [persist(), publish(), reply(answer)]
+    end function
+
+    function refreshed(state as Object, request as Object, op as Object, result as Object, now as Integer) as Object
+        current = state.refreshing
+        if current = invalid or current.requestId <> request.requestId or op.generation <> state.generation then return []
+        state.refreshing = invalid
+        if result.ok <> true and isOriginError(result.error)
+            ' Never sent: the origin is not confirmed. No backoff.
+            decisions = setHold(state, false)
+            decisions.Append(answerMedia(state))
+            return decisions
+        end if
+        tokens = parseTokens(result)
+        if tokens <> invalid
+            setTokens(state, tokens, now)
+            state.generation = state.generation + 1
+            ' Persisted before the held requests start with the new tokens.
+            decisions = [persist()]
+            decisions.Append(setHold(state, false))
+            decisions.Append(answerMedia(state))
+            return decisions
+        end if
+        if result.ok <> true and result.status <> 0 and api.auth.problems.action(result.error.problemType, result.status, "refresh") = api.auth.problems.SIGN_OUT
+            decisions = endSession(state, "expired")
+            decisions.Append([persist(), publish()])
+            return decisions
+        end if
+        ' Unavailable, unanswered, or malformed: keep the tokens.
+        delay = BACKOFF_SECONDS
+        asked = result.error <> invalid and util.isNumber(result.error.retryAfterSeconds) and result.error.retryAfterSeconds > 0
+        if asked then delay = result.error.retryAfterSeconds
+        if delay > MAX_BACKOFF_SECONDS then delay = MAX_BACKOFF_SECONDS
+        state.notBefore = now + delay
+        state.unanswered = not asked and (result.status = 0 or result.status = 502 or result.status = 503 or result.status = 504)
+        decisions = setHold(state, false)
+        decisions.Append(answerMedia(state))
+        return decisions
+    end function
+
+    ' ---- Refresh
+
+    ' An answer below 500 from the configured origin ends a backoff that
+    ' began because a refresh got no answer, or only a gateway's: the server
+    ' is back, so the next 401, including the one being answered, refreshes
+    ' at once (hardware run 8, defect 5: Retry's system/info answered 200,
+    ' then the start's 401s waited out the backoff for 17 s). A backoff the
+    ' server asked for (Retry-After) stays.
+    sub noteAnswer(state as Object, request as Object, result as Object)
+        if not state.unanswered or result.status < 200 or result.status >= 500 then return
+        if util.isString(request.url) and not api.request.isSameOrigin(request.url, state.saved.origin) then return
+        state.notBefore = 0
+        state.unanswered = false
+    end sub
+
+    ' A 401 on an authenticated request sent with credentials.
+    function unauthorized(state as Object, request as Object, result as Object, now as Integer) as Object
+        if state.saved.accessToken = "" then return [finish(api.response.failure(request, "signed_out"))]
+        replays = not owns(state, request.requestId) and not util.isTrue(request.authRetried)
+        if not util.isNumber(request.authGeneration) or request.authGeneration <> state.generation
+            ' The tokens rotated after this request was sent.
+            if not replays then return [finish(result)]
+            request.authRetried = true
+            return [{ kind: "requeue", requestId: request.requestId }]
+        end if
+        decisions = []
+        if state.refreshing <> invalid
+            decisions.Append(holdFor(state, request.lane))
+        else if now < state.notBefore
+            unavailable = api.response.failure(request, "auth_unavailable")
+            unavailable.error.retryAfterSeconds = state.notBefore - now
+            return [finish(unavailable)]
+        else
+            decisions.Append(startRefresh(state, request.lane, true))
+        end if
+        if not replays
+            decisions.Push(finish(result))
+            return decisions
+        end if
+        request.authRetried = true
+        decisions.Push({ kind: "requeue", requestId: request.requestId })
+        return decisions
+    end function
+
+    ' Starts the one refresh. With hold, credentialed requests wait for it.
+    function startRefresh(state as Object, lane as String, hold as Boolean) as Object
+        refreshLane = api.scheduler.LANE_INTERACTIVE
+        if lane = api.scheduler.LANE_PLAYBACK then refreshLane = lane
+        request = build(state, { owner: "" }, { method: "POST", path: REFRESH_PATH, body: { refresh_token: state.saved.refreshToken }, lane: refreshLane, timeoutMs: REFRESH_TIMEOUT_MS }, { kind: "refresh", origin: state.saved.origin, generation: state.generation })
+        state.refreshing = { requestId: request.requestId, lane: refreshLane }
+        decisions = []
+        if hold then decisions.Append(setHold(state, true))
+        decisions.Append(submitConfidential(state, request))
+        return decisions
+    end function
+
+    ' A request on lane waits for the running refresh, which moves to the
+    ' playback slot when a playback request waits for it.
+    function holdFor(state as Object, lane as String) as Object
+        decisions = setHold(state, true)
+        if lane = api.scheduler.LANE_PLAYBACK and state.refreshing.lane <> lane
+            state.refreshing.lane = lane
+            decisions.Push({ kind: "promote", requestId: state.refreshing.requestId })
+        end if
+        return decisions
+    end function
+
+    function setHold(state as Object, held as Boolean) as Object
+        if state.held = held then return []
+        state.held = held
+        return [{ kind: "hold", held: held }]
+    end function
+
+    function expired(state as Object, now as Integer) as Boolean
+        return state.saved.expiresAt > 0 and now >= state.saved.expiresAt - EXPIRY_MARGIN_SECONDS
+    end function
+
+    ' Ends the account session: tokens, profile tokens, and the active profile
+    ' go, and requests holding for a refresh are released to fail as signed
+    ' out. An explicit sign-out or a server change also forgets the account and
+    ' its remembered profile; an expired session keeps them, so signing in to
+    ' the same account reopens its profile. reason "" is a new sign-in.
+    function endSession(state as Object, reason as String) as Object
+        state.saved.accessToken = ""
+        state.saved.refreshToken = ""
+        state.saved.expiresAt = 0
+        state.saved.refreshAt = 0
+        state.saved.profileTokens = []
+        if reason = "signed_out" or reason = "server_changed"
+            state.saved.accountId = ""
+            state.saved.profileId = ""
+        end if
+        state.profile = invalid
+        state.verification = invalid
+        state.proofs = {}
+        state.generation = state.generation + 1
+        state.epoch = state.epoch + 1
+        state.refreshing = invalid
+        state.notBefore = 0
+        state.unanswered = false
+        state.reason = reason
+        decisions = setHold(state, false)
+        ' Media headers waiting for a refresh are answered signed_out.
+        decisions.Append(answerMedia(state))
+        return decisions
+    end function
+
+    ' expires_in counts from now on the wall clock; the proactive refresh comes
+    ' PROACTIVE_SECONDS before expiry, or halfway for a short lifetime.
+    sub setTokens(state as Object, tokens as Object, now as Integer)
+        state.saved.accessToken = tokens.accessToken
+        state.saved.refreshToken = tokens.refreshToken
+        lifetime = tokens.expiresIn
+        early = lifetime - PROACTIVE_SECONDS
+        if early < lifetime \ 2 then early = lifetime \ 2
+        state.saved.expiresAt = now + lifetime
+        state.saved.refreshAt = now + early
+        state.notBefore = 0
+        state.unanswered = false
+    end sub
+
+    ' { accessToken, refreshToken, expiresIn } from a TokenPair or
+    ' RefreshedTokens body, or invalid.
+    function parseTokens(result as Object) as Dynamic
+        body = result.body
+        if result.ok <> true or not util.isObject(body) then return invalid
+        if not nonEmpty(body.access_token) or not nonEmpty(body.refresh_token) or not util.isNumber(body.expires_in) or body.expires_in <= 0 then return invalid
+        return { accessToken: body.access_token, refreshToken: body.refresh_token, expiresIn: Int(body.expires_in) }
+    end function
+
+    ' ---- Profiles
+
+    function profileToken(state as Object, profileId as String) as String
+        for each entry in state.saved.profileTokens
+            if entry.id = profileId then return entry.token
+        end for
+        return ""
+    end function
+
+    ' The server refused a profile's token, or its id without one (403
+    ' profile_verification_required; a changed PIN invalidates the token). The
+    ' refused token alone is forgotten, unless one stored since the request
+    ' was sent (proof) replaced it. For the open profile, verification asks
+    ' for its PIN again: the profile stays the identity and the remembered
+    ' one, but counts as PIN-locked, so its requests answer pin_required
+    ' until the viewer enters the PIN again (spec section 7.3).
+    function refuseProof(state as Object, profileId as String, proof as Dynamic) as Object
+        if util.isNumber(proof) and proof <> proofSerial(state, profileId) then return []
+        decisions = []
+        if profileToken(state, profileId) <> ""
+            state.saved.profileTokens = otherProfileTokens(state, profileId)
+            decisions.Push(persist())
+        end if
+        active = state.profile
+        if active <> invalid and active.id = profileId and state.verification = invalid
+            active.hasPin = true
+            state.verification = profileView(active)
+        else if decisions.Count() = 0
+            return decisions
+        end if
+        decisions.Push(publish())
+        return decisions
+    end function
+
+    ' How many tokens were stored for profileId in this run.
+    function proofSerial(state as Object, profileId as String) as Integer
+        serial = state.proofs[profileId]
+        if serial = invalid then return 0
+        return serial
+    end function
+
+    ' The stored profile tokens of every profile but profileId, oldest first.
+    function otherProfileTokens(state as Object, profileId as String) as Object
+        kept = []
+        for each entry in state.saved.profileTokens
+            if entry.id <> profileId then kept.Push(entry)
+        end for
+        return kept
+    end function
+
+    ' { id, name, hasPin, isChild, avatarUrl } from a screen's profile, or
+    ' invalid.
+    function profileInput(value as Dynamic) as Dynamic
+        if not util.isObject(value) or not nonEmpty(value.id) then return invalid
+        return { id: value.id, name: util.text(value.name), hasPin: util.isTrue(value.hasPin), isChild: util.isTrue(value.isChild), avatarUrl: util.text(value.avatarUrl) }
+    end function
+
+    function profileView(profile as Object) as Object
+        return { id: profile.id, name: profile.name, hasPin: profile.hasPin, isChild: profile.isChild, avatarUrl: profile.avatarUrl }
+    end function
+
+    ' ---- Building requests and envelopes
+
+    ' A normalized request: input's request ID and owner (a new ID when it has
+    ' none), the fields given, and op remembered for settled().
+    function build(state as Object, input as Object, fields as Object, op as Object) as Object
+        id = input.requestId
+        if not nonEmpty(id)
+            state.nextId = state.nextId + 1
+            id = ID_PREFIX + state.nextId.ToStr()
+        end if
+        spec = { requestId: id, owner: util.text(input.owner), auth: "none" }
+        spec.Append(fields)
+        ' The scheduler lets these run past their deadline once started
+        ' (api.scheduler.ROTATING_CAP_MS): the server may have rotated the
+        ' refresh token, and a late answer is still applied.
+        if op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" then spec.rotatesCredentials = true
+        ' These carry a credential without auth, and wait for the origin check.
+        if op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "logout" then spec.confidential = true
+        state.ops[id] = op
+        return api.request.normalize(spec)
+    end function
+
+    function logoutRequest(state as Object, origin as String, accessToken as String) as Object
+        return build(state, { owner: "" }, { method: "POST", path: LOGOUT_PATH, timeoutMs: LOGOUT_TIMEOUT_MS }, { kind: "logout", origin: origin, accessToken: accessToken })
+    end function
+
+    ' A successful envelope; status 0 for an operation answered without HTTP.
+    function succeeded(input as Object, body as Object, status = 0 as Integer) as Object
+        id = ""
+        if util.isString(input.requestId) then id = input.requestId
+        return { requestId: id, ok: true, status: status, headers: {}, body: body, error: invalid }
+    end function
+
+    ' A copy of an envelope without its body, which may hold tokens.
+    function withoutBody(result as Object) as Object
+        out = {}
+        out.Append(result)
+        out.body = invalid
+        return out
+    end function
+
+    ' The Problem type of an error envelope, or "".
+    function problemType(result as Object) as String
+        if result.error = invalid then return ""
+        return util.text(result.error.problemType)
+    end function
+
+    function sameIdentity(fence as Object, current as Object) as Boolean
+        return util.text(fence.server) = current.server and util.text(fence.account) = current.account and util.text(fence.profile) = current.profile
+    end function
+
+    function nonEmpty(value as Dynamic) as Boolean
+        return util.isString(value) and value <> ""
+    end function
+
+    function submit(request as Object) as Object
+        return { kind: "submit", request: request }
+    end function
+
+    function finish(result as Object) as Object
+        return { kind: "finish", result: result }
+    end function
+
+    function reply(result as Object) as Object
+        return { kind: "reply", result: result }
+    end function
+
+    function persist() as Object
+        return { kind: "persist" }
+    end function
+
+    function publish() as Object
+        return { kind: "publish" }
+    end function
+end namespace

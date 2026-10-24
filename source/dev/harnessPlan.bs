@@ -1,0 +1,227 @@
+import "pkg:/source/util/values.bs"
+
+' Development-only transport harness: reading playback plans and protocol identities.
+' Pure functions over plan data, so they run headless. Excluded from release builds.
+namespace harness
+
+    ' The server accepts only lowercase canonical UUIDs for stop and event IDs.
+    function lowerUuid(uuid as String) as String
+        return LCase(uuid.Trim())
+    end function
+
+    function isLowerUuid(text as String) as Boolean
+        return CreateObject("roRegex", "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "").IsMatch(text)
+    end function
+
+    function newUuid() as String
+        return lowerUuid(CreateObject("roDeviceInfo").GetRandomUUID())
+    end function
+
+    ' Server rule for playback_attempt_id, plan_attempt_id, and replan_request_id.
+    function isBoundedIdentifier(text as String) as Boolean
+        return CreateObject("roRegex", "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$", "").IsMatch(text)
+    end function
+
+    ' Roku StreamFormat for a plan's stream, from its protocol and container only
+    ' (never from the URL). Returns "" when the harness cannot map it, so the
+    ' caller refuses to play instead of guessing.
+    function streamFormat(stream as Object) as String
+        if stream = invalid then return ""
+        protocol = LCase(stringOr(stream.protocol, ""))
+        container = LCase(stringOr(stream.container, ""))
+        if protocol = "hls" then return "hls"
+        if protocol = "http_progressive"
+            if container = "mp4" then return "mp4"
+            if container = "mkv" then return "mkv"
+        end if
+        return ""
+    end function
+
+    ' Source position = player position + timeline_offset_seconds (protocol section 5).
+    function sourcePosition(timeline as Object, playerPosition as Float) as Float
+        return playerPosition + numberOr(timeline.timeline_offset_seconds, 0)
+    end function
+
+    ' Decides how to reach `target` (a source position): a local seek to the
+    ' player position, or a seek_reanchor replan when the plan's timeline does
+    ' not cover it (copy remuxes leave seek_window_end_seconds absent).
+    function seekDecision(timeline as Object, target as Float) as Object
+        offset = numberOr(timeline.timeline_offset_seconds, 0)
+        if target < 0 then target = 0.0
+        seekLocally = timeline.can_seek_anywhere = true
+        if not seekLocally and isNumber(timeline.seek_window_start_seconds) and isNumber(timeline.seek_window_end_seconds)
+            seekLocally = target >= timeline.seek_window_start_seconds and target <= timeline.seek_window_end_seconds
+        end if
+        if seekLocally
+            playerTarget = target - offset
+            if playerTarget < 0 then playerTarget = 0.0
+            return { kind: "local", playerPosition: playerTarget }
+        end if
+        return { kind: "reanchor", sourcePosition: target }
+    end function
+
+    ' Where a seek key lands: `delta` seconds from `pending` (a target still
+    ' waiting behind a replan: a queued seek or the in-flight seek_reanchor's
+    ' position) when there is one, else from `current`, the source position.
+    ' Never before 0, and never within 5 s of a known duration.
+    function seekTarget(current as Float, pending as Dynamic, delta as Float, duration as Float) as Float
+        base = current
+        if isNumber(pending) then base = pending
+        target = base + delta
+        if duration > 0 and target > duration - 5 then target = duration - 5
+        if target < 0 then target = 0.0
+        return target
+    end function
+
+    ' The Audio track menu: one choice per entry of a watch version's
+    ' audio_tracks. The server's audio ordinal is the entry's position, the
+    ' index it publishes as effective_audio_track_index.
+    function audioChoices(tracks as Dynamic) as Object
+        choices = []
+        for each track in arrayOr(tracks)
+            label = stringOr(track.language, "und") + " " + stringOr(track.codec, "?")
+            if isNumber(track.channels) then label = label + " " + track.channels.ToStr() + "ch"
+            if util.isTrue(track.default) then label = label + " default"
+            choices.Push({ index: choices.Count(), label: label + titleSuffix(track.title) })
+        end for
+        return choices
+    end function
+
+    ' The Subtitle track menu, in the server's combined subtitle_track_index
+    ' space: external tracks first (0..n-1, in the order the watch version
+    ' lists them), then embedded tracks after every external. The version's own
+    ' `index` values are container stream indexes, a different space, and are
+    ' never sent.
+    function subtitleChoices(tracks as Dynamic) as Object
+        externals = []
+        embedded = []
+        for each track in arrayOr(tracks)
+            label = stringOr(track.language, "und") + " " + stringOr(track.codec, "?")
+            if util.isTrue(track.external) then label = label + " external"
+            if util.isTrue(track.forced) then label = label + " forced"
+            if util.isTrue(track.hearing_impaired) then label = label + " SDH"
+            choice = { label: label + titleSuffix(track.title) }
+            if util.isTrue(track.external)
+                externals.Push(choice)
+            else
+                embedded.Push(choice)
+            end if
+        end for
+        choices = externals
+        choices.Append(embedded)
+        for i = 0 to choices.Count() - 1
+            choices[i].index = i
+        end for
+        return choices
+    end function
+
+    function titleSuffix(title as Dynamic) as String
+        if not nonEmpty(title) then return ""
+        return " '" + Left(title, 24) + "'"
+    end function
+
+    ' failure.classification for a Video errorCode, in the vocabulary the
+    ' Android client sends.
+    function failureClassification(errorCode as Integer) as String
+        if errorCode = -1 then return "http_failure"
+        if errorCode = -2 then return "transport_failure"
+        if errorCode = -4 then return "source_unavailable"
+        if errorCode = -5 then return "decoder_failure"
+        return "player_error"
+    end function
+
+    ' The selected sidecar the plan asks the client to render, or invalid. Only
+    ' render/convert decisions with an artifact qualify; an HLS rendition or a
+    ' native embedded selection travels inside the stream instead.
+    function subtitleArtifact(plan as Object) as Object
+        subtitle = plan.subtitle
+        if subtitle = invalid or subtitle.artifact = invalid then return invalid
+        mode = stringOr(subtitle.mode, "off")
+        if mode <> "render" and mode <> "convert" then return invalid
+        artifact = subtitle.artifact
+        if not nonEmpty(artifact.url) then return invalid
+        language = "und"
+        for each entry in arrayOr(subtitle.inventory)
+            if entry.track_id = subtitle.track_id and nonEmpty(entry.language) then language = entry.language
+        end for
+        return { url: artifact.url, format: LCase(stringOr(artifact.format, "")), language: language }
+    end function
+
+    ' A VTT receiver may ask the server to shift cues onto its player clock
+    ' with timestamp_offset = -timeline_offset_seconds (protocol section 4.2).
+    ' Other formats are returned unchanged; the server cannot shift them.
+    function subtitleUrlForPlayer(url as String, format as String, offset as Float) as String
+        if format <> "vtt" or offset = 0 then return url
+        separator = "?"
+        if Instr(1, url, "?") > 0 then separator = "&"
+        return url + separator + "timestamp_offset=" + formatDecimal(-offset)
+    end function
+
+    ' Non-secret plan facts for the stats overlay: never URLs, tokens, or headers.
+    function planFacts(decision as Object, configuredOrigin as String) as Object
+        plan = decision.playback_plan
+        if plan = invalid
+            terminal = decision.terminal
+            if terminal = invalid then terminal = {}
+            return { outcome: stringOr(decision.outcome, ""), terminalReason: stringOr(terminal.reason, ""), terminalMessage: stringOr(terminal.message, "") }
+        end if
+        stream = plan.stream
+        timeline = plan.timeline
+        return {
+            outcome: stringOr(decision.outcome, ""),
+            delivery: stringOr(plan.delivery, ""),
+            decisionReason: stringOr(plan.decision_reason, ""),
+            protocol: stringOr(stream.protocol, ""),
+            container: stringOr(stream.container, ""),
+            streamFormat: streamFormat(stream),
+            mediaOrigin: mediaOriginKind(resolveUrl(configuredOrigin, stringOr(stream.url, "")), configuredOrigin),
+            timelineOffset: numberOr(timeline.timeline_offset_seconds, 0),
+            playerStart: numberOr(timeline.player_start_seconds, 0),
+            canSeekAnywhere: timeline.can_seek_anywhere = true,
+            durationSeconds: numberOr(plan.source.duration_seconds, 0),
+            videoCodec: stringOr(plan.effective_recipe.video_codec, ""),
+            audioCodec: stringOr(plan.effective_recipe.audio_codec, "")
+        }
+    end function
+
+    ' Seconds as a short decimal string ("12.5", "-3", "0.125"), at millisecond precision.
+    function formatDecimal(value as Double) as String
+        sign = ""
+        if value < 0
+            sign = "-"
+            value = -value
+        end if
+        millis = Int(value * 1000# + 0.5#)
+        whole = millis \ 1000
+        fraction = millis - whole * 1000
+        text = sign + whole.ToStr()
+        if fraction = 0 then return text
+        digits = Right("00" + fraction.ToStr(), 3)
+        while Right(digits, 1) = "0"
+            digits = Left(digits, Len(digits) - 1)
+        end while
+        return text + "." + digits
+    end function
+
+    function stringOr(value as Dynamic, fallback as String) as String
+        if type(value) = "String" or type(value) = "roString" then return value
+        return fallback
+    end function
+
+    ' Intrinsic or boxed. Numbers read back from a node's assocarray field,
+    ' such as the Task's request, arrive boxed (roInt, roFloat).
+    function isNumber(value as Dynamic) as Boolean
+        return util.isNumber(value)
+    end function
+
+    function numberOr(value as Dynamic, fallback as Float) as Float
+        if isNumber(value) then return value
+        return fallback
+    end function
+
+    function arrayOr(value as Dynamic) as Object
+        if type(value) = "roArray" then return value
+        return []
+    end function
+
+end namespace

@@ -1,0 +1,143 @@
+namespace tests
+
+    @suite("playback player")
+    class PlaybackPlayerTests extends rooibos.BaseTestSuite
+
+        function plan() as Object
+            return tests.sessions.fixture("playback_start_opaque_ids").playback_plan
+        end function
+
+        @describe("answerEvent")
+
+        @it("turns ApiTask's answers into reducer results for the command")
+        sub _()
+            start = { type: "start", playback_attempt_id: "a-1" }
+            event = playback.player.answerEvent(start, { kind: "ok", status: 201, decision: { outcome: "playable" }, bodyText: "{}", context: { installationId: "i" } })
+            m.assertEqual(event, { type: "startResult", playback_attempt_id: "a-1", kind: "ok", status: 201, decision: { outcome: "playable" }, bodyText: "{}", context: { installationId: "i" }, reason: invalid })
+            m.assertEqual(playback.player.answerEvent(start, { kind: "rejected", status: 0, reason: "playback_closed" }).reason, "playback_closed")
+            replan = playback.player.answerEvent({ type: "replan", replan_request_id: "r-1" }, { kind: "conflict", status: 409, bodyText: "{}" })
+            m.assertEqual([replan.type, replan.replan_request_id, replan.kind, replan.status, replan.bodyText], ["replanResult", "r-1", "conflict", 409, "{}"])
+            progress = playback.player.answerEvent({ type: "progress", session_id: "s-1", sequence: 4 }, { kind: "ok" })
+            m.assertEqual(progress, { type: "progressResult", session_id: "s-1", sequence: 4, kind: "ok", status: 0 })
+        end sub
+
+        @it("counts a missing answer as offline, so the reducer replays it")
+        sub _()
+            m.assertEqual(playback.player.answerEvent({ type: "progress", session_id: "s-1", sequence: 1 }, invalid).kind, "offline")
+            m.assertEqual(playback.player.answerEvent({ type: "start", playback_attempt_id: "a" }, {}).kind, "offline")
+            m.assertInvalid(playback.player.answerEvent({ type: "routeEvent" }, { kind: "ok" }))
+        end sub
+
+        @describe("statusOf")
+
+        @it("shows the most important busy state in the capsule, tvOS's Loading… for a start or a stall")
+        sub _()
+            m.assertEqual(playback.player.statusOf({ stopping: true, reconnecting: true }).busy, "Stopping…")
+            m.assertEqual(playback.player.statusOf({ progressPending: true, buffering: true }).busy, "Playback progress is pending…")
+            m.assertEqual(playback.player.statusOf({ starting: true }).busy, "Loading…")
+            m.assertEqual(playback.player.statusOf({ buffering: true, subtitlesLoading: true }).busy, "Loading…")
+            m.assertEqual(playback.player.statusOf({ subtitlesLoading: true, notice: "x" }), { busy: "Loading subtitles…", notice: invalid })
+            m.assertEqual(playback.player.statusOf({}), { busy: "", notice: invalid })
+        end sub
+
+        @it("shows Reconnecting and notices as cards, a notice only when nothing outranks it")
+        sub _()
+            reconnecting = playback.player.statusOf({ reconnecting: true, progressPending: true, notice: "x" })
+            m.assertEqual(reconnecting.busy, "Playback progress is pending…")
+            m.assertEqual(reconnecting.notice, { title: "Reconnecting…", message: "The connection to the server was lost. Playback will continue where you left off.", tone: "info" })
+            m.assertEqual(playback.player.statusOf({ notice: "Can't switch to that track." }).notice, { title: "Can't switch to that track.", message: "", tone: "warning" })
+        end sub
+
+        @describe("noticeShows")
+
+        @it("counts a notice's time only while nothing outranks it, so one that comes while buffering shows whole after (run 23)")
+        sub _()
+            clock = playback.player.newNoticeClock(4000)
+            buffering = { buffering: true, notice: "Subtitles are too large to show." }
+            playing = { notice: "Subtitles are too large to show." }
+            m.assertTrue(playback.player.noticeShows(clock, buffering, 1000))
+            m.assertTrue(playback.player.noticeShows(clock, buffering, 9000), "behind Buffering for 8 s")
+            m.assertEqual(clock.leftMs, 4000)
+            m.assertTrue(playback.player.noticeShows(clock, playing, 9500), "buffering ended")
+            m.assertTrue(playback.player.noticeShows(clock, playing, 13400))
+            m.assertFalse(playback.player.noticeShows(clock, playing, 13500), "4 s on screen")
+        end sub
+
+        @it("keeps what is left of a notice that something outranks after it showed")
+        sub _()
+            clock = playback.player.newNoticeClock(4000)
+            playing = { notice: "Can't switch to that track." }
+            m.assertTrue(playback.player.noticeShows(clock, playing, 0))
+            m.assertTrue(playback.player.noticeShows(clock, { buffering: true, notice: playing.notice }, 1000), "1 s shown, then Buffering")
+            m.assertTrue(playback.player.noticeShows(clock, { subtitlesLoading: true, notice: playing.notice }, 6000), "then Loading subtitles…")
+            m.assertTrue(playback.player.noticeShows(clock, playing, 7000))
+            m.assertTrue(playback.player.noticeShows(clock, playing, 9900))
+            m.assertFalse(playback.player.noticeShows(clock, playing, 10000), "3 s more")
+            m.assertFalse(playback.player.noticeShows(playback.player.newNoticeClock(0), playing, 0), "no notice")
+        end sub
+
+        @describe("errorCopy")
+
+        @it("shows a server's terminal message as written, else copy for the reason")
+        sub _()
+            m.assertEqual(playback.player.errorCopy({ reason: "adaptation_exhausted", message: "No route left." }).message, "No route left.")
+            m.assertEqual(playback.player.errorCopy({ reason: "connection_lost" }).title, "Can't reach the server")
+            m.assertEqual(playback.player.errorCopy({ reason: "replan_failed", serverUnreachable: true }).title, "Can't reach the server")
+            m.assertEqual(playback.player.errorCopy({ reason: "video_stuck" }).title, "Playback stopped")
+            m.assertEqual(playback.player.errorCopy({ reason: "media_unauthorized" }).message, "The server refused access to the video. Try again.")
+            m.assertEqual(playback.player.errorCopy({ reason: "playback_closed" }).title, "Playback is not available")
+            m.assertEqual(playback.player.errorCopy({ reason: "pin_required" }).title, "Sign in again")
+            m.assertEqual(playback.player.errorCopy({ reason: "anything" }).title, "Playback failed")
+        end sub
+
+        @describe("plan facts")
+
+        @it("gives what device runs check, and no URL or identity")
+        sub _()
+            facts = playback.player.planFacts(m.plan(), false)
+            m.assertEqual(facts.delivery, "original_http")
+            m.assertEqual(facts.decision_reason, "validated_original_playback")
+            m.assertEqual([facts.protocol, facts.container, facts.origin], ["http_progressive", "mp4", "api"])
+            m.assertEqual([facts.video_codec, facts.audio_codec, facts.dynamic_range], ["h264", "aac", "sdr"])
+            m.assertFalse(facts.dolby_vision)
+            m.assertEqual(facts.player_start_seconds, tests.dbl(12.5), "where the load should start, for device runs (run 8, defect 6)")
+            m.assertEqual(playback.player.planFacts(m.plan(), true).origin, "proxy")
+            m.assertEqual(playback.player.planFacts(invalid, false), {})
+            text = FormatJson(facts) + FormatJson(playback.player.statsColumns(m.plan(), false, { videoFormat: "hevc_b", audioFormat: "eac3", videoMode: "2160p60b10", captionMode: "Off" }))
+            for each secret in ["/api/v2", "plan:", "v3:", "11111111-"]
+                m.assertEqual(Instr(1, text, secret), 0, secret)
+            end for
+            m.assertNotEqual(Instr(1, text, "hevc_b"), 0)
+        end sub
+
+        @it("names the video codec alone for a title without audio (run 11)")
+        sub _()
+            plan = m.plan()
+            plan.effective_recipe.audio_channels = 6
+            m.assertEqual(playback.player.recipeText(playback.player.planFacts(plan, false)), "h264/aac 6 ch")
+            plan.effective_recipe.Delete("audio_codec")
+            plan.effective_recipe.Delete("audio_channels")
+            m.assertEqual(playback.player.recipeText(playback.player.planFacts(plan, false)), "h264, no audio")
+            m.assertEqual(playback.player.statsColumns(plan, false, {})[0].rows[4], ["Recipe", "h264, no audio"])
+        end sub
+
+        @it("gives the last stop's time only once there is one (run 6)")
+        sub _()
+            rows = playback.player.statsColumns(m.plan(), false, { slowStops: 0, lastStopMs: invalid })[1].rows
+            m.assertEqual(rows[rows.Count() - 1], ["Slow stops", "0"])
+            rows = playback.player.statsColumns(m.plan(), false, { slowStops: 1, lastStopMs: 3411 })[1].rows
+            m.assertEqual(rows[rows.Count() - 1], ["Last stop", "3411 ms"])
+        end sub
+
+        @it("splits Stats into the plan's source and the player's state, and says when there is no plan")
+        sub _()
+            columns = playback.player.statsColumns(m.plan(), true, { videoFormat: "hevc_b" })
+            m.assertEqual([columns[0].title, columns[1].title], ["Source", "Playback"])
+            m.assertEqual(columns[0].rows[3], ["Origin", "proxy"])
+            m.assertEqual(columns[1].rows[2], ["Video format", "hevc_b"])
+            m.assertEqual(playback.player.statsColumns(invalid, false, {}), [{ title: "Source", rows: [["Plan", "None yet"]] }])
+        end sub
+
+    end class
+
+end namespace

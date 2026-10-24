@@ -1,0 +1,109 @@
+namespace tests
+
+    ' The detail page's Version, Audio, and Subtitles offer, built by the map
+    ' step from the server's watch projection (tests.catalogData.selectionWatch).
+    @suite("catalog selection")
+    class CatalogSelectionTests extends rooibos.BaseTestSuite
+
+        function copy() as Object
+            return i18n.load("en_US")
+        end function
+
+        function selection(extra = invalid as Dynamic) as Object
+            return catalog.selection.fromWatch(tests.catalogData.selectionWatch(extra), m.copy())
+        end function
+
+        function titles(options as Object) as Object
+            out = []
+            for each choice in options
+                out.Push(choice.title)
+            end for
+            return out
+        end function
+
+        @describe("versions (spec section 5.6, tvOS's Version menu)")
+
+        @it("offers Auto and every version, Auto playing the version the player's start chooses")
+        sub _()
+            selection = m.selection()
+            m.assertEqual(m.titles(selection.versionOptions), ["Auto", "2160p · HEVC · DV · TrueHD", "1080p · H.264 · AC3"])
+            m.assertEqual([selection.versionOptions[0].value, selection.versionOptions[0].detail], [catalog.pickers.AUTO, "Best match for this device"])
+            m.assertEqual([selection.versionOptions[1].value, selection.versionOptions[2].value], [0, 1])
+            m.assertEqual(selection.defaultFile, "101", "the server's default variant")
+            m.assertEqual(m.selection({ user_data: { last_file_id: "102", played: false, watched_count: 0, unplayed_count: 0, in_progress_count: 0 } }).defaultFile, "102", "the version last played")
+            m.assertEqual([selection.versions[0].fileId, selection.versions[0].compact, selection.versions[1].compact], ["101", "2160p · DV", "1080p"])
+        end sub
+
+        @it("keys track preferences by the series, else by the item, as tvOS and the web do")
+        sub _()
+            m.assertEqual(m.selection().key, "movie:heat-1995")
+            m.assertEqual(m.selection({ type: "episode", content_id: "episode:a-1", series_id: "series:a" }).key, "series:a")
+        end sub
+
+        @it("has no selection without a version")
+        sub _()
+            m.assertInvalid(catalog.selection.fromWatch({ content_id: "movie:a", versions: [] }, m.copy()))
+            m.assertInvalid(catalog.selection.fromWatch(invalid, m.copy()))
+        end sub
+
+        @describe("audio")
+
+        @it("sums each track up, and names the server's effective track for Auto, else the default")
+        sub _()
+            selection = m.selection()
+            version = selection.versions[0]
+            summaries = []
+            for each track in version.audio
+                summaries.Push(track.summary)
+            end for
+            m.assertEqual(summaries, ["English · TrueHD · 7.1", "English · EAC3 · 5.1", "Japanese · AAC · Stereo", "English · AC3 · Stereo"])
+            m.assertEqual(m.titles(version.audioOptions), ["Auto", "English", "English", "Japanese", "English"])
+            m.assertEqual(version.audioOptions[2].detail, "EAC3 · 5.1 · Preferred")
+            m.assertEqual(version.autoAudio, 1)
+            m.assertEqual(selection.versions[1].autoAudio, 0)
+            m.assertEqual(version.audioByLanguage, { en: 0, ja: 2 }, "each language's best main mix")
+        end sub
+
+        @describe("subtitles")
+
+        @it("lists the profile's language first, and predicts Auto beside each audio track")
+        sub _()
+            version = m.selection().versions[0]
+            m.assertEqual(m.titles(version.subtitleOptions), ["Auto", "Off", "English", "English", "Japanese", "Spanish"])
+            ' Combined order: Spanish (external), English, English forced, Japanese.
+            m.assertEqual([version.subtitles[0].summary, version.subtitles[2].summary], ["Spanish · SRT", "English (Forced) · PGS"])
+            ' English audio under mode auto shows only English forced; Japanese audio, English.
+            m.assertEqual(version.autoSubtitles, [2, 2, 1, 2])
+            m.assertEqual(m.selection().versions[1].autoSubtitles, [playback.tracks.OFF])
+            off = m.selection({ effective_subtitle_mode: "off", effective_show_forced_subtitles: false })
+            m.assertEqual(off.versions[0].autoSubtitles, [playback.tracks.OFF, playback.tracks.OFF, playback.tracks.OFF, playback.tracks.OFF])
+        end sub
+
+        @it("starts on the track the profile chose on the item, or Off, as tvOS seeds it")
+        sub _()
+            signature = { source: "embedded", language: "ja", codec: "ass", label: "Signs", forced: false, hearing_impaired: false }
+            chosen = m.selection({ effective_subtitle_track_signature: signature })
+            m.assertEqual([chosen.versions[0].subtitleSeed, chosen.versions[1].subtitleSeed], [3, catalog.pickers.AUTO], "only a language or label match counts")
+            m.assertEqual(m.selection().versions[0].subtitleSeed, catalog.pickers.AUTO)
+            m.assertEqual(m.selection({ effective_subtitle_mode: "off", effective_show_forced_subtitles: false }).versions[0].subtitleSeed, playback.tracks.OFF)
+            m.assertEqual(m.selection({ effective_subtitle_mode: "off" }).versions[0].subtitleSeed, catalog.pickers.AUTO, "off with forced subtitles shown still starts the forced track")
+        end sub
+
+        @describe("track preferences (tvOS TrackSelectionPersistence)")
+
+        @it("writes an audio track's ordinal, language, and signature")
+        sub _()
+            pref = m.selection().versions[0].audio[1].pref
+            m.assertEqual(pref, { audio_track_index: 1, audio_language: "en", track_signature: { language: "en", title: "", embedded_title: "", codec: "eac3", layout: "5.1(side)", channels: 6, default: false } })
+        end sub
+
+        @it("writes a subtitle's own stream index, an external track's file, and a signature")
+        sub _()
+            selection = m.selection()
+            external = selection.versions[0].subtitles[0].pref
+            m.assertEqual(external, { subtitle_language: "es", subtitle_track_index: 9, subtitle_mode: "always", external_subtitle_path: "Movie.es.srt", track_signature: { source: "external", language: "es", codec: "subrip", label: "", forced: false, hearing_impaired: false } })
+            m.assertEqual(selection.versions[0].subtitles[3].pref.track_signature.label, "Signs")
+            m.assertEqual(selection.versions[1].subtitles[0].pref.subtitle_track_index, 0, "stream 0, which the server omits")
+        end sub
+    end class
+end namespace

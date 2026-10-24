@@ -1,0 +1,474 @@
+import "pkg:/source/playback/tracks.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' The Version, Audio, and Subtitles menus on a detail page, and the values
+' the readout above its action row shows (spec section 5.6), pure, worded
+' as tvOS words them (silo-apple b90a86ea, DetailPlaybackFormatting and the
+' TrackLabels and SubtitleDisplayOrder its player shares). Version offers
+' Auto and each version; Audio offers Auto and each track in the version's
+' order; Subtitles offers Auto, Off, and each track in tvOS's order
+' (subtitleOrder). An option is { value, title, detail }: a version's value
+' is its place in the selection's versions (catalog.selection), a track's is
+' a server ordinal (playback.tracks), and AUTO and playback.tracks.OFF are
+' Auto and Off. A track's title is its language, else its own title cleaned
+' of what the row shows, else "Track N"; its detail names the rest. copy is
+' the strings table (i18n.load).
+namespace catalog.pickers
+    ' Auto, which the player resolves (playback.tracks.AUTO): the version
+    ' the start path chooses (playback.intent.chooseVersion); audio left to
+    ' the start path (the version's effective_audio_track_index, else the
+    ' profile's language and the device's codecs,
+    ' playback.options.initialAudio); subtitles following the profile's
+    ' preferences for the audio the first plan plays
+    ' (playback.options.afterStart). A value goes to the player as it is
+    ' (nav.player.withSelection).
+    const AUTO = playback.tracks.AUTO
+
+    ' --- Versions -----------------------------------------------------------------
+
+    ' A version's row: "2160p · HEVC · DV · EAC3" over "Director's Cut · HEVC
+    ' · MKV · 58.31 GB".
+    function versionOption(value as Integer, version as Object, copy as Object) as Object
+        return option(value, versionTitle(version, copy), versionDetail(version, copy))
+    end function
+
+    ' Resolution, video codec, dynamic range, and audio codec, or Auto when
+    ' the version names none.
+    function versionTitle(version as Object, copy as Object) as String
+        return orAuto(joined([util.text(version.resolution), videoCodecName(util.text(version.codec_video)), dynamicRange(version), audioCodecName(util.text(version.codec_audio))]), copy)
+    end function
+
+    ' The readout's version: resolution and dynamic range ("2160p · DV").
+    function versionCompact(version as Object, copy as Object) as String
+        return orAuto(joined([util.text(version.resolution), dynamicRange(version)]), copy)
+    end function
+
+    ' The edition, which tvOS leaves out (spec section 5.9), then the video
+    ' codec, the container, and the file's size.
+    function versionDetail(version as Object, copy as Object) as String
+        size = ""
+        if util.isNumber(version.file_size) and version.file_size > 0 then size = sizeText(version.file_size, copy)
+        return joined([util.text(version.edition_raw).Trim(), videoCodecName(util.text(version.codec_video)), UCase(util.text(version.container).Trim()), size])
+    end function
+
+    ' DV when a video track carries Dolby Vision, else HDR when the version
+    ' is HDR, else "".
+    function dynamicRange(version as Object) as String
+        if type(version.video_tracks) = "roArray"
+            for each track in version.video_tracks
+                if util.isObject(track) and util.text(track.dolby_vision).Trim() <> "" then return "DV"
+            end for
+        end if
+        if util.isTrue(version.hdr) then return "HDR"
+        return ""
+    end function
+
+    function videoCodecName(codec as String) as String
+        lowered = LCase(codec.Trim())
+        if lowered = "" then return ""
+        if Instr(1, lowered, "hevc") > 0 or Instr(1, lowered, "h265") > 0 then return "HEVC"
+        if Instr(1, lowered, "av1") > 0 then return "AV1"
+        if Instr(1, lowered, "avc") > 0 or Instr(1, lowered, "h264") > 0 then return "H.264"
+        return UCase(lowered)
+    end function
+
+    ' Bytes as a file manager counts them (1000 per step): "845.2 MB",
+    ' "58.31 GB".
+    function sizeText(bytes as Dynamic, copy as Object) as String
+        if bytes >= 1000000000
+            return i18n.format(i18n.lookup(copy, "detail.sizeGb"), { size: decimal(bytes / 1000000000#, 2) })
+        end if
+        return i18n.format(i18n.lookup(copy, "detail.sizeMb"), { size: decimal(bytes / 1000000#, 1) })
+    end function
+
+    ' value rounded to places decimals, without trailing zeros.
+    function decimal(value as Double, places as Integer) as String
+        scale = 1
+        for i = 1 to places
+            scale = scale * 10
+        end for
+        scaled = Int(value * scale + 0.5)
+        whole = Int(scaled / scale)
+        fraction = scaled - whole * scale
+        out = whole.ToStr()
+        if fraction = 0 then return out
+        digits = Right(string(places, "0") + fraction.ToStr(), places)
+        while Right(digits, 1) = "0"
+            digits = Left(digits, Len(digits) - 1)
+        end while
+        return out + "." + digits
+    end function
+
+    ' --- Audio --------------------------------------------------------------------
+
+    ' preferred is the version's effective_audio_track_index (the track the
+    ' server's preferences choose), or -1. A row's detail is its title when
+    ' that says something the row does not already (audioTitle), its codec,
+    ' its layout, Default, and Preferred.
+    function audioOptions(tracks as Object, preferred as Integer, copy as Object) as Object
+        out = [option(AUTO, i18n.lookup(copy, "detail.auto"), i18n.lookup(copy, "detail.autoAudio"))]
+        for each track in tracks
+            name = audioName(track, copy)
+            layoutName = channelLayout(track, copy)
+            parts = []
+            title = qualifier(audioTitle(track, copy), name)
+            ' A title of "Atmos" says nothing a layout of "Atmos" does not.
+            if LCase(title) <> LCase(layoutName) then parts.Push(title)
+            parts.Push(audioCodecName(track.codec))
+            parts.Push(layoutName)
+            if track.isDefault then parts.Push(i18n.lookup(copy, "detail.trackDefault"))
+            if track.index = preferred then parts.Push(i18n.lookup(copy, "detail.trackPreferred"))
+            out.Push(option(track.index, name, joined(parts)))
+        end for
+        return out
+    end function
+
+    ' The readout's audio: language, codec, and layout ("English · EAC3 ·
+    ' 5.1"), else the track's name.
+    function audioSummary(track as Object, copy as Object) as String
+        summary = joined([languageName(track.language, copy), audioCodecName(track.codec), channelLayout(track, copy)])
+        if summary = "" then return audioName(track, copy)
+        return summary
+    end function
+
+    ' A row's name: its language, else its title (audioTitle), else "Track N".
+    function audioName(track as Object, copy as Object) as String
+        return nameOf(languageName(track.language, copy), audioTitle(track, copy), track.index, copy)
+    end function
+
+    ' The track's title (else its embedded title) without what the row
+    ' already shows, as tvOS's TrackLabels.audioTitle reads it: "" for a
+    ' release name; codec names and their qualifiers, ffprobe's codec
+    ' descriptions, channel layouts, and rates go, JOC reads Atmos, the
+    ' language (or its code written in capitals) goes, then empty brackets
+    ' and edge punctuation; a title left in brackets loses them; "" when one
+    ' letter or "Track N" is all that is left. "Director Commentary AAC"
+    ' reads "Director Commentary"; "AAC (Advanced Audio Coding)", "DTS-HD MA
+    ' 5.1", "English 5.1", or "ENG (eac3)" on an English track, "".
+    function audioTitle(track as Object, copy as Object) as String
+        title = util.text(track.title)
+        if title = "" then title = util.text(track.embeddedTitle)
+        if title = "" or isReleaseName(title) then return ""
+        rest = CreateObject("roRegex", audioTermPattern(), "i").ReplaceAll(title, " ")
+        joc = " "
+        if Instr(1, LCase(rest), "atmos") = 0 then joc = "Atmos"
+        rest = CreateObject("roRegex", "\bjoc\b", "i").ReplaceAll(rest, joc)
+        language = languageName(track.language, copy)
+        if language <> "" then rest = withoutLanguage(rest, language, copy)
+        rest = CreateObject("roRegex", "\([^A-Za-z0-9]*\)|\[[^A-Za-z0-9]*\]", "").ReplaceAll(rest, " ")
+        rest = trimmed(CreateObject("roRegex", "\s+", "").ReplaceAll(rest, " "), "-–—_:/|,.+·•@ ")
+        bracketed = CreateObject("roRegex", "^[(\[]([^()\[\]]+)[)\]]$", "").Match(rest)
+        if bracketed.Count() > 1 then rest = bracketed[1].Trim()
+        if letters(rest) <= 1 or CreateObject("roRegex", "^(?:audio\s+)?track\s*\d+$", "i").IsMatch(rest) then return ""
+        return displayTitle(rest)
+    end function
+
+    ' tvOS's audioTechnicalTerm: channel layouts ("5.1", "7.1.4", "6ch"),
+    ' bit and sample rates and depths, and codec names, their qualifiers,
+    ' and ffprobe's descriptions of them, as whole words.
+    function audioTermPattern() as String
+        return "(?<![0-9])(?<![0-9]\.)(?:\d\.\d(?:\.\d)?(?:\s?ch)?|\d+\s?ch(?:annels?)?)(?![0-9a-z])" + "|(?<![0-9a-z.])\d+(?:[.,]\d+)?[\s-]?(?:[km]?(?:bps|b/s|bit/s)|k?hz|bits?)(?![a-z])" + "|\b(?:atsc|a/52[ab]?|he-?aac(?:[\s-]?v2)?|aac[\s-]?lc|aac\s+latm|e?-?ac-?3|ec-?3|true[\s-]?hd|aac|flac|alac" + "|opus|vorbis|mp[23]|pcm\s+(?:un)?signed\s+[\d|]+-bit\s+(?:little|big)-endian(?:\s+for\s+blu-ray\s+media)?" + "|l?pcm(?:_[a-z0-9]+)?|dd\+?|ddp|stereo|mono|surround|dolby|digital(?:\s*plus)?|dca|mlp" + "|advanced\s+audio\s+coding(?:\s+latm\s+syntax)?|coherent\s+acoustics|(?:free|apple)\s+lossless\s+audio\s+codec" + "|interactive\s+audio\s+codec|mpeg\s+audio\s+layer\s+\d|meridian\s+lossless\s+packing" + "|dts(?:-?hd)?(?:[\s:._-]*(?:ma|master\s+audio|hra?|high\s+resolution(?:\s+audio)?|es|x))?)(?![a-z])"
+    end function
+
+    ' text without the words that name language, or that are its code
+    ' written in capitals ("ENG"), so "por" or "It" in a title stays.
+    function withoutLanguage(text as String, language as String, copy as Object) as String
+        out = ""
+        word = ""
+        for i = 1 to Len(text)
+            character = Mid(text, i, 1)
+            if isAsciiLetter(character)
+                word = word + character
+            else
+                out = out + unlessLanguage(word, language, copy) + character
+                word = ""
+            end if
+        end for
+        return out + unlessLanguage(word, language, copy)
+    end function
+
+    ' word, or a space when it names language or is its code in capitals.
+    function unlessLanguage(word as String, language as String, copy as Object) as String
+        if word = "" then return ""
+        if LCase(word) = LCase(language) then return " "
+        if Len(word) >= 2 and Len(word) <= 3 and word = UCase(word) and languageName(word, copy) = language then return " "
+        return word
+    end function
+
+    ' --- Subtitles ----------------------------------------------------------------
+
+    ' preferred is the profile's subtitle language (playback.tracks.languageKey).
+    ' A row's detail is its title when that says something the row does not
+    ' (subtitleTitle), its format, Forced, SDH, Default, and External.
+    function subtitleOptions(tracks as Object, preferred as String, copy as Object) as Object
+        out = [option(AUTO, i18n.lookup(copy, "detail.auto"), i18n.lookup(copy, "detail.autoSubtitles")), option(playback.tracks.OFF, i18n.lookup(copy, "detail.off"), i18n.lookup(copy, "detail.offDetail"))]
+        for each track in subtitleOrder(tracks, preferred, copy)
+            name = subtitleName(track, copy)
+            parts = [qualifier(subtitleTitle(track, copy), name), subtitleCodecName(track.codec)]
+            if isForced(track) then parts.Push(i18n.lookup(copy, "detail.trackForced"))
+            if isHearingImpaired(track) then parts.Push(i18n.lookup(copy, "detail.trackSdh"))
+            if track.isDefault then parts.Push(i18n.lookup(copy, "detail.trackDefault"))
+            if track.external then parts.Push(i18n.lookup(copy, "detail.trackExternal"))
+            out.Push(option(track.index, name, joined(parts)))
+        end for
+        return out
+    end function
+
+    ' The readout's subtitle: its name, marked SDH or Forced unless the name
+    ' says so, then its format ("English (SDH) · SRT").
+    function subtitleSummary(track as Object, copy as Object) as String
+        name = subtitleName(track, copy)
+        words = wordList(name)
+        marked = Instr(1, words, "|sdh|") > 0 or Instr(1, words, "|cc|") > 0 or Instr(1, words, "|hi|") > 0 or Instr(1, LCase(name), "hearing impaired") > 0
+        if isHearingImpaired(track) and not marked then name = name + " (" + i18n.lookup(copy, "detail.trackSdh") + ")"
+        if isForced(track) and Instr(1, LCase(name), "forced") = 0 then name = name + " (" + i18n.lookup(copy, "detail.trackForced") + ")"
+        return joined([name, subtitleCodecName(track.codec)])
+    end function
+
+    ' A row's name: its language, else its title (subtitleTitle), else
+    ' "Track N".
+    function subtitleName(track as Object, copy as Object) as String
+        return nameOf(languageName(track.language, copy), subtitleTitle(track, copy), track.index, copy)
+    end function
+
+    ' The track's title (else its embedded title) when it says something
+    ' the row does not, as tvOS's TrackLabels.subtitleTitle reads it: not a
+    ' release name, a format name, a flag the row shows (Forced, SDH, CC,
+    ' and HI on a hearing-impaired track), "Subtitles", the language or its
+    ' code, or the codec. "Signs & Songs" stays; "SubRip" or "English" do
+    ' not. Nor a subtitle file's name, which the server gives an untitled
+    ' sidecar as its title and its inventory label alike (a Roku rule from
+    ' Android TV's meaningfulSubtitleRowTitle; run 6 showed "… (2026).en.srt").
+    function subtitleTitle(track as Object, copy as Object) as String
+        title = rawTitle(track)
+        if title = "" or isReleaseName(title) or isFileName(title) then return ""
+        lowered = LCase(title)
+        flags = "|forced|sdh|cc|hearing impaired|subtitle|subtitles|ass|ssa|srt|subrip|pgs|sup|sub|vtt|webvtt|vobsub|dvdsub|mov_text|"
+        if util.isTrue(track.hearingImpaired) then flags = flags + "hi|"
+        if Instr(1, flags, "|" + lowered + "|") > 0 then return ""
+        if lowered = LCase(languageName(track.language, copy)) or lowered = LCase(util.text(track.language)) then return ""
+        if lowered = LCase(util.text(track.codec)) or lowered = LCase(subtitleCodecName(track.codec)) then return ""
+        return displayTitle(title)
+    end function
+
+    ' Forced by its flag or its title, as tvOS reads it.
+    function isForced(track as Object) as Boolean
+        return util.isTrue(track.forced) or Instr(1, LCase(rawTitle(track)), "forced") > 0
+    end function
+
+    ' SDH by its flag or a title that says SDH, CC, hearing impaired, or
+    ' closed captions (tvOS's titleIndicatesHearingImpaired).
+    function isHearingImpaired(track as Object) as Boolean
+        if util.isTrue(track.hearingImpaired) then return true
+        lowered = LCase(rawTitle(track))
+        if Instr(1, lowered, "hearing impaired") > 0 or Instr(1, lowered, "closed caption") > 0 then return true
+        words = wordList(lowered)
+        return Instr(1, words, "|cc|") > 0 or Instr(1, words, "|sdh|") > 0
+    end function
+
+    ' tvOS's SubtitleDisplayOrder: the preferred language's tracks first, the
+    ' other languages by name, tracks without one last; within a language,
+    ' SRT, ASS, SSA, WebVTT, TX3G, PGS, VobSub and DVB, then the rest; full
+    ' dialogue before forced before SDH; the default first; else as listed.
+    function subtitleOrder(tracks as Object, preferred as String, copy as Object) as Object
+        keyed = []
+        for i = 0 to tracks.Count() - 1
+            track = tracks[i]
+            key = playback.tracks.languageKey(track.language)
+            group = "2"
+            if key = preferred and key <> "" then group = "0"
+            if key <> "" and group <> "0" then group = "1" + LCase(languageName(track.language, copy)) + Chr(1) + key
+            variant = 0
+            if isForced(track) then variant = 1
+            if isHearingImpaired(track) then variant = 2
+            fallback = 1
+            if track.isDefault then fallback = 0
+            keyed.Push({ order: group + Chr(1) + formatRank(track.codec).ToStr() + variant.ToStr() + fallback.ToStr() + Right("0000" + i.ToStr(), 5), track: track })
+        end for
+        ' A lower-case key: brs-node, which runs the specs, matches SortBy keys by case.
+        keyed.SortBy("order")
+        out = []
+        for each entry in keyed
+            out.Push(entry.track)
+        end for
+        return out
+    end function
+
+    ' Lower comes first: SRT, ASS, SSA, WebVTT, TX3G, PGS, VobSub and DVB,
+    ' then the rest.
+    function formatRank(codec as String) as Integer
+        lowered = LCase(codec)
+        if lowered = "" then return 7
+        if lowered = "srt" or Instr(1, lowered, "subrip") > 0 then return 0
+        if Instr(1, lowered, "ass") > 0 then return 1
+        if Instr(1, lowered, "ssa") > 0 then return 2
+        if lowered = "vtt" or Instr(1, lowered, "webvtt") > 0 then return 3
+        if Instr(1, lowered, "mov_text") > 0 or Instr(1, lowered, "movtext") > 0 or Instr(1, lowered, "tx3g") > 0 then return 4
+        if lowered = "sup" or Instr(1, lowered, "pgs") > 0 or Instr(1, lowered, "hdmv") > 0 then return 5
+        if Instr(1, lowered, "dvd") > 0 or Instr(1, lowered, "vobsub") > 0 or Instr(1, lowered, "dvb") > 0 then return 6
+        return 7
+    end function
+
+    ' A subtitle format as tvOS prints it: SRT, ASS, SSA, WebVTT, PGS,
+    ' VobSub, TX3G, else in capitals.
+    function subtitleCodecName(codec as String) as String
+        lowered = LCase(codec)
+        if lowered = "" then return ""
+        if lowered = "srt" or Instr(1, lowered, "subrip") > 0 then return "SRT"
+        if Instr(1, lowered, "ass") > 0 then return "ASS"
+        if Instr(1, lowered, "ssa") > 0 then return "SSA"
+        if lowered = "vtt" or Instr(1, lowered, "webvtt") > 0 then return "WebVTT"
+        if lowered = "sup" or Instr(1, lowered, "pgs") > 0 or Instr(1, lowered, "hdmv") > 0 then return "PGS"
+        if Instr(1, lowered, "dvd") > 0 or Instr(1, lowered, "vobsub") > 0 then return "VobSub"
+        if Instr(1, lowered, "mov_text") > 0 or Instr(1, lowered, "tx3g") > 0 then return "TX3G"
+        return UCase(codec)
+    end function
+
+    ' --- Shared -------------------------------------------------------------------
+
+    function option(value as Integer, title as String, detail as String) as Object
+        return { value: value, title: title, detail: detail }
+    end function
+
+    ' The language, else the title, else "Track N" (index + 1).
+    function nameOf(language as String, title as String, index as Integer, copy as Object) as String
+        if language <> "" then return language
+        if title <> "" then return title
+        return i18n.format(i18n.lookup(copy, "detail.track"), { number: index + 1 })
+    end function
+
+    ' A title worth a detail token: "" when it only repeats the row's name.
+    function qualifier(title as String, name as String) as String
+        if LCase(title) = LCase(name) then return ""
+        return title
+    end function
+
+    function rawTitle(track as Object) as String
+        title = util.text(track.title)
+        if title = "" then title = util.text(track.embeddedTitle)
+        return title
+    end function
+
+    ' text's words in lower case as "|a|b|", split at all but letters and digits.
+    function wordList(text as String) as String
+        return "|" + CreateObject("roRegex", "[^a-z0-9]+", "").ReplaceAll(LCase(text), "|") + "|"
+    end function
+
+    ' A release group's stamp ("Movie (2026) [Remux-2160p HEVC DV]"), which
+    ' says nothing about the track.
+    function isReleaseName(title as String) as Boolean
+        lowered = LCase(title)
+        for each mark in ["2160p", "1080p", "720p", "480p", "remux", "bluray", "blu-ray", "web-dl", "webrip", "hdtv", "x264", "x265", "h.264", "h.265", "hevc", "10-bit", "hdr10", ".mkv", ".mp4"]
+            if Instr(1, lowered, mark) > 0 then return true
+        end for
+        return false
+    end function
+
+    ' A subtitle file's name: "Heat (1995).en.srt".
+    function isFileName(title as String) as Boolean
+        lowered = LCase(title)
+        for each suffix in [".srt", ".ass", ".ssa", ".vtt", ".sub", ".sup", ".idx"]
+            if Right(lowered, Len(suffix)) = suffix then return true
+        end for
+        return false
+    end function
+
+    ' SDH, CC, SubRip, and WebVTT as tvOS writes them; else trimmed.
+    function displayTitle(title as String) as String
+        trimmedTitle = title.Trim()
+        names = { sdh: "SDH", cc: "CC", srt: "SubRip", subrip: "SubRip", webvtt: "WebVTT", vtt: "WebVTT" }
+        name = names[LCase(trimmedTitle)]
+        if name <> invalid then return name
+        return trimmedTitle
+    end function
+
+    ' text without the characters of edges at either end.
+    function trimmed(text as String, edges as String) as String
+        first = 1
+        last = Len(text)
+        while first <= last and Instr(1, edges, Mid(text, first, 1)) > 0
+            first = first + 1
+        end while
+        while last >= first and Instr(1, edges, Mid(text, last, 1)) > 0
+            last = last - 1
+        end while
+        return Mid(text, first, last - first + 1)
+    end function
+
+    ' The letters in text, any outside ASCII counted as letters.
+    function letters(text as String) as Integer
+        count = 0
+        for i = 1 to Len(text)
+            character = Mid(text, i, 1)
+            if isAsciiLetter(character) or Asc(character) > 127 then count = count + 1
+        end for
+        return count
+    end function
+
+    function isAsciiLetter(character as String) as Boolean
+        return (character >= "a" and character <= "z") or (character >= "A" and character <= "Z")
+    end function
+
+    ' "English" for "eng", "en", or "en-US" (language.<code> in locale/), a
+    ' spelled-out name as written ("english" reads "English"), the code in
+    ' capitals when the table has no name for it, or "" for none.
+    function languageName(language as String, copy as Object) as String
+        key = playback.tracks.languageKey(language)
+        if key = "" then return ""
+        name = copy["language." + key]
+        if util.isString(name) then return name
+        if Len(key) > 3 then return UCase(Left(key, 1)) + Mid(key, 2)
+        return UCase(key)
+    end function
+
+    ' The track's layout as tvOS names it ("Atmos", "7.1", "5.1", "Stereo",
+    ' "Mono", else as the server sends it), else from its channel count
+    ' ("7.1", "5.1", "Stereo", "Mono", "4ch").
+    function channelLayout(track as Object, copy as Object) as String
+        named = LCase(util.text(track.layout))
+        if named <> ""
+            if Instr(1, named, "atmos") > 0 then return "Atmos"
+            if Instr(1, named, "7.1") > 0 then return "7.1"
+            if Instr(1, named, "5.1") > 0 then return "5.1"
+            if Instr(1, named, "stereo") > 0 then return i18n.lookup(copy, "detail.stereo")
+            if Instr(1, named, "mono") > 0 then return i18n.lookup(copy, "detail.mono")
+            return track.layout
+        end if
+        channels = track.channels
+        if channels = 8 then return "7.1"
+        if channels = 6 then return "5.1"
+        if channels = 2 then return i18n.lookup(copy, "detail.stereo")
+        if channels = 1 then return i18n.lookup(copy, "detail.mono")
+        if channels > 0 then return i18n.format(i18n.lookup(copy, "detail.channels"), { count: channels })
+        return ""
+    end function
+
+    ' An audio codec as tvOS prints it: EAC3, AC3, AAC, MP3, TrueHD, DTS,
+    ' FLAC, else in capitals.
+    function audioCodecName(codec as String) as String
+        lowered = LCase(codec)
+        for each pair in [["eac3", "EAC3"], ["e-ac-3", "EAC3"], ["ec-3", "EAC3"], ["ac3", "AC3"], ["ac-3", "AC3"], ["aac", "AAC"], ["mp3", "MP3"], ["truehd", "TrueHD"], ["dts", "DTS"], ["flac", "FLAC"]]
+            if Instr(1, lowered, pair[0]) > 0 then return pair[1]
+        end for
+        return UCase(codec)
+    end function
+
+    ' "Auto · value", the readout's mark for a value Auto chose.
+    function autoValue(value as String, copy as Object) as String
+        return i18n.format(i18n.lookup(copy, "detail.autoValue"), { value: value })
+    end function
+
+    function orAuto(value as String, copy as Object) as String
+        if value = "" then return i18n.lookup(copy, "detail.auto")
+        return value
+    end function
+
+    function joined(parts as Object) as String
+        kept = []
+        for each part in parts
+            if part <> "" then kept.Push(part)
+        end for
+        return kept.Join(" · ")
+    end function
+end namespace

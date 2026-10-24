@@ -1,0 +1,137 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/auth/server.bs"
+
+' The server address screen (spec sections 5.4 and 7.1): the shortcut chips,
+' what Connect does with the typed address, and what a failed check leads to.
+' Pure; messages are locale keys (source/util/i18n.bs).
+namespace onboarding.address
+    const HTTPS_CHIP = "https://"
+    const HTTP_CHIP = "http://"
+    const COM_CHIP = ".com"
+
+    ' Connect's next step (attempt) and a failed check's (afterFailure).
+    ' Connect: send api.session.setServer with the attempt's allowHttp.
+    const CONNECT = "connect"
+    ' Ask "Connect without encryption?" first; Connect then sends allowHttp.
+    const CONFIRM_HTTP = "confirmHttp"
+    ' Push the "server update required" screen.
+    const UPDATE_REQUIRED = "updateRequired"
+    ' Show the error, a locale key.
+    const SHOW_ERROR = "error"
+    ' Nothing to show (the check was cancelled).
+    const IDLE = "idle"
+
+    ' The chips under the address field, in order.
+    function chips() as Object
+        return [HTTPS_CHIP, HTTP_CHIP, COM_CHIP]
+    end function
+
+    ' The address after a chip, as the Android TV app edits it: a scheme chip
+    ' goes in front of the address without its leading spaces unless it
+    ' already starts with http:// or https:// (one scheme is never swapped for
+    ' the other), and .com goes at the end.
+    function withChip(address as String, chip as String) as String
+        if chip = COM_CHIP then return address + COM_CHIP
+        unpadded = trimStart(address)
+        if hasScheme(unpadded) then return address
+        return chip + unpadded
+    end function
+
+    function hasScheme(address as String) as Boolean
+        lower = LCase(address)
+        return Left(lower, 7) = HTTP_CHIP or Left(lower, 8) = HTTPS_CHIP
+    end function
+
+    ' Whether the address asks for plain HTTP, so the screen warns under it.
+    function isCleartext(address as String) as Boolean
+        return Left(LCase(address.Trim()), 7) = HTTP_CHIP
+    end function
+
+    ' What Connect does with the typed address: { step, error, allowHttp,
+    ' canTryHttp, host }. An address without a scheme is tried over HTTPS, and
+    ' canTryHttp says HTTP may be offered if that gets no answer; an http://
+    ' address asks first (CONFIRM_HTTP); an https:// one is never downgraded.
+    ' host names the server in the "Connect without encryption?" prompt.
+    function attempt(address as String) as Object
+        trimmed = address.Trim()
+        if trimmed = "" then return failed("setup.error.empty")
+        checked = api.auth.server.normalize(trimmed, false)
+        if checked.error = "needs_http_confirmation"
+            checked = api.auth.server.normalize(trimmed, true)
+            if checked.error <> invalid then return failed(errorKey(checked.error))
+            return { step: CONFIRM_HTTP, error: "", allowHttp: true, canTryHttp: false, host: hostOf(checked.url) }
+        end if
+        if checked.error <> invalid then return failed(errorKey(checked.error))
+        return { step: CONNECT, error: "", allowHttp: false, canTryHttp: checked.canTryHttp, host: hostOf(checked.url) }
+    end function
+
+    ' The next step after api.session.setServer failed with an error kind
+    ' (source/api/response.bs) for an attempt, as { step, error }, and for
+    ' UPDATE_REQUIRED problem, the kind the update screen explains
+    ' (updateCopy). Only an HTTPS check that got no answer, for an address
+    ' typed without a scheme, offers HTTP; the attempt then needs allowHttp
+    ' set.
+    function afterFailure(kind as String, tried as Object) as Object
+        if kind = "cancelled" then return { step: IDLE, error: "" }
+        if kind = "server_update_required" or kind = "origin_unconfirmed" then return { step: UPDATE_REQUIRED, error: "", problem: kind }
+        if kind = "unreachable" and tried.canTryHttp and not tried.allowHttp then return { step: CONFIRM_HTTP, error: "" }
+        return { step: SHOW_ERROR, error: errorKey(kind) }
+    end function
+
+    ' The update screen's { headline, body } locale keys for why a server
+    ' cannot be used (api.auth.server.checkInfo): too old to confirm the
+    ' origin a request reached (it needs an update to sign in on Roku), an
+    ' origin other than the configured one, or, for anything else, no /api/v2.
+    function updateCopy(problem as String) as Object
+        if problem = "origin_unconfirmed" then return { headline: "update.headline", body: "update.originBody" }
+        if problem = "origin_mismatch" then return { headline: "update.mismatchHeadline", body: "update.mismatchBody" }
+        return { headline: "update.headline", body: "update.body" }
+    end function
+
+    ' The locale key of the server card's badge on the update screen, for
+    ' the same problems as updateCopy.
+    function updateBadge(problem as String) as String
+        if problem = "origin_mismatch" then return "firstRun.badge.mismatch"
+        return "firstRun.badge.update"
+    end function
+
+    ' The locale key for an address or server check error kind.
+    function errorKey(kind as String) as String
+        if kind = "invalid_address" then return "setup.error.invalidAddress"
+        if kind = "unsupported_scheme" then return "setup.error.unsupportedScheme"
+        if kind = "credentials_in_address" then return "setup.error.credentials"
+        if kind = "origin_mismatch" then return "setup.error.originMismatch"
+        return "setup.error.unreachable"
+    end function
+
+    ' host[:port] of a base URL ("https://media.example.com:8443/silo" gives
+    ' "media.example.com:8443"), or "" for anything else.
+    function hostOf(url as Dynamic) as String
+        if not api.request.isHttpUrl(url) then return ""
+        rest = Mid(url, Instr(1, url, "://") + 3)
+        slash = Instr(1, rest, "/")
+        if slash > 0 then return Left(rest, slash - 1)
+        return rest
+    end function
+
+    ' What the server card shows for a base URL, as { name, address, badge,
+    ' warning }: the host over the URL, with the badge's locale key, Secure
+    ' for HTTPS and HTTP, in the warning colour, otherwise. The session keeps
+    ' no server name, so the host stands in for it.
+    function serverCard(baseUrl as String) as Object
+        if LCase(Left(baseUrl, 8)) = HTTPS_CHIP then return { name: hostOf(baseUrl), address: baseUrl, badge: "firstRun.badge.secure", warning: false }
+        return { name: hostOf(baseUrl), address: baseUrl, badge: "firstRun.badge.http", warning: true }
+    end function
+
+    function failed(key as String) as Object
+        return { step: SHOW_ERROR, error: key, allowHttp: false, canTryHttp: false, host: "" }
+    end function
+
+    function trimStart(value as String) as String
+        i = 1
+        while i <= Len(value) and Mid(value, i, 1) = " "
+            i = i + 1
+        end while
+        return Mid(value, i)
+    end function
+end namespace

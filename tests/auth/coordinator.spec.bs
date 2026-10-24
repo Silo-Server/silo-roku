@@ -1,0 +1,1076 @@
+namespace tests
+
+    ' The account session driven through tests.sessions, which wires the
+    ' scheduler and the coordinator as ApiTask does. Server answers come from
+    ' the contract fixtures (tests/fixtures/v2/).
+    @suite("auth coordinator")
+    class AuthCoordinatorTests extends rooibos.BaseTestSuite
+
+        @describe("refresh after a 401")
+
+        @it("joins concurrent 401s into one refresh and retries each request once")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            for each id in ["r1", "r2", "r3"]
+                tests.sessions.send(loop, { requestId: id, path: "/api/v2/" + id, auth: "account" })
+            end for
+            for each id in ["r1", "r2", "r3"]
+                tests.sessions.respond(loop, id, 401, tests.sessions.fixture("token_refresh_required"))
+            end for
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 1)
+            m.assertEqual(loop.running.Count(), 1)
+            m.assertEqual(loop.running.auth1.request.body, { refresh_token: "ref" })
+
+            tests.sessions.respond(loop, "auth1", 200, tests.sessions.fixture("refresh_session_ok"))
+            m.assertEqual(loop.persisted.Peek().accessToken, "acc2")
+            m.assertEqual(loop.persisted.Peek().refreshToken, "ref2")
+            ' Rotated tokens are flushed before the held requests start again.
+            m.assertTrue(tests.sessions.position(loop, "persist") < tests.sessions.position(loop, "start /api/v2/r1", 2))
+            for each id in ["r1", "r2", "r3"]
+                m.assertEqual(tests.sessions.count(loop, "start /api/v2/" + id), 2)
+                m.assertEqual(loop.running[id].headers.Authorization, "Bearer acc2")
+            end for
+
+            ' A second 401 is answered: each request is retried at most once.
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, "r2", 200, {})
+            m.assertEqual(loop.delivered.r1.status, 401)
+            m.assertTrue(loop.delivered.r2.ok)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 2)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/r1"), 2)
+        end sub
+
+        @it("retries at once, without a refresh, a 401 on tokens that have since rotated")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/b", auth: "account" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, "auth1", 200, tests.sessions.fixture("refresh_session_ok"))
+            tests.sessions.respond(loop, "r2", 401, tests.sessions.fixture("token_refresh_required"))
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 1)
+            m.assertEqual(loop.running.r2.headers.Authorization, "Bearer acc2")
+        end sub
+
+        @it("signs out when the refresh is refused")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/b", auth: "profile" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, "auth1", 401, tests.sessions.fixture("refresh_session_revoked"))
+            m.assertEqual(loop.delivered.r1.error.kind, "signed_out")
+            saved = loop.persisted.Peek()
+            m.assertEqual([saved.accessToken, saved.refreshToken, saved.profileTokens], ["", "", []])
+            ' The account and its remembered profile stay for the next sign-in.
+            m.assertEqual(saved.accountId, "1")
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.reason], ["signed_out", "expired"])
+            m.assertTrue(tests.sessions.count(loop, "publish") > 0)
+        end sub
+
+        @it("signs out on a refresh refused as invalid_token")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, "auth1", 401, { type: "https://siloserver.org/docs/api/v2/problems/invalid_token", title: "Invalid token", status: 401, detail: "x", instance: "urn:silo:request:1" })
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "signed_out")
+        end sub
+
+        @it("keeps the tokens when the refresh answers 503")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, "auth1", 503, tests.sessions.fixture("refresh_session_provider_unavailable"), { "Retry-After": "20" })
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "signed_in")
+            m.assertEqual(api.auth.coordinator.record(loop.session).accessToken, "acc")
+            m.assertEqual(tests.sessions.count(loop, "persist"), 0)
+            ' The held request tries once more; until Retry-After passes no new
+            ' refresh starts, and a 401 answers auth_unavailable.
+            m.assertEqual(loop.running.r1.headers.Authorization, "Bearer acc")
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/b", auth: "account" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, "r2", 401, tests.sessions.fixture("token_refresh_required"))
+            m.assertEqual(loop.delivered.r1.error.kind, "auth_unavailable")
+            m.assertEqual(loop.delivered.r2.error.kind, "auth_unavailable")
+            m.assertEqual(loop.delivered.r2.error.retryAfterSeconds, 20)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 1)
+
+            loop.now = loop.now + 21
+            tests.sessions.send(loop, { requestId: "r3", path: "/api/v2/c", auth: "account" })
+            tests.sessions.respond(loop, "r3", 401, tests.sessions.fixture("token_refresh_required"))
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 2)
+        end sub
+
+        @it("keeps the tokens when the refresh gets no answer")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, "auth1", -6)
+            m.assertEqual(api.auth.coordinator.record(loop.session).refreshToken, "ref")
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "signed_in")
+        end sub
+
+        @it("refreshes at once once the server answers after an outage (run 8, defect 5)")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.expiresAt = tests.sessions.NOW - 60
+            loop = tests.sessions.create(record)
+            ' During the outage the refresh gets a gateway's 502, then no answer.
+            tests.sessions.send(loop, { requestId: "p1", path: "/api/v2/playback/start", auth: "account", lane: "playback" })
+            tests.sessions.respond(loop, "auth1", 502)
+            tests.sessions.respond(loop, "p1", 502)
+            loop.now = loop.now + 31
+            tests.sessions.send(loop, { requestId: "p2", path: "/api/v2/playback/start", auth: "account", lane: "playback" })
+            tests.sessions.respond(loop, "auth2", -7)
+            tests.sessions.respond(loop, "p2", -7)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 2)
+
+            ' The server is back: Retry's check answers, and the start's 401
+            ' refreshes at once instead of answering auth_unavailable.
+            loop.now = loop.now + 5
+            tests.sessions.send(loop, { requestId: "info", path: "/api/v2/system/info" })
+            tests.sessions.respond(loop, "info", 200, tests.sessions.systemInfo())
+            tests.sessions.send(loop, { requestId: "p3", path: "/api/v2/playback/start", auth: "account", lane: "playback" })
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 3, "the expired token refreshes before the start")
+            tests.sessions.respond(loop, "auth3", 200, tests.sessions.fixture("refresh_session_ok"))
+            m.assertEqual(loop.running.p3.headers.Authorization, "Bearer acc2")
+        end sub
+
+        @it("takes a 401 as the server's answer and refreshes at once after a refresh got none")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, "auth1", 504)
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 2)
+            tests.sessions.respond(loop, "auth2", 200, tests.sessions.fixture("refresh_session_ok"))
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/b", auth: "account" })
+            m.assertEqual(loop.running.r2.headers.Authorization, "Bearer acc2")
+        end sub
+
+        @it("keeps a backoff the server asked for, and ignores answers from another origin")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, "auth1", 503, invalid, { "Retry-After": "20" })
+            tests.sessions.send(loop, { requestId: "info", path: "/api/v2/system/info" })
+            tests.sessions.respond(loop, "info", 200, tests.sessions.systemInfo())
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            m.assertEqual(loop.delivered.r1.error.kind, "auth_unavailable")
+
+            record = tests.sessions.signedIn()
+            record.expiresAt = tests.sessions.NOW - 60
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.respond(loop, "auth1", -6)
+            tests.sessions.send(loop, { requestId: "art", url: "https://images.example/a.jpg" })
+            tests.sessions.respond(loop, "art", 200, {})
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/b", auth: "account" })
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 1, "another origin says nothing about the server")
+            m.assertEqual(loop.running.r2.headers.Authorization, "Bearer acc")
+        end sub
+
+        @it("runs a refresh a playback request waits for in the playback slot")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.expiresAt = tests.sessions.NOW + 10
+            loop = tests.sessions.create(record)
+            ' Three slots busy with requests that need no credentials.
+            for each id in ["r1", "r2", "r3"]
+                tests.sessions.send(loop, { requestId: id, path: "/api/v2/" + id })
+            end for
+            tests.sessions.send(loop, { requestId: "p1", path: "/api/v2/playback/start", auth: "account", lane: "playback" })
+            m.assertNotInvalid(tests.sessions.runningId(loop, "/api/v2/auth/refresh"))
+            m.assertEqual(loop.running.auth1.request.lane, "playback")
+        end sub
+
+        @it("moves a queued refresh to the playback slot when a playback request joins it")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/r1", auth: "account" })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/r2" })
+            tests.sessions.send(loop, { requestId: "r3", path: "/api/v2/r3" })
+            tests.sessions.send(loop, { requestId: "p1", path: "/api/v2/p1", auth: "account", lane: "playback" })
+            tests.sessions.send(loop, { requestId: "r4", path: "/api/v2/r4" })
+            ' r1's 401 queues the refresh behind r4 on the interactive lane.
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            m.assertEqual(loop.running.r4.request.path, "/api/v2/r4")
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/auth/refresh"))
+            tests.sessions.respond(loop, "p1", 401, tests.sessions.fixture("token_refresh_required"))
+            m.assertEqual(loop.running.auth1.request.lane, "playback")
+        end sub
+
+        @describe("proactive refresh")
+
+        @it("refreshes under 30 minutes before expiry without holding requests")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.expiresAt = tests.sessions.NOW + 1700
+            record.refreshAt = tests.sessions.NOW - 100
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 1)
+            m.assertEqual(loop.running.r1.headers.Authorization, "Bearer acc")
+            m.assertEqual(tests.sessions.count(loop, "hold"), 0)
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/b", auth: "account" })
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 1)
+            tests.sessions.respond(loop, "auth1", 200, tests.sessions.fixture("refresh_session_ok"))
+            saved = loop.persisted.Peek()
+            m.assertEqual([saved.accessToken, saved.expiresAt, saved.refreshAt], ["acc2", tests.sessions.NOW + 3600, tests.sessions.NOW + 1800])
+        end sub
+
+        @it("does not refresh earlier than 30 minutes before expiry")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.respond(loop, "r1", 200, {})
+            loop.now = tests.sessions.NOW + 1799
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/b", auth: "account" })
+            tests.sessions.respond(loop, "r2", 200, {})
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 0)
+            ' Requests without credentials never start one.
+            loop.now = tests.sessions.NOW + 1801
+            tests.sessions.send(loop, { requestId: "r3", path: "/api/v2/c" })
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 0)
+            tests.sessions.send(loop, { requestId: "r4", path: "/api/v2/d", auth: "account" })
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 1)
+        end sub
+
+        @it("refreshes halfway through a lifetime shorter than an hour")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            pair = tests.sessions.fixture("login_ok")
+            pair.expires_in = 900
+            tests.sessions.respond(loop, "r1", 200, pair)
+            saved = api.auth.coordinator.record(loop.session)
+            m.assertEqual([saved.expiresAt, saved.refreshAt], [tests.sessions.NOW + 900, tests.sessions.NOW + 450])
+        end sub
+
+        @it("holds requests behind the refresh once the token has expired")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.expiresAt = tests.sessions.NOW + 10
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/info" })
+            m.assertInvalid(loop.running.r1)
+            m.assertNotInvalid(loop.running.r2)
+            tests.sessions.respond(loop, "auth1", 200, tests.sessions.fixture("refresh_session_ok"))
+            m.assertEqual(loop.running.r1.headers.Authorization, "Bearer acc2")
+            m.assertTrue(tests.sessions.position(loop, "persist") < tests.sessions.position(loop, "start /api/v2/a"))
+        end sub
+
+        @describe("sign-in")
+
+        @it("never refreshes after a login 401")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "wrong" })
+            m.assertEqual(loop.running.r1.request.body, { username: "laura", password: "wrong" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("login_invalid_credentials"))
+            result = loop.delivered.r1
+            m.assertEqual([result.status, result.error.problemType], [401, "invalid_token"])
+            m.assertEqual(api.auth.problems.forResult(result, "login"), api.auth.problems.INVALID_CREDENTIALS)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 0)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/login"), 1)
+            ' The existing session is untouched.
+            m.assertEqual(api.auth.coordinator.record(loop.session).accessToken, "acc")
+        end sub
+
+        @it("never replays a login without an answer")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            tests.sessions.respond(loop, "r1", -28)
+            m.assertEqual(loop.delivered.r1.error.kind, "timeout")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/login"), 1)
+        end sub
+
+        @it("stores the tokens and answers with the account only")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            headers = loop.running.r1.headers
+            m.assertEqual([headers["X-Silo-Device-Id"], headers["X-Silo-Device-Platform"], headers["X-Silo-Client"]], ["device-1", "roku", "Silo Roku"])
+            m.assertInvalid(headers.Authorization)
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("login_ok"))
+            result = loop.delivered.r1
+            m.assertTrue(result.ok)
+            m.assertEqual(result.body, { account: { id: "1", username: "laura", role: "user", passwordChangeRequired: false } })
+            json = FormatJson(result)
+            m.assertEqual([Instr(1, json, Chr(34) + "acc" + Chr(34)), Instr(1, json, Chr(34) + "ref" + Chr(34))], [0, 0])
+            saved = loop.persisted.Peek()
+            m.assertEqual([saved.accessToken, saved.refreshToken, saved.accountId], ["acc", "ref", "1"])
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "signed_in")
+        end sub
+
+        @it("forgets the remembered profile when another account signs in")
+        sub _()
+            record = tests.sessions.signedOut()
+            record.accountId = "9"
+            record.profileId = "p-other"
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("login_ok"))
+            m.assertEqual(api.auth.coordinator.record(loop.session).profileId, "")
+
+            record = tests.sessions.signedOut()
+            record.accountId = "1"
+            record.profileId = "p-other"
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("login_ok"))
+            m.assertEqual(api.auth.coordinator.view(loop.session).rememberedProfileId, "p-other")
+        end sub
+
+        @it("refuses a sign-in before a server is set up, and empty credentials")
+        sub _()
+            loop = tests.sessions.create(storage.empty())
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            m.assertEqual(loop.delivered.r1.error.kind, "no_server")
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "r2", session: "signIn", username: "laura", password: "" })
+            m.assertEqual(loop.delivered.r2.error.kind, "invalid_request")
+            m.assertEqual(loop.running.Count(), 0)
+        end sub
+
+        @describe("sign-out")
+
+        @it("clears the session at once and asks the server to end it")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", session: "signOut" })
+            m.assertTrue(loop.delivered.r1.ok)
+            saved = loop.persisted.Peek()
+            m.assertEqual([saved.accessToken, saved.refreshToken, saved.accountId, saved.profileId], ["", "", "", ""])
+            m.assertEqual(api.auth.coordinator.view(loop.session).reason, "signed_out")
+            logout = tests.sessions.runningId(loop, "/api/v2/auth/logout")
+            m.assertEqual(loop.running[logout].headers.Authorization, "Bearer acc")
+            ' Unreachable: nothing else happens.
+            tests.sessions.respond(loop, logout, -6)
+            m.assertEqual(loop.running.Count(), 0)
+        end sub
+
+        @it("refreshes with the captured refresh token first when the access token has expired")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.expiresAt = tests.sessions.NOW - 5
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", session: "signOut" })
+            refresh = tests.sessions.runningId(loop, "/api/v2/auth/refresh")
+            m.assertEqual(loop.running[refresh].request.body, { refresh_token: "ref" })
+            tests.sessions.respond(loop, refresh, 200, tests.sessions.fixture("refresh_session_ok"))
+            logout = tests.sessions.runningId(loop, "/api/v2/auth/logout")
+            m.assertEqual(loop.running[logout].headers.Authorization, "Bearer acc2")
+            ' The new tokens are dropped.
+            m.assertEqual(api.auth.coordinator.record(loop.session).accessToken, "")
+        end sub
+
+        @describe("configured origin")
+
+        ' A launch on record whose origin check is still running.
+        function launching(record as Object, allowUnconfirmed = false as Boolean) as Object
+            return tests.sessions.create(record, false, allowUnconfirmed)
+        end function
+
+        sub answerCheck(loop as Object, code as Integer, body as Dynamic)
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), code, body)
+        end sub
+
+        ' Whether any request so far went out with a credential.
+        function sentCredentials(loop as Object) as Boolean
+            for each id in loop.running
+                headers = loop.running[id].headers
+                if headers.DoesExist("Authorization") or headers.DoesExist("X-Profile-Id") then return true
+            end for
+            return tests.sessions.count(loop, "start /api/v2/auth/login") + tests.sessions.count(loop, "start /api/v2/auth/refresh") > 0
+        end function
+
+        @it("checks a restored session's origin at launch before any credential goes out")
+        sub _()
+            loop = m.launching(tests.sessions.signedIn())
+            check = loop.running[tests.sessions.runningId(loop, api.auth.server.INFO_PATH)]
+            m.assertEqual(check.url, "https://silo.example/api/v2/system/info")
+            m.assertFalse(check.headers.DoesExist("Authorization"))
+            m.assertFalse(check.headers.DoesExist("X-Silo-Device-Id"))
+            m.assertEqual(api.auth.coordinator.view(loop.session).originStatus, "checking")
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/auth/providers" })
+            m.assertInvalid(loop.running.r1, "waits for the check")
+            m.assertNotInvalid(loop.running.r2, "a request without credentials goes")
+            m.answerCheck(loop, 200, tests.sessions.systemInfo())
+            m.assertEqual(loop.running.r1.headers.Authorization, "Bearer acc")
+            m.assertEqual(api.auth.coordinator.view(loop.session).originStatus, "verified")
+        end sub
+
+        @it("refuses every credential for a server that does not confirm the origin, in a release build")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.expiresAt = tests.sessions.NOW - 5
+            loop = m.launching(record)
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/profiles", auth: "account" })
+            tests.sessions.send(loop, { requestId: "p1", session: "verifyPin", profile: { id: "p-owner", name: "Laura", hasPin: true, isChild: false }, pin: "1234" })
+            m.answerCheck(loop, 200, tests.sessions.fixture("get_system_info_ok"))
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.originStatus, view.originProblem], ["refused", "origin_unconfirmed"])
+            m.assertEqual(loop.delivered.r1.error.kind, "origin_unconfirmed")
+            m.assertEqual(loop.delivered.p1.body.outcome, "error")
+            m.assertFalse(m.sentCredentials(loop))
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/profiles/p-owner/verify-pin"), 0)
+            ' Later requests fail at once, without another check.
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home", auth: "account" })
+            m.assertEqual(loop.delivered.r2.error.kind, "origin_unconfirmed")
+            tests.sessions.send(loop, { requestId: "h1", session: "mediaHeaders", url: "https://silo.example/api/v2/stream/s-1", generation: 0, refresh: false })
+            m.assertEqual(loop.delivered.h1.error.kind, "origin_unconfirmed")
+            m.assertEqual(tests.sessions.count(loop, "start " + api.auth.server.INFO_PATH), 1)
+            m.assertFalse(m.sentCredentials(loop))
+            m.assertEqual(api.auth.coordinator.record(loop.session).accessToken, "acc", "the session is kept for an updated server")
+        end sub
+
+        @it("sends credentials with a warning to a server without request_origin only in a debug build")
+        sub _()
+            loop = m.launching(tests.sessions.signedIn(), true)
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
+            m.answerCheck(loop, 200, tests.sessions.fixture("get_system_info_ok"))
+            m.assertEqual(loop.running.r1.headers.Authorization, "Bearer acc")
+            m.assertEqual(api.auth.coordinator.view(loop.session).originStatus, "verified")
+            m.assertEqual(tests.sessions.count(loop, "warn the server does not confirm which origin a request reached; a debug build sends credentials to it anyway"), 1)
+        end sub
+
+        @it("refuses a redirected launch check in every build")
+        sub _()
+            for each allowUnconfirmed in [false, true]
+                loop = m.launching(tests.sessions.signedIn(), allowUnconfirmed)
+                tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
+                m.answerCheck(loop, 200, tests.sessions.systemInfo("https://login.other.example"))
+                view = api.auth.coordinator.view(loop.session)
+                m.assertEqual([view.originStatus, view.originProblem], ["refused", "origin_mismatch"])
+                m.assertEqual(loop.delivered.r1.error.kind, "origin_mismatch")
+                m.assertFalse(m.sentCredentials(loop))
+            end for
+        end sub
+
+        @it("refuses credentials when the stored server stopped serving /api/v2")
+        sub _()
+            loop = m.launching(tests.sessions.signedIn())
+            m.answerCheck(loop, 404, { error: "not found" })
+            m.assertEqual(api.auth.coordinator.view(loop.session).originProblem, "server_update_required")
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
+            m.assertEqual(loop.delivered.r1.error.kind, "server_update_required")
+        end sub
+
+        @it("checks again with the next request after a check got no answer")
+        sub _()
+            loop = m.launching(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
+            m.answerCheck(loop, -6, invalid)
+            m.assertEqual(loop.delivered.r1.error.kind, "origin_unverified")
+            m.assertEqual(api.auth.coordinator.view(loop.session).originStatus, "unverified")
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/account/me", auth: "account" })
+            m.assertInvalid(loop.running.r2)
+            m.answerCheck(loop, 200, tests.sessions.systemInfo())
+            m.assertEqual(loop.running.r2.headers.Authorization, "Bearer acc")
+        end sub
+
+        @it("holds a password until the origin is confirmed and never sends it to a refused one")
+        sub _()
+            loop = m.launching(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "i1", session: "signIn", username: "laura", password: "pw" })
+            m.assertInvalid(loop.running.i1)
+            m.answerCheck(loop, 200, tests.sessions.systemInfo("https://silo.example.evil"))
+            m.assertEqual(loop.delivered.i1.error.kind, "origin_mismatch")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/login"), 0)
+        end sub
+
+        @it("starts a token refresh only once the origin is confirmed")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.expiresAt = tests.sessions.NOW - 5
+            loop = m.launching(record)
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 0)
+            m.answerCheck(loop, 200, tests.sessions.systemInfo())
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 1)
+            m.assertInvalid(loop.running.r1, "still waits for the refresh")
+        end sub
+
+        @it("clears a refused session locally on sign-out without telling that server")
+        sub _()
+            loop = m.launching(tests.sessions.signedIn())
+            m.answerCheck(loop, 200, tests.sessions.systemInfo("https://other.example"))
+            tests.sessions.send(loop, { requestId: "o1", session: "signOut" })
+            m.assertTrue(loop.delivered.o1.ok)
+            m.assertEqual(api.auth.coordinator.record(loop.session).accessToken, "")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/logout"), 0)
+        end sub
+
+        @it("checks a refused origin again when asked, and takes the server to the update screen meanwhile")
+        sub _()
+            loop = m.launching(tests.sessions.signedIn())
+            m.answerCheck(loop, 200, tests.sessions.fixture("get_system_info_ok"))
+            shell = nav.phase.onSession(nav.phase.create(), api.auth.coordinator.view(loop.session)).shell
+            m.assertEqual(shell.phase, nav.phase.UPDATE_REQUIRED)
+            tests.sessions.send(loop, { requestId: "c1", session: "checkOrigin" })
+            m.assertTrue(loop.delivered.c1.ok)
+            m.assertEqual(tests.sessions.count(loop, "start " + api.auth.server.INFO_PATH), 2)
+            m.answerCheck(loop, 200, tests.sessions.systemInfo())
+            decision = nav.phase.onSession(shell, api.auth.coordinator.view(loop.session))
+            m.assertEqual(decision.shell.phase, nav.phase.PROFILE)
+            m.assertTrue(decision.reset)
+        end sub
+
+        @it("confirms a refused origin when the setup check of the same server passes")
+        sub _()
+            loop = m.launching(tests.sessions.signedIn())
+            m.answerCheck(loop, 200, tests.sessions.fixture("get_system_info_ok"))
+            tests.sessions.send(loop, { requestId: "s1", session: "server", address: "https://silo.example" })
+            tests.sessions.respond(loop, "s1", 200, tests.sessions.systemInfo())
+            m.assertEqual(loop.delivered.s1.body.changed, false)
+            m.assertEqual(api.auth.coordinator.view(loop.session).originStatus, "verified")
+            m.assertEqual(api.auth.coordinator.record(loop.session).accessToken, "acc")
+        end sub
+
+        @it("keeps a launch check going when a setup check of the same server is cancelled")
+        sub _()
+            loop = m.launching(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
+            tests.sessions.send(loop, { requestId: "s1", owner: "setup", session: "server", address: "https://silo.example" })
+            tests.sessions.cancel(loop, { owner: "setup" })
+            m.assertInvalid(loop.delivered.r1, "still waiting")
+            m.answerCheck(loop, 200, tests.sessions.systemInfo())
+            m.assertNotInvalid(loop.running.r1)
+        end sub
+
+        @describe("server setup")
+
+        @it("stores a checked server")
+        sub _()
+            loop = tests.sessions.create(storage.empty())
+            tests.sessions.send(loop, { requestId: "r1", session: "server", address: "Silo.Example/", allowHttp: false })
+            m.assertEqual(loop.running.r1.url, "https://silo.example/api/v2/system/info")
+            m.assertEqual(loop.running.r1.headers["X-Silo-Client"], "Silo Roku")
+            m.assertInvalid(loop.running.r1.headers["X-Silo-Device-Id"])
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.systemInfo())
+            m.assertEqual(loop.delivered.r1.body, { origin: "https://silo.example", changed: true })
+            m.assertEqual(loop.persisted.Peek().origin, "https://silo.example")
+            m.assertEqual(loop.baseUrl, "https://silo.example")
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.originStatus], ["signed_out", "verified"])
+            tests.sessions.send(loop, { requestId: "i1", session: "signIn", username: "laura", password: "pw" })
+            m.assertNotInvalid(loop.running.i1, "the setup check confirmed the origin")
+        end sub
+
+        @it("refuses a new server that does not confirm the origin, and keeps no server")
+        sub _()
+            loop = tests.sessions.create(storage.empty())
+            tests.sessions.send(loop, { requestId: "r1", session: "server", address: "silo.example" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("get_system_info_ok"))
+            m.assertEqual(loop.delivered.r1.error.kind, "origin_unconfirmed")
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "no_server")
+            tests.sessions.send(loop, { requestId: "r2", session: "server", address: "silo.example" })
+            tests.sessions.respond(loop, "r2", 200, tests.sessions.systemInfo("https://cdn.example"))
+            m.assertEqual(loop.delivered.r2.error.kind, "origin_mismatch")
+            tests.sessions.send(loop, { requestId: "i1", session: "signIn", username: "laura", password: "pw" })
+            m.assertEqual(loop.delivered.i1.error.kind, "no_server")
+        end sub
+
+        @it("ends the session and cancels other requests when the server changes")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/home", auth: "profile", owner: "home" })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/catalog", auth: "account", owner: "home" })
+            tests.sessions.send(loop, { requestId: "r3", session: "server", address: "https://other.example" })
+            tests.sessions.respond(loop, "r3", 200, tests.sessions.systemInfo("https://other.example"))
+            m.assertEqual(loop.delivered.r2.error.reason, "server")
+            m.assertEqual(loop.delivered.r1.error.kind, "profile_required")
+            saved = loop.persisted.Peek()
+            m.assertEqual([saved.origin, saved.accessToken, saved.accountId], ["https://other.example", "", ""])
+            m.assertEqual(api.auth.coordinator.view(loop.session).reason, "server_changed")
+            m.assertTrue(tests.sessions.position(loop, "server https://other.example") >= 0)
+        end sub
+
+        @it("never issues a request the server change cancelled while it waited for a slot")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", session: "server", address: "https://other.example" })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home" })
+            tests.sessions.send(loop, { requestId: "r3", path: "/api/v2/catalog" })
+            tests.sessions.send(loop, { requestId: "r4", path: "/api/v2/search" })
+            m.assertInvalid(loop.running.r4, "queued behind three interactive transfers")
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.systemInfo("https://other.example"))
+            m.assertEqual(loop.delivered.r4.error.reason, "server")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/search"), 0)
+            m.assertTrue(loop.running.IsEmpty())
+        end sub
+
+        @it("times out a queued request whose deadline passed before a completion freed its slot")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/home" })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/catalog" })
+            tests.sessions.send(loop, { requestId: "r3", path: "/api/v2/genres" })
+            tests.sessions.send(loop, { requestId: "r4", method: "POST", path: "/api/v2/me/favorites", body: { id: "m1" }, timeoutMs: 1000 })
+            loop.ms = 1001
+            tests.sessions.respond(loop, "r1", 200, { items: [] })
+            m.assertTrue(loop.delivered.r1.ok)
+            m.assertEqual(loop.delivered.r4.error.kind, "timeout")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/me/favorites"), 0)
+        end sub
+
+        @it("keeps the session when the same server is checked again")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", session: "server", address: "https://silo.example/" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.systemInfo())
+            m.assertEqual(loop.delivered.r1.body.changed, false)
+            m.assertEqual(api.auth.coordinator.record(loop.session).accessToken, "acc")
+            m.assertEqual(tests.sessions.count(loop, "persist"), 0)
+        end sub
+
+        @it("requires api_major 2")
+        @params(1, 200, "server_update_required")
+        @params(3, 200, "server_update_required")
+        @params(2, 404, "server_update_required")
+        @params(2, 0, "unreachable")
+        sub _(major as Integer, code as Integer, kind as String)
+            loop = tests.sessions.create(storage.empty())
+            tests.sessions.send(loop, { requestId: "r1", session: "server", address: "silo.example" })
+            info = tests.sessions.systemInfo()
+            info.api_major = major
+            tests.sessions.respond(loop, "r1", code, info)
+            m.assertEqual(loop.delivered.r1.error.kind, kind)
+            m.assertEqual(api.auth.coordinator.record(loop.session).origin, "")
+        end sub
+
+        @it("refuses an address before any request")
+        @params("http://silo.local:8096", false, "needs_http_confirmation")
+        @params("https://user:pw@silo.example", false, "credentials_in_address")
+        @params("ftp://silo.example", true, "unsupported_scheme")
+        sub _(address as String, allowHttp as Boolean, kind as String)
+            loop = tests.sessions.create(storage.empty())
+            tests.sessions.send(loop, { requestId: "r1", session: "server", address: address, allowHttp: allowHttp })
+            m.assertEqual(loop.delivered.r1.error.kind, kind)
+            m.assertEqual(loop.running.Count(), 0)
+        end sub
+
+        @describe("credentials and profiles")
+
+        @it("sends account credentials and device headers to the configured origin only")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
+            m.assertEqual(loop.running.r1.headers, {
+                "Accept": "application/json",
+                "X-Silo-Client": "Silo Roku",
+                "X-Silo-Client-Version": "0.1.0",
+                "X-Silo-Client-Build": "7",
+                "X-Silo-Client-Channel": "dev",
+                "X-Silo-Device-Id": "device-1",
+                "X-Silo-Device-Name": "Roku Ultra",
+                "X-Silo-Device-Platform": "roku",
+                "Authorization": "Bearer acc"
+            })
+            tests.sessions.send(loop, { requestId: "r2", url: "https://elsewhere.example/api/v2/account/me", auth: "account" })
+            m.assertEqual(loop.delivered.r2.error.kind, "invalid_request")
+            tests.sessions.send(loop, { requestId: "r3", url: "https://images.example/a.jpg" })
+            m.assertEqual(loop.running.r3.headers, { "Accept": "application/json" })
+        end sub
+
+        @it("refuses credential and identity headers a caller sets, on any origin")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", url: "https://elsewhere.example/x", headers: { "authorization": "Bearer stolen" } })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home", headers: { "X-PROFILE-TOKEN": "pvt" } })
+            tests.sessions.send(loop, { requestId: "r3", url: "https://elsewhere.example/x", headers: { "X-Silo-Device-Id": "device-1" } })
+            for each id in ["r1", "r2", "r3"]
+                m.assertEqual(loop.delivered[id].error.kind, "invalid_request", id)
+            end for
+            m.assertTrue(loop.running.IsEmpty())
+        end sub
+
+        @it("names the requests whose bodies hold the password, a PIN, or a refresh token")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            tests.sessions.send(loop, { requestId: "r2", session: "server", address: "https://silo.example" })
+            m.assertTrue(api.auth.coordinator.sendsSecret(loop.session, "r1"))
+            m.assertFalse(api.auth.coordinator.sendsSecret(loop.session, "r2"), "server check")
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r3", session: "verifyPin", profile: { id: "p-owner", hasPin: true }, pin: "1234" })
+            tests.sessions.send(loop, { requestId: "r4", path: "/api/v2/account/me", auth: "account" })
+            tests.sessions.respond(loop, "r4", 401, tests.sessions.fixture("token_refresh_required"))
+            refresh = tests.sessions.runningId(loop, "/api/v2/auth/refresh")
+            m.assertTrue(api.auth.coordinator.sendsSecret(loop.session, "r3"))
+            m.assertTrue(api.auth.coordinator.sendsSecret(loop.session, refresh))
+            m.assertFalse(api.auth.coordinator.sendsSecret(loop.session, "r4"), "router request")
+            tests.sessions.send(loop, { requestId: "r5", session: "signOut" })
+            logout = tests.sessions.runningId(loop, "/api/v2/auth/logout")
+            m.assertTrue(util.isString(logout))
+            m.assertFalse(api.auth.coordinator.sendsSecret(loop.session, util.text(logout)), "logout carries the token as a header")
+        end sub
+
+        @it("refuses requests the session cannot authorize")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/profiles", auth: "account" })
+            m.assertEqual(loop.delivered.r1.error.kind, "signed_out")
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home", auth: "profile" })
+            m.assertEqual(loop.delivered.r2.error.kind, "profile_required")
+        end sub
+
+        @it("sends X-Profile-Id alone for a profile without a PIN")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            profile = api.auth.profiles.list(tests.sessions.fixture("list_profiles_ok"))[0]
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: profile })
+            m.assertEqual(loop.delivered.r1.body.profile, { id: "p-owner", name: "Laura", hasPin: false, isChild: false, avatarUrl: "/avatars/presets/fox.png" })
+            m.assertEqual(loop.persisted.Peek().profileId, "p-owner")
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home", auth: "profile" })
+            m.assertEqual(loop.running.r2.headers["X-Profile-Id"], "p-owner")
+            m.assertFalse(loop.running.r2.headers.DoesExist("X-Profile-Token"))
+            m.assertEqual(api.auth.coordinator.view(loop.session).profile.id, "p-owner")
+            ' The shell draws the profile's avatar from it (spec section 5.3).
+            m.assertEqual(api.auth.coordinator.view(loop.session).profile.avatarUrl, "/avatars/presets/fox.png")
+        end sub
+
+        @it("asks for the PIN of a locked profile without a token, and sends the pair once verified")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            locked = { id: "p-kid", name: "Kid", hasPin: true, isChild: true }
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: locked })
+            m.assertEqual(loop.delivered.r1.error.kind, "pin_required")
+            m.assertInvalid(api.auth.coordinator.view(loop.session).profile)
+
+            tests.sessions.send(loop, { requestId: "r2", session: "verifyPin", profile: locked, pin: "1234" })
+            m.assertEqual(loop.running.r2.request.path, "/api/v2/profiles/p-kid/verify-pin")
+            m.assertEqual(loop.running.r2.request.body, { pin: "1234" })
+            m.assertFalse(loop.running.r2.headers.DoesExist("X-Profile-Id"))
+            tests.sessions.respond(loop, "r2", 200, tests.sessions.fixture("verify_profile_pin_ok"))
+            result = loop.delivered.r2
+            m.assertEqual(result.body.outcome, "verified")
+            m.assertEqual(result.body.profile, { id: "p-kid", name: "Kid", hasPin: true, isChild: true, avatarUrl: "" })
+            m.assertEqual(Instr(1, FormatJson(result), "pvt_fixture"), 0)
+            m.assertEqual(loop.persisted.Peek().profileTokens, [{ id: "p-kid", token: "pvt_fixture" }])
+            m.assertTrue(api.auth.coordinator.view(loop.session).profile.isChild)
+
+            tests.sessions.send(loop, { requestId: "r3", path: "/api/v2/home", auth: "profile" })
+            m.assertEqual([loop.running.r3.headers["X-Profile-Id"], loop.running.r3.headers["X-Profile-Token"]], ["p-kid", "pvt_fixture"])
+            ' The stored token reopens the profile later without the PIN.
+            tests.sessions.send(loop, { requestId: "r4", session: "selectProfile", profile: locked })
+            m.assertTrue(loop.delivered.r4.ok)
+        end sub
+
+        @it("answers a wrong PIN and a lockout without retrying")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            locked = { id: "p-owner", name: "Laura", hasPin: true, isChild: false }
+            tests.sessions.send(loop, { requestId: "r1", session: "verifyPin", profile: locked, pin: "0000" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("verify_profile_pin_wrong"))
+            m.assertEqual(loop.delivered.r1.body.outcome, "wrong")
+            lockout = { type: "https://siloserver.org/docs/api/v2/problems/rate_limited", title: "Rate limited", status: 429, detail: "x", instance: "urn:silo:request:2" }
+            tests.sessions.send(loop, { requestId: "r2", session: "verifyPin", profile: locked, pin: "0000" })
+            tests.sessions.respond(loop, "r2", 429, lockout, { "Retry-After": "300" })
+            m.assertEqual(loop.delivered.r2.body, { outcome: "locked", retryAfterSeconds: 300 })
+            tests.sessions.send(loop, { requestId: "r3", session: "verifyPin", profile: locked, pin: "0000" })
+            tests.sessions.respond(loop, "r3", -6)
+            m.assertEqual(loop.delivered.r3.body.outcome, "uncertain")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/profiles/p-owner/verify-pin"), 3)
+            m.assertEqual(api.auth.coordinator.record(loop.session).profileTokens, [])
+        end sub
+
+        @it("sends the verified token even for a profile the screen called unlocked")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", session: "verifyPin", profile: { id: "p-owner", hasPin: false }, pin: "1234" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("verify_profile_pin_ok"))
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home", auth: "profile" })
+            m.assertEqual(loop.running.r2.headers["X-Profile-Token"], "pvt_fixture")
+        end sub
+
+        @it("refreshes but never replays a PIN check that got a 401")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            locked = { id: "p-owner", name: "Laura", hasPin: true, isChild: false }
+            tests.sessions.send(loop, { requestId: "r1", session: "verifyPin", profile: locked, pin: "1234" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            m.assertEqual(loop.delivered.r1.body.outcome, "error")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/profiles/p-owner/verify-pin"), 1)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 1)
+        end sub
+
+        @it("keeps a verified PIN when a refresh happens during the check")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            locked = { id: "p-owner", name: "Laura", hasPin: true, isChild: false }
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.send(loop, { requestId: "r2", session: "verifyPin", profile: locked, pin: "1234" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, "auth1", 200, tests.sessions.fixture("refresh_session_ok"))
+            tests.sessions.respond(loop, "r2", 200, tests.sessions.fixture("verify_profile_pin_ok"))
+            m.assertEqual(loop.delivered.r2.body.outcome, "verified")
+            m.assertEqual(api.auth.coordinator.view(loop.session).profile.id, "p-owner")
+        end sub
+
+        function refusedProof() as Object
+            return { type: "https://siloserver.org/docs/api/v2/problems/profile_verification_required", title: "Profile verification required", status: 403, detail: "x", instance: "urn:silo:request:3" }
+        end function
+
+        @it("asks for the PIN again when the server refuses the profile token")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.profileId = "p-owner"
+            record.profileTokens = [{ id: "p-kid", token: "kid" }, { id: "p-owner", token: "old" }]
+            loop = tests.sessions.create(record)
+            locked = { id: "p-owner", name: "Laura", hasPin: true, isChild: false }
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: locked })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home", auth: "profile" })
+            tests.sessions.respond(loop, "r2", 403, m.refusedProof())
+            m.assertEqual(api.auth.problems.forResult(loop.delivered.r2), api.auth.problems.VERIFY_PIN)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/home"), 1, "the refused request is not replayed")
+            m.assertEqual(loop.persisted.Peek().profileTokens, [{ id: "p-kid", token: "kid" }], "only the refused token goes")
+
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.rememberedProfileId], ["signed_in", "p-owner"])
+            m.assertInvalid(view.profile, "no profile counts as open")
+            m.assertEqual(view.verification, { id: "p-owner", name: "Laura", hasPin: true, isChild: false, avatarUrl: "" })
+            m.assertEqual(api.auth.coordinator.identity(loop.session).profile, "p-owner", "its playback stays fenced to it")
+            tests.sessions.send(loop, { requestId: "r3", path: "/api/v2/home", auth: "profile" })
+            m.assertEqual(loop.delivered.r3.error.kind, "pin_required")
+
+            ' Choosing it again takes a new PIN.
+            tests.sessions.send(loop, { requestId: "r4", session: "selectProfile", profile: { id: "p-owner", name: "Laura", hasPin: false, isChild: false } })
+            m.assertEqual(loop.delivered.r4.error.kind, "pin_required")
+            tests.sessions.send(loop, { requestId: "r5", session: "verifyPin", profile: locked, pin: "1234" })
+            tests.sessions.respond(loop, "r5", 200, tests.sessions.fixture("verify_profile_pin_ok"))
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual(view.profile.id, "p-owner")
+            m.assertInvalid(view.verification)
+            tests.sessions.send(loop, { requestId: "r6", path: "/api/v2/home", auth: "profile" })
+            m.assertEqual(loop.running.r6.headers["X-Profile-Token"], "pvt_fixture")
+        end sub
+
+        @it("returns the app to the profile step for a refused token")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.profileTokens = [{ id: "p-owner", token: "old" }]
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: { id: "p-owner", name: "Laura", hasPin: true, isChild: false } })
+            shell = nav.phase.onSession(nav.phase.create(), api.auth.coordinator.view(loop.session)).shell
+            m.assertEqual(shell.phase, nav.phase.MAIN)
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home", auth: "profile" })
+            tests.sessions.respond(loop, "r2", 403, m.refusedProof())
+            decision = nav.phase.onSession(shell, api.auth.coordinator.view(loop.session))
+            m.assertEqual([decision.shell.phase, decision.root], [nav.phase.PROFILE, nav.route.PROFILE])
+            m.assertTrue(decision.reset)
+        end sub
+
+        @it("keeps a token stored after the refused request was sent")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.profileTokens = [{ id: "p-owner", token: "old" }]
+            loop = tests.sessions.create(record)
+            locked = { id: "p-owner", name: "Laura", hasPin: true, isChild: false }
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: locked })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home", auth: "profile" })
+            tests.sessions.send(loop, { requestId: "r3", session: "verifyPin", profile: locked, pin: "1234" })
+            tests.sessions.respond(loop, "r3", 200, tests.sessions.fixture("verify_profile_pin_ok"))
+            tests.sessions.respond(loop, "r2", 403, m.refusedProof())
+            m.assertEqual(api.auth.coordinator.record(loop.session).profileTokens, [{ id: "p-owner", token: "pvt_fixture" }])
+            m.assertEqual(api.auth.coordinator.view(loop.session).profile.id, "p-owner")
+        end sub
+
+        @it("forgets another profile's refused token without leaving the open one")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.profileTokens = [{ id: "p-kid", token: "kid" }, { id: "p-owner", token: "old" }]
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: { id: "p-kid", name: "Kid", hasPin: true, isChild: true } })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home", auth: "profile" })
+            tests.sessions.send(loop, { requestId: "r3", session: "selectProfile", profile: { id: "p-owner", name: "Laura", hasPin: true, isChild: false } })
+            tests.sessions.respond(loop, "r2", 403, m.refusedProof())
+            m.assertEqual(api.auth.coordinator.record(loop.session).profileTokens, [{ id: "p-owner", token: "old" }])
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual(view.profile.id, "p-owner")
+            m.assertInvalid(view.verification)
+        end sub
+
+        @it("treats a profile as locked once the server asks for its PIN")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: { id: "p-owner", hasPin: false } })
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/home", auth: "profile" })
+            tests.sessions.respond(loop, "r2", 403, m.refusedProof())
+            tests.sessions.send(loop, { requestId: "r3", path: "/api/v2/home", auth: "profile" })
+            m.assertEqual(loop.delivered.r3.error.kind, "pin_required")
+            m.assertTrue(api.auth.coordinator.view(loop.session).verification.hasPin)
+        end sub
+
+        @it("ignores coordinator markers a screen puts on a request")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account", authRetried: true })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/a"), 1)
+            tests.sessions.respond(loop, "auth1", 200, tests.sessions.fixture("refresh_session_ok"))
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/a"), 2)
+        end sub
+
+        @describe("credential-rotating answers")
+
+        @it("applies a refresh that answers after its deadline")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            ' The deadline passes with the refresh in flight: the server may
+            ' already have rotated the refresh token.
+            tests.sessions.tick(loop, api.auth.coordinator.REFRESH_TIMEOUT_MS + 5000)
+            m.assertNotInvalid(loop.running.auth1, "still in flight")
+            m.assertEqual(loop.delivered.r1.error.kind, "timeout", "the waiting request has its own deadline")
+            tests.sessions.respond(loop, "auth1", 200, tests.sessions.fixture("refresh_session_ok"))
+            saved = loop.persisted.Peek()
+            m.assertEqual([saved.accessToken, saved.refreshToken], ["acc2", "ref2"])
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "signed_in")
+        end sub
+
+        @it("applies a sign-in that answers after its deadline")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            tests.sessions.tick(loop, api.auth.coordinator.LOGIN_TIMEOUT_MS + 1000)
+            m.assertEqual(loop.delivered.Count(), 0, "no timeout is answered while it runs")
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("login_ok"))
+            m.assertTrue(loop.delivered.r1.ok)
+            m.assertNotEqual(loop.persisted.Peek().refreshToken, "")
+        end sub
+
+        @it("ends a refresh at its hard cap")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account" })
+            tests.sessions.respond(loop, "r1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.tick(loop, api.scheduler.ROTATING_CAP_MS)
+            m.assertInvalid(loop.running.auth1)
+            m.assertEqual(api.auth.coordinator.record(loop.session).refreshToken, "ref", "an unanswered refresh keeps the tokens")
+        end sub
+
+        @it("drops a rotation marker a screen puts on its request")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "account", rotatesCredentials: true, timeoutMs: 5000 })
+            tests.sessions.tick(loop, 5000)
+            m.assertEqual(loop.delivered.r1.error.kind, "timeout")
+        end sub
+
+        @describe("media headers")
+
+        @it("gives the Video node account and profile headers for the configured origin only")
+        sub _()
+            loop = m.withProfile()
+            tests.sessions.send(loop, { requestId: "h1", session: "mediaHeaders", url: "https://silo.example/api/v2/stream/s-1?st=x" })
+            m.assertEqual(loop.delivered.h1.body.httpHeaders, ["Authorization: Bearer acc", "X-Profile-Id: p-owner"])
+            m.assertTrue(loop.delivered.h1.body.credentialed)
+            ' When the token expires and would be refreshed, for the player's renewal.
+            m.assertEqual([loop.delivered.h1.body.expiresAt, loop.delivered.h1.body.refreshAt], [tests.sessions.NOW + 3600, tests.sessions.NOW + 1800])
+            tests.sessions.send(loop, { requestId: "h2", session: "mediaHeaders", url: "https://proxy.example/media/signed/s-1/master.m3u8" })
+            m.assertEqual(loop.delivered.h2.body, { httpHeaders: [], generation: loop.delivered.h1.body.generation, credentialed: false })
+            ' Same host, other scheme or port: another origin.
+            for each url in ["http://silo.example/api/v2/stream/s-1", "https://silo.example:8443/api/v2/stream/s-1"]
+                tests.sessions.send(loop, { requestId: "h3", session: "mediaHeaders", url: url })
+                m.assertFalse(loop.delivered.h3.body.credentialed, url)
+            end for
+            tests.sessions.send(loop, { requestId: "h4", session: "mediaHeaders", url: "HTTPS://SILO.EXAMPLE:443/api/v2/stream/s-1" })
+            m.assertTrue(loop.delivered.h4.body.credentialed, "a default port and letter case are the same origin")
+        end sub
+
+        @it("sends the profile token with its id for a PIN-locked profile")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            profile = { id: "p-kid", name: "Kid", hasPin: true, isChild: true }
+            tests.sessions.send(loop, { requestId: "r1", session: "verifyPin", profile: profile, pin: "1234" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("verify_profile_pin_ok"))
+            tests.sessions.send(loop, { requestId: "h1", session: "mediaHeaders", url: "https://silo.example/a" })
+            lines = loop.delivered.h1.body.httpHeaders
+            m.assertEqual(lines.Count(), 3)
+            m.assertEqual(lines[1], "X-Profile-Id: p-kid")
+            m.assertEqual(Left(lines[2], 17), "X-Profile-Token: ")
+        end sub
+
+        @it("refreshes first inside the proactive window, on the playback lane")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.refreshAt = tests.sessions.NOW - 1
+            loop = m.withProfile(record)
+            tests.sessions.send(loop, { requestId: "h1", session: "mediaHeaders", url: "https://silo.example/a" })
+            m.assertInvalid(loop.delivered.h1, "waits for the refresh")
+            m.assertEqual(loop.running.auth1.request.lane, "playback")
+            tests.sessions.respond(loop, "auth1", 200, tests.sessions.fixture("refresh_session_ok"))
+            m.assertEqual(loop.delivered.h1.body.httpHeaders[0], "Authorization: Bearer acc2")
+        end sub
+
+        @it("forces a refresh after a 401 only while the tokens are those that failed")
+        sub _()
+            loop = m.withProfile()
+            tests.sessions.send(loop, { requestId: "h1", session: "mediaHeaders", url: "https://silo.example/a" })
+            failed = loop.delivered.h1.body.generation
+            tests.sessions.send(loop, { requestId: "h2", session: "mediaHeaders", url: "https://silo.example/a", generation: failed, refresh: true })
+            m.assertInvalid(loop.delivered.h2)
+            tests.sessions.respond(loop, "auth1", 200, tests.sessions.fixture("refresh_session_ok"))
+            m.assertEqual(loop.delivered.h2.body.httpHeaders[0], "Authorization: Bearer acc2")
+            ' Another load that failed with the old tokens takes the new ones at once.
+            tests.sessions.send(loop, { requestId: "h3", session: "mediaHeaders", url: "https://silo.example/a", generation: failed, refresh: true })
+            m.assertEqual(loop.delivered.h3.body.httpHeaders[0], "Authorization: Bearer acc2")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/refresh"), 1)
+        end sub
+
+        @it("answers signed_out when the refresh it waited for is refused, or without a session")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.refreshAt = tests.sessions.NOW - 1
+            loop = m.withProfile(record)
+            tests.sessions.send(loop, { requestId: "h1", session: "mediaHeaders", url: "https://silo.example/a" })
+            tests.sessions.respond(loop, "auth1", 401, tests.sessions.fixture("refresh_session_revoked"))
+            m.assertEqual(loop.delivered.h1.error.kind, "signed_out")
+            tests.sessions.send(loop, { requestId: "h2", session: "mediaHeaders", url: "https://silo.example/a" })
+            m.assertEqual(loop.delivered.h2.error.kind, "signed_out")
+        end sub
+
+        @describe("playback fences")
+
+        @it("names the identity whose credentials requests carry")
+        sub _()
+            loop = m.withProfile()
+            m.assertEqual(api.auth.coordinator.identity(loop.session), { server: "https://silo.example", account: "1", profile: "p-owner" })
+            m.assertEqual(api.auth.coordinator.identity(tests.sessions.create(tests.sessions.signedOut()).session), { server: "https://silo.example", account: "", profile: "" })
+        end sub
+
+        @it("never sends a request fenced to another identity")
+        sub _()
+            loop = m.withProfile()
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/a", auth: "profile", fence: { server: "https://silo.example", account: "1", profile: "p-other" } })
+            m.assertEqual(loop.delivered.r1.error.kind, "identity_changed")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/a"), 0)
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/a", auth: "profile", fence: { server: "https://silo.example", account: "1", profile: "p-owner" } })
+            m.assertEqual(loop.running.r2.headers["X-Profile-Id"], "p-owner")
+        end sub
+
+        ' Signed in on https://silo.example with the fixture's unlocked profile.
+        function withProfile(record = invalid as Dynamic) as Object
+            if record = invalid then record = tests.sessions.signedIn()
+            loop = tests.sessions.create(record)
+            profile = api.auth.profiles.list(tests.sessions.fixture("list_profiles_ok"))[0]
+            tests.sessions.send(loop, { requestId: "select", session: "selectProfile", profile: profile })
+            return loop
+        end function
+
+    end class
+
+end namespace

@@ -1,0 +1,418 @@
+namespace tests
+
+    ' Seek-bar previews (source/playback/trickplay.bs and trickplayFetch.bs)
+    ' against the server's fixtures: eligibility, the request, the parse, tile
+    ' maths for the fixture's title and a 2-hour one, decode and display
+    ' sizes, retention, and the refresh rule.
+    @suite("playback trickplay")
+    class PlaybackTrickplayTests extends rooibos.BaseTestSuite
+
+        ' The fixture's expires_at in epoch seconds, as an Integer (a 10-digit
+        ' literal is a Double).
+        function expiry() as Integer
+            return Int(1767409445#)
+        end function
+
+        function base() as String
+            return "https://media.example:8443"
+        end function
+
+        function body() as Object
+            return tests.catalogData.fixture("get_watch_trickplay_ok")
+        end function
+
+        function parsed() as Object
+            return playback.trickplay.parseManifest(m.body(), "42", m.base())
+        end function
+
+        ' A 2-hour title as the server's default recipe cuts it: 300 px tiles
+        ' at 16:9 (168 px, even), 10 by 8 to a sheet, one every 10 s.
+        function twoHours(count = 720 as Integer) as Object
+            sheets = []
+            for i = 0 to (count - 1) \ 80
+                sheets.Push({ index: i, url: "/api/v2/artwork/trickplay/7/5/" + i.ToStr() + ".5.jpg?exp=1&sig=s" })
+            end for
+            return playback.trickplay.parseManifest({ file_id: "7", interval_ms: 10000, thumbnail_width: 300, thumbnail_height: 168, tile_columns: 10, tile_rows: 8, thumbnail_count: count, sheets: sheets, expires_at: "2026-10-23T00:00:00Z" }, "7", m.base())
+        end function
+
+        ' The fixture's body with one member replaced.
+        function changed(name as String, value as Dynamic) as Object
+            out = m.body()
+            out[name] = value
+            return out
+        end function
+
+        function tile(manifest as Object, seconds as Dynamic) as Object
+            return playback.trickplay.tileAt(manifest, seconds)
+        end function
+
+        ' A RequestHandle the router has given result, as AppScene's does.
+        function answered(result as Object) as Object
+            handle = CreateObject("roSGNode", "RequestHandle")
+            api.router.deliver(handle, result)
+            return handle
+        end function
+
+        function watchWith(available as Boolean) as Object
+            watch = tests.catalogData.fixture("get_watch_state_ok")
+            watch.versions[0].trickplay_available = available
+            return watch
+        end function
+
+        @describe("eligibility (get_watch_state_ok.json)")
+
+        @it("reads previews only for a file with trickplay_available on a server with trickplay_v1")
+        sub _()
+            features = ["sequenced_progress_v1", "trickplay_v1"]
+            m.assertFalse(playback.trickplay.isEligible(tests.catalogData.fixture("get_watch_state_ok"), "42", features))
+            m.assertTrue(playback.trickplay.isEligible(m.watchWith(true), "42", features))
+            m.assertFalse(playback.trickplay.isEligible(m.watchWith(true), "42", ["sequenced_progress_v1"]))
+            m.assertFalse(playback.trickplay.isEligible(m.watchWith(true), "43", features))
+            m.assertFalse(playback.trickplay.isEligible(m.watchWith(true), "", features))
+            m.assertFalse(playback.trickplay.isEligible(invalid, "42", features))
+        end sub
+
+        @it("finds a file among a playback variant's parts")
+        sub _()
+            watch = { versions: [], playback_variants: [{ parts: [{ versions: [{ file_id: "77", trickplay_available: true }] }] }] }
+            m.assertTrue(playback.trickplay.isEligible(watch, "77", ["trickplay_v1"]))
+            watch.playback_variants[0].parts[0].versions[0].trickplay_available = false
+            m.assertFalse(playback.trickplay.isEligible(watch, "77", ["trickplay_v1"]))
+        end sub
+
+        @describe("the request (catalog-operations.json getWatchTrickplay)")
+
+        @it("reads /watch/{id}/trickplay with file_id as the profile, mapped in ApiTask")
+        sub _()
+            operation = tests.catalogData.operations().getWatchTrickplay
+            request = playback.trickplay.manifestRequest("movie:heat-1995", "42", m.base())
+            m.assertEqual(operation.path, "/api/v2/watch/{id}/trickplay")
+            m.assertEqual(request.path, "/api/v2/watch/movie:heat-1995/trickplay")
+            m.assertEqual(operation.method, "GET")
+            m.assertAAHasKeys(operation.query, ["file_id"])
+            m.assertEqual(request.query, { file_id: "42" })
+            m.assertEqual(request.auth, "profile")
+            m.assertEqual(request.map, { kind: "trickplay", fileId: "42", baseUrl: m.base() })
+            m.assertEqual(playback.trickplay.manifestRequest("a b/c", "1", "").path, "/api/v2/watch/a%20b%2Fc/trickplay")
+        end sub
+
+        @it("is parsed by ApiTask's map step, which refuses a body that is not a manifest")
+        sub _()
+            request = { requestId: "r1", map: playback.trickplay.manifestRequest("movie:heat-1995", "42", m.base()).map }
+            result = catalog.map.apply(request, tests.catalogData.ok(m.body()), tests.catalogData.words())
+            m.assertTrue(result.ok)
+            m.assertEqual(result.body.fileId, "42")
+            m.assertEqual(result.body.sheets.Count(), 11)
+            bad = catalog.map.apply(request, tests.catalogData.ok(m.changed("tile_columns", 0)), tests.catalogData.words())
+            m.assertFalse(bad.ok)
+            m.assertEqual(bad.error.kind, "parse")
+            other = { requestId: "r2", map: playback.trickplay.manifestRequest("movie:heat-1995", "43", m.base()).map }
+            m.assertFalse(catalog.map.apply(other, tests.catalogData.ok(m.body()), tests.catalogData.words()).ok)
+        end sub
+
+        @describe("the manifest (get_watch_trickplay_ok.json)")
+
+        @it("reads the fixture's grid, count, and expiry")
+        sub _()
+            manifest = m.parsed()
+            m.assertTrue(playback.trickplay.isParsed(manifest))
+            m.assertEqual(manifest.fileId, "42")
+            m.assertEqual(manifest.intervalMs, 10000)
+            m.assertEqual(manifest.thumbnailWidth, 300)
+            m.assertEqual(manifest.thumbnailHeight, 126)
+            m.assertEqual(manifest.columns, 10)
+            m.assertEqual(manifest.rows, 10)
+            m.assertEqual(manifest.count, 1020)
+            m.assertEqual(manifest.perSheet, 100)
+            m.assertEqual(manifest.expiresAt, m.expiry())
+        end sub
+
+        @it("resolves the server's relative sheet paths against the base URL, in index order")
+        sub _()
+            body = m.body()
+            body.sheets.Reverse()
+            manifest = playback.trickplay.parseManifest(body, "42", m.base())
+            m.assertEqual(manifest.sheets.Count(), 11)
+            m.assertEqual(manifest.sheets[0], "https://media.example:8443/api/v2/artwork/trickplay/42/9913/0.9913.jpg?exp=1767409445&sig=a")
+            m.assertEqual(manifest.sheets[10], "https://media.example:8443/api/v2/artwork/trickplay/42/9913/10.9913.jpg?exp=1767409445&sig=k")
+            m.assertEqual(playback.trickplay.parseManifest(m.body(), "42", "https://silo.example/silo").sheets[1], "https://silo.example/silo/api/v2/artwork/trickplay/42/9913/1.9913.jpg?exp=1767409445&sig=b")
+        end sub
+
+        @it("keeps an object store's absolute URL on its own origin, and refuses other schemes")
+        sub _()
+            m.assertEqual(playback.trickplay.sheetUrl(m.base(), "https://bucket.s3.example/t/0.jpg?X-Amz-Signature=x"), "https://bucket.s3.example/t/0.jpg?X-Amz-Signature=x")
+            m.assertEqual(playback.trickplay.sheetUrl(m.base(), "//cdn.example/0.jpg?sig=a"), "https://cdn.example/0.jpg?sig=a")
+            m.assertEqual(playback.trickplay.sheetUrl("http://10.0.0.2:8080", "/api/v2/artwork/a.jpg"), "http://10.0.0.2:8080/api/v2/artwork/a.jpg")
+            m.assertEqual(playback.trickplay.sheetUrl(m.base(), "ftp://files.example/0.jpg"), "")
+            m.assertEqual(playback.trickplay.sheetUrl(m.base(), "javascript:alert(1)"), "")
+            m.assertEqual(playback.trickplay.sheetUrl(m.base(), ""), "")
+            m.assertEqual(playback.trickplay.sheetUrl(m.base(), invalid), "")
+            m.assertEqual(playback.trickplay.sheetUrl("", "/api/v2/artwork/a.jpg"), "")
+        end sub
+
+        @it("refuses zero, negative, and non-integer sizes, grids, intervals, and counts")
+        sub _()
+            for each name in ["interval_ms", "thumbnail_width", "thumbnail_height", "tile_columns", "tile_rows", "thumbnail_count"]
+                for each value in [0, -1, 1.5, "10", invalid]
+                    m.assertInvalid(playback.trickplay.parseManifest(m.changed(name, value), "42", m.base()), name)
+                end for
+            end for
+        end sub
+
+        @it("refuses sheets over 3200 px wide or 16384 px tall")
+        sub _()
+            m.assertInvalid(playback.trickplay.parseManifest(m.changed("tile_columns", 11), "42", m.base()))
+            m.assertInvalid(playback.trickplay.parseManifest(m.changed("thumbnail_width", 321), "42", m.base()))
+            m.assertInvalid(playback.trickplay.parseManifest(m.changed("thumbnail_width", 2147483647), "42", m.base()))
+            m.assertInvalid(playback.trickplay.parseManifest(m.changed("thumbnail_height", 1639), "42", m.base()))
+            m.assertNotInvalid(playback.trickplay.parseManifest(m.changed("thumbnail_width", 320), "42", m.base()))
+        end sub
+
+        @it("refuses sheets beyond the grid, missing, repeated, or without a usable URL")
+        sub _()
+            extra = m.body()
+            extra.sheets.Push({ index: 11, url: "/api/v2/artwork/trickplay/42/9913/11.9913.jpg?sig=l" })
+            m.assertInvalid(playback.trickplay.parseManifest(extra, "42", m.base()), "beyond the grid")
+            missing = m.body()
+            missing.sheets.Pop()
+            m.assertInvalid(playback.trickplay.parseManifest(missing, "42", m.base()), "missing")
+            fewer = m.changed("thumbnail_count", 1000)
+            m.assertInvalid(playback.trickplay.parseManifest(fewer, "42", m.base()), "a sheet the count does not need")
+            repeated = m.body()
+            repeated.sheets[10].index = 9
+            m.assertInvalid(playback.trickplay.parseManifest(repeated, "42", m.base()), "repeated")
+            for each index in [-1, 11, "3", 2.5]
+                moved = m.body()
+                moved.sheets[10].index = index
+                m.assertInvalid(playback.trickplay.parseManifest(moved, "42", m.base()), "index")
+            end for
+            badUrl = m.body()
+            badUrl.sheets[3].url = "ftp://files.example/3.jpg"
+            m.assertInvalid(playback.trickplay.parseManifest(badUrl, "42", m.base()), "url")
+            m.assertInvalid(playback.trickplay.parseManifest(m.changed("sheets", invalid), "42", m.base()), "no sheets")
+        end sub
+
+        @it("refuses another file, a missing file ID, an unreadable expiry, or no body")
+        sub _()
+            m.assertInvalid(playback.trickplay.parseManifest(m.body(), "43", m.base()))
+            m.assertNotInvalid(playback.trickplay.parseManifest(m.body(), "", m.base()))
+            m.assertInvalid(playback.trickplay.parseManifest(m.changed("file_id", ""), "", m.base()))
+            for each value in ["tomorrow", "2026-01-03 03:04:05Z", "2026-01-03T03:04:05+0200", 0, invalid]
+                m.assertInvalid(playback.trickplay.parseManifest(m.changed("expires_at", value), "42", m.base()), "expires_at")
+            end for
+            m.assertInvalid(playback.trickplay.parseManifest(invalid, "42", m.base()))
+            m.assertInvalid(playback.trickplay.parseManifest([], "42", m.base()))
+        end sub
+
+        @it("reads RFC 3339 instants with fractions and offsets")
+        sub _()
+            m.assertEqual(playback.values.epochSeconds("2026-01-03T03:04:05Z"), m.expiry())
+            m.assertEqual(playback.values.epochSeconds("2026-01-03T03:04:05.123456Z"), m.expiry())
+            m.assertEqual(playback.values.epochSeconds("2026-01-03T05:04:05+02:00"), m.expiry())
+            m.assertEqual(playback.values.epochSeconds("2026-01-02T21:34:05.5-05:30"), m.expiry())
+            m.assertEqual(playback.values.epochSeconds("2026-01-03T03:04:05+00:00"), m.expiry())
+            m.assertEqual(playback.values.epochSeconds("2026-01-03T03:04:05"), 0)
+        end sub
+
+        @describe("tile maths")
+
+        @it("cuts the fixture's 10x10 sheets, with its last sheet partly filled")
+        sub _()
+            manifest = m.parsed()
+            m.assertEqual(m.tile(manifest, 0), { index: 0, sheet: 0, column: 0, row: 0 })
+            m.assertEqual(m.tile(manifest, 9.999).index, 0)
+            m.assertEqual(m.tile(manifest, 10), { index: 1, sheet: 0, column: 1, row: 0 })
+            m.assertEqual(m.tile(manifest, 995), { index: 99, sheet: 0, column: 9, row: 9 })
+            m.assertEqual(m.tile(manifest, 1000), { index: 100, sheet: 1, column: 0, row: 0 })
+            m.assertEqual(m.tile(manifest, 5432.1), { index: 543, sheet: 5, column: 3, row: 4 })
+            ' 1020 thumbnails: the eleventh sheet holds 20, two rows.
+            m.assertEqual(m.tile(manifest, 10195), { index: 1019, sheet: 10, column: 9, row: 1 })
+        end sub
+
+        @it("clamps before the start and past the end")
+        sub _()
+            manifest = m.parsed()
+            m.assertEqual(m.tile(manifest, -5), { index: 0, sheet: 0, column: 0, row: 0 })
+            m.assertEqual(m.tile(manifest, invalid).index, 0)
+            m.assertEqual(m.tile(manifest, 10200), { index: 1019, sheet: 10, column: 9, row: 1 })
+            m.assertEqual(m.tile(manifest, 999999999).index, 1019)
+        end sub
+
+        @it("cuts a 2-hour title's nine full sheets and a tenth with one thumbnail")
+        sub _()
+            manifest = m.twoHours()
+            m.assertEqual(manifest.sheets.Count(), 9)
+            m.assertEqual(m.tile(manifest, 799.9), { index: 79, sheet: 0, column: 9, row: 7 })
+            m.assertEqual(m.tile(manifest, 800), { index: 80, sheet: 1, column: 0, row: 0 })
+            m.assertEqual(m.tile(manifest, 3600), { index: 360, sheet: 4, column: 0, row: 4 })
+            m.assertEqual(m.tile(manifest, 7199), { index: 719, sheet: 8, column: 9, row: 7 })
+            m.assertEqual(m.tile(manifest, 7200).index, 719)
+            longer = m.twoHours(721)
+            m.assertEqual(longer.sheets.Count(), 10)
+            m.assertEqual(m.tile(longer, 7205), { index: 720, sheet: 9, column: 0, row: 0 })
+            m.assertEqual(m.tile(longer, 9000).index, 720)
+        end sub
+
+        @it("follows the rate ladder's fastest step through every sheet in order, reusing one tile")
+        sub _()
+            manifest = m.twoHours()
+            reused = {}
+            last = 0
+            seen = 0
+            ' 32x moves 64 s every 100 ms (spec section 5.7).
+            for position = 0 to 7300 step 64
+                tile = playback.trickplay.tileAt(manifest, position, reused)
+                m.assertTrue(tile.index < 720 and tile.sheet >= last and tile.sheet <= 8)
+                if tile.sheet <> last then seen = seen + 1
+                last = tile.sheet
+            end for
+            m.assertEqual(seen, 8)
+            m.assertEqual(reused.sheet, 8)
+        end sub
+
+        @describe("decode and display sizes")
+
+        @it("decodes 3000 px sheets 1600 px wide and shows tiles 240 px wide")
+        sub _()
+            decode = playback.trickplay.decodeSize(m.parsed())
+            m.assertEqual(decode.loadWidth, 1600)
+            m.assertEqual(decode.loadHeight, 672)
+            m.assertTrue(Abs(decode.tileWidth - 160) < 0.001)
+            m.assertTrue(Abs(decode.tileHeight - 67.2) < 0.001)
+            m.assertEqual(playback.trickplay.displaySize(m.parsed()), { width: 240, height: 100 })
+            twoHours = m.twoHours()
+            m.assertEqual(playback.trickplay.decodeSize(twoHours).loadHeight, 717)
+            m.assertEqual(playback.trickplay.displaySize(twoHours), { width: 240, height: 134 })
+        end sub
+
+        @it("keeps a narrow sheet's own size and fits a tall one within 1600 px")
+        sub _()
+            narrow = playback.trickplay.parseManifest(m.changed("thumbnail_width", 160), "42", m.base())
+            m.assertEqual(playback.trickplay.decodeSize(narrow).loadWidth, 1600)
+            small = m.changed("tile_columns", 5)
+            small.tile_rows = 4
+            small.thumbnail_count = 220
+            small.sheets = []
+            for i = 0 to 10
+                small.sheets.Push({ index: i, url: "/s/" + i.ToStr() + ".jpg" })
+            end for
+            decode = playback.trickplay.decodeSize(playback.trickplay.parseManifest(small, "42", m.base()))
+            m.assertEqual([decode.loadWidth, decode.loadHeight], [1500, 504])
+            m.assertTrue(Abs(decode.scale - 1) < 0.001)
+            tall = m.changed("thumbnail_height", 534)
+            tall.tile_rows = 8
+            tall.thumbnail_count = 880
+            tallManifest = playback.trickplay.parseManifest(tall, "42", m.base())
+            decode = playback.trickplay.decodeSize(tallManifest)
+            m.assertEqual([decode.loadWidth, decode.loadHeight], [1124, 1600])
+            m.assertEqual(playback.trickplay.displaySize(tallManifest), { width: 134, height: 240 })
+        end sub
+
+        @it("rounds the shown size to even pixels at the tile's aspect")
+        sub _()
+            fourThree = playback.trickplay.parseManifest(m.changed("thumbnail_height", 226), "42", m.base())
+            m.assertEqual(playback.trickplay.displaySize(fourThree), { width: 240, height: 180 })
+            square = playback.trickplay.parseManifest(m.changed("thumbnail_height", 300), "42", m.base())
+            m.assertEqual(playback.trickplay.displaySize(square), { width: 240, height: 240 })
+        end sub
+
+        @it("centres the preview on the scrub point, kept within the scrubber")
+        sub _()
+            m.assertEqual(playback.trickplay.centerX(960.4, 240, 88, 1832), 960)
+            m.assertEqual(playback.trickplay.centerX(100, 240, 88, 1832), 208)
+            m.assertEqual(playback.trickplay.centerX(1830, 240, 88, 1832), 1712)
+            m.assertEqual(playback.trickplay.centerX(1830, 134, 88, 1832), 1765)
+        end sub
+
+        @it("finds the scrub point on the scrubber, at its start while the runtime is unknown")
+        sub _()
+            m.assertEqual(tests.dbl(playback.trickplay.scrubPointX(3600, 7200, 88, 1832)), tests.dbl(960))
+            m.assertEqual(tests.dbl(playback.trickplay.scrubPointX(9000, 7200, 88, 1832)), tests.dbl(1832))
+            m.assertEqual(tests.dbl(playback.trickplay.scrubPointX(-5, 7200, 88, 1832)), tests.dbl(88))
+            m.assertEqual(tests.dbl(playback.trickplay.scrubPointX(60, 0, 88, 1832)), tests.dbl(88))
+            m.assertEqual(tests.dbl(playback.trickplay.scrubPointX(60, invalid, 88, 1832)), tests.dbl(88))
+        end sub
+
+        @describe("retention and refresh")
+
+        @it("keeps sheets for the memory policy's tier, and the low tier's under pressure")
+        sub _()
+            m.assertEqual(playback.trickplay.previewTier({ tier: "standard", level: "normal" }), "standard")
+            m.assertEqual(playback.trickplay.previewTier({ tier: "standard", level: "trim" }), "standard")
+            m.assertEqual(playback.trickplay.previewTier({ tier: "standard", level: "pressure" }), "low")
+            m.assertEqual(playback.trickplay.previewTier({ tier: "standard", level: "critical" }), "low")
+            m.assertEqual(playback.trickplay.previewTier({ tier: "low", level: "normal" }), "low")
+            m.assertEqual(playback.trickplay.previewTier(invalid), "low")
+        end sub
+
+        @it("keeps the current sheet on the low tier, and its neighbour in the direction of travel elsewhere")
+        sub _()
+            m.assertEqual(playback.trickplay.retainedSheets(memory.tier.LOW, 3, 11, false), [3])
+            m.assertEqual(playback.trickplay.retainedSheets("", 3, 11, false), [3])
+            m.assertEqual(playback.trickplay.retainedSheets(memory.tier.STANDARD, 3, 11, false), [3, 4])
+            m.assertEqual(playback.trickplay.retainedSheets(memory.tier.STANDARD, 3, 11, true), [3, 2])
+            m.assertEqual(playback.trickplay.retainedSheets(memory.tier.STANDARD, 0, 11, true), [0, 1])
+            m.assertEqual(playback.trickplay.retainedSheets(memory.tier.STANDARD, 10, 11, false), [10, 9])
+            m.assertEqual(playback.trickplay.retainedSheets(memory.tier.STANDARD, 0, 1, false), [0])
+        end sub
+
+        @it("reads the manifest again for another file, a failed sheet, or URLs about to expire")
+        sub _()
+            manifest = m.parsed()
+            expires = manifest.expiresAt
+            m.assertEqual(playback.trickplay.refreshReason(manifest, {}), "")
+            m.assertEqual(playback.trickplay.refreshReason(manifest, { fileId: "42", now: expires - 31 }), "")
+            m.assertEqual(playback.trickplay.refreshReason(manifest, { now: expires - 30 }), "expired")
+            m.assertEqual(playback.trickplay.refreshReason(manifest, { now: expires + 1, failed: true }), "failed")
+            m.assertEqual(playback.trickplay.refreshReason(manifest, { fileId: "43", failed: true }), "file")
+            m.assertEqual(playback.trickplay.refreshReason(playback.trickplay.pending(), { fileId: "43" }), "")
+            m.assertEqual(playback.trickplay.refreshReason({}, { failed: true }), "")
+        end sub
+
+        @it("swaps URLs only between manifests that cut the same thumbnails")
+        sub _()
+            first = m.parsed()
+            renewed = m.body()
+            for each sheet in renewed.sheets
+                sheet.url = sheet.url.Replace("sig=", "sig=new")
+            end for
+            m.assertTrue(playback.trickplay.hasSameLayout(first, playback.trickplay.parseManifest(renewed, "42", m.base())))
+            m.assertFalse(playback.trickplay.hasSameLayout(first, playback.trickplay.parseManifest(m.changed("interval_ms", 5000), "42", m.base())))
+            m.assertFalse(playback.trickplay.hasSameLayout(invalid, first))
+            m.assertFalse(playback.trickplay.hasSameLayout(first, playback.trickplay.pending()))
+        end sub
+
+        @describe("answers (trickplayFetch.bs)")
+
+        @it("gives the manifest for the latest fetch of the file playing")
+        sub _()
+            handle = m.answered(tests.catalogData.ok(m.parsed()))
+            manifest = playback.trickplay.settle({ fileId: "42", handle: handle }, handle, "42")
+            m.assertEqual(manifest.fileId, "42")
+            m.assertEqual(manifest.sheets.Count(), 11)
+        end sub
+
+        @it("gives {} when the file has no previews or the answer is not a manifest")
+        sub _()
+            notFound = { requestId: "r1", ok: false, status: 404, headers: {}, body: tests.catalogData.fixture("get_watch_trickplay_not_found"), error: { kind: "http", status: 404 } }
+            handle = m.answered(notFound)
+            m.assertEqual(playback.trickplay.settle({ fileId: "42", handle: handle }, handle, "42"), {})
+            other = m.parsed()
+            other.fileId = "43"
+            handle = m.answered(tests.catalogData.ok(other))
+            m.assertEqual(playback.trickplay.settle({ fileId: "42", handle: handle }, handle, "42"), {})
+        end sub
+
+        @it("ignores an older fetch's answer, one for a file no longer playing, and one not yet arrived")
+        sub _()
+            old = m.answered(tests.catalogData.ok(m.parsed()))
+            latest = CreateObject("roSGNode", "RequestHandle")
+            m.assertInvalid(playback.trickplay.settle({ fileId: "42", handle: latest }, old, "42"))
+            m.assertInvalid(playback.trickplay.settle({ fileId: "42", handle: old }, old, "43"))
+            m.assertInvalid(playback.trickplay.settle({ fileId: "42", handle: latest }, latest, "42"))
+            m.assertInvalid(playback.trickplay.settle(invalid, old, "42"))
+        end sub
+
+    end class
+
+end namespace

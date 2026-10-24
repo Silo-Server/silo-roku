@@ -1,0 +1,265 @@
+namespace tests
+
+    @suite("dev harness: plans and identities")
+    class HarnessPlanTests extends rooibos.BaseTestSuite
+
+        @describe("identities")
+
+        @it("lowercases UUIDs into the canonical form the server accepts")
+        sub _()
+            m.assertEqual(harness.lowerUuid(" 3F2B7C9E-0D1A-4C55-9F0E-6A7B8C9D0E1F "), "3f2b7c9e-0d1a-4c55-9f0e-6a7b8c9d0e1f")
+            m.assertTrue(harness.isLowerUuid("3f2b7c9e-0d1a-4c55-9f0e-6a7b8c9d0e1f"))
+            m.assertFalse(harness.isLowerUuid("3F2B7C9E-0D1A-4C55-9F0E-6A7B8C9D0E1F"))
+            m.assertFalse(harness.isLowerUuid("3f2b7c9e0d1a4c559f0e6a7b8c9d0e1f"))
+        end sub
+
+        @it("mints lowercase UUIDs that are also valid attempt identifiers")
+        sub _()
+            id = harness.newUuid()
+            m.assertTrue(harness.isLowerUuid(id), id)
+            m.assertTrue(harness.isBoundedIdentifier(id), id)
+            m.assertNotEqual(id, harness.newUuid())
+        end sub
+
+        @it("applies the server's bounded identifier rule")
+        sub _()
+            m.assertTrue(harness.isBoundedIdentifier("plan:478677870860e5e5"))
+            m.assertFalse(harness.isBoundedIdentifier("short"))
+            m.assertFalse(harness.isBoundedIdentifier("-leading-dash-x"))
+        end sub
+
+        @describe("streamFormat")
+
+        @it("maps the plan's protocol and container, never the URL")
+        sub _()
+            m.assertEqual(harness.streamFormat({ protocol: "hls", container: "hls", url: "/x/stream" }), "hls")
+            m.assertEqual(harness.streamFormat({ protocol: "http_progressive", container: "mp4", url: "/x/master.m3u8" }), "mp4")
+            m.assertEqual(harness.streamFormat({ protocol: "HTTP_PROGRESSIVE", container: "MKV" }), "mkv")
+            m.assertEqual(harness.streamFormat(m.plan().stream), "mp4")
+        end sub
+
+        @it("refuses what it cannot map instead of guessing")
+        sub _()
+            m.assertEqual(harness.streamFormat({ protocol: "http_progressive", container: "webm" }), "")
+            m.assertEqual(harness.streamFormat({ protocol: "dash", container: "mp4" }), "")
+            m.assertEqual(harness.streamFormat({ container: "mp4" }), "")
+            m.assertEqual(harness.streamFormat(invalid), "")
+        end sub
+
+        @describe("seekDecision")
+
+        @it("seeks locally on a complete timeline, subtracting the offset")
+        sub _()
+            decision = harness.seekDecision(m.plan().timeline, 600)
+            m.assertEqual(decision.kind, "local")
+            m.assertEqual(decision.playerPosition, 600.0)
+            decision = harness.seekDecision({ can_seek_anywhere: true, timeline_offset_seconds: 100 }, 130)
+            m.assertEqual(decision.playerPosition, 30.0)
+        end sub
+
+        @it("reanchors on a copy remux, whose window has no end")
+        sub _()
+            decision = harness.seekDecision(m.remuxTimeline(), 2000)
+            m.assertEqual(decision.kind, "reanchor")
+            m.assertEqual(decision.sourcePosition, 2000.0)
+            m.assertEqual(harness.seekDecision(m.remuxTimeline(), 1300).kind, "reanchor")
+        end sub
+
+        @it("seeks locally inside a bounded window and reanchors outside it")
+        sub _()
+            timeline = { can_seek_anywhere: false, timeline_offset_seconds: 1200, seek_window_start_seconds: 1200, seek_window_end_seconds: 1800 }
+            m.assertEqual(harness.seekDecision(timeline, 1500), { kind: "local", playerPosition: 300.0 })
+            m.assertEqual(harness.seekDecision(timeline, 1900).kind, "reanchor")
+            m.assertEqual(harness.seekDecision(timeline, 1100).kind, "reanchor")
+        end sub
+
+        @it("never seeks before zero")
+        sub _()
+            m.assertEqual(harness.seekDecision({ can_seek_anywhere: true, timeline_offset_seconds: 0 }, -40), { kind: "local", playerPosition: 0.0 })
+            m.assertEqual(harness.seekDecision(m.remuxTimeline(), -40), { kind: "reanchor", sourcePosition: 0.0 })
+        end sub
+
+        @it("converts player positions to source positions")
+        sub _()
+            m.assertEqual(harness.sourcePosition(m.remuxTimeline(), 12.5), 1212.5)
+            m.assertEqual(harness.sourcePosition({}, 12.5), 12.5)
+        end sub
+
+        @describe("seekTarget")
+
+        @it("counts from the source position when nothing waits")
+        sub _()
+            m.assertEqual(harness.seekTarget(100, invalid, 30, 7200), 130.0)
+            m.assertEqual(harness.seekTarget(100, invalid, -300, 7200), 0.0)
+        end sub
+
+        @it("counts from a target still waiting behind a replan")
+        sub _()
+            m.assertEqual(harness.seekTarget(100, 700, 300, 7200), 1000.0)
+            m.assertEqual(harness.seekTarget(100, tests.throughNodeField({ at: 400 }).at, -30, 7200), 370.0)
+        end sub
+
+        @it("stops 5 s before a known end")
+        sub _()
+            m.assertEqual(harness.seekTarget(7000, invalid, 300, 7200), 7195.0)
+            m.assertEqual(harness.seekTarget(7000, invalid, 300, 0), 7300.0)
+        end sub
+
+        @describe("failureClassification")
+
+        @it("uses the Android client's vocabulary for Video error codes")
+        sub _()
+            m.assertEqual(harness.failureClassification(-1), "http_failure")
+            m.assertEqual(harness.failureClassification(-2), "transport_failure")
+            m.assertEqual(harness.failureClassification(-4), "source_unavailable")
+            m.assertEqual(harness.failureClassification(-5), "decoder_failure")
+            m.assertEqual(harness.failureClassification(-3), "player_error")
+            m.assertEqual(harness.failureClassification(0), "player_error")
+        end sub
+
+        @describe("subtitles")
+
+        @it("finds no sidecar when the plan's subtitle mode is off")
+        sub _()
+            m.assertInvalid(harness.subtitleArtifact(m.plan()))
+        end sub
+
+        @it("returns the selected render artifact with its track's language")
+        sub _()
+            plan = m.plan()
+            plan.subtitle.mode = "render"
+            plan.subtitle.track_id = "file:42:subtitle:0"
+            plan.subtitle.artifact = { url: "/api/v2/stream/s1/subtitles/0.srt?file_id=42&original=1", format: "SRT", mime_type: "application/x-subrip", timing_origin_seconds: 0 }
+            artifact = harness.subtitleArtifact(plan)
+            m.assertEqual(artifact.format, "srt")
+            m.assertEqual(artifact.language, "eng")
+            m.assertEqual(artifact.url, "/api/v2/stream/s1/subtitles/0.srt?file_id=42&original=1")
+        end sub
+
+        @it("ignores an artifact under modes that do not render it")
+        sub _()
+            plan = m.plan()
+            plan.subtitle.mode = "burn_in"
+            plan.subtitle.artifact = { url: "/x.vtt", format: "vtt" }
+            m.assertInvalid(harness.subtitleArtifact(plan))
+        end sub
+
+        @it("asks the server to shift VTT cues by the negative timeline offset")
+        sub _()
+            url = "/api/v2/stream/s1/subtitles/1.vtt?file_id=42&embedded_stream_index=0"
+            m.assertEqual(harness.subtitleUrlForPlayer(url, "vtt", 1200.5), url + "&timestamp_offset=-1200.5")
+            m.assertEqual(harness.subtitleUrlForPlayer("/s.vtt", "vtt", 3), "/s.vtt?timestamp_offset=-3")
+            m.assertEqual(harness.subtitleUrlForPlayer(url, "vtt", 0), url)
+            m.assertEqual(harness.subtitleUrlForPlayer("/s.srt?original=1", "srt", 1200), "/s.srt?original=1")
+        end sub
+
+        @it("formats seconds without float noise")
+        sub _()
+            m.assertEqual(harness.formatDecimal(12.5), "12.5")
+            m.assertEqual(harness.formatDecimal(-3), "-3")
+            m.assertEqual(harness.formatDecimal(0.125), "0.125")
+            m.assertEqual(harness.formatDecimal(1234.0004), "1234")
+            m.assertEqual(harness.formatDecimal(7.06), "7.06")
+        end sub
+
+        @describe("track choices")
+
+        @it("numbers audio tracks by their position in the version")
+        sub _()
+            choices = harness.audioChoices([{ language: "eng", codec: "eac3", channels: 6, default: true }, { codec: "aac", channels: 2, title: "Commentary" }])
+            m.assertEqual(choices, [{ index: 0, label: "eng eac3 6ch default" }, { index: 1, label: "und aac 2ch 'Commentary'" }])
+            m.assertEqual(harness.audioChoices(invalid), [])
+        end sub
+
+        @it("numbers subtitles in the combined space: externals first, then embedded")
+        sub _()
+            ' The watch projection lists embedded tracks first, with container
+            ' stream indexes; externals follow with indexes after them.
+            tracks = [
+                { index: 2, language: "eng", codec: "subrip", forced: false, default: false, hearing_impaired: false, external: false },
+                { index: 3, language: "fre", codec: "ass", forced: true, default: false, hearing_impaired: false, external: false },
+                { index: 4, language: "eng", codec: "srt", forced: false, default: false, hearing_impaired: true, external: true, title: "English SDH" }
+            ]
+            m.assertEqual(harness.subtitleChoices(tracks), [
+                { index: 0, label: "eng srt external SDH 'English SDH'" },
+                { index: 1, label: "eng subrip" },
+                { index: 2, label: "fre ass forced" }
+            ])
+        end sub
+
+        @it("treats missing subtitle flags as embedded and unforced")
+        sub _()
+            m.assertEqual(harness.subtitleChoices([{ language: "eng" }]), [{ index: 0, label: "eng ?" }])
+            m.assertEqual(harness.subtitleChoices(invalid), [])
+        end sub
+
+        @describe("isNumber")
+
+        @it("accepts intrinsic and boxed numbers")
+        sub _()
+            for each value in [0, 1.5, 2.5#, &h7FFFFFFFFF&, box(0), box(1.5)]
+                m.assertTrue(harness.isNumber(value), type(value))
+            end for
+        end sub
+
+        @it("accepts numbers read back from a node field, as the Task's request")
+        sub _()
+            request = tests.throughNodeField({ startPosition: 0, audioTrackIndex: 1, position: 12.5 })
+            m.assertTrue(harness.isNumber(request.startPosition), type(request.startPosition))
+            m.assertTrue(harness.isNumber(request.audioTrackIndex), type(request.audioTrackIndex))
+            m.assertTrue(harness.isNumber(request.position), type(request.position))
+            m.assertEqual(harness.numberOr(request.position, -1), 12.5)
+        end sub
+
+        @it("refuses strings, Booleans, and invalid")
+        sub _()
+            for each value in ["0", true, invalid, {}]
+                m.assertFalse(harness.isNumber(value), type(value))
+            end for
+        end sub
+
+        @describe("planFacts")
+
+        @it("summarises a playable fixture without URLs or headers")
+        sub _()
+            facts = harness.planFacts(tests.contract.fixture("playback_start_opaque_ids"), "https://silo.example")
+            m.assertEqual(facts.delivery, "original_http")
+            m.assertEqual(facts.decisionReason, "validated_original_playback")
+            m.assertEqual(facts.streamFormat, "mp4")
+            m.assertEqual(facts.mediaOrigin, "api")
+            m.assertEqual(facts.playerStart, 12.5)
+            m.assertTrue(facts.canSeekAnywhere)
+            m.assertEqual(facts.durationSeconds, 7200.0)
+            for each key in facts
+                value = facts[key]
+                if type(value) = "String" or type(value) = "roString" then m.assertEqual(Instr(1, value, "/"), 0, key)
+            end for
+        end sub
+
+        @it("labels an absolute media URL on another origin as a proxy")
+        sub _()
+            decision = tests.contract.fixture("playback_start_opaque_ids")
+            decision.playback_plan.stream.url = "https://proxy.example/stream/v3/s1/token"
+            m.assertEqual(harness.planFacts(decision, "https://silo.example").mediaOrigin, "proxy")
+        end sub
+
+        @it("reports a terminal decision")
+        sub _()
+            decision = { protocol_version: 3, server_features: [], outcome: "adaptation_unavailable", terminal: { reason: "audio_conversion_unsupported", message: "Cannot play", retryable: false } }
+            facts = harness.planFacts(decision, "https://silo.example")
+            m.assertEqual(facts.outcome, "adaptation_unavailable")
+            m.assertEqual(facts.terminalReason, "audio_conversion_unsupported")
+        end sub
+
+        function plan() as Object
+            return tests.contract.fixture("playback_start_opaque_ids").playback_plan
+        end function
+
+        ' A copy remux resumed at 1200 s: the window starts at the keyframe and has no end.
+        function remuxTimeline() as Object
+            return { source_start_seconds: 1200, stream_origin_seconds: 1200, player_start_seconds: 0, timeline_offset_seconds: 1200, can_seek_anywhere: false, seek_restoration: "source_position", seek_window_start_seconds: 1200 }
+        end function
+
+    end class
+
+end namespace

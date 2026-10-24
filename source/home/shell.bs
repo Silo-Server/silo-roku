@@ -1,0 +1,191 @@
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/onboarding/profiles.bs"
+import "pkg:/source/util/values.bs"
+
+' The top bar's items (components/views/TopBar.xml keys).
+namespace mainShell.barItem
+    const SEARCH = "search"
+    const HOME = "home"
+    const MOVIES = "movies"
+    const SERIES = "series"
+    const AVATAR = "avatar"
+end namespace
+
+' The avatar menu's choices (spec section 5.3), in menu order.
+namespace mainShell.menuItem
+    const SWITCH_PROFILE = "switchProfile"
+    const SWITCH_SERVER = "switchServer"
+    const SIGN_OUT = "signOut"
+    ' Development builds only: the diagnostic screen with the dev tools.
+    const DIAGNOSTICS = "diagnostics"
+end namespace
+
+' The main shell around root pages (spec section 5.3), pure: which library
+' tabs show, what a top bar or avatar menu choice does, and where focus goes
+' when a page with the bar is shown again. Home and the library tab pages are
+' stack roots (nav.stack.reset), so the reducer settles Back: content, then
+' the selected tab, then Home, then exit. Components in
+' components/screens/home/ carry out the decisions.
+namespace mainShell
+    ' The profile's "Visible in navigation" preference, as the web and
+    ' Android TV read it: a preference, not access control, so the libraries
+    ' it names are still listed by user/libraries.
+    const HIDDEN_LIBRARIES_KEY = "ui.disabled_library_ids"
+    ' The profile's title art preference (tvOS e5e13323): false shows heroes'
+    ' text titles instead of their logos.
+    const TITLE_ART_KEY = "ui.title_art"
+
+    ' The selected tab of a page with the bar, from its stack entry. Search
+    ' is a pushed page without the bar (D3).
+    function selectedTab(route as String, params as Dynamic) as String
+        if route = nav.route.LIBRARY and util.isObject(params)
+            kind = util.text(params.type)
+            if kind = mainShell.barItem.MOVIES or kind = mainShell.barItem.SERIES then return kind
+        end if
+        return mainShell.barItem.HOME
+    end function
+
+    ' GET /api/v2/settings/values/effective for the hidden libraries and the
+    ' title art preference.
+    function settingsRequest() as Object
+        return { path: "/api/v2/settings/values/effective", query: { keys: [HIDDEN_LIBRARIES_KEY, TITLE_ART_KEY] }, auth: "profile" }
+    end function
+
+    ' Whether heroes show title logos, from an EffectiveSettingCollection:
+    ' only a false ui.title_art turns them off.
+    function titleArtShown(body as Dynamic) as Boolean
+        if not util.isObject(body) or type(body.items) <> "roArray" then return true
+        for each setting in body.items
+            if util.isObject(setting) and util.text(setting.key) = TITLE_ART_KEY
+                return not (util.isBoolean(setting.value) and not setting.value)
+            end if
+        end for
+        return true
+    end function
+
+    ' The hidden library IDs from an EffectiveSettingCollection, as an AA of
+    ' ID strings. The value is an array of positive whole numbers, or the
+    ' legacy JSON text of one; other entries are dropped, as the web does.
+    function hiddenLibraryIds(body as Dynamic) as Object
+        out = {}
+        if not util.isObject(body) or type(body.items) <> "roArray" then return out
+        for each setting in body.items
+            if util.isObject(setting) and util.text(setting.key) = HIDDEN_LIBRARIES_KEY
+                value = setting.value
+                if util.isString(value) and value.Trim() <> "" then value = ParseJson(value)
+                if type(value) = "roArray"
+                    for each entry in value
+                        if util.isNumber(entry) and entry >= 1 and entry = Int(entry) then out[Int(entry).ToStr()] = true
+                    end for
+                end if
+            end if
+        end for
+        return out
+    end function
+
+    ' The library tabs to show, { movies, series }, from user/libraries
+    ' (catalog.summary.libraries) without the hidden libraries. No answer
+    ' shows neither tab.
+    function visibleTabs(summary as Dynamic, hidden as Object) as Object
+        out = { movies: false, series: false }
+        if not util.isObject(summary) or type(summary.libraries) <> "roArray" then return out
+        for each library in summary.libraries
+            if not hidden.DoesExist(util.text(library.id))
+                out.movies = out.movies or util.isTrue(library.movies)
+                out.series = out.series or util.isTrue(library.series)
+            end if
+        end for
+        return out
+    end function
+
+    ' What OK on a top bar item does, from the page whose tab is selected:
+    '   { kind: "content" }                 the selected item: focus the content
+    '   { kind: "menu" }                    the avatar: open its menu
+    '   { kind: "push", route, params }     Search, above the page
+    '   { kind: "switch", route, params }   another tab: its page becomes the root
+    ' Home opened from another page's bar starts with its own bar focused,
+    ' as Back from that bar does (nav.stack.back).
+    function barAction(item as String, selected as String) as Object
+        if item = mainShell.barItem.AVATAR then return { kind: "menu" }
+        if item = selected then return { kind: "content" }
+        if item = mainShell.barItem.SEARCH then return { kind: "push", route: nav.route.SEARCH, params: {} }
+        if item = mainShell.barItem.HOME then return { kind: "switch", route: nav.route.HOME, params: { bar: true } }
+        return { kind: "switch", route: nav.route.LIBRARY, params: { type: item } }
+    end function
+
+    ' The avatar menu's items in groups, which a divider separates, as on
+    ' Android TV without the items the first release leaves out (Watchlist,
+    ' Favorites, History, Watch Party, Settings). debug adds Diagnostics.
+    function menuGroups(debug as Boolean) as Object
+        out = [[mainShell.menuItem.SWITCH_PROFILE], [mainShell.menuItem.SWITCH_SERVER, mainShell.menuItem.SIGN_OUT]]
+        if debug then out.Push([mainShell.menuItem.DIAGNOSTICS])
+        return out
+    end function
+
+    ' The open profile as the bar's avatar and the menu's header draw it
+    ' (ProfileAvatar), the picker's way: { initials, name, tint, uri }, the
+    ' uploaded image resolved against the session's origin, or "" for the
+    ' initial on the profile's colour (spec sections 5.3 and 5.4).
+    function profileBadge(profile as Dynamic, origin as String) as Object
+        if not util.isObject(profile) then profile = {}
+        name = util.text(profile.name)
+        return {
+            initials: onboarding.profiles.initials(name),
+            name: name,
+            tint: onboarding.profiles.tintIndex(util.text(profile.id)),
+            uri: onboarding.profiles.avatarUri(util.text(profile.avatarUrl), origin)
+        }
+    end function
+
+    ' The menu header's second line in capitals: the server's own name
+    ' (theme/branding's server_name) when it has one, else its host and any
+    ' port from the session's origin ("MEDIA.EXAMPLE.COM").
+    function serverLabel(origin as String, name = "" as String) as String
+        if name.Trim() <> "" then return UCase(name.Trim())
+        text = origin
+        mark = Instr(1, text, "://")
+        if mark > 0 then text = Mid(text, mark + 3)
+        slash = Instr(1, text, "/")
+        if slash > 0 then text = Left(text, slash - 1)
+        return UCase(text)
+    end function
+
+    ' What an avatar menu choice does:
+    '   { kind: "push", route, params }  the profile picker, server entry, or
+    '                                    (debug) the diagnostic screen
+    '   { kind: "signOut" }              api.session.signOut; AppScene then
+    '                                    starts over at sign-in
+    ' Both pushed screens already handle being pushed: the picker pops
+    ' itself when the open profile is chosen again, and server entry when
+    ' the same server is entered (a new profile or server resets the stack).
+    function menuAction(item as String) as Dynamic
+        if item = mainShell.menuItem.SWITCH_PROFILE then return { kind: "push", route: nav.route.PROFILE, params: { choose: true } }
+        if item = mainShell.menuItem.SWITCH_SERVER then return { kind: "push", route: nav.route.SETUP, params: { pushed: true } }
+        if item = mainShell.menuItem.SIGN_OUT then return { kind: "signOut" }
+        if item = mainShell.menuItem.DIAGNOSTICS then return { kind: "push", route: nav.route.DIAGNOSTIC, params: {} }
+        return invalid
+    end function
+
+    ' The focus key of a page with the bar: where focus was, the highlighted
+    ' bar item, and the content's own key (nav.focus.newKey), or invalid.
+    function newKey(zone as String, highlighted as String, contentKey as Dynamic) as Object
+        return { zone: zone, barItem: highlighted, content: contentKey }
+    end function
+
+    ' Where focus goes when the page is shown: { zone, barItem, content }.
+    ' Without a key the page starts in its content, or on its bar when
+    ' params.bar says so. A page covered from its avatar (a menu choice)
+    ' comes back to the avatar; from anywhere else on the bar it comes back
+    ' to the selected tab: after Search, as on tvOS (D3), and after another
+    ' tab, which was left for its page.
+    function restoreTarget(key as Dynamic, selected as String, params as Dynamic) as Object
+        if not util.isObject(key)
+            if util.isObject(params) and util.isTrue(params.bar) then return { zone: nav.zone.BAR, barItem: selected, content: invalid }
+            return { zone: nav.zone.CONTENT, barItem: selected, content: invalid }
+        end if
+        if util.text(key.zone) <> nav.zone.BAR then return { zone: nav.zone.CONTENT, barItem: selected, content: key.content }
+        item = selected
+        if util.text(key.barItem) = mainShell.barItem.AVATAR then item = mainShell.barItem.AVATAR
+        return { zone: nav.zone.BAR, barItem: item, content: key.content }
+    end function
+end namespace

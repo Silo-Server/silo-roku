@@ -1,0 +1,779 @@
+import "pkg:/source/api/problem.bs"
+import "pkg:/source/api/request.bs"
+import "pkg:/source/api/response.bs"
+import "pkg:/source/api/scheduler.bs"
+import "pkg:/source/auth/server.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/playback/results.bs"
+import "pkg:/source/playback/jobs.bs"
+import "pkg:/source/playback/probe.bs"
+import "pkg:/source/playback/gates.bs"
+import "pkg:/source/playback/capabilities.bs"
+import "pkg:/source/playback/intent.bs"
+import "pkg:/source/playback/options.bs"
+
+' Playback in ApiTask (plan sections 6.3, 6.6, and 6.8): the requests the
+' player's reducer asks for, built and sent here, and the durable jobs that
+' outlive the player. Pure, like the account session: ApiTask passes env and
+' carries out the decisions returned, in order:
+'   { kind: "submit", request }   queue a request built here; its result
+'                                 comes back through settled()
+'   { kind: "reply", result }     send this envelope to the player
+'   { kind: "session", input }    run a session operation that waited
+'                                 (deferSession)
+'   { kind: "log", level, message, fields }
+'                                 level "debug", "info", or "warn"
+' env: { now (milliseconds on a clock that is never reset), device
+' (roDeviceInfo, or a facade in specs), identity
+' (api.auth.coordinator.identity), app ({ version, build, channel }), gates
+' (a playback.gates.evaluate context, or invalid for this build's), uuid()
+' (a canonical UUID, for the stops this file builds itself) }.
+'
+' Operations arrive as requests with a `playback` member:
+'   { playback: "start", command }                a reducer "start" command
+'   { playback: "replan", command, audioTracks }  a "replan" command and the
+'                                                 intent's audio tracks
+'   { playback: "progress", command }
+'   { playback: "routeEvent", command }
+'   { playback: "job", job }                      a "job" command's job
+'   { playback: "refuseAudioCodec", codec }
+'   { playback: "outputContext" }                 re-probe the output
+' Each gets one envelope whose body is { kind, status, ... }: kind is a
+' playback.results kind, "fenced" when the command belongs to an identity
+' other than the one whose credentials ApiTask holds, or "queued" for a job.
+' A start adds decision, bodyText, and context; a replan decision and
+' bodyText; outputContext outputContextId. Requests built here run on the
+' playback lane with no owner, so the player's teardown never cancels them.
+'
+' Bodies: a command with bodyText is sent byte for byte under the same
+' identifiers. Otherwise the body is built here once, from this start's probe
+' and the serializer, and its text goes back for the reducer to replay.
+'
+' Starts outlive their player (plan section 6.6): each attempt's start is
+' tracked with the owner of the player that sent it until the reducer takes
+' over its session, which it does by handing over the session's stop, or
+' gives it up: a replan or progress post answered that the session ended,
+' or the same player starts a newer attempt, which also settles an earlier
+' start whose answer stayed uncertain. When that owner is released
+' (cancel) before then, the session the start was accepted with is stopped
+' here, and a start whose answer was uncertain is replayed, byte for byte,
+' to learn whether there is one.
+namespace playback.worker
+    const CAPABILITIES_PATH = "/api/v2/playback/capabilities"
+    const START_PATH = "/api/v2/playback/start"
+    const ROUTE_EVENTS_PATH = "/api/v2/playback/route-events"
+    const SESSION_PATH = "/api/v2/playback/"
+    const REQUEST_TIMEOUT_MS = 15000
+    ' Capabilities are reused for this long, then revalidated with
+    ' If-None-Match (the server sends a strong ETag).
+    const CAPABILITIES_TTL_MS = 600000
+    ' Start contexts kept for verbatim replays.
+    const MAX_CONTEXTS = 8
+    ' Request IDs of requests built here; router IDs start with "r".
+    const ID_PREFIX = "pb"
+    ' Starts tracked at once; the oldest goes first.
+    const MAX_STARTS = 8
+    ' A start whose player is gone is replayed this many times (1 to 16 s
+    ' apart) after uncertain answers, as the reducer would.
+    const ORPHAN_RETRIES = 5
+
+    ' starts: { attemptId, owner, fence, installationId, bodyText, sessionId,
+    ' requestId (the start in flight, or ""), orphaned, tries, retryAt }.
+    function create() as Object
+        return { ops: {}, nextId: 0, capabilities: invalid, ladders: {}, jobs: playback.jobs.create(), deferred: invalid, refusedAudio: [], contexts: {}, contextOrder: [], starts: [] }
+    end function
+
+    ' Whether requestId is a request built here, whose result goes to settled().
+    function owns(state as Object, requestId as String) as Boolean
+        return state.ops.DoesExist(requestId)
+    end function
+
+    function operation(state as Object, input as Object, env as Object) as Object
+        op = util.text(input.playback)
+        if op = "job" then return addJob(state, input, env)
+        if op = "refuseAudioCodec"
+            codec = LCase(util.text(input.codec))
+            if codec <> "" and not util.contains(state.refusedAudio, codec) then state.refusedAudio.Push(codec)
+            return [logged("info", "audio codec refused", { codec: codec }), reply(answer(input, "ok", 0))]
+        end if
+        if op = "outputContext"
+            ' Plan section 6.6: the normalized output after a capability
+            ' event; the player sends output_change only when it differs.
+            out = answer(input, "ok", 0)
+            out.body.outputContextId = probeNow(state, env).outputContextId
+            return [reply(out)]
+        end if
+        command = input.command
+        if not util.isObject(command) or not util.isObject(command.fence) then return [reply(answer(input, "rejected", 0))]
+        if not fencedTo(command.fence, env.identity) then return [reply(answer(input, "fenced", 0))]
+        ' While an identity change waits, the identity that is leaving starts
+        ' nothing new; replays of what is in flight still go.
+        if (op = "start" or op = "replan") and departing(state, command.fence) and not playback.values.isText(command.bodyText) then return [reply(answer(input, "fenced", 0))]
+        if op = "start" then return startPlayback(state, input, env)
+        if op = "replan" then return replan(state, input, env)
+        if op = "progress" then return [submit(build(state, { method: "POST", path: sessionPath(command.session_id) + "/progress", bodyText: util.text(command.bodyText), fence: command.fence }, { kind: "progress", input: input, since: state.jobs.serial }))]
+        if op = "routeEvent" then return [submit(build(state, { method: "POST", path: ROUTE_EVENTS_PATH, bodyText: FormatJson(command.body), fence: command.fence }, { kind: "routeEvent", input: input }))]
+        return [reply(answer(input, "rejected", 0))]
+    end function
+
+    ' A request built here ended.
+    function settled(state as Object, request as Object, result as Object, env as Object) as Object
+        op = state.ops[request.requestId]
+        if op = invalid then return []
+        state.ops.Delete(request.requestId)
+        if op.kind = "job" then return jobSettled(state, op, result, env)
+        if op.kind = "capabilities" then return capabilitiesRead(state, op, result, env)
+        kind = resultKind(result)
+        decisions = []
+        if op.kind = "start" then decisions = startSettled(state, op, kind, result, env)
+        if op.kind = "progress" or op.kind = "replan"
+            command = op.input.command
+            ' The reducer gives up a session the server no longer has, and
+            ' never stops it: neither is it stopped here when its player
+            ' leaves (hardware run 8, defect 3).
+            if kind = "notFound" or kind = "ended" then forgetSession(state, util.text(command.session_id))
+            ' A post of an identity that has gone retires nothing.
+            if op.kind = "progress" and kind = "ok" and fencedTo(command.fence, env.identity)
+                for each record in playback.jobs.supersede(state.jobs, command.fence, util.text(command.session_id), op.since)
+                    decisions.Push(jobLog(record))
+                end for
+            end if
+        end if
+        ' A replay for a player that is gone has no one to answer.
+        if util.isTrue(op.orphan) then return decisions
+        out = answer(op.input, kind, result.status)
+        if op.kind = "start" or op.kind = "replan"
+            if kind = "ok" then out.body.decision = result.body
+            out.body.bodyText = op.bodyText
+            if op.kind = "start" then out.body.context = op.context
+        end if
+        decisions.Push(reply(out))
+        return decisions
+    end function
+
+    ' Expires jobs, stops the sessions of an identity that is leaving, runs
+    ' session operations whose wait is over, releases jobs and starts of an
+    ' identity that is gone, replays the starts of players that are gone, and
+    ' sends the jobs that are due with the current identity's credentials.
+    function tick(state as Object, env as Object) as Object
+        decisions = []
+        for each record in playback.jobs.expire(state.jobs, env.now)
+            decisions.Push(jobLog(record))
+        end for
+        decisions.Append(settleDeparting(state, env))
+        decisions.Append(releaseSession(state, env))
+        for each record in playback.jobs.releaseOthers(state.jobs, env.identity, "identity_changed")
+            decisions.Push(jobLog(record))
+        end for
+        decisions.Append(releaseStarts(state, env.identity))
+        decisions.Append(replayOrphans(state, env))
+        for each job in playback.jobs.due(state.jobs, env.now, env.identity)
+            decisions.Push(submit(jobRequest(state, job)))
+        end for
+        return decisions
+    end function
+
+    ' When tick() next has work, on env's clock, or invalid.
+    function nextWake(state as Object) as Dynamic
+        wake = playback.jobs.nextWake(state.jobs)
+        if state.deferred <> invalid and (wake = invalid or state.deferred.until < wake) then wake = state.deferred.until
+        for each entry in state.starts
+            if awaitsReplay(entry) and (wake = invalid or entry.retryAt < wake) then wake = entry.retryAt
+        end for
+        return wake
+    end function
+
+    ' Cancellation from the render thread ({ owner } or { requestId }), before
+    ' the scheduler's: session operations still waiting (deferSession) are
+    ' dropped, their password and PIN discarded, and answered cancelled; and
+    ' the starts of a released owner pass to this file. A sign-out is the one
+    ' exception: the viewer asked to leave this device's session, and it runs
+    ' whatever becomes of the screen that asked.
+    function cancel(state as Object, rule as Object, env as Object) as Object
+        key = "requestId"
+        reason = "request"
+        if util.isString(rule.owner)
+            key = "owner"
+            reason = "owner"
+        end if
+        target = util.text(rule[key])
+        if target = "" then return []
+        decisions = []
+        deferred = state.deferred
+        if deferred <> invalid
+            kept = []
+            for each item in deferred.inputs
+                if util.text(item[key]) = target and util.text(item.session) <> "signOut"
+                    item.Delete("password")
+                    item.Delete("pin")
+                    decisions.Push(logged("info", "session operation cancelled while it waited", { operation: util.text(item.session) }))
+                    decisions.Push(reply(api.response.failure(item, "cancelled", reason)))
+                else
+                    kept.Push(item)
+                end if
+            end for
+            deferred.inputs = kept
+            if kept.Count() = 0 then state.deferred = invalid
+        end if
+        if key <> "owner" then return decisions
+        for each entry in startsOf(state, target)
+            if entry.sessionId <> invalid
+                decisions.Append(stopStart(state, entry, env, "its player left"))
+            else if not entry.orphaned
+                entry.orphaned = true
+                ' An uncertain start the reducer would have replayed.
+                if entry.requestId = "" then entry.retryAt = env.now
+            end if
+        end for
+        return decisions
+    end function
+
+    ' --- Start ----------------------------------------------------------------
+
+    ' Capabilities (cached per server and profile), then the probe and the
+    ' body. A replay sends the stored text and answers with the context it
+    ' was built with.
+    function startPlayback(state as Object, input as Object, env as Object) as Object
+        command = input.command
+        if playback.values.isText(command.bodyText) then return [submit(startRequest(state, input, command.bodyText, state.contexts[util.text(command.playback_attempt_id)]))]
+        key = capabilitiesKey(env.identity)
+        caps = state.capabilities
+        if util.isTrue(command.refreshCapabilities) or (caps <> invalid and caps.key <> key)
+            state.capabilities = invalid
+            caps = invalid
+        end if
+        if caps <> invalid and env.now - caps.readAt < CAPABILITIES_TTL_MS then return buildStart(state, input, caps, env)
+        headers = {}
+        if caps <> invalid and caps.etag <> "" then headers["If-None-Match"] = caps.etag
+        return [submit(build(state, { method: "GET", path: CAPABILITIES_PATH, headers: headers, responseHeaders: ["etag"], fence: command.fence }, { kind: "capabilities", input: input }))]
+    end function
+
+    ' Plan section 6.6: playback needs state "available", allowed, protocol
+    ' 3, and sequenced_progress_v1.
+    function capabilitiesRead(state as Object, op as Object, result as Object, env as Object) as Object
+        caps = state.capabilities
+        if result.status = 304 and caps <> invalid
+            caps.readAt = env.now
+            return buildStart(state, op.input, caps, env)
+        end if
+        if result.ok <> true then return [reply(answer(op.input, resultKind(result), result.status))]
+        body = result.body
+        if not isAvailable(body)
+            fields = {}
+            if util.isObject(body) then fields = { state: util.text(body.state), allowed: util.isTrue(body.allowed) }
+            out = answer(op.input, "rejected", result.status)
+            out.body.reason = "playback_unavailable"
+            return [logged("warn", "playback is not available", fields), reply(out)]
+        end if
+        etag = ""
+        if util.isObject(result.headers) then etag = util.text(result.headers.etag)
+        caps = { key: capabilitiesKey(env.identity), etag: etag, installationId: body.installation_id, features: body.features, readAt: env.now }
+        state.capabilities = caps
+        return buildStart(state, op.input, caps, env)
+    end function
+
+    function isAvailable(body as Dynamic) as Boolean
+        if not util.isObject(body) or util.text(body.state) <> "available" or not util.isTrue(body.allowed) then return false
+        if not util.contains(body.protocol_versions, 3) or not util.contains(body.features, "sequenced_progress_v1") then return false
+        return playback.values.isText(body.installation_id)
+    end function
+
+    ' The start body (plan section 6.3): this start's audio probe with the
+    ' cached video ladder, the gates, the track the start names, and the
+    ' interim AAC rule; serialized once.
+    function buildStart(state as Object, input as Object, caps as Object, env as Object) as Object
+        command = input.command
+        intent = command.intent
+        if not util.isObject(intent) then intent = {}
+        probe = probeNow(state, env)
+        gates = playback.gates.evaluate(probe, env.gates)
+        tracks = startTracks(command, intent, playback.capabilities.audioCodecs(probe, gates), probe.audio.multichannelAac)
+        request = {
+            installationId: caps.installationId,
+            fileId: util.text(intent.fileId),
+            profileId: util.text(env.identity.profile),
+            playbackAttemptId: util.text(command.playback_attempt_id),
+            qualityPreference: util.text(command.quality_preference),
+            audioTrack: tracks.audio,
+            subtitleTrack: tracks.subtitle,
+            pinsVersion: util.isTrue(intent.pinsVersion),
+            stereoAacRestart: util.isTrue(command.stereoAacRestart),
+            app: env.app,
+            serverFeatures: caps.features
+        }
+        ' Positions cross node fields, which may narrow a Double; they were
+        ' whole milliseconds when the reducer minted them.
+        if util.isNumber(command.start_position) then request.startPosition = playback.values.roundMs(command.start_position)
+        body = playback.capabilities.startBody(probe, gates, request)
+        if body = invalid
+            out = answer(input, "rejected", 0)
+            out.body.reason = "playback_closed"
+            return [reply(out)]
+        end if
+        if util.isNumber(command.bandwidth_estimate_kbps) then body.bandwidth_estimate_kbps = command.bandwidth_estimate_kbps
+        if util.isNumber(command.bandwidth_cap_kbps) then body.bandwidth_cap_kbps = command.bandwidth_cap_kbps
+        context = { installationId: caps.installationId, features: caps.features, multichannelAac: probe.audio.multichannelAac, outputContextId: probe.outputContextId }
+        remember(state, request.playbackAttemptId, context)
+        return [logged("debug", "start body", startFields(body)), submit(startRequest(state, input, FormatJson(body), context))]
+    end function
+
+    ' The start body's member names, never their values (assumption AG-292
+    ' (5)): those it has, sorted, and which of the members that carry the
+    ' detail page's choices (the version, whether it is pinned, the tracks)
+    ' it leaves out, so a device run sees the hand-off in the console.
+    function startFields(body as Object) as Object
+        names = body.Keys()
+        names.Sort()
+        absent = []
+        for each name in ["file_id", "allow_alternate_versions", "audio_track_index", "subtitle_track_index"]
+            if not body.DoesExist(name) then absent.Push(name)
+        end for
+        return { present: names.Join(","), absent: absent.Join(",") }
+    end function
+
+    ' The tracks a start names, as { audio, subtitle } for the serializer. A
+    ' new attempt for the same viewing (a restart) names the server's
+    ' selected_tracks. A first start names the detail page's choices (the
+    ' intent's audioIndex and subtitleIndex, server ordinals,
+    ' playback.options.initialTracks). Without Detail's audio (Auto) it names
+    ' the version's effective_audio_track_index (the intent's
+    ' effectiveAudioIndex), as tvOS does, else the track
+    ' playback.options.initialAudio chooses for the profile's audio language
+    ' (the intent's audioLanguage) and this start's codecs. codec and
+    ' channels come from the intent's tracks, for the interim AAC rule, and
+    ' are not sent.
+    function startTracks(command as Object, intent as Object, codecs as Object, multichannelAac as Boolean) as Object
+        selected = command.selected_tracks
+        if util.isObject(selected)
+            out = { audio: invalid, subtitle: invalid }
+            if util.isObject(selected.audio)
+                out.audio = { id: util.text(selected.audio.id), index: selected.audio.index }
+                known = playback.intent.audioTrack(intent.audioTracks, selected.audio.index)
+                if known <> invalid
+                    out.audio.codec = known.codec
+                    out.audio.channels = known.channels
+                end if
+            end if
+            if util.isObject(selected.subtitle) then out.subtitle = { id: util.text(selected.subtitle.id), index: selected.subtitle.index }
+            return out
+        end if
+        out = { audio: invalid, subtitle: invalid }
+        chosen = invalid
+        if util.isNumber(intent.audioIndex) and intent.audioIndex >= 0
+            chosen = playback.intent.audioTrack(intent.audioTracks, intent.audioIndex)
+        else if util.isNumber(intent.effectiveAudioIndex) and intent.effectiveAudioIndex >= 0
+            chosen = playback.intent.audioTrack(intent.audioTracks, intent.effectiveAudioIndex)
+        end if
+        if chosen = invalid and playback.values.isArray(intent.audioTracks)
+            index = playback.options.initialAudio(intent.audioTracks, util.text(intent.audioLanguage), { codecs: codecs, multichannelAac: multichannelAac })
+            chosen = playback.intent.audioTrack(intent.audioTracks, index)
+        end if
+        if chosen <> invalid then out.audio = { index: chosen.index, codec: chosen.codec, channels: chosen.channels }
+        if util.isNumber(intent.subtitleIndex) and intent.subtitleIndex >= 0 then out.subtitle = { index: Int(intent.subtitleIndex) }
+        return out
+    end function
+
+    function startRequest(state as Object, input as Object, bodyText as String, context as Dynamic) as Object
+        request = build(state, { method: "POST", path: START_PATH, bodyText: bodyText, fence: input.command.fence }, { kind: "start", input: input, bodyText: bodyText, context: context })
+        trackStart(state, input, bodyText, context, request.requestId)
+        return request
+    end function
+
+    ' --- Starts that outlive their player ---------------------------------------
+
+    ' A player's newer attempt means its reducer has settled every earlier
+    ' start of that player: it handed over the stops of their sessions,
+    ' learned they had ended (restart() after a session the server lost),
+    ' or gave up a start whose answer stayed uncertain (an error after its
+    ' replays, then Retry or Try Anyway). None is stopped or replayed here.
+    ' Replaying a superseded start once its player had left created a session
+    ' only to stop it without a sample (hardware run 9, T3d), which could
+    ' write that start's older position over the newer session's; a session
+    ' an uncertain start did create is left to the server's expiry (spec
+    ' section 9.5, assumption AG-145).
+    sub trackStart(state as Object, input as Object, bodyText as String, context as Dynamic, requestId as String)
+        command = input.command
+        attemptId = util.text(command.playback_attempt_id)
+        entry = startEntry(state, attemptId)
+        if entry = invalid
+            owner = util.text(input.owner)
+            if owner <> ""
+                for each earlier in startsOf(state, owner)
+                    removeStart(state, earlier)
+                end for
+            end if
+            fence = command.fence
+            installationId = ""
+            if util.isObject(context) then installationId = util.text(context.installationId)
+            if installationId = "" and state.capabilities <> invalid then installationId = util.text(state.capabilities.installationId)
+            entry = { attemptId: attemptId, owner: owner, fence: { server: util.text(fence.server), account: util.text(fence.account), profile: util.text(fence.profile), contentId: util.text(fence.contentId) }, installationId: installationId, bodyText: bodyText, sessionId: invalid, requestId: "", orphaned: false, tries: 0, retryAt: invalid }
+            state.starts.Push(entry)
+            while state.starts.Count() > MAX_STARTS
+                state.starts.Shift()
+            end while
+        end if
+        entry.requestId = requestId
+        entry.retryAt = invalid
+    end sub
+
+    ' A tracked start answered. A session accepted for a player that is gone,
+    ' or for an identity that is leaving, is stopped here; an uncertain answer
+    ' for a player that is gone is replayed later; any other answer that
+    ' created no session ends the tracking.
+    function startSettled(state as Object, op as Object, kind as String, result as Object, env as Object) as Object
+        entry = startEntry(state, util.text(op.input.command.playback_attempt_id))
+        if entry = invalid then return []
+        entry.requestId = ""
+        decision = result.body
+        if kind = "ok" and util.isObject(decision) and decision.outcome = "playable" and playback.values.isText(decision.session_id)
+            entry.sessionId = decision.session_id
+            if entry.orphaned then return stopStart(state, entry, env, "its player left")
+            if departing(state, entry.fence) then return stopStart(state, entry, env, "its identity is changing")
+            return []
+        end if
+        if kind = "offline" or kind = "retry"
+            ' The reducer replays it while its player is there.
+            if not entry.orphaned then return []
+            entry.tries = entry.tries + 1
+            if entry.tries <= ORPHAN_RETRIES
+                entry.retryAt = env.now + playback.jobs.backoffMs(entry.tries)
+                return []
+            end if
+        end if
+        removeStart(state, entry)
+        if entry.orphaned then return [logged("warn", "start of a player that left ended without a session", { kind: kind })]
+        return []
+    end function
+
+    ' Queues the stop for a tracked start's session: unplayed, so its body is
+    ' the installation and a new stop_id.
+    function stopStart(state as Object, entry as Object, env as Object, why as String) as Object
+        removeStart(state, entry)
+        fence = { server: entry.fence.server, account: entry.fence.account, profile: entry.fence.profile, contentId: entry.fence.contentId, attempt: entry.attemptId, session: entry.sessionId }
+        body = { installation_id: entry.installationId, stop_id: LCase(env.uuid()) }
+        job = { kind: "stop", id: entry.sessionId + ":stop", fence: fence, sessionId: entry.sessionId, sequence: invalid, uncertain: false, bodyText: FormatJson(body) }
+        decisions = [logged("info", "stopping a session because " + why, invalid)]
+        decisions.Append(queueJob(state, job, env))
+        return decisions
+    end function
+
+    ' Replays, byte for byte, each start of a player that is gone whose
+    ' uncertain answer's wait is over.
+    function replayOrphans(state as Object, env as Object) as Object
+        decisions = []
+        for each entry in state.starts
+            if awaitsReplay(entry) and env.now >= entry.retryAt
+                input = { requestId: "", owner: "", command: { fence: entry.fence, playback_attempt_id: entry.attemptId } }
+                request = build(state, { method: "POST", path: START_PATH, bodyText: entry.bodyText, fence: entry.fence }, { kind: "start", input: input, bodyText: entry.bodyText, context: invalid, orphan: true })
+                entry.requestId = request.requestId
+                entry.retryAt = invalid
+                decisions.Push(submit(request))
+            end if
+        end for
+        return decisions
+    end function
+
+    ' Stops tracking starts of an identity other than identity that are not
+    ' in flight: their sessions cannot be stopped with its credentials.
+    function releaseStarts(state as Object, identity as Object) as Object
+        decisions = []
+        kept = []
+        for each entry in state.starts
+            if entry.requestId = "" and not fencedTo(entry.fence, identity)
+                if entry.sessionId <> invalid or entry.orphaned then decisions.Push(logged("warn", "a session of an identity that is gone is left to the server", invalid))
+            else
+                kept.Push(entry)
+            end if
+        end for
+        state.starts = kept
+        return decisions
+    end function
+
+    ' The reducer handed over a session's stop, or the session ended.
+    sub forgetSession(state as Object, sessionId as String)
+        kept = []
+        for each entry in state.starts
+            if entry.sessionId = invalid or entry.sessionId <> sessionId then kept.Push(entry)
+        end for
+        state.starts = kept
+    end sub
+
+    ' Whether entry is a start of a player that is gone, waiting to be replayed.
+    function awaitsReplay(entry as Object) as Boolean
+        return entry.orphaned and entry.requestId = "" and util.isNumber(entry.retryAt)
+    end function
+
+    function startEntry(state as Object, attemptId as String) as Dynamic
+        for each entry in state.starts
+            if entry.attemptId = attemptId then return entry
+        end for
+        return invalid
+    end function
+
+    function startsOf(state as Object, owner as String) as Object
+        out = []
+        for each entry in state.starts
+            if entry.owner = owner then out.Push(entry)
+        end for
+        return out
+    end function
+
+    sub removeStart(state as Object, target as Object)
+        kept = []
+        for each entry in state.starts
+            if entry.attemptId <> target.attemptId then kept.Push(entry)
+        end for
+        state.starts = kept
+    end sub
+
+    ' --- Replan ---------------------------------------------------------------
+
+    ' The reducer's members plus the serializer's capability parts, from a
+    ' fresh audio probe and the track the replan selects.
+    function replan(state as Object, input as Object, env as Object) as Object
+        command = input.command
+        if playback.values.isText(command.bodyText) then return [submit(replanRequest(state, input, command.bodyText))]
+        body = playback.values.copy(command.members)
+        body.position_seconds = playback.values.roundMs(body.position_seconds)
+        probe = probeNow(state, env)
+        gates = playback.gates.evaluate(probe, env.gates)
+        audio = invalid
+        if util.isObject(body.selected_tracks) and util.isObject(body.selected_tracks.audio)
+            known = playback.intent.audioTrack(input.audioTracks, body.selected_tracks.audio.index)
+            if known <> invalid then audio = { codec: known.codec, channels: known.channels }
+        end if
+        serverFeatures = []
+        if state.capabilities <> invalid then serverFeatures = state.capabilities.features
+        body.Append(playback.capabilities.replanParts(probe, gates, { audioTrack: audio, stereoAacRestart: util.isTrue(command.stereoAacRestart), app: env.app, serverFeatures: serverFeatures }))
+        return [submit(replanRequest(state, input, FormatJson(body)))]
+    end function
+
+    function replanRequest(state as Object, input as Object, bodyText as String) as Object
+        command = input.command
+        return build(state, { method: "POST", path: sessionPath(command.session_id) + "/replan", bodyText: bodyText, fence: command.fence }, { kind: "replan", input: input, bodyText: bodyText })
+    end function
+
+    ' --- Jobs -----------------------------------------------------------------
+
+    ' A job handed over after its identity has gone is released before it
+    ' touches the queue or the starts tracked: its player's stop is never
+    ' sent with another identity's credentials, and it neither retires nor
+    ' holds the current identity's jobs for the same content (W9-2).
+    function addJob(state as Object, input as Object, env as Object) as Object
+        job = input.job
+        if not util.isObject(job) or not util.isObject(job.fence) or not playback.values.isText(job.sessionId) or not playback.values.isText(job.bodyText) then return [reply(answer(input, "rejected", 0))]
+        if not fencedTo(job.fence, env.identity) then return [jobLog(playback.jobs.record(job, "identity_changed")), reply(answer(input, "fenced", 0))]
+        if job.kind = "stop" then forgetSession(state, job.sessionId)
+        decisions = queueJob(state, job, env)
+        decisions.Push(reply(answer(input, "queued", 0)))
+        decisions.Append(tick(state, env))
+        return decisions
+    end function
+
+    ' Queues a job fenced to the identity whose credentials ApiTask holds,
+    ' and releases one fenced to any other.
+    function queueJob(state as Object, job as Object, env as Object) as Object
+        if not fencedTo(job.fence, env.identity) then return [jobLog(playback.jobs.record(job, "identity_changed"))]
+        decisions = []
+        for each record in playback.jobs.add(state.jobs, job, env.now)
+            decisions.Push(jobLog(record))
+        end for
+        return decisions
+    end function
+
+    ' A stop is DELETE /playback/{session_id}; a progress sample is POST
+    ' .../progress. Both send the reducer's text.
+    function jobRequest(state as Object, job as Object) as Object
+        fields = { method: "POST", path: sessionPath(job.sessionId) + "/progress", bodyText: job.bodyText, fence: job.fence }
+        if job.kind = "stop"
+            fields.method = "DELETE"
+            fields.path = sessionPath(job.sessionId)
+        end if
+        return build(state, fields, { kind: "job", id: job.id })
+    end function
+
+    function jobSettled(state as Object, op as Object, result as Object, env as Object) as Object
+        kind = resultKind(result)
+        ' A job sent just before an identity change waits to be released.
+        if kind = "fenced" then kind = "offline"
+        record = playback.jobs.finish(state.jobs, op.id, kind, env.now)
+        if record = invalid then return []
+        return [jobLog(record)]
+    end function
+
+    function jobLog(record as Object) as Object
+        level = "warn"
+        if record.reason = "done" then level = "info"
+        return logged(level, "playback job " + record.reason, { kind: record.kind })
+    end function
+
+    ' --- Identity changes -----------------------------------------------------
+
+    ' Whether a session operation must wait (plan section 6.6): one that
+    ' changes whose credentials requests carry waits while the current
+    ' identity has playback in progress (busy), at most
+    ' playback.jobs.SETTLE_MS, so its jobs, the starts and replans in flight,
+    ' and the stops of its live sessions finish with that identity's
+    ' credentials before the new identity is published; later operations
+    ' queue behind it. cancel() drops waiting operations.
+    function deferSession(state as Object, input as Object, env as Object) as Boolean
+        op = util.text(input.session)
+        if op <> "server" and op <> "signIn" and op <> "signOut" and op <> "selectProfile" and op <> "verifyPin" then return false
+        if state.deferred <> invalid
+            state.deferred.inputs.Push(input)
+            return true
+        end if
+        if not changesIdentity(input, env.identity) or not busy(state, env.identity) then return false
+        state.deferred = { inputs: [input], identity: env.identity, until: env.now + playback.jobs.SETTLE_MS, settled: false }
+        return true
+    end function
+
+    ' Whether a session operation would change the identity: selecting or
+    ' unlocking the profile already open, or checking the server already
+    ' configured, does not.
+    function changesIdentity(input as Object, identity as Object) as Boolean
+        op = util.text(input.session)
+        if op = "selectProfile" or op = "verifyPin"
+            if not util.isObject(input.profile) then return false
+            return util.text(input.profile.id) <> util.text(identity.profile)
+        end if
+        if op = "server"
+            address = api.auth.server.normalize(input.address, util.isTrue(input.allowHttp))
+            return address.url <> invalid and address.url <> util.text(identity.server)
+        end if
+        return true
+    end function
+
+    ' Whether identity has playback in progress: jobs, a start or replan in
+    ' flight, or a session a start was accepted with that no stop covers yet.
+    function busy(state as Object, identity as Object) as Boolean
+        if playback.jobs.pending(state.jobs, identity) > 0 then return true
+        for each entry in state.starts
+            if fencedTo(entry.fence, identity) then return true
+        end for
+        for each id in state.ops
+            op = state.ops[id]
+            if op.kind = "replan" and fencedTo(op.input.command.fence, identity) then return true
+        end for
+        return false
+    end function
+
+    ' Whether fence belongs to an identity whose change is waiting.
+    function departing(state as Object, fence as Object) as Boolean
+        return state.deferred <> invalid and fencedTo(fence, state.deferred.identity)
+    end function
+
+    ' Once per identity change: the sessions its starts were accepted with,
+    ' which a player may still be playing, are stopped now, while that
+    ' identity's credentials still apply. The player's own stop, which comes
+    ' when it is closed for the new identity, is too late to be sent.
+    function settleDeparting(state as Object, env as Object) as Object
+        deferred = state.deferred
+        if deferred = invalid or deferred.settled then return []
+        deferred.settled = true
+        live = []
+        for each entry in state.starts
+            if entry.sessionId <> invalid and fencedTo(entry.fence, deferred.identity) then live.Push(entry)
+        end for
+        decisions = []
+        for each entry in live
+            decisions.Append(stopStart(state, entry, env, "its identity is changing"))
+        end for
+        return decisions
+    end function
+
+    ' The deferred operations, once their identity's playback has settled or
+    ' the wait is over; jobs still left are released with "identity_changed".
+    function releaseSession(state as Object, env as Object) as Object
+        deferred = state.deferred
+        if deferred = invalid then return []
+        if busy(state, deferred.identity) and env.now < deferred.until then return []
+        state.deferred = invalid
+        decisions = []
+        for each record in playback.jobs.release(state.jobs, deferred.identity, "identity_changed")
+            decisions.Push(jobLog(record))
+        end for
+        for each item in deferred.inputs
+            decisions.Push({ kind: "session", input: item })
+        end for
+        return decisions
+    end function
+
+    ' --- Helpers --------------------------------------------------------------
+
+    ' The probe for one request: audio and display now, the video ladder
+    ' cached per output context, less the audio codecs the player refused.
+    ' output_context_id stays the probed one: a refusal is not an output change.
+    function probeNow(state as Object, env as Object) as Object
+        probe = playback.probe.collectCached(env.device, playback.gates.probeOptions(), state.ladders)
+        if state.refusedAudio.Count() = 0 then return probe
+        kept = []
+        for each codec in probe.audio.codecs
+            if not util.contains(state.refusedAudio, codec) then kept.Push(codec)
+        end for
+        probe.audio.codecs = kept
+        return probe
+    end function
+
+    ' A request built here: the playback lane, the profile's credentials, no
+    ' owner, and the command's fence ({ server, account, profile }), which
+    ' ApiTask checks before it sends credentials.
+    function build(state as Object, fields as Object, op as Object) as Object
+        state.nextId = state.nextId + 1
+        id = ID_PREFIX + state.nextId.ToStr()
+        spec = { requestId: id, owner: "", auth: "profile", lane: api.scheduler.LANE_PLAYBACK, timeoutMs: REQUEST_TIMEOUT_MS }
+        spec.Append(fields)
+        fence = fields.fence
+        if util.isObject(fence) then spec.fence = { server: util.text(fence.server), account: util.text(fence.account), profile: util.text(fence.profile) }
+        state.ops[id] = op
+        return api.request.normalize(spec)
+    end function
+
+    function sessionPath(sessionId as Dynamic) as String
+        return SESSION_PATH + api.request.escape(util.text(sessionId))
+    end function
+
+    function capabilitiesKey(identity as Object) as String
+        return util.text(identity.server) + "|" + util.text(identity.account) + "|" + util.text(identity.profile)
+    end function
+
+    function fencedTo(fence as Object, identity as Object) as Boolean
+        return util.text(fence.server) = util.text(identity.server) and util.text(fence.account) = util.text(identity.account) and util.text(fence.profile) = util.text(identity.profile)
+    end function
+
+    sub remember(state as Object, attemptId as String, context as Object)
+        if not state.contexts.DoesExist(attemptId) then state.contextOrder.Push(attemptId)
+        state.contexts[attemptId] = context
+        while state.contextOrder.Count() > MAX_CONTEXTS
+            state.contexts.Delete(state.contextOrder.Shift())
+        end while
+    end sub
+
+    ' The playback.results kind of an envelope; "fenced" when ApiTask refused
+    ' to send it with another identity's credentials.
+    function resultKind(result as Object) as String
+        if result.ok <> true and util.isObject(result.error) and result.error.kind = "identity_changed" then return "fenced"
+        problem = invalid
+        if util.isObject(result.error) then problem = result.error.problemType
+        return playback.results.kind(result.status, problem)
+    end function
+
+    function answer(input as Object, kind as String, status as Integer) as Object
+        id = ""
+        if util.isString(input.requestId) then id = input.requestId
+        return { requestId: id, ok: true, status: status, headers: {}, body: { kind: kind, status: status }, error: invalid }
+    end function
+
+    function submit(request as Object) as Object
+        return { kind: "submit", request: request }
+    end function
+
+    function reply(result as Object) as Object
+        return { kind: "reply", result: result }
+    end function
+
+    function logged(level as String, message as String, fields as Object) as Object
+        return { kind: "log", level: level, message: message, fields: fields }
+    end function
+end namespace

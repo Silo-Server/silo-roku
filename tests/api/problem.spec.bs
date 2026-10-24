@@ -1,0 +1,98 @@
+namespace tests
+
+    ' Bodies are copied from silo-server contracts/api/v2/fixtures/ at 3bc9e58c
+    ' (file named above each); M0-7's fixture sync replaces the inline copies.
+    @suite("api problem")
+    class ApiProblemTests extends rooibos.BaseTestSuite
+
+        @describe("parse")
+
+        @it("reads a rate limit with its Retry-After (rate_limited.json)")
+        sub _()
+            body = ParseJson(`{"type":"https://siloserver.org/docs/api/v2/problems/rate_limited","title":"Rate limited","status":429,"detail":"Too many requests; retry after the Retry-After delay.","instance":"urn:silo:request:00000000000000000000000b"}`)
+            headers = [{ "content-type": "application/problem+json" }, { "retry-after": "30" }]
+            m.assertEqual(api.problem.parse(body, headers), { type: "rate_limited", status: 429, instance: "urn:silo:request:00000000000000000000000b", retryAfterSeconds: 30 })
+        end sub
+
+        @it("reads a provider outage without Retry-After (refresh_session_provider_unavailable.json)")
+        sub _()
+            body = ParseJson(`{"type":"https://siloserver.org/docs/api/v2/problems/provider_unavailable","title":"Provider unavailable","status":503,"detail":"The sign-in provider could not confirm the account. Try again later; the session stays valid.","instance":"urn:silo:request:0000000000000000000002ca"}`)
+            problem = api.problem.parse(body, [])
+            m.assertEqual(problem.type, "provider_unavailable")
+            m.assertEqual(problem.status, 503)
+            m.assertInvalid(problem.retryAfterSeconds)
+        end sub
+
+        @it("reads auth and profile problems (token_refresh_required.json, get_catalog_filters_locked_profile.json)")
+        sub _()
+            refresh = ParseJson(`{"type":"https://siloserver.org/docs/api/v2/problems/token_refresh_required","title":"Token refresh required","status":401,"detail":"The account's role changed; refresh the session and retry the request.","instance":"urn:silo:request:0000000000000000000002ad"}`)
+            locked = ParseJson(`{"type":"https://siloserver.org/docs/api/v2/problems/profile_verification_required","title":"Profile verification required","status":403,"detail":"The declared profile is locked; verify it and retry with X-Profile-Token.","instance":"urn:silo:request:00000000000000000000011a"}`)
+            m.assertEqual(api.problem.parse(refresh).type, "token_refresh_required")
+            m.assertEqual(api.problem.parse(locked).type, "profile_verification_required")
+            m.assertEqual(api.problem.parse(locked).status, 403)
+        end sub
+
+        @it("ignores validation errors and detail (validation_failed_body.json, playback_progress_conflict.json)")
+        sub _()
+            validation = ParseJson(`{"type":"https://siloserver.org/docs/api/v2/problems/validation_failed","title":"Validation failed","status":422,"detail":"The request did not pass validation; see errors.","instance":"urn:silo:request:000000000000000000000003","errors":[{"location":"body.count","code":"out_of_range","detail":"expected number <= 10"}]}`)
+            conflict = ParseJson(`{"type":"https://siloserver.org/docs/api/v2/problems/progress_conflict","title":"Playback progress conflict","status":409,"detail":"The sequence already has different progress","instance":"urn:silo:request:00000000000000000000027e"}`)
+            m.assertEqual(api.problem.parse(validation), { type: "validation_failed", status: 422, instance: "urn:silo:request:000000000000000000000003", retryAfterSeconds: invalid })
+            m.assertEqual(api.problem.parse(conflict).type, "progress_conflict")
+        end sub
+
+        @it("gives invalid for bodies that are not Problems")
+        sub _()
+            m.assertInvalid(api.problem.parse(ParseJson(`{"server_version":"unavailable","api_major":2}`)))
+            m.assertInvalid(api.problem.parse(ParseJson(`{"type":"x","status":500}`)))
+            m.assertInvalid(api.problem.parse(ParseJson(`[1,2]`)))
+            m.assertInvalid(api.problem.parse("<html>Bad gateway</html>"))
+            m.assertInvalid(api.problem.parse(invalid))
+        end sub
+
+        @it("leaves a missing or empty instance invalid")
+        sub _()
+            problem = api.problem.parse({ type: "https://siloserver.org/docs/api/v2/problems/internal_error", title: "Internal error", status: 500, instance: "" })
+            m.assertEqual(problem.type, "internal_error")
+            m.assertInvalid(problem.instance)
+        end sub
+
+        @describe("typeName")
+
+        @it("takes the last path segment")
+        sub _()
+            m.assertEqual(api.problem.typeName("https://siloserver.org/docs/api/v2/problems/dependency_unavailable"), "dependency_unavailable")
+            m.assertEqual(api.problem.typeName("https://siloserver.org/docs/api/v2/problems/not_found/"), "not_found")
+            m.assertEqual(api.problem.typeName("https://siloserver.org/docs/api/v2/problems/conflict?x=1#y"), "conflict")
+            m.assertEqual(api.problem.typeName("/problems/session_expired"), "session_expired")
+        end sub
+
+        @it("gives invalid for a type without a segment")
+        sub _()
+            m.assertInvalid(api.problem.typeName("about:blank"))
+            m.assertInvalid(api.problem.typeName("https://"))
+            m.assertInvalid(api.problem.typeName(""))
+            m.assertInvalid(api.problem.typeName(404))
+        end sub
+
+        @describe("retryAfter and header")
+
+        @it("reads delay-seconds by case-insensitive name from either header form")
+        sub _()
+            m.assertEqual(api.problem.retryAfter([{ "Retry-After": " 120 " }]), 120)
+            m.assertEqual(api.problem.retryAfter({ "retry-after": "0" }), 0)
+            m.assertEqual(api.problem.retryAfter([{ "retry-after": "5" }, { "Retry-After": "7" }]), 7)
+        end sub
+
+        @it("gives invalid for HTTP dates, negative, malformed, and absent values")
+        sub _()
+            m.assertInvalid(api.problem.retryAfter([{ "retry-after": "Wed, 21 Oct 2026 07:28:00 GMT" }]))
+            m.assertInvalid(api.problem.retryAfter([{ "retry-after": "-5" }]))
+            m.assertInvalid(api.problem.retryAfter([{ "retry-after": "1.5" }]))
+            m.assertInvalid(api.problem.retryAfter([{ "retry-after": "9999999999" }]))
+            m.assertInvalid(api.problem.retryAfter([{ "etag": "x" }]))
+            m.assertInvalid(api.problem.retryAfter(invalid))
+        end sub
+
+    end class
+
+end namespace

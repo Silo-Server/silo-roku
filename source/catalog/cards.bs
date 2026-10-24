@@ -1,0 +1,377 @@
+import "pkg:/source/catalog/art.bs"
+import "pkg:/source/catalog/detail.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Card shapes (spec section 5.2); CardContent.shape and RowContent.shape.
+namespace catalog.shape
+    ' 176x264 posters.
+    const POSTER = "poster"
+    ' 360x200 cards with a progress bar: Continue Watching, Next Up, and
+    ' rows of episodes and series.
+    const LANDSCAPE = "landscape"
+    ' 360x200 episode stills on series detail, captioned "S01E02 · Title".
+    const EPISODE = "episode"
+    ' A season capsule on series detail: text only.
+    const SEASON = "season"
+end namespace
+
+' Server items to card fields: the CardContent fields (components/views/
+' CardContent.xml) as a plain AA, which ApiTask's map step sets on a node.
+' Pure; only what cards, the hero, and the audio guide show is kept.
+' Copy comes from words(), built once from the locale strings.
+namespace catalog.cards
+    ' A synopsis is cut here: the hero shows two lines.
+    const MAX_SYNOPSIS = 300
+    const SEPARATOR = " · "
+
+    ' The locale templates the fields use, from an i18n strings table.
+    function words(strings as Object) as Object
+        out = {}
+        for each key in ["runtimeHoursMinutes", "runtimeHours", "runtimeMinutes", "episodeTag", "episodeCaption", "seasonsOne", "seasonsOther", "ratingImdb", "ratingTmdb", "audioEpisode"]
+            out[key] = i18n.lookup(strings, "catalog." + key)
+        end for
+        ' The hero's meta line.
+        for each key in ["timeLeft", "seasonEpisode", "seasonOnly", "episodeOnly"]
+            out[key] = i18n.lookup(strings, "home." + key)
+        end for
+        return out
+    end function
+
+    ' The shape of a section's cards: progress sections (Continue Watching,
+    ' Next Up) are landscape, as on Android TV, and the rest posters.
+    function shapeFor(sectionType as Dynamic) as String
+        name = LCase(util.text(sectionType))
+        for each mark in ["continue", "in_progress", "next_up", "up_next"]
+            if Instr(1, name, mark) > 0 then return catalog.shape.LANDSCAPE
+        end for
+        return catalog.shape.POSTER
+    end function
+
+    ' A row's shape from its section type and items, as tvOS's Home decides
+    ' it (SectionRow.isEpisodeRow): shapeFor's landscape rows, and rows with
+    ' an episode whose items are all episodes, seasons, or series, which
+    ' show stills; a row with a movie in it keeps posters.
+    function rowShape(sectionType as Dynamic, items as Dynamic) as String
+        shape = shapeFor(sectionType)
+        if shape <> catalog.shape.POSTER or type(items) <> "roArray" then return shape
+        episodes = false
+        for each item in items
+            kind = ""
+            if util.isObject(item) then kind = LCase(util.text(item.type))
+            if kind = "episode"
+                episodes = true
+            else if kind <> "series" and kind <> "season"
+                return shape
+            end if
+        end for
+        if episodes then return catalog.shape.LANDSCAPE
+        return shape
+    end function
+
+    ' Whether a section is Continue Watching, whose cards' meta lines say
+    ' the time left.
+    function isResumeRow(sectionType as Dynamic) as Boolean
+        name = LCase(util.text(sectionType))
+        return name = "continue_watching" or name = "in_progress"
+    end function
+
+    ' A CatalogItem as a poster or landscape card, or invalid without a
+    ' content_id. Landscape cards show the backdrop (the poster when there is
+    ' none) and the item's progress. resumeRow (isResumeRow) adds the time
+    ' left to the hero's meta line.
+    function fromItem(item as Dynamic, shape as String, copy as Object, resumeRow = false as Boolean) as Dynamic
+        if not util.isObject(item) then return invalid
+        id = util.text(item.content_id)
+        if id = "" then return invalid
+        isEpisode = util.text(item.type) = "episode"
+        title = util.text(item.title)
+        heroTitle = title
+        if isEpisode and util.text(item.series_title) <> "" then heroTitle = item.series_title
+        poster = util.text(item.poster_url)
+        backdrop = util.text(item.backdrop_url)
+        ' The hero's wash comes from the picture it shows.
+        tint = item.backdrop_thumbhash
+        if backdrop = ""
+            backdrop = poster
+            tint = item.poster_thumbhash
+        end if
+        art = poster
+        progress = -1.0
+        if shape = catalog.shape.LANDSCAPE
+            art = backdrop
+            progress = fraction(item.position_seconds, item.duration_seconds)
+        end if
+        info = infoLine(item, copy, resumeRow)
+        rated = UCase(util.text(item.content_rating).Trim())
+        state = item.user_state
+        return {
+            id: id,
+            title: title,
+            shape: shape,
+            caption: heroTitle,
+            artUri: art,
+            backdropUri: backdrop,
+            tint: catalog.art.washColor(tint),
+            logoUri: util.text(item.logo_url),
+            heroTitle: heroTitle,
+            infoLine: info,
+            contentRating: rated,
+            badges: badges(item.overlay_summary),
+            synopsis: synopsis(item.overview),
+            progress: progress,
+            played: util.isObject(state) and util.isTrue(state.played),
+            itemType: util.text(item.type),
+            playId: util.text(item.play_content_id),
+            seriesId: util.text(item.series_id),
+            seasonNumber: whole(item.season_number),
+            episodeNum: whole(item.episode_number),
+            audioGuideText: spoken([heroTitle, episodeSpoken(item, copy), rated, info])
+        }
+    end function
+
+    ' An Episode as an episode card: its still, "S01E02 · Title" over its
+    ' air date and runtime, its progress, and its resume point for the
+    ' detail page's action row. The info line ("S1 · E2 · 57 min") is the
+    ' detail hero's and Up Next's.
+    function fromEpisode(episode as Dynamic, copy as Object) as Dynamic
+        if not util.isObject(episode) then return invalid
+        id = util.text(episode.content_id)
+        if id = "" then return invalid
+        season = whole(episode.season_number)
+        number = whole(episode.episode_number)
+        state = episode.user_data
+        if not util.isObject(state) then state = {}
+        duration = state.duration_seconds
+        if not util.isNumber(duration) and util.isNumber(episode.runtime) then duration = episode.runtime * 60
+        runtime = runtimeText(episode.runtime, invalid, copy)
+        info = join([i18n.format(copy.episodeCaption, { season: season, episode: number }), runtime])
+        title = util.text(episode.title)
+        still = util.text(episode.still_url)
+        return {
+            id: id,
+            title: title,
+            shape: catalog.shape.EPISODE,
+            caption: join([episodeTag(episode.season_number, episode.episode_number, copy), title.Trim()]),
+            captionDetail: join([dateText(episode.air_date), runtime]),
+            artUri: still,
+            backdropUri: still,
+            logoUri: "",
+            heroTitle: title,
+            infoLine: info,
+            synopsis: synopsis(episode.overview),
+            progress: fraction(state.position_seconds, duration),
+            resumeSeconds: catalog.detail.resumePoint(state.position_seconds, duration),
+            played: util.isTrue(state.played),
+            itemType: "episode",
+            playId: "",
+            seriesId: "",
+            seasonNumber: season,
+            episodeNum: number,
+            audioGuideText: spoken([title, i18n.format(copy.audioEpisode, { season: season, episode: number })])
+        }
+    end function
+
+    ' A Season as a season capsule; playId is the episode to play next.
+    function fromSeason(season as Dynamic) as Dynamic
+        if not util.isObject(season) then return invalid
+        id = util.text(season.content_id)
+        if id = "" then return invalid
+        title = util.text(season.title)
+        return { id: id, title: title, shape: catalog.shape.SEASON, caption: title, playId: util.text(season.play_content_id), seasonNumber: whole(season.season_number), audioGuideText: title }
+    end function
+
+    ' The hero's meta line after its content-rating chip (tvOS's marquee):
+    ' year · first genre · runtime · IMDb (else TMDB) rating; an episode
+    ' reads "S2 E7 · its title · runtime". On Continue Watching
+    ' (resumeRow) the time left follows while the item is started and less
+    ' than 95% watched.
+    function infoLine(item as Object, copy as Object, resumeRow = false as Boolean) as String
+        parts = []
+        if util.text(item.type) = "episode"
+            parts.Push(marqueeEpisode(item.season_number, item.episode_number, copy))
+            parts.Push(util.text(item.title))
+            parts.Push(runtimeText(item.runtime, item.duration_seconds, copy))
+        else
+            if util.isNumber(item.year) and item.year > 0 then parts.Push(Int(item.year).ToStr())
+            if type(item.genres) = "roArray" and item.genres.Count() > 0 then parts.Push(util.text(item.genres[0]))
+            parts.Push(runtimeText(item.runtime, item.duration_seconds, copy))
+            parts.Push(rating(item.rating_imdb, item.rating_tmdb, copy))
+        end if
+        if resumeRow then parts.Push(timeLeft(item.position_seconds, item.duration_seconds, copy))
+        return join(parts)
+    end function
+
+    ' "S2 E7", "Season 2", "Episode 7", or "" (tvOS's marquee token).
+    function marqueeEpisode(season as Dynamic, episode as Dynamic, copy as Object) as String
+        hasSeason = util.isNumber(season)
+        hasEpisode = util.isNumber(episode)
+        if hasSeason and hasEpisode then return i18n.format(copy.seasonEpisode, { season: Int(season), episode: Int(episode) })
+        if hasSeason then return i18n.format(copy.seasonOnly, { season: Int(season) })
+        if hasEpisode then return i18n.format(copy.episodeOnly, { episode: Int(episode) })
+        return ""
+    end function
+
+    ' "23 min left" while 0 < position < duration and under 95% watched,
+    ' rounding the minutes up; "" otherwise.
+    function timeLeft(position as Dynamic, duration as Dynamic, copy as Object) as String
+        if not util.isNumber(position) or not util.isNumber(duration) or position <= 0 or position >= duration or position / duration >= 0.95 then return ""
+        rest = (duration - position) / 60
+        minutes = Int(rest)
+        if minutes < rest then minutes = minutes + 1
+        if minutes < 1 then minutes = 1
+        return i18n.format(copy.timeLeft, { time: runtimeText(minutes, invalid, copy) })
+    end function
+
+    ' The hero's quality chips from an item's overlay_summary, as tvOS's
+    ' marquee names them: the resolution ("4K", "1080p"), DOLBY VISION or
+    ' the HDR name, and ATMOS or the audio name.
+    function badges(summary as Dynamic) as Object
+        out = []
+        if not util.isObject(summary) then return out
+        resolution = resolutionText(summary.resolution)
+        if resolution <> "" then out.Push(resolution)
+        hdr = util.text(summary.hdr).Trim()
+        if hdr <> ""
+            lowered = LCase(hdr)
+            if Instr(1, lowered, "dv") > 0 or Instr(1, lowered, "dolby") > 0 then hdr = "DOLBY VISION"
+            out.Push(UCase(hdr))
+        end if
+        audio = util.text(summary.audio).Trim()
+        if audio <> ""
+            if Instr(1, LCase(audio), "atmos") > 0 then audio = "ATMOS"
+            out.Push(UCase(audio))
+        end if
+        return out
+    end function
+
+    ' "4K" and "8K" for UHD, "1080p" for a line count, else the value in
+    ' capitals (tvOS's MediaTextFormatting.resolution).
+    function resolutionText(value as Dynamic) as String
+        text = util.text(value).Trim()
+        lowered = LCase(text)
+        if lowered = "2160p" or lowered = "4k" or lowered = "uhd" then return "4K"
+        if lowered = "4320p" or lowered = "8k" then return "8K"
+        if Len(lowered) > 1 and Right(lowered, 1) = "p" and digitsOnly(Left(lowered, Len(lowered) - 1)) then return lowered
+        return UCase(text)
+    end function
+
+    function digitsOnly(text as String) as Boolean
+        for i = 1 to Len(text)
+            c = Mid(text, i, 1)
+            if c < "0" or c > "9" then return false
+        end for
+        return true
+    end function
+
+    ' A YYYY-MM-DD date as Roku writes it for the device locale ("Feb 18,
+    ' 2026"), as the detail page's facts do; "" for a missing or malformed one.
+    function dateText(value as Dynamic) as String
+        text = util.text(value)
+        if Len(text) < 10 or Mid(text, 5, 1) <> "-" then return ""
+        ' A Roku device leaves a date-only string unparsed (run 5), so the
+        ' time is spelled out.
+        date = CreateObject("roDateTime")
+        date.FromISO8601String(Left(text, 10) + "T00:00:00Z")
+        if date.GetYear() < 1000 or Left(text, 4) <> date.GetYear().ToStr() then return ""
+        return date.AsDateString("short-month-no-weekday")
+    end function
+
+    ' "1h 45m", "2h", or "45 min" from runtime minutes, else from a duration
+    ' in seconds; "" without either.
+    function runtimeText(minutes as Dynamic, seconds as Dynamic, copy as Object) as String
+        total = 0
+        if util.isNumber(minutes) and minutes > 0
+            total = Int(minutes)
+        else if util.isNumber(seconds) and seconds > 0
+            total = Int(seconds / 60 + 0.5)
+        end if
+        if total <= 0 then return ""
+        if total < 60 then return i18n.format(copy.runtimeMinutes, { minutes: total })
+        hours = total \ 60
+        rest = total mod 60
+        if rest = 0 then return i18n.format(copy.runtimeHours, { hours: hours })
+        return i18n.format(copy.runtimeHoursMinutes, { hours: hours, minutes: rest })
+    end function
+
+    ' "IMDb 8.3", else "TMDB 7.1", from ratings out of ten; "" without one.
+    function rating(imdb as Dynamic, tmdb as Dynamic, copy as Object) as String
+        if outOfTen(imdb) then return i18n.format(copy.ratingImdb, { value: oneDecimal(imdb) })
+        if outOfTen(tmdb) then return i18n.format(copy.ratingTmdb, { value: oneDecimal(tmdb) })
+        return ""
+    end function
+
+    function outOfTen(value as Dynamic) as Boolean
+        return util.isNumber(value) and value > 0 and value <= 10
+    end function
+
+    ' One decimal with a point, rounding half up: 8.25 is "8.3".
+    function oneDecimal(value as Dynamic) as String
+        tenths = Int(value * 10 + 0.5)
+        return (tenths \ 10).ToStr() + "." + (tenths mod 10).ToStr()
+    end function
+
+    ' "S01E02" (zero-padded, as Android TV's Home cards), "S01", "E02", or "".
+    function episodeTag(season as Dynamic, episode as Dynamic, copy as Object) as String
+        hasSeason = util.isNumber(season)
+        hasEpisode = util.isNumber(episode)
+        if hasSeason and hasEpisode then return i18n.format(copy.episodeTag, { season: padded(season), episode: padded(episode) })
+        if hasSeason then return "S" + padded(season)
+        if hasEpisode then return "E" + padded(episode)
+        return ""
+    end function
+
+    function padded(value as Dynamic) as String
+        text = Int(value).ToStr()
+        if Len(text) < 2 then text = "0" + text
+        return text
+    end function
+
+    ' An episode's caption in search results (spec section 5.6): its series
+    ' title, else its own, then its tag, "Severance · S01E02", so it differs
+    ' from the series' own card.
+    function taggedCaption(item as Object, copy as Object) as String
+        title = util.text(item.series_title)
+        if title = "" then title = util.text(item.title)
+        return join([title, episodeTag(item.season_number, item.episode_number, copy)])
+    end function
+
+    ' "Season 1, episode 2" for the audio guide, or "" for other items.
+    function episodeSpoken(item as Object, copy as Object) as String
+        if util.text(item.type) <> "episode" or not util.isNumber(item.season_number) or not util.isNumber(item.episode_number) then return ""
+        return i18n.format(copy.audioEpisode, { season: Int(item.season_number), episode: Int(item.episode_number) })
+    end function
+
+    ' Watched fraction 0 to 1, or -1 (no bar) unless both values are positive.
+    function fraction(position as Dynamic, duration as Dynamic) as Float
+        if not util.isNumber(position) or not util.isNumber(duration) or position <= 0 or duration <= 0 then return -1.0
+        value = position / duration
+        if value > 1 then value = 1.0
+        return value
+    end function
+
+    function synopsis(text as Dynamic) as String
+        value = util.text(text).Trim()
+        if Len(value) > MAX_SYNOPSIS then value = Left(value, MAX_SYNOPSIS - 1).Trim() + "…"
+        return value
+    end function
+
+    ' The non-empty parts joined with " · ".
+    function join(parts as Object) as String
+        kept = []
+        for each part in parts
+            if part <> "" then kept.Push(part)
+        end for
+        return kept.Join(SEPARATOR)
+    end function
+
+    ' The non-empty parts as one spoken sentence, separators read as pauses.
+    function spoken(parts as Object) as String
+        return join(parts).Replace(SEPARATOR, ", ")
+    end function
+
+    function whole(value as Dynamic) as Integer
+        if util.isNumber(value) then return Int(value)
+        return -1
+    end function
+end namespace

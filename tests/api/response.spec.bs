@@ -1,0 +1,170 @@
+namespace tests
+
+    @suite("api response")
+    class ApiResponseTests extends rooibos.BaseTestSuite
+
+        @describe("fromTransfer")
+
+        @it("parses a 200 body and returns only the asked-for headers (get_system_info_ok.json)")
+        sub _()
+            request = m.request(["etag"])
+            body = `{"server_version":"unavailable","api_major":2,"contract_digest":"0000000000000000000000000000000000000000000000000000000000000000","links":{"openapi":"/api/v2/openapi.json","capabilities":"/api/v2/capabilities","identity":"/api/v2/system/identity"}}`
+            result = api.response.fromTransfer(request, { code: 200, body: body, headers: [{ "content-type": "application/json" }, { "ETag": """abc""" }, { "set-cookie": "s=1" }] })
+            m.assertTrue(result.ok)
+            m.assertEqual(result.requestId, "r1")
+            m.assertEqual(result.status, 200)
+            m.assertEqual(result.headers, { etag: """abc""" })
+            m.assertEqual(result.body.api_major, 2)
+            m.assertInvalid(result.error)
+        end sub
+
+        @it("accepts an empty 204 and a 304")
+        sub _()
+            noContent = api.response.fromTransfer(m.request(), { code: 204, body: "", headers: [] })
+            m.assertTrue(noContent.ok)
+            m.assertInvalid(noContent.body)
+            m.assertTrue(api.response.fromTransfer(m.request(), { code: 304, body: "", headers: [] }).ok)
+        end sub
+
+        @it("decodes a Problem with its type, instance, and Retry-After")
+        sub _()
+            body = `{"type":"https://siloserver.org/docs/api/v2/problems/dependency_unavailable","title":"Dependency unavailable","status":503,"detail":"Try again later.","instance":"urn:silo:request:000000000000000000000042"}`
+            result = api.response.fromTransfer(m.request(), { code: 503, body: body, headers: [{ "Retry-After": "12" }] })
+            m.assertFalse(result.ok)
+            m.assertEqual(result.status, 503)
+            m.assertEqual(result.error, { kind: "http", status: 503, problemType: "dependency_unavailable", instance: "urn:silo:request:000000000000000000000042", retryAfterSeconds: 12 })
+            m.assertEqual(result.body.status, 503)
+        end sub
+
+        @it("reports an HTTP error whose body is not JSON")
+        sub _()
+            result = api.response.fromTransfer(m.request(), { code: 502, body: "<html>Bad gateway</html>", headers: [] })
+            m.assertEqual(result.error, { kind: "http", status: 502, problemType: invalid, instance: invalid, retryAfterSeconds: invalid })
+            m.assertInvalid(result.body)
+        end sub
+
+        @it("fails a 200 whose body does not parse")
+        sub _()
+            m.assertEqual(api.response.fromTransfer(m.request(), { code: 200, body: "<html>captive portal</html>", headers: [] }).error.kind, "parse")
+            m.assertEqual(api.response.fromTransfer(m.request(), { code: 200, body: "{truncated", headers: [] }).error.kind, "parse")
+        end sub
+
+        @it("fails a body over 2 MB without parsing it")
+        sub _()
+            chunk = string(65536, "a")
+            parts = []
+            for i = 1 to 33
+                parts.Push(chunk)
+            end for
+            result = api.response.fromTransfer(m.request(), { code: 200, body: "[" + parts.Join(""), headers: [] })
+            m.assertEqual(result.error, { kind: "too_large", status: 200, problemType: invalid, instance: invalid, retryAfterSeconds: invalid })
+            m.assertInvalid(result.body)
+        end sub
+
+        @it("fails a body file over 2 MB by its size, keeping the status and asked-for headers")
+        sub _()
+            result = api.response.fromTransfer(m.request(["etag"]), { code: 200, body: "", headers: [{ "etag": "v1" }], size: 2097153 })
+            m.assertEqual(result.error.kind, "too_large")
+            m.assertEqual(result.status, 200)
+            m.assertEqual(result.headers, { etag: "v1" })
+            within = api.response.fromTransfer(m.request(), { code: 200, body: "{""a"":1}", headers: [], size: 2097152 })
+            m.assertTrue(within.ok)
+            m.assertEqual(within.body, { a: 1 })
+        end sub
+
+        @it("judges a declared length only when the body is not compressed")
+        sub _()
+            budget = api.response.MAX_BODY_BYTES
+            m.assertTrue(api.response.declaresTooLarge([{ "content-length": "2097153" }], budget))
+            m.assertTrue(api.response.declaresTooLarge([{ "Content-Length": " 99999999999 " }, { "Content-Encoding": "identity" }], budget))
+            m.assertFalse(api.response.declaresTooLarge([{ "content-length": "2097152" }], budget))
+            m.assertFalse(api.response.declaresTooLarge([{ "content-length": "9999999" }, { "content-encoding": "gzip" }], budget), "compressed")
+            m.assertFalse(api.response.declaresTooLarge([{ "content-length": "-1" }], budget), "malformed")
+            m.assertFalse(api.response.declaresTooLarge([{ "content-length": "3e9" }], budget), "malformed")
+            m.assertFalse(api.response.declaresTooLarge([], budget), "no length")
+            m.assertFalse(api.response.declaresTooLarge(invalid, budget))
+            m.assertFalse(api.response.declaresTooLarge([{ "content-length": "2097153" }], api.response.MAX_SIDECAR_BYTES), "a sidecar's budget")
+            m.assertTrue(api.response.declaresTooLarge([{ "content-length": "16777217" }], api.response.MAX_SIDECAR_BYTES))
+        end sub
+
+        @it("gives a download, a subtitle sidecar saved to tmp:/, its own budget, and every other request 2 MiB")
+        sub _()
+            ' Run 23's TV had 515,284 KB free at launch.
+            m.assertEqual(api.response.limit({ requestId: "r1", download: "ass" }, 515284), 16777216)
+            m.assertEqual(api.response.limit({ requestId: "r1", download: invalid }, 515284), 2097152)
+            m.assertEqual(api.response.limit(m.request()), 2097152)
+            ' A download's error body is read as JSON, so it keeps 2 MiB.
+            result = api.response.fromTransfer({ requestId: "r1", responseHeaders: [], download: "srt" }, { code: 404, body: "", headers: [], size: 2097153 })
+            m.assertEqual(result.error.kind, "too_large")
+        end sub
+
+        @it("sets a download's budget at an eighth of the app's free memory, from 2 MiB to 16 MiB (run 23)")
+        sub _()
+            m.assertEqual(api.response.sidecarBudget(515284), 16777216, "run 23's TV: an eighth is 62.9 MiB")
+            m.assertEqual(api.response.sidecarBudget(131072), 16777216, "128 MiB free: exactly 16 MiB")
+            m.assertEqual(api.response.sidecarBudget(102400), 13107200, "100 MiB free: 12.5 MiB")
+            m.assertEqual(api.response.sidecarBudget(16384), 2097152, "16 MiB free: no less than any response gets")
+            m.assertEqual(api.response.sidecarBudget(1024), 2097152)
+            m.assertEqual(api.response.sidecarBudget(4294967295&), 16777216, "past Integer's range")
+            ' Run 23's 10,736,314-byte ASS fits from 81.9 MiB free.
+            m.assertTrue(api.response.sidecarBudget(83878) >= 10736314)
+            m.assertFalse(api.response.sidecarBudget(83877) >= 10736314)
+        end sub
+
+        @it("falls back to 8 MiB when the free memory cannot be read")
+        sub _()
+            for each reading in [invalid, 0, -1, "515284", {}]
+                m.assertEqual(api.response.sidecarBudget(reading), 8388608)
+            end for
+            m.assertEqual(api.response.limit({ requestId: "r1", download: "ass" }), 8388608)
+        end sub
+
+        @it("builds a too_large envelope for a transfer stopped early")
+        sub _()
+            m.assertEqual(api.response.tooLarge(m.request(), 0), { requestId: "r1", ok: false, status: 0, headers: {}, body: invalid, error: { kind: "too_large", status: 0, problemType: invalid, instance: invalid, retryAfterSeconds: invalid } })
+            m.assertEqual(api.response.tooLarge(m.request(), 200).error.status, 200)
+        end sub
+
+        @it("maps transport failures to network or timeout")
+        sub _()
+            m.assertEqual(api.response.fromTransfer(m.request(), { code: -6, body: "", headers: [] }).error.kind, "network")
+            m.assertEqual(api.response.fromTransfer(m.request(), { code: -28, body: "", headers: [] }).error.kind, "timeout")
+            m.assertEqual(api.response.fromTransfer(m.request(), { code: -60, body: "", headers: [] }).status, 0)
+        end sub
+
+        @describe("saved")
+
+        @it("answers a kept download with its path and size, within the budget it started with")
+        sub _()
+            request = { requestId: "r1", responseHeaders: [], download: "ass" }
+            budget = api.response.MAX_SIDECAR_BYTES
+            result = api.response.saved(request, { code: 200, headers: [], path: "tmp:/downloads/1.srt", size: 120, budget: budget })
+            m.assertTrue(result.ok)
+            m.assertEqual(result.body, { path: "tmp:/downloads/1.srt", size: 120 })
+            ' Run 22's typeset ASS was over 2 MiB on every start, and run
+            ' 23's 10,736,314 bytes.
+            m.assertTrue(api.response.saved(request, { code: 200, headers: [], path: "tmp:/downloads/2.ass", size: api.response.MAX_BODY_BYTES + 1, budget: budget }).ok, "past the JSON budget")
+            m.assertTrue(api.response.saved(request, { code: 200, headers: [], path: "tmp:/downloads/3.ass", size: 10736314, budget: budget }).ok, "run 23's file")
+            m.assertTrue(api.response.saved(request, { code: 200, headers: [], path: "tmp:/downloads/4.ass", size: budget, budget: budget }).ok)
+            large = api.response.saved(request, { code: 200, headers: [], path: "tmp:/downloads/5.ass", size: budget + 1, budget: budget })
+            m.assertFalse(large.ok)
+            m.assertEqual(large.error.kind, "too_large")
+            m.assertFalse(api.response.saved(request, { code: 200, headers: [], path: "tmp:/downloads/6.ass", size: 10736314, budget: api.response.UNKNOWN_ROOM_SIDECAR_BYTES }).ok, "a smaller budget at its start")
+        end sub
+
+        @describe("failure")
+
+        @it("builds failures with no response, and a reason only when given")
+        sub _()
+            m.assertEqual(api.response.failure(m.request(), "cancelled", "shed"), { requestId: "r1", ok: false, status: 0, headers: {}, body: invalid, error: { kind: "cancelled", status: 0, problemType: invalid, instance: invalid, retryAfterSeconds: invalid, reason: "shed" } })
+            m.assertFalse(api.response.failure(m.request(), "not_configured").error.DoesExist("reason"))
+            m.assertEqual(api.response.failure({ path: "/x" }, "invalid_request").requestId, "")
+        end sub
+
+        function request(responseHeaders = [] as Object) as Object
+            return api.request.normalize({ requestId: "r1", path: "/api/v2/system/info", responseHeaders: responseHeaders })
+        end function
+
+    end class
+
+end namespace

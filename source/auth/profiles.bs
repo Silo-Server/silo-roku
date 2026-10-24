@@ -1,0 +1,72 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/util/values.bs"
+
+' Profiles and PIN checks (spec section 7.3). Pure.
+namespace api.auth.profiles
+    const LIST_PATH = "/api/v2/profiles"
+
+    ' The profiles in a GET /api/v2/profiles body, in the server's order, as
+    ' { id, name, hasPin, isChild, isPrimary, avatarUrl }; items without an id
+    ' are skipped. isChild is what deep links consult (decision D-4).
+    function list(body as Dynamic) as Object
+        out = []
+        if not util.isObject(body) or type(body.items) <> "roArray" then return out
+        for each item in body.items
+            if util.isObject(item) and util.isString(item.id) and item.id <> ""
+                out.Push({ id: item.id, name: util.text(item.name), hasPin: util.isTrue(item.has_pin), isChild: util.isTrue(item.is_child), isPrimary: util.isTrue(item.is_primary), avatarUrl: util.text(item.avatar_url) })
+            end if
+        end for
+        return out
+    end function
+
+    ' The profile to reopen on an ordinary launch: the one last chosen on this
+    ' device, if the account still lists it. Otherwise invalid and the viewer
+    ' picks, so the client never chooses a profile, a child profile included,
+    ' on its own.
+    function restore(profiles as Object, rememberedId as String) as Dynamic
+        if rememberedId = "" then return invalid
+        for each profile in profiles
+            if profile.id = rememberedId then return profile
+        end for
+        return invalid
+    end function
+
+    function verifyPath(profileId as String) as String
+        return LIST_PATH + "/" + api.request.escape(profileId) + "/verify-pin"
+    end function
+
+    ' A verify-pin answer as { outcome, token, retryAfterSeconds }, outcome one of
+    '   verified   the PIN matched; token is the X-Profile-Token, which stays
+    '              in ApiTask
+    '   wrong      200 with valid false
+    '   locked     429: five wrong PINs lock the profile; retryAfterSeconds is
+    '              the server's Retry-After, or invalid without one
+    '   uncertain  no answer (network, timeout): the check may have counted
+    '   cancelled  the request was cancelled
+    '   error      any other answer
+    ' None is retried automatically; the viewer enters the PIN again.
+    function pinOutcome(result as Object) as Object
+        out = { outcome: "error", token: invalid, retryAfterSeconds: invalid }
+        body = result.body
+        if result.ok = true and util.isObject(body)
+            if util.isTrue(body.valid) and util.isString(body.profile_token) and body.profile_token <> ""
+                out.outcome = "verified"
+                out.token = body.profile_token
+            else if util.isBoolean(body.valid) and not body.valid
+                out.outcome = "wrong"
+            end if
+            return out
+        end if
+        if result.status = 429
+            out.outcome = "locked"
+            if result.error <> invalid then out.retryAfterSeconds = result.error.retryAfterSeconds
+        else if result.status = 0 and result.error <> invalid
+            if result.error.kind = "cancelled"
+                out.outcome = "cancelled"
+            else if result.error.kind = "network" or result.error.kind = "timeout"
+                out.outcome = "uncertain"
+            end if
+        end if
+        return out
+    end function
+end namespace

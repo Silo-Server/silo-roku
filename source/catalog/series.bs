@@ -1,0 +1,235 @@
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Season and episode selection on a series detail page (spec sections 5.6
+' and 8.3), pure, as the Android TV and tvOS detail pages choose:
+'
+' - The page opens on the season it is asked for (the season the viewer
+'   was on, else the episode card's, else the play target's
+'   play_season_number), else the first numbered season with an episode in
+'   progress, partly watched, or unplayed, in that order, else the first
+'   numbered season, else the first.
+' - The active episode is the one Play targets and the hero describes: the
+'   episode asked for, else the play target, else the season's first episode
+'   in progress, then its first unplayed, then its first. Focusing an
+'   episode card makes it active, and the viewer switching season makes that
+'   season's first episode active.
+' - Seasons are listed as tvOS lists them (ordered): numbered seasons by
+'   number, then Specials. The episode rail is one row over a run of
+'   adjacent loaded seasons (window), keeping at most a few seasons'
+'   episodes (retained).
+' - After the player closes, an episode this playback finished hands the
+'   active place to the next episode in play order, played or not, never
+'   from a regular season into Specials (successor), else to the next
+'   numbered season's first episode (nextSeason), as tvOS's
+'   SeriesPlaybackReturn does; otherwise it keeps it.
+'
+' Seasons are catalog.series.rollup entries; episodes are CardContent
+' nodes or AAs with id, seasonNumber, resumeSeconds, and played.
+namespace catalog.series
+    ' What a page opens with selected: { episode, season }, an episode ID
+    ' ("" for none) and a season number (0 for Specials, -1 for none).
+    ' params are the route's (an episode card's episodeId and seasonNumber,
+    ' homeFeed.detailParams); restore is the page's focus key when it is
+    ' rebuilt (DetailScreen's focusKey), whose episode and season, the
+    ' viewer's last, win over the route's.
+    function opening(params as Object, restore as Dynamic) as Object
+        out = { episode: util.text(params.episodeId), season: seasonOf(params.seasonNumber) }
+        if not util.isObject(restore) then return out
+        if util.text(restore.episode) <> "" then out.episode = restore.episode
+        season = seasonOf(restore.season)
+        if season >= 0 then out.season = season
+        return out
+    end function
+
+    ' A season number, or -1 when value names none.
+    function seasonOf(value as Dynamic) as Integer
+        if util.isNumber(value) and value >= 0 then return Int(value)
+        return -1
+    end function
+
+    ' A Season's facts for choosing where to open: { seasonNumber,
+    ' specials, inProgress, watched, unplayed, episodes }, episodes -1 when
+    ' the server does not count them; or invalid without an ID.
+    function rollup(season as Dynamic) as Dynamic
+        if not util.isObject(season) or util.text(season.content_id) = "" then return invalid
+        state = season.user_data
+        if not util.isObject(state) then state = {}
+        number = -1
+        if util.isNumber(season.season_number) then number = Int(season.season_number)
+        return {
+            seasonNumber: number,
+            specials: util.isTrue(season.is_specials) or number = 0,
+            inProgress: count(state.in_progress_count) > 0 or util.isTrue(state.is_in_progress),
+            watched: count(state.watched_count),
+            unplayed: count(state.unplayed_count),
+            episodes: wholeOr(season.episode_count, -1)
+        }
+    end function
+
+    ' The positions of rollups in tvOS's order (SeriesEpisodeWindow
+    ' .orderedSeasons): numbered seasons by number, then Specials, a number
+    ' listed twice kept once, the first listed.
+    function ordered(rollups as Object) as Object
+        regular = []
+        specials = []
+        seen = {}
+        for i = 0 to rollups.Count() - 1
+            key = rollups[i].seasonNumber.ToStr()
+            if not seen.DoesExist(key)
+                seen[key] = true
+                if rollups[i].specials
+                    specials.Push(i)
+                else
+                    regular.Push({ at: i, number: rollups[i].seasonNumber })
+                end if
+            end if
+        end for
+        ' SortBy is stable.
+        regular.SortBy("number")
+        out = []
+        for each entry in regular
+            out.Push(entry.at)
+        end for
+        out.Append(specials)
+        return out
+    end function
+
+    ' The index of the season to open on, among rollups; wanted is a season
+    ' number, or -1.
+    function initialSeason(rollups as Object, wanted as Integer) as Integer
+        if rollups.Count() = 0 then return -1
+        if wanted >= 0
+            for i = 0 to rollups.Count() - 1
+                if rollups[i].seasonNumber = wanted then return i
+            end for
+        end if
+        for each rule in ["inProgress", "partly", "unplayed", "numbered"]
+            for i = 0 to rollups.Count() - 1
+                if not rollups[i].specials and matches(rollups[i], rule) then return i
+            end for
+        end for
+        return 0
+    end function
+
+    function matches(entry as Object, rule as String) as Boolean
+        if rule = "inProgress" then return entry.inProgress
+        if rule = "partly" then return entry.watched > 0 and entry.unplayed > 0
+        if rule = "unplayed" then return entry.unplayed > 0
+        return true
+    end function
+
+    ' "Season 2", the server's own title, or "Specials" for season 0.
+    function seasonLabel(title as String, seasonNumber as Integer, copy as Object) as String
+        if title.Trim() <> "" then return title.Trim()
+        if seasonNumber = 0 then return i18n.lookup(copy, "detail.specials")
+        return i18n.format(i18n.lookup(copy, "detail.season"), { number: seasonNumber })
+    end function
+
+    ' The active episode's index among episodes when a season's episodes
+    ' arrive: wantedId's, else playId's, else the season's suggestion; -1
+    ' without episodes.
+    function activeEpisode(episodes as Object, wantedId as String, playId as String) as Integer
+        for each id in [wantedId, playId]
+            if id <> ""
+                at = indexOf(episodes, id)
+                if at >= 0 then return at
+            end if
+        end for
+        return suggested(episodes)
+    end function
+
+    ' The first episode in progress, else the first unplayed, else the first.
+    function suggested(episodes as Object) as Integer
+        if episodes.Count() = 0 then return -1
+        for i = 0 to episodes.Count() - 1
+            if episodes[i].resumeSeconds >= 0 and not episodes[i].played then return i
+        end for
+        for i = 0 to episodes.Count() - 1
+            if not episodes[i].played then return i
+        end for
+        return 0
+    end function
+
+    ' The episode after the one at index in play order, played or not, or -1
+    ' after the last: tvOS's choice after a finished episode
+    ' (SeriesPlaybackReturn), which never moves from a regular episode into
+    ' Specials.
+    function successor(episodes as Object, index as Integer) as Integer
+        if index < 0 or index + 1 >= episodes.Count() then return -1
+        if episodes[index + 1].seasonNumber = 0 and episodes[index].seasonNumber <> 0 then return -1
+        return index + 1
+    end function
+
+    ' The index of the season after rollups[index] in series order, as tvOS
+    ' orders seasons (numbered ones by number, Specials apart): the numbered
+    ' season with the next higher number wherever the server lists it, so a
+    ' gap in the numbers is skipped, as is a season the server counts no
+    ' episodes in; -1 after the last numbered season, from Specials, and from
+    ' a season without a number.
+    function nextSeason(rollups as Object, index as Integer) as Integer
+        if index < 0 or index >= rollups.Count() then return -1
+        current = rollups[index]
+        if current.specials or current.seasonNumber < 0 then return -1
+        found = -1
+        for i = 0 to rollups.Count() - 1
+            entry = rollups[i]
+            if not entry.specials and entry.seasonNumber > current.seasonNumber and entry.episodes <> 0
+                if found < 0 or entry.seasonNumber < rollups[found].seasonNumber then found = i
+            end if
+        end for
+        return found
+    end function
+
+    ' The run of loaded seasons the rail shows: { first, last }, the
+    ' positions around selected (in a list in series order) while loaded
+    ' says each holds its episodes, an empty season included, as tvOS's
+    ' SeriesEpisodeWindow crosses one; first -1 when selected is not loaded.
+    function window(loaded as Object, selected as Integer) as Object
+        if selected < 0 or selected >= loaded.Count() or not loaded[selected] then return { first: -1, last: -1 }
+        first = selected
+        last = selected
+        while first > 0 and loaded[first - 1]
+            first = first - 1
+        end while
+        while last + 1 < loaded.Count() and loaded[last + 1]
+            last = last + 1
+        end while
+        return { first: first, last: last }
+    end function
+
+    ' The positions whose episodes the page keeps, of a list in series order
+    ' where sizes are the episode counts of loaded seasons (-1 for one not
+    ' loaded): the limit nonempty ones nearest selected, the earlier on a
+    ' tie, and every empty one, which costs nothing (tvOS's retainedPages
+    ' keeps five; spec section 5.9).
+    function retained(sizes as Object, selected as Integer, limit as Integer) as Object
+        kept = []
+        for distance = 0 to sizes.Count()
+            for each at in [selected - distance, selected + distance]
+                if at >= 0 and at < sizes.Count() and sizes[at] > 0 and kept.Count() < limit and not util.contains(kept, at) then kept.Push(at)
+            end for
+        end for
+        for i = 0 to sizes.Count() - 1
+            if sizes[i] = 0 then kept.Push(i)
+        end for
+        return kept
+    end function
+
+    function indexOf(episodes as Object, id as String) as Integer
+        for i = 0 to episodes.Count() - 1
+            if episodes[i].id = id then return i
+        end for
+        return -1
+    end function
+
+    function count(value as Dynamic) as Integer
+        if util.isNumber(value) and value > 0 then return Int(value)
+        return 0
+    end function
+
+    function wholeOr(value as Dynamic, fallback as Integer) as Integer
+        if util.isNumber(value) and value >= 0 then return Int(value)
+        return fallback
+    end function
+end namespace

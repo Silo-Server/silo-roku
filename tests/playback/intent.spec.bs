@@ -1,0 +1,238 @@
+namespace tests
+
+    @suite("playback intent")
+    class PlaybackIntentTests extends rooibos.BaseTestSuite
+
+        function watch() as Object
+            return tests.contract.fixture("get_watch_state_ok")
+        end function
+
+        function track(index as Integer, codec as String, channels as Integer, language as String) as Object
+            return { index: index, codec: codec, channels: channels, language: language }
+        end function
+
+        @describe("fromWatch")
+
+        @it("takes the file, tracks, runtime, and saved position from the watch projection")
+        sub _()
+            intent = playback.intent.fromWatch(m.watch(), "movie:heat-1995")
+            m.assertEqual(intent.itemId, "movie:heat-1995")
+            m.assertEqual(intent.title, "Heat")
+            m.assertEqual(intent.fileId, "42")
+            m.assertEqual(intent.runtime, 10200)
+            m.assertEqual(intent.audioTracks, [{ index: 0, codec: "eac3", channels: 6, language: "eng", title: "", default: true, bitrate: invalid }])
+            m.assertEqual(tests.dbl(intent.resumeSeconds), tests.dbl(1325.5))
+        end sub
+
+        @it("gives each audio track what the initial choice ranks: its title, else the embedded one")
+        sub _()
+            detail = m.watch()
+            detail.versions[0].audio_tracks = [{ language: "ENG", codec: "AAC", channels: 2, embedded_title: "Commentary", bitrate: 192000 }, { language: "fra", codec: "ac3", title: "VF", embedded_title: "French" }]
+            tracks = playback.intent.fromWatch(detail, "x").audioTracks
+            m.assertEqual(tracks[0], { index: 0, codec: "aac", channels: 2, language: "eng", title: "Commentary", default: false, bitrate: 192000 })
+            m.assertEqual([tracks[1].index, tracks[1].title], [1, "VF"])
+        end sub
+
+        @it("keeps the version's effective audio track, -1 without one")
+        sub _()
+            detail = m.watch()
+            m.assertEqual(playback.intent.fromWatch(detail, "x").effectiveAudioIndex, -1)
+            detail.versions[0].effective_audio_track_index = 0
+            m.assertEqual(playback.intent.fromWatch(detail, "x").effectiveAudioIndex, 0)
+        end sub
+
+        @it("prefers the version last played, then the variant's default, then the first")
+        sub _()
+            detail = m.watch()
+            second = {}
+            second.Append(detail.versions[0])
+            second.file_id = "3"
+            detail.versions.Push(second)
+            m.assertEqual(playback.intent.fromWatch(detail, "x").fileId, "3", "last played")
+            detail.user_data.last_file_id = "gone"
+            m.assertEqual(playback.intent.fromWatch(detail, "x").fileId, "42", "the variant's default")
+            detail.playback_variants = []
+            detail.versions.Reverse()
+            m.assertEqual(playback.intent.fromWatch(detail, "x").fileId, "3", "the first")
+        end sub
+
+        @it("plays the version a detail page pinned while the projection lists it")
+        sub _()
+            detail = tests.catalogData.selectionWatch()
+            pinned = playback.intent.fromWatch(detail, "x", "102")
+            m.assertEqual([pinned.fileId, pinned.pinned, pinned.audioTracks.Count()], ["102", true, 1])
+            gone = playback.intent.fromWatch(detail, "x", "999")
+            m.assertEqual([gone.fileId, gone.pinned], ["101", false], "a file no longer listed: the start path's choice, unpinned")
+            m.assertFalse(playback.intent.fromWatch(detail, "x").pinned)
+        end sub
+
+        @it("resumes a played title from its saved position, and has no intent without a file")
+        sub _()
+            detail = m.watch()
+            detail.user_data.played = true
+            m.assertEqual(tests.dbl(playback.intent.fromWatch(detail, "x").resumeSeconds), tests.dbl(1325.5), "a rewatch stopped partway")
+            detail.user_data.position_seconds = 0
+            m.assertInvalid(playback.intent.fromWatch(detail, "x").resumeSeconds, "the server zeroes the position when it marks the title played")
+            detail.versions = []
+            m.assertInvalid(playback.intent.fromWatch(detail, "x"))
+            m.assertInvalid(playback.intent.fromWatch(invalid, "x"))
+        end sub
+
+        @it("keeps what the controls show: kind, names, numbers, and year")
+        sub _()
+            intent = playback.intent.fromWatch(m.watch(), "x")
+            m.assertEqual([intent.kind, intent.name, intent.seriesTitle, intent.year], ["movie", "Heat", "", 1995])
+            detail = m.watch()
+            detail.Append({ type: "episode", title: "Pilot", series_title: "Show", season_number: 1, episode_number: 2 })
+            intent = playback.intent.fromWatch(detail, "x")
+            m.assertEqual([intent.kind, intent.name, intent.seriesTitle, intent.seasonNumber, intent.episodeNumber], ["episode", "Pilot", "Show", 1, 2])
+        end sub
+
+        @it("titles an episode with its series and number")
+        sub _()
+            detail = { type: "episode", title: "Pilot", series_title: "Show", season_number: 1, episode_number: 2 }
+            m.assertEqual(playback.intent.titleOf(detail), "Show · S1:E2 · Pilot")
+            m.assertEqual(playback.intent.titleOf({ type: "movie", title: "Heat" }), "Heat")
+        end sub
+
+        @describe("the saved position Detail and the start share (spec section 5.6, assumption AG-189)")
+
+        ' A watch projection of a 22-minute title (as hardware run 16's) with
+        ' user_data position and played; an episode when episode >= 0.
+        function saved(position as Dynamic, played as Boolean, episode = -1 as Integer, duration = 1320 as Dynamic) as Object
+            body = { content_id: "movie:synthetic", type: "movie", title: "Synthetic", versions: [{ file_id: "7", duration_seconds: duration }], user_data: { position_seconds: position, duration_seconds: duration, played: played } }
+            if episode >= 0 then body.Append({ content_id: "episode:s1e" + episode.ToStr(), type: "episode", season_number: 1, episode_number: episode, series_title: "Show" })
+            return body
+        end function
+
+        ' What Detail shows for body, as a movie page or an episode card
+        ' reads it, and where the player's start (fromWatch, then the
+        ' rewind) puts it: { labels, start }, labels being the action row's
+        ' buttons before the watch read and after it, which must agree.
+        function shown(body as Object) as Object
+            copy = i18n.load("en_US")
+            words = tests.catalogData.words()
+            if body.type = "episode"
+                card = catalog.cards.fromEpisode({ content_id: body.content_id, season_number: 1, episode_number: body.episode_number, runtime: 24, user_data: body.user_data }, words)
+                before = catalog.actions.episodeTarget(card, card.resumeSeconds)
+            else
+                before = catalog.actions.movieTarget(catalog.detail.fromItem({ content_id: body.content_id, type: "movie", runtime: 22, user_data: body.user_data }, words))
+            end if
+            after = {}
+            after.Append(before)
+            after.resumeSeconds = catalog.detail.resume(body).resumeSeconds
+            labels = []
+            for each target in [before, after]
+                row = []
+                for each button in catalog.actions.row(target, invalid, copy)
+                    if button.key = catalog.action.PLAY or button.key = catalog.action.START_OVER then row.Push(button.label)
+                end for
+                labels.Push(row)
+            end for
+            start = playback.intent.resumeAt(playback.intent.fromWatch(body, body.content_id).resumeSeconds)
+            if start <> invalid then start = tests.dbl(start)
+            return { labels: labels, start: start }
+        end function
+
+        @it("resumes a played movie with a saved position where Resume says, with Start Over (hardware run 16, T2k)")
+        sub _()
+            out = m.shown(m.saved(139.4, true))
+            m.assertEqual(out.labels, [["Resume 2:19", "Start Over"], ["Resume 2:19", "Start Over"]])
+            m.assertEqual(out.start, tests.dbl(132.4))
+        end sub
+
+        @it("resumes a played episode with a saved position where its card's Resume says")
+        sub _()
+            out = m.shown(m.saved(600, true, 10, 1440))
+            m.assertEqual(out.labels, [["Resume S1:E10", "Start Over"], ["Resume S1:E10", "Start Over"]])
+            m.assertEqual(out.start, tests.dbl(593))
+        end sub
+
+        @it("plays a played movie or episode without a position from the server's start, with no Start Over")
+        sub _()
+            m.assertEqual(m.shown(m.saved(0, true)), { labels: [["Play"], ["Play"]], start: invalid })
+            m.assertEqual(m.shown(m.saved(invalid, true, 3)), { labels: [["Play S1:E3"], ["Play S1:E3"]], start: invalid })
+        end sub
+
+        @it("treats an unplayed title the same as a played one")
+        sub _()
+            m.assertEqual(m.shown(m.saved(139.4, false)), m.shown(m.saved(139.4, true)))
+            m.assertEqual(m.shown(m.saved(600, false, 10, 1440)), m.shown(m.saved(600, true, 10, 1440)))
+            m.assertEqual(m.shown(m.saved(0, false)), m.shown(m.saved(0, true)))
+        end sub
+
+        @it("resumes from the server's 5% floor, and offers Play on a shorter saved position that the start still resumes (AG-125)")
+        sub _()
+            ' The server writes no position below 5% of the runtime, so a
+            ' 22-minute title's first saved position is 66 s, past Resume's
+            ' 30 s.
+            out = m.shown(m.saved(66, true))
+            m.assertEqual(out.labels[1], ["Resume 1:06", "Start Over"])
+            m.assertEqual(out.start, tests.dbl(59))
+            ' Under 10 minutes the floor is under 30 s: Play, which starts
+            ' at the saved position as on tvOS and Android TV.
+            out = m.shown(m.saved(25, true, -1, 400))
+            m.assertEqual(out.labels, [["Play"], ["Play"]])
+            m.assertEqual(out.start, tests.dbl(18))
+        end sub
+
+        @it("plays from the server's start within 5 s of the end, played or not")
+        sub _()
+            m.assertEqual(m.shown(m.saved(1315, true)), { labels: [["Play"], ["Play"]], start: invalid })
+            m.assertEqual(m.shown(m.saved(1314, false)).labels[1], ["Resume 21:54", "Start Over"])
+            m.assertInvalid(playback.intent.savedPosition(-1, 100))
+            m.assertEqual(playback.intent.savedPosition(96, invalid), 96)
+        end sub
+
+        @it("reads the start's duration from the version when the watch state has none")
+        sub _()
+            body = m.saved(1316, true)
+            body.user_data.Delete("duration_seconds")
+            m.assertInvalid(playback.intent.fromWatch(body, "x").resumeSeconds)
+            m.assertEqual(catalog.detail.resume(body).resumeSeconds, -1.0)
+        end sub
+
+        @describe("resumeAt")
+
+        @it("starts 7 s before the saved position, never below 0")
+        sub _()
+            m.assertEqual(playback.intent.resumeAt(1325.5), 1318.5)
+            m.assertEqual(playback.intent.resumeAt(3), 0)
+            m.assertInvalid(playback.intent.resumeAt(invalid))
+        end sub
+
+        @describe("versionOf and playingFile")
+
+        @it("finds the plan's file among the versions and the variants' parts, else the start's version")
+        sub _()
+            detail = m.watch()
+            other = {}
+            other.Append(detail.versions[0])
+            other.file_id = "7"
+            detail.playback_variants[0].parts[0].versions = [other]
+            m.assertEqual(playback.intent.versionOf(detail, "42").file_id, "42")
+            m.assertEqual(playback.intent.versionOf(detail, "7").file_id, "7")
+            m.assertEqual(playback.intent.versionOf(detail, "gone").file_id, "42", "the version a start plays")
+            m.assertEqual(playback.intent.versionOf(detail, "").file_id, "42")
+        end sub
+
+        @it("plays the plan's effective file, else the one asked for")
+        sub _()
+            m.assertEqual(playback.intent.playingFile({ effective_media_file_id: "43", requested_media_file_id: "42" }, "42"), "43")
+            m.assertEqual(playback.intent.playingFile({ effective_media_file_id: "" }, "42"), "42")
+            m.assertEqual(playback.intent.playingFile(invalid, "42"), "42")
+        end sub
+
+        @describe("audioTrack")
+
+        @it("finds a track by the server's ordinal")
+        sub _()
+            tracks = [m.track(0, "aac", 2, "eng"), m.track(1, "ac3", 6, "eng")]
+            m.assertEqual(playback.intent.audioTrack(tracks, 1), tracks[1])
+            m.assertInvalid(playback.intent.audioTrack(tracks, 5))
+            m.assertInvalid(playback.intent.audioTrack(tracks, invalid))
+        end sub
+
+    end class
+
+end namespace

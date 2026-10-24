@@ -1,0 +1,170 @@
+import "pkg:/source/util/values.bs"
+
+' Translates what the Video node reports into playback.session events
+' (plan sections 6.4 and 6.7). Pure: the player passes the node's field values
+' and the load its content belongs to, so an event from earlier content
+' carries an earlier load and the reducer ignores it.
+namespace playback.video
+    ' Video.errorCode values. Roku's Video node reference lists -1 as a
+    ' network error (server down or unresponsive, unreachable), -2 as a
+    ' connection timeout, -3 as unknown or generic, and -5 as a media error
+    ' (format unknown or unsupported); older references, which this client
+    ' first followed, listed 0 as the network error and -1 as HTTP's.
+    const ERROR_LEGACY_NETWORK = 0
+    const ERROR_NETWORK = -1
+    const ERROR_TIMEOUT = -2
+    const ERROR_MEDIA = -5
+    ' A media connection that failed, in errorStr or errorInfo's dbgmsg
+    ' (hardware run 14, the lab probe resetting or closing media
+    ' connections): Roku's reader quotes libcurl's message after "Transfer
+    ' error:" ("Failure when receiving data from the peer", "Server
+    ' returned nothing (no headers, no data)") except for an HTTP error
+    ' status, which httpStatus reads; an HLS playlist it read empty is "mpr
+    ' zero length playlist"; and its demuxer reports every variant's
+    ' downloads failing as "Errors seen on all bitrates", whose last_err is
+    ' an HTTP status when there was one (run 8) and another number when
+    ' the connection failed (961 in run 14; Roku does not document these
+    ' codes).
+    const TRANSPORT_PATTERN = "\btransfer error:(?!\s*http response code said error)|zero length playlist|errors seen on all bitrates|\blast_?err(?:or)?:-?[1-9]|connection (?:reset|refused|closed)|reset by peer|couldn'?t (?:connect|resolve)|timeout was reached|timed out"
+    ' An HTTP error whose status Roku's reader did not quote.
+    const HTTP_ERROR_PATTERN = "http response code said error"
+    ' A media error's own diagnosis of what it was given: a decoder, a
+    ' codec, or something unsupported ("decoder:video:unsupported profile").
+    const DECODER_PATTERN = "\bdecod|\bcodec|unsupported"
+    ' audioFormat for Dolby MAT, which Roku reports when it cannot play the
+    ' track (plan section 6.7).
+    const UNSUPPORTED_AUDIO = "mat"
+
+    ' The event for a Video state, or invalid for states the reducer does not
+    ' take ("none", "stopping", "stopped", and "error", which failure() reads).
+    ' played says the load's content has reached "playing": the node reports
+    ' "finished" right after an error (hardware evidence, harness defect 3),
+    ' and when the failed content is replaced quickly that report would carry
+    ' the new load, so "finished" counts only for content that played, or
+    ' that the player changed just before once it had started (afterWrite):
+    ' Roku stopped content it was opening 0.17 s after the player selected
+    ' its subtitle (hardware run 20), which the reducer reads as the
+    ' client's doing (afterWrite true on the event).
+    function stateEvent(videoState as String, load as Integer, played as Boolean, afterWrite = false as Boolean) as Dynamic
+        if videoState = "finished" and afterWrite then return { type: "player", load: load, state: videoState, afterWrite: true }
+        if videoState = "finished" and not played then return invalid
+        if videoState = "buffering" or videoState = "playing" or videoState = "paused" or videoState = "finished" then return { type: "player", load: load, state: videoState }
+        return invalid
+    end function
+
+    ' The input event for a Video.bufferingStatus reading, or invalid when it
+    ' carries no fill percentage.
+    function bufferEvent(status as Dynamic, load as Integer) as Dynamic
+        if not util.isObject(status) or not util.isNumber(status.percentage) then return invalid
+        return { type: "input", load: load, buffer: status.percentage }
+    end function
+
+    ' The input event for a Video.downloadedSegment report, or invalid for
+    ' a download that failed (a nonzero Status, Roku's Video node
+    ' reference), which delivered no media.
+    function segmentEvent(segment as Dynamic, load as Integer) as Dynamic
+        if util.isObject(segment) and util.isNumber(segment.Status) and segment.Status <> 0 then return invalid
+        return { type: "input", load: load }
+    end function
+
+    ' The failure for a Video error, as { event, status }: event is the
+    ' reducer's failure event; status is the HTTP status the error reports,
+    ' or 0. The status decides before the error code: Roku reports a media
+    ' request's refusal as error -5 ("mediaerror") with the status only in
+    ' its text (hardware run 8), and a progressive original's as error -1
+    ' with the status in its text after the URL (run 10). A 401 or 403 is
+    ' "auth", the content's credential: refreshed headers and a reload at
+    ' the current position, which excludes nothing (plan section 6.4). A 404
+    ' or 410 from the configured origin means the session ended (plan
+    ' section 5); from a proxy node it is a refusal the server may route
+    ' around. Any other 5xx is "server", the reconnect after the first frame
+    ' (spec section 9.6). Without a status, a failed connection is
+    ' "network" whatever the code (run 14: error -3 for a reset range
+    ' request or playlist, error -5 for reset segments), as is error -1 or
+    ' -2, and an "http" category that quotes no status. Otherwise a media
+    ' error (-5) is "decode" when it names a decoder, a codec, or something
+    ' unsupported, and "media" when it names no cause, which the reducer
+    ' reads from what reached the load (W11-1). message is redacted by the
+    ' caller.
+    function failure(load as Integer, errorCode as Dynamic, info as Dynamic, detail as Dynamic, proxy as Boolean, message = invalid as Dynamic) as Object
+        ' An error without a code is the player's, not the network's.
+        code = 1
+        if util.isNumber(errorCode) then code = errorCode
+        status = httpStatus(info, detail)
+        kind = "player"
+        if status = 401 or status = 403
+            kind = "auth"
+        else if (status = 404 or status = 410) and not proxy
+            kind = "ended"
+        else if status >= 500
+            kind = "server"
+        else if status >= 400 or mentions(HTTP_ERROR_PATTERN, info, detail)
+            kind = "http"
+        else if transportFailed(code, info, detail)
+            kind = "network"
+        else if code = ERROR_MEDIA and mentions(DECODER_PATTERN, info, detail)
+            kind = "decode"
+        else if code = ERROR_MEDIA
+            kind = "media"
+        end if
+        event = { type: "failure", load: load, kind: kind }
+        if util.isString(message) and message <> "" then event.message = message
+        return { event: event, status: status }
+    end function
+
+    ' Whether a Video error without an HTTP status says the media connection
+    ' failed: its code, errorInfo's category, or its text (TRANSPORT_PATTERN).
+    ' Roku documents the categories "http", "drm", "mediaerror", and
+    ' "mediaplayer"; "network" is read too, though no run has shown it.
+    function transportFailed(code as Integer, info as Dynamic, detail as Dynamic) as Boolean
+        if code = ERROR_NETWORK or code = ERROR_TIMEOUT or code = ERROR_LEGACY_NETWORK then return true
+        if util.isObject(info)
+            category = LCase(util.text(info.category))
+            if category = "http" or category = "network" then return true
+        end if
+        return mentions(TRANSPORT_PATTERN, info, detail)
+    end function
+
+    ' Whether pattern matches errorStr (detail) or errorInfo's dbgmsg.
+    function mentions(pattern as String, info as Dynamic, detail as Dynamic) as Boolean
+        regex = CreateObject("roRegex", pattern, "i")
+        if util.isString(detail) and regex.IsMatch(detail) then return true
+        return util.isObject(info) and util.isString(info.dbgmsg) and regex.IsMatch(info.dbgmsg)
+    end function
+
+    ' The failure event when audioFormat shows Roku cannot play the track,
+    ' else invalid.
+    function audioEvent(audioFormat as Dynamic, load as Integer) as Dynamic
+        if LCase(util.text(audioFormat)) <> UNSUPPORTED_AUDIO then return invalid
+        return { type: "failure", load: load, kind: "audio_unsupported", message: "audioFormat " + UNSUPPORTED_AUDIO }
+    end function
+
+    ' The HTTP status a Video error reports, or 0: errorInfo's errcode for an
+    ' "http" category; else the status Roku quotes in errorStr or errorInfo's
+    ' dbgmsg, as its demuxer's "last_err:" or "lasterror:" (error -5, run 8:
+    ' "buffer:loop:demux:Errors seen on all bitrates:last_err:401:…") or
+    ' after the URL its reader names (error -1, run 10: "reader pick stream
+    ' error:HTTP error:Transfer error: HTTP response code said error response
+    ' code:(<url>):502:…"); else "http" followed by a status in errorStr
+    ' (never from a URL's scheme or port).
+    function httpStatus(info as Dynamic, detail as Dynamic) as Integer
+        if util.isObject(info) and LCase(util.text(info.category)) = "http" and util.isNumber(info.errcode) and info.errcode >= 100 and info.errcode <= 599 then return info.errcode
+        texts = [detail]
+        if util.isObject(info) then texts.Push(info.dbgmsg)
+        for each pattern in ["\blast_?err(?:or)?:([1-5][0-9][0-9])\b", "\bresponse code:(?:\([^)]*\):)?([1-5][0-9][0-9])\b"]
+            for each text in texts
+                status = matchStatus(pattern, text)
+                if status > 0 then return status
+            end for
+        end for
+        return matchStatus("\bhttp(?!s?://)(?:/[0-9.]+)?[^0-9]{0,16}?\b([1-5][0-9][0-9])\b", detail)
+    end function
+
+    ' The status pattern's first group captures in text, or 0.
+    function matchStatus(pattern as String, text as Dynamic) as Integer
+        if not util.isString(text) then return 0
+        match = CreateObject("roRegex", pattern, "i").Match(text)
+        if match.Count() < 2 then return 0
+        return match[1].ToInt()
+    end function
+end namespace

@@ -1,0 +1,415 @@
+namespace tests
+
+    @suite("deep link route")
+    class DeepLinkRouteTests extends rooibos.BaseTestSuite
+
+        ' A context as AppScene reads it.
+        function at(phase as String, profileId = "" as String, topRoute = "" as String, overlay = false as Boolean, rememberedId = "" as String) as Object
+            return deeplink.route.context(phase, profileId, rememberedId, topRoute, overlay)
+        end function
+
+        function main(profileId = "p-a" as String, topRoute = "home" as String) as Object
+            return m.at(nav.phase.MAIN, profileId, topRoute)
+        end function
+
+        function link(contentId = "movie:heat-1995" as String) as Object
+            return deeplink.parse({ contentId: contentId, mediaType: "movie" })
+        end function
+
+        ' A server profile, as GET /api/v2/profiles lists it.
+        function serverProfile(id as String, isChild = false as Boolean, hasPin = false as Boolean) as Object
+            return { id: id, name: "Profile " + id, has_pin: hasPin, is_child: isChild, is_primary: false }
+        end function
+
+        function profilesBody(items as Object) as Object
+            return { items: items }
+        end function
+
+        function answer(status as Integer, body as Dynamic) as Object
+            return { requestId: "r1", ok: status >= 200 and status < 300, status: status, headers: {}, body: body, error: invalid }
+        end function
+
+        function failure(status as Integer, kind as String) as Object
+            result = m.answer(status, invalid)
+            result.error = { kind: kind, status: status, problemType: invalid, instance: invalid, retryAfterSeconds: invalid }
+            return result
+        end function
+
+        function selected() as Object
+            return { requestId: "r1", ok: true, status: 0, headers: {}, body: {}, error: invalid }
+        end function
+
+        function movie(contentId = "movie:heat-1995" as String) as Object
+            return m.answer(200, { content_id: contentId, type: "movie", title: "Heat" })
+        end function
+
+        function playing(contentId as String, replace = false as Boolean) as Object
+            return { kind: deeplink.step.PLAY, intent: nav.player.intent(contentId, nav.player.RESUME), replace: replace }
+        end function
+
+        function drop(reason as String) as Object
+            return { kind: deeplink.step.DROP, reason: reason }
+        end function
+
+        function selecting(id as String, isChild = false as Boolean, hasPin = false as Boolean) as Object
+            return { kind: deeplink.step.SELECT, profile: api.auth.profiles.list(m.profilesBody([m.serverProfile(id, isChild, hasPin)]))[0] }
+        end function
+
+        ' A launch link that reached the profile phase and asked for profiles.
+        function choosing() as Object
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, m.link(), m.at(nav.phase.PROFILE))
+            return state
+        end function
+
+        ' The profile rule opened profiles[0] of items, and the item is loading.
+        function resolvingAfterRule(items as Object, rememberedId = "" as String) as Object
+            state = m.choosing()
+            deeplink.route.onProfiles(state, m.answer(200, m.profilesBody(items)), m.at(nav.phase.PROFILE, "", "profile", false, rememberedId))
+            deeplink.route.onPhase(state, m.main(state.trying.id))
+            return state
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("the state table (plan section 7)")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("stores the link while there is no session")
+        sub _()
+            for each phase in [nav.phase.LAUNCH, nav.phase.SETUP, nav.phase.SIGN_IN, nav.phase.UPDATE_REQUIRED]
+                state = deeplink.route.create()
+                m.assertEqual(deeplink.route.onLink(state, m.link(), m.at(phase)), [], phase)
+                m.assertEqual(state.stage, deeplink.stage.WAITING, phase)
+                m.assertTrue(deeplink.route.busy(state), phase)
+            end for
+        end sub
+
+        @it("leaves the profile picker or PIN at launch for the profile rule")
+        sub _()
+            state = deeplink.route.create()
+            decisions = deeplink.route.onLink(state, m.link(), m.at(nav.phase.PROFILE, "", nav.route.PIN))
+            m.assertEqual(decisions, [{ kind: deeplink.step.PICKER, deepLink: true }, { kind: deeplink.step.PROFILES }])
+            m.assertEqual(state.stage, deeplink.stage.PROFILES)
+        end sub
+
+        @it("resolves the item under the open profile, then pushes the player above the stack")
+        sub _()
+            for each topRoute in [nav.route.HOME, nav.route.DETAIL, nav.route.PROFILE]
+                state = deeplink.route.create()
+                m.assertEqual(deeplink.route.onLink(state, m.link(), m.main("p-a", topRoute)), [{ kind: deeplink.step.RESOLVE, contentId: "movie:heat-1995" }], topRoute)
+                m.assertEqual(deeplink.route.onResolved(state, m.movie(), m.main("p-a", topRoute)), [m.playing("movie:heat-1995")], topRoute)
+                m.assertFalse(deeplink.route.busy(state), topRoute)
+            end for
+        end sub
+
+        @it("closes an open keyboard or dialog before the player opens")
+        sub _()
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, m.link(), m.main())
+            decisions = deeplink.route.onResolved(state, m.movie(), m.at(nav.phase.MAIN, "p-a", nav.route.HOME, true))
+            m.assertEqual(decisions, [{ kind: deeplink.step.CLOSE }, m.playing("movie:heat-1995")])
+        end sub
+
+        @it("replaces a running player, which hands its stop to ApiTask as it goes")
+        sub _()
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, m.link("episode:9"), m.main("p-a", nav.route.PLAYER))
+            decisions = deeplink.route.onResolved(state, m.answer(200, { content_id: "episode:9", type: "episode" }), m.main("p-a", nav.route.PLAYER))
+            m.assertEqual(decisions, [m.playing("episode:9", true)])
+        end sub
+
+        @it("drops an invalid link and changes nothing, on launch or while running")
+        sub _()
+            bad = deeplink.parse({ contentId: "c1", mediaType: "live" })
+            for each phase in [nav.phase.LAUNCH, nav.phase.PROFILE, nav.phase.MAIN]
+                state = deeplink.route.create()
+                m.assertEqual(deeplink.route.onLink(state, bad, m.at(phase)), [m.drop("invalid")], phase)
+                m.assertFalse(deeplink.route.busy(state), phase)
+            end for
+        end sub
+
+        @it("keeps the link under way when an invalid one arrives")
+        sub _()
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, m.link(), m.main())
+            m.assertEqual(deeplink.route.onLink(state, deeplink.parse({ contentId: "", mediaType: "movie" }), m.main()), [m.drop("invalid")])
+            m.assertEqual(state.stage, deeplink.stage.RESOLVING)
+            m.assertEqual(state.link.contentId, "movie:heat-1995")
+        end sub
+
+        @it("ignores an event that is not a deep link")
+        sub _()
+            state = deeplink.route.create()
+            m.assertEqual(deeplink.route.onLink(state, invalid, m.main()), [])
+            m.assertFalse(deeplink.route.busy(state))
+        end sub
+
+        @it("stays on the current screen when the open profile cannot see the item or the server fails")
+        sub _()
+            cases = [[404, "http", "inaccessible"], [403, "http", "inaccessible"], [500, "http", "unavailable"], [0, "timeout", "unavailable"], [400, "http", "unavailable"]]
+            for each c in cases
+                state = deeplink.route.create()
+                deeplink.route.onLink(state, m.link(), m.main())
+                m.assertEqual(deeplink.route.onResolved(state, m.failure(c[0], c[1]), m.main()), [m.drop(c[2])], c[0].ToStr())
+                m.assertFalse(deeplink.route.busy(state))
+            end for
+        end sub
+
+        @it("lets a new link replace one under way")
+        sub _()
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, m.link("movie:a"), m.main())
+            m.assertEqual(deeplink.route.onLink(state, m.link("movie:b"), m.main()), [{ kind: deeplink.step.RESOLVE, contentId: "movie:b" }])
+            m.assertEqual(state.link.contentId, "movie:b")
+        end sub
+
+        @it("ignores answers that arrive after the link ended")
+        sub _()
+            state = deeplink.route.create()
+            m.assertEqual(deeplink.route.onResolved(state, m.movie(), m.main()), [])
+            m.assertEqual(deeplink.route.onProfiles(state, m.answer(200, m.profilesBody([m.serverProfile("p-a")])), m.main()), [])
+            m.assertEqual(deeplink.route.onSelected(state, m.selected(), m.main()), [])
+            m.assertEqual(deeplink.route.onPhase(state, m.main()), [])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("deferral through sign-in")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("continues a launch link from server setup through sign-in and the profile rule to the player")
+        sub _()
+            state = deeplink.route.create()
+            m.assertEqual(deeplink.route.onLink(state, m.link(), m.at(nav.phase.LAUNCH)), [])
+            m.assertEqual(deeplink.route.onPhase(state, m.at(nav.phase.SETUP)), [])
+            m.assertEqual(deeplink.route.onPhase(state, m.at(nav.phase.SIGN_IN)), [])
+            m.assertEqual(deeplink.route.onPhase(state, m.at(nav.phase.PROFILE)), [{ kind: deeplink.step.PICKER, deepLink: true }, { kind: deeplink.step.PROFILES }])
+            m.assertEqual(deeplink.route.onProfiles(state, m.answer(200, m.profilesBody([m.serverProfile("p-a")])), m.at(nav.phase.PROFILE)), [m.selecting("p-a")])
+            m.assertEqual(deeplink.route.onSelected(state, m.selected(), m.at(nav.phase.PROFILE)), [])
+            m.assertEqual(deeplink.route.onPhase(state, m.main("p-a")), [{ kind: deeplink.step.RESOLVE, contentId: "movie:heat-1995" }])
+            m.assertEqual(deeplink.route.onResolved(state, m.movie(), m.main("p-a")), [m.playing("movie:heat-1995")])
+            m.assertFalse(deeplink.route.busy(state))
+        end sub
+
+        @it("moves on when the profile opens before the select answer arrives")
+        sub _()
+            state = m.choosing()
+            deeplink.route.onProfiles(state, m.answer(200, m.profilesBody([m.serverProfile("p-a")])), m.at(nav.phase.PROFILE))
+            m.assertEqual(deeplink.route.onPhase(state, m.main("p-a")), [{ kind: deeplink.step.RESOLVE, contentId: "movie:heat-1995" }])
+            m.assertEqual(deeplink.route.onSelected(state, m.selected(), m.main("p-a")), [])
+        end sub
+
+        @it("waits again when the session ends before the link plays, and keeps the link")
+        sub _()
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, m.link(), m.main())
+            m.assertEqual(deeplink.route.onPhase(state, m.at(nav.phase.SIGN_IN)), [{ kind: deeplink.step.CANCEL }])
+            m.assertEqual(state.stage, deeplink.stage.WAITING)
+            m.assertEqual(state.link.contentId, "movie:heat-1995")
+            m.assertEqual(deeplink.route.onPhase(state, m.at(nav.phase.SETUP)), [])
+            m.assertEqual(deeplink.route.onPhase(state, m.at(nav.phase.PROFILE)), [{ kind: deeplink.step.PICKER, deepLink: true }, { kind: deeplink.step.PROFILES }])
+        end sub
+
+        @it("asks for the profiles once while the profile phase lasts")
+        sub _()
+            state = m.choosing()
+            m.assertEqual(deeplink.route.onPhase(state, m.at(nav.phase.PROFILE)), [])
+            m.assertEqual(state.stage, deeplink.stage.PROFILES)
+        end sub
+
+        @it("resolves again when the open profile changes while the item loads")
+        sub _()
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, m.link(), m.main("p-a"))
+            m.assertEqual(deeplink.route.onPhase(state, m.main("p-b")), [{ kind: deeplink.step.RESOLVE, contentId: "movie:heat-1995" }])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("the profile rule (decision D-4)")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("tries the profile last chosen on this device first, then the others in the server's order")
+        sub _()
+            profiles = api.auth.profiles.list(m.profilesBody([m.serverProfile("p-a"), m.serverProfile("p-b"), m.serverProfile("p-c")]))
+            m.assertEqual(m.ids(deeplink.route.profileOrder(profiles, "p-b")), ["p-b", "p-a", "p-c"])
+            m.assertEqual(m.ids(deeplink.route.profileOrder(profiles, "")), ["p-a", "p-b", "p-c"])
+            m.assertEqual(m.ids(deeplink.route.profileOrder(profiles, "p-gone")), ["p-a", "p-b", "p-c"])
+        end sub
+
+        @it("never tries a child profile, even the one last chosen")
+        sub _()
+            profiles = api.auth.profiles.list(m.profilesBody([m.serverProfile("p-kid", true), m.serverProfile("p-a"), m.serverProfile("p-teen", true), m.serverProfile("p-b")]))
+            m.assertEqual(m.ids(deeplink.route.profileOrder(profiles, "p-kid")), ["p-a", "p-b"])
+        end sub
+
+        @it("opens the remembered profile")
+        sub _()
+            state = m.choosing()
+            body = m.profilesBody([m.serverProfile("p-a"), m.serverProfile("p-b")])
+            m.assertEqual(deeplink.route.onProfiles(state, m.answer(200, body), m.at(nav.phase.PROFILE, "", "profile", false, "p-b")), [m.selecting("p-b")])
+        end sub
+
+        @it("opens the account's first non-child profile when the remembered one is a child profile")
+        sub _()
+            state = m.choosing()
+            body = m.profilesBody([m.serverProfile("p-kid", true), m.serverProfile("p-a"), m.serverProfile("p-b")])
+            m.assertEqual(deeplink.route.onProfiles(state, m.answer(200, body), m.at(nav.phase.PROFILE, "", "profile", false, "p-kid")), [m.selecting("p-a")])
+        end sub
+
+        @it("skips a PIN-locked profile, which the session answers with pin_required, for the next")
+        sub _()
+            state = m.choosing()
+            body = m.profilesBody([m.serverProfile("p-dad", false, true), m.serverProfile("p-mom")])
+            m.assertEqual(deeplink.route.onProfiles(state, m.answer(200, body), m.at(nav.phase.PROFILE, "", "profile", false, "p-dad")), [m.selecting("p-dad", false, true)])
+            m.assertEqual(deeplink.route.onSelected(state, m.failure(0, "pin_required"), m.at(nav.phase.PROFILE)), [m.selecting("p-mom")])
+            m.assertEqual(deeplink.route.onPhase(state, m.main("p-mom")), [{ kind: deeplink.step.RESOLVE, contentId: "movie:heat-1995" }])
+            m.assertEqual(state.first.id, "p-mom")
+        end sub
+
+        @it("opens a PIN profile whose token this device already holds")
+        sub _()
+            state = m.choosing()
+            body = m.profilesBody([m.serverProfile("p-dad", false, true)])
+            deeplink.route.onProfiles(state, m.answer(200, body), m.at(nav.phase.PROFILE, "", "profile", false, "p-dad"))
+            m.assertEqual(deeplink.route.onSelected(state, m.selected(), m.at(nav.phase.PROFILE)), [])
+            m.assertEqual(deeplink.route.onPhase(state, m.main("p-dad")), [{ kind: deeplink.step.RESOLVE, contentId: "movie:heat-1995" }])
+        end sub
+
+        @it("gives the picker back when only child or PIN-locked profiles remain")
+        sub _()
+            state = m.choosing()
+            onlyKids = m.profilesBody([m.serverProfile("p-kid", true)])
+            m.assertEqual(deeplink.route.onProfiles(state, m.answer(200, onlyKids), m.at(nav.phase.PROFILE)), [{ kind: deeplink.step.PICKER, deepLink: false }, m.drop("no_profile")])
+            m.assertFalse(deeplink.route.busy(state))
+
+            state = m.choosing()
+            locked = m.profilesBody([m.serverProfile("p-kid", true), m.serverProfile("p-dad", false, true)])
+            deeplink.route.onProfiles(state, m.answer(200, locked), m.at(nav.phase.PROFILE))
+            m.assertEqual(deeplink.route.onSelected(state, m.failure(0, "pin_required"), m.at(nav.phase.PROFILE)), [{ kind: deeplink.step.PICKER, deepLink: false }, m.drop("no_profile")])
+        end sub
+
+        @it("gives the picker back when the profiles cannot load or a profile cannot open")
+        sub _()
+            state = m.choosing()
+            m.assertEqual(deeplink.route.onProfiles(state, m.failure(0, "network"), m.at(nav.phase.PROFILE)), [{ kind: deeplink.step.PICKER, deepLink: false }, m.drop("profiles_failed")])
+
+            state = m.choosing()
+            deeplink.route.onProfiles(state, m.answer(200, m.profilesBody([m.serverProfile("p-a")])), m.at(nav.phase.PROFILE))
+            m.assertEqual(deeplink.route.onSelected(state, m.failure(0, "signed_out"), m.at(nav.phase.PROFILE)), [{ kind: deeplink.step.PICKER, deepLink: false }, m.drop("select_failed")])
+        end sub
+
+        @it("moves on at once when the rule picks the profile already open")
+        sub _()
+            state = m.choosing()
+            ' A profile opened while the list loaded.
+            m.assertEqual(deeplink.route.onPhase(state, m.main("p-a")), [])
+            deeplink.route.onProfiles(state, m.answer(200, m.profilesBody([m.serverProfile("p-a")])), m.main("p-a"))
+            m.assertEqual(deeplink.route.onSelected(state, m.selected(), m.main("p-a")), [{ kind: deeplink.step.RESOLVE, contentId: "movie:heat-1995" }])
+        end sub
+
+        @it("switches away from a child profile that opened while the list loaded")
+        sub _()
+            state = m.choosing()
+            deeplink.route.onPhase(state, m.main("p-kid"))
+            body = m.profilesBody([m.serverProfile("p-kid", true), m.serverProfile("p-a")])
+            m.assertEqual(deeplink.route.onProfiles(state, m.answer(200, body), m.at(nav.phase.MAIN, "p-kid", nav.route.HOME, false, "p-kid")), [m.selecting("p-a")])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("a profile that cannot see the item")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("tries the next profile the rule allows")
+        sub _()
+            state = m.resolvingAfterRule([m.serverProfile("p-a"), m.serverProfile("p-b")])
+            m.assertEqual(deeplink.route.onResolved(state, m.failure(404, "http"), m.main("p-a")), [m.selecting("p-b")])
+            m.assertEqual(deeplink.route.onPhase(state, m.main("p-b")), [{ kind: deeplink.step.RESOLVE, contentId: "movie:heat-1995" }])
+            m.assertEqual(deeplink.route.onResolved(state, m.movie(), m.main("p-b")), [m.playing("movie:heat-1995")])
+        end sub
+
+        @it("reopens the first profile that opened and stays Home when none can see it")
+        sub _()
+            state = m.resolvingAfterRule([m.serverProfile("p-a"), m.serverProfile("p-b")])
+            deeplink.route.onResolved(state, m.failure(404, "http"), m.main("p-a"))
+            deeplink.route.onPhase(state, m.main("p-b"))
+            m.assertEqual(deeplink.route.onResolved(state, m.failure(403, "http"), m.main("p-b")), [m.selecting("p-a"), m.drop("inaccessible")])
+            m.assertFalse(deeplink.route.busy(state))
+        end sub
+
+        @it("stays on Home under the only profile that opened")
+        sub _()
+            state = m.resolvingAfterRule([m.serverProfile("p-a"), m.serverProfile("p-dad", false, true)])
+            m.assertEqual(deeplink.route.onResolved(state, m.failure(404, "http"), m.main("p-a")), [m.selecting("p-dad", false, true)])
+            m.assertEqual(deeplink.route.onSelected(state, m.failure(0, "pin_required"), m.main("p-a")), [m.drop("no_profile")])
+        end sub
+
+        @it("never changes the profile the viewer opened for a link that arrives while running")
+        sub _()
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, m.link(), m.main("p-kid"))
+            m.assertEqual(deeplink.route.onResolved(state, m.failure(404, "http"), m.main("p-kid")), [m.drop("inaccessible")])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("what plays (spec section 8.3)")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("plays a movie or an episode itself")
+        sub _()
+            m.assertEqual(deeplink.route.playableId({ content_id: "movie:heat-1995", type: "movie" }), "movie:heat-1995")
+            m.assertEqual(deeplink.route.playableId({ content_id: "episode:9", type: "episode", series_id: "series:1" }), "episode:9")
+            m.assertEqual(deeplink.route.playableId({ content_id: "movie:x", type: "Movie" }), "movie:x")
+        end sub
+
+        @it("plays a series' or a season's play target")
+        sub _()
+            m.assertEqual(deeplink.route.playableId({ content_id: "series:1", type: "series", play_content_id: "episode:5", play_season_number: 2 }), "episode:5")
+            m.assertEqual(deeplink.route.playableId({ content_id: "season:1-2", type: "season", play_content_id: "episode:6", play_season_number: 2 }), "episode:6")
+        end sub
+
+        @it("has nothing to play for a series without a play target or an item that is not video")
+        sub _()
+            m.assertEqual(deeplink.route.playableId({ content_id: "series:1", type: "series" }), "")
+            for each itemType in ["audiobook", "ebook", "podcast", "podcast_episode", ""]
+                m.assertEqual(deeplink.route.playableId({ content_id: "x:1", type: itemType }), "", itemType)
+            end for
+            m.assertEqual(deeplink.route.playableId(invalid), "")
+        end sub
+
+        @it("plays a series link's target episode and resumes it")
+        sub _()
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, deeplink.parse({ contentId: "series:1", mediaType: "series" }), m.main())
+            series = m.answer(200, { content_id: "series:1", type: "series", play_content_id: "episode:5", play_season_number: 2 })
+            m.assertEqual(deeplink.route.onResolved(state, series, m.main()), [m.playing("episode:5")])
+        end sub
+
+        @it("treats a season link like its series")
+        sub _()
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, deeplink.parse({ contentId: "season:1-2", mediaType: "season" }), m.main())
+            season = m.answer(200, { content_id: "season:1-2", type: "season", play_content_id: "episode:6", play_season_number: 2 })
+            m.assertEqual(deeplink.route.onResolved(state, season, m.main()), [m.playing("episode:6")])
+        end sub
+
+        @it("drops a link whose item has nothing to play")
+        sub _()
+            state = deeplink.route.create()
+            deeplink.route.onLink(state, m.link("book:1"), m.main())
+            m.assertEqual(deeplink.route.onResolved(state, m.answer(200, { content_id: "book:1", type: "audiobook" }), m.main()), [m.drop("not_playable")])
+        end sub
+
+        @it("asks for the item by its escaped ID")
+        sub _()
+            m.assertEqual(deeplink.route.itemPath("movie:heat-1995"), "/api/v2/catalog/items/movie%3Aheat-1995")
+            m.assertEqual(deeplink.route.itemPath("a/b?c"), "/api/v2/catalog/items/a%2Fb%3Fc")
+        end sub
+
+        function ids(profiles as Object) as Object
+            out = []
+            for each profile in profiles
+                out.Push(profile.id)
+            end for
+            return out
+        end function
+    end class
+end namespace

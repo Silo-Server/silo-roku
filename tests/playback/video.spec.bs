@@ -1,0 +1,200 @@
+namespace tests
+
+    @suite("playback video")
+    class PlaybackVideoTests extends rooibos.BaseTestSuite
+
+        @describe("stateEvent")
+
+        @it("passes the states the reducer takes, tagged with the load")
+        sub _()
+            for each name in ["buffering", "playing", "paused", "finished"]
+                m.assertEqual(playback.video.stateEvent(name, 3, true), { type: "player", load: 3, state: name }, name)
+            end for
+            for each name in ["none", "stopping", "stopped", "error"]
+                m.assertInvalid(playback.video.stateEvent(name, 3, true), name)
+            end for
+        end sub
+
+        @it("ignores finished from content that never played, as after an error")
+        sub _()
+            m.assertInvalid(playback.video.stateEvent("finished", 4, false))
+            m.assertEqual(playback.video.stateEvent("buffering", 4, false).state, "buffering")
+        end sub
+
+        @it("passes finished right after the player changed the content, played or not, tagged as the client's doing (hardware run 20)")
+        sub _()
+            for each played in [false, true]
+                m.assertEqual(playback.video.stateEvent("finished", 4, played, true), { type: "player", load: 4, state: "finished", afterWrite: true })
+            end for
+            m.assertEqual(playback.video.stateEvent("playing", 4, true, true), { type: "player", load: 4, state: "playing" }, "only finished is tagged")
+        end sub
+
+        @describe("bufferEvent")
+
+        @it("passes the buffer's fill and drops a reading without one")
+        sub _()
+            m.assertEqual(playback.video.bufferEvent({ percentage: 74, isUnderrun: false, prebufferDone: false }, 2), { type: "input", load: 2, buffer: 74 })
+            m.assertInvalid(playback.video.bufferEvent({}, 2))
+            m.assertInvalid(playback.video.bufferEvent(invalid, 2))
+        end sub
+
+        @describe("segmentEvent")
+
+        @it("passes a downloaded segment and drops one whose download failed")
+        sub _()
+            m.assertEqual(playback.video.segmentEvent({ Status: 0, SegSequence: 12 }, 3), { type: "input", load: 3 })
+            m.assertInvalid(playback.video.segmentEvent({ Status: 1, SegSequence: 13 }, 3), "no media arrived")
+            m.assertEqual(playback.video.segmentEvent({ SegSequence: 14 }, 3), { type: "input", load: 3 }, "no status")
+            m.assertEqual(playback.video.segmentEvent(invalid, 3), { type: "input", load: 3 })
+        end sub
+
+        @describe("failure")
+
+        @it("treats a 401 or 403 as the content's credential")
+        sub _()
+            failure = playback.video.failure(2, -1, { category: "http", errcode: 401 }, "", false, "Video error -1")
+            m.assertEqual(failure, { event: { type: "failure", load: 2, kind: "auth", message: "Video error -1" }, status: 401 })
+            m.assertEqual(playback.video.failure(2, -1, { category: "http", errcode: 403 }, "", true).event.kind, "auth", "a proxy's path token too")
+        end sub
+
+        @it("classes Roku's error -5 by the status its demuxer quotes (run 8)")
+        sub _()
+            detail = "buffer:loop:demux:Errors seen on all bitrates:last_err:401:extra:content_id:2:err_clip_idx:0:etype:buffer:is_init:0:lasterror:401:num_keys:0:num_lic:0:program_id::retry:0"
+            failure = playback.video.failure(4, -5, { category: "mediaerror" }, detail, false)
+            m.assertEqual([failure.event.kind, failure.status], ["auth", 401])
+            m.assertEqual(playback.video.failure(4, -5, { category: "mediaerror" }, "buffer:loop:demux:Errors seen on all bitrates:last_err:502:extra", false).event.kind, "server")
+            m.assertEqual(playback.video.failure(4, -5, { category: "mediaerror", dbgmsg: "lasterror:503" }, "", false).event.kind, "server", "errorInfo's dbgmsg")
+            m.assertEqual(playback.video.failure(4, -5, { category: "mediaerror" }, "x:last_err:404:y", false).event.kind, "ended")
+            m.assertEqual(playback.video.failure(4, -5, { category: "mediaerror" }, "x:last_err:404:y", true).event.kind, "http")
+            m.assertEqual(playback.video.failure(4, -5, { category: "mediaerror" }, "x:last_err:0:y", false).event.kind, "media", "no status")
+        end sub
+
+        @it("ends the session on a 404 or 410 from the configured origin only")
+        sub _()
+            m.assertEqual(playback.video.failure(1, -1, { category: "http", errcode: 404 }, "", false).event.kind, "ended")
+            m.assertEqual(playback.video.failure(1, -1, invalid, "HTTP/1.1 410 Gone", false).event.kind, "ended")
+            m.assertEqual(playback.video.failure(1, -1, { category: "http", errcode: 404 }, "", true).event.kind, "http", "a proxy node's refusal")
+        end sub
+
+        @it("maps Roku's error codes when no status is reported")
+        sub _()
+            m.assertEqual(playback.video.failure(1, 0, invalid, "", false).event.kind, "network")
+            m.assertEqual(playback.video.failure(1, -2, invalid, "", false).event.kind, "network")
+            m.assertEqual(playback.video.failure(1, -1, invalid, "", false).event.kind, "network", "Roku's reference: a network error")
+            m.assertEqual(playback.video.failure(1, -5, invalid, "", false).event.kind, "media", "a media error that names no cause")
+            m.assertEqual(playback.video.failure(1, -3, invalid, "", false).event.kind, "player")
+            m.assertEqual(playback.video.failure(1, invalid, invalid, invalid, false).event.kind, "player")
+            m.assertFalse(playback.video.failure(1, -5, invalid, "", false).event.DoesExist("message"))
+        end sub
+
+        @it("classes a failed media connection as network, whatever the code (run 14)")
+        sub _()
+            ' Run 14's errorStr values, each URL replaced by an example of the
+            ' same shape: the lab probe resetting or closing media connections.
+            url = "http://192.0.2.10:8180/api/v2/playback/sessions/s-1/stream/original.mkv?st=x"
+            player = { category: "mediaplayer" }
+            cases = [
+                { code: -3, info: player, detail: "reader pick stream error:bad:Transfer error: Failure when receiving data from the peer response code:(" + url + "):extra:content_id:9:err_clip_idx:0:etype:buffer:program_id:", name: "an original's reopen, reset" },
+                { code: -3, info: player, detail: "reader pick stream error:bad:Transfer error: Server returned nothing (no headers, no data) response code:(" + url + "):extra:content_id:15:err_clip_idx:0:etype:buffer:program_id:", name: "an original's reopen, closed" },
+                { code: -3, info: player, detail: "reader pick stream error:bad:mpr zero length playlist err0:extra:content_id:10:err_clip_idx:0:etype:buffer:program_id:", name: "a remux's or transcode's playlist" },
+                { code: -5, info: { category: "mediaerror" }, detail: "buffer:loop:demux:Errors seen on all bitrates:last_err:961:extra:content_id:21:err_clip_idx:0:etype:buffer:is_init:0:lasterror:961:num_keys:0:num_lic:0:program_id::retry:0", name: "HLS segments" },
+                { code: -5, info: { category: "mediaerror", dbgmsg: "demux:lasterror:961:num_keys:0" }, detail: "", name: "a non-HTTP lasterror in dbgmsg" },
+                { code: -3, info: { category: "mediaplayer", dbgmsg: "reader:Transfer error: Timeout was reached" }, detail: "", name: "a timeout in dbgmsg" },
+                { code: -3, info: { category: "http", errcode: 0 }, detail: "", name: "the http category without a status" },
+                { code: -1, info: invalid, detail: "Connection reset by peer", name: "a reset" }
+            ]
+            for each c in cases
+                failure = playback.video.failure(4, c.code, c.info, c.detail, false)
+                m.assertEqual([failure.event.kind, failure.status], ["network", 0], c.name)
+            end for
+            m.assertEqual(playback.video.failure(4, -3, player, cases[0].detail, true).event.kind, "network", "from a proxy node too")
+        end sub
+
+        @it("keeps a status, a player error, and a media error that names no connection")
+        sub _()
+            ' A status Roku quotes wins over the transfer error around it (run 10).
+            detail = "reader pick stream error:HTTP error:Transfer error: HTTP response code said error response code:(http://192.0.2.10:8080/x.mkv?st=x):502:extra:content_id:82"
+            m.assertEqual(playback.video.failure(1, -1, { category: "http", errcode: 0 }, detail, false).event.kind, "server")
+            m.assertEqual(playback.video.failure(1, -5, { category: "mediaerror" }, "buffer:loop:demux:Errors seen on all bitrates:last_err:404:extra", false).event.kind, "ended")
+            m.assertEqual(playback.video.failure(1, -1, { category: "http", errcode: 0 }, "Transfer error: HTTP response code said error response code:(http://192.0.2.10:8080/x):extra", false).event.kind, "http", "an HTTP error without its status")
+            ' Earlier runs' playlist and player errors, which quote no status (AG-157).
+            m.assertEqual(playback.video.failure(1, -3, { category: "mediaplayer", errcode: 0, dbgmsg: "reader pick stream error:bad:mpr playlist file is too large.:extra:content_id:13" }, "", false).event.kind, "player")
+            m.assertEqual(playback.video.failure(1, -3, { category: "mediaplayer", errcode: 6, dbgmsg: "Player cannot recover after a fatal error" }, "", false).event.kind, "player")
+            m.assertEqual(playback.video.failure(1, -5, { category: "mediaerror" }, "decoder:video:unsupported profile", false).event.kind, "decode")
+            m.assertEqual(playback.video.failure(1, -5, { category: "mediaerror" }, "x:last_err:0:y", false).event.kind, "media", "no error code")
+        end sub
+
+        @it("keeps a media error's own decoder or format diagnosis, and calls one that names no cause media (W11-1)")
+        sub _()
+            ' Synthetic texts: no run has captured a decoder's own -5.
+            mediaError = { category: "mediaerror" }
+            for each detail in ["decoder:video:unsupported profile", "Decoding failed", "unsupported codec hev1", "buffer:loop:demux:unsupported container"]
+                m.assertEqual(playback.video.failure(1, -5, mediaError, detail, false).event.kind, "decode", detail)
+            end for
+            m.assertEqual(playback.video.failure(1, -5, { category: "mediaerror", dbgmsg: "decoder:audio:unsupported" }, "", false).event.kind, "decode", "in dbgmsg")
+            for each detail in ["", "x:last_err:0:y", "buffer:loop:demux:extra:content_id:3"]
+                m.assertEqual(playback.video.failure(1, -5, mediaError, detail, false).event.kind, "media", detail)
+            end for
+            ' The cause decides first: a status, then a failed connection.
+            m.assertEqual(playback.video.failure(1, -5, mediaError, "decoder:video:unsupported profile:last_err:401", false).event.kind, "auth")
+            m.assertEqual(playback.video.failure(1, -5, mediaError, "buffer:loop:demux:Errors seen on all bitrates:last_err:961:decoder", false).event.kind, "network")
+            m.assertEqual(playback.video.failure(1, -3, { category: "mediaplayer" }, "decoder:video:unsupported profile", false).event.kind, "player", "only a media error (-5)")
+        end sub
+
+        @it("reads any last_err that is not a status as a failed connection, though only 961 has been seen (AG-183)")
+        sub _()
+            for each code in ["961", "962", "-1007", "12"]
+                detail = "buffer:loop:demux:Errors seen on all bitrates:last_err:" + code + ":extra:lasterror:" + code
+                m.assertEqual(playback.video.failure(1, -5, { category: "mediaerror" }, detail, false).event.kind, "network", code)
+                m.assertEqual(playback.video.failure(1, -5, { category: "mediaerror" }, "demux:last_err:" + code + ":extra", false).event.kind, "network", code + " alone")
+            end for
+            m.assertEqual(playback.video.failure(1, -5, { category: "mediaerror" }, "buffer:loop:demux:Errors seen on all bitrates:last_err:0:extra", false).event.kind, "network", "every variant failed")
+        end sub
+
+        @describe("httpStatus")
+
+        @it("reads errorInfo's errcode for the http category, then errorStr")
+        sub _()
+            m.assertEqual(playback.video.httpStatus({ category: "HTTP", errcode: 403 }, ""), 403)
+            m.assertEqual(playback.video.httpStatus({ category: "mediaerror", errcode: 403 }, ""), 0)
+            m.assertEqual(playback.video.httpStatus(invalid, "http error 503 from segment"), 503)
+            m.assertEqual(playback.video.httpStatus(invalid, "HTTP/1.1 401 Unauthorized"), 401)
+            m.assertEqual(playback.video.httpStatus({ category: "mediaerror" }, "demux:last_err:502:extra"), 502)
+            m.assertEqual(playback.video.httpStatus({ category: "mediaerror" }, "demux:lasterror:403:num_keys:0"), 403)
+        end sub
+
+        @it("reads the status Roku's reader quotes after the URL in error -1 (run 10, T2c)")
+        sub _()
+            ' Run 10's errorStr with its URL replaced by an example of the same shape.
+            detail = "reader pick stream error:HTTP error:Transfer error: HTTP response code said error response code:(http://192.0.2.10:8080/api/v2/playback/sessions/s-1/stream/original.mkv?st=x):502:extra:content_id:82:err_clip_idx:0:etype:buffer:program_id:"
+            m.assertEqual(playback.video.httpStatus({ category: "http", errcode: 0 }, detail), 502)
+            m.assertEqual(playback.video.httpStatus({ category: "http", dbgmsg: detail }, ""), 502, "from dbgmsg too")
+            m.assertEqual(playback.video.httpStatus(invalid, "HTTP response code said error response code:(https://silo.example:443/x):401:extra"), 401, "not the port")
+            m.assertEqual(playback.video.httpStatus(invalid, "HTTP response code said error response code:404:extra"), 404, "without a URL")
+            failure = playback.video.failure(3, -1, { category: "http", errcode: 0 }, detail, false)
+            m.assertEqual(failure.status, 502)
+            m.assertEqual(failure.event.kind, "server", "the reconnect after the first frame, not http")
+            m.assertEqual(playback.video.failure(3, -1, { category: "http" }, detail, true).event.kind, "server", "from a proxy node too")
+        end sub
+
+        @it("never reads a status from a URL's scheme or port")
+        sub _()
+            m.assertEqual(playback.video.httpStatus(invalid, "https://silo.example:443/api/v2/stream"), 0)
+            m.assertEqual(playback.video.httpStatus(invalid, "http://10.0.0.5:404/x"), 0)
+            m.assertEqual(playback.video.httpStatus(invalid, "reader pick stream error:bad:mpr playlist file is too large."), 0)
+            m.assertEqual(playback.video.httpStatus(invalid, "HTTP response code said error response code:(http://192.0.2.10:8080/x):extra"), 0)
+            m.assertEqual(playback.video.httpStatus(invalid, invalid), 0)
+        end sub
+
+        @describe("audioEvent")
+
+        @it("fails the load when Roku reports Dolby MAT, which it cannot play")
+        sub _()
+            m.assertEqual(playback.video.audioEvent("MAT", 5), { type: "failure", load: 5, kind: "audio_unsupported", message: "audioFormat mat" })
+            m.assertInvalid(playback.video.audioEvent("eac3", 5))
+            m.assertInvalid(playback.video.audioEvent(invalid, 5))
+        end sub
+
+    end class
+
+end namespace

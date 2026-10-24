@@ -1,0 +1,204 @@
+import "pkg:/components/screens/firstRun.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/textures.bs"
+import "pkg:/source/onboarding/pin.bs"
+import "pkg:/source/onboarding/profiles.bs"
+
+' Text labels are centred on a line this wide.
+const LABEL_WIDTH = 900
+' An empty dot's ring, as tvOS draws it.
+const RING_OPACITY = 0.7
+' The pad's "5", where focus starts as on tvOS: [section, row, column].
+const CENTRE_KEY = [0, 1, 1]
+
+sub init()
+    m.mesh = m.top.findNode("mesh")
+    setUpMesh(m.mesh, theme.firstRunArt.MESH_PROFILES)
+    m.textures = nav.textures.create()
+    nav.textures.addPoster(m.textures, m.mesh)
+    m.avatar = m.top.findNode("avatar")
+    m.name = m.top.findNode("name")
+    m.name.font = theme.font(theme.textStyle.PIN_NAME)
+    m.name.color = theme.color.TEXT
+    m.status = m.top.findNode("status")
+    m.status.font = theme.font(theme.textStyle.PIN_STATUS)
+    m.dots = buildDots(m.top.findNode("dots"))
+    m.pad = m.top.findNode("pad")
+    m.pad.hideTextBox = true
+    m.pad.textEditBox.maxTextLength = onboarding.pin.LENGTH
+    m.pad.textEditBox.voiceEnabled = true
+    m.pad.observeField("text", "onPadText")
+    m.cancel = m.top.findNode("cancel")
+    m.cancel.text = i18n.text("common.cancel")
+    m.request = invalid
+    m.failed = false
+    m.statusIsError = false
+end sub
+
+' Four dots, each a ring for an empty place and a disc for a digit.
+function buildDots(parent as Object) as Object
+    dots = []
+    size = theme.firstRun.PIN_DOT
+    for i = 0 to onboarding.pin.LENGTH - 1
+        dot = parent.createChild("Group")
+        dot.translation = [i * (size + theme.firstRun.PIN_DOT_GAP), 0]
+        ring = dot.createChild("Poster")
+        ring.uri = theme.firstRunArt.PIN_DOT_RING
+        ring.width = size
+        ring.height = size
+        ring.blendColor = theme.color.FOCUS
+        ring.opacity = RING_OPACITY
+        fill = dot.createChild("Poster")
+        fill.uri = theme.firstRunArt.PIN_DOT
+        fill.width = size
+        fill.height = size
+        dots.Push({ ring: ring, fill: fill })
+    end for
+    return dots
+end function
+
+sub onShow(event as Object)
+    if event.first then describe(m.top.entry.params.profile)
+    nav.textures.restore(m.textures)
+    m.top.prompting = true
+    focusPad()
+end sub
+
+sub onHide()
+    m.top.prompting = false
+    nav.textures.hide(m.textures)
+end sub
+
+sub onRelease()
+    m.top.prompting = false
+    m.pad.text = ""
+end sub
+
+sub describe(profile as Object)
+    m.profile = profile
+    m.avatar.initials = onboarding.profiles.initials(profile.name)
+    m.avatar.tint = onboarding.profiles.tintIndex(profile.id)
+    m.avatar.uri = onboarding.profiles.avatarUri(profile.avatarUrl, sessionOrigin())
+    m.name.text = profile.name
+    showStatus(i18n.text("pin.prompt"), theme.color.MARQUEE_SECONDARY)
+    area = m.pad.boundingRect()
+    spot = onboarding.pin.layout(Int(area.width), Int(area.height))
+    left = spot.infoX - LABEL_WIDTH \ 2
+    m.avatar.translation = [spot.infoX - theme.firstRun.PIN_AVATAR \ 2, spot.avatarY]
+    m.name.translation = [left, spot.nameY]
+    m.status.translation = [left, spot.statusY]
+    dotsWidth = onboarding.pin.LENGTH * theme.firstRun.PIN_DOT + (onboarding.pin.LENGTH - 1) * theme.firstRun.PIN_DOT_GAP
+    m.top.findNode("dots").translation = [spot.infoX - dotsWidth \ 2, spot.dotsY]
+    m.pad.translation = [spot.padX, spot.padY]
+    m.cancel.translation = [spot.cancelX - Int(m.cancel.localBoundingRect().width) \ 2, spot.cancelY]
+    if m.pad.keyGrid <> invalid then m.pad.keyGrid.jumpToKey = CENTRE_KEY
+    setControlRows([[m.cancel]], false)
+    showDots(0)
+    speak(i18n.text("pin.audio", { name: profile.name }))
+end sub
+
+' The one line under the dots: the prompt, "Checking…", or what went wrong.
+sub showStatus(text as String, color as String)
+    m.status.text = text
+    m.status.color = color
+    m.statusIsError = color = theme.color.ERROR
+end sub
+
+sub showDots(count as Integer)
+    states = onboarding.pin.dotStates(count, m.failed)
+    for i = 0 to states.Count() - 1
+        dot = m.dots[i]
+        dot.ring.visible = states[i] = onboarding.pin.DOT_EMPTY
+        dot.fill.visible = not dot.ring.visible
+        if states[i] = onboarding.pin.DOT_ERROR
+            dot.fill.blendColor = theme.color.ERROR
+        else
+            dot.fill.blendColor = theme.color.FOCUS
+        end if
+    end for
+end sub
+
+sub focusPad()
+    highlightAt(invalid)
+    m.pad.setFocus(true)
+end sub
+
+' Each digit fills a dot; the fourth sends the check. Digits typed while a
+' check runs are dropped.
+sub onPadText()
+    entry = m.pad.text
+    if m.request <> invalid
+        if entry <> "" then m.pad.text = ""
+        return
+    end if
+    typed = onboarding.pin.digits(entry)
+    if typed <> "" and m.statusIsError
+        m.failed = false
+        showStatus(i18n.text("pin.prompt"), theme.color.MARQUEE_SECONDARY)
+    end if
+    if Len(typed) < onboarding.pin.LENGTH
+        showDots(Len(typed))
+        return
+    end if
+    showDots(onboarding.pin.LENGTH)
+    verify(typed)
+end sub
+
+' POST /api/v2/profiles/{id}/verify-pin, once: each check counts toward the
+' lockout, so none is sent again on its own.
+sub verify(entered as String)
+    send("onVerified")
+    showStatus(i18n.text("pin.checking"), theme.color.MARQUEE_SECONDARY)
+    api.session.verifyPin(m.profile, entered, m.request)
+    m.pad.text = ""
+end sub
+
+' A verified PIN selects the profile and the app moves on to Home, so only
+' the other outcomes answer here.
+sub onVerified(event as Object)
+    result = takeResult(event)
+    if result = invalid then return
+    outcome = onboarding.pin.outcomeOf(result)
+    if outcome = "verified" then return
+    retryAfter = invalid
+    if util.isObject(result.body) then retryAfter = result.body.retryAfterSeconds
+    shown = onboarding.pin.feedback(outcome, retryAfter)
+    m.failed = shown.failed
+    if shown.key = ""
+        showStatus(i18n.text("pin.prompt"), theme.color.MARQUEE_SECONDARY)
+    else
+        showStatus(i18n.text(shown.key, shown.values), theme.color.ERROR)
+        speak(m.status.text)
+    end if
+    showDots(0)
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if m.controlAt = invalid
+        ' The pad left a key unhandled.
+        if key = "down"
+            focusScreen()
+            highlightAt({ row: 0, col: 0 })
+            return true
+        end if
+        ' Back deletes the last digit first, as on tvOS; with none, it
+        ' returns to the picker.
+        if key = "back" and m.request = invalid
+            shorter = onboarding.pin.withoutLastDigit(m.pad.text)
+            if shorter = invalid then return false
+            m.pad.text = shorter
+            return true
+        end if
+        return false
+    end if
+    if key = "up"
+        focusPad()
+        return true
+    end if
+    if key = "OK"
+        nav.pop()
+        return true
+    end if
+    return false
+end function

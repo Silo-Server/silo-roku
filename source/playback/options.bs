@@ -1,0 +1,1306 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/playback/media.bs"
+import "pkg:/source/playback/sidecars.bs"
+import "pkg:/source/playback/tracks.bs"
+import "pkg:/source/catalog/pickers.bs"
+
+' The player's Options panel (spec section 5.7) and the track, quality, and
+' caption rules behind it (spec sections 8.5 and 9.7, plan sections 6.8 and
+' 6.10). Pure: components/player/options/OptionsPanel draws model() and
+' reports a row's { kind, value }; choose() says what the player does.
+'
+' Track identity is the server's. Subtitles are the plan's
+' subtitle.inventory, named by track_id with its combined_index. Audio is the
+' playing version's audio_tracks from GET /api/v2/watch/{id}, listed by
+' position, the server's audio ordinal (assumption AG-16), because neither
+' the watch projection nor the plan gives audio tracks an ID; a track_change
+' names one by the server's address for the ordinal on the file the plan
+' plays (audioIdentity, assumption AG-120). A new plan replaces every track
+' choice, so nothing here outlives the plan it was built from.
+'
+' state, as the player gathers it for model() and choose():
+'   plan: the current plan (playback_plan), or invalid during a start
+'   version: the WatchFileVersion playing (playback.intent.versionOf)
+'   quality: the session's quality preference, "auto" or a label
+'   switching: a quality change is on its way
+'   captionMode: Video.globalCaptionMode
+'   modelType: roDeviceInfo.GetModelType(), "TV" on a Roku TV
+'   autoplay: whether Up Next plays on by itself (session-local)
+'   episode: whether the title is an episode, which shows Auto-play next
+'   info: { series, title, tag, year, runtime, overview } for Info
+'   stats: playback.player.statsColumns
+'   contentTracks: the ready sidecars of the content playing the current
+'     plan (the player's item.tracks), or invalid while none plays
+'   rokuSubtitles: Video.availableSubtitleTracks, the tracks Roku lists
+'   subtitleLanguage: the language key the subtitle list leads with
+'     (subtitleOrderLanguage), "" for none
+'   burnWanted: the burned-in subtitle captions Off set aside
+'     (captionTracks), or invalid
+namespace playback.options
+    const TAB_INFO = "info"
+    const TAB_STATS = "stats"
+    const TAB_VIDEO = "video"
+    const TAB_AUDIO = "audio"
+    const TAB_SUBTITLES = "subtitles"
+
+    ' Video.globalCaptionMode values (plan section 6.10, criterion 4.8).
+    const CAPTION_OFF = "Off"
+    const CAPTION_ON = "On"
+    const CAPTION_REPLAY = "Instant replay"
+    const CAPTION_MUTE = "When mute"
+
+    ' Row kinds, which a choice carries back.
+    const KIND_QUALITY = "quality"
+    const KIND_AUTOPLAY = "autoplay"
+    const KIND_AUDIO = "audio"
+    const KIND_SUBTITLE = "subtitle"
+    const KIND_CAPTION = "caption"
+
+    ' Outcome kinds of choose() and fromRokuOverlay().
+    const OUTCOME_NONE = "none"
+    const OUTCOME_QUALITY = "qualityChange"
+    const OUTCOME_TRACKS = "trackChange"
+    const OUTCOME_CAPTION = "captionMode"
+    const OUTCOME_AUTOPLAY = "autoplay"
+    const OUTCOME_REVERT = "revert"
+
+    const QUALITY_AUTO = "auto"
+    ' Retired spellings of "play the source", which Auto now does (Android
+    ' TV's videoQualityPreference).
+    const SOURCE_ALIASES = "|auto|original|source|max|"
+
+    ' The values of playback.subtitle_mode (settings manifest), and what
+    ' initialTracks leaves for afterStart.
+    const MODE_AUTO = "auto"
+    const MODE_ALWAYS = "always"
+    const MODE_OFF = "off"
+    const RULE_PICK = "pick"
+    const RULE_OFF = "off"
+    const RULE_AUTO = "auto"
+
+    ' Subtitle codecs Roku can only show burned in (no bitmap capability is
+    ' claimed, spec section 9.7).
+    const BITMAP_CODECS = "|pgs|pgssub|hdmv_pgs_subtitle|dvd_subtitle|dvdsub|vobsub|dvb_subtitle|dvbsub|xsub|"
+
+    ' The panel's copy from a strings table (i18n.load), as catalog.cards.words,
+    ' with the table itself (strings), which names languages and track
+    ' formats as the detail page does (catalog.pickers).
+    function words(strings as Object) as Object
+        out = { strings: strings }
+        for each key in ["tabInfo", "tabStats", "tabVideo", "tabAudio", "tabSubtitles", "quality", "auto", "quality4k", "qualityUpTo", "qualityUpToHd", "autoplayNext", "on", "off", "captions", "captionOn", "captionReplay", "captionMute", "track", "default", "forced", "sdh", "selected"]
+            out[key] = i18n.lookup(strings, "options." + key)
+        end for
+        for each key in ["title", "stream", "playback", "sync", "tracks", "options", "channels", "codec", "route", "audio", "subtitles", "file", "switching", "external", "none"]
+            out[key] = i18n.lookup(strings, "player.hud." + key)
+        end for
+        return out
+    end function
+
+    ' --- The panel --------------------------------------------------------------
+
+    ' The tabs in order, each { key, label, columns } (spec section 5.7,
+    ' tvOS's Info HUD). A column is { title, width, rows, items }: rows take
+    ' focus, items do not. width is px, or 0 for an even share of the
+    ' panel's width. A row is { kind, value, style, label, detail, trailing,
+    ' chevron, checked, speech, picker }: style "track" (label over detail),
+    ' "setting" (label, trailing value, and a chevron when picker opens a
+    ' dialog), or "toggle"; value goes back in the choice; speech is the
+    ' audio guide's text; picker is { title, rows } of "option" rows. An item
+    ' is { type: "text", text, style, color, lines }, { type: "badges",
+    ' badges }, { type: "pair", label, value, stats }, or { type: "header",
+    ' text }. Audio shows only when the version lists audio tracks, as on
+    ' tvOS; Stats always shows, and Subtitles always holds Roku's caption
+    ' modes (spec section 5.9).
+    function model(state as Object, copy as Object) as Object
+        tabs = [
+            { key: TAB_INFO, label: copy.tabInfo, columns: infoColumns(state, copy) },
+            { key: TAB_STATS, label: copy.tabStats, columns: statsColumns(state) },
+            { key: TAB_VIDEO, label: copy.tabVideo, columns: videoColumns(state, copy) }
+        ]
+        if trackList(state.version).Count() > 0 then tabs.Push({ key: TAB_AUDIO, label: copy.tabAudio, columns: audioColumns(state, copy) })
+        tabs.Push({ key: TAB_SUBTITLES, label: copy.tabSubtitles, columns: subtitleColumns(state, copy) })
+        return { tabs: tabs }
+    end function
+
+    ' Roku's caption modes Options offers: On mute only on a Roku TV (plan
+    ' section 6.10), whose GetModelType() is "TV".
+    function captionModes(modelType as String) as Object
+        modes = [CAPTION_OFF, CAPTION_ON, CAPTION_REPLAY]
+        if modelType = "TV" then modes.Push(CAPTION_MUTE)
+        return modes
+    end function
+
+    function column(title as String, rows as Object, items as Object, width = 0 as Integer) as Object
+        return { title: title, width: width, rows: rows, items: items }
+    end function
+
+    function textItem(text as String, style as String, color as String, lines = 1 as Integer) as Object
+        return { type: "text", text: text, style: style, color: color, lines: lines }
+    end function
+
+    function pairItem(label as String, value as String, stats = false as Boolean) as Object
+        return { type: "pair", label: label, value: value, stats: stats }
+    end function
+
+    ' Info: TITLE (the series, title, tag, year and runtime, and overview)
+    ' and STREAM (badges, then Route, Audio, Subtitles, and Roku's File row:
+    ' container, the plan's bitrate, and size). The bitrate is the plan's
+    ' source.bitrate_kbps: the version's is documented in bits per second
+    ' but filled in kilobits (run 6 showed 4,162 for a 4.2 Mbps file;
+    ' assumption AG-121), so it is not read. state.info is { series, title,
+    ' tag, year, runtime, overview } from the player.
+    function infoColumns(state as Object, copy as Object) as Object
+        info = state.info
+        if not util.isObject(info) then info = {}
+        lines = []
+        series = util.text(info.series)
+        if series <> "" then lines.Push(textItem(UCase(series), "hudInfoSeries", "0xFFFFFF99"))
+        lines.Push(textItem(util.text(info.title), "hudInfoTitle", "0xFFFFFFFF", 2))
+        if util.text(info.tag) <> "" then lines.Push(textItem(info.tag, "hudInfoTag", "0xFFFFFFBF"))
+        year = ""
+        if util.isNumber(info.year) and info.year > 0 then year = Int(info.year).ToStr()
+        meta = join([year, util.text(info.runtime)], "  ·  ")
+        if meta <> "" then lines.Push(textItem(meta, "hudInfoMeta", "0xFFFFFFA6"))
+        if util.text(info.overview) <> "" then lines.Push(textItem(info.overview, "hudInfoMeta", "0xFFFFFFBF", 0))
+        stream = []
+        version = state.version
+        if util.isObject(version)
+            badges = compact([util.text(version.resolution), catalog.pickers.dynamicRange(version), catalog.pickers.videoCodecName(util.text(version.codec_video))])
+            audio = currentAudioTrack(state)
+            if audio <> invalid then badges.Append(compact([catalog.pickers.channelLayout(audio, copy.strings), catalog.pickers.audioCodecName(audio.codec)]))
+            if badges.Count() > 0 then stream.Push({ type: "badges", badges: badges })
+        end if
+        if util.isObject(state.plan) then stream.Push(pairItem(copy.route, routeText(state.plan)))
+        audio = currentAudioTrack(state)
+        if audio <> invalid then stream.Push(pairItem(copy.audio, join([catalog.pickers.audioCodecName(audio.codec), catalog.pickers.channelLayout(audio, copy.strings)], " · ")))
+        subtitleValue = copy.off
+        entry = invalid
+        if util.isObject(state.plan) then entry = subtitleEntry(state.plan, playback.media.selectedSubtitle(state.plan))
+        if entry <> invalid then subtitleValue = subtitleLine(entry, copy)
+        stream.Push(pairItem(copy.subtitles, subtitleValue))
+        if util.isObject(version)
+            kbps = invalid
+            if util.isObject(state.plan) and util.isObject(state.plan.source) then kbps = state.plan.source.bitrate_kbps
+            file = join([UCase(util.text(version.container)), bitrateText(kbps), sizeText(version.file_size)], " · ")
+            if file <> "" then stream.Push(pairItem(copy.file, file))
+        end if
+        return [column(copy.title, [], lines), column(copy.stream, [], stream)]
+    end function
+
+    ' Info's runtime, "1h 42m", "2h", or "45 min" (the catalog's words), or
+    ' "" without one.
+    function runtimeText(seconds as Dynamic, strings as Object) as String
+        if not util.isNumber(seconds) or seconds < 60 then return ""
+        minutes = Int(seconds / 60 + 0.5)
+        hours = minutes \ 60
+        rest = minutes mod 60
+        if hours = 0 then return i18n.format(i18n.lookup(strings, "catalog.runtimeMinutes"), { minutes: minutes })
+        if rest = 0 then return i18n.format(i18n.lookup(strings, "catalog.runtimeHours"), { hours: hours })
+        return i18n.format(i18n.lookup(strings, "catalog.runtimeHoursMinutes"), { hours: hours, minutes: rest })
+    end function
+
+    ' "Direct play", "Transcode": the plan's delivery in words.
+    function routeText(plan as Object) as String
+        delivery = util.text(plan.delivery).Replace("_", " ")
+        if delivery = "" then return ""
+        return UCase(Left(delivery, 1)) + Mid(delivery, 2)
+    end function
+
+    ' Stats: the player's stats (playback.player.statsColumns), which hold no
+    ' URL, token, or plan identity, as two columns of label-value pairs
+    ' under their headers.
+    function statsColumns(state as Object) as Object
+        out = []
+        sections = state.stats
+        if type(sections) <> "roArray" then return out
+        for each section in sections
+            items = []
+            for each pair in section.rows
+                items.Push(pairItem(pair[0], pair[1], true))
+            end for
+            out.Push(column(section.title, [], items))
+        end for
+        return out
+    end function
+
+    ' Video: PLAYBACK, the Quality row while the plan offers a choice (else
+    ' the quality as a line), and SYNC, Auto-play next for an episode. The
+    ' toggle's value is the state choosing it sets.
+    function videoColumns(state as Object, copy as Object) as Object
+        playbackRows = []
+        playbackItems = []
+        options = qualityOptions(state, copy)
+        value = qualityValue(state, copy)
+        if options.Count() > 1
+            row = settingRow("setting", KIND_QUALITY, copy.quality, value, true, copy)
+            if util.isTrue(state.switching)
+                row.trailing = copy.switching
+                row.speech = join([copy.quality, copy.switching], ", ")
+            else
+                row.picker = { title: copy.quality, rows: options }
+            end if
+            playbackRows.Push(row)
+        else
+            playbackItems.Push(pairItem(copy.quality, value))
+        end if
+        columns = [column(copy.playback, playbackRows, playbackItems)]
+        if util.isTrue(state.episode)
+            enabled = util.isTrue(state.autoplay)
+            detail = copy.off
+            if enabled then detail = copy.on
+            toggle = settingRow("toggle", KIND_AUTOPLAY, copy.autoplayNext, detail, false, copy)
+            toggle.value = not enabled
+            columns.Push(column(copy.sync, [toggle], []))
+        end if
+        return columns
+    end function
+
+    ' A setting or toggle row: label, then value at its right.
+    function settingRow(style as String, kind as String, label as String, value as String, chevron as Boolean, copy as Object) as Object
+        row = entryRow(kind, invalid, label, "", false, copy)
+        row.style = style
+        row.trailing = value
+        row.chevron = chevron
+        row.speech = join([label, value], ", ")
+        return row
+    end function
+
+    ' The Quality picker's rows: Auto, then the plan's choices (qualityEntries)
+    ' in server order, each named by its display name, else its label, with
+    ' its bitrate ("1080p (8 Mbps)"), and chosen by its label (spec section
+    ' 9.7; tvOS's labelWithBitrate).
+    function qualityOptions(state as Object, copy as Object) as Object
+        current = currentQuality(state)
+        rows = [optionRow(KIND_QUALITY, QUALITY_AUTO, copy.auto, current = QUALITY_AUTO, copy)]
+        for each entry in qualityEntries(state.plan)
+            rows.Push(optionRow(KIND_QUALITY, entry.label, qualityName(entry), current = entry.label, copy))
+        end for
+        return rows
+    end function
+
+    function optionRow(kind as String, value as Dynamic, label as String, checked as Boolean, copy as Object) as Object
+        row = entryRow(kind, value, label, "", checked, copy)
+        row.style = "option"
+        return row
+    end function
+
+    ' "1080p (8 Mbps)", or the name alone without a bitrate.
+    function qualityName(entry as Object) as String
+        name = util.text(entry.display_name).Trim()
+        if name = "" then name = entry.label
+        bitrate = bitrateText(entry.bitrate_kbps)
+        if bitrate = "" then return name
+        return name + " (" + bitrate + ")"
+    end function
+
+    ' The Quality row's value: the checked choice's name, else the
+    ' preference's (preferenceName), so the row reads Auto only while Auto is
+    ' checked. tvOS names the session's preference when it lights no row
+    ' (TVPlayerInfoHUD's qualityValue): a saved 1080p under a plan that
+    ' reports no rung reads "Up to 1080p HD" (hardware run 27 read Auto).
+    function qualityValue(state as Object, copy as Object) as String
+        current = currentQuality(state)
+        for each entry in qualityEntries(state.plan)
+            if entry.label = current then return qualityName(entry)
+        end for
+        return preferenceName(preference(state.quality), copy)
+    end function
+
+    ' A quality preference's name: Auto, the profile's saved resolutions as
+    ' tvOS's ApplePlaybackQuality.displayName names them, else the label as
+    ' the server wrote it (a rung the viewer chose that the plan no longer
+    ' lists).
+    function preferenceName(quality as String, copy as Object) as String
+        if quality = QUALITY_AUTO then return copy.auto
+        if quality = "2160p" then return copy.quality4k
+        if quality = "1080p" or quality = "720p" then return i18n.format(copy.qualityUpToHd, { resolution: quality })
+        if quality = "480p" then return i18n.format(copy.qualityUpTo, { resolution: quality })
+        return quality
+    end function
+
+    ' Audio: TRACKS, the version's audio tracks by position, led by the
+    ' language (catalog.pickers, as the detail page names them), the
+    ' track's own title as the detail menu cleans it
+    ' (catalog.pickers.audioTitle), codec, layout, and Default on the line
+    ' under; and OPTIONS, the playing track's channels and codec.
+    function audioColumns(state as Object, copy as Object) as Object
+        rows = []
+        tracks = playback.tracks.audioTracks(versionAudio(state.version))
+        current = currentAudio(state.plan, state.version)
+        for each track in tracks
+            language = catalog.pickers.languageName(track.language, copy.strings)
+            name = catalog.pickers.nameOf(language, catalog.pickers.rawTitle(track), track.index, copy.strings)
+            defaultText = ""
+            if track.isDefault then defaultText = copy.default
+            detail = join([qualifier(catalog.pickers.audioTitle(track, copy.strings), name), catalog.pickers.audioCodecName(track.codec), catalog.pickers.channelLayout(track, copy.strings), defaultText], " · ")
+            rows.Push(trackRow(KIND_AUDIO, track.index, name, detail, track.index = current, copy))
+        end for
+        audio = currentAudioTrack(state)
+        channels = copy.none
+        codec = copy.none
+        if audio <> invalid
+            channels = orText(catalog.pickers.channelLayout(audio, copy.strings), copy.none)
+            codec = orText(catalog.pickers.audioCodecName(audio.codec), copy.none)
+        end if
+        return [column(copy.tracks, rows, []), column(copy.options, [], [pairItem(copy.channels, channels), pairItem(copy.codec, codec)])]
+    end function
+
+    ' The playing audio track, normalized (playback.tracks.audioTracks), or
+    ' invalid.
+    function currentAudioTrack(state as Object) as Dynamic
+        tracks = playback.tracks.audioTracks(versionAudio(state.version))
+        index = currentAudio(state.plan, state.version)
+        if index < 0 or index >= tracks.Count() then return invalid
+        return tracks[index]
+    end function
+
+    function versionAudio(version as Dynamic) as Dynamic
+        if util.isObject(version) then return version.audio_tracks
+        return invalid
+    end function
+
+    ' Subtitles: TRACKS, Off and the plan's inventory, each led by its
+    ' language with the rest on the line under (tvOS's TRACKS, 470 px); and
+    ' CAPTIONS, Roku's caption modes, where tvOS has its OPTIONS (440 px, 58
+    ' px from it; spec section 5.9). The inventory is in the detail menu's
+    ' order and words (catalog.pickers' subtitleOrder and subtitleTitle) led
+    ' by state.subtitleLanguage (subtitleOrderLanguage), as tvOS orders both
+    ' lists with SubtitleDisplayOrder, so a track sits where the detail page
+    ' put it (hardware run 27 listed the server's order here).
+    function subtitleColumns(state as Object, copy as Object) as Object
+        current = ""
+        if util.isObject(state.plan) then current = playback.media.selectedSubtitle(state.plan)
+        rows = [trackRow(KIND_SUBTITLE, "", copy.off, "", current = "", copy)]
+        tracks = []
+        for each entry in subtitleEntries(state.plan)
+            tracks.Push(inventoryTrack(entry))
+        end for
+        for each track in catalog.pickers.subtitleOrder(tracks, util.text(state.subtitleLanguage), copy.strings)
+            rows.Push(trackRow(KIND_SUBTITLE, track.trackId, subtitleTitle(track, copy), subtitleDetail(track, copy), track.trackId = current, copy))
+        end for
+        names = { Off: copy.off, On: copy.captionOn }
+        names[CAPTION_REPLAY] = copy.captionReplay
+        names[CAPTION_MUTE] = copy.captionMute
+        shown = shownCaptionMode(state)
+        modes = []
+        for each mode in offeredCaptionModes(state)
+            modes.Push(trackRow(KIND_CAPTION, mode, names[mode], "", mode = shown, copy))
+        end for
+        return [column(copy.tracks, rows, [], 470), column(copy.captions, modes, [], 440)]
+    end function
+
+    ' The language key both subtitle lists lead with: the watch projection's
+    ' effective_subtitle_language (tvOS's player's subtitleOrderingLanguage),
+    ' or "" without one. The detail menu (catalog.selection) and Options
+    ' (Player's optionsState) read it from the same projection.
+    function subtitleOrderLanguage(watch as Dynamic) as String
+        return playback.tracks.languageKey(subtitlePreferences(watch, {}).language)
+    end function
+
+    ' An inventory entry in playback.tracks.subtitleTracks' shape, for
+    ' catalog.pickers, with its track_id: its label is its title, as the
+    ' version's title is on the detail page (the server writes both from
+    ' the file's title, else its name).
+    function inventoryTrack(entry as Object) as Object
+        return { trackId: entry.track_id, index: playback.values.number(entry.combined_index, 0), language: LCase(util.text(entry.language)), codec: LCase(util.text(entry.codec)), title: util.text(entry.label).Trim(), embeddedTitle: "", forced: util.isTrue(entry.forced), hearingImpaired: util.isTrue(entry.hearing_impaired), external: util.text(entry.source) = "external", isDefault: util.isTrue(entry.default) }
+    end function
+
+    ' A subtitle's name: its language, else its title, else its format
+    ' ("SRT"), as tvOS names one (a5a170ea), its title cleaned as the detail
+    ' page cleans it (catalog.pickers.subtitleTitle).
+    function subtitleTitle(track as Object, copy as Object) as String
+        language = catalog.pickers.languageName(track.language, copy.strings)
+        title = catalog.pickers.subtitleTitle(track, copy.strings)
+        if language = "" and title = "" and track.codec <> "" then return catalog.pickers.subtitleCodecName(track.codec)
+        return catalog.pickers.nameOf(language, title, track.index, copy.strings)
+    end function
+
+    ' The title when the name does not already say it, then the format,
+    ' Default, Forced, SDH, and External (tvOS's PlayerTrack
+    ' attributePillLabels; Forced and SDH by flag or title, as on the
+    ' detail page).
+    function subtitleDetail(track as Object, copy as Object) as String
+        parts = [qualifier(catalog.pickers.subtitleTitle(track, copy.strings), subtitleTitle(track, copy)), catalog.pickers.subtitleCodecName(track.codec)]
+        if track.isDefault then parts.Push(copy.default)
+        if catalog.pickers.isForced(track) then parts.Push(copy.forced)
+        if catalog.pickers.isHearingImpaired(track) then parts.Push(copy.sdh)
+        if track.external then parts.Push(copy.external)
+        return join(parts, " · ")
+    end function
+
+    ' Info's Subtitles value on one line, tvOS's singleLineLabel: "English
+    ' (Signs & Songs, Forced)".
+    function subtitleLine(entry as Object, copy as Object) as String
+        track = inventoryTrack(entry)
+        name = subtitleTitle(track, copy)
+        marks = compact([qualifier(catalog.pickers.subtitleTitle(track, copy.strings), name)])
+        if catalog.pickers.isForced(track) then marks.Push(copy.forced)
+        if catalog.pickers.isHearingImpaired(track) then marks.Push(copy.sdh)
+        if marks.Count() = 0 then return name
+        return name + " (" + marks.Join(", ") + ")"
+    end function
+
+    ' A track's own title where it says more than its name, or "" (tvOS's
+    ' TrackLabels.qualifier): not the name itself, as it is without a
+    ' language.
+    function qualifier(title as String, name as String) as String
+        if title = "" or LCase(title) = LCase(name) then return ""
+        return title
+    end function
+
+    function trackRow(kind as String, value as Dynamic, label as String, detail as String, checked as Boolean, copy as Object) as Object
+        row = entryRow(kind, value, label, detail, checked, copy)
+        row.style = "track"
+        return row
+    end function
+
+    function entryRow(kind as String, value as Dynamic, label as String, detail as String, checked as Boolean, copy as Object) as Object
+        spoken = [label, detail]
+        if checked then spoken.Push(copy.selected)
+        return { kind: kind, value: value, style: "", label: label, detail: detail, trailing: "", chevron: false, checked: checked, speech: join(spoken, ", "), picker: invalid }
+    end function
+
+    function orText(value as String, fallback as String) as String
+        if value = "" then return fallback
+        return value
+    end function
+
+    ' --- Choices ----------------------------------------------------------------
+
+    ' What a row's choice ({ kind, value }) does, as one outcome:
+    '   { kind: "none" }: it is what already holds;
+    '   { kind: "qualityChange", event }: dispatch event to the session;
+    '   { kind: "trackChange", event, captionMode }: dispatch event, and write
+    '     captionMode to Video.globalCaptionMode when it is not invalid;
+    '   { kind: "captionMode", captionMode }: write it;
+    '   { kind: "autoplay", autoplay }: keep it for Up Next, in this session
+    '     only, since the client writes no settings (spec section 8.5).
+    function choose(state as Object, choice as Object) as Object
+        kind = util.text(choice.kind)
+        if kind = KIND_QUALITY then return chooseQuality(state, util.text(choice.value))
+        if kind = KIND_AUDIO then return chooseAudio(state, choice.value)
+        if kind = KIND_SUBTITLE then return chooseSubtitle(state, util.text(choice.value))
+        if kind = KIND_CAPTION then return chooseCaption(state, util.text(choice.value))
+        if kind = KIND_AUTOPLAY and util.isBoolean(choice.value) and choice.value <> util.isTrue(state.autoplay) then return { kind: OUTCOME_AUTOPLAY, autoplay: choice.value }
+        return { kind: OUTCOME_NONE }
+    end function
+
+    ' A quality_change replan with the label as the server published it, or
+    ' "auto"; nothing for the checked row, the preference already held, or
+    ' a label the plan no longer lists.
+    function chooseQuality(state as Object, label as String) as Object
+        if label = currentQuality(state) or label = preference(state.quality) then return { kind: OUTCOME_NONE }
+        known = label = QUALITY_AUTO
+        for each entry in qualityEntries(state.plan)
+            if entry.label = label then known = true
+        end for
+        if not known then return { kind: OUTCOME_NONE }
+        return { kind: OUTCOME_QUALITY, event: { type: "qualityChange", quality: label } }
+    end function
+
+    ' A track_change naming the audio track at this ordinal
+    ' (audioIdentity) and keeping the plan's subtitle; the content reloads.
+    function chooseAudio(state as Object, index as Dynamic) as Object
+        plan = state.plan
+        if not util.isObject(plan) or not util.isNumber(index) then return { kind: OUTCOME_NONE }
+        if index < 0 or index >= trackList(state.version).Count() or index = currentAudio(plan, state.version) then return { kind: OUTCOME_NONE }
+        audio = audioIdentity(plan, index)
+        if audio = invalid then return { kind: OUTCOME_NONE }
+        selection = keepSubtitle(plan)
+        selection.audio = audio
+        return trackOutcome(selection, false, invalid)
+    end function
+
+    ' A track_change to the subtitle with this track_id, or off for "",
+    ' keeping the plan's audio. Choosing a track turns Roku's captions on
+    ' when they are off, and Off turns them off (plan section 6.10); the
+    ' track already selected only turns captions back on. It switches on the
+    ' playing content when that carries the track and Roku lists it
+    ' (playback.sidecars.inPlace).
+    function chooseSubtitle(state as Object, trackId as String) as Object
+        plan = state.plan
+        if not util.isObject(plan) then return { kind: OUTCOME_NONE }
+        captionsOff = util.text(state.captionMode) = CAPTION_OFF
+        if trackId = playback.media.selectedSubtitle(plan)
+            if trackId <> "" and captionsOff then return { kind: OUTCOME_CAPTION, captionMode: CAPTION_ON }
+            if trackId = "" and not captionsOff then return { kind: OUTCOME_CAPTION, captionMode: CAPTION_OFF }
+            return { kind: OUTCOME_NONE }
+        end if
+        tracks = keepAudio(plan)
+        mode = CAPTION_OFF
+        if trackId <> ""
+            entry = subtitleEntry(plan, trackId)
+            if entry = invalid then return { kind: OUTCOME_NONE }
+            tracks.subtitle = subtitleIdentity(entry)
+            mode = CAPTION_ON
+        end if
+        if captionsOff = (mode = CAPTION_OFF) then mode = invalid
+        inPlace = playback.values.isArray(state.contentTracks) and playback.sidecars.inPlace(state.contentTracks, tracks, state.rokuSubtitles)
+        return trackOutcome(tracks, inPlace, mode)
+    end function
+
+    function chooseCaption(state as Object, mode as String) as Object
+        if mode = shownCaptionMode(state) or not util.contains(offeredCaptionModes(state), mode) then return { kind: OUTCOME_NONE }
+        return { kind: OUTCOME_CAPTION, captionMode: mode }
+    end function
+
+    ' The caption modes Options offers: Off and On alone while the plan
+    ' burns its subtitle into the video or captions Off set one aside,
+    ' since the pixels cannot follow On replay or On mute; else
+    ' captionModes.
+    function offeredCaptionModes(state as Object) as Object
+        if burning(state) then return [CAPTION_OFF, CAPTION_ON]
+        return captionModes(util.text(state.modelType))
+    end function
+
+    ' The caption mode Options checks: while burning, any mode but Off
+    ' shows the burned-in subtitle, so it reads as On.
+    function shownCaptionMode(state as Object) as String
+        mode = util.text(state.captionMode)
+        if burning(state) and mode <> CAPTION_OFF then return CAPTION_ON
+        return mode
+    end function
+
+    function burning(state as Object) as Boolean
+        return state.burnWanted <> invalid or (util.isObject(state.plan) and burnedSubtitle(state.plan) <> invalid)
+    end function
+
+    ' --- Captions and the plan ----------------------------------------------------
+
+    ' What a plan needs for Roku's caption mode, asked when the mode
+    ' changes, not with a track choice, and when a plan arrives:
+    ' { event, wanted }, event the track_change to send or invalid. carried
+    ' says the content playing the plan carries subtitle tracks; wanted is
+    ' the burned-in subtitle captions Off set aside, or invalid, and the
+    ' outcome's wanted replaces it.
+    '   - A burned-in subtitle (subtitle.mode "burn_in") is in the video's
+    '     pixels, which no caption mode hides: Off asks for the plan without
+    '     it and sets it aside; every other mode shows it.
+    '   - With subtitles off and captions not Off, a subtitle set aside is
+    '     asked for again.
+    '   - With captions on, Roku shows a carried track by the viewer's
+    '     caption language whenever none is selected
+    '     (Video.currentSubtitleTrack), and clearing subtitleTrack cannot
+    '     stop it; so a plan with subtitles off reloads, by a track_change
+    '     that keeps its selection, into content that carries none
+    '     (playback.sidecars.offered leaves them out while captions are on).
+    function captionTracks(plan as Dynamic, captionMode as String, carried as Boolean, wanted as Dynamic) as Object
+        out = { event: invalid, wanted: wanted }
+        if not util.isObject(plan) then return out
+        off = captionMode = CAPTION_OFF
+        burned = burnedSubtitle(plan)
+        if burned <> invalid
+            if off
+                out.wanted = burned
+                out.event = trackOutcome(keepAudio(plan), false, invalid).event
+            end if
+            return out
+        end if
+        if off or playback.media.selectedSubtitle(plan) <> "" then return out
+        if wanted <> invalid
+            out.wanted = invalid
+            ' A replan to another file names its own tracks.
+            if subtitleEntry(plan, util.text(wanted.id)) <> invalid
+                selection = keepAudio(plan)
+                selection.subtitle = wanted
+                out.event = trackOutcome(selection, false, invalid).event
+                return out
+            end if
+        end if
+        if carried then out.event = trackOutcome(keepAudio(plan), false, invalid).event
+        return out
+    end function
+
+    ' A track_change that keeps the plan's audio and subtitle and reloads
+    ' (inPlace false), for a subtitle Roku did not switch to on the playing
+    ' content; invalid when the inventory does not list the plan's subtitle.
+    function reloadSelection(plan as Object) as Dynamic
+        entry = subtitleEntry(plan, playback.media.selectedSubtitle(plan))
+        if entry = invalid then return invalid
+        selection = keepAudio(plan)
+        selection.subtitle = subtitleIdentity(entry)
+        return trackOutcome(selection, false, invalid).event
+    end function
+
+    ' The identity of the subtitle the plan burns into the video, or
+    ' invalid when it burns none in.
+    function burnedSubtitle(plan as Object) as Dynamic
+        subtitle = plan.subtitle
+        if not util.isObject(subtitle) or util.text(subtitle.mode) <> "burn_in" then return invalid
+        entry = subtitleEntry(plan, util.text(subtitle.track_id))
+        if entry <> invalid then return subtitleIdentity(entry)
+        if util.isObject(plan.selected_tracks) and util.isObject(plan.selected_tracks.subtitle) then return plan.selected_tracks.subtitle
+        return { id: util.text(subtitle.track_id) }
+    end function
+
+    ' Whether a track_change's subtitle would be burned in: a bitmap track,
+    ' or one the inventory offers only burned in, since Roku claims no
+    ' bitmap subtitle support (spec section 9.7).
+    function burnsIn(plan as Object, selection as Dynamic) as Boolean
+        if not util.isObject(selection) or not util.isObject(selection.subtitle) then return false
+        entry = subtitleEntry(plan, util.text(selection.subtitle.id))
+        return entry <> invalid and burnOnly(entry)
+    end function
+
+    function burnOnly(entry as Object) as Boolean
+        return util.text(entry.delivery) = "burn_in_only" or Instr(1, BITMAP_CODECS, "|" + LCase(util.text(entry.codec)) + "|") > 0
+    end function
+
+    ' --- Roku's overlay ---------------------------------------------------------
+
+    ' A track choice made in Roku's own `*` overlay (plan section 6.10, H15).
+    ' The plan owns track identity, so a change that maps to exactly one
+    ' inventory track becomes a track_change, and any other is undone.
+    ' inventory: { version, rokuAudio (Video.availableAudioTracks),
+    ' contentTracks (as in state), audioTrack and subtitleTrack (the values
+    ' the player last set or accepted) }.
+    ' audioTrack and subtitleTrack are the Video node's values now; one
+    ' changes at a time, and the audio change is read first. Outcomes:
+    '   { kind: "none" }: nothing to send; take the values as accepted;
+    '   { kind: "trackChange", event, captionMode: invalid }: dispatch event
+    '     and take the values as accepted;
+    '   { kind: "revert", audioTrack | subtitleTrack }: write that member
+    '     back to the Video node.
+    ' An empty subtitleTrack is not a choice: Roku's overlay turns captions
+    ' off through the caption mode, which the player observes on its own.
+    function fromRokuOverlay(plan as Dynamic, inventory as Object, audioTrack as String, subtitleTrack as String) as Object
+        if not util.isObject(plan) then return { kind: OUTCOME_NONE }
+        if audioTrack <> util.text(inventory.audioTrack) then return overlayAudio(plan, inventory, audioTrack)
+        if subtitleTrack <> util.text(inventory.subtitleTrack) and subtitleTrack <> "" then return overlaySubtitle(plan, inventory, subtitleTrack)
+        return { kind: OUTCOME_NONE }
+    end function
+
+    ' Roku names an audio track by its Track, with a Language and Format. It
+    ' maps to the version's track in that language, narrowed by codec when
+    ' the language has several; the ordinal order of Roku's list is not
+    ' relied on.
+    function overlayAudio(plan as Object, inventory as Object, audioTrack as String) as Object
+        revert = { kind: OUTCOME_REVERT, audioTrack: util.text(inventory.audioTrack) }
+        chosen = invalid
+        if playback.values.isArray(inventory.rokuAudio)
+            for each entry in inventory.rokuAudio
+                if util.isObject(entry) and util.text(entry.Track) = audioTrack then chosen = entry
+            end for
+        end if
+        if chosen = invalid then return revert
+        language = languageKey(util.text(chosen.Language))
+        tracks = trackList(inventory.version)
+        matches = []
+        for i = 0 to tracks.Count() - 1
+            if language <> "" and languageKey(util.text(tracks[i].language)) = language then matches.Push(i)
+        end for
+        if matches.Count() > 1
+            family = codecFamily(util.text(chosen.Format))
+            narrowed = []
+            for each i in matches
+                if codecFamily(util.text(tracks[i].codec)) = family then narrowed.Push(i)
+            end for
+            matches = narrowed
+        end if
+        if matches.Count() <> 1 then return revert
+        if matches[0] = currentAudio(plan, inventory.version) then return { kind: OUTCOME_NONE }
+        audio = audioIdentity(plan, matches[0])
+        if audio = invalid then return revert
+        selection = keepSubtitle(plan)
+        selection.audio = audio
+        return trackOutcome(selection, false, invalid)
+    end function
+
+    ' Roku names a sidecar by the TrackName it lists for the path the player
+    ' gave it, or by that path (playback.sidecars.isTrack), which is one of
+    ' the content's ready sidecars; Roku is already showing it.
+    function overlaySubtitle(plan as Object, inventory as Object, subtitleTrack as String) as Object
+        trackId = ""
+        if playback.values.isArray(inventory.contentTracks)
+            for each track in inventory.contentTracks
+                if util.isObject(track)
+                    path = util.text(track.path)
+                    if playback.sidecars.isTrack(subtitleTrack, path) then trackId = util.text(track.trackId)
+                end if
+            end for
+        end if
+        entry = invalid
+        if trackId <> "" then entry = subtitleEntry(plan, trackId)
+        if entry = invalid then return { kind: OUTCOME_REVERT, subtitleTrack: util.text(inventory.subtitleTrack) }
+        if trackId = playback.media.selectedSubtitle(plan) then return { kind: OUTCOME_NONE }
+        selection = keepAudio(plan)
+        selection.subtitle = subtitleIdentity(entry)
+        return trackOutcome(selection, true, invalid)
+    end function
+
+    ' fromRokuOverlay as the player watches the Video node: audioTrack and
+    ' subtitleTrack are its values now, read whenever either changes. watch
+    ' is the player's { played, version, rokuAudio, contentTracks, audio,
+    ' subtitle }: played says the content of the
+    ' current plan has reached "playing", and audio and subtitle are the
+    ' node's values as the player last wrote or accepted them. Before the
+    ' content plays, Roku is picking tracks as it opens, never the viewer;
+    ' afterwards a value the player wrote comes back equal to watch's, so
+    ' the echo of the player's own write, or of a revert, is no choice. The
+    ' outcome is fromRokuOverlay's; unless it is "revert", watch takes the
+    ' value it was about, the audio when that changed, else the subtitle.
+    function watchOverlay(plan as Dynamic, watch as Object, audioTrack as String, subtitleTrack as String) as Object
+        if not util.isTrue(watch.played) then return { kind: OUTCOME_NONE }
+        audioChanged = audioTrack <> util.text(watch.audio)
+        outcome = fromRokuOverlay(plan, { version: watch.version, rokuAudio: watch.rokuAudio, contentTracks: watch.contentTracks, audioTrack: watch.audio, subtitleTrack: watch.subtitle }, audioTrack, subtitleTrack)
+        if outcome.kind = OUTCOME_REVERT then return outcome
+        if audioChanged
+            watch.audio = audioTrack
+        else
+            watch.subtitle = subtitleTrack
+        end if
+        return outcome
+    end function
+
+    ' --- Initial tracks -----------------------------------------------------------
+
+    ' What a first start names, and the rule afterStart follows, for the
+    ' version the start plays. picks are Detail's choices for that version
+    ' (nav.player.tracksFor: { audioIndex, subtitleIndex }, server ordinals
+    ' or playback.tracks.AUTO, and a subtitle's playback.tracks.OFF), or
+    ' invalid without any (a deep link, or OK before Detail read the
+    ' tracks); detail is the watch projection; prefs the parsed effective
+    ' settings (playback.preferences). Returns { audioIndex, subtitleIndex,
+    ' subtitleRule, subtitlePrefs }: the start body's audio_track_index and
+    ' subtitle_track_index, or -1 to name none, and subtitleRule and
+    ' subtitlePrefs for afterStart. A picked audio track wins; otherwise the
+    ' worker names the version's effective track, else chooses it with
+    ' initialAudio, where the probe's codecs are known. A picked subtitle,
+    ' or Off, wins too. An Auto subtitle, like a
+    ' start without picks, names none, and the preferences choose among the
+    ' first plan's inventory for the audio that plan plays, as Android TV's
+    ' player does, because the watch projection has no combined subtitle
+    ' ordinal and only the plan says which audio the worker chose.
+    function initialTracks(detail as Dynamic, prefs as Dynamic, picks as Dynamic) as Object
+        if not util.isObject(prefs) then prefs = {}
+        out = { audioIndex: -1, subtitleIndex: -1, subtitleRule: RULE_AUTO, subtitlePrefs: subtitlePreferences(detail, prefs) }
+        if not util.isObject(picks) then return out
+        if util.isNumber(picks.audioIndex) and picks.audioIndex >= 0 then out.audioIndex = Int(picks.audioIndex)
+        picked = picks.subtitleIndex
+        if not util.isNumber(picked) then return out
+        if picked >= 0
+            out.subtitleIndex = Int(picked)
+            out.subtitleRule = RULE_PICK
+        else if picked = playback.tracks.OFF
+            out.subtitleRule = RULE_OFF
+        end if
+        return out
+    end function
+
+    ' Android TV's subtitle preference cascade: the watch projection's
+    ' effective_subtitle_* (which hold a series' own choice), then the
+    ' effective settings, then the manifest defaults (mode auto, forced
+    ' subtitles shown). A blank language is no preference, as Android TV
+    ' reads it. { language, mode, showForced, signature }: signature is the
+    ' projection's effective_subtitle_track_signature, the track the viewer
+    ' last chose on the item or its series, or invalid.
+    function subtitlePreferences(detail as Dynamic, prefs as Object) as Object
+        if not util.isObject(detail) then detail = {}
+        signature = invalid
+        if util.isObject(detail.effective_subtitle_track_signature) then signature = detail.effective_subtitle_track_signature
+        out = { language: firstText([detail.effective_subtitle_language, prefs.subtitleLanguage]), mode: LCase(firstText([detail.effective_subtitle_mode, prefs.subtitleMode])), showForced: true, signature: signature }
+        if out.mode = "" then out.mode = MODE_AUTO
+        if util.isBoolean(detail.effective_show_forced_subtitles)
+            out.showForced = detail.effective_show_forced_subtitles
+        else if util.isBoolean(prefs.showForcedSubtitles)
+            out.showForced = prefs.showForcedSubtitles
+        end if
+        return out
+    end function
+
+    ' Android TV's selectBestCompatibleAudioTrackOrdinal: the preferred
+    ' language, then English, each tier taking its best main mix the device
+    ' plays as is, else its best main mix; with neither language present, a
+    ' playable default, a playable track, a default, then any track. "Best"
+    ' ranks codec quality, then channels, bitrate, and the default flag; the
+    ' earlier track wins a tie. -1 when there is no track.
+    function initialAudio(tracks as Object, language as String, device as Dynamic) as Integer
+        if tracks.Count() = 0 then return -1
+        all = []
+        for i = 0 to tracks.Count() - 1
+            all.Push(i)
+        end for
+        tiers = []
+        for each code in [languageKey(language), "en"]
+            if code <> "" and not util.contains(tiers, code) then tiers.Push(code)
+        end for
+        for each tier in tiers
+            pool = []
+            for each i in all
+                if languageKey(util.text(tracks[i].language)) = tier then pool.Push(i)
+            end for
+            if pool.Count() > 0
+                mixes = mainMixes(tracks, pool)
+                found = bestAudio(tracks, playable(tracks, mixes, device))
+                if found < 0 then found = bestAudio(tracks, mixes)
+                return found
+            end if
+        end for
+        mixes = mainMixes(tracks, all)
+        usable = playable(tracks, mixes, device)
+        for each pool in [defaults(tracks, usable), usable, defaults(tracks, mixes), mixes]
+            found = bestAudio(tracks, pool)
+            if found >= 0 then return found
+        end for
+        return -1
+    end function
+
+    ' The track_change the first plan of a start needs for its subtitle to
+    ' follow initial (initialTracks), or invalid when the plan already
+    ' agrees. A picked track the server could not honour stays as the plan
+    ' has it (subtitle_track_unavailable). Under the preferences, Android TV's
+    ' resolveAutoSubtitle chooses from the plan's inventory against the
+    ' language of the plan's audio, and no choice means off. The content has
+    ' not played, so it reloads.
+    function afterStart(plan as Dynamic, version as Dynamic, initial as Object) as Dynamic
+        if not util.isObject(plan) or initial.subtitleRule = RULE_PICK then return invalid
+        current = playback.media.selectedSubtitle(plan)
+        target = ""
+        if initial.subtitleRule = RULE_AUTO
+            tracks = trackList(version)
+            index = currentAudio(plan, version)
+            audioLanguage = ""
+            if index >= 0 then audioLanguage = util.text(tracks[index].language)
+            entry = autoSubtitle(subtitleEntries(plan), initial.subtitlePrefs, audioLanguage)
+            if entry <> invalid then target = entry.track_id
+        end if
+        if target = current then return invalid
+        selection = keepAudio(plan)
+        if target <> "" then selection.subtitle = subtitleIdentity(subtitleEntry(plan, target))
+        return { type: "trackChange", tracks: selection, inPlace: false }
+    end function
+
+    ' tvOS's SubtitleAutoResolver (silo-apple 75034f9c) over inventory
+    ' entries, with the reading that no choice is off: mode off chooses the
+    ' forced track in the audio's language when forced subtitles are shown,
+    ' else nothing; then the track best matching the signature the viewer
+    ' last chose (signatureMatch); without a language only mode always
+    ' chooses, the best of all; with the audio already in the language, mode
+    ' auto chooses only that language's forced track, when forced subtitles
+    ' are shown; otherwise the best track in the language, else, with forced
+    ' subtitles shown, the best forced track. The entry, or invalid.
+    function autoSubtitle(entries as Object, prefs as Object, audioLanguage as String) as Dynamic
+        mode = util.text(prefs.mode)
+        showForced = util.isTrue(prefs.showForced)
+        if mode = MODE_OFF
+            audio = languageKey(audioLanguage)
+            if not showForced or audio = "" then return invalid
+            return bestSubtitle(entries, audio, true)
+        end if
+        if util.isObject(prefs.signature)
+            matched = signatureMatch(entries, prefs.signature)
+            if matched <> invalid then return matched
+        end if
+        target = languageKey(util.text(prefs.language))
+        if target = ""
+            if mode <> MODE_ALWAYS then return invalid
+            return bestSubtitle(entries, "", false)
+        end if
+        if mode = MODE_AUTO and languageKey(audioLanguage) = target
+            if showForced then return bestSubtitle(entries, target, true)
+            return invalid
+        end if
+        found = bestSubtitle(entries, target, false)
+        if found = invalid and showForced then found = bestSubtitle(entries, "", true)
+        return found
+    end function
+
+    ' tvOS's bestSignatureMatch over inventory entries: 5 for the
+    ' signature's language and 2 for a label containing its label, which
+    ' only count with one of them, and 1 each for its forced flag, its
+    ' hearing-impaired flag, and its codec; the highest score wins, the
+    ' first on a tie. The entry, or invalid.
+    function signatureMatch(entries as Object, signature as Object) as Dynamic
+        language = languageKey(util.text(signature.language))
+        label = LCase(util.text(signature.label).Trim())
+        codec = LCase(util.text(signature.codec))
+        found = invalid
+        best = 0
+        for each entry in entries
+            score = 0
+            strong = false
+            if language <> "" and languageKey(util.text(entry.language)) = language
+                score = score + 5
+                strong = true
+            end if
+            if util.isTrue(signature.forced) = util.isTrue(entry.forced) then score = score + 1
+            if util.isTrue(signature.hearing_impaired) = hearingImpaired(entry) then score = score + 1
+            if codec <> "" and codec = LCase(util.text(entry.codec)) then score = score + 1
+            if label <> "" and Instr(1, LCase(util.text(entry.label)), label) > 0
+                score = score + 2
+                strong = true
+            end if
+            if strong and score > best
+                found = entry
+                best = score
+            end if
+        end for
+        return found
+    end function
+
+    ' The first entry in the language ("" for any), forced ones only when
+    ' asked, ranked as Android TV's autoSubtitlePreferenceOrder: one Roku
+    ' shows without a burn-in, full dialogue before forced, plain before
+    ' SDH, then embedded, external, and downloaded.
+    function bestSubtitle(entries as Object, language as String, forcedOnly as Boolean) as Dynamic
+        found = invalid
+        best = 0
+        for each entry in entries
+            if (language = "" or languageKey(util.text(entry.language)) = language) and (not forcedOnly or util.isTrue(entry.forced))
+                score = subtitleScore(entry)
+                if found = invalid or score < best
+                    found = entry
+                    best = score
+                end if
+            end if
+        end for
+        return found
+    end function
+
+    function subtitleScore(entry as Object) as Integer
+        score = 0
+        if burnOnly(entry) then score = score + 16
+        if util.isTrue(entry.forced) then score = score + 8
+        if hearingImpaired(entry) then score = score + 4
+        source = util.text(entry.source)
+        if source = "external" then score = score + 1
+        if source = "downloaded" then score = score + 2
+        return score
+    end function
+
+    ' --- Helpers ------------------------------------------------------------------
+
+    ' The value of the checked Quality row, or "" when none is: Auto under
+    ' an Auto preference, else the plan's active_quality, else the row the
+    ' preference names.
+    function currentQuality(state as Object) as String
+        wanted = preference(state.quality)
+        if wanted = QUALITY_AUTO then return QUALITY_AUTO
+        entries = qualityEntries(state.plan)
+        active = ""
+        if util.isObject(state.plan) then active = util.text(state.plan.active_quality)
+        for each entry in entries
+            if entry.label = active then return active
+        end for
+        if active <> "" then return ""
+        for each entry in entries
+            if LCase(entry.label) = LCase(wanted) then return entry.label
+        end for
+        return ""
+    end function
+
+    ' A quality preference with the source's retired spellings as "auto".
+    function preference(quality as Dynamic) as String
+        value = util.text(quality).Trim()
+        if value = "" or Instr(1, SOURCE_ALIASES, "|" + LCase(value) + "|") > 0 then return QUALITY_AUTO
+        return value
+    end function
+
+    ' The plan's quality choices: available_qualities with a label, less the
+    ' source's retired spellings, which read as Auto, and a label listed
+    ' twice (tvOS f148e231 and 0168c423).
+    function qualityEntries(plan as Dynamic) as Object
+        out = []
+        if not util.isObject(plan) or not playback.values.isArray(plan.available_qualities) then return out
+        seen = {}
+        for each entry in plan.available_qualities
+            if util.isObject(entry) and playback.values.isText(entry.label)
+                key = LCase(entry.label.Trim())
+                if Instr(1, SOURCE_ALIASES, "|" + key + "|") = 0 and not seen.DoesExist(key)
+                    seen[key] = true
+                    out.Push(entry)
+                end if
+            end if
+        end for
+        return out
+    end function
+
+    ' The ordinal of the plan's audio when it names one in range, else the
+    ' version's effective_audio_track_index, its default, then the first
+    ' (Android TV's effectiveAudioOrdinal); -1 without tracks.
+    function currentAudio(plan as Dynamic, version as Dynamic) as Integer
+        tracks = trackList(version)
+        count = tracks.Count()
+        if count = 0 then return -1
+        if util.isObject(plan) and util.isObject(plan.selected_tracks) and util.isObject(plan.selected_tracks.audio)
+            index = plan.selected_tracks.audio.index
+            if util.isNumber(index) and index >= 0 and index < count then return index
+        end if
+        effective = version.effective_audio_track_index
+        if util.isNumber(effective) and effective >= 0 and effective < count then return effective
+        for i = 0 to count - 1
+            if util.isTrue(tracks[i].default) then return i
+        end for
+        return 0
+    end function
+
+    ' The version's audio tracks; an entry that is not an object keeps its
+    ' place, since positions are ordinals.
+    function trackList(version as Dynamic) as Object
+        out = []
+        if not util.isObject(version) or not playback.values.isArray(version.audio_tracks) then return out
+        for each track in version.audio_tracks
+            if util.isObject(track)
+                out.Push(track)
+            else
+                out.Push({})
+            end if
+        end for
+        return out
+    end function
+
+    function subtitleEntries(plan as Dynamic) as Object
+        out = []
+        if not util.isObject(plan) or not util.isObject(plan.subtitle) or not playback.values.isArray(plan.subtitle.inventory) then return out
+        for each entry in plan.subtitle.inventory
+            if util.isObject(entry) and playback.values.isText(entry.track_id) then out.Push(entry)
+        end for
+        return out
+    end function
+
+    function subtitleEntry(plan as Object, trackId as String) as Dynamic
+        for each entry in subtitleEntries(plan)
+            if entry.track_id = trackId then return entry
+        end for
+        return invalid
+    end function
+
+    ' How a track_change names the audio track at a version's ordinal: by
+    ' the server's address for it, file:{file}:audio:{ordinal} (playback
+    ' protocol section 8, as Android TV builds it), on the file the plan
+    ' plays, with the ordinal as its index; invalid when the plan names no
+    ' file. The server requires the id (TrackIdentityV3) and refuses an
+    ' index alone (run 6), and neither the plan nor the watch projection
+    ' lists audio IDs (assumption AG-120).
+    function audioIdentity(plan as Object, index as Integer) as Dynamic
+        fileId = util.text(plan.effective_media_file_id)
+        if fileId = "" then return invalid
+        return { id: "file:" + fileId + ":audio:" + index.ToStr(), index: index }
+    end function
+
+    ' The inventory's identity: track_id, with combined_index when it has one.
+    function subtitleIdentity(entry as Object) as Object
+        out = { id: entry.track_id }
+        if util.isNumber(entry.combined_index) then out.index = entry.combined_index
+        return out
+    end function
+
+    ' A selection keeping the plan's audio as the plan names it.
+    function keepAudio(plan as Object) as Object
+        out = {}
+        if util.isObject(plan.selected_tracks) and util.isObject(plan.selected_tracks.audio) then out.audio = plan.selected_tracks.audio
+        return out
+    end function
+
+    ' A selection keeping the plan's subtitle: a track_change without one
+    ' turns subtitles off.
+    function keepSubtitle(plan as Object) as Object
+        out = {}
+        if util.isObject(plan.selected_tracks) and util.isObject(plan.selected_tracks.subtitle) then out.subtitle = plan.selected_tracks.subtitle
+        return out
+    end function
+
+    ' The "trackChange" outcome for the reducer's trackChange event.
+    function trackOutcome(selection as Object, inPlace as Boolean, captionMode as Dynamic) as Object
+        return { kind: OUTCOME_TRACKS, event: { type: "trackChange", tracks: selection, inPlace: inPlace }, captionMode: captionMode }
+    end function
+
+    function hearingImpaired(entry as Object) as Boolean
+        if util.isTrue(entry.hearing_impaired) then return true
+        label = " " + LCase(util.text(entry.label)) + " "
+        for each mark in ["sdh", "(cc)", " cc ", "hearing impaired"]
+            if Instr(1, label, mark) > 0 then return true
+        end for
+        return false
+    end function
+
+    function audioTitle(track as Object) as String
+        title = util.text(track.title)
+        if title = "" then title = util.text(track.embedded_title)
+        return title
+    end function
+
+    function isCommentary(track as Object) as Boolean
+        title = LCase(audioTitle(track))
+        for each mark in ["commentary", "description", "descriptive", "director", "isolated score"]
+            if Instr(1, title, mark) > 0 then return true
+        end for
+        return false
+    end function
+
+    ' The positions that are not commentary, or all of them when none is.
+    function mainMixes(tracks as Object, positions as Object) as Object
+        out = []
+        for each i in positions
+            if not isCommentary(tracks[i]) then out.Push(i)
+        end for
+        if out.Count() = 0 then return positions
+        return out
+    end function
+
+    function defaults(tracks as Object, positions as Object) as Object
+        out = []
+        for each i in positions
+            if util.isTrue(tracks[i].default) then out.Push(i)
+        end for
+        return out
+    end function
+
+    ' The positions whose track the device plays as it is: its codec is one
+    ' the device decodes or passes through, and multichannel AAC only where
+    ' the device decodes it (the interim AAC rule, assumption AG-27). Every
+    ' position without device facts.
+    function playable(tracks as Object, positions as Object, device as Dynamic) as Object
+        if not util.isObject(device) then return positions
+        out = []
+        for each i in positions
+            track = tracks[i]
+            codec = LCase(util.text(track.codec))
+            family = codecFamily(codec)
+            if family = "aac"
+                if not (util.isNumber(track.channels) and track.channels > 2 and not util.isTrue(device.multichannelAac)) then out.Push(i)
+            else if util.contains(device.codecs, codec) or util.contains(device.codecs, family)
+                out.Push(i)
+            end if
+        end for
+        return out
+    end function
+
+    ' The best of the positions, or -1 for none: main mixes first, then
+    ' codec quality, channels, bitrate, and the default flag.
+    function bestAudio(tracks as Object, positions as Object) as Integer
+        found = -1
+        best = invalid
+        for each i in mainMixes(tracks, positions)
+            track = tracks[i]
+            key = [codecRank(util.text(track.codec)), playback.values.number(track.channels, 0), playback.values.number(track.bitrate, 0), 0]
+            if util.isTrue(track.default) then key[3] = 1
+            if best = invalid or ranksAbove(key, best)
+                found = i
+                best = key
+            end if
+        end for
+        return found
+    end function
+
+    function ranksAbove(key as Object, other as Object) as Boolean
+        for i = 0 to key.Count() - 1
+            if key[i] <> other[i] then return key[i] > other[i]
+        end for
+        return false
+    end function
+
+    ' A codec as one family name: Android TV's audioPreferenceCodec, which
+    ' also reads Roku's Format names ("EAC3", "DD+", "AC3").
+    function codecFamily(codec as String) as String
+        lowered = LCase(codec)
+        if Instr(1, lowered, "dd+") > 0 or Instr(1, lowered, "e-ac") > 0 then return "eac3"
+        token = ""
+        for i = 1 to Len(lowered)
+            c = Mid(lowered, i, 1)
+            if (c >= "a" and c <= "z") or (c >= "0" and c <= "9") then token = token + c
+        end for
+        if Instr(1, token, "truehd") > 0 or token = "mlp" then return "truehd"
+        if Instr(1, token, "eac3joc") > 0 or Instr(1, token, "ec3joc") > 0 then return "eac3_joc"
+        if Instr(1, token, "dtshd") > 0 or Instr(1, token, "dtsma") > 0 then return "dts_hd"
+        if Left(token, 3) = "ec3" or token = "eac3" or token = "ddp" then return "eac3"
+        if Left(token, 3) = "ac3" or token = "dd" then return "ac3"
+        if Left(token, 3) = "aac" then return "aac"
+        if Left(token, 3) = "pcm" or Left(token, 4) = "lpcm" then return "pcm"
+        return token
+    end function
+
+    ' Android TV's audioQualityRank.
+    function codecRank(codec as String) as Integer
+        ranks = { truehd: 1000, eac3_joc: 950, eac3: 900, dts_hd: 850, flac: 825, ac4: 800, dts: 700, ac3: 650, aac: 500, opus: 450, vorbis: 400, mp3: 300, pcm: 250 }
+        family = codecFamily(codec)
+        if ranks.DoesExist(family) then return ranks[family]
+        return 0
+    end function
+
+    function audioCodecName(codec as String) as String
+        names = { eac3: "E-AC-3", eac3_joc: "E-AC-3 Atmos", ac3: "AC-3", truehd: "TrueHD", dts: "DTS", dts_hd: "DTS-HD", aac: "AAC", flac: "FLAC", opus: "Opus", vorbis: "Vorbis", mp3: "MP3", pcm: "PCM", ac4: "AC-4", alac: "ALAC" }
+        family = codecFamily(codec)
+        if names.DoesExist(family) then return names[family]
+        return UCase(codec)
+    end function
+
+    ' Android TV's compactAudioLayout: Atmos, 7.1, 5.1, or Stereo from the
+    ' layout, else from the channel count.
+    function layoutText(track as Object) as String
+        layout = LCase(util.text(track.layout))
+        if Instr(1, layout, "atmos") > 0 then return "Atmos"
+        if Instr(1, layout, "7.1") > 0 then return "7.1"
+        if Instr(1, layout, "5.1") > 0 then return "5.1"
+        if Instr(1, layout, "stereo") > 0 then return "Stereo"
+        if layout <> "" then return util.text(track.layout)
+        channels = track.channels
+        if not util.isNumber(channels) then return ""
+        if channels = 1 then return "Mono"
+        if channels = 2 then return "Stereo"
+        if channels = 6 then return "5.1"
+        if channels = 8 then return "7.1"
+        return channels.ToStr() + "ch"
+    end function
+
+    ' Android TV's formatPlaybackQualityBitrate: "40 Mbps", "1.5 Mbps",
+    ' "800 kbps", or "" when unknown.
+    function bitrateText(kbps as Dynamic) as String
+        if not util.isNumber(kbps) or kbps <= 0 then return ""
+        if kbps < 1000 then return Int(kbps).ToStr() + " kbps"
+        return oneDecimal(kbps / 1000) + " Mbps"
+    end function
+
+    function sizeText(bytes as Dynamic) as String
+        if not util.isNumber(bytes) or bytes <= 0 then return ""
+        if bytes >= 1000000000 then return oneDecimal(bytes / 1000000000#) + " GB"
+        return oneDecimal(bytes / 1000000#) + " MB"
+    end function
+
+    function oneDecimal(value as Dynamic) as String
+        tenths = Int(value * 10 + 0.5)
+        if tenths mod 10 = 0 then return (tenths \ 10).ToStr()
+        return (tenths \ 10).ToStr() + "." + (tenths mod 10).ToStr()
+    end function
+
+    ' A language tag folded for comparison (Android TV's
+    ' autoSubtitleLanguageKey, with the wider alias table of its language
+    ' names): lowercase, region dropped, three-letter codes as two; "" for
+    ' none or "und".
+    function languageKey(language as String) as String
+        primary = LCase(language.Trim()).Replace("_", "-")
+        cut = Instr(1, primary, "-")
+        if cut > 0 then primary = Left(primary, cut - 1)
+        if primary = "und" then return ""
+        aliases = languageAliases()
+        if aliases.DoesExist(primary) then return aliases[primary]
+        return primary
+    end function
+
+    function languageAliases() as Object
+        return { ara: "ar", bul: "bg", cat: "ca", chi: "zh", zho: "zh", cze: "cs", ces: "cs", dan: "da", ger: "de", deu: "de", gre: "el", ell: "el", eng: "en", spa: "es", est: "et", per: "fa", fas: "fa", fin: "fi", fre: "fr", fra: "fr", heb: "he", hin: "hi", hrv: "hr", hun: "hu", ind: "id", ice: "is", isl: "is", ita: "it", jpn: "ja", kor: "ko", lit: "lt", lav: "lv", may: "ms", msa: "ms", nob: "nb", dut: "nl", nld: "nl", nor: "no", pol: "pl", por: "pt", rum: "ro", ron: "ro", rus: "ru", slo: "sk", slk: "sk", slv: "sl", srp: "sr", swe: "sv", tam: "ta", tel: "te", tha: "th", tur: "tr", ukr: "uk", vie: "vi" }
+    end function
+
+    function firstText(values as Object) as String
+        for each value in values
+            text = util.text(value).Trim()
+            if text <> "" then return text
+        end for
+        return ""
+    end function
+
+    ' The non-empty parts, joined.
+    function join(parts as Object, separator as String) as String
+        return compact(parts).Join(separator)
+    end function
+
+    function compact(parts as Object) as Object
+        out = []
+        for each part in parts
+            if util.text(part).Trim() <> "" then out.Push(util.text(part).Trim())
+        end for
+        return out
+    end function
+end namespace

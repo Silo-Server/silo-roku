@@ -1,0 +1,247 @@
+import "pkg:/source/catalog/pickers.bs"
+import "pkg:/source/playback/intent.bs"
+import "pkg:/source/playback/options.bs"
+import "pkg:/source/playback/tracks.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' What a detail page's Version, Audio, and Subtitles buttons and the readout
+' above them offer for one item (spec section 5.6), built from its watch
+' projection (GET /api/v2/watch/{id}) by ApiTask's map step, so the render
+' thread only looks values up (catalog.choice). Pure. Every value is the
+' server's: file IDs, audio ordinals (positions in a version's
+' audio_tracks), and subtitle ordinals in the combined order
+' (playback.tracks). A selection is
+'
+'     { key, defaultFile, versions, versionOptions }
+'
+' key names the item's track preferences (its series, else itself, as tvOS
+' and the web keep them); defaultFile is the file Auto plays, the one the
+' player's start chooses (playback.intent.chooseVersion); versionOptions is
+' the Version menu (catalog.pickers). Each version is
+'
+'     { fileId, compact, audio, audioOptions, autoAudio, audioByLanguage,
+'       subtitles, subtitleOptions, autoSubtitles, clearedAutoSubtitles,
+'       subtitleSeed }
+'
+' compact is the readout's value; audio and subtitles are per track, in
+' ordinal order, { summary, pref }: the readout's value and the body of the
+' track preference that remembers it (PUT /api/v2/{audio,subtitle}-prefs,
+' as tvOS's TrackSelectionPersistence writes it). autoAudio is the track
+' the readout names under Auto (autoAudio); audioByLanguage the best track per language key
+' (playback.options.initialAudio), for a remembered track that moved
+' (catalog.choice.seedAudio). autoSubtitles[i] is the subtitle Auto plays
+' beside audio track i (playback.options.autoSubtitle over the version's
+' tracks against that track's language; one entry with no language when
+' the version has no audio), an ordinal or playback.tracks.OFF;
+' clearedAutoSubtitles the same without the track the profile last chose
+' on the item (effective_subtitle_track_signature), as Auto plays once the
+' page has deleted that choice (catalog.choice's cleared). subtitleSeed is the subtitle the page starts with: a track the profile
+' last chose on this item (effective_subtitle_track_signature), Off when its
+' subtitle mode is off and forced subtitles are not shown, else Auto, as
+' tvOS seeds it (DetailPlaybackFormatting.serverPreferredSubtitleIndex).
+namespace catalog.selection
+    ' The selection for a watch body, or invalid when it lists no version.
+    function fromWatch(watch as Dynamic, copy as Object) as Dynamic
+        if not util.isObject(watch) or not playback.values.isArray(watch.versions) then return invalid
+        chosen = playback.intent.chooseVersion(watch)
+        if chosen = invalid then return invalid
+        prefs = playback.options.subtitlePreferences(watch, {})
+        ' The language the Subtitles menu leads with, as Options' list does.
+        preferredLanguage = playback.options.subtitleOrderLanguage(watch)
+        versions = []
+        options = [catalog.pickers.option(catalog.pickers.AUTO, i18n.lookup(copy, "detail.auto"), i18n.lookup(copy, "detail.autoVersion"))]
+        for each version in watch.versions
+            if util.isObject(version) and util.text(version.file_id) <> ""
+                options.Push(catalog.pickers.versionOption(versions.Count(), version, copy))
+                versions.Push(fromVersion(version, watch, prefs, preferredLanguage, copy))
+            end if
+        end for
+        key = util.text(watch.series_id)
+        if key = "" then key = util.text(watch.content_id)
+        return { key: key, defaultFile: util.text(chosen.file_id), versions: versions, versionOptions: options }
+    end function
+
+    function fromVersion(version as Object, watch as Object, prefs as Object, preferredLanguage as String, copy as Object) as Object
+        ' The tracks as the server sent them, numbered as audio is.
+        raw = []
+        if playback.values.isArray(version.audio_tracks)
+            for each track in version.audio_tracks
+                if util.isObject(track) then raw.Push(track)
+            end for
+        end if
+        audio = playback.tracks.audioTracks(raw)
+        subtitles = playback.tracks.subtitleTracks(version.subtitle_tracks)
+        preferred = -1
+        if util.isNumber(version.effective_audio_track_index) then preferred = Int(version.effective_audio_track_index)
+        out = {
+            fileId: util.text(version.file_id),
+            compact: catalog.pickers.versionCompact(version, copy),
+            audio: [],
+            audioOptions: catalog.pickers.audioOptions(audio, preferred, copy),
+            autoAudio: autoAudio(audio, preferred),
+            audioByLanguage: {},
+            subtitles: [],
+            subtitleOptions: catalog.pickers.subtitleOptions(subtitles, preferredLanguage, copy),
+            autoSubtitles: [],
+            clearedAutoSubtitles: [],
+            subtitleSeed: subtitleSeed(watch, subtitles)
+        }
+        for each track in audio
+            out.audio.Push({ summary: catalog.pickers.audioSummary(track, copy), pref: audioPreference(raw[track.index], track.index) })
+            key = playback.tracks.languageKey(track.language)
+            if key <> "" and not out.audioByLanguage.DoesExist(key) then out.audioByLanguage[key] = playback.options.initialAudio(raw, key, invalid)
+        end for
+        entries = []
+        for each track in subtitles
+            out.subtitles.Push({ summary: catalog.pickers.subtitleSummary(track, copy), pref: subtitlePreference(track) })
+            entries.Push(subtitleEntry(track))
+        end for
+        languages = [""]
+        if audio.Count() > 0
+            languages = []
+            for each track in audio
+                languages.Push(track.language)
+            end for
+        end if
+        cleared = { language: prefs.language, mode: prefs.mode, showForced: prefs.showForced, signature: invalid }
+        for each language in languages
+            out.autoSubtitles.Push(autoOrdinal(entries, prefs, language))
+            out.clearedAutoSubtitles.Push(autoOrdinal(entries, cleared, language))
+        end for
+        return out
+    end function
+
+    ' The ordinal playback.options.autoSubtitle chooses, or OFF for none.
+    function autoOrdinal(entries as Object, prefs as Object, audioLanguage as String) as Integer
+        found = playback.options.autoSubtitle(entries, prefs, audioLanguage)
+        if found = invalid then return playback.tracks.OFF
+        return found.ordinal
+    end function
+
+    ' Android TV's effectiveAudioOrdinal, as playback.options.currentAudio
+    ' reads it before a plan: preferred (the server's
+    ' effective_audio_track_index) when in range, else the default track,
+    ' else the first; -1 without tracks.
+    function autoAudio(tracks as Object, preferred as Integer) as Integer
+        if tracks.Count() = 0 then return -1
+        if preferred >= 0 and preferred < tracks.Count() then return preferred
+        for each track in tracks
+            if track.isDefault then return track.index
+        end for
+        return 0
+    end function
+
+    ' A subtitle track as playback.options reads an inventory entry.
+    function subtitleEntry(track as Object) as Object
+        return { language: track.language, codec: track.codec, forced: track.forced, hearing_impaired: track.hearingImpaired, label: labelOf(track), source: sourceOf(track), ordinal: track.index }
+    end function
+
+    ' A subtitle track's title, else its embedded title.
+    function labelOf(track as Object) as String
+        if track.title <> "" then return track.title
+        return track.embeddedTitle
+    end function
+
+    function sourceOf(track as Object) as String
+        if track.external then return "external"
+        return "embedded"
+    end function
+
+    ' --- Track preferences (tvOS TrackSelectionPersistence) -------------------------
+
+    ' PUT /api/v2/audio-prefs/{key}'s body for the version's audio track at
+    ' ordinal (raw, as the server sent it): its ordinal, language, and
+    ' signature, which the server matches when ordinals shift.
+    function audioPreference(raw as Object, ordinal as Integer) as Object
+        signature = signatureOf(raw)
+        signature.default = util.isTrue(raw.default)
+        return { audio_track_index: ordinal, audio_language: signature.language, track_signature: signature }
+    end function
+
+    ' An audio track's signature as the server compares it (an audio track
+    ' or a stored preference's track_signature): language, title, embedded
+    ' title, codec, layout, and channel count.
+    function signatureOf(raw as Object) as Object
+        channels = 0
+        if util.isNumber(raw.channels) then channels = Int(raw.channels)
+        return { language: util.text(raw.language).Trim(), title: util.text(raw.title).Trim(), embedded_title: util.text(raw.embedded_title).Trim(), codec: util.text(raw.codec).Trim(), layout: util.text(raw.layout).Trim(), channels: channels }
+    end function
+
+    ' PUT /api/v2/subtitle-prefs/{key}'s body for a subtitle track: mode
+    ' always, the version's own index for the track (not the combined
+    ' ordinal a start names), an external track's file, and a signature.
+    function subtitlePreference(track as Object) as Object
+        out = {
+            subtitle_language: track.language,
+            subtitle_track_index: track.streamIndex,
+            subtitle_mode: "always",
+            track_signature: { source: sourceOf(track), language: track.language, codec: track.codec, label: labelOf(track), forced: track.forced, hearing_impaired: track.hearingImpaired }
+        }
+        if track.external then out.external_subtitle_path = track.fileName
+        return out
+    end function
+
+    ' --- The subtitle the page starts with -------------------------------------
+
+    function subtitleSeed(watch as Object, tracks as Object) as Integer
+        if LCase(util.text(watch.effective_subtitle_mode)) = "off"
+            showForced = true
+            if util.isBoolean(watch.effective_show_forced_subtitles) then showForced = watch.effective_show_forced_subtitles
+            if showForced then return catalog.pickers.AUTO
+            return playback.tracks.OFF
+        end if
+        signature = watch.effective_subtitle_track_signature
+        if not util.isObject(signature) then return catalog.pickers.AUTO
+        return bestSignatureMatch(signature, tracks)
+    end function
+
+    ' tvOS's bestSignatureMatch: a track scores 5 for the signature's
+    ' language and 2 for a title containing its label, which only count
+    ' together with one of them, and 1 each for its forced flag, its
+    ' hearing-impaired flag, and its codec; the highest score wins, the first
+    ' in the version's order on a tie. Auto when nothing matches.
+    function bestSignatureMatch(signature as Object, tracks as Object) as Integer
+        language = playback.tracks.languageKey(signature.language)
+        label = LCase(util.text(signature.label).Trim())
+        codec = LCase(util.text(signature.codec))
+        found = catalog.pickers.AUTO
+        best = 0
+        bestPosition = 0
+        for each track in tracks
+            score = 0
+            strong = false
+            if language <> "" and playback.tracks.languageKey(track.language) = language
+                score = score + 5
+                strong = true
+            end if
+            if util.isTrue(signature.forced) = track.forced then score = score + 1
+            if util.isTrue(signature.hearing_impaired) = track.hearingImpaired then score = score + 1
+            if codec <> "" and codec = track.codec then score = score + 1
+            if label <> "" and Instr(1, LCase(labelOf(track)), label) > 0
+                score = score + 2
+                strong = true
+            end if
+            if strong and (score > best or (score = best and track.position < bestPosition))
+                found = track.index
+                best = score
+                bestPosition = track.position
+            end if
+        end for
+        return found
+    end function
+
+    ' --- The remembered audio track (GET /api/v2/audio-prefs/{key}) -------------
+
+    ' The map step's answer for an audio preference: { index, language,
+    ' signature }, signature in the preference's own fields, or invalid.
+    function audioPreferenceOf(body as Dynamic) as Dynamic
+        if not util.isObject(body) then return invalid
+        index = -1
+        if util.isNumber(body.audio_track_index) then index = Int(body.audio_track_index)
+        signature = invalid
+        if util.isObject(body.track_signature) then signature = signatureOf(body.track_signature)
+        return { index: index, language: util.text(body.audio_language).Trim(), signature: signature }
+    end function
+end namespace

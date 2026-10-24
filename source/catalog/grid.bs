@@ -1,0 +1,380 @@
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/nav/focus.bs"
+import "pkg:/source/util/values.bs"
+
+' Paging for the Browse and Search grids (spec sections 5.5 and 5.6, plan
+' section 4.8), pure. Items are numbered from 0 in result order; the grid
+' holds the items lo to hi - 1, where lo is a multiple of COLUMNS so items
+' never change column when the front is dropped or filled. Cursors are
+' opaque positions the server gave: marks [{ offset, cursor }] record where
+' each is, offset 0 needing none, and next is the cursor at nextAt, where
+' reading on resumes (hi, or the nearest mark before an end trimmed
+' between marks). A request carries { offset, cursor, limit, direction,
+' skip }:
+'   direction "next"      read on from nextAt for a page past hi; the held
+'                         items it reads again are left out
+'   direction "previous"  fill in before lo, read from the nearest mark;
+'                         an answer that stops short of lo is gathered
+'                         and the read goes on from its cursor, so cards
+'                         go in only once they reach lo
+'   skip true             read only for the cursor after limit items (no
+'                         items), to walk from a mark further back than
+'                         one read before lo may cover
+'   direction "refresh"   read items the grid holds again, for fresh
+'                         artwork URLs (refreshFor, refreshRange)
+' started, failed, received, trim, and refreshFor change the state in place;
+' want and restore only read it.
+namespace catalog.grid
+    const COLUMNS = 6
+    ' Spec section 5.6 and plan section 4.8: 40 results a page.
+    const PAGE_SIZE = 40
+    ' Spec section 5.5: the next page loads when focus is within eight rows
+    ' of the end (fewer when few pages are held: reach).
+    const LOAD_ROWS = 8
+    ' Plan section 4.8: cursor checkpoints kept before the held items.
+    const MAX_CHECKPOINTS = 10
+    ' The furthest one request reads.
+    const MAX_READ = catalog.request.MAX_LIMIT
+
+    ' pages is how many pages to hold (memory.policy.actions gridPages).
+    ' gather is the read before lo in progress, { start, end, cursor, lo }:
+    ' its cards from start to end wait in the grid for the rest up to lo.
+    ' stalled is set when the results ended before lo, so nothing before it
+    ' can be read again.
+    function create(pages as Integer) as Object
+        return { lo: 0, hi: 0, next: "", nextAt: 0, complete: false, total: -1, marks: [], loading: invalid, refreshed: {}, maxItems: pages * PAGE_SIZE, gather: invalid, stalled: false }
+    end function
+
+    ' The request to make with focus on item focus, or invalid: the next
+    ' page when focus is within reach rows of the last held row, else the
+    ' items before lo when it is within reach of the first. One at a time.
+    ' reach and backFill leave each read's trim of the other end out of
+    ' reach; a read whose trim would still bring it within reach (after
+    ' short answers) waits until focus is on the held row at its own end,
+    ' so a read at one end never drops what the other end then reads again.
+    function want(state as Object, focus as Integer) as Dynamic
+        if state.loading <> invalid then return invalid
+        rows = reach(state)
+        focusRow = focus \ COLUMNS
+        lastRow = rowOf(state.hi - 1)
+        if not state.complete and lastRow - focusRow <= rows
+            newLo = frontAfter(state, state.hi + PAGE_SIZE)
+            if focusRow >= lastRow or newLo = state.lo or focusRow - rowOf(newLo) > rows then return readOn(state)
+        end if
+        if state.lo > 0 and not state.stalled and focusRow - rowOf(state.lo) <= rows
+            decision = before(state)
+            if decision.skip or focusRow <= rowOf(state.lo) then return decision
+            newHi = endAfter(state, readStart(state, decision))
+            if newHi = state.hi or rowOf(newHi - 1) - focusRow > rows then return decision
+        end if
+        return invalid
+    end function
+
+    ' How many rows from an end of the held items focus may come before the
+    ' grid reads past it: LOAD_ROWS, or fewer when maxItems holds too few
+    ' rows for a page read at one end to leave focus out of reach of the
+    ' other.
+    function reach(state as Object) as Integer
+        pageRows = (PAGE_SIZE + COLUMNS - 1) \ COLUMNS
+        rows = (state.maxItems \ COLUMNS - pageRows) \ 2 - 1
+        if rows > LOAD_ROWS then rows = LOAD_ROWS
+        if rows < 1 then rows = 1
+        return rows
+    end function
+
+    ' The most items one read before lo puts in: whole rows, as many as
+    ' leave focus out of reach of the end the read trims, up to MAX_READ.
+    function backFill(state as Object) as Integer
+        rows = state.maxItems \ COLUMNS - 2 * reach(state) - 2
+        if rows > MAX_READ \ COLUMNS then rows = MAX_READ \ COLUMNS
+        if rows < 1 then rows = 1
+        return rows * COLUMNS
+    end function
+
+    ' The page past hi, read on from nextAt.
+    function readOn(state as Object) as Object
+        limit = state.hi - state.nextAt + PAGE_SIZE
+        if limit > MAX_READ then limit = MAX_READ
+        return { offset: state.nextAt, cursor: state.next, limit: limit, direction: "next", skip: false }
+    end function
+
+    ' Reads the items just before lo from the nearest mark that fills at
+    ' least one row, and at most backFill items' worth of rows. A mark
+    ' further back is first walked forward: read only for the cursor after
+    ' up to MAX_READ items, toward the row boundary backFill before lo. A
+    ' gathered read goes on from where it stopped.
+    function before(state as Object) as Object
+        gather = state.gather
+        if gather <> invalid then return { offset: gather.end, cursor: gather.cursor, limit: state.lo - gather.end, direction: "previous", skip: false }
+        mark = { offset: 0, cursor: "" }
+        for each candidate in state.marks
+            if alignUp(candidate.offset) < state.lo and candidate.offset > mark.offset then mark = candidate
+        end for
+        fill = backFill(state)
+        gap = state.lo - mark.offset
+        if gap < fill + COLUMNS and gap <= MAX_READ then return { offset: mark.offset, cursor: mark.cursor, limit: gap, direction: "previous", skip: false }
+        walk = state.lo - fill - mark.offset
+        if walk > MAX_READ then walk = MAX_READ
+        return { offset: mark.offset, cursor: mark.cursor, limit: walk, direction: "previous", skip: true }
+    end function
+
+    ' Where the cards of a read before lo start: the first row boundary of
+    ' the read, or of the reads gathered so far.
+    function readStart(state as Object, request as Object) as Integer
+        if state.gather <> invalid then return state.gather.start
+        return alignUp(request.offset)
+    end function
+
+    ' The request is sent.
+    sub started(state as Object, request as Object)
+        state.loading = request
+    end sub
+
+    ' The request failed or was cancelled: want may ask for it again.
+    sub failed(state as Object)
+        state.loading = invalid
+    end sub
+
+    ' What came back for request: page { size, nextCursor, hasMore, total }
+    ' (catalog.summary.page), size counting every item the answer consumed
+    ' (catalog.map's page has a card for each). Gives the change to make to
+    ' the grid's content:
+    '   { insert: "end" | "start" | "gather" | "", from, size, dropStart, dropEnd }
+    ' insert takes size of the page's items starting at from: "end" puts
+    ' them after the held items, "gather" keeps them aside, and "start" puts
+    ' the cards gathered so far, then them, before the held items. The grid
+    ' drops the gathered cards whenever state.gather is invalid. dropStart
+    ' and dropEnd are how many held items go from each end, to stay within
+    ' maxItems. (No member is named count, which would hide an AA's
+    ' Count().)
+    function received(state as Object, request as Object, page as Object) as Object
+        state.loading = invalid
+        change = unchanged()
+        if util.isNumber(page.total) then state.total = page.total
+        nextCursor = util.text(page.nextCursor)
+        if nextCursor <> "" then addMark(state, request.offset + page.size, nextCursor)
+        if request.direction = "next"
+            addMark(state, request.offset, request.cursor)
+            fillEnd(state, request, page, nextCursor, change)
+        else if request.direction = "previous" and request.skip
+            ' A walk back that brings nothing cannot reach its mark.
+            if page.size = 0 or nextCursor = "" then state.stalled = true
+        else if request.direction = "previous"
+            fillFront(state, request, page, nextCursor, change)
+        end if
+        if state.gather <> invalid and state.gather.lo <> state.lo then state.gather = invalid
+        keepCheckpoints(state)
+        return change
+    end function
+
+    ' An answer to a read on from nextAt: its items past hi go in. A trim
+    ' while it loaded may have moved the end before it; then the trim's
+    ' place to read on from stands and nothing goes in.
+    sub fillEnd(state as Object, request as Object, page as Object, nextCursor as String, change as Object)
+        if request.offset > state.hi then return
+        reached = request.offset + page.size
+        if reached > state.hi
+            change.insert = "end"
+            change.from = state.hi - request.offset
+            change.size = reached - state.hi
+            state.hi = reached
+        end if
+        state.next = nextCursor
+        state.nextAt = reached
+        state.complete = not util.isTrue(page.hasMore) or nextCursor = "" or page.size = 0
+        trimFront(state, change)
+    end sub
+
+    ' An answer to a read before lo, its items from request.offset to
+    ' reached. Cards start at boundary, the first row boundary of the read
+    ' (or of the reads gathered so far), so lo stays a multiple of COLUMNS,
+    ' and go in once the reads reach lo. An answer short of lo is gathered;
+    ' one that ends there, or brings nothing, means the results changed
+    ' since the held items were read, and the grid stops reading back.
+    sub fillFront(state as Object, request as Object, page as Object, nextCursor as String, change as Object)
+        boundary = readStart(state, request)
+        reached = request.offset + page.size
+        first = boundary
+        if first < request.offset then first = request.offset
+        last = reached
+        if last > state.lo then last = state.lo
+        change.from = first - request.offset
+        change.size = last - first
+        if change.size < 0 then change.size = 0
+        if reached >= state.lo
+            change.insert = "start"
+            state.lo = boundary
+            state.gather = invalid
+            trimBack(state, change)
+        else if page.size > 0 and nextCursor <> ""
+            change.insert = "gather"
+            state.gather = { start: boundary, end: reached, cursor: nextCursor, lo: state.lo }
+        else
+            change.size = 0
+            state.gather = invalid
+            state.stalled = true
+        end if
+    end sub
+
+    ' Drops held items to fit maxItems after memory pressure lowered it,
+    ' giving the change (as received). The end further from focus goes
+    ' first, but no closer to focus than half of maxItems, so focus stays
+    ' held and out of reach of both ends.
+    function trim(state as Object, pages as Integer, focus as Integer) as Object
+        state.maxItems = pages * PAGE_SIZE
+        change = unchanged()
+        if state.hi - state.lo <= state.maxItems then return change
+        newLo = frontAfter(state, state.hi)
+        centred = alignDown(focus - state.maxItems \ 2)
+        if centred < newLo then newLo = centred
+        if newLo > state.lo
+            change.dropStart = newLo - state.lo
+            state.lo = newLo
+        end if
+        trimBack(state, change)
+        if state.gather <> invalid and state.gather.lo <> state.lo then state.gather = invalid
+        keepCheckpoints(state)
+        return change
+    end function
+
+    function unchanged() as Object
+        return { insert: "", from: 0, size: 0, dropStart: 0, dropEnd: 0 }
+    end function
+
+    ' Where the front would be with the end at newHi: lo, or the first row
+    ' boundary that leaves at most maxItems.
+    function frontAfter(state as Object, newHi as Integer) as Integer
+        excess = newHi - state.lo - state.maxItems
+        if excess <= 0 then return state.lo
+        return alignUp(state.lo + excess)
+    end function
+
+    ' Where the end would be with the front at newLo: hi, or maxItems on.
+    function endAfter(state as Object, newLo as Integer) as Integer
+        limit = newLo + state.maxItems
+        if state.hi <= limit then return state.hi
+        return limit
+    end function
+
+    ' Removes whole rows from the front until the held items fit.
+    sub trimFront(state as Object, change as Object)
+        newLo = frontAfter(state, state.hi)
+        change.dropStart = change.dropStart + newLo - state.lo
+        state.lo = newLo
+    end sub
+
+    ' Removes items from the end until the held items fit. Reading on
+    ' resumes from the nearest mark at or before the new end.
+    sub trimBack(state as Object, change as Object)
+        newHi = endAfter(state, state.lo)
+        if newHi = state.hi then return
+        change.dropEnd = state.hi - newHi
+        state.hi = newHi
+        resumeMark = { offset: 0, cursor: "" }
+        for each mark in state.marks
+            if mark.offset <= newHi and mark.offset > resumeMark.offset then resumeMark = mark
+        end for
+        state.next = resumeMark.cursor
+        state.nextAt = resumeMark.offset
+        state.complete = false
+    end sub
+
+    ' The refresh for the held item at index after its artwork failed: the
+    ' items from the mark at or before it to the next mark, once per mark.
+    ' Gives invalid when that mark was already refreshed.
+    function refreshFor(state as Object, index as Integer) as Dynamic
+        mark = { offset: 0, cursor: "" }
+        following = state.hi
+        for each candidate in state.marks
+            if candidate.offset <= index and candidate.offset > mark.offset then mark = candidate
+        end for
+        for each candidate in state.marks
+            if candidate.offset > mark.offset and candidate.offset < following then following = candidate.offset
+        end for
+        key = mark.offset.ToStr()
+        if state.refreshed.DoesExist(key) then return invalid
+        state.refreshed[key] = true
+        limit = following - mark.offset
+        if limit > MAX_READ then limit = MAX_READ
+        return { offset: mark.offset, cursor: mark.cursor, limit: limit, direction: "refresh", skip: false }
+    end function
+
+    ' Which held items a refresh's size items replace: { start, from, size }
+    ' with start an index into the held items and from one into the answer.
+    function refreshRange(state as Object, request as Object, size as Integer) as Object
+        first = request.offset
+        if first < state.lo then first = state.lo
+        last = request.offset + size
+        if last > state.hi then last = state.hi
+        if last < first then last = first
+        return { start: first - state.lo, from: first - request.offset, size: last - first }
+    end function
+
+    ' Where focus goes for a saved key (nav.focus.newKey with the item's
+    ' absolute index as itemIndex) in the held items itemKeys (lo onwards):
+    ' { kind, index } with an absolute index, kind from nav.restore. While the
+    ' target is not held and final is false, kind is WAIT: the grid keeps
+    ' reading toward it (want with focus at index).
+    function restore(state as Object, key as Dynamic, itemKeys as Object, final as Boolean) as Object
+        if not util.isObject(key) or itemKeys.Count() = 0 then return { kind: nav.restore.DEFAULT, index: 0 }
+        wanted = nav.focus.whole(key.itemIndex)
+        held = wanted >= state.lo and wanted < state.hi
+        if held and util.text(itemKeys[wanted - state.lo]) = util.text(key.item) then return { kind: nav.restore.ITEM, index: wanted }
+        for i = 0 to itemKeys.Count() - 1
+            if util.text(itemKeys[i]) = util.text(key.item) then return { kind: nav.restore.ITEM, index: state.lo + i }
+        end for
+        unreachable = (wanted >= state.hi and state.complete) or (wanted < state.lo and state.stalled)
+        if not held and not final and not unreachable then return { kind: nav.restore.WAIT, index: wanted }
+        index = wanted
+        if index < state.lo then index = state.lo
+        if index >= state.hi then index = state.hi - 1
+        return { kind: nav.restore.POSITION, index: index }
+    end function
+
+    sub addMark(state as Object, offset as Integer, cursor as String)
+        if offset <= 0 or cursor = "" then return
+        for each mark in state.marks
+            if mark.offset = offset
+                mark.cursor = cursor
+                return
+            end if
+        end for
+        state.marks.Push({ offset: offset, cursor: cursor })
+    end sub
+
+    ' Keeps every mark from lo to hi and the MAX_CHECKPOINTS nearest before lo.
+    sub keepCheckpoints(state as Object)
+        earlier = []
+        kept = []
+        for each mark in state.marks
+            if mark.offset < state.lo
+                earlier.Push(mark)
+            else if mark.offset <= state.hi
+                kept.Push(mark)
+            end if
+        end for
+        earlier.SortBy("offset")
+        first = earlier.Count() - MAX_CHECKPOINTS
+        if first < 0 then first = 0
+        for i = first to earlier.Count() - 1
+            kept.Push(earlier[i])
+        end for
+        state.marks = kept
+    end sub
+
+    function rowOf(index as Integer) as Integer
+        if index < 0 then return -1
+        return index \ COLUMNS
+    end function
+
+    ' The first multiple of COLUMNS at or after index.
+    function alignUp(index as Integer) as Integer
+        return ((index + COLUMNS - 1) \ COLUMNS) * COLUMNS
+    end function
+
+    ' The last multiple of COLUMNS at or before index, 0 for a negative one.
+    function alignDown(index as Integer) as Integer
+        if index <= 0 then return 0
+        return (index \ COLUMNS) * COLUMNS
+    end function
+end namespace

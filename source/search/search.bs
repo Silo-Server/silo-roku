@@ -1,0 +1,175 @@
+import "pkg:/source/catalog/detail.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/util/values.bs"
+
+' Where focus is on the Search screen (spec section 5.6), for Back and the
+' arrow keys. The keyboard folds away while focus is below it.
+namespace search.zone
+    const KEYBOARD = "keyboard"
+    ' The All, Movies, and Series filter.
+    const FILTER = "filter"
+    ' The grid, or the Try again button of the error state.
+    const RESULTS = "results"
+end namespace
+
+' What the screen does after a search event (decision.action).
+namespace search.step
+    const NONE = ""
+    ' Start the debounce Timer for decision.delayMs; a Timer already running
+    ' starts over.
+    const WAIT = "wait"
+    ' Load the grid with catalog.request.search for decision { q, scope,
+    ' videoWithEpisodes }, which cancels the requests of the query before.
+    const RUN = "run"
+    ' No query: drop the results and their requests, and show "Search your
+    ' library".
+    const CLEAR = "clear"
+end namespace
+
+' The Search screen's query (spec sections 5.6 and 8.1), as a reducer over
+' plain data with an injected clock in ms. The screen observes the keyboard's
+' text, its Timer, the filter, and the capabilities answer, and carries out
+' each decision (search.step):
+'
+'     { text, scope, dueAt, shown, videoWithEpisodes, held }
+'
+'     text               the normalized query
+'     scope              catalog.searchScope of the selected segment
+'     dueAt              when the typed query runs, or -1
+'     shown              { q, scope } the grid holds, or invalid
+'     videoWithEpisodes  the search capability, or invalid until it answers
+'     held               a query is due but waits for the capability
+'
+' A query runs DEBOUNCE_MS after typing stops; a segment, Retry, or Play
+' runs it at once. An empty query clears at once.
+namespace search
+    const DEBOUNCE_MS = 300
+
+    function create() as Object
+        return { text: "", scope: catalog.searchScope.ALL, dueAt: -1, shown: invalid, videoWithEpisodes: invalid, held: false }
+    end function
+
+    ' The query as sent: trimmed, then cut to catalog.request.MAX_QUERY.
+    function normalize(text as String) as String
+        return Left(text.Trim(), catalog.request.MAX_QUERY)
+    end function
+
+    ' The keyboard's text changed at now.
+    function typed(state as Object, text as String, now as Integer) as Object
+        q = normalize(text)
+        if q = state.text then return decision(search.step.NONE)
+        state.text = q
+        state.held = false
+        if q = ""
+            state.dueAt = -1
+            state.shown = invalid
+            return decision(search.step.CLEAR)
+        end if
+        if isShown(state)
+            ' Typed back to what the grid already holds.
+            state.dueAt = -1
+            return decision(search.step.NONE)
+        end if
+        state.dueAt = now + DEBOUNCE_MS
+        return waitFor(DEBOUNCE_MS)
+    end function
+
+    ' The debounce Timer fired at now. A Timer that fires early waits again
+    ' for the rest.
+    function tick(state as Object, now as Integer) as Object
+        if state.dueAt < 0 then return decision(search.step.NONE)
+        if now < state.dueAt then return waitFor(state.dueAt - now)
+        return runNow(state)
+    end function
+
+    ' A segment was chosen: the query runs again at once in its scope.
+    function choose(state as Object, scope as String) as Object
+        if scope = state.scope then return decision(search.step.NONE)
+        state.scope = scope
+        if state.text = "" then return decision(search.step.NONE)
+        return runNow(state)
+    end function
+
+    ' Retry after an error, or Play on the keyboard: the query runs at once.
+    function submit(state as Object) as Object
+        if state.text = "" then return decision(search.step.NONE)
+        if isShown(state) and state.dueAt < 0 and not state.held then return decision(search.step.NONE)
+        return runNow(state)
+    end function
+
+    ' Retry: the shown query runs again.
+    function retry(state as Object) as Object
+        state.shown = invalid
+        return submit(state)
+    end function
+
+    ' The search capability answered (catalog.summary.searchCapabilities);
+    ' false when it failed, so All searches "video" (spec section 8.1). A
+    ' query held for it runs.
+    function capabilities(state as Object, videoWithEpisodes as Boolean) as Object
+        state.videoWithEpisodes = videoWithEpisodes
+        if not state.held then return decision(search.step.NONE)
+        return runNow(state)
+    end function
+
+    ' Where Back goes from where (search.zone): to the keyboard from below
+    ' it, else "" to leave Search (spec section 5.6).
+    function back(where as String) as String
+        if where = search.zone.FILTER or where = search.zone.RESULTS then return search.zone.KEYBOARD
+        return ""
+    end function
+
+    ' The result count's locale key for the grid's state and total
+    ' (BrowseGrid), or "" for no line: "Searching…" while it loads, for the
+    ' audio guide (tvOS shows only the spinner); none for the empty and error
+    ' states, which say it themselves, or without a server total.
+    function countKey(gridState as String, total as Integer) as String
+        if gridState = "loading" then return "search.searching"
+        if gridState <> "ready" or total <= 0 then return ""
+        if total = 1 then return "search.resultOne"
+        return "search.resultOther"
+    end function
+
+    ' The filter's segments in order: [scope, locale key].
+    function segments() as Object
+        return [
+            [catalog.searchScope.ALL, "search.filter.all"]
+            [catalog.searchScope.MOVIES, "search.filter.movies"]
+            [catalog.searchScope.SERIES, "search.filter.series"]
+        ]
+    end function
+
+    ' The detail route's params for a selected card (CardContent fields,
+    ' catalog.detail.routeParams): an episode opens its series with that
+    ' episode selected; the rest open themselves, seeded with the card's
+    ' hero fields.
+    function detailParams(card as Object) as Object
+        return catalog.detail.routeParams(card)
+    end function
+
+    function runNow(state as Object) as Object
+        state.dueAt = -1
+        if state.videoWithEpisodes = invalid
+            state.held = true
+            return decision(search.step.NONE)
+        end if
+        state.held = false
+        state.shown = { q: state.text, scope: state.scope }
+        out = decision(search.step.RUN)
+        out.Append({ q: state.text, scope: state.scope, videoWithEpisodes: state.videoWithEpisodes })
+        return out
+    end function
+
+    function isShown(state as Object) as Boolean
+        shown = state.shown
+        return shown <> invalid and shown.q = state.text and shown.scope = state.scope
+    end function
+
+    function decision(action as String) as Object
+        return { action: action }
+    end function
+
+    function waitFor(delayMs as Integer) as Object
+        return { action: search.step.WAIT, delayMs: delayMs }
+    end function
+end namespace

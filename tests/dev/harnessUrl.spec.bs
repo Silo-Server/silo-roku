@@ -1,0 +1,163 @@
+namespace tests
+
+    @suite("dev harness: origins and credential headers")
+    class HarnessUrlTests extends rooibos.BaseTestSuite
+
+        @describe("parseOrigin")
+
+        @it("lowercases the scheme and host and drops default ports")
+        sub _()
+            m.assertEqual(harness.parseOrigin("HTTPS://Silo.Example:443/api/v2").origin, "https://silo.example")
+            m.assertEqual(harness.parseOrigin("http://Silo.Example:80").origin, "http://silo.example")
+            m.assertEqual(harness.parseOrigin("https://silo.example").port, 443)
+            m.assertEqual(harness.parseOrigin("http://silo.example").port, 80)
+        end sub
+
+        @it("keeps a non-default port, normalising leading zeros")
+        sub _()
+            m.assertEqual(harness.parseOrigin("https://silo.example:8443/x").origin, "https://silo.example:8443")
+            m.assertEqual(harness.parseOrigin("https://silo.example:0443").origin, "https://silo.example")
+            m.assertEqual(harness.parseOrigin("http://silo.example:443").origin, "http://silo.example:443")
+        end sub
+
+        @it("accepts bracketed IPv6 hosts")
+        sub _()
+            m.assertEqual(harness.parseOrigin("http://[FD00::1]:8096/stream").origin, "http://[fd00::1]:8096")
+            m.assertEqual(harness.parseOrigin("https://[fd00::1]").origin, "https://[fd00::1]")
+        end sub
+
+        @it("ends the authority at a path, query, or fragment")
+        sub _()
+            m.assertEqual(harness.parseOrigin("https://silo.example?st=1").origin, "https://silo.example")
+            m.assertEqual(harness.parseOrigin("https://silo.example#x").origin, "https://silo.example")
+            m.assertEqual(harness.parseOrigin("https://silo.example/a:b@c").origin, "https://silo.example")
+        end sub
+
+        @it("refuses credentials, other schemes, and malformed authorities")
+        sub _()
+            for each url in ["https://user:pass@silo.example", "https://user@silo.example", "ftp://silo.example", "https://", "https://:443", "https://silo.example:0", "https://silo.example:65536", "https://silo.example:12a", "https://[fd00::1", "https://[fd00::1]x", "/api/v2/stream/1", "silo.example", "https://silo example"]
+                m.assertInvalid(harness.parseOrigin(url), url)
+            end for
+        end sub
+
+        @describe("sameOrigin")
+
+        @it("treats case and explicit default ports as the same origin")
+        sub _()
+            m.assertTrue(harness.sameOrigin("https://SILO.example:443/api/v2/stream/1", "https://silo.example"))
+            m.assertTrue(harness.sameOrigin("http://192.0.2.5:80/x", "http://192.0.2.5"))
+        end sub
+
+        @it("separates scheme, host, and port")
+        sub _()
+            m.assertFalse(harness.sameOrigin("http://silo.example/x", "https://silo.example"))
+            m.assertFalse(harness.sameOrigin("https://silo.example:8443/x", "https://silo.example"))
+            m.assertFalse(harness.sameOrigin("https://proxy.silo.example/x", "https://silo.example"))
+            m.assertFalse(harness.sameOrigin("https://silo.example.evil.test/x", "https://silo.example"))
+        end sub
+
+        @it("is false for relative or unparsable URLs")
+        sub _()
+            m.assertFalse(harness.sameOrigin("/api/v2/stream/1", "https://silo.example"))
+            m.assertFalse(harness.sameOrigin("https://silo.example", ""))
+        end sub
+
+        @describe("normalizeServerInput")
+
+        @it("defaults a bare host to https and strips trailing slashes")
+        sub _()
+            result = harness.normalizeServerInput("  Silo.Example:8443/// ")
+            m.assertEqual(result.origin, "https://silo.example:8443")
+            m.assertFalse(result.insecure)
+        end sub
+
+        @it("reports plain http so the caller can ask before using it")
+        sub _()
+            result = harness.normalizeServerInput("http://192.0.2.5:8096/")
+            m.assertEqual(result.origin, "http://192.0.2.5:8096")
+            m.assertTrue(result.insecure)
+        end sub
+
+        @it("rejects empty input, paths, queries, and credentials")
+        sub _()
+            for each text in ["", "   ", "https://silo.example/silo", "https://silo.example/?a=1", "https://user:pw@silo.example", "ftp://silo.example"]
+                m.assertNotInvalid(harness.normalizeServerInput(text).error, text)
+            end for
+        end sub
+
+        @describe("resolveUrl")
+
+        @it("resolves plan URLs against the configured origin and keeps absolute ones")
+        sub _()
+            origin = "https://silo.example"
+            m.assertEqual(harness.resolveUrl(origin, "/api/v2/stream/s1?st=t"), "https://silo.example/api/v2/stream/s1?st=t")
+            m.assertEqual(harness.resolveUrl(origin, "https://proxy.example/stream/v3/s1/tok"), "https://proxy.example/stream/v3/s1/tok")
+            m.assertEqual(harness.resolveUrl(origin, "HTTP://proxy.example/x"), "HTTP://proxy.example/x")
+            m.assertEqual(harness.resolveUrl(origin, "//proxy.example/x"), "https://proxy.example/x")
+            m.assertEqual(harness.resolveUrl(origin, "api/v2/x"), "https://silo.example/api/v2/x")
+        end sub
+
+        @describe("credentialHeaders")
+
+        @it("attaches the account and profile headers on the configured origin")
+        sub _()
+            headers = harness.credentialHeaders("https://silo.example/api/v2/stream/s1", "https://silo.example", m.auth())
+            m.assertEqual(headers["Authorization"], "Bearer access-1")
+            m.assertEqual(headers["X-Profile-Id"], "p-owner")
+            m.assertEqual(headers["X-Profile-Token"], "pvt-1")
+            m.assertEqual(headers.Count(), 3)
+        end sub
+
+        @it("sends X-Profile-Id without a token for a profile that has no PIN")
+        sub _()
+            auth = m.auth()
+            auth.profileToken = ""
+            headers = harness.credentialHeaders("https://silo.example/x", "https://silo.example", auth)
+            m.assertEqual(headers["X-Profile-Id"], "p-owner")
+            m.assertFalse(headers.DoesExist("X-Profile-Token"))
+        end sub
+
+        @it("never sends a profile token without its profile id")
+        sub _()
+            auth = m.auth()
+            auth.profileId = ""
+            headers = harness.credentialHeaders("https://silo.example/x", "https://silo.example", auth)
+            m.assertEqual(headers.Count(), 1)
+            m.assertTrue(headers.DoesExist("Authorization"))
+        end sub
+
+        @it("sends nothing to a proxy, another port, plain http, or a relative URL")
+        sub _()
+            for each url in ["https://proxy.example/stream/v3/s1/tok", "https://silo.example:8443/x", "http://silo.example/x", "//silo.example/x", "/api/v2/stream/s1"]
+                m.assertEqual(harness.credentialHeaders(url, "https://silo.example", m.auth()).Count(), 0, url)
+            end for
+        end sub
+
+        @it("sends nothing without an access token or auth state")
+        sub _()
+            auth = m.auth()
+            auth.accessToken = ""
+            auth.profileId = ""
+            m.assertEqual(harness.credentialHeaders("https://silo.example/x", "https://silo.example", auth).Count(), 0)
+            m.assertEqual(harness.credentialHeaders("https://silo.example/x", "https://silo.example", invalid).Count(), 0)
+        end sub
+
+        @it("formats headers as ContentNode HttpHeaders lines")
+        sub _()
+            lines = harness.headerLines({ "X-Profile-Id": "p-owner" })
+            m.assertEqual(lines, ["X-Profile-Id: p-owner"])
+        end sub
+
+        @it("labels the media origin as api or proxy")
+        sub _()
+            m.assertEqual(harness.mediaOriginKind("https://silo.example/api/v2/stream/s1", "https://silo.example"), "api")
+            m.assertEqual(harness.mediaOriginKind("https://proxy.example/stream/v3/s1", "https://silo.example"), "proxy")
+        end sub
+
+        function auth() as Object
+            return { accessToken: "access-1", profileId: "p-owner", profileToken: "pvt-1" }
+        end function
+
+    end class
+
+end namespace

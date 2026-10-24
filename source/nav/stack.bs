@@ -1,0 +1,274 @@
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/util/values.bs"
+
+' The navigation stack (spec sections 5.3 and 6.2, plan section 4.5), as a
+' reducer over plain data. AppScene keeps one stack. Each entry is
+'
+'     { id, route, params, focusKey, live, refresh, played }
+'
+' where focusKey is what the screen gave when it was covered, live says
+' whether a screen node exists for the entry, and refresh says the player has
+' left since the entry was last shown. played is what a player entry last
+' played, { contentId, seasonNumber, finished }: Up Next's next episode as
+' it starts, then, as the player leaves, its last item and whether that
+' playback finished it (notePlayed). When the player leaves, the entry it
+' was opened from takes it, until that entry is next shown. An operation never
+' changes the stack it is given; it returns a plan with the new stack and
+' the screen work that takes AppScene there, in this order:
+'
+'     release  entries whose screens are destroyed: removed from the stack, or
+'              beyond the live window (their entries stay, to be rebuilt)
+'     hide     the previous top, still alive beneath the new one
+'     keep     other hidden screens that stay alive, untouched
+'     detach   live hidden screens that set their lists' content to invalid
+'     create   a new entry that needs a screen
+'     rebuild  a released entry whose screen is built again from its entry
+'     show     the entry to make visible, or invalid when the top is unchanged;
+'              restore is its focus key (invalid on a new entry), refresh
+'              says it should re-read watch state, and played is what the
+'              player it opened played last, or invalid
+'     action   what Back did (nav.action), or nav.action.NONE
+'
+' The live window is the top, the root, and at most two pushed screens beneath
+' the top (LIVE_BENEATH). Under nav.pressure.SHED only the top stays alive.
+namespace nav.stack
+    const LIVE_BENEATH = 2
+
+    function create() as Object
+        return { entries: [], nextId: 0, level: nav.pressure.NORMAL }
+    end function
+
+    ' The top entry, or invalid on an empty stack.
+    function topEntry(stack as Object) as Dynamic
+        if stack.entries.Count() = 0 then return invalid
+        return stack.entries.Peek()
+    end function
+
+    function push(stack as Object, route as String, params as Object) as Object
+        nextStack = clone(stack)
+        nextStack.nextId = nextStack.nextId + 1
+        nextStack.entries.Push(newEntry(nextStack.nextId, route, params))
+        plan = settle(stack, nextStack)
+        ' Browse textures go before playback (plan section 4.7).
+        if route = nav.route.PLAYER then plan.detach = hiddenLive(plan)
+        return plan
+    end function
+
+    ' Removes the top entry. The root is never popped: the plan is empty.
+    function pop(stack as Object) as Object
+        nextStack = clone(stack)
+        if nextStack.entries.Count() > 1 then nextStack.entries.Pop()
+        return settle(stack, nextStack)
+    end function
+
+    ' Puts a new entry in place of the top one.
+    function replace(stack as Object, route as String, params as Object) as Object
+        nextStack = clone(stack)
+        nextStack.entries.Pop()
+        nextStack.nextId = nextStack.nextId + 1
+        nextStack.entries.Push(newEntry(nextStack.nextId, route, params))
+        return settle(stack, nextStack)
+    end function
+
+    ' Starts over with a single root entry, releasing every screen: a new app
+    ' state, a new identity, or a tab's bar going back to Home.
+    function reset(stack as Object, route as String, params as Object) as Object
+        nextStack = clone(stack)
+        nextStack.nextId = nextStack.nextId + 1
+        nextStack.entries = [newEntry(nextStack.nextId, route, params)]
+        return settle(stack, nextStack)
+    end function
+
+    ' Pops every pushed entry, back to the root.
+    function popToRoot(stack as Object) as Object
+        nextStack = clone(stack)
+        while nextStack.entries.Count() > 1
+            nextStack.entries.Pop()
+        end while
+        return settle(stack, nextStack)
+    end function
+
+    ' Records what the player entry entryId plays now, { contentId,
+    ' seasonNumber }, for the entry beneath it. Returns the new stack.
+    function notePlayed(stack as Object, entryId as String, played as Object) as Object
+        nextStack = clone(stack)
+        for each entry in nextStack.entries
+            if entry.id = entryId then entry.played = played
+        end for
+        return nextStack
+    end function
+
+    ' Records the top screen's focus key, which AppScene asks for just before
+    ' an operation covers or releases it. Returns the new stack.
+    function saveFocus(stack as Object, focusKey as Dynamic) as Object
+        nextStack = clone(stack)
+        top = topEntry(nextStack)
+        if top <> invalid then top.focusKey = focusKey
+        return nextStack
+    end function
+
+    ' Applies a nav.pressure level. DETACH and SHED detach every live hidden
+    ' screen, SHED also releases them, and while either holds, each screen a
+    ' push hides is detached too. NORMAL rebuilds and reattaches nothing:
+    ' screens do that when they are next shown.
+    function setPressure(stack as Object, level as String) as Object
+        nextStack = clone(stack)
+        nextStack.level = level
+        plan = settle(stack, nextStack)
+        if level <> nav.pressure.NORMAL then plan.detach = hiddenLive(plan)
+        return plan
+    end function
+
+    ' Detaches every live hidden screen and leaves the stack as it is: the
+    ' player's call before it loads a stream (plan section 4.7).
+    function detachHidden(stack as Object) as Object
+        plan = settle(stack, clone(stack))
+        plan.detach = hiddenLive(plan)
+        return plan
+    end function
+
+    ' Back (spec section 5.3), after the focused screen has not handled it.
+    ' where is the top screen's backContext(): { overlay, zone, barItem },
+    ' barItem the highlighted bar item. An open overlay closes first; a
+    ' pushed screen pops; on a tab page, content focuses the bar, a library
+    ' tab's bar goes back to Home with Home's bar focused, another item on
+    ' Home's bar goes to its Home tab (tvOS), and Home's tab exits; a root
+    ' page without the bar exits.
+    function back(stack as Object, where as Dynamic) as Object
+        overlay = false
+        focusZone = nav.zone.NONE
+        barItem = ""
+        if util.isObject(where)
+            overlay = util.isTrue(where.overlay)
+            focusZone = util.text(where.zone)
+            barItem = util.text(where.barItem)
+        end if
+        count = stack.entries.Count()
+        plan = invalid
+        outcome = nav.action.EXIT_APP
+        if count = 0
+            ' No screen yet: Back exits.
+        else if overlay
+            outcome = nav.action.CLOSE_OVERLAY
+        else if count > 1
+            plan = pop(stack)
+            outcome = nav.action.POP
+        else if focusZone = nav.zone.CONTENT
+            outcome = nav.action.FOCUS_BAR
+        else if focusZone = nav.zone.BAR and stack.entries[0].route <> nav.route.HOME
+            plan = reset(stack, nav.route.HOME, { bar: true })
+            outcome = nav.action.HOME
+        else if focusZone = nav.zone.BAR and barItem <> "" and barItem <> nav.route.HOME
+            outcome = nav.action.FOCUS_BAR
+        end if
+        if plan = invalid then plan = settle(stack, clone(stack))
+        plan.action = outcome
+        return plan
+    end function
+
+    function newEntry(id as Integer, route as String, params as Object) as Object
+        return { id: "e" + id.ToStr(), route: route, params: params, focusKey: invalid, live: false, refresh: false, played: invalid }
+    end function
+
+    ' A copy whose entries can change without changing the original's.
+    function clone(stack as Object) as Object
+        entries = []
+        for each entry in stack.entries
+            copied = {}
+            copied.Append(entry)
+            entries.Push(copied)
+        end for
+        return { entries: entries, nextId: stack.nextId, level: stack.level }
+    end function
+
+    ' The IDs of the entries that may have a screen.
+    function liveWindow(stack as Object) as Object
+        ids = {}
+        entries = stack.entries
+        last = entries.Count() - 1
+        if last < 0 then return ids
+        ids[entries[last].id] = true
+        if stack.level = nav.pressure.SHED then return ids
+        ids[entries[0].id] = true
+        lowest = last - LIVE_BENEATH
+        if lowest < 1 then lowest = 1
+        for i = last - 1 to lowest step -1
+            ids[entries[i].id] = true
+        end for
+        return ids
+    end function
+
+    ' Compares prior with nextStack and fills in the plan's screen work.
+    function settle(prior as Object, nextStack as Object) as Object
+        plan = { stack: nextStack, show: invalid, restore: invalid, refresh: false, played: invalid, create: [], rebuild: [], hide: [], keep: [], release: [], detach: [], action: nav.action.NONE }
+        entries = nextStack.entries
+        window = liveWindow(nextStack)
+        byId = {}
+        for each entry in entries
+            byId[entry.id] = entry
+        end for
+        priorIds = {}
+        playerLeft = false
+        for i = prior.entries.Count() - 1 to 0 step -1
+            old = prior.entries[i]
+            priorIds[old.id] = true
+            remaining = byId[old.id]
+            if remaining = invalid and old.route = nav.route.PLAYER
+                playerLeft = true
+                ' The entry the player was opened from takes what it played.
+                origin = invalid
+                if i > 0 then origin = byId[prior.entries[i - 1].id]
+                if origin <> invalid and old.played <> invalid then origin.played = old.played
+            end if
+            if old.live and (remaining = invalid or not window.DoesExist(old.id))
+                plan.release.Push(old)
+                if remaining <> invalid then remaining.live = false
+            end if
+        end for
+        if playerLeft
+            for each entry in entries
+                if priorIds.DoesExist(entry.id) then entry.refresh = true
+            end for
+        end if
+
+        priorTop = topEntry(prior)
+        top = topEntry(nextStack)
+        if top <> invalid and (priorTop = invalid or priorTop.id <> top.id)
+            if not top.live
+                if priorIds.DoesExist(top.id)
+                    plan.rebuild.Push(top)
+                else
+                    plan.create.Push(top)
+                end if
+                top.live = true
+            end if
+            plan.show = top
+            plan.restore = top.focusKey
+            plan.refresh = top.refresh
+            top.refresh = false
+            plan.played = top.played
+            top.played = invalid
+        end if
+
+        for i = 0 to entries.Count() - 2
+            entry = entries[i]
+            if entry.live
+                if priorTop <> invalid and entry.id = priorTop.id
+                    plan.hide.Push(entry)
+                else
+                    plan.keep.Push(entry)
+                end if
+            end if
+        end for
+        if nextStack.level <> nav.pressure.NORMAL then plan.detach = plan.hide
+        return plan
+    end function
+
+    ' Every live screen beneath the top.
+    function hiddenLive(plan as Object) as Object
+        hidden = []
+        hidden.Append(plan.hide)
+        hidden.Append(plan.keep)
+        return hidden
+    end function
+end namespace

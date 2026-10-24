@@ -1,0 +1,233 @@
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/util/values.bs"
+
+' What a library page shows (nav.route.LIBRARY params.mode).
+namespace libraryTab.mode
+    ' The library's sections as rows, the same feed as Home.
+    const RECOMMENDED = "recommended"
+    ' The Sort pill over the six-column grid, beside the alphabet rail.
+    const BROWSE = "browse"
+end namespace
+
+' Where focus is in a library page's content (libraryTab.nextZone).
+namespace libraryTab.zone
+    ' The top bar's selected tab: the shell takes focus there.
+    const BAR = "bar"
+    ' Recommended's rows.
+    const ROWS = "rows"
+    const PILL = "pill"
+    const GRID = "grid"
+    const RAIL = "rail"
+    ' The empty or error state's button.
+    const STATUS = "status"
+end namespace
+
+' A library tab's pages (spec sections 5.3 and 5.5), pure: which libraries
+' the tab's list offers and which one the tab opens, the route params, the
+' Browse request for a sort and letter, the Sort pill's wording, and where
+' the arrow keys and Back move focus. components/screens/library/ and the
+' shell (components/screens/home/shell.bs) carry out the decisions.
+namespace libraryTab
+    ' Library types whose Browse sends no type, as Android TV does: their
+    ' items are not typed movie or series alone.
+    const UNTYPED = "|video|show|"
+
+    ' The libraries a tab ("movies" or "series") lists, [{ id, name, type }]
+    ' in the server's order, from user/libraries (catalog.summary.libraries)
+    ' without the hidden IDs (mainShell.hiddenLibraryIds).
+    function visibleLibraries(summary as Dynamic, hidden as Object, kind as String) as Object
+        out = []
+        if not util.isObject(summary) or type(summary.libraries) <> "roArray" then return out
+        for each library in summary.libraries
+            id = util.text(library.id)
+            if not hidden.DoesExist(id) and util.isTrue(library[kind]) then out.Push({ id: id, name: util.text(library.name), type: util.text(library.type) })
+        end for
+        return out
+    end function
+
+    ' The library with ID id in list, or invalid.
+    function find(list as Object, id as String) as Dynamic
+        if id = "" then return invalid
+        for each library in list
+            if library.id = id then return library
+        end for
+        return invalid
+    end function
+
+    ' The library a tab opens: the one chosen last, if the tab still lists
+    ' it, else the first, as on Android TV. invalid without libraries.
+    function defaultLibrary(list as Object, remembered as String) as Dynamic
+        found = find(list, remembered)
+        if found <> invalid or list.Count() = 0 then return found
+        return list[0]
+    end function
+
+    ' The nav.route.LIBRARY params for a library of a tab in a mode.
+    function routeParams(kind as String, library as Object, chosenMode as String) as Object
+        return { type: kind, libraryId: library.id, libraryType: library.type, mode: chosenMode }
+    end function
+
+    ' The library and mode a page shows, from its params and the tab's
+    ' libraries once known (list invalid until then): { library, mode }, or
+    ' invalid while the library is not known. A library the tab no longer
+    ' lists gives way to the tab's default (defaultLibrary).
+    function resolve(params as Dynamic, list as Dynamic, remembered as String) as Dynamic
+        if not util.isObject(params) then params = {}
+        shownMode = util.text(params.mode)
+        if shownMode <> libraryTab.mode.BROWSE then shownMode = libraryTab.mode.RECOMMENDED
+        id = util.text(params.libraryId)
+        if list = invalid
+            if id = "" then return invalid
+            return { library: { id: id, name: "", type: util.text(params.libraryType) }, mode: shownMode }
+        end if
+        library = find(list, id)
+        if library = invalid then library = defaultLibrary(list, remembered)
+        if library = invalid then return invalid
+        return { library: library, mode: shownMode }
+    end function
+
+    ' The library list under a tab (spec section 5.3), as Android TV draws
+    ' it: the libraries, with the current one marked, and each library's
+    ' sections. One library shows its sections alone. current is the index
+    ' of the library with ID currentId, else 0.
+    function listModel(list as Object, currentId as String) as Object
+        current = 0
+        for i = 0 to list.Count() - 1
+            if list[i].id = currentId then current = i
+        end for
+        return { libraries: list, current: current, single: list.Count() = 1, sections: [libraryTab.mode.RECOMMENDED, libraryTab.mode.BROWSE] }
+    end function
+
+    ' What a choice in the list does from a page showing shown ({ libraryId,
+    ' mode }, or invalid on Home): { kind: "content" } when the page already
+    ' shows it, else { kind: "switch", params } for nav.switchTab.
+    function listAction(kind as String, library as Object, chosenMode as String, shown as Dynamic) as Object
+        if util.isObject(shown) and util.text(shown.libraryId) = library.id and util.text(shown.mode) = chosenMode then return { kind: "content" }
+        return { kind: "switch", params: routeParams(kind, library, chosenMode) }
+    end function
+
+    ' The key a remembered choice is kept under: one per server, profile,
+    ' and tab, as on Android TV.
+    function choiceKey(origin as String, profileId as String, kind as String) as String
+        return origin + "|" + profileId + "|" + kind
+    end function
+
+    ' The mode a tab reopens on within a session (spec section 5.5, as on
+    ' tvOS): the one its page showed last, from modes, an AA of mode by
+    ' choiceKey (invalid before any), else Recommended.
+    function reopenMode(modes as Dynamic, key as String) as String
+        if util.isObject(modes) and util.text(modes[key]) = libraryTab.mode.BROWSE then return libraryTab.mode.BROWSE
+        return libraryTab.mode.RECOMMENDED
+    end function
+
+    ' ---- Browse
+
+    ' Browse opens sorted by title, A to Z.
+    function defaultSort() as Object
+        return { field: "title", descending: false }
+    end function
+
+    ' Browse's sort and letter after the viewer picks field in the sort
+    ' menu: the active sort reverses, another starts in its default
+    ' direction (catalog.sort.choose), and the letter stays, as on tvOS,
+    ' since the rail shows under every sort. state is { sort, letter }.
+    function chooseSort(state as Object, field as String) as Object
+        return { sort: catalog.sort.choose(state.sort, field), letter: state.letter }
+    end function
+
+    ' Options for catalog.request.browse: the library, its media type for
+    ' the tab, the sort, and the rail's letter as name_prefix under any sort.
+    ' "#" goes as it is, as tvOS sends it; "" (All) sends none.
+    function browseOptions(kind as String, library as Object, sort as Object, letter as String) as Object
+        out = { libraryId: library.id, type: mediaType(kind, util.text(library.type)), sort: catalog.sort.param(sort.field, sort.descending) }
+        if letter <> "" then out.namePrefix = letter
+        return out
+    end function
+
+    ' The catalog type for a tab's library: movie or series, or "" for a
+    ' library whose items are typed otherwise (UNTYPED).
+    function mediaType(kind as String, libraryType as String) as String
+        if Instr(1, UNTYPED, "|" + LCase(libraryType) + "|") > 0 then return ""
+        if kind = "series" then return "series"
+        return "movie"
+    end function
+
+    ' The catalog.sort option key ("title", "added", ...) for a field, which
+    ' names its label (catalog.sort.<key> in locale/), or "".
+    function sortKey(field as String) as String
+        for each option in catalog.sort.options()
+            if option[1] = field then return option[0]
+        end for
+        return ""
+    end function
+
+    ' How a sort's direction reads, as Android TV words it: the key of
+    ' library.direction.<key> in locale/.
+    function directionKey(sort as Object) as String
+        field = sort.field
+        if field = "title"
+            if sort.descending then return "za"
+            return "az"
+        else if field = "rating_imdb" or field = "resolution"
+            if sort.descending then return "highest"
+            return "lowest"
+        else if field = "runtime"
+            if sort.descending then return "longest"
+            return "shortest"
+        end if
+        if sort.descending then return "newest"
+        return "oldest"
+    end function
+
+    ' ---- Focus
+
+    ' Where an arrow key the content left unhandled takes focus from the
+    ' zone at, or "" to leave it. The lists hand on Up only from their first
+    ' row, and the grid Right only from its last column. Recommended's rows
+    ' go up to the tab; in Browse the grid goes up to the Sort pill and the
+    ' pill to the tab (spec section 5.5, as on tvOS), and the rail sits
+    ' right of the grid and the pill. page is { mode, gridItems, rail,
+    ' status }: the grid holds or awaits items, the rail can take focus, and
+    ' the state has a button.
+    function nextZone(at as String, key as String, page as Object) as String
+        rail = ""
+        if util.isTrue(page.rail) then rail = libraryTab.zone.RAIL
+        if page.mode <> libraryTab.mode.BROWSE
+            if key = "up" and (at = libraryTab.zone.ROWS or at = libraryTab.zone.STATUS) then return libraryTab.zone.BAR
+            return ""
+        end if
+        if at = libraryTab.zone.PILL
+            if key = "up" then return libraryTab.zone.BAR
+            if key = "down" then return below(page)
+            if key = "right" then return rail
+        else if at = libraryTab.zone.GRID or at = libraryTab.zone.STATUS
+            if key = "up" then return libraryTab.zone.PILL
+            if key = "right" then return rail
+        else if at = libraryTab.zone.RAIL and key = "left"
+            return besideRail(page)
+        end if
+        return ""
+    end function
+
+    ' The zones that may take focus when it should go to wanted, in order:
+    ' wanted, then the page's list, its state's button, and in Browse the
+    ' pill, which is always there. The page focuses the first that can.
+    function zoneOrder(chosenMode as String, wanted as String) as Object
+        if chosenMode = libraryTab.mode.BROWSE then return [wanted, libraryTab.zone.GRID, libraryTab.zone.STATUS, libraryTab.zone.PILL]
+        return [wanted, libraryTab.zone.ROWS, libraryTab.zone.STATUS]
+    end function
+
+    ' The grid, else the state's button, else the pill.
+    function besideRail(page as Object) as String
+        found = below(page)
+        if found = "" then return libraryTab.zone.PILL
+        return found
+    end function
+
+    ' What sits below the pill: the grid, or the state's button, or nothing.
+    function below(page as Object) as String
+        if util.isTrue(page.gridItems) then return libraryTab.zone.GRID
+        if util.isTrue(page.status) then return libraryTab.zone.STATUS
+        return ""
+    end function
+end namespace

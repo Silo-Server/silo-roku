@@ -1,0 +1,855 @@
+namespace tests
+
+    ' The playback worker through ApiTask's glue (tests/helpers/sessions.bs):
+    ' the requests it builds go through the account session and the scheduler
+    ' as on the device.
+    @suite("playback worker")
+    class PlaybackWorkerTests extends rooibos.BaseTestSuite
+
+        ' Signed in with the fixture's unlocked profile, on the dev TV's probe.
+        function signedIn() as Object
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            profile = api.auth.profiles.list(tests.sessions.fixture("list_profiles_ok"))[0]
+            tests.sessions.send(loop, { requestId: "select", session: "selectProfile", profile: profile })
+            loop.device = tests.devices.fromFixture(tests.devices.fixture("dev-tv-tcl-55r625"))
+            return loop
+        end function
+
+        function fence(loop as Object, sessionId = invalid as Dynamic) as Object
+            out = api.auth.coordinator.identity(loop.session)
+            out.attempt = "attempt-0001"
+            out.session = sessionId
+            return out
+        end function
+
+        function startCommand(loop as Object) as Object
+            intent = { fileId: "42", audioTracks: [{ index: 0, codec: "eac3", channels: 6, language: "eng", default: true }] }
+            return { type: "start", fence: m.fence(loop), playback_attempt_id: "attempt-0001", retry: false, intent: intent, quality_preference: "auto", stereoAacRestart: false, refreshCapabilities: false }
+        end function
+
+        ' Sends a start and answers the capabilities read with body; gives the
+        ' running start request's ID. owner is the player's.
+        function started(loop as Object, requestId as String, capabilities = invalid as Dynamic, owner = "" as String) as Dynamic
+            if capabilities = invalid then capabilities = tests.sessions.fixture("playback_capability_available")
+            tests.sessions.send(loop, { requestId: requestId, owner: owner, playback: "start", command: m.startCommand(loop) })
+            caps = tests.sessions.runningId(loop, "/api/v2/playback/capabilities")
+            if caps <> invalid then tests.sessions.respond(loop, caps, 200, capabilities, { ETag: """caps-1""" })
+            return tests.sessions.runningId(loop, "/api/v2/playback/start")
+        end function
+
+        function body(loop as Object, requestId as String) as Object
+            return ParseJson(loop.running[requestId].request.bodyText)
+        end function
+
+        ' The body of a start that is then answered, so the next one is the
+        ' only start running.
+        function startBody(loop as Object, requestId as String, capabilities = invalid as Dynamic) as Object
+            id = m.started(loop, requestId, capabilities)
+            sent = m.body(loop, id)
+            tests.sessions.respond(loop, id, 201, tests.sessions.fixture("playback_start_opaque_ids"))
+            return sent
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("start")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("reads capabilities, probes, and posts the body on the playback lane")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "p1", playback: "start", command: m.startCommand(loop) })
+            caps = loop.running[tests.sessions.runningId(loop, "/api/v2/playback/capabilities")]
+            m.assertEqual([caps.request.lane, caps.request.owner], ["playback", ""])
+            m.assertEqual(caps.headers["X-Profile-Id"], "p-owner")
+            tests.sessions.respond(loop, caps.request.requestId, 200, tests.sessions.fixture("playback_capability_available"))
+            id = tests.sessions.runningId(loop, "/api/v2/playback/start")
+            sent = m.body(loop, id)
+            m.assertEqual(sent.installation_id, "11111111-1111-4111-8111-111111111111")
+            m.assertEqual([sent.file_id, sent.profile_id, sent.playback_attempt_id], ["42", "p-owner", "attempt-0001"])
+            m.assertEqual(sent.client_playback_context.deliveries.hls.features, ["native_hls_playback_v1"])
+            m.assertFalse(sent.DoesExist("start_position"), "the server resumes")
+
+            text = loop.running[id].request.bodyText
+            tests.sessions.respond(loop, id, 201, tests.sessions.fixture("playback_start_opaque_ids"))
+            answer = loop.delivered.p1.body
+            m.assertEqual([answer.kind, answer.status], ["ok", 201])
+            m.assertEqual(answer.decision.session_id, "11111111-1111-4111-8111-111111111111")
+            m.assertEqual(answer.bodyText, text, "the text it sent, for a verbatim replay")
+            m.assertEqual(answer.context.installationId, "11111111-1111-4111-8111-111111111111")
+            m.assertEqual(answer.context.outputContextId, playback.probe.collect(loop.device).outputContextId)
+        end sub
+
+        @it("asks for TS copy remuxes only when the capabilities advertise them")
+        sub _()
+            loop = m.signedIn()
+            capabilities = tests.sessions.fixture("playback_capability_available")
+            capabilities.features.Push("hls_copy_mpegts_v1")
+            m.assertEqual(m.startBody(loop, "p1", capabilities).client_playback_context.deliveries.hls.features, ["native_hls_playback_v1", "hls_copy_mpegts_v1"])
+        end sub
+
+        @it("replays a stored body byte for byte, without reading capabilities again")
+        sub _()
+            loop = m.signedIn()
+            id = m.started(loop, "p1")
+            text = loop.running[id].request.bodyText
+            tests.sessions.respond(loop, id, 503)
+            m.assertEqual(loop.delivered.p1.body.kind, "retry")
+            command = m.startCommand(loop)
+            command.retry = true
+            command.bodyText = text
+            tests.sessions.send(loop, { requestId: "p2", playback: "start", command: command })
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/capabilities"), 1)
+            replay = tests.sessions.runningId(loop, "/api/v2/playback/start")
+            m.assertEqual(loop.running[replay].request.bodyText, text)
+            tests.sessions.respond(loop, replay, 201, tests.sessions.fixture("playback_start_opaque_ids"))
+            m.assertEqual(loop.delivered.p2.body.context.installationId, "11111111-1111-4111-8111-111111111111", "the context it was built with")
+        end sub
+
+        @it("revalidates cached capabilities with their ETag once they are old")
+        sub _()
+            loop = m.signedIn()
+            m.startBody(loop, "p1")
+            m.startBody(loop, "p2")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/capabilities"), 1, "cached")
+            tests.sessions.tick(loop, playback.worker.CAPABILITIES_TTL_MS)
+            tests.sessions.send(loop, { requestId: "p3", playback: "start", command: m.startCommand(loop) })
+            caps = loop.running[tests.sessions.runningId(loop, "/api/v2/playback/capabilities")]
+            m.assertEqual(caps.request.headers["If-None-Match"], """caps-1""")
+            tests.sessions.respond(loop, caps.request.requestId, 304)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/start"), 3, "built from the cached document")
+        end sub
+
+        @it("names the tracks a detail page chose, as server ordinals")
+        sub _()
+            loop = m.signedIn()
+            command = m.startCommand(loop)
+            command.intent.audioTracks.Push({ index: 1, codec: "aac", channels: 2, language: "fra" })
+            command.intent.audioIndex = 1
+            command.intent.subtitleIndex = 2
+            tests.sessions.send(loop, { requestId: "p1", playback: "start", command: command })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/capabilities"), 200, tests.sessions.fixture("playback_capability_available"))
+            sent = m.body(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"))
+            m.assertEqual([sent.audio_track_index, sent.subtitle_track_index], [1, 2])
+            m.assertAANotHasKeys(sent, ["audio_track_id", "subtitle_track_id"])
+        end sub
+
+        @it("keeps the version a detail page pinned, with the tracks chosen for it (allow_alternate_versions false)")
+        sub _()
+            for each pinned in [true, false]
+                loop = m.signedIn()
+                command = m.startCommand(loop)
+                command.intent.pinsVersion = pinned
+                command.intent.audioIndex = 0
+                command.intent.subtitleIndex = playback.tracks.OFF
+                tests.sessions.send(loop, { requestId: "p1", playback: "start", command: command })
+                tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/capabilities"), 200, tests.sessions.fixture("playback_capability_available"))
+                sent = m.body(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"))
+                m.assertEqual(sent.file_id, command.intent.fileId)
+                m.assertEqual(sent.audio_track_index, 0)
+                m.assertAANotHasKeys(sent, ["subtitle_track_index", "subtitle_track_id"])
+                if pinned
+                    m.assertFalse(sent.allow_alternate_versions)
+                else
+                    m.assertAANotHasKey(sent, "allow_alternate_versions", "Auto lets the server fall back to another version")
+                end if
+            end for
+        end sub
+
+        @it("logs the start body's member names at debug level, never their values (AG-292 (5))")
+        sub _()
+            loop = m.signedIn()
+            command = m.startCommand(loop)
+            command.intent.pinsVersion = true
+            command.intent.audioIndex = 0
+            tests.sessions.send(loop, { requestId: "p1", playback: "start", command: command })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/capabilities"), 200, tests.sessions.fixture("playback_capability_available"))
+            sent = m.body(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"))
+            m.assertEqual(loop.logs.Count(), 1)
+            entry = loop.logs[0]
+            m.assertEqual([entry.level, entry.message], ["debug", "start body"])
+            names = sent.Keys()
+            names.Sort()
+            m.assertEqual(entry.fields, { present: names.Join(","), absent: "subtitle_track_index" })
+            m.assertTrue(Instr(1, entry.fields.present, "file_id,") > 0 and Instr(1, entry.fields.present, "allow_alternate_versions,") > 0 and Instr(1, entry.fields.present, "audio_track_index,") > 0)
+            text = FormatJson(entry.fields)
+            for each value in [sent.file_id, sent.profile_id, sent.playback_attempt_id, sent.installation_id]
+                m.assertEqual(Instr(1, text, value), 0, "no value: " + value)
+            end for
+            m.assertEqual(playback.worker.startFields({ file_id: "42" }), { present: "file_id", absent: "allow_alternate_versions,audio_track_index,subtitle_track_index" })
+        end sub
+
+        @it("chooses the audio for the profile's language and the device's codecs, and names no subtitle, without a choice")
+        sub _()
+            for each test in [["en", 1], ["fr", 2], ["", 1]]
+                loop = m.signedIn()
+                command = m.startCommand(loop)
+                command.intent.audioTracks = [{ index: 0, codec: "truehd", channels: 8, language: "eng", default: true }, { index: 1, codec: "eac3", channels: 6, language: "eng" }, { index: 2, codec: "aac", channels: 2, language: "fre" }]
+                command.intent.audioIndex = -1
+                command.intent.subtitleIndex = -1
+                command.intent.audioLanguage = test[0]
+                tests.sessions.send(loop, { requestId: "p1", playback: "start", command: command })
+                tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/capabilities"), 200, tests.sessions.fixture("playback_capability_available"))
+                sent = m.body(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"))
+                m.assertEqual(sent.audio_track_index, test[1], test[0])
+                m.assertAANotHasKeys(sent, ["subtitle_track_index"])
+            end for
+        end sub
+
+        @it("names the version's effective audio track under Auto, over the profile's language and the device's codecs (D2)")
+        sub _()
+            ' The track a detail page chose, the effective track, and, with
+            ' none listed, the profile's language's best playable track.
+            for each test in [[2, 0, 2], [-1, 0, 0], [-1, 5, 1], [-1, -1, 1]]
+                loop = m.signedIn()
+                command = m.startCommand(loop)
+                command.intent.audioTracks = [{ index: 0, codec: "truehd", channels: 8, language: "eng", default: true }, { index: 1, codec: "eac3", channels: 6, language: "eng" }, { index: 2, codec: "aac", channels: 2, language: "fre" }]
+                command.intent.audioIndex = test[0]
+                command.intent.effectiveAudioIndex = test[1]
+                command.intent.audioLanguage = "en"
+                tests.sessions.send(loop, { requestId: "p1", playback: "start", command: command })
+                tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/capabilities"), 200, tests.sessions.fixture("playback_capability_available"))
+                sent = m.body(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"))
+                m.assertEqual(sent.audio_track_index, test[2], FormatJson(test))
+            end for
+        end sub
+
+        @it("sends the start's quality preference and bitrate cap")
+        sub _()
+            loop = m.signedIn()
+            command = m.startCommand(loop)
+            command.quality_preference = "720p"
+            command.bandwidth_cap_kbps = 4000
+            tests.sessions.send(loop, { requestId: "p1", playback: "start", command: command })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/capabilities"), 200, tests.sessions.fixture("playback_capability_available"))
+            sent = m.body(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"))
+            m.assertEqual([sent.quality_preference, sent.bandwidth_cap_kbps], ["720p", 4000])
+            m.assertAANotHasKeys(m.startBody(m.signedIn(), "p2"), ["bandwidth_cap_kbps"])
+        end sub
+
+        @it("refuses a start fenced to another identity without sending anything")
+        sub _()
+            loop = m.signedIn()
+            command = m.startCommand(loop)
+            command.fence.profile = "p-other"
+            tests.sessions.send(loop, { requestId: "p1", playback: "start", command: command })
+            m.assertEqual(loop.delivered.p1.body.kind, "fenced")
+            m.assertEqual(loop.running.Count(), 0)
+        end sub
+
+        @it("answers why it sends no start: playback unavailable, or gate G1 closed")
+        sub _()
+            loop = m.signedIn()
+            m.started(loop, "p1", tests.sessions.fixture("playback_capability_unconfigured"))
+            m.assertEqual([loop.delivered.p1.body.kind, loop.delivered.p1.body.reason], ["rejected", "playback_unavailable"])
+            loop = m.signedIn()
+            loop.gates = { debug: false }
+            m.assertInvalid(m.started(loop, "p1"))
+            m.assertEqual([loop.delivered.p1.body.kind, loop.delivered.p1.body.reason], ["rejected", "playback_closed"])
+        end sub
+
+        @it("leaves an audio codec the player refused out of later bodies")
+        sub _()
+            loop = m.signedIn()
+            m.assertTrue(util.contains(m.startBody(loop, "p1").client_capabilities.codecs_audio, "eac3"))
+            tests.sessions.send(loop, { requestId: "x", playback: "refuseAudioCodec", codec: "EAC3" })
+            m.assertEqual(loop.delivered.x.body.kind, "ok")
+            m.assertFalse(util.contains(m.startBody(loop, "p2").client_capabilities.codecs_audio, "eac3"))
+        end sub
+
+        @it("re-probes the output for the reducer's output context")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "o1", playback: "outputContext" })
+            m.assertEqual(loop.delivered.o1.body.outputContextId, playback.probe.collect(loop.device).outputContextId)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("replan and progress")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("adds the capability parts to the reducer's members and replays the text")
+        sub _()
+            loop = m.signedIn()
+            m.startBody(loop, "p1")
+            members = { installation_id: "inst-1", protocol_version: 3, playback_attempt_id: "attempt-0001", replan_request_id: "rr-1", operation: "seek_reanchor", position_seconds: 596.4999, selected_tracks: { audio: { id: "file:42:audio:0", index: 0 } } }
+            command = { type: "replan", fence: m.fence(loop, "s-1"), session_id: "s-1", replan_request_id: "rr-1", retry: false, stereoAacRestart: false, members: members }
+            tests.sessions.send(loop, { requestId: "r1", playback: "replan", command: command, audioTracks: [{ index: 0, codec: "eac3", channels: 6, language: "eng" }] })
+            id = tests.sessions.runningId(loop, "/api/v2/playback/s-1/replan")
+            sent = m.body(loop, id)
+            m.assertEqual(sent.operation, "seek_reanchor")
+            m.assertEqual(sent.position_seconds, 596.5)
+            m.assertNotInvalid(sent.client_capabilities)
+            m.assertEqual(sent.client_playback_context.deliveries.hls.features, ["native_hls_playback_v1"])
+            text = loop.running[id].request.bodyText
+            tests.sessions.respond(loop, id, 200, tests.sessions.fixture("playback_replan_reanchored"))
+            m.assertEqual([loop.delivered.r1.body.kind, loop.delivered.r1.body.bodyText], ["ok", text])
+
+            command.retry = true
+            command.bodyText = text
+            tests.sessions.send(loop, { requestId: "r2", playback: "replan", command: command })
+            m.assertEqual(loop.running[tests.sessions.runningId(loop, "/api/v2/playback/s-1/replan")].request.bodyText, text)
+        end sub
+
+        @it("posts a progress sample's text as it is")
+        sub _()
+            loop = m.signedIn()
+            text = `{"installation_id":"inst-1","sequence":3,"position":12.5,"is_paused":false}`
+            tests.sessions.send(loop, { requestId: "g1", playback: "progress", command: { type: "progress", fence: m.fence(loop, "s-1"), session_id: "s-1", sequence: 3, bodyText: text } })
+            id = tests.sessions.runningId(loop, "/api/v2/playback/s-1/progress")
+            m.assertEqual(loop.running[id].request.bodyText, text)
+            tests.sessions.respond(loop, id, 409, tests.sessions.fixture("playback_progress_conflict"))
+            m.assertEqual(loop.delivered.g1.body.kind, "progressConflict")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("jobs")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("sends a stop with its stored body, retrying with backoff, with no owner")
+        sub _()
+            loop = m.signedIn()
+            text = `{"installation_id":"inst-1","stop_id":"00000000-0000-4000-8000-000000000009"}`
+            job = { kind: "stop", id: "s-1:stop", fence: m.fence(loop, "s-1"), sessionId: "s-1", sequence: invalid, uncertain: false, bodyText: text }
+            tests.sessions.send(loop, { requestId: "j1", playback: "job", job: job })
+            m.assertEqual(loop.delivered.j1.body.kind, "queued")
+            id = tests.sessions.runningId(loop, "/api/v2/playback/s-1")
+            request = loop.running[id].request
+            m.assertEqual([request.method, request.lane, request.owner, request.bodyText], ["DELETE", "playback", "", text])
+            tests.sessions.respond(loop, id, 503)
+            tests.sessions.tick(loop, 999)
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/playback/s-1"))
+            tests.sessions.tick(loop, 1)
+            retry = tests.sessions.runningId(loop, "/api/v2/playback/s-1")
+            m.assertEqual(loop.running[retry].request.bodyText, text)
+            tests.sessions.respond(loop, retry, 200, tests.sessions.fixture("playback_stop_completed"))
+            m.assertTrue(tests.sessions.count(loop, "log playback job done") = 1)
+        end sub
+
+        @it("lets a profile change wait for the current profile's jobs")
+        sub _()
+            loop = m.signedIn()
+            job = { kind: "stop", id: "s-1:stop", fence: m.fence(loop, "s-1"), sessionId: "s-1", sequence: invalid, uncertain: false, bodyText: "{}" }
+            tests.sessions.send(loop, { requestId: "j1", playback: "job", job: job })
+            other = { id: "p-other", name: "Other", hasPin: false, isChild: false }
+            tests.sessions.send(loop, { requestId: "s1", session: "selectProfile", profile: other })
+            m.assertEqual(tests.sessions.count(loop, "defer selectProfile"), 1)
+            m.assertInvalid(loop.delivered.s1)
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-1"), 200, tests.sessions.fixture("playback_stop_completed"))
+            tests.sessions.tick(loop)
+            m.assertTrue(loop.delivered.s1.ok, "runs once the job is done")
+            m.assertEqual(api.auth.coordinator.identity(loop.session).profile, "p-other")
+        end sub
+
+        @it("drops a job handed over for an identity that is already gone, and never spins on it")
+        sub _()
+            loop = m.signedIn()
+            fence = m.fence(loop, "s-1")
+            tests.sessions.send(loop, { requestId: "s1", session: "selectProfile", profile: { id: "p-other", name: "Other", hasPin: false, isChild: false } })
+            job = { kind: "stop", id: "s-1:stop", fence: fence, sessionId: "s-1", sequence: invalid, uncertain: false, bodyText: "{}" }
+            tests.sessions.send(loop, { requestId: "j1", playback: "job", job: job })
+            m.assertEqual(tests.sessions.count(loop, "log playback job identity_changed"), 1)
+            m.assertEqual(loop.running.Count(), 0)
+            m.assertInvalid(playback.worker.nextWake(loop.worker))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("cancelling operations that wait")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        function pendingStop(loop as Object) as Object
+            job = { kind: "stop", id: "s-1:stop", fence: m.fence(loop, "s-1"), sessionId: "s-1", sequence: invalid, uncertain: false, bodyText: "{}" }
+            tests.sessions.send(loop, { requestId: "j1", playback: "job", job: job })
+            return job
+        end function
+
+        function other() as Object
+            return { id: "p-other", name: "Other", hasPin: false, isChild: false }
+        end function
+
+        @it("drops a profile selection whose screen left while it waited")
+        sub _()
+            loop = m.signedIn()
+            m.pendingStop(loop)
+            tests.sessions.send(loop, { requestId: "s1", owner: "picker", session: "selectProfile", profile: m.other() })
+            m.assertEqual(tests.sessions.count(loop, "defer selectProfile"), 1)
+            tests.sessions.cancel(loop, { owner: "picker" })
+            m.assertEqual([loop.delivered.s1.error.kind, loop.delivered.s1.error.reason], ["cancelled", "owner"])
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-1"), 200, tests.sessions.fixture("playback_stop_completed"))
+            tests.sessions.tick(loop, playback.jobs.SETTLE_MS)
+            m.assertEqual(api.auth.coordinator.identity(loop.session).profile, "p-owner")
+            m.assertEqual(tests.sessions.count(loop, "session selectProfile"), 0)
+            m.assertInvalid(playback.worker.nextWake(loop.worker))
+        end sub
+
+        @it("discards a cancelled PIN at once and runs only the operations still waiting")
+        sub _()
+            loop = m.signedIn()
+            m.pendingStop(loop)
+            pinInput = { requestId: "v1", owner: "pin", session: "verifyPin", profile: { id: "p-locked", name: "Locked", hasPin: true, isChild: false }, pin: "1234" }
+            tests.sessions.send(loop, pinInput)
+            tests.sessions.send(loop, { requestId: "s1", owner: "picker", session: "selectProfile", profile: m.other() })
+            tests.sessions.cancel(loop, { requestId: "v1" })
+            m.assertFalse(pinInput.DoesExist("pin"), "the PIN is not kept")
+            m.assertEqual(loop.delivered.v1.error.kind, "cancelled")
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-1"), 200, tests.sessions.fixture("playback_stop_completed"))
+            tests.sessions.tick(loop)
+            m.assertEqual(tests.sessions.count(loop, "session verifyPin"), 0)
+            m.assertEqual(tests.sessions.count(loop, "session selectProfile"), 1)
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/profiles/p-locked/verify-pin"))
+            m.assertEqual(api.auth.coordinator.identity(loop.session).profile, "p-other")
+        end sub
+
+        @it("drops a sign-in's password with its screen")
+        sub _()
+            loop = m.signedIn()
+            m.pendingStop(loop)
+            signInput = { requestId: "i1", owner: "signin", session: "signIn", username: "u", password: "secret" }
+            tests.sessions.send(loop, signInput)
+            tests.sessions.cancel(loop, { owner: "signin" })
+            m.assertFalse(signInput.DoesExist("password"))
+            m.assertInvalid(loop.worker.deferred, "nothing waits any more")
+        end sub
+
+        @it("still signs out when the screen that asked goes away")
+        sub _()
+            loop = m.signedIn()
+            m.pendingStop(loop)
+            tests.sessions.send(loop, { requestId: "o1", owner: "picker", session: "signOut" })
+            tests.sessions.cancel(loop, { owner: "picker" })
+            m.assertInvalid(loop.delivered.o1, "a sign-out is not cancelled")
+            tests.sessions.tick(loop, playback.jobs.SETTLE_MS)
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "signed_out")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("starts that outlive their player")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        function stopRunning(loop as Object) as Dynamic
+            return tests.sessions.runningId(loop, "/api/v2/playback/11111111-1111-4111-8111-111111111111")
+        end function
+
+        @it("stops a session accepted after its player was released")
+        sub _()
+            loop = m.signedIn()
+            id = m.started(loop, "p1", invalid, "player-1")
+            tests.sessions.cancel(loop, { owner: "player-1" })
+            m.assertNotInvalid(loop.running[id], "the start is not cancelled")
+            tests.sessions.respond(loop, id, 201, tests.sessions.fixture("playback_start_opaque_ids"))
+            tests.sessions.tick(loop)
+            stopId = m.stopRunning(loop)
+            m.assertNotInvalid(stopId)
+            request = loop.running[stopId].request
+            m.assertEqual([request.method, request.owner, request.fence.profile], ["DELETE", "", "p-owner"])
+            body = ParseJson(request.bodyText)
+            m.assertEqual(body.installation_id, "11111111-1111-4111-8111-111111111111")
+            m.assertEqual(Len(body.stop_id), 36)
+            m.assertEqual(LCase(body.stop_id), body.stop_id)
+            m.assertFalse(body.DoesExist("position"), "the attempt never played")
+        end sub
+
+        @it("stops an accepted session whose player left without handing over a stop")
+        sub _()
+            loop = m.signedIn()
+            id = m.started(loop, "p1", invalid, "player-1")
+            tests.sessions.respond(loop, id, 201, tests.sessions.fixture("playback_start_opaque_ids"))
+            tests.sessions.tick(loop)
+            m.assertInvalid(m.stopRunning(loop))
+            tests.sessions.cancel(loop, { owner: "player-1" })
+            tests.sessions.tick(loop)
+            m.assertNotInvalid(m.stopRunning(loop))
+        end sub
+
+        @it("leaves a session to the player's own stop once it has one")
+        sub _()
+            loop = m.signedIn()
+            id = m.started(loop, "p1", invalid, "player-1")
+            tests.sessions.respond(loop, id, 201, tests.sessions.fixture("playback_start_opaque_ids"))
+            sessionId = "11111111-1111-4111-8111-111111111111"
+            job = { kind: "stop", id: sessionId + ":stop", fence: m.fence(loop, sessionId), sessionId: sessionId, sequence: 3, uncertain: false, bodyText: `{"stop_id":"x"}` }
+            tests.sessions.send(loop, { requestId: "j1", owner: "player-1", playback: "job", job: job })
+            tests.sessions.respond(loop, m.stopRunning(loop), 200, tests.sessions.fixture("playback_stop_completed"))
+            tests.sessions.cancel(loop, { owner: "player-1" })
+            tests.sessions.tick(loop)
+            m.assertInvalid(m.stopRunning(loop))
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/" + sessionId), 1)
+        end sub
+
+        ' Answers a start from player-1 for attempt with session sessionId.
+        function startedAs(loop as Object, attempt as String, sessionId as String) as Object
+            command = m.startCommand(loop)
+            command.playback_attempt_id = attempt
+            command.fence.attempt = attempt
+            command.fence.contentId = "c-1"
+            tests.sessions.send(loop, { requestId: attempt, owner: "player-1", playback: "start", command: command })
+            caps = tests.sessions.runningId(loop, "/api/v2/playback/capabilities")
+            if caps <> invalid then tests.sessions.respond(loop, caps, 200, tests.sessions.fixture("playback_capability_available"), { ETag: """caps-1""" })
+            answer = tests.sessions.fixture("playback_start_opaque_ids")
+            answer.session_id = sessionId
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"), 201, answer)
+            return command.fence
+        end function
+
+        ' The reducer's stop for sessionId, with a final sample.
+        sub handOverStop(loop as Object, fence as Object, sessionId as String)
+            stopFence = playback.values.copy(fence)
+            stopFence.session = sessionId
+            job = { kind: "stop", id: sessionId + ":stop", fence: stopFence, sessionId: sessionId, sequence: 5, uncertain: false, bodyText: `{"position":468.584,"sequence":5,"stop_id":"x"}` }
+            tests.sessions.send(loop, { requestId: sessionId + "-job", owner: "player-1", playback: "job", job: job })
+        end sub
+
+        @it("never stops a session the server lost once a replan found it gone (run 8, defect 3)")
+        sub _()
+            ' T2a: a server restart loses s-1; its failure_recovery answers
+            ' 404, the reducer starts s-2 at the position, plays, and stops s-2
+            ' at 468.584 s; then the player is released.
+            loop = m.signedIn()
+            fence = m.startedAs(loop, "attempt-0001", "s-1")
+            replanFence = playback.values.copy(fence)
+            replanFence.session = "s-1"
+            members = { installation_id: "inst-1", protocol_version: 3, playback_attempt_id: "attempt-0001", replan_request_id: "rr-1", operation: "failure_recovery", position_seconds: 420.995, selected_tracks: { audio: { id: "file:42:audio:0", index: 0 } } }
+            tests.sessions.send(loop, { requestId: "rp", owner: "player-1", playback: "replan", command: { type: "replan", fence: replanFence, session_id: "s-1", replan_request_id: "rr-1", retry: false, stereoAacRestart: false, members: members }, audioTracks: [] })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-1/replan"), 404)
+            m.assertEqual(loop.delivered.rp.body.kind, "notFound")
+            m.startedAs(loop, "attempt-0002", "s-2")
+            m.handOverStop(loop, fence, "s-2")
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-2"), 200, tests.sessions.fixture("playback_stop_completed"))
+            tests.sessions.cancel(loop, { owner: "player-1" })
+            tests.sessions.tick(loop)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-1"), 0, "no stop without a sample rewrites s-1's last progress over s-2's stop")
+            m.assertEqual(tests.sessions.count(loop, "log stopping a session because its player left"), 0)
+        end sub
+
+        @it("never stops a session an administrator ended once its player leaves")
+        sub _()
+            loop = m.signedIn()
+            fence = m.startedAs(loop, "attempt-0001", "s-1")
+            replanFence = playback.values.copy(fence)
+            replanFence.session = "s-1"
+            members = { installation_id: "inst-1", protocol_version: 3, playback_attempt_id: "attempt-0001", replan_request_id: "rr-1", operation: "track_change", position_seconds: 30, selected_tracks: { audio: { id: "file:42:audio:0", index: 0 } } }
+            tests.sessions.send(loop, { requestId: "rp", owner: "player-1", playback: "replan", command: { type: "replan", fence: replanFence, session_id: "s-1", replan_request_id: "rr-1", retry: false, stereoAacRestart: false, members: members }, audioTracks: [] })
+            ended = { type: "https://siloserver.org/docs/api/v2/problems/playback_session_ended", title: "Ended", status: 410, detail: "x", instance: "urn:silo:request:1" }
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-1/replan"), 410, ended)
+            m.assertEqual(loop.delivered.rp.body.kind, "ended")
+            tests.sessions.cancel(loop, { owner: "player-1" })
+            tests.sessions.tick(loop)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-1"), 0)
+        end sub
+
+        @it("leaves an earlier session of the player to its reducer once the player starts again")
+        sub _()
+            ' The same, when the reducer learned of the loss from the media
+            ' (a 404 on the stream) rather than from a replan.
+            loop = m.signedIn()
+            fence = m.startedAs(loop, "attempt-0001", "s-1")
+            m.startedAs(loop, "attempt-0002", "s-2")
+            m.handOverStop(loop, fence, "s-2")
+            tests.sessions.cancel(loop, { owner: "player-1" })
+            tests.sessions.tick(loop)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-1"), 0)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-2"), 1)
+        end sub
+
+        @it("neither replays nor stops a start that a newer attempt of its player replaced (run 9, T3d)")
+        sub _()
+            loop = m.signedIn()
+            ' Try Anyway while the server is down: the proxy answers its start
+            ' 502 each time the reducer sends it, until the error shows.
+            id = m.started(loop, "p1", invalid, "player-1")
+            replay = m.startCommand(loop)
+            replay.bodyText = loop.running[id].request.bodyText
+            replay.retry = true
+            tests.sessions.respond(loop, id, 502)
+            tests.sessions.send(loop, { requestId: "p1-again", owner: "player-1", playback: "start", command: replay })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"), 502)
+            ' Retry once it is back: the player's newer attempt plays, and its
+            ' stop is handed over when the viewer leaves.
+            fence = m.startedAs(loop, "attempt-0002", "s-2")
+            m.handOverStop(loop, fence, "s-2")
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-2"), 200, tests.sessions.fixture("playback_stop_completed"))
+            tests.sessions.cancel(loop, { owner: "player-1" })
+            tests.sessions.tick(loop, 60000)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/start"), 3, "Try Anyway's two tries and Retry's start, nothing after")
+            m.assertEqual(tests.sessions.count(loop, "log stopping a session because its player left"), 0)
+            m.assertEqual(loop.worker.starts, [])
+        end sub
+
+        @it("still replays a player's newest uncertain start once the player leaves, and stops what it finds")
+        sub _()
+            loop = m.signedIn()
+            m.startedAs(loop, "attempt-0001", "s-1")
+            command = m.startCommand(loop)
+            command.playback_attempt_id = "attempt-0002"
+            command.fence.attempt = "attempt-0002"
+            tests.sessions.send(loop, { requestId: "p2", owner: "player-1", playback: "start", command: command })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"), 503)
+            tests.sessions.cancel(loop, { owner: "player-1" })
+            tests.sessions.tick(loop)
+            replay = tests.sessions.runningId(loop, "/api/v2/playback/start")
+            m.assertEqual(ParseJson(loop.running[replay].request.bodyText).playback_attempt_id, "attempt-0002")
+            tests.sessions.respond(loop, replay, 201, tests.sessions.fixture("playback_start_opaque_ids"))
+            tests.sessions.tick(loop)
+            m.assertNotInvalid(m.stopRunning(loop))
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-1"), 0, "the session the newer attempt replaced is not stopped")
+        end sub
+
+        @it("retires an older session's waiting stop for the title once a newer session's progress lands")
+        sub _()
+            loop = m.signedIn()
+            fence = m.fence(loop, "s-1")
+            fence.contentId = "c-1"
+            job = { kind: "stop", id: "s-1:stop", fence: fence, sessionId: "s-1", sequence: 8, uncertain: false, bodyText: `{"position":481.556,"sequence":8,"stop_id":"x"}` }
+            tests.sessions.send(loop, { requestId: "j1", playback: "job", job: job })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-1"), 502)
+            newer = m.fence(loop, "s-2")
+            newer.contentId = "c-1"
+            text = `{"installation_id":"inst-1","sequence":1,"position":475.1,"is_paused":false}`
+            tests.sessions.send(loop, { requestId: "g1", playback: "progress", command: { type: "progress", fence: newer, session_id: "s-2", sequence: 1, bodyText: text } })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-2/progress"), 200, {})
+            m.assertEqual(tests.sessions.count(loop, "log playback job superseded"), 1)
+            tests.sessions.tick(loop, 60000)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-1"), 1, "the stop is not tried again")
+        end sub
+
+        @it("replays an uncertain start of a player that left, then stops its session")
+        sub _()
+            loop = m.signedIn()
+            id = m.started(loop, "p1", invalid, "player-1")
+            text = loop.running[id].request.bodyText
+            tests.sessions.respond(loop, id, 503)
+            tests.sessions.cancel(loop, { owner: "player-1" })
+            tests.sessions.tick(loop)
+            replay = tests.sessions.runningId(loop, "/api/v2/playback/start")
+            m.assertNotInvalid(replay)
+            m.assertEqual(loop.running[replay].request.bodyText, text, "byte for byte, under the same attempt")
+            tests.sessions.respond(loop, replay, 503)
+            tests.sessions.tick(loop, 999)
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/playback/start"))
+            tests.sessions.tick(loop, 1)
+            replay = tests.sessions.runningId(loop, "/api/v2/playback/start")
+            delivered = loop.delivered.Count()
+            tests.sessions.respond(loop, replay, 201, tests.sessions.fixture("playback_start_opaque_ids"))
+            m.assertEqual(loop.delivered.Count(), delivered, "no one to answer")
+            tests.sessions.tick(loop)
+            m.assertNotInvalid(m.stopRunning(loop))
+        end sub
+
+        @it("gives up replaying a start whose player left after five uncertain answers")
+        sub _()
+            loop = m.signedIn()
+            id = m.started(loop, "p1", invalid, "player-1")
+            tests.sessions.respond(loop, id, 503)
+            tests.sessions.cancel(loop, { owner: "player-1" })
+            for i = 1 to playback.worker.ORPHAN_RETRIES + 1
+                tests.sessions.tick(loop, 30000)
+                tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"), 503)
+            end for
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/start"), playback.worker.ORPHAN_RETRIES + 2)
+            m.assertEqual(loop.worker.starts, [])
+            m.assertInvalid(playback.worker.nextWake(loop.worker))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("identity changes during playback")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("stops a live session with the old identity before a profile change is published")
+        sub _()
+            loop = m.signedIn()
+            id = m.started(loop, "p1", invalid, "player-1")
+            tests.sessions.respond(loop, id, 201, tests.sessions.fixture("playback_start_opaque_ids"))
+            tests.sessions.send(loop, { requestId: "s1", owner: "picker", session: "selectProfile", profile: m.other() })
+            m.assertEqual(tests.sessions.count(loop, "defer selectProfile"), 1)
+            tests.sessions.tick(loop)
+            stopId = m.stopRunning(loop)
+            m.assertEqual(loop.running[stopId].headers["X-Profile-Id"], "p-owner")
+            m.assertInvalid(loop.delivered.s1)
+            tests.sessions.respond(loop, stopId, 200, tests.sessions.fixture("playback_stop_completed"))
+            tests.sessions.tick(loop)
+            m.assertTrue(loop.delivered.s1.ok)
+            m.assertEqual(api.auth.coordinator.identity(loop.session).profile, "p-other")
+        end sub
+
+        @it("waits for a start in flight, then stops what it accepted, before a profile change")
+        sub _()
+            loop = m.signedIn()
+            id = m.started(loop, "p1", invalid, "player-1")
+            tests.sessions.send(loop, { requestId: "s1", session: "selectProfile", profile: m.other() })
+            tests.sessions.tick(loop)
+            m.assertInvalid(loop.delivered.s1, "the start is in flight")
+            tests.sessions.respond(loop, id, 201, tests.sessions.fixture("playback_start_opaque_ids"))
+            m.assertEqual(loop.delivered.p1.body.kind, "ok", "the player still hears its answer")
+            tests.sessions.tick(loop)
+            stopId = m.stopRunning(loop)
+            m.assertNotInvalid(stopId)
+            tests.sessions.respond(loop, stopId, 200, tests.sessions.fixture("playback_stop_completed"))
+            tests.sessions.tick(loop)
+            m.assertTrue(loop.delivered.s1.ok)
+        end sub
+
+        @it("starts nothing new for an identity that is leaving")
+        sub _()
+            loop = m.signedIn()
+            m.pendingStop(loop)
+            tests.sessions.send(loop, { requestId: "s1", session: "selectProfile", profile: m.other() })
+            tests.sessions.send(loop, { requestId: "p2", playback: "start", command: m.startCommand(loop) })
+            m.assertEqual(loop.delivered.p2.body.kind, "fenced")
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/playback/capabilities"))
+        end sub
+
+        @it("sends a refused profile's stop only with the PIN token entered after")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.profileTokens = [{ id: "p-owner", token: "old" }]
+            loop = tests.sessions.create(record)
+            locked = { id: "p-owner", name: "Laura", hasPin: true, isChild: false }
+            tests.sessions.send(loop, { requestId: "s0", session: "selectProfile", profile: locked })
+            tests.sessions.send(loop, { requestId: "h1", path: "/api/v2/home", auth: "profile" })
+            tests.sessions.respond(loop, "h1", 403, { type: "https://siloserver.org/docs/api/v2/problems/profile_verification_required", title: "Profile verification required", status: 403, detail: "x", instance: "urn:silo:request:3" })
+            m.pendingStop(loop)
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/playback/s-1"), "no token to send it with")
+            tests.sessions.send(loop, { requestId: "v1", session: "verifyPin", profile: locked, pin: "1234" })
+            tests.sessions.respond(loop, "v1", 200, tests.sessions.fixture("verify_profile_pin_ok"))
+            tests.sessions.tick(loop, 1000)
+            stopId = tests.sessions.runningId(loop, "/api/v2/playback/s-1")
+            m.assertEqual(loop.running[stopId].headers["X-Profile-Token"], "pvt_fixture")
+        end sub
+
+        @it("does not wait for playback to unlock the profile already open")
+        sub _()
+            loop = m.signedIn()
+            m.pendingStop(loop)
+            identity = api.auth.coordinator.identity(loop.session)
+            tests.sessions.send(loop, { requestId: "v1", session: "verifyPin", profile: { id: identity.profile, name: "Owner", hasPin: true, isChild: false }, pin: "1234" })
+            m.assertEqual(tests.sessions.count(loop, "defer verifyPin"), 0)
+            m.assertNotInvalid(tests.sessions.runningId(loop, "/api/v2/profiles/" + identity.profile + "/verify-pin"))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("jobs of an identity that has gone (W9-2)")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        ' The reducer's stop for identity's sessionId of the title c-1: with a
+        ' final sample at position when sequence is a number, else unplayed.
+        function titleStop(identity as Object, sessionId as String, sequence as Dynamic, position = 0 as Integer) as Object
+            fence = { server: identity.server, account: identity.account, profile: identity.profile, attempt: "attempt-" + sessionId, session: sessionId, contentId: "c-1" }
+            body = { installation_id: "inst-1", stop_id: "00000000-0000-4000-8000-0000000000" + Right("0" + Len(sessionId).ToStr(), 2) }
+            if util.isNumber(sequence)
+                body.sequence = sequence
+                body.position = position
+                body.is_paused = false
+            end if
+            return { kind: "stop", id: sessionId + ":stop", fence: fence, sessionId: sessionId, sequence: sequence, uncertain: false, bodyText: FormatJson(body) }
+        end function
+
+        ' ApiTask's worker env for identity at now, without the account
+        ' session: a server or account change that a spec cannot sign in to.
+        function envAt(identity as Object, now as Integer) as Object
+            return { now: now, device: invalid, identity: identity, app: { version: "0.1.0", build: "7", channel: "dev" }, gates: { debug: true }, uuid: tests.sessions.uuid }
+        end function
+
+        function submitted(decisions as Object) as Object
+            out = []
+            for each decision in decisions
+                if decision.kind = "submit" then out.Push(decision.request)
+            end for
+            return out
+        end function
+
+        function logs(decisions as Object) as Object
+            out = []
+            for each decision in decisions
+                if decision.kind = "log" then out.Push(decision.message)
+            end for
+            return out
+        end function
+
+        function replyKind(decisions as Object) as Dynamic
+            for each decision in decisions
+                if decision.kind = "reply" then return decision.result.body.kind
+            end for
+            return invalid
+        end function
+
+        ' A gateway's 502 for request, or a 200 with body.
+        function answered(request as Object, status as Integer, body = invalid as Dynamic) as Object
+            if status = 200 then return { requestId: request.requestId, ok: true, status: 200, headers: {}, body: body, error: invalid }
+            return { requestId: request.requestId, ok: false, status: status, headers: {}, body: invalid, error: { kind: "http" } }
+        end function
+
+        @it("keeps the newest final stop deliverable when an old profile's stop for its title arrives late")
+        sub _()
+            loop = m.signedIn()
+            old = m.titleStop(api.auth.coordinator.identity(loop.session), "s-old", 5, 300)
+            tests.sessions.send(loop, { requestId: "s1", session: "selectProfile", profile: m.other() })
+            current = api.auth.coordinator.identity(loop.session)
+            m.assertEqual(current.profile, "p-other")
+            newer = m.titleStop(current, "s-new", 9, 600)
+            tests.sessions.send(loop, { requestId: "j1", playback: "job", job: newer })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-new"), 502)
+            tests.sessions.send(loop, { requestId: "j2", playback: "job", job: old })
+            m.assertEqual(loop.delivered.j2.body.kind, "fenced")
+            m.assertEqual(tests.sessions.count(loop, "log playback job identity_changed"), 1)
+            m.assertEqual(tests.sessions.count(loop, "log playback job superseded"), 0)
+            tests.sessions.tick(loop, 60000)
+            retry = loop.running[tests.sessions.runningId(loop, "/api/v2/playback/s-new")]
+            m.assertEqual(retry.request.bodyText, newer.bodyText, "byte for byte")
+            m.assertEqual(retry.headers["X-Profile-Id"], "p-other")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-new"), 2)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-old"), 0, "never sent with the new profile's credentials")
+        end sub
+
+        @it("keeps a pending or in-flight current stop when an old server's, account's, or profile's stop for its title arrives")
+        sub _()
+            current = { server: "https://silo.example", account: "1", profile: "p-owner" }
+            for each member in ["server", "account", "profile"]
+                for each inFlight in [false, true]
+                    label = member + " inFlight=" + inFlight.ToStr() + ": "
+                    old = playback.values.copy(current)
+                    old[member] = "old-" + member
+                    worker = playback.worker.create()
+                    newer = m.titleStop(current, "s-new", 9, 600)
+                    sent = m.submitted(playback.worker.operation(worker, { requestId: "j1", playback: "job", job: newer }, m.envAt(current, 0)))[0]
+                    if not inFlight then playback.worker.settled(worker, sent, m.answered(sent, 502), m.envAt(current, 0))
+                    decisions = playback.worker.operation(worker, { requestId: "j2", playback: "job", job: m.titleStop(old, "s-old", 5, 300) }, m.envAt(current, 10))
+                    m.assertEqual(m.replyKind(decisions), "fenced", label)
+                    m.assertEqual(m.logs(decisions), ["playback job identity_changed"], label + "released, nothing superseded")
+                    m.assertEqual(m.submitted(decisions), [], label + "never sent")
+                    m.assertEqual(worker.jobs.queue.Count(), 1, label + "never queued")
+                    if inFlight then m.assertEqual(m.logs(playback.worker.settled(worker, sent, m.answered(sent, 502), m.envAt(current, 20))), [], label + "the in-flight stop waits to be retried")
+                    retry = m.submitted(playback.worker.tick(worker, m.envAt(current, 60000)))
+                    m.assertEqual(retry.Count(), 1, label)
+                    m.assertEqual(retry[0].bodyText, newer.bodyText, label + "byte for byte")
+                    m.assertEqual(retry[0].fence, { server: current.server, account: current.account, profile: current.profile }, label)
+                end for
+            end for
+        end sub
+
+        @it("lets an old identity's progress answer retire nothing once a new session has posted progress")
+        sub _()
+            current = { server: "https://silo.example", account: "1", profile: "p-owner" }
+            for each member in ["server", "account", "profile"]
+                old = playback.values.copy(current)
+                old[member] = "old-" + member
+                worker = playback.worker.create()
+                oldFence = { server: old.server, account: old.account, profile: old.profile, attempt: "attempt-s-old", session: "s-old", contentId: "c-1" }
+                oldPost = m.submitted(playback.worker.operation(worker, { requestId: "g1", playback: "progress", command: { type: "progress", fence: oldFence, session_id: "s-old", sequence: 3, bodyText: `{"installation_id":"inst-1","sequence":3,"position":300,"is_paused":false}` } }, m.envAt(old, 0)))[0]
+                ' The identity changes. Its first session never played; its stop
+                ' waits for a retry while the next session posts progress.
+                unplayed = m.titleStop(current, "s-new", invalid)
+                sent = m.submitted(playback.worker.operation(worker, { requestId: "j1", playback: "job", job: unplayed }, m.envAt(current, 10)))[0]
+                playback.worker.settled(worker, sent, m.answered(sent, 502), m.envAt(current, 10))
+                newFence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-s-next", session: "s-next", contentId: "c-1" }
+                playback.worker.operation(worker, { requestId: "g2", playback: "progress", command: { type: "progress", fence: newFence, session_id: "s-next", sequence: 1, bodyText: `{"installation_id":"inst-1","sequence":1,"position":20,"is_paused":false}` } }, m.envAt(current, 20))
+                decisions = playback.worker.settled(worker, oldPost, m.answered(oldPost, 200, {}), m.envAt(current, 30))
+                m.assertEqual(m.logs(decisions), [], member + ": nothing superseded")
+                m.assertEqual(m.replyKind(decisions), "ok", member + ": the old player still hears its answer")
+                retry = m.submitted(playback.worker.tick(worker, m.envAt(current, 60000)))
+                m.assertEqual(retry.Count(), 1, member)
+                m.assertEqual(retry[0].bodyText, unplayed.bodyText, member)
+            end for
+        end sub
+
+    end class
+
+end namespace

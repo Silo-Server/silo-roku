@@ -1,0 +1,300 @@
+namespace tests
+
+    @suite("dev harness: device probe and playback bodies")
+    class HarnessBodyTests extends rooibos.BaseTestSuite
+
+        @describe("probeDevice")
+
+        @it("records the live answers of a 4K Dolby Vision Roku TV")
+        sub _()
+            facts = m.tvFacts()
+            m.assertEqual(facts.model, "A109X")
+            m.assertEqual(facts.manufacturer, "TCL")
+            m.assertEqual(facts.osVersion, "15.3.4")
+            m.assertEqual(facts.uiResolution, "fhd")
+            m.assertTrue(facts.mkv)
+            m.assertEqual(facts.video.hevcMain10Level, "5.1")
+            m.assertTrue(facts.video.h264High42)
+            m.assertTrue(facts.audio.eac3)
+            m.assertTrue(facts.display.dolbyVision)
+        end sub
+
+        @it("takes the highest documented HEVC level that answers yes")
+        sub _()
+            facts = harness.probeDevice(tests.fakeDevice(["hevc|main 10|4.1", "mpeg4 avc|high|4.1"], [], "1080p60", {}), tests.fakeApp(""))
+            m.assertEqual(facts.video.hevcMain10Level, "4.1")
+            m.assertFalse(facts.video.h264High42)
+            m.assertFalse(facts.mkv)
+            m.assertFalse(facts.display.hdr10)
+        end sub
+
+        @describe("capabilities")
+
+        @it("claims HEVC Main 10 4K with HDR10 and HLG, and never Dolby Vision")
+        sub _()
+            caps = harness.capabilities(m.tvFacts(), harness.defaultToggles())
+            client = caps.client_capabilities
+            m.assertEqual(client.codecs_video, ["h264", "hevc"])
+            m.assertEqual(client.max_resolution, "2160p")
+            m.assertTrue(client.hdr)
+            m.assertEqual(client.hdr_details, { hdr10: true, hdr10_plus: false, hlg: true, dolby_vision_profiles: [] })
+            hevc = client.video_decode[1]
+            m.assertEqual(hevc.levels, [153])
+            m.assertEqual(hevc.profiles, ["main", "main 10"])
+            m.assertEqual(hevc.max_height, 2160)
+            output = caps.client_playback_context.output
+            m.assertEqual(output.hdr_details.dolby_vision_profiles, [])
+            m.assertEqual(output.display.hdr_types.dolby_vision_profiles, [])
+            m.assertEqual(output.display.hdr_evidence, "exact")
+            m.assertEqual(output.output_context_id, "roku:2160:hdr10.hlg:aac.ac3.eac3")
+            m.assertEqual(caps.client_playback_context.device.platform_details, { model_type: "TV", video_mode: "2160p", ui_resolution: "fhd" })
+        end sub
+
+        @it("keeps output.hdr_details within the panel's own flags")
+        sub _()
+            output = harness.capabilities(m.tvFacts(), harness.defaultToggles()).client_playback_context.output
+            for each range in ["hdr10", "hlg", "hdr10_plus"]
+                if output.hdr_details[range] then m.assertTrue(output.display.hdr_types[range], range)
+            end for
+        end sub
+
+        @it("uses signed-URL media mode: no header-authenticated or authorized-origin features")
+        sub _()
+            features = harness.capabilities(m.tvFacts(), harness.defaultToggles()).client_features
+            m.assertArrayNotContains(features, "header_authenticated_media_v1")
+            m.assertArrayNotContains(features, "authorized_media_origins_v1")
+            m.assertArrayContains(features, "seek_reanchor_v1")
+            m.assertArrayContains(features, "direct_stream_resume_v1")
+            m.assertArrayContains(features, "subrip_sidecar_v1")
+        end sub
+
+        @it("shapes the three delivery classes per the plan")
+        sub _()
+            deliveries = harness.capabilities(m.tvFacts(), harness.defaultToggles()).client_playback_context.deliveries
+            m.assertTrue(deliveries.original_http.enabled)
+            m.assertEqual(deliveries.original_http.containers, ["mp4", "mkv"])
+            m.assertEqual(deliveries.original_http.hdr_details.dolby_vision_profiles, [])
+            m.assertAANotHasKey(deliveries.original_http, "failure_reason")
+            m.assertEqual(deliveries.hls.containers, ["hls"])
+            m.assertEqual(deliveries.hls.audio_decode_codecs, ["aac", "ac3", "eac3"])
+            m.assertEqual(deliveries.hls.features, ["native_hls_playback_v1"])
+            m.assertAANotHasKey(deliveries.hls, "hdr_details")
+            m.assertFalse(deliveries.progressive.enabled)
+            m.assertEqual(deliveries.progressive.failure_reason, "disabled_pending_seekable_transport")
+            for each name in deliveries
+                m.assertEqual(deliveries[name].audio_passthrough_codecs, [], name)
+                m.assertAANotHasKey(deliveries[name], "max_channels")
+            end for
+        end sub
+
+        @it("advertises MKV only when the manifest sets requires_mkv=1")
+        sub _()
+            facts = m.tvFacts()
+            facts.mkv = false
+            caps = harness.capabilities(facts, harness.defaultToggles())
+            m.assertEqual(caps.client_capabilities.containers, ["mp4"])
+            m.assertEqual(caps.client_playback_context.deliveries.original_http.containers, ["mp4"])
+        end sub
+
+        @it("turns original_http off with a reason, to force a remux")
+        sub _()
+            toggles = harness.defaultToggles()
+            toggles.originalHttp = false
+            original = harness.capabilities(m.tvFacts(), toggles).client_playback_context.deliveries.original_http
+            m.assertFalse(original.enabled)
+            m.assertTrue(original.supported_on_device)
+            m.assertEqual(original.failure_reason, "disabled_by_dev_harness")
+        end sub
+
+        @it("drops HEVC, E-AC-3, and the HDR they carry, to force a transcode")
+        sub _()
+            toggles = harness.defaultToggles()
+            toggles.hevcEac3 = false
+            caps = harness.capabilities(m.tvFacts(), toggles)
+            m.assertEqual(caps.client_capabilities.codecs_video, ["h264"])
+            m.assertArrayNotContains(caps.client_capabilities.codecs_audio, "eac3")
+            m.assertArrayContains(caps.client_capabilities.codecs_audio, "ac3")
+            m.assertFalse(caps.client_capabilities.hdr)
+            m.assertEqual(caps.client_capabilities.max_resolution, "1080p")
+            m.assertEqual(caps.client_playback_context.deliveries.hls.video_codecs, ["h264"])
+            m.assertEqual(caps.client_playback_context.output.output_context_id, "roku:2160:sdr:aac.ac3")
+        end sub
+
+        @it("withholds sidecar subtitles and their features when switched off")
+        sub _()
+            toggles = harness.defaultToggles()
+            toggles.sidecarSubtitles = false
+            caps = harness.capabilities(m.tvFacts(), toggles)
+            m.assertEqual(caps.client_features, ["seek_reanchor_v1", "direct_stream_resume_v1"])
+            for each name in caps.client_playback_context.deliveries
+                m.assertFalse(caps.client_playback_context.deliveries[name].subtitles.sidecar_text, name)
+            end for
+        end sub
+
+        @it("leaves the prototype features out by default")
+        sub _()
+            caps = harness.capabilities(m.tvFacts(), harness.defaultToggles())
+            m.assertArrayNotContains(caps.client_features, "hls_no_variable_substitution_v1")
+            m.assertEqual(caps.client_playback_context.deliveries.hls.features, ["native_hls_playback_v1"])
+            m.assertEqual(harness.prototypeFeatures(harness.defaultToggles()), [])
+        end sub
+
+        @it("asks for TS copy remux segments on the hls delivery only")
+        sub _()
+            toggles = harness.defaultToggles()
+            toggles.tsCopyRemux = true
+            caps = harness.capabilities(m.tvFacts(), toggles)
+            deliveries = caps.client_playback_context.deliveries
+            m.assertEqual(deliveries.hls.features, ["native_hls_playback_v1", "hls_copy_mpegts_v1"])
+            m.assertEqual(deliveries.original_http.features, [])
+            m.assertArrayNotContains(caps.client_features, "hls_copy_mpegts_v1")
+            m.assertEqual(harness.prototypeFeatures(toggles), ["hls_copy_mpegts_v1"])
+        end sub
+
+        @it("asks for playlists without variables in client_features")
+        sub _()
+            toggles = harness.defaultToggles()
+            toggles.noPlaylistVariables = true
+            caps = harness.capabilities(m.tvFacts(), toggles)
+            m.assertEqual(caps.client_features, ["seek_reanchor_v1", "direct_stream_resume_v1", "subrip_sidecar_v1", "hls_subtitle_renditions_v1", "hls_no_variable_substitution_v1"])
+            m.assertEqual(caps.client_playback_context.deliveries.hls.features, ["native_hls_playback_v1"])
+        end sub
+
+        @it("reads toggles as the Task does, from its request field")
+        sub _()
+            toggles = harness.defaultToggles()
+            toggles.tsCopyRemux = true
+            toggles.noPlaylistVariables = true
+            toggles.hevcEac3 = false
+            caps = harness.capabilities(m.tvFacts(), tests.throughNodeField(toggles))
+            m.assertEqual(caps.client_playback_context.deliveries.hls.features, ["native_hls_playback_v1", "hls_copy_mpegts_v1"])
+            m.assertArrayContains(caps.client_features, "hls_no_variable_substitution_v1")
+            m.assertEqual(caps.client_capabilities.codecs_video, ["h264"])
+            m.assertEqual(harness.prototypeFeatures(tests.throughNodeField(toggles)), ["hls_copy_mpegts_v1", "hls_no_variable_substitution_v1"])
+        end sub
+
+        @it("claims no HDR on a 1080p output even when the panel reports it")
+        sub _()
+            facts = harness.probeDevice(tests.fakeDevice(tests.allVideoProbes(), tests.allAudioProbes(), "1080p60", { Hdr10: true, HLG: true }), tests.fakeApp("1"))
+            caps = harness.capabilities(facts, harness.defaultToggles())
+            m.assertFalse(caps.client_capabilities.hdr)
+            m.assertTrue(caps.client_playback_context.output.display.hdr_types.hdr10)
+            m.assertFalse(caps.client_playback_context.output.hdr_details.hdr10)
+            m.assertEqual(caps.client_capabilities.max_resolution, "2160p")
+        end sub
+
+        @it("reports unknown HDR evidence when the display cannot be read")
+        sub _()
+            facts = m.tvFacts()
+            facts.display.known = false
+            display = harness.capabilities(facts, harness.defaultToggles()).client_playback_context.output.display
+            m.assertEqual(display.hdr_evidence, "unknown")
+            m.assertAANotHasKey(display, "hdr_types")
+        end sub
+
+        @describe("start, replan, progress, and stop bodies")
+
+        @it("builds a start body from the server fixtures")
+        sub _()
+            body = m.startBody(invalid, -1)
+            m.assertEqual(body.installation_id, "11111111-1111-4111-8111-111111111111")
+            m.assertEqual(body.profile_id, "p-owner")
+            m.assertEqual(body.file_id, "42")
+            m.assertEqual(body.protocol_version, 3)
+            m.assertEqual(body.client_playback_context.protocol_version, 3)
+            m.assertEqual(body.quality_preference, "auto")
+            m.assertEqual(body.subtitle_fidelity_preference, "compatible")
+            m.assertTrue(harness.isBoundedIdentifier(body.playback_attempt_id))
+            m.assertAANotHasKeys(body, ["metered", "start_position", "audio_track_index", "audio_track_id"])
+        end sub
+
+        @it("sends start_position and the audio ordinal only when chosen")
+        sub _()
+            body = m.startBody(0, 0)
+            m.assertEqual(body.start_position, 0)
+            m.assertEqual(body.audio_track_index, 0)
+            m.assertAANotHasKey(body, "audio_track_id")
+        end sub
+
+        @it("sends the subtitle ordinal only when one is chosen")
+        sub _()
+            caps = harness.capabilities(m.tvFacts(), harness.defaultToggles())
+            request = { installationId: "i", profileId: "p-owner", fileId: "42", attemptId: harness.newUuid(), subtitleTrackIndex: 2 }
+            m.assertEqual(harness.startBody(request, caps).subtitle_track_index, 2)
+            request.subtitleTrackIndex = -1
+            m.assertAANotHasKeys(harness.startBody(request, caps), ["subtitle_track_index", "subtitle_track_id"])
+        end sub
+
+        @it("keeps start_position 0 and the track ordinals read back from the Task's request field")
+        sub _()
+            ' The menu's request reaches the Task through an assocarray field,
+            ' which boxes its numbers; the first hardware run lost all three.
+            caps = harness.capabilities(m.tvFacts(), harness.defaultToggles())
+            request = tests.throughNodeField({ installationId: "i", profileId: "p-owner", fileId: "42", attemptId: harness.newUuid(), startPosition: 0, audioTrackIndex: 1, subtitleTrackIndex: 0 })
+            body = ParseJson(FormatJson(harness.startBody(request, caps)))
+            m.assertEqual(body.start_position, 0)
+            m.assertEqual(body.audio_track_index, 1)
+            m.assertEqual(body.subtitle_track_index, 0)
+        end sub
+
+        @it("echoes the current plan's identity and tracks on a replan")
+        sub _()
+            plan = tests.contract.fixture("playback_start_opaque_ids").playback_plan
+            body = m.replanBody(plan, "seek_reanchor", invalid)
+            m.assertEqual(body.failed_plan_id, plan.plan_id)
+            m.assertEqual(body.plan_attempt_key, plan.plan_attempt_key)
+            m.assertEqual(body.selected_tracks, { audio: { id: "file:42:audio:0", index: 0 } })
+            m.assertEqual(body.position_seconds, 600)
+            m.assertAANotHasKey(body, "failure")
+        end sub
+
+        @it("carries the failure only on failure_recovery")
+        sub _()
+            plan = tests.contract.fixture("playback_start_opaque_ids").playback_plan
+            body = m.replanBody(plan, "failure_recovery", { classification: "decoder_failure", message: "Roku Video errorCode -5" })
+            m.assertEqual(body.failure.classification, "decoder_failure")
+            m.assertEqual(body.operation, "failure_recovery")
+        end sub
+
+        @it("clamps negative positions and lowercases the stop_id")
+        sub _()
+            m.assertEqual(harness.progressBody("i", 3, -2, true), { installation_id: "i", sequence: 3, position: 0, is_paused: true })
+            body = harness.stopBody("i", "44444444-4444-4444-8444-44444444ABCD", 4, 120.5, false)
+            m.assertEqual(body.stop_id, "44444444-4444-4444-8444-44444444abcd")
+            m.assertEqual(body.sequence, 4)
+            m.assertEqual(body.position, 120.5)
+        end sub
+
+        @it("copies only track identities into selected_tracks")
+        sub _()
+            m.assertEqual(harness.selectedTracks({ audio: { id: "a", index: 1, extra: true }, subtitle: { index: 2 } }), { audio: { id: "a", index: 1 } })
+            m.assertEqual(harness.selectedTracks(invalid), {})
+        end sub
+
+        ' --- Helpers ---
+
+        ' The dev Roku TV (assumption A-10): a 4K Dolby Vision panel without HDR10+.
+        function tvFacts() as Object
+            return tests.fakeTvFacts({ Hdr10: true, HLG: true, Hdr10Plus: false, DolbyVision: true })
+        end function
+
+        function startBody(startPosition as Dynamic, audioTrackIndex as Dynamic) as Object
+            caps = harness.capabilities(m.tvFacts(), harness.defaultToggles())
+            capability = tests.contract.fixture("playback_capability_available")
+            profile = tests.contract.fixture("list_profiles_ok").items[0]
+            version = tests.contract.fixture("get_watch_state_ok").versions[0]
+            return harness.startBody({ installationId: capability.installation_id, profileId: profile.id, fileId: version.file_id, attemptId: harness.newUuid(), startPosition: startPosition, audioTrackIndex: audioTrackIndex }, caps)
+        end function
+
+        function replanBody(plan as Object, operation as String, failure as Dynamic) as Object
+            caps = harness.capabilities(m.tvFacts(), harness.defaultToggles())
+            request = { installationId: "11111111-1111-4111-8111-111111111111", attemptId: harness.newUuid(), planAttemptId: harness.newUuid(), replanRequestId: harness.newUuid(), operation: operation, position: 600, attemptedPlanKeys: [], attemptCount: 1, failure: failure }
+            if failure <> invalid
+                request.attemptedPlanKeys = [plan.plan_attempt_key]
+            end if
+            return harness.replanBody(request, plan, caps)
+        end function
+
+    end class
+
+end namespace

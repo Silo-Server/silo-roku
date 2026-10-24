@@ -1,0 +1,215 @@
+import "pkg:/components/screens/firstRun.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/onboarding/address.bs"
+
+' The chips 22 px under the field (or its error), the note 18 px under them.
+const CHIPS_GAP = 22
+const NOTE_GAP = 18
+
+sub init()
+    m.layout = m.top.findNode("layout")
+    m.layout.headline = i18n.text("setup.headline")
+    m.layout.body = i18n.text("setup.body")
+    m.layout.chip = CreateObject("roDeviceInfo").GetFriendlyName()
+    m.form = m.top.findNode("form")
+    m.field = styleField(m.top.findNode("address"), i18n.text("setup.placeholder"), i18n.text("setup.field"))
+    m.chipRow = m.top.findNode("chips")
+    m.chips = addChips(m.chipRow, onboarding.address.chips())
+    m.note = styleFormLabel(m.top.findNode("note"), theme.textStyle.FIRST_RUN_BODY, theme.color.MARQUEE_FAINT)
+    m.errorLabel = styleFormLabel(m.top.findNode("error"), theme.textStyle.FIELD_ERROR, theme.color.ERROR)
+    m.buttonRow = m.top.findNode("buttons")
+    m.connect = styleButton(m.top.findNode("connect"), i18n.text("setup.connect"))
+    m.back = styleButton(m.top.findNode("back"), i18n.text("common.back"), true)
+    ' Down from any chip lands on Connect.
+    m.controlEnterFirst = [2]
+    m.address = ""
+    m.errorKey = ""
+    m.attempt = invalid
+    m.request = invalid
+    m.dialog = invalid
+    m.pushed = false
+    ' Why the update screen shows, for its copy (onboarding.address.updateCopy).
+    m.problem = ""
+end sub
+
+sub onShow(event as Object)
+    if event.first
+        m.pushed = firstRunIsPushed()
+        m.back.visible = m.pushed
+        refresh()
+        setControlRows(controlRowsNow())
+    end if
+    m.layout.callFunc("showMesh", true)
+    m.top.prompting = true
+    focusScreen()
+end sub
+
+sub onHide()
+    m.top.prompting = false
+    m.layout.callFunc("showMesh", false)
+end sub
+
+sub onRelease()
+    m.top.prompting = false
+    closeDialog()
+end sub
+
+function controlRowsNow() as Object
+    buttons = [m.connect]
+    if m.pushed then buttons.Push(m.back)
+    return [[m.field], m.chips, buttons]
+end function
+
+' Shows the address, its error, the note under the chips, and Connect's
+' label, and stacks them in the column.
+sub refresh()
+    m.field.text = m.address
+    m.field.error = m.errorKey <> ""
+    if onboarding.address.isCleartext(m.address)
+        m.note.text = i18n.text("setup.noteCleartext")
+        m.note.color = theme.color.WARNING
+    else
+        m.note.text = i18n.text("setup.noteSecure")
+        m.note.color = theme.color.MARQUEE_FAINT
+    end if
+    m.errorLabel.text = ""
+    if m.errorKey <> "" then m.errorLabel.text = i18n.text(m.errorKey)
+    if m.request <> invalid
+        m.connect.text = i18n.text("setup.connecting")
+    else
+        m.connect.text = i18n.text("setup.connect")
+    end if
+    placeInRow([m.connect, m.back], BUTTON_GAP)
+    parts = [[m.field, theme.firstRun.FIELD_HEIGHT, 0]]
+    if m.errorKey <> "" then parts.Push([m.errorLabel, labelHeight(m.errorLabel), ERROR_GAP])
+    parts.Append([[m.chipRow, Int(m.chips[0].localBoundingRect().height), CHIPS_GAP], [m.note, labelHeight(m.note), NOTE_GAP], [m.buttonRow, theme.firstRun.BUTTON_HEIGHT, BUTTONS_GAP]])
+    m.errorLabel.visible = m.errorKey <> ""
+    arrangeColumn(m.layout, invalid, 0, m.form, FORM_GAP, stackForm(parts))
+end sub
+
+sub showError(key as String)
+    m.errorKey = key
+    refresh()
+    speak(m.errorLabel.text)
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if m.request <> invalid
+        ' Back stops the check; nothing else acts until it answers.
+        if key = "back" then stopCheck()
+        return true
+    end if
+    if moveHighlight(key) then return true
+    if key = "OK"
+        activate(highlightedControl())
+        return true
+    end if
+    return false
+end function
+
+sub activate(control as Dynamic)
+    if control = invalid then return
+    if control.isSameNode(m.field)
+        m.panel = openKeyboard(m.panel, { title: i18n.text("setup.field"), text: m.address, hint: i18n.text("setup.placeholder"), secure: false, revealable: false, domain: "generic", chips: onboarding.address.chips(), maxLength: 255 })
+    else if control.isSameNode(m.connect)
+        connect()
+    else if control.isSameNode(m.back)
+        nav.pop()
+    else
+        m.address = onboarding.address.withChip(m.address, control.text)
+        m.errorKey = ""
+        refresh()
+    end if
+end sub
+
+' The keyboard closed: keep what was typed and offer Connect.
+sub onKeyboardClosed()
+    m.address = m.panel.callFunc("takeText")
+    m.errorKey = ""
+    focusScreen()
+    refresh()
+    if m.address.Trim() <> "" then highlightControl(m.connect)
+end sub
+
+sub connect()
+    m.attempt = onboarding.address.attempt(m.address)
+    follow(m.attempt.step, m.attempt.error)
+end sub
+
+sub follow(action as String, key as String)
+    if action = onboarding.address.SHOW_ERROR
+        showError(key)
+    else if action = onboarding.address.CONFIRM_HTTP
+        confirmHttp()
+    else if action = onboarding.address.CONNECT
+        check()
+    else if action = onboarding.address.UPDATE_REQUIRED
+        nav.push(nav.route.UPDATE_REQUIRED, { pushed: true, problem: m.problem, host: m.attempt.host })
+    end if
+end sub
+
+' GET /api/v2/system/info through the session, which stores the server
+' when it answers with api_major 2.
+sub check()
+    m.errorKey = ""
+    send("onChecked")
+    api.session.setServer(m.address, m.attempt.allowHttp, m.request)
+    refresh()
+end sub
+
+sub stopCheck()
+    dropRequest()
+    refresh()
+end sub
+
+' A new server ends the session, and AppScene starts over at sign-in for
+' it. The same server changes nothing: Change server then goes back.
+sub onChecked(event as Object)
+    result = takeResult(event)
+    if result = invalid then return
+    refresh()
+    if result.ok
+        if m.pushed and not util.isTrue(result.body.changed) then nav.pop()
+        return
+    end if
+    kind = ""
+    if result.error <> invalid then kind = result.error.kind
+    nextStep = onboarding.address.afterFailure(kind, m.attempt)
+    m.problem = util.text(nextStep.problem)
+    follow(nextStep.step, nextStep.error)
+end sub
+
+' "Connect without encryption?" (spec section 5.4), as both existing apps ask.
+sub confirmHttp()
+    dialog = CreateObject("roSGNode", "StandardMessageDialog")
+    dialog.title = i18n.text("setup.cleartext.title")
+    dialog.message = [i18n.text("setup.cleartext.body", { host: m.attempt.host })]
+    dialog.buttons = [i18n.text("setup.cleartext.connect"), i18n.text("common.cancel")]
+    dialog.observeField("buttonSelected", "onCleartextAnswered")
+    dialog.observeField("wasClosed", "onCleartextAnswered")
+    m.dialog = dialog
+    m.top.getScene().dialog = dialog
+end sub
+
+sub onCleartextAnswered()
+    if m.dialog = invalid then return
+    agreed = m.dialog.wasClosed <> true and m.dialog.buttonSelected = 0
+    closeDialog()
+    focusScreen()
+    if agreed
+        m.attempt.allowHttp = true
+        check()
+    else if m.attempt.canTryHttp
+        ' HTTPS got no answer and the viewer kept to it.
+        showError("setup.error.unreachable")
+    end if
+end sub
+
+sub closeDialog()
+    if m.dialog = invalid then return
+    m.dialog.unobserveField("buttonSelected")
+    m.dialog.unobserveField("wasClosed")
+    m.dialog.close = true
+    m.dialog = invalid
+end sub

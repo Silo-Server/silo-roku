@@ -1,0 +1,97 @@
+namespace tests
+
+    @suite("dev memory check")
+    class MemoryCheckTests extends rooibos.BaseTestSuite
+
+        ' Ticks with these usages (percent) and plenty of memory available;
+        ' the actions of all of them.
+        function ticks(state as Object, usages as Object) as Object
+            actions = []
+            for each usage in usages
+                actions.Append(memcheck.tick(state, usage, 500000, "normal"))
+            end for
+            return actions
+        end function
+
+        function names(actions as Object) as Object
+            out = []
+            for each action in actions
+                name = action.action
+                if action.kind <> invalid then name = name + ":" + action.kind
+                if action.reason <> invalid then name = name + ":" + action.reason
+                out.Push(name)
+            end for
+            return out
+        end function
+
+        @describe("ramp")
+
+        @it("adds byte buffers while the API counts them, up to the ceiling, then holds")
+        sub _()
+            state = memcheck.create(23000, 2)
+            actions = m.ticks(state, [2, 6, 10, 50, 91, 92])
+            m.assertEqual(m.names(actions), ["allocate:bytes", "allocate:bytes", "allocate:bytes", "allocate:bytes", "allocate:bytes", "hold:ceiling"])
+            m.assertEqual(state.held, 5)
+            m.assertEqual(state.phase, "hold")
+        end sub
+
+        @it("drops a kind the API does not count after its probe blocks and tries textures")
+        sub _()
+            state = memcheck.create(23000, 2)
+            actions = m.ticks(state, [2, 2, 3])
+            m.assertEqual(m.names(actions), ["allocate:bytes", "allocate:bytes", "uncounted:bytes", "free", "free"])
+            m.assertEqual(actions[2].rise, 1)
+            m.assertEqual(state.held, 0)
+            ' The textures' baseline is the usage after the bytes went.
+            m.assertEqual(m.names(m.ticks(state, [2, 3, 5, 9])), ["allocate:textures", "allocate:textures", "allocate:textures", "allocate:textures"])
+            m.assertEqual(state.kindStart, 2)
+            m.assertEqual(state.uncounted, ["bytes"])
+        end sub
+
+        @it("finishes when no kind moves the API")
+        sub _()
+            state = memcheck.create(23000, 2)
+            m.ticks(state, [2, 2, 2])
+            actions = m.ticks(state, [2, 2, 2, 2])
+            m.assertEqual(m.names(actions), ["allocate:textures", "allocate:textures", "uncounted:textures", "free", "free", "finish:uncounted"])
+            m.assertEqual(state.uncounted, ["bytes", "textures"])
+        end sub
+
+        @it("holds when the device has room for too few blocks, counted or not")
+        sub _()
+            state = memcheck.create(23000, 2)
+            m.assertEqual(m.names(memcheck.tick(state, 2, 45999, "normal")), ["hold:available"])
+            state = memcheck.create(23000, 2)
+            m.assertEqual(m.names(memcheck.tick(state, 2, invalid, "normal")), ["allocate:bytes"])
+        end sub
+
+        @describe("hold, release, and settle")
+
+        @it("holds, frees one block per tick, then waits for the policy to return to normal")
+        sub _()
+            state = memcheck.create(23000, 2)
+            m.ticks(state, [2, 10, 20, 95])
+            m.assertEqual(state.held, 3)
+            held = m.ticks(state, [95, 95, 95, 95, 95, 95])
+            m.assertEqual(held, [])
+            m.assertEqual(state.phase, "release")
+            m.assertEqual(m.names(m.ticks(state, [95, 90, 85])), ["free", "free", "free"])
+            m.assertEqual(state.phase, "settle")
+            m.assertEqual(memcheck.tick(state, 70, 500000, "trim"), [])
+            m.assertEqual(m.names(memcheck.tick(state, 60, 500000, "normal")), ["finish:settled"])
+        end sub
+
+        @it("stops waiting to settle after SETTLE_TICKS")
+        sub _()
+            state = memcheck.create(23000, 2)
+            m.ticks(state, [2, 95])
+            m.ticks(state, [95, 95, 95, 95, 95, 95, 95])
+            m.assertEqual(state.phase, "settle")
+            actions = []
+            for i = 1 to memcheck.SETTLE_TICKS
+                actions.Append(memcheck.tick(state, 80, 500000, "pressure"))
+            end for
+            m.assertEqual(m.names(actions), ["finish:settled"])
+        end sub
+    end class
+end namespace

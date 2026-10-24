@@ -1,0 +1,429 @@
+' Development-only transport harness menu: server, sign-in, profile, item, the
+' file, audio, and subtitle tracks, the delivery toggles, and Play. Text is
+' entered through the standard keyboard and PIN pad dialogs. The password and
+' PIN go from the dialog straight into one Task request and are never kept,
+' shown, or logged here.
+
+sub init()
+    m.menu = m.top.findNode("menu")
+    m.status = m.top.findNode("status")
+    m.player = m.top.findNode("player")
+    m.task = CreateObject("roSGNode", "DevHarnessTask")
+    m.task.observeField("response", "onTaskResponse")
+    m.task.control = "run"
+    m.player.task = m.task
+    m.player.observeField("finished", "onPlayerFinished")
+    m.menu.observeField("itemSelected", "onMenuSelected")
+
+    m.origin = ""
+    m.username = ""
+    m.signedIn = false
+    m.profiles = []
+    m.profileName = ""
+    m.itemId = ""
+    m.versions = []
+    m.versionIndex = -1
+    resetTracks()
+    m.toggles = harness.defaultToggles()
+    m.startOver = false
+    m.busy = false
+    m.dialog = invalid
+    refreshMenu()
+    setStatus("Set the server address, sign in, choose a profile, and enter an item ID.")
+    m.menu.setFocus(true)
+end sub
+
+' --- Menu ------------------------------------------------------------------
+
+sub refreshMenu()
+    version = currentVersion()
+    fileText = "load an item first"
+    audioText = "server default"
+    subtitleText = "off (none sent)"
+    if version <> invalid
+        fileText = version.fileId + "  " + version.label
+        if m.audioIndex >= 0 then audioText = trackText(version.audioTracks[m.audioIndex])
+        if m.subtitleIndex >= 0 then subtitleText = trackText(version.subtitleTracks[m.subtitleIndex])
+        if version.subtitleTracks.Count() = 0 then subtitleText = subtitleText + ", the file has none"
+    end if
+    startText = "server resume point"
+    if m.startOver then startText = "from the beginning (start_position 0)"
+    forwardText = "Roku default"
+    if not m.toggles.forwardQueryParams then forwardText = "false"
+    signInText = "Sign in"
+    if m.signedIn then signInText = "Sign in again (signed in as " + m.username + ")"
+
+    m.items = [
+        { id: "server", title: "Server: " + valueOr(m.origin, "not set") },
+        { id: "signin", title: signInText },
+        { id: "profile", title: "Profile: " + valueOr(m.profileName, "not chosen") },
+        { id: "item", title: "Item ID: " + valueOr(m.itemId, "not set") },
+        { id: "file", title: "File: " + fileText },
+        { id: "audio", title: "Audio track: " + audioText },
+        { id: "subtitle", title: "Subtitle track: " + subtitleText },
+        { id: "originalHttp", title: "original_http delivery: " + onOff(m.toggles.originalHttp) },
+        { id: "hevcEac3", title: "HEVC and E-AC-3: " + onOff(m.toggles.hevcEac3) },
+        { id: "sidecarSubtitles", title: "Subtitle sidecars: " + onOff(m.toggles.sidecarSubtitles) },
+        { id: "tsCopyRemux", title: "TS copy remux (prototype): " + onOff(m.toggles.tsCopyRemux) },
+        { id: "noPlaylistVariables", title: "No playlist variables (prototype): " + onOff(m.toggles.noPlaylistVariables) },
+        { id: "forwardQueryParams", title: "ForwardQueryStringParams: " + forwardText },
+        { id: "startOver", title: "Start: " + startText },
+        { id: "play", title: "Play" },
+        { id: "close", title: "Close the harness" }
+    ]
+    content = CreateObject("roSGNode", "ContentNode")
+    for each item in m.items
+        child = content.createChild("ContentNode")
+        child.title = item.title
+    end for
+    focused = m.menu.itemFocused
+    m.menu.content = content
+    if focused > 0 then m.menu.jumpToItem = focused
+end sub
+
+sub onMenuSelected()
+    id = m.items[m.menu.itemSelected].id
+    if id = "close"
+        closeHarness()
+        return
+    end if
+    if m.busy
+        setStatus("Still waiting for the last request…")
+        return
+    end if
+    if id = "server"
+        showKeyboard("Server address", "HTTPS is used unless you type http://.", valueOr(m.origin, "https://"), false, "onServerEntered")
+    else if id = "signin"
+        if m.origin = ""
+            setStatus("Set the server address first.")
+            return
+        end if
+        showKeyboard("User name", "", m.username, false, "onUsernameEntered")
+    else if id = "profile"
+        showProfiles()
+    else if id = "item"
+        showKeyboard("Item ID", "The catalog item to play, as in GET /api/v2/watch/{id}.", m.itemId, false, "onItemEntered")
+    else if id = "file"
+        if m.versions.Count() > 0
+            m.versionIndex = (m.versionIndex + 1) mod m.versions.Count()
+            resetTracks()
+        end if
+    else if id = "audio"
+        version = currentVersion()
+        if version <> invalid then m.audioIndex = nextChoice(m.audioIndex, version.audioTracks)
+    else if id = "subtitle"
+        version = currentVersion()
+        if version <> invalid then m.subtitleIndex = nextChoice(m.subtitleIndex, version.subtitleTracks)
+    else if m.toggles.DoesExist(id)
+        m.toggles[id] = not m.toggles[id]
+    else if id = "startOver"
+        m.startOver = not m.startOver
+    else if id = "play"
+        startPlayback()
+    end if
+    refreshMenu()
+end sub
+
+' --- Server and sign-in ----------------------------------------------------
+
+sub onServerEntered()
+    text = closeDialog()
+    if text = invalid then return
+    normalized = harness.normalizeServerInput(text)
+    if normalized.error <> invalid
+        setStatus(normalized.error)
+        return
+    end if
+    m.pendingOrigin = normalized.origin
+    if normalized.insecure
+        showMessage("Connect without encryption?", ["Your user name, password, and viewing activity will be sent unencrypted to " + normalized.origin + "."], ["Connect without encryption", "Cancel"], "onInsecureAnswered")
+    else
+        connect()
+    end if
+end sub
+
+sub onInsecureAnswered()
+    choice = closeDialog()
+    if choice = 0 then connect()
+end sub
+
+sub connect()
+    m.origin = ""
+    m.signedIn = false
+    m.profileName = ""
+    m.versions = []
+    m.versionIndex = -1
+    send({ op: "connect", origin: m.pendingOrigin })
+    setStatus("Checking " + m.pendingOrigin + "…")
+end sub
+
+sub onUsernameEntered()
+    text = closeDialog()
+    if text = invalid then return
+    m.username = text.Trim()
+    showKeyboard("Password", "Sent once to " + m.origin + " and never stored.", "", true, "onPasswordEntered")
+end sub
+
+sub onPasswordEntered()
+    password = closeDialog()
+    if password = invalid then return
+    m.signedIn = false
+    m.profileName = ""
+    send({ op: "login", username: m.username, password: password })
+    setStatus("Signing in…")
+end sub
+
+' --- Profiles --------------------------------------------------------------
+
+sub showProfiles()
+    if not m.signedIn
+        setStatus("Sign in first.")
+        return
+    end if
+    if m.profiles.Count() = 0
+        send({ op: "profiles" })
+        setStatus("Loading profiles…")
+        return
+    end if
+    names = []
+    for each profile in m.profiles
+        name = profile.name
+        if profile.hasPin then name = name + " (PIN)"
+        names.Push(name)
+    end for
+    showMessage("Who's watching?", ["Choose the profile for X-Profile-Id."], names, "onProfileChosen")
+end sub
+
+sub onProfileChosen()
+    choice = closeDialog()
+    if choice = invalid or choice < 0 or choice >= m.profiles.Count() then return
+    m.chosenProfile = m.profiles[choice]
+    if m.chosenProfile.hasPin
+        dialog = CreateObject("roSGNode", "StandardPinPadDialog")
+        dialog.title = "PIN for " + m.chosenProfile.name
+        dialog.buttons = ["OK", "Cancel"]
+        if dialog.pinPad <> invalid then dialog.pinPad.secureMode = true
+        openDialog(dialog, "onPinEntered")
+    else
+        selectProfile("")
+    end if
+end sub
+
+sub onPinEntered()
+    pin = closeDialog()
+    if pin = invalid then return
+    selectProfile(pin)
+end sub
+
+sub selectProfile(pin as String)
+    m.profileName = ""
+    send({ op: "selectProfile", profileId: m.chosenProfile.id, pin: pin })
+    setStatus("Selecting " + m.chosenProfile.name + "…")
+end sub
+
+' --- Item and playback -----------------------------------------------------
+
+sub onItemEntered()
+    text = closeDialog()
+    if text = invalid then return
+    m.itemId = text.Trim()
+    m.versions = []
+    m.versionIndex = -1
+    resetTracks()
+    if m.itemId <> "" and m.profileName <> ""
+        send({ op: "watch", itemId: m.itemId })
+        setStatus("Loading the item…")
+    end if
+    refreshMenu()
+end sub
+
+sub startPlayback()
+    version = currentVersion()
+    if version = invalid
+        setStatus("Choose a profile and load an item first.")
+        return
+    end if
+    startPosition = invalid
+    if m.startOver then startPosition = 0
+    send({ op: "start", fileId: version.fileId, audioTrackIndex: chosenIndex(m.audioIndex, version.audioTracks), subtitleTrackIndex: chosenIndex(m.subtitleIndex, version.subtitleTracks), startPosition: startPosition, toggles: m.toggles })
+    setStatus("Starting playback…")
+end sub
+
+sub onPlayerFinished()
+    m.player.visible = false
+    m.menu.setFocus(true)
+    status = "Playback stopped."
+    if m.player.lastError <> "" then status = status + " Last Video error: " + m.player.lastError
+    setStatus(status)
+end sub
+
+' --- Task responses --------------------------------------------------------
+
+sub onTaskResponse()
+    response = m.task.response
+    if response.owner = "player"
+        m.player.taskResponse = response
+        return
+    end if
+    m.busy = false
+    if response.ok <> true
+        setStatus(harness.stringOr(response.message, "Request failed"))
+    else if response.op = "connect"
+        m.origin = m.pendingOrigin
+        setStatus("Server OK (" + response.serverVersion + "). Sign in next.")
+    else if response.op = "login"
+        m.signedIn = true
+        m.profiles = []
+        send({ op: "profiles" })
+        setStatus("Signed in as " + valueOr(response.username, m.username) + ". Loading profiles…")
+    else if response.op = "profiles"
+        m.profiles = response.profiles
+        if m.profiles.Count() = 0
+            setStatus("This account has no profiles.")
+        else
+            showProfiles()
+        end if
+    else if response.op = "selectProfile"
+        m.profileName = m.chosenProfile.name
+        setStatus("Profile " + m.profileName + " selected. Enter an item ID.")
+        if m.itemId <> "" then send({ op: "watch", itemId: m.itemId })
+    else if response.op = "watch"
+        m.versions = response.versions
+        m.versionIndex = 0
+        for i = 0 to m.versions.Count() - 1
+            if m.versions[i].fileId = response.defaultFileId then m.versionIndex = i
+        end for
+        if m.versions.Count() = 0 then m.versionIndex = -1
+        resetTracks()
+        setStatus(response.title + ": " + m.versions.Count().ToStr() + " file version(s). Choose the file and toggles, then Play.")
+    else if response.op = "start"
+        showStart(response)
+    end if
+    refreshMenu()
+end sub
+
+sub showStart(response as Object)
+    facts = response.facts
+    if response.playable <> true
+        setStatus("Not playable: " + harness.stringOr(facts.terminalReason, "") + " " + harness.stringOr(facts.terminalMessage, ""))
+        return
+    end if
+    setStatus("Playing " + facts.delivery + " (" + facts.decisionReason + ").")
+    m.player.visible = true
+    m.player.load = response
+end sub
+
+' --- Dialogs and helpers ---------------------------------------------------
+
+sub showKeyboard(title as String, message as String, text as String, secure as Boolean, callback as String)
+    dialog = CreateObject("roSGNode", "StandardKeyboardDialog")
+    dialog.title = title
+    if message <> "" then dialog.message = [message]
+    dialog.text = text
+    dialog.buttons = ["OK", "Cancel"]
+    if secure and dialog.textEditBox <> invalid then dialog.textEditBox.secureMode = true
+    openDialog(dialog, callback)
+end sub
+
+sub showMessage(title as String, message as Object, buttons as Object, callback as String)
+    dialog = CreateObject("roSGNode", "StandardMessageDialog")
+    dialog.title = title
+    dialog.message = message
+    dialog.buttons = buttons
+    openDialog(dialog, callback)
+end sub
+
+sub openDialog(dialog as Object, callback as String)
+    m.dialog = dialog
+    dialog.observeField("buttonSelected", callback)
+    dialog.observeField("wasClosed", callback)
+    m.top.getScene().dialog = dialog
+end sub
+
+' Closes the open dialog and returns what it produced: the entered text or PIN
+' when OK was chosen, the button index for message dialogs, or invalid when it
+' was cancelled or closed with Back.
+function closeDialog() as Dynamic
+    dialog = m.dialog
+    if dialog = invalid then return invalid
+    m.dialog = invalid
+    choice = dialog.buttonSelected
+    cancelled = dialog.wasClosed = true
+    dialog.unobserveField("buttonSelected")
+    dialog.unobserveField("wasClosed")
+    dialog.close = true
+    if dialog.subtype() = "StandardMessageDialog"
+        if cancelled then return invalid
+        return choice
+    end if
+    ' Read the entry, then clear it so the closed dialog keeps no password or PIN.
+    if dialog.subtype() = "StandardPinPadDialog"
+        value = dialog.pin
+        dialog.pin = ""
+    else
+        value = dialog.text
+        dialog.text = ""
+    end if
+    if cancelled or choice <> 0 then return invalid
+    return value
+end function
+
+sub send(request as Object)
+    m.busy = true
+    m.task.request = request
+end sub
+
+sub closeHarness()
+    m.task.request = { op: "quit" }
+    m.top.closed = true
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if press and key = "back" and not m.player.visible
+        closeHarness()
+        return true
+    end if
+    return false
+end function
+
+' Track choices index the current version's audioTracks and subtitleTracks;
+' -1 is "server default" for audio and "off" for subtitles.
+sub resetTracks()
+    m.audioIndex = -1
+    m.subtitleIndex = -1
+end sub
+
+' The next choice after `current`, wrapping to -1 after the last.
+function nextChoice(current as Integer, choices as Object) as Integer
+    if current + 1 >= choices.Count() then return -1
+    return current + 1
+end function
+
+' The server ordinal of a chosen track, or -1 when none is chosen.
+function chosenIndex(current as Integer, choices as Object) as Integer
+    if current < 0 or current >= choices.Count() then return -1
+    return choices[current].index
+end function
+
+function trackText(choice as Object) as String
+    return "#" + choice.index.ToStr() + " " + choice.label
+end function
+
+function currentVersion() as Dynamic
+    if m.versionIndex < 0 or m.versionIndex >= m.versions.Count() then return invalid
+    return m.versions[m.versionIndex]
+end function
+
+sub setStatus(text as String)
+    m.status.text = text
+end sub
+
+function valueOr(value as String, fallback as String) as String
+    if value = "" then return fallback
+    return value
+end function
+
+function onOff(value as Boolean) as String
+    if value then return "on"
+    return "off"
+end function

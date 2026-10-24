@@ -1,0 +1,351 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/media.bs"
+import "pkg:/source/playback/values.bs"
+
+' Which subtitle sidecars a content carries, and when a new plan can switch
+' subtitles on the content already playing (plan section 6.8). Roku reads a
+' content's SubtitleTracks when the content loads, and reloading it to change
+' track brought cues back 3 to 8 s after the key (hardware run 4). So a
+' content carries, up front, the plan's selected sidecar and the other text
+' sidecars its inventory offers, and a track_change whose plan streams the
+' same media switches the Video node's subtitleTrack instead, to the
+' TrackName Roku lists for the sidecar (listedName). Pure.
+namespace playback.sidecars
+    ' Sidecars per content, the selected one included; each is at most
+    ' api.response.MAX_SIDECAR_BYTES as downloaded and
+    ' playback.subtitles.MAX_CUES cues (assumption AG-210).
+    const MAX_TRACKS = 4
+    ' Subtitle modes the client renders itself, or none: the stream is the
+    ' same whichever of them a plan has.
+    const CLIENT_MODES = "|off|render|convert|"
+    const FORMATS = "|srt|vtt|ass|"
+    ' How long a new content waits for its sidecars before it plays without
+    ' those still downloading or converting: the viewer's selected one
+    ' (chosen or Auto) up to SELECTED_WAIT_MS, the others OTHERS_GRACE_MS.
+    ' A selected sidecar that comes after its content started reloads the
+    ' plan to carry it, which cost file A a 3.3-3.6 s Video stop and a
+    ' second start on every start of hardware run 24 (17.9-19.5 s to the
+    ' first frame); its sidecar (a 10.24 MiB ASS) was ready 7.8-8.3 s after
+    ' the plan, so the cap is that and a fifth more. First extractions of
+    ' embedded text (21.8 s in run 22, 26.1 s in run 24, about 65 s on the
+    ' reference file, assumption A-15) are past it and take the late path
+    ' (assumption AG-219).
+    const SELECTED_WAIT_MS = 10000
+    const OTHERS_GRACE_MS = 1000
+    ' The sidecars to download for a plan's content, the selected one first,
+    ' as { trackId, url, format, language, label, shiftSeconds, selected,
+    ' cacheKey }: url resolved against baseUrl and asking for the plan's
+    ' timestamp offset, format "srt", "vtt", or "ass"
+    ' (playback.media.subtitleArtifact), cacheKey as cacheKey gives it.
+    ' Only sidecars on the configured origin, which carry the profile's
+    ' credentials, and at most MAX_TRACKS. The inventory's other text
+    ' sidecars come only when the plan renders subtitles itself or has none,
+    ' and, with none selected, only while captionMode is "Off": with captions
+    ' on, Roku shows a track by the viewer's caption language whenever the
+    ' player selects none.
+    function offered(plan as Object, baseUrl as String, captionMode as String) as Object
+        out = []
+        offset = 0
+        if util.isObject(plan.timeline) then offset = plan.timeline.timeline_offset_seconds
+        selected = playback.media.subtitleArtifact(plan)
+        selectedId = ""
+        subtitle = plan.subtitle
+        if selected <> invalid
+            selectedId = selected.trackId
+            selected.cacheKey = cacheKey(plan, playback.media.inventoryEntry(subtitle, selectedId), selected.format, offset, baseUrl)
+            add(out, selected, true, baseUrl, offset)
+        end if
+        if not util.isObject(subtitle) or not playback.values.isArray(subtitle.inventory) or not clientRendered(plan) or not mayCarry(plan, captionMode) then return out
+        for each entry in subtitle.inventory
+            if out.Count() >= MAX_TRACKS then exit for
+            if util.isObject(entry) and util.text(entry.delivery) = "sidecar" and playback.values.isText(entry.track_id) and entry.track_id <> selectedId
+                format = formatOf(entry.url)
+                language = "und"
+                if playback.values.isText(entry.language) then language = entry.language
+                if format <> "" then add(out, { trackId: entry.track_id, url: entry.url, format: format, language: language, label: util.text(entry.label), cacheKey: cacheKey(plan, entry, format, offset, baseUrl) }, false, baseUrl, offset)
+            end if
+        end for
+        return out
+    end function
+
+    ' Whether content for plan may carry sidecars while Roku's caption mode
+    ' is captionMode: not when the plan selects none and captions are on,
+    ' since Roku would then show one by the viewer's caption language. The
+    ' mode can change while content waits for its headers, sidecars, or the
+    ' Video node's stop, so the player asks again before it hands content
+    ' over.
+    function mayCarry(plan as Object, captionMode as String) as Boolean
+        return captionMode = "Off" or playback.media.subtitleArtifact(plan) <> invalid
+    end function
+
+    ' Whether the Video node draws no subtitle (Video.suppressCaptions, which
+    ' leaves Roku's caption mode alone, assumption AG-75): true unless the
+    ' plan's subtitle is the sidecar the content carries at path (the
+    ' TrackName the player selects) or the HLS rendition in its stream. With
+    ' captions on and nothing selected that it can draw, Roku draws a track
+    ' it picks by the caption language (Video.currentSubtitleTrack), and
+    ' content cannot leave out a text track embedded in an original's
+    ' container (hardware run 16). So Off, a burned-in subtitle, and a
+    ' selected sidecar not carried yet or at all draw nothing, whatever the
+    ' caption mode (assumption AG-190).
+    function suppressed(plan as Dynamic, path as String) as Boolean
+        if not util.isObject(plan) then return true
+        subtitle = plan.subtitle
+        if util.isObject(subtitle) and util.isObject(subtitle.hls_rendition)
+            mode = util.text(subtitle.mode)
+            if mode = "render" or mode = "convert" then return false
+        end if
+        return path = ""
+    end function
+
+    sub add(out as Object, track as Object, selected as Boolean, baseUrl as String, offset as Dynamic)
+        target = playback.media.subtitleUrl(playback.media.resolve(baseUrl, track.url), track.format, offset)
+        if target = "" or playback.media.isProxy(target, baseUrl) then return
+        out.Push({ trackId: track.trackId, url: target, format: track.format, language: track.language, label: track.label, shiftSeconds: playback.media.shiftSeconds(track.format, offset), selected: selected, cacheKey: track.cacheKey })
+    end sub
+
+    ' What names a converted sidecar in the session's cache
+    ' (playback.sidecarCache): the configured server's origin, whose IDs
+    ' the others are; the plan's file (fileOf); the track's stream in that
+    ' file (embeddedStream) and what the inventory entry says of it; the
+    ' format served; and the timeline offset its cues were moved by. ""
+    ' for a track the cache does not keep: only a file's embedded text
+    ' tracks, whose bytes change only with the file, and only those whose
+    ' stream the server names. The server corrects the timing of external
+    ' and downloaded tracks (those with a sync_key) behind the same URL, on
+    ' its own after their first play included. An entry's track_id is a
+    ' position in the inventory that a rescan can give another track, and
+    ' two tracks can say the same of themselves, so neither names one.
+    ' Never the URL, which names the session (assumptions AG-220,
+    ' AG-289, and AG-290).
+    function cacheKey(plan as Object, entry as Dynamic, format as String, offsetSeconds as Dynamic, origin as String) as String
+        fileId = fileOf(plan)
+        if origin = "" or fileId = "" or not util.isObject(entry) or util.text(entry.source) <> "embedded" or util.text(entry.sync_key) <> "" then return ""
+        stream = embeddedStream(entry.url, fileId)
+        if stream = "" then return ""
+        return FormatJson([origin, fileId, stream, util.text(entry.codec), util.text(entry.language), util.text(entry.label), util.isTrue(entry.forced), util.isTrue(entry.default), util.isTrue(entry.hearing_impaired), format, playback.media.decimal(offsetSeconds)])
+    end function
+
+    ' The stream an embedded track is in its file, as its sidecar URL's
+    ' embedded_stream_index names it beside file_id fileId, or "". The
+    ' server resolves the track by it, not by its position in the
+    ' inventory, so it survives a rescan (silo-server
+    ' ScopeSubtitleInventoryV3, which adds it to every embedded sidecar).
+    function embeddedStream(url as Dynamic, fileId as String) as String
+        text = util.text(url)
+        cut = Instr(1, text, "?")
+        if cut = 0 then return ""
+        params = {}
+        for each part in Mid(text, cut + 1).Split("&")
+            at = Instr(1, part, "=")
+            if at > 1 then params[Left(part, at - 1)] = Mid(part, at + 1)
+        end for
+        stream = util.text(params["embedded_stream_index"])
+        if util.text(params["file_id"]) <> fileId or stream = "" or stream.ToInt().ToStr() <> stream then return ""
+        return stream
+    end function
+
+    ' A sidecar URL's format from its path's extension ("ssa" is "ass"), or
+    ' "" for anything but SRT, WebVTT, and ASS.
+    function formatOf(url as Dynamic) as String
+        path = LCase(util.text(url))
+        for each mark in ["?", "#"]
+            cut = Instr(1, path, mark)
+            if cut > 0 then path = Left(path, cut - 1)
+        end for
+        dot = 0
+        at = Instr(1, path, ".")
+        while at > 0
+            dot = at
+            at = Instr(at + 1, path, ".")
+        end while
+        if dot = 0 or Instr(dot, path, "/") > 0 then return ""
+        format = Mid(path, dot + 1)
+        if format = "ssa" then format = "ass"
+        if Instr(1, FORMATS, "|" + format + "|") = 0 then return ""
+        return format
+    end function
+
+    ' Whether plan streams what previous streams, so the content playing
+    ' previous can play on under plan. The URL alone cannot say: without its
+    ' signed stream token, which every plan of a signed-URL session renews
+    ' (playback.media.withoutStreamToken), it is /stream/{session} on the
+    ' configured origin, or {proxy}/stream/direct/ on a proxy node, whatever
+    ' file the session plays, and the token carries the file and its recipe.
+    ' So the plans must name the same file, present in both as
+    ' effective_media_file_id and source.media_file_id, and the same bytes
+    ' and timeline from it: the same delivery; the stream's protocol,
+    ' container, and URL but for that token (so the same origin, proxy node
+    ' included, and route; a proxy's remux or transcode token is kept, so a
+    ' new one is another stream); the same effective_recipe,
+    ' transformations, and selected audio, a file without audio having none
+    ' in both; the same timeline offset and stream origin; and subtitles the
+    ' client renders itself, or none, in both. A replan's player start is
+    ' the position it was asked at, so it is not compared.
+    function sameMedia(previous as Object, plan as Object) as Boolean
+        return mediaDifferences(previous, plan).Count() = 0
+    end function
+
+    ' The names of the sameMedia checks plan fails against previous, none
+    ' when it streams the same media: "file", "delivery", "stream" (either
+    ' has none), the stream URL's (playback.media.urlDifferences),
+    ' "protocol", "container", "recipe", "transformations", "audio",
+    ' "timeline", "timeline_offset_seconds", "stream_origin_seconds", and
+    ' "subtitle_mode". Names only, so the player can log why a plan
+    ' reloads (assumption AG-212).
+    function mediaDifferences(previous as Object, plan as Object) as Object
+        out = []
+        fileId = fileOf(previous)
+        if fileId = "" or fileId <> fileOf(plan) then out.Push("file")
+        if util.text(previous.delivery) <> util.text(plan.delivery) then out.Push("delivery")
+        before = previous.stream
+        after = plan.stream
+        if not util.isObject(before) or not util.isObject(after) or not playback.values.isText(before.url)
+            out.Push("stream")
+        else
+            out.Append(playback.media.urlDifferences(before.url, after.url))
+            for each key in ["protocol", "container"]
+                if util.text(before[key]) <> util.text(after[key]) then out.Push(key)
+            end for
+        end if
+        if not util.isObject(previous.effective_recipe) or not playback.values.equal(previous.effective_recipe, plan.effective_recipe) then out.Push("recipe")
+        if not playback.values.equal(previous.transformations, plan.transformations) then out.Push("transformations")
+        if not playback.values.equal(audioOf(previous), audioOf(plan)) then out.Push("audio")
+        if not util.isObject(previous.timeline) or not util.isObject(plan.timeline)
+            out.Push("timeline")
+        else
+            for each key in ["timeline_offset_seconds", "stream_origin_seconds"]
+                if playback.values.roundMs(previous.timeline[key]) <> playback.values.roundMs(plan.timeline[key]) then out.Push(key)
+            end for
+        end if
+        if not clientRendered(previous) or not clientRendered(plan) then out.Push("subtitle_mode")
+        return out
+    end function
+
+    ' The file a plan plays, as text, when its effective_media_file_id and
+    ' source.media_file_id name the same one; "" otherwise.
+    function fileOf(plan as Object) as String
+        effective = util.text(plan.effective_media_file_id)
+        if effective = "" or not util.isObject(plan.source) or util.text(plan.source.media_file_id) <> effective then return ""
+        return effective
+    end function
+
+    ' The selected audio's identity, or invalid for a file without audio.
+    function audioOf(plan as Object) as Dynamic
+        if not util.isObject(plan.selected_tracks) then return invalid
+        return plan.selected_tracks.audio
+    end function
+
+    ' Whether the plan's subtitle mode is one the client renders, or off.
+    function clientRendered(plan as Object) as Boolean
+        subtitle = plan.subtitle
+        if not util.isObject(subtitle) then return true
+        return Instr(1, CLIENT_MODES, "|" + util.text(subtitle.mode) + "|") > 0
+    end function
+
+    ' Until when a content waits for its sidecars (offered, each with a
+    ' state of "queued", "loading", "ready", or "failed"), counted from
+    ' startedAt: SELECTED_WAIT_MS while the selected one is pending,
+    ' OTHERS_GRACE_MS while others are. Invalid when none is pending.
+    function waitUntil(tracks as Dynamic, startedAt as Dynamic) as Dynamic
+        if type(tracks) <> "roArray" or not util.isNumber(startedAt) then return invalid
+        longest = -1
+        for each track in tracks
+            if isPending(track)
+                limit = OTHERS_GRACE_MS
+                if track.selected then limit = SELECTED_WAIT_MS
+                if limit > longest then longest = limit
+            end if
+        end for
+        if longest < 0 then return invalid
+        return startedAt + longest
+    end function
+
+    ' Whether the selected sidecar among tracks is still downloading or
+    ' converting.
+    function selectedPending(tracks as Dynamic) as Boolean
+        if type(tracks) <> "roArray" then return false
+        for each track in tracks
+            if track.selected and isPending(track) then return true
+        end for
+        return false
+    end function
+
+    function isPending(track as Object) as Boolean
+        return track.state = "queued" or track.state = "loading"
+    end function
+
+    ' Whether a track_change to selection ({ audio, subtitle }) can switch on
+    ' a content that carries tracks (ready sidecars): subtitles off, or one
+    ' the content has and Roku lists (listedName in listed,
+    ' Video.availableSubtitleTracks), since only a listed TrackName selects
+    ' a track on playing content (hardware run 17). Any other reloads.
+    function inPlace(tracks as Object, selection as Object, listed as Dynamic) as Boolean
+        if not util.isObject(selection) or not util.isObject(selection.subtitle) then return true
+        return listedName(listed, pathOf(tracks, util.text(selection.subtitle.id))) <> ""
+    end function
+
+    ' The TrackName Roku lists in listed (Video.availableSubtitleTracks) for
+    ' the sidecar the player gave it at path, or "" when it lists none. Roku
+    ' fills the list from the content's SubtitleTracks, then adds the tracks
+    ' it finds in the stream, and selects a track by the TrackName listed
+    ' there, which need not be the one given: jellyfin-roku matches a listed
+    ' name that contains the URL it gave. So the name that is path, else one
+    ' that contains it; no sidecar's path contains another's (MediaTask's
+    ' track<n>.srt).
+    function listedName(listed as Dynamic, path as String) as String
+        if path = "" or type(listed) <> "roArray" then return ""
+        found = ""
+        for each track in listed
+            if util.isObject(track)
+                name = util.text(track.TrackName)
+                if name = path then return name
+                if found = "" and isTrack(name, path) then found = name
+            end if
+        end for
+        return found
+    end function
+
+    ' Whether a track name Roku reports (a listed TrackName, subtitleTrack,
+    ' or currentSubtitleTrack) is the sidecar the player gave it at path:
+    ' the path itself or a name that contains it. Roku reported subtitleTrack
+    ' as the bare path after the player wrote the listed name, and the
+    ' listed name later (hardware run 20).
+    function isTrack(name as String, path as String) as Boolean
+        return path <> "" and Instr(1, name, path) > 0
+    end function
+
+    ' The path of the sidecar among tracks (the content's ready sidecars)
+    ' that name is, or "" for none: a track Roku found in the stream, such
+    ' as an MKV's own (mkv/3), or no track.
+    function trackPath(tracks as Object, name as String) as String
+        if name = "" then return ""
+        for each track in tracks
+            if isTrack(name, util.text(track.path)) then return track.path
+        end for
+        return ""
+    end function
+
+    ' Whether Roku draws the sidecar the player selected at path once its
+    ' content has settled, from what Roku reports: selected
+    ' (Video.subtitleTrack) and playing (Video.currentSubtitleTrack). True
+    ' when Roku reports the sidecar selected and plays it, or names nothing
+    ' as playing. False for anything else, so the player selects the
+    ' sidecar: no selection of it, another sidecar, or any track Roku found
+    ' in the stream, whatever its language (run 21: Arabic chosen, mkv/3
+    ' drawn; Italian chosen, the English sidecar drawn; run 22: English
+    ' chosen, the file's only English track mkv/4 reported playing, and
+    ' nothing drawn).
+    function drawn(path as String, selected as String, playing as String) as Boolean
+        return isTrack(selected, path) and (playing = "" or isTrack(playing, path))
+    end function
+
+    ' The path of the ready sidecar for trackId among tracks, or "" when
+    ' there is none (trackId "" selects none).
+    function pathOf(tracks as Object, trackId as String) as String
+        for each track in tracks
+            if track.trackId = trackId and track.state = "ready" then return track.path
+        end for
+        return ""
+    end function
+end namespace

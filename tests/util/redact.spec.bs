@@ -1,0 +1,396 @@
+namespace tests
+
+    ' Fake credentials shaped like Silo's: a JWT (access and stream tokens) and a
+    ' 32-byte base64url opaque token (refresh and proxy path tokens).
+    const JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1MSIsImV4cCI6MTk5OTk5OTk5OX0.ZmFrZS1zaWduYXR1cmUtZm9yLXRlc3Rz"
+    const OPAQUE = "Zm9vYmFyLWZha2UtcmVmcmVzaC0wMTIzNDU2Nzg5YWJj"
+    const ITEM_ID = "0f6b1c2e-3d4a-4b5c-8d9e-0a1b2c3d4e5f"
+
+    @suite("redact")
+    class RedactTests extends rooibos.BaseTestSuite
+
+        ' The text as a JSON string's contents: backslashes and quotes escaped.
+        function escape(text as String) as String
+            return text.Replace("\", "\\").Replace(Chr(34), "\" + Chr(34))
+        end function
+
+        function problemJson() as String
+            return `{"type":"https://siloserver.org/docs/api/v2/problems/invalid_credentials","title":"Invalid credentials","status":401,"detail":"refresh token ${OPAQUE} was revoked","instance":"/api/v2/auth/refresh?refresh_token=${OPAQUE}","refresh_token":"${OPAQUE}"}`
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("text")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("masks JWTs on their own and inside text")
+        sub _()
+            m.assertEqual(redact.text(JWT), redact.MASK)
+            m.assertEqual(redact.text("expired " + JWT + " at 10:00"), "expired <redacted> at 10:00")
+        end sub
+
+        @it("masks Bearer credentials")
+        sub _()
+            m.assertEqual(redact.text("sent Bearer abc.def-123 to the server"), "sent Bearer <redacted> to the server")
+        end sub
+
+        @it("masks token members in JSON and keeps the rest")
+        sub _()
+            input = `{"access_token":"${JWT}","refresh_token":"${OPAQUE}","profile_token":"p-1","token_type":"Bearer","expires_in":28800}`
+            expected = `{"access_token":"<redacted>","refresh_token":"<redacted>","profile_token":"<redacted>","token_type":"Bearer","expires_in":28800}`
+            m.assertEqual(redact.text(input), expected)
+        end sub
+
+        @it("masks device-login codes, passwords, and PINs")
+        sub _()
+            input = `{"device_code":"dc-1","user_code":"1234-5678","verification_uri":"https://silo.example/link","interval":5}`
+            expected = `{"device_code":"<redacted>","user_code":"<redacted>","verification_uri":"https://silo.example/link","interval":5}`
+            m.assertEqual(redact.text(input), expected)
+            m.assertEqual(redact.text("password=hunter2&pin=1234&profile=kids"), "password=<redacted>&pin=<redacted>&profile=kids")
+            m.assertEqual(redact.text(`{"pin": 1234, "code": "9876"}`), `{"pin": <redacted>, "code": "<redacted>"}`)
+            m.assertEqual(redact.text(`{"password":"a\\"b c","user":"x"}`), `{"password":"<redacted>","user":"x"}`)
+        end sub
+
+        @it("masks camelCase and header-style members")
+        sub _()
+            m.assertEqual(redact.text("accessToken: abc123 userCode=1234-5678"), "accessToken: <redacted> userCode=<redacted>")
+            m.assertEqual(redact.text("Authorization: Bearer abc def"), "Authorization: <redacted>")
+            m.assertEqual(redact.text("Set-Cookie: sid=abc; Path=/; HttpOnly"), "Set-Cookie: <redacted>")
+            m.assertEqual(redact.text("X-Profile-Token: abc" + Chr(10) + "X-Profile-Id: p1"), "X-Profile-Token: <redacted>" + Chr(10) + "X-Profile-Id: p1")
+        end sub
+
+        @it("leaves ordinary words and identifiers alone")
+        sub _()
+            input = "decode codec mapping: hevc status: 503 host=silo first=1 item " + ITEM_ID
+            m.assertEqual(redact.text(input), input)
+        end sub
+
+        @it("drops query strings from relative URLs")
+        sub _()
+            m.assertEqual(redact.text("GET /api/v2/items?st=abc&limit=5 failed"), "GET /api/v2/items failed")
+        end sub
+
+        @it("masks long opaque tokens")
+        sub _()
+            m.assertEqual(redact.text("refresh " + OPAQUE + " rejected"), "refresh <redacted> rejected")
+        end sub
+
+        @it("reduces URLs inside text")
+        sub _()
+            input = "fetch https://user:pw@Silo.Example:8443/api/v2/items/123?st=x failed"
+            m.assertEqual(redact.text(input), "fetch https://silo.example:8443/api/v2/items/<redacted> failed")
+        end sub
+
+        @it("returns a type tag for non-strings and keeps empty strings")
+        sub _()
+            m.assertEqual(redact.text(invalid), "<invalid>")
+            m.assertEqual(redact.text(1234), "<Integer>")
+            m.assertEqual(redact.text({ pin: "1234" }), "<roAssociativeArray>")
+            m.assertEqual(redact.text(""), "")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("text assignment forms")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("masks values after any whitespace around the separator")
+        sub _()
+            m.assertEqual(redact.text("pin:" + Chr(10) + "1234"), "pin:" + Chr(10) + "<redacted>")
+            m.assertEqual(redact.text("password:" + Chr(9) + "review-pass"), "password:" + Chr(9) + "<redacted>")
+            m.assertEqual(redact.text("password=" + Chr(9) + "secret ok"), "password=" + Chr(9) + "<redacted> ok")
+            m.assertEqual(redact.text("pin =" + Chr(13) + Chr(10) + " 1234"), "pin =" + Chr(13) + Chr(10) + " <redacted>")
+            m.assertEqual(redact.text("password" + Chr(9) + "= hunter2"), "password" + Chr(9) + "= <redacted>")
+            m.assertEqual(redact.text("X-Profile-Token:" + Chr(9) + "pt-1"), "X-Profile-Token:" + Chr(9) + "<redacted>")
+        end sub
+
+        @it("masks JSON members split across lines")
+        sub _()
+            m.assertEqual(redact.text(`{"password":` + Chr(10) + `  "review-pass"}`), `{"password":` + Chr(10) + `  "<redacted>"}`)
+            m.assertEqual(redact.text(`{"password"` + Chr(10) + `:` + Chr(10) + `"x","user":"u"}`), `{"password"` + Chr(10) + `:` + Chr(10) + `"<redacted>","user":"u"}`)
+        end sub
+
+        @it("masks members of backslash-escaped JSON")
+        sub _()
+            m.assertEqual(redact.text(m.escape(`{"password":"review-pass","user":"x"}`)), m.escape(`{"password":"<redacted>","user":"x"}`))
+            m.assertEqual(redact.text(m.escape(`{"pin":1234,"user":"x"}`)), m.escape(`{"pin":<redacted>,"user":"x"}`))
+            m.assertEqual(redact.text(m.escape(`{"password":"a\\"b c","user":"x"}`)), m.escape(`{"password":"<redacted>","user":"x"}`))
+            m.assertEqual(redact.text(m.escape(m.escape(`{"pin":"1234","user":"x"}`))), m.escape(m.escape(`{"pin":"<redacted>","user":"x"}`)))
+            ' A JSON-encoded newline between the colon and the value.
+            m.assertEqual(redact.text(`{\\"password\\":\\n\\"x\\"}`), `{\\"password\\":\\n\\"<redacted>\\"}`)
+        end sub
+
+        @it("ends quoted values at the closing quote")
+        sub _()
+            m.assertEqual(redact.text(`{"password":"a\\\\","user":"x"}`), `{"password":"<redacted>","user":"x"}`)
+            m.assertEqual(redact.text("password='it\'s secret' user='x'"), "password='<redacted>' user='x'")
+            m.assertEqual(redact.text(`password = "two words" user="x"`), `password = "<redacted>" user="x"`)
+            m.assertEqual(redact.text(`password="never closed, user=x`), `password="<redacted>`)
+        end sub
+
+        @it("masks object and array values whole")
+        sub _()
+            m.assertEqual(redact.text(`{"credentials":["abc123","x]"],"status":401}`), `{"credentials":<redacted>,"status":401}`)
+            m.assertEqual(redact.text(`{"auth_token":{"value":"x","kind":{"k":1}},"ok":true}`), `{"auth_token":<redacted>,"ok":true}`)
+            m.assertEqual(redact.text(`{"credentials":[1,2`), `{"credentials":<redacted>`)
+        end sub
+
+        @it("masks a URL given as a secret value")
+        sub _()
+            m.assertEqual(redact.text("password=https://review.example/simple"), "password=<redacted>")
+            m.assertEqual(redact.text(`{"password": "https://review.example/simple?x=1"}`), `{"password": "<redacted>"}`)
+            m.assertEqual(redact.text("token: http://a.example/b next"), "token: <redacted> next")
+        end sub
+
+        @it("masks URL-encoded secret assignments")
+        sub _()
+            input = "next=%2Flogin%3Fpassword%3Dhunter2%26pin%3D1234%26lang%3Den"
+            m.assertEqual(redact.text(input), "next=%2Flogin%3Fpassword%3D<redacted>%26pin%3D<redacted>%26lang%3Den")
+            m.assertEqual(redact.text("q=password%253Dhunter2%2526pin%253D1234%2526x%253D1"), "q=password%253D<redacted>%2526pin%253D<redacted>%2526x%253D1")
+            m.assertEqual(redact.text("form PIN%3a1234 sent"), "form PIN%3a<redacted> sent")
+        end sub
+
+        @it("masks credential headers in multi-line text")
+        sub _()
+            crlf = Chr(13) + Chr(10)
+            input = "POST /api/v2/auth/refresh" + crlf + "Authorization:" + Chr(9) + "Bearer " + JWT + crlf + "X-Profile-Token: pt-1" + crlf + "Cookie: a=b; c=d" + crlf + "Accept: */*"
+            expected = "POST /api/v2/auth/refresh" + crlf + "Authorization:" + Chr(9) + "<redacted>" + crlf + "X-Profile-Token: <redacted>" + crlf + "Cookie: <redacted>" + crlf + "Accept: */*"
+            m.assertEqual(redact.text(input), expected)
+            m.assertEqual(redact.text("sent Bearer" + Chr(9) + "abc.def then"), "sent Bearer" + Chr(9) + "<redacted> then")
+            m.assertEqual(redact.text("authorization:" + Chr(10) + "Basic dXNlcjpwYXNz"), "authorization:" + Chr(10) + "<redacted>")
+        end sub
+
+        @it("masks PEM bodies")
+        sub _()
+            lf = Chr(10)
+            input = "key -----BEGIN PRIVATE KEY-----" + lf + "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" + lf + "AbC+/de==" + lf + "-----END PRIVATE KEY----- loaded"
+            m.assertEqual(redact.text(input), "key -----BEGIN PRIVATE KEY-----<redacted>-----END PRIVATE KEY----- loaded")
+            m.assertEqual(redact.text("-----BEGIN CERTIFICATE-----" + lf + "MIIB/x+y"), "-----BEGIN CERTIFICATE-----<redacted>")
+        end sub
+
+        @it("masks long base64 runs that contain slashes")
+        sub _()
+            m.assertEqual(redact.text("key Zm9vYmFyLWZh/a2UtcmVmcmVz/aC0wMTIzNDU2/Nzg5YWJj== end"), "key <redacted> end")
+            m.assertEqual(redact.text("seg /stream/zm9vymfylwzha2utcmvmcmvzac0wmtiz/seg.ts"), "seg /stream/<redacted>/seg.ts")
+        end sub
+
+        @it("leaves ordinary text alone")
+        sub _()
+            lf = Chr(10)
+            input = "Error: password rejected; retry" + lf + "status:" + Chr(9) + "503" + lf + "token_type: Bearer" + lf + "host =" + lf + "silo mapping:" + lf + " hevc"
+            m.assertEqual(redact.text(input), input)
+            input = m.escape(`{"status":"ok","codec":"hevc"}`) + " 10:30:00 open /components/screens/HomeScreen.brs and tmp:/cache/Poster_1080x1920.jpg"
+            m.assertEqual(redact.text(input), input)
+            m.assertEqual(redact.text("https%3A%2F%2Fsilo.example%2Fapi"), "https%3A%2F%2Fsilo.example%2Fapi")
+        end sub
+
+        @it("handles a large input quickly")
+        sub _()
+            chunk = `pin=1234 Bearer abc "password":` + Chr(9) + `"x\\"y" ` + m.escape(`{"pin":"9876"}`) + " https://silo.example/a?st=1 /x?code=5 Zm9v/YmFyLWZha2UtcmVmcmVzaC0w ok? a=b:c%3Dd " + Chr(10)
+            parts = []
+            for i = 1 to 300
+                parts.Push(chunk)
+            end for
+            ' Each "?" without "=" once rescanned the rest of its URL.
+            input = parts.Join("") + string(3000, "a?") + ` "password":"` + string(20000, "\")
+            clock = CreateObject("roTimespan")
+            output = redact.text(input)
+            elapsed = clock.TotalMilliseconds()
+            ' Measured against three character-by-character passes over the
+            ' same input on the same machine, so a slow or busy runner moves
+            ' both: redacting takes about 3 times as long as the passes, and
+            ' took about 300 times as long when it rescanned queries.
+            clock.Mark()
+            marks = 0
+            for pass = 1 to 3
+                for i = 1 to Len(input)
+                    if Mid(input, i, 1) = "?" then marks = marks + 1
+                end for
+            end for
+            baseline = clock.TotalMilliseconds()
+            m.assertEqual(marks, 3 * (3 * 300 + 3000))
+            m.assertTrue(Len(input) > 60000)
+            m.assertEqual(output.Instr("1234"), -1)
+            m.assertEqual(output.Instr("9876"), -1)
+            m.assertEqual(output.Instr("abc"), -1)
+            m.assertEqual(output.Instr("x\"), -1)
+            m.assertTrue(elapsed < 30 * baseline, "redacting " + Len(input).ToStr() + " chars took " + elapsed.ToStr() + " ms, the passes " + baseline.ToStr() + " ms")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("url")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("reduces a signed API-origin media URL to its route")
+        sub _()
+            input = "https://silo.example/api/v2/playback/sessions/" + ITEM_ID + "/hls/master.m3u8?st=" + JWT + "&seek=12"
+            m.assertEqual(redact.url(input), "https://silo.example/api/v2/playback/sessions/<redacted>")
+        end sub
+
+        @it("drops path tokens on proxy URLs")
+        sub _()
+            m.assertEqual(redact.url("https://proxy-1.example:9443/stream/" + OPAQUE + "/seg-00001.ts"), "https://proxy-1.example:9443/stream/<redacted>")
+            m.assertEqual(redact.url("https://cdn.example/" + JWT + "/master.m3u8"), "https://cdn.example/<redacted>")
+        end sub
+
+        @it("drops credentials before the host")
+        sub _()
+            m.assertEqual(redact.url("http://admin:s3cret@192.168.1.10:8096/api/v2/system/info"), "http://192.168.1.10:8096/api/v2/system/info")
+            m.assertEqual(redact.url("https://a:b@c@silo.example/"), "https://silo.example/")
+        end sub
+
+        @it("drops fragments and keeps bare origins")
+        sub _()
+            m.assertEqual(redact.url("https://silo.example"), "https://silo.example")
+            m.assertEqual(redact.url("https://silo.example/"), "https://silo.example/")
+            m.assertEqual(redact.url("https://silo.example/web/#/details?id=1"), "https://silo.example/web")
+        end sub
+
+        @it("keeps at most four path words")
+        sub _()
+            m.assertEqual(redact.url("https://silo.example/a/b/c/d/e"), "https://silo.example/a/b/c/d/<redacted>")
+        end sub
+
+        @it("handles relative, local, and opaque URIs")
+        sub _()
+            m.assertEqual(redact.url("/api/v2/items/123?st=x"), "/api/v2/items/<redacted>")
+            m.assertEqual(redact.url("pkg:/images/icon.png"), "pkg:/images/icon.png")
+            m.assertEqual(redact.url("about:blank"), "about:blank")
+            m.assertEqual(redact.url("urn:uuid:" + ITEM_ID), "urn:<redacted>")
+        end sub
+
+        @it("masks input that is not a URL")
+        sub _()
+            m.assertEqual(redact.url("not a url"), redact.MASK)
+            m.assertEqual(redact.url(""), redact.MASK)
+            m.assertEqual(redact.url("https://bad host/x"), "https://<redacted>/x")
+            m.assertEqual(redact.url(invalid), "<invalid>")
+            m.assertEqual(redact.url(42), "<Integer>")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("headers")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("keeps names and shows only allow-listed values")
+        sub _()
+            input = {
+                "Authorization": "Bearer " + JWT,
+                "X-Profile-Token": "pt-1",
+                "X-Profile-Id": "p1",
+                "Cookie": "a=b",
+                "Set-Cookie": "sid=1",
+                "X-Silo-Device-Id": "dev-1",
+                "Content-Type": "application/json",
+                "Content-Length": 12,
+                "Location": "https://silo.example/api/v2/items/1?st=x"
+            }
+            expected = {
+                "Authorization": redact.MASK,
+                "X-Profile-Token": redact.MASK,
+                "X-Profile-Id": "p1",
+                "Cookie": redact.MASK,
+                "Set-Cookie": redact.MASK,
+                "X-Silo-Device-Id": redact.MASK,
+                "Content-Type": "application/json",
+                "Content-Length": 12,
+                "Location": "https://silo.example/api/v2/items/<redacted>"
+            }
+            m.assertEqual(redact.headers(input), expected)
+        end sub
+
+        @it("handles the array form and non-maps")
+        sub _()
+            input = [{ "set-cookie": "sid=1" }, { "content-type": "text/plain" }]
+            m.assertEqual(redact.headers(input), [{ "set-cookie": redact.MASK }, { "content-type": "text/plain" }])
+            m.assertEqual(redact.headers(invalid), "<invalid>")
+            m.assertEqual(redact.headers("Authorization: Bearer x"), "Authorization: <redacted>")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("body")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("summarises a Problem Details body that contains a token")
+        sub _()
+            m.assertEqual(redact.body(m.problemJson()), "problem invalid_credentials status=401 instance=/api/v2/auth/refresh")
+            m.assertEqual(redact.body(ParseJson(m.problemJson())), "problem invalid_credentials status=401 instance=/api/v2/auth/refresh")
+        end sub
+
+        @it("masks a problem type that is not a plain word")
+        sub _()
+            m.assertEqual(redact.body({ type: "https://silo.example/problems/" + OPAQUE, status: 400 }), "problem <redacted> status=400")
+        end sub
+
+        @it("reduces other bodies to their size or kind")
+        sub _()
+            m.assertEqual(redact.body(`{"items":[],"total":0}`), "<body 22 chars>")
+            m.assertEqual(redact.body(`{"type":"movie","id":"${ITEM_ID}"}`), "<body 60 chars>")
+            m.assertEqual(redact.body("<html>oops</html>"), "<body 17 chars>")
+            m.assertEqual(redact.body(""), "<empty body>")
+            m.assertEqual(redact.body({ items: [] }), "<body object>")
+            m.assertEqual(redact.body([1]), "<body array>")
+            m.assertEqual(redact.body(invalid), "<invalid>")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("value")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("redacts nested AAs and arrays by member name")
+        sub _()
+            input = {
+                user: { name: "alice", password: "pw", tokens: [JWT, "plain"] },
+                profiles: [{ id: "p1", pin: 1234, profile_token: invalid }],
+                stream_url: "https://silo.example/api/v2/x?st=1",
+                headers: { "Authorization": "Bearer x", "Accept": "*/*" },
+                body: m.problemJson(),
+                note: "via Bearer abc",
+                total: 3,
+                ok: true,
+                ratio: 0.5
+            }
+            expected = {
+                user: { name: "alice", password: redact.MASK, tokens: [redact.MASK, "plain"] },
+                profiles: [{ id: "p1", pin: redact.MASK, profile_token: invalid }],
+                stream_url: "https://silo.example/api/v2/x",
+                headers: { "Authorization": redact.MASK, "Accept": "*/*" },
+                body: "problem invalid_credentials status=401 instance=/api/v2/auth/refresh",
+                note: "via Bearer <redacted>",
+                total: 3,
+                ok: true,
+                ratio: 0.5
+            }
+            m.assertEqual(redact.value(input), expected)
+        end sub
+
+        @it("matches secret names in camelCase and lowercase without catching lookalikes")
+        sub _()
+            input = { accessToken: "a", refreshtoken: "b", userCode: "1", deviceCode: "2", "X-Profile-Token": "t", st: "s", host: "silo", first: "x", codec: "hevc", mapping: "m" }
+            expected = { accessToken: redact.MASK, refreshtoken: redact.MASK, userCode: redact.MASK, deviceCode: redact.MASK, "X-Profile-Token": redact.MASK, st: redact.MASK, host: "silo", first: "x", codec: "hevc", mapping: "m" }
+            m.assertEqual(redact.value(input), expected)
+        end sub
+
+        @it("passes scalars and tags other objects")
+        sub _()
+            m.assertInvalid(redact.value(invalid))
+            m.assertEqual(redact.value(42), 42)
+            m.assertEqual(redact.value(true), true)
+            m.assertEqual(redact.value("Bearer abc"), "Bearer <redacted>")
+            m.assertEqual(redact.value(CreateObject("roByteArray")), "<roByteArray>")
+            m.assertEqual(redact.value({ when: CreateObject("roDateTime"), node: CreateObject("roSGNode", "Node") }), { when: "<roDateTime>", node: "<roSGNode:Node>" })
+        end sub
+
+        @it("stops at a fixed depth, so cycles terminate")
+        sub _()
+            loop = {}
+            loop.self = loop
+            node = redact.value(loop)
+            loop.self = invalid
+            for i = 1 to 7
+                node = node.self
+            end for
+            m.assertEqual(node.self, redact.MASK)
+        end sub
+
+    end class
+
+end namespace

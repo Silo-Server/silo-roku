@@ -1,0 +1,337 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/markers.bs"
+
+' The Skip Intro button (spec section 5.7), as Android TV's
+' IntroAutoSkipController decides it. Pure: reduce(state, event) updates
+' state in place and returns commands. The player feeds it positions, the
+' Video node's state, and wake ticks, and carries out what it returns:
+'
+'   { type: "seek", seconds }         a source position: give playback.session
+'                                     { type: "seekTo", position: seconds },
+'                                     which seeks locally or reanchors
+'   { type: "show", mode, progress }  SkipIntroButton's mode ("skip" or
+'                                     "watch") and fill (0 to 1); sent again
+'                                     whenever either changes
+'   { type: "hide" }
+'
+' Each intro range (playback.markers) is offered once per item. Ask shows
+' Skip Intro while playback is inside the range: OK seeks to its end, Back
+' dismisses it, and either resolves the range for good. The 5 s timer runs
+' only while playing (a rebuffer keeps it running for PAUSE_GRACE_MS); when
+' it runs out the button withdraws, and only leaving the range and coming
+' back offers it again, with a full timer. Always seeks to the range's end
+' as playback enters it, then shows Intro skipped with Watch Intro for 5 s,
+' pinned to that range whatever the position does: Watch Intro seeks back to
+' the start, and Watch Intro, Back, or the timer running out resolves the
+' range, so it is never skipped again. Never shows nothing. Nothing is
+' offered until playback first plays, so the fill starts with the picture.
+'
+' Events, with now in monotonic milliseconds:
+'
+'   { type: "position", seconds, now }  source seconds (playback.session's
+'                                       player position)
+'   { type: "player", state, now }      the Video state as the session reducer
+'                                       gets it: "playing", "paused",
+'                                       "buffering", or "finished"
+'   { type: "tick", now }               at nextWake while the button shows
+'   { type: "press", now }              OK while the button shows (and the
+'                                       controls are hidden)
+'   { type: "back", now }               Back; visible(state) says whether it
+'                                       is the button's (spec 5.7 Back chain)
+'   { type: "mode", mode, now }         playback.intro_skip_mode changed
+'   { type: "markers", markers, now }   the playing file's markers changed
+namespace playback.skipIntro
+    const NEVER = "never"
+    const ASK = "ask"
+    const ALWAYS = "always"
+    ' SkipIntroButton modes.
+    const SKIP = "skip"
+    const WATCH = "watch"
+    ' How long the button shows while playing (spec section 5.7).
+    const PROMPT_MS = 5000
+    ' A rebuffer this short does not pause the timer (Android TV's
+    ' PLAYBACK_PAUSE_GRACE_MS); a pause does at once.
+    const PAUSE_GRACE_MS = 1500
+    ' How often the fill moves while the button shows.
+    const TICK_MS = 100
+
+    ' playback.intro_skip_mode as one of the three modes; anything else is
+    ' ask, the default (spec section 8.5).
+    function modeOf(value as Dynamic) as String
+        text = LCase(util.text(value))
+        if text = NEVER or text = ALWAYS then return text
+        return ASK
+    end function
+
+    ' mode is a playback.intro_skip_mode value; markers a playback.markers
+    ' list for the playing file.
+    function create(mode as Dynamic, markers as Object) as Object
+        return {
+            mode: modeOf(mode),
+            intros: playback.markers.ofKind(markers, playback.markers.INTRO),
+            ' Range keys never offered again, and the one whose Ask timed out.
+            resolved: {},
+            expired: "",
+            ' { kind: SKIP or WATCH, key, range, remainingMs }, or invalid.
+            prompt: invalid,
+            position: invalid,
+            playerState: "",
+            ' While buffering, the timer runs until this time.
+            graceUntil: invalid,
+            lastNow: invalid,
+            ' The last show command's mode and progress, or invalid when hidden.
+            shown: invalid
+        }
+    end function
+
+    function reduce(state as Object, event as Object) as Object
+        out = []
+        now = event.now
+        if util.isNumber(now) then advance(state, now)
+        t = event.type
+        if t = "position"
+            if util.isNumber(event.seconds) then state.position = event.seconds
+        else if t = "player"
+            onPlayer(state, util.text(event.state), now)
+        else if t = "press"
+            onPress(state, out)
+        else if t = "back"
+            if state.prompt <> invalid then resolve(state)
+        else if t = "mode"
+            state.mode = modeOf(event.mode)
+            withdraw(state)
+        else if t = "markers" and type(event.markers) = "roArray"
+            onMarkers(state, event.markers)
+        end if
+        evaluate(state, out)
+        publish(state, out)
+        return out
+    end function
+
+    ' Whether the button shows, for the controls' Back chain and OK routing.
+    function visible(state as Object) as Boolean
+        return state.prompt <> invalid
+    end function
+
+    ' When to send the next tick, or invalid: every TICK_MS while the timer
+    ' runs, and when a rebuffer's grace ends.
+    function nextWake(state as Object, now as Dynamic) as Dynamic
+        if state.prompt = invalid or not util.isNumber(now) or not running(state, now) then return invalid
+        wake = now + TICK_MS
+        if state.prompt.remainingMs < TICK_MS then wake = now + state.prompt.remainingMs
+        if state.playerState = "buffering" and state.graceUntil < wake then wake = state.graceUntil
+        return wake
+    end function
+
+    ' --- Internals --------------------------------------------------------------
+
+    sub onPlayer(state as Object, playerState as String, now as Dynamic)
+        if playerState = "buffering" and state.playerState = "playing" and util.isNumber(now)
+            state.graceUntil = now + PAUSE_GRACE_MS
+        else if playerState <> "buffering"
+            state.graceUntil = invalid
+        end if
+        state.playerState = playerState
+    end sub
+
+    ' A button whose range is gone withdraws, Watch Intro too.
+    sub onMarkers(state as Object, markers as Object)
+        state.intros = playback.markers.ofKind(markers, playback.markers.INTRO)
+        if state.prompt = invalid then return
+        for each range in state.intros
+            if keyOf(range) = state.prompt.key then return
+        end for
+        state.prompt = invalid
+    end sub
+
+    ' Playing, or rebuffering within the grace after playing.
+    function running(state as Object, now as Dynamic) as Boolean
+        if state.playerState = "playing" then return true
+        return state.playerState = "buffering" and util.isNumber(state.graceUntil) and util.isNumber(now) and now < state.graceUntil
+    end function
+
+    ' Runs the timer from the last event to now, counting only the time
+    ' playback ran, and withdraws the button when it runs out.
+    sub advance(state as Object, now as Dynamic)
+        last = state.lastNow
+        state.lastNow = now
+        prompt = state.prompt
+        if prompt = invalid or not util.isNumber(last) or now <= last then return
+        stopAt = last
+        if state.playerState = "playing"
+            stopAt = now
+        else if state.playerState = "buffering" and util.isNumber(state.graceUntil)
+            stopAt = state.graceUntil
+            if now < stopAt then stopAt = now
+        end if
+        if stopAt <= last then return
+        prompt.remainingMs = prompt.remainingMs - (stopAt - last)
+        if prompt.remainingMs > 0 then return
+        ' Ask withdraws without deciding; Always's Watch Intro resolves.
+        if prompt.kind = WATCH
+            state.resolved[prompt.key] = true
+        else
+            state.expired = prompt.key
+        end if
+        state.prompt = invalid
+    end sub
+
+    sub onPress(state as Object, out as Object)
+        prompt = state.prompt
+        if prompt = invalid then return
+        target = prompt.range.end_seconds
+        if prompt.kind = WATCH then target = prompt.range.start_seconds
+        resolve(state)
+        out.Push({ type: "seek", seconds: target })
+    end sub
+
+    sub resolve(state as Object)
+        state.resolved[state.prompt.key] = true
+        withdraw(state)
+    end sub
+
+    ' Takes the button down, deciding nothing, and forgets a timed-out Ask.
+    sub withdraw(state as Object)
+        state.expired = ""
+        state.prompt = invalid
+    end sub
+
+    ' Android TV's handle(): Watch Intro is pinned to its range; otherwise the
+    ' button follows the intro the position is in.
+    sub evaluate(state as Object, out as Object)
+        prompt = state.prompt
+        if prompt <> invalid and prompt.kind = WATCH then return
+        range = playback.markers.activeIntro(state.intros, state.position)
+        if range = invalid
+            withdraw(state)
+            return
+        end if
+        key = keyOf(range)
+        if prompt <> invalid and prompt.key <> key then withdraw(state)
+        if state.mode = NEVER or state.resolved.DoesExist(key) or state.expired = key
+            state.prompt = invalid
+            return
+        end if
+        if state.prompt <> invalid or state.playerState <> "playing" then return
+        if state.mode = ALWAYS
+            state.prompt = { kind: WATCH, key: key, range: range, remainingMs: PROMPT_MS }
+            out.Push({ type: "seek", seconds: range.end_seconds })
+        else
+            state.prompt = { kind: SKIP, key: key, range: range, remainingMs: PROMPT_MS }
+        end if
+    end sub
+
+    ' Sends show when the mode or fill changed, and hide once.
+    sub publish(state as Object, out as Object)
+        prompt = state.prompt
+        if prompt = invalid
+            if state.shown <> invalid then out.Push({ type: "hide" })
+            state.shown = invalid
+            return
+        end if
+        progress = 1 - prompt.remainingMs / PROMPT_MS
+        if progress < 0 then progress = 0
+        shown = state.shown
+        if shown <> invalid and shown.mode = prompt.kind and shown.progress = progress then return
+        state.shown = { mode: prompt.kind, progress: progress }
+        out.Push({ type: "show", mode: prompt.kind, progress: progress })
+    end sub
+
+    function keyOf(range as Object) as String
+        return range.start_seconds.ToStr() + ":" + range.end_seconds.ToStr()
+    end function
+end namespace
+
+' The Skip Recap pill and recap auto-skip (spec section 5.7, tvOS's segment
+' pill and RecapAutoSkipPolicy, silo-apple 76963f28 and 930d7268). Pure, as
+' playback.skipIntro: reduce(state, event) updates state in place and
+' returns commands, { type: "seek", seconds }, { type: "show" }, or
+' { type: "hide" }, each sent when it changes something.
+'
+' The pill shows while playback is inside a recap range (playback.markers),
+' once the item has first played: a recap often starts at 0:00, and nothing
+' is offered or skipped before the picture. OK seeks to the range's end.
+' With the profile's playback.auto_skip_recap on, playback entering a range
+' seeks past it instead, once per range for the item: a range already
+' skipped stays skipped when the viewer goes back into it, and shows the
+' pill then.
+'
+' Events, as playback.skipIntro takes them: position, player, markers,
+' press; and { type: "autoSkip", value } when the preference arrives.
+namespace playback.skipRecap
+    function create(autoSkip as Boolean, markers as Object) as Object
+        return {
+            autoSkip: autoSkip,
+            recaps: playback.markers.ofKind(markers, playback.markers.RECAP),
+            ' Range keys auto-skip has passed, and the one it just passed,
+            ' whose pill stays down until playback has left it.
+            skipped: {},
+            leaving: "",
+            position: invalid,
+            played: false,
+            shown: false
+        }
+    end function
+
+    function reduce(state as Object, event as Object) as Object
+        out = []
+        t = event.type
+        if t = "position"
+            if util.isNumber(event.seconds) then state.position = event.seconds
+        else if t = "player"
+            if util.text(event.state) = "playing" then state.played = true
+        else if t = "markers" and type(event.markers) = "roArray"
+            state.recaps = playback.markers.ofKind(event.markers, playback.markers.RECAP)
+        else if t = "autoSkip"
+            state.autoSkip = util.isTrue(event.value)
+        else if t = "press"
+            range = activeRange(state)
+            if range <> invalid and state.played
+                setShown(state, false, out)
+                out.Push({ type: "seek", seconds: range.end_seconds })
+                return out
+            end if
+        end if
+        evaluate(state, out)
+        return out
+    end function
+
+    function visible(state as Object) as Boolean
+        return state.shown
+    end function
+
+    function activeRange(state as Object) as Dynamic
+        return playback.markers.activeRange(state.recaps, playback.markers.RECAP, state.position)
+    end function
+
+    sub evaluate(state as Object, out as Object)
+        range = activeRange(state)
+        key = ""
+        if range <> invalid then key = playback.skipIntro.keyOf(range)
+        if key <> state.leaving then state.leaving = ""
+        if range = invalid or not state.played or key = state.leaving
+            setShown(state, false, out)
+            return
+        end if
+        if state.autoSkip and not state.skipped.DoesExist(key)
+            ' Kept before the seek: positions it reports before landing must
+            ' see this range as handled, and show no pill.
+            state.skipped[key] = true
+            state.leaving = key
+            setShown(state, false, out)
+            out.Push({ type: "seek", seconds: range.end_seconds })
+            return
+        end if
+        setShown(state, true, out)
+    end sub
+
+    sub setShown(state as Object, shown as Boolean, out as Object)
+        if state.shown = shown then return
+        state.shown = shown
+        if shown
+            out.Push({ type: "show" })
+        else
+            out.Push({ type: "hide" })
+        end if
+    end sub
+end namespace

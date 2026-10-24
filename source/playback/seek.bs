@@ -1,0 +1,94 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/values.bs"
+
+' Timeline and seek decisions for the current plan (plan section 6.5, protocol
+' v3 section 5). Positions are seconds. A source position counts from the
+' start of the file; a player position is what the Video node reports. Every
+' position sent to the server is a source position.
+namespace playback.seek
+    ' Skips pressed within this many milliseconds of each other merge into one
+    ' seek (spec section 5.7).
+    const MERGE_MS = 200
+
+    function offset(timeline as Object) as Double
+        return playback.values.toDouble(timeline.timeline_offset_seconds)
+    end function
+
+    function sourcePosition(timeline as Object, playerSeconds as Dynamic) as Double
+        return playback.values.toDouble(playerSeconds) + offset(timeline)
+    end function
+
+    function playerPosition(timeline as Object, sourceSeconds as Dynamic) as Double
+        position = playback.values.toDouble(sourceSeconds) - offset(timeline)
+        if position < 0 then return 0
+        return position
+    end function
+
+    ' The media's runtime: source.duration_seconds when the plan has it, else
+    ' the catalog runtime; never the Video node's duration, which on a copy
+    ' remux is only the length produced so far. Invalid when neither is known.
+    function runtime(plan as Object, catalogRuntime as Dynamic) as Dynamic
+        source = plan.source
+        if util.isObject(source) and util.isNumber(source.duration_seconds) and source.duration_seconds > 0 then return source.duration_seconds
+        if util.isNumber(catalogRuntime) and catalogRuntime > 0 then return catalogRuntime
+        return invalid
+    end function
+
+    function clamp(target as Dynamic, limit as Dynamic) as Double
+        position = playback.values.toDouble(target)
+        if position < 0 then return 0
+        if util.isNumber(limit) and position > limit then return playback.values.toDouble(limit)
+        return position
+    end function
+
+    ' Local when the timeline allows seeking anywhere, or when both window
+    ' bounds are present and contain the target. A copy remux leaves the end
+    ' bound out, so its seeks always go back to the server.
+    function canSeekLocally(timeline as Object, target as Dynamic) as Boolean
+        if util.isTrue(timeline.can_seek_anywhere) then return true
+        first = timeline.seek_window_start_seconds
+        last = timeline.seek_window_end_seconds
+        return util.isNumber(first) and util.isNumber(last) and target >= first and target <= last
+    end function
+
+    ' Where a seek to a source target goes: {kind: "local", position: <player
+    ' position>} or {kind: "reanchor", position: <source position>} for a
+    ' seek_reanchor replan. A reopen at the current position decides the same
+    ' way, so a reopen on a copy remux is a reanchor.
+    function decide(timeline as Object, target as Dynamic) as Object
+        if canSeekLocally(timeline, target) then return { kind: "local", position: playerPosition(timeline, target) }
+        return { kind: "reanchor", position: playback.values.toDouble(target) }
+    end function
+
+    ' The subtitle command after a reanchored plan is adopted: sidecar cues use
+    ' source time, so they move with the new timeline_offset_seconds.
+    function subtitleShift(timeline as Object) as Object
+        return { type: "subtitleShift", offsetSeconds: offset(timeline) }
+    end function
+
+    ' Rapid skips: each press moves a pending target, measured from the last
+    ' pending target or, when none is pending, from the position given.
+    function newSkips() as Object
+        return { target: invalid, at: invalid }
+    end function
+
+    sub skip(skips as Object, from as Dynamic, delta as Dynamic, limit as Dynamic, now as Dynamic)
+        base = from
+        if util.isNumber(skips.target) then base = skips.target
+        skips.target = clamp(base + playback.values.number(delta, 0), limit)
+        skips.at = now + MERGE_MS
+    end sub
+
+    ' The merged target once MERGE_MS has passed since the last press, else invalid.
+    function dueSkip(skips as Object, now as Dynamic) as Dynamic
+        if not util.isNumber(skips.at) or now < skips.at then return invalid
+        target = skips.target
+        cancelSkips(skips)
+        return target
+    end function
+
+    sub cancelSkips(skips as Object)
+        skips.target = invalid
+        skips.at = invalid
+    end sub
+end namespace

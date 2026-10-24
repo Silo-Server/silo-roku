@@ -1,0 +1,207 @@
+namespace tests
+
+    ' Android TV's IntroAutoSkipController rules (spec section 5.7), with an
+    ' intro from 10 s to 90 s unless a test says otherwise. Commands are
+    ' summarized as "seek:90", "show:skip:20" (fill in percent), and "hide".
+    @suite("playback skip intro")
+    class PlaybackSkipIntroTests extends rooibos.BaseTestSuite
+
+        function intro(mode as String, extra = invalid as Dynamic) as Object
+            segments = [{ kind: "intro", start_seconds: 10, end_seconds: 90 }]
+            if extra <> invalid then segments.Append(extra)
+            return playback.skipIntro.create(mode, playback.markers.parse(segments))
+        end function
+
+        ' Feeds events in order and summarizes every command.
+        function feed(state as Object, events as Object) as Object
+            out = []
+            for each event in events
+                for each command in playback.skipIntro.reduce(state, event)
+                    if command.type = "seek"
+                        out.Push("seek:" + command.seconds.ToStr())
+                    else if command.type = "show"
+                        out.Push("show:" + command.mode + ":" + Int(command.progress * 100 + 0.5).ToStr())
+                    else
+                        out.Push(command.type)
+                    end if
+                end for
+            end for
+            return out
+        end function
+
+        function at(seconds as Dynamic, now as Integer) as Object
+            return { type: "position", seconds: seconds, now: now }
+        end function
+
+        function player(playerState as String, now as Integer) as Object
+            return { type: "player", state: playerState, now: now }
+        end function
+
+        function tick(now as Integer) as Object
+            return { type: "tick", now: now }
+        end function
+
+        ' Playing from 0 ms at seconds.
+        function playingAt(state as Object, seconds as Dynamic) as Object
+            return m.feed(state, [m.player("playing", 0), m.at(seconds, 0)])
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("modes")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("reads playback.intro_skip_mode, defaulting to ask")
+        sub _()
+            m.assertEqual(playback.skipIntro.modeOf("never"), "never")
+            m.assertEqual(playback.skipIntro.modeOf("ALWAYS"), "always")
+            m.assertEqual(playback.skipIntro.modeOf("ask"), "ask")
+            m.assertEqual(playback.skipIntro.modeOf("sometimes"), "ask")
+            m.assertEqual(playback.skipIntro.modeOf(invalid), "ask")
+        end sub
+
+        @it("never offers anything in never mode")
+        sub _()
+            state = m.intro("never")
+            m.assertEqual(m.playingAt(state, 20), [])
+            m.assertEqual(m.feed(state, [m.tick(1000), { type: "press", now: 1000 }]), [])
+            m.assertFalse(playback.skipIntro.visible(state))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("ask")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("waits for playback to play before offering Skip Intro")
+        sub _()
+            state = m.intro("ask")
+            m.assertEqual(m.feed(state, [m.player("buffering", 0), m.at(20, 0)]), [])
+            m.assertEqual(m.feed(state, [m.player("playing", 500)]), ["show:skip:0"])
+            m.assertTrue(playback.skipIntro.visible(state))
+        end sub
+
+        @it("fills over 5 s and seeks to the intro's end on OK, once per intro")
+        sub _()
+            state = m.intro("ask")
+            m.assertEqual(m.playingAt(state, 20), ["show:skip:0"])
+            m.assertEqual(m.feed(state, [m.tick(1000), m.tick(2500)]), ["show:skip:20", "show:skip:50"])
+            m.assertEqual(m.feed(state, [{ type: "press", now: 2600 }]), ["seek:90", "hide"])
+            m.assertFalse(playback.skipIntro.visible(state))
+            ' Seeking back into a skipped intro offers nothing.
+            m.assertEqual(m.feed(state, [m.at(30, 3000), m.tick(3100)]), [])
+        end sub
+
+        @it("withdraws on leaving the intro and offers a full timer on coming back")
+        sub _()
+            state = m.intro("ask")
+            m.playingAt(state, 20)
+            m.assertEqual(m.feed(state, [m.tick(2000), m.at(95, 2000)]), ["show:skip:40", "hide"])
+            m.assertEqual(m.feed(state, [m.at(40, 3000)]), ["show:skip:0"])
+        end sub
+
+        @it("withdraws after 5 s and offers again only after playback leaves the intro")
+        sub _()
+            state = m.intro("ask")
+            m.playingAt(state, 20)
+            m.assertEqual(m.feed(state, [m.tick(4900), m.tick(5000)]), ["show:skip:98", "hide"])
+            m.assertEqual(m.feed(state, [m.at(25, 5500), m.tick(6000)]), [])
+            m.assertEqual(m.feed(state, [m.at(95, 7000), m.at(40, 8000)]), ["show:skip:0"])
+        end sub
+
+        @it("dismisses on Back, which resolves the intro without seeking")
+        sub _()
+            state = m.intro("ask")
+            m.playingAt(state, 20)
+            m.assertEqual(m.feed(state, [{ type: "back", now: 1000 }]), ["hide"])
+            m.assertEqual(m.feed(state, [m.at(95, 2000), m.at(30, 3000)]), [])
+            ' A Back with nothing showing changes nothing.
+            m.assertEqual(m.feed(state, [{ type: "back", now: 3500 }]), [])
+        end sub
+
+        @it("stops the timer while paused and keeps it for a short rebuffer")
+        sub _()
+            state = m.intro("ask")
+            m.playingAt(state, 20)
+            m.assertEqual(m.feed(state, [m.player("paused", 1000), m.tick(3000)]), ["show:skip:20"])
+            m.assertInvalid(playback.skipIntro.nextWake(state, 3000))
+            m.assertEqual(m.feed(state, [m.player("playing", 3000), m.tick(4000)]), ["show:skip:40"])
+            ' Buffering counts for 1.5 s, then stops the timer until playing.
+            m.assertEqual(m.feed(state, [m.player("buffering", 4000), m.tick(5000)]), ["show:skip:60"])
+            m.assertEqual(m.feed(state, [m.tick(7000)]), ["show:skip:70"])
+            m.assertEqual(m.feed(state, [m.tick(8000)]), [])
+        end sub
+
+        @it("offers each intro of a file on its own")
+        sub _()
+            state = m.intro("ask", [{ kind: "intro", start_seconds: 600, end_seconds: 640 }])
+            m.playingAt(state, 20)
+            m.feed(state, [{ type: "press", now: 100 }])
+            m.assertEqual(m.feed(state, [m.at(100, 1000), m.at(610, 2000)]), ["show:skip:0"])
+            m.assertEqual(m.feed(state, [{ type: "press", now: 2100 }]), ["seek:640", "hide"])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("always")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("skips to the intro's end and offers Watch Intro pinned to it")
+        sub _()
+            state = m.intro("always")
+            m.assertEqual(m.playingAt(state, 10), ["seek:90", "show:watch:0"])
+            ' The seek lands outside the intro; Watch Intro stays.
+            m.assertEqual(m.feed(state, [m.at(90.5, 1000), m.tick(1000)]), ["show:watch:20"])
+            m.assertEqual(m.feed(state, [{ type: "press", now: 1500 }]), ["seek:10", "hide"])
+            ' Watching it: the intro plays and is never skipped again.
+            m.assertEqual(m.feed(state, [m.at(10, 2000), m.at(11, 3000), m.tick(3100)]), [])
+        end sub
+
+        @it("resolves the intro when Watch Intro runs out, so a seek back plays it")
+        sub _()
+            state = m.intro("always")
+            m.playingAt(state, 10)
+            m.assertEqual(m.feed(state, [m.at(91, 1000), m.tick(5000)]), ["show:watch:20", "hide"])
+            m.assertEqual(m.feed(state, [m.at(20, 6000), m.tick(6100)]), [])
+        end sub
+
+        @it("keeps Watch Intro while the viewer seeks around, and Back takes it down")
+        sub _()
+            state = m.intro("always")
+            m.playingAt(state, 50)
+            m.assertEqual(m.feed(state, [m.at(30, 1000)]), ["show:watch:20"])
+            m.assertEqual(m.feed(state, [{ type: "back", now: 1200 }]), ["hide"])
+            m.assertEqual(m.feed(state, [m.at(40, 2000)]), [])
+        end sub
+
+        @it("re-evaluates on a mode change: ask to always skips at once")
+        sub _()
+            state = m.intro("ask")
+            m.playingAt(state, 20)
+            m.assertEqual(m.feed(state, [{ type: "mode", mode: "always", now: 1000 }]), ["seek:90", "show:watch:0"])
+            m.assertEqual(m.feed(state, [{ type: "mode", mode: "never", now: 1500 }, m.at(91, 1600)]), ["hide"])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("wakes and markers")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("asks for ticks while the timer runs, up to its end and the rebuffer grace")
+        sub _()
+            state = m.intro("ask")
+            m.assertInvalid(playback.skipIntro.nextWake(state, 0))
+            m.playingAt(state, 20)
+            m.assertEqual(playback.skipIntro.nextWake(state, 0), 100)
+            m.feed(state, [m.tick(4950)])
+            m.assertEqual(playback.skipIntro.nextWake(state, 4950), 5000)
+            m.feed(state, [m.player("buffering", 4960)])
+            m.assertEqual(playback.skipIntro.nextWake(state, 4960), 5000)
+        end sub
+
+        @it("withdraws a button whose intro the new markers drop")
+        sub _()
+            state = m.intro("always")
+            m.playingAt(state, 20)
+            m.assertEqual(m.feed(state, [{ type: "markers", markers: playback.markers.parse([{ kind: "intro", start_seconds: 10, end_seconds: 90 }]), now: 500 }]), ["show:watch:10"])
+            m.assertTrue(playback.skipIntro.visible(state))
+            m.assertEqual(m.feed(state, [{ type: "markers", markers: [], now: 600 }]), ["hide"])
+        end sub
+    end class
+end namespace

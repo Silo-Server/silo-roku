@@ -1,0 +1,386 @@
+namespace tests
+
+    ' DetailScreen headless after the player closes, the tracks it gives the
+    ' player, and its Versions, Audio Tracks, and Subtitles menus, as
+    ' detailScreen.spec.bs drives it (tests/helpers/detailScreen.bs). Split
+    ' from that file so each headless shard stays small (README,
+    ' Development).
+    @suite("detail screen tracks and return")
+    class DetailTracksTests extends tests.DetailScreenSuite
+
+        @describe("after the player closes (spec section 5.6; P-19, P-20)")
+
+        ' Season's episodes, those numbered in watched already played.
+        function episodesWatched(season as Integer, count as Integer, watched as Object) as Object
+            body = m.episodes(season, count)
+            for each item in body.items
+                if util.contains(watched, item.episode_number) then item.user_data = { played: true, position_seconds: 0, duration_seconds: 3000 }
+            end for
+            return body
+        end function
+
+        @it("keeps a rewatched episode stopped partway, though the server counts it watched (P-19)")
+        sub _()
+            probe = m.playedFrom("episode:s1e2", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e2", seasonNumber: 1, finished: false })
+            m.answerPlayed(probe, "episode:s1e2", 900, true)
+            state = probe.callFunc("inspect")
+            m.assertEqual([state.activeIndex, state.target.contentId], [1, "episode:s1e2"])
+            probe.callFunc("refreshAgain")
+            m.answerPlayed(probe, "episode:s1e2", 905, true)
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s1e2", "the second read keeps it")
+
+            ' An unwatched episode stopped partway, and a player that handed nothing back.
+            probe = m.playedFrom("episode:s1e2", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e2", seasonNumber: 1, finished: false })
+            m.answerPlayed(probe, "episode:s1e2", 900, false)
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s1e2")
+            probe = m.playedFrom("episode:s1e2", [1, 2])
+            m.returned(probe, invalid)
+            m.answerPlayed(probe, "episode:s1e2", 900, true)
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s1e2")
+        end sub
+
+        @it("moves on from an episode this playback finished (P-19)")
+        sub _()
+            probe = m.playedFrom("episode:s1e2", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e2", seasonNumber: 1, finished: true })
+            m.answerPlayed(probe, "episode:s1e2", 0, true)
+            state = probe.callFunc("inspect")
+            m.assertEqual([state.activeIndex, state.target.contentId], [2, "episode:s1e3"])
+        end sub
+
+        @it("keeps the chain's last episode when the viewer stopped partway through it, a rewatch included (P-19)")
+        sub _()
+            probe = m.playedFrom("episode:s1e1", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e3", seasonNumber: 1, finished: false })
+            m.answerPlayed(probe, "episode:s1e3", 600, true)
+            state = probe.callFunc("inspect")
+            m.assertEqual([state.activeIndex, state.target.contentId], [2, "episode:s1e3"])
+        end sub
+
+        @it("moves to the next episode though the viewer watched it before (D8)")
+        sub _()
+            probe = m.playedFrom("episode:s1e1", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e1", seasonNumber: 1, finished: true })
+            m.assertTrue(m.answer(probe, m.sentIndex(probe, "refresh", m.episodesPath(1)), m.episodesWatched(1, 4, [1, 2])), "the refresh's read")
+            m.answerPlayed(probe, "episode:s1e1", 0, true)
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s1e2")
+        end sub
+
+        @it("moves from a finished season finale to the next season's first episode (P-20)")
+        sub _()
+            probe = m.playedFrom("episode:s1e4", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e4", seasonNumber: 1, finished: true })
+            m.answerPlayed(probe, "episode:s1e4", 0, true)
+            at = m.sentIndex(probe, "successor", m.episodesPath(2))
+            m.assertTrue(at >= 0, "season 2's episodes")
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s1e4", "until they arrive")
+            m.answer(probe, at, m.episodes(2, 3))
+            state = probe.callFunc("inspect")
+            m.assertEqual([state.activeIndex, state.target.contentId], [4, "episode:s2e1"])
+            m.assertEqual(state.rowIds[4], "episode:s2e1", "on one rail after season 1")
+            m.assertEqual(probe.findNode("seasons").selected, 1)
+            m.assertEqual(probe.findNode("actions").buttons.items[0].label, "Play S2:E1")
+            probe.callFunc("refreshAgain")
+            m.answerPlayed(probe, "episode:s1e4", 0, true)
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s2e1", "the second read leaves it there")
+        end sub
+
+        @it("passes over a gap in the season numbers to the next season's first episode, watched or not (D8)")
+        sub _()
+            probe = m.playedFrom("episode:s1e4", [1, 3, 0])
+            m.returned(probe, { contentId: "episode:s1e4", seasonNumber: 1, finished: true })
+            m.answerPlayed(probe, "episode:s1e4", 0, true)
+            at = m.sentIndex(probe, "successor", m.episodesPath(3))
+            m.assertTrue(at >= 0, "season 3's episodes")
+            m.answer(probe, at, m.episodesWatched(3, 3, [1]))
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s3e1")
+            m.assertEqual(probe.findNode("seasons").selected, 1)
+        end sub
+
+        @it("crosses into the next season after an Up Next chain finished the season's last episode (P-20)")
+        sub _()
+            probe = m.playedFrom("episode:s1e2", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e4", seasonNumber: 1, finished: true })
+            m.answerPlayed(probe, "episode:s1e4", 0, true)
+            m.answer(probe, m.sentIndex(probe, "successor", m.episodesPath(2)), m.episodes(2, 2))
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s2e1")
+        end sub
+
+        @it("keeps the finale when the next season has no episodes, when it is the series' last, or before Specials (D8)")
+        sub _()
+            probe = m.playedFrom("episode:s1e4", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e4", seasonNumber: 1, finished: true })
+            m.answerPlayed(probe, "episode:s1e4", 0, true)
+            m.answer(probe, m.sentIndex(probe, "successor", m.episodesPath(2)), { items: [] })
+            state = probe.callFunc("inspect")
+            m.assertEqual([state.activeIndex, state.target.contentId], [3, "episode:s1e4"])
+            m.assertEqual(state.railIds[0], "episode:s1e1")
+            m.assertEqual(probe.findNode("seasons").selected, 0)
+
+            for each seasons in [[1], [0, 1]]
+                probe = m.playedFrom("episode:s1e4", seasons)
+                m.returned(probe, { contentId: "episode:s1e4", seasonNumber: 1, finished: true })
+                m.answerPlayed(probe, "episode:s1e4", 0, true)
+                m.assertEqual(m.sentIndex(probe, "successor", m.episodesPath(0)), -1, "no read for Specials")
+                m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s1e4")
+            end for
+        end sub
+
+        @it("leaves the viewer's own choice when the next season arrives after it (P-20)")
+        sub _()
+            probe = m.playedFrom("episode:s1e4", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e4", seasonNumber: 1, finished: true })
+            m.answerPlayed(probe, "episode:s1e4", 0, true)
+            at = m.sentIndex(probe, "successor", m.episodesPath(2))
+            probe.callFunc("focusEpisode", 1)
+            m.answer(probe, at, m.episodes(2, 3))
+            state = probe.callFunc("inspect")
+            m.assertEqual(state.target.contentId, "episode:s1e2")
+            m.assertEqual(state.railIds[0], "episode:s1e1")
+        end sub
+
+        @describe("the tracks the player is given (spec section 5.6)")
+
+        @it("sends Auto subtitles as Auto beside the audio the viewer chose")
+        sub _()
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e2", seasonNumber: 1 })
+            m.assertTrue(m.throughSeasons(probe, [1], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            m.assertEqual(m.path(probe, 3), "/api/v2/watch/episode:s1e2")
+            ' An English subtitle preference, which Auto skips beside English audio.
+            version = { file_id: "77", audio_tracks: [{ language: "eng", codec: "eac3", channels: 6, default: true }, { language: "fra", codec: "ac3", channels: 6 }], subtitle_tracks: [{ language: "eng", codec: "subrip" }] }
+            m.answer(probe, 3, { content_id: "episode:s1e2", user_data: {}, versions: [version], effective_subtitle_language: "eng", effective_subtitle_mode: "auto" })
+            auto = playback.tracks.AUTO
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.PLAY).tracks, { fileId: "77", pinsVersion: false, audioIndex: auto, subtitleIndex: auto })
+            probe.findNode("actions").activated = catalog.action.AUDIO
+            probe.findNode("picker").picked = 1
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.PLAY).tracks, { fileId: "77", pinsVersion: false, audioIndex: 1, subtitleIndex: auto })
+            probe.findNode("actions").activated = catalog.action.SUBTITLES
+            probe.findNode("picker").picked = playback.tracks.OFF
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.START_OVER).tracks, { fileId: "77", pinsVersion: false, audioIndex: 1, subtitleIndex: playback.tracks.OFF })
+        end sub
+
+        @describe("Versions, Audio Tracks, and Subtitles (spec section 5.6, tvOS b90a86ea)")
+
+        ' Heat's page through its item and two-version watch state
+        ' (tests.catalogData.selectionWatch), the audio preference unanswered.
+        function movie(extra = invalid as Dynamic) as Object
+            probe = m.opened({ itemId: "movie:heat-1995" })
+            m.answer(probe, 0, { content_id: "movie:heat-1995", type: "movie", title: "Heat", runtime: 170 })
+            m.assertEqual(m.path(probe, 1), "/api/v2/watch/movie:heat-1995")
+            m.answer(probe, 1, tests.catalogData.selectionWatch(extra))
+            return probe
+        end function
+
+        function buttons(probe as Object) as Object
+            return probe.findNode("actions").buttons.items
+        end function
+
+        ' Chooses value in the menu of the selector key.
+        sub pick(probe as Object, key as String, value as Integer)
+            probe.findNode("actions").activated = key
+            probe.findNode("picker").picked = value
+        end sub
+
+        @it("dims the selectors until the watch state is read, then names what Auto plays")
+        sub _()
+            probe = m.opened({ itemId: "movie:heat-1995" })
+            m.answer(probe, 0, { content_id: "movie:heat-1995", type: "movie", title: "Heat", runtime: 170 })
+            items = m.buttons(probe)
+            m.assertEqual([items[0].key, items[1].key, items[2].key, items[3].key], ["play", "version", "audio", "subtitles"])
+            m.assertEqual([items[0].enabled, items[1].enabled, items[2].enabled, items[3].enabled], [true, false, false, false])
+            m.assertTrue(probe.findNode("selection").visible)
+            m.assertEqual(probe.callFunc("inspect").readout, {}, "bars until the values are read")
+            m.answer(probe, 1, tests.catalogData.selectionWatch())
+            items = m.buttons(probe)
+            m.assertEqual([items[1].enabled, items[2].enabled, items[3].enabled], [true, true, true])
+            m.assertEqual(probe.callFunc("inspect").readout, { version: "Auto · 2160p · DV", audio: "Auto · English · EAC3 · 5.1", subtitles: "Auto · English (Forced) · PGS" })
+            m.assertEqual([items[1].speech, items[2].speech], ["Versions, Auto · 2160p · DV", "Audio Tracks, Auto · English · EAC3 · 5.1"])
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.PLAY).tracks, { fileId: "101", pinsVersion: false, audioIndex: catalog.pickers.AUTO, subtitleIndex: catalog.pickers.AUTO })
+        end sub
+
+        @it("starts on the audio track the profile chose for the movie, and on Auto without one")
+        sub _()
+            probe = m.movie()
+            m.assertEqual(m.path(probe, 2), "/api/v2/audio-prefs/movie:heat-1995")
+            m.pick(probe, catalog.action.SUBTITLES, playback.tracks.OFF)
+            m.answer(probe, 2, { profile_id: "p-1", series_id: "movie:heat-1995", audio_track_index: 2, audio_language: "ja", track_signature: { language: "ja", codec: "aac", layout: "stereo", channels: 2 }, updated_at: "2026-01-02T03:04:05.000Z" })
+            m.assertEqual(probe.callFunc("inspect").readout.audio, "Japanese · AAC · Stereo", "a subtitle choice leaves the read alone")
+            m.pick(probe, catalog.action.SUBTITLES, catalog.pickers.AUTO)
+            m.assertEqual(probe.callFunc("inspect").readout.subtitles, "Auto · English · SRT", "Auto's subtitle follows the audio")
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.PLAY).tracks.audioIndex, 2)
+            none = m.movie()
+            m.assertTrue(m.failed(none, 2, 404))
+            m.assertEqual(none.callFunc("playIntent", catalog.action.PLAY).tracks.audioIndex, catalog.pickers.AUTO)
+        end sub
+
+        @it("starts on the subtitle the profile chose on the item, or Off")
+        sub _()
+            signature = { source: "external", language: "es", codec: "subrip", label: "", forced: false, hearing_impaired: false }
+            probe = m.movie({ effective_subtitle_track_signature: signature })
+            m.assertEqual(probe.callFunc("inspect").readout.subtitles, "Spanish · SRT")
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.PLAY).tracks.subtitleIndex, 0)
+            off = m.movie({ effective_subtitle_mode: "off", effective_show_forced_subtitles: false })
+            m.assertEqual(off.callFunc("inspect").readout.subtitles, "Off")
+            m.assertEqual(off.callFunc("playIntent", catalog.action.PLAY).tracks.subtitleIndex, playback.tracks.OFF)
+            m.pick(off, catalog.action.SUBTITLES, playback.tracks.OFF)
+            m.assertEqual(off.callFunc("writes").Count(), 0, "OK on the seeded Off changes nothing and writes nothing (W12 review)")
+        end sub
+
+        @it("names what Auto plays without the item's remembered subtitle as soon as Auto is chosen, and reads the tracks again once the write lands (run 26)")
+        sub _()
+            signature = { source: "external", language: "es", codec: "subrip", label: "", forced: false, hearing_impaired: false }
+            probe = m.movie({ effective_subtitle_track_signature: signature })
+            m.assertEqual(probe.callFunc("inspect").readout.subtitles, "Spanish · SRT")
+            first = m.sentIndex(probe, "watch", "/api/v2/watch/movie:heat-1995")
+            m.pick(probe, catalog.action.SUBTITLES, catalog.pickers.AUTO)
+            m.assertEqual(probe.callFunc("inspect").readout.subtitles, "Auto · English (Forced) · PGS", "not the Spanish just left")
+            writes = probe.callFunc("writes")
+            m.assertEqual([writes[0].request.method, writes[0].rereadId], ["DELETE", "movie:heat-1995"])
+            m.assertEqual(m.sentIndex(probe, "watch", "/api/v2/watch/movie:heat-1995"), first, "nothing read before the write lands")
+            ' A write that fails, or one a newer write replaced, reads nothing.
+            probe.callFunc("landWrite", 0, { ok: false, status: 500, headers: {}, body: invalid, error: { kind: "http" } })
+            m.assertEqual(m.sentIndex(probe, "watch", "/api/v2/watch/movie:heat-1995"), first)
+            probe.callFunc("landWrite", 0, { ok: true, status: 204, headers: {}, body: invalid })
+            at = m.sentIndex(probe, "watch", "/api/v2/watch/movie:heat-1995")
+            m.assertTrue(at > first, "the tracks read again")
+            ' The server now resolves Auto with the profile's own preferences.
+            m.answer(probe, at, tests.catalogData.selectionWatch({ effective_subtitle_language: "ja", effective_subtitle_mode: "always" }))
+            state = probe.callFunc("inspect")
+            m.assertEqual([state.choice.subtitle, state.choice.cleared], [catalog.pickers.AUTO, true], "the viewer's choice stays")
+            m.assertEqual(state.readout.subtitles, "Auto · Japanese · ASS")
+            ' A track or Off chosen reads nothing again; Auto audio does.
+            m.pick(probe, catalog.action.SUBTITLES, playback.tracks.OFF)
+            m.pick(probe, catalog.action.AUDIO, 2)
+            m.pick(probe, catalog.action.AUDIO, catalog.pickers.AUTO)
+            writes = probe.callFunc("writes")
+            m.assertEqual([writes[1].rereadId, writes[2].rereadId, writes[3].rereadId], ["", "", "movie:heat-1995"])
+            m.assertFalse(probe.callFunc("inspect").choice.cleared, "Off is the viewer's own")
+            ' A page already gone reads nothing.
+            probe.callFunc("release")
+            count = probe.callFunc("sent").Count()
+            probe.callFunc("landWrite", 3, { ok: true, status: 204, headers: {}, body: invalid })
+            m.assertEqual(probe.callFunc("sent").Count(), count)
+        end sub
+
+        @it("opens a long menu clear of its button and of the readout (run 26)")
+        sub _()
+            probe = m.movie()
+            readout = probe.findNode("selection").translation[1]
+            row = probe.findNode("actions").translation[1]
+            probe.findNode("actions").activated = catalog.action.SUBTITLES
+            picker = probe.findNode("picker")
+            m.assertEqual([picker.anchor[1], picker.clearTop], [row, readout])
+            panel = picker.findNode("panel")
+            top = panel.translation[1]
+            bottom = top + panel.height
+            m.assertTrue(bottom <= readout or top >= row + 76, "the panel runs " + top.ToStr() + " to " + bottom.ToStr())
+        end sub
+
+        @it("opens each menu on the current choice, Audio marking the track Auto plays, and Back closes it")
+        sub _()
+            probe = m.movie()
+            picker = probe.findNode("picker")
+            probe.findNode("actions").activated = catalog.action.VERSION
+            m.assertTrue(picker.visible)
+            m.assertEqual([picker.title, picker.chosen, picker.options.items.Count()], ["Version", catalog.pickers.AUTO, 3])
+            m.assertTrue(probe.callFunc("backContext").overlay)
+            probe.callFunc("onBack", nav.action.CLOSE_OVERLAY)
+            m.assertFalse(picker.visible)
+            m.assertFalse(probe.callFunc("backContext").overlay)
+            probe.findNode("actions").activated = catalog.action.AUDIO
+            items = picker.options.items
+            m.assertEqual([picker.title, picker.chosen], ["Audio", catalog.pickers.AUTO])
+            m.assertEqual([items[1].marked, items[2].marked, items[3].marked], [false, true, false], "the server's effective track")
+            probe.callFunc("onBack", nav.action.CLOSE_OVERLAY)
+            m.pick(probe, catalog.action.AUDIO, 3)
+            probe.findNode("actions").activated = catalog.action.AUDIO
+            m.assertEqual(picker.chosen, 3)
+            m.assertFalse(picker.options.items[4].marked, "a chosen track is marked as chosen")
+            probe.callFunc("onBack", nav.action.CLOSE_OVERLAY)
+            probe.findNode("actions").activated = catalog.action.SUBTITLES
+            m.assertEqual([picker.title, picker.chosen, picker.options.items[1].title], ["Subtitles", catalog.pickers.AUTO, "Off"])
+        end sub
+
+        @it("re-resolves the tracks for a version chosen, and pins the file the start names")
+        sub _()
+            probe = m.movie()
+            m.pick(probe, catalog.action.AUDIO, 3)
+            m.pick(probe, catalog.action.SUBTITLES, 2)
+            writes = probe.callFunc("writes").Count()
+            m.pick(probe, catalog.action.VERSION, 1)
+            m.assertEqual(probe.callFunc("inspect").readout, { version: "1080p", audio: "Auto · English · AC3 · 5.1", subtitles: "Auto · None" })
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.START_OVER).tracks, { fileId: "102", pinsVersion: true, audioIndex: catalog.pickers.AUTO, subtitleIndex: catalog.pickers.AUTO })
+            m.assertEqual(probe.callFunc("writes").Count(), writes, "a version is not remembered beyond the page")
+            m.pick(probe, catalog.action.AUDIO, 0)
+            m.pick(probe, catalog.action.VERSION, catalog.pickers.AUTO)
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.PLAY).tracks, { fileId: "101", pinsVersion: false, audioIndex: 0, subtitleIndex: catalog.pickers.AUTO })
+            m.assertEqual(probe.callFunc("inspect").readout.version, "Auto · 2160p · DV")
+        end sub
+
+        @it("remembers a changed Audio or Subtitles choice for the movie at once, each in its key's line")
+        sub _()
+            probe = m.movie()
+            m.pick(probe, catalog.action.AUDIO, catalog.pickers.AUTO)
+            m.pick(probe, catalog.action.SUBTITLES, catalog.pickers.AUTO)
+            m.assertEqual(probe.callFunc("writes").Count(), 0, "OK on the value already chosen writes nothing (W12 review)")
+            m.pick(probe, catalog.action.AUDIO, 2)
+            m.pick(probe, catalog.action.AUDIO, 2)
+            writes = probe.callFunc("writes")
+            m.assertEqual(writes.Count(), 1, "the same track twice")
+            m.assertEqual([writes[0].kind, writes[0].request.method, writes[0].request.path, writes[0].request.lane], ["audio", "PUT", "/api/v2/audio-prefs/movie:heat-1995", "interactive"])
+            m.assertEqual(writes[0].request.orderKey, "/api/v2/audio-prefs/movie:heat-1995", "the router keeps the key's writes in order (api.router.order)")
+            m.assertEqual(writes[0].request.body.audio_language, "ja")
+            m.pick(probe, catalog.action.AUDIO, catalog.pickers.AUTO)
+            m.pick(probe, catalog.action.AUDIO, 0)
+            m.pick(probe, catalog.action.SUBTITLES, playback.tracks.OFF)
+            writes = probe.callFunc("writes")
+            m.assertEqual(writes.Count(), 4, "each choice goes as it is made")
+            m.assertEqual([writes[1].request.method, writes[2].request.method, writes[2].request.body.audio_track_index], ["DELETE", "PUT", 0])
+            m.assertEqual([writes[3].kind, writes[3].request.method, writes[3].request.body.subtitle_mode, writes[3].request.orderKey], ["subtitle", "PUT", "off", "/api/v2/subtitle-prefs/movie:heat-1995"])
+            m.pick(probe, catalog.action.SUBTITLES, catalog.pickers.AUTO)
+            writes = probe.callFunc("release")
+            m.assertEqual([writes.Count(), writes[4].request.method, writes[4].request.path], [5, "DELETE", "/api/v2/subtitle-prefs/movie:heat-1995"], "the page's release sends nothing of its own")
+        end sub
+
+        @it("keeps the viewer's choice when the item is read again after the player closes")
+        sub _()
+            probe = m.movie()
+            m.pick(probe, catalog.action.VERSION, 1)
+            m.pick(probe, catalog.action.SUBTITLES, playback.tracks.OFF)
+            probe.callFunc("markPlaying")
+            m.cover(probe)
+            m.returned(probe, { contentId: "movie:heat-1995", seasonNumber: -1 })
+            at = m.sentIndex(probe, "played", "/api/v2/watch/movie:heat-1995")
+            m.assertTrue(at >= 0)
+            m.answer(probe, at, tests.catalogData.selectionWatch({ user_data: { position_seconds: 600, duration_seconds: 10200, played: false, last_file_id: "102", watched_count: 0, unplayed_count: 0, in_progress_count: 1 } }))
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.PLAY).tracks, { fileId: "102", pinsVersion: true, audioIndex: catalog.pickers.AUTO, subtitleIndex: playback.tracks.OFF })
+            m.assertEqual(m.buttons(probe)[0].label, "Resume 10:00")
+        end sub
+
+        @it("reads a series' remembered audio once, and carries the viewer's audio to the next episode, over a read that answers late (W12 review)")
+        sub _()
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e2", seasonNumber: 1 })
+            m.assertTrue(m.throughSeasons(probe, [1], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            m.answer(probe, 3, tests.catalogData.selectionWatch({ type: "episode", content_id: "episode:s1e2", series_id: "series:show" }))
+            m.assertEqual(m.path(probe, 4), "/api/v2/catalog/items/episode:s1e2", "the described episode's facts")
+            m.assertEqual(m.path(probe, 5), "/api/v2/audio-prefs/series:show")
+            m.assertEqual(probe.callFunc("sent")[5].request.orderKey, "/api/v2/audio-prefs/series:show", "behind the key's writes")
+            m.pick(probe, catalog.action.AUDIO, 2)
+            m.assertFalse(m.answer(probe, 5, { audio_track_index: 0, audio_language: "en" }), "the viewer chose first: the read was cancelled, and its older English never lands")
+            m.assertEqual(probe.callFunc("writes")[0].request.path, "/api/v2/audio-prefs/series:show")
+            probe.callFunc("focusEpisode", 2)
+            m.assertEqual(probe.callFunc("inspect").choice.audio, catalog.pickers.AUTO, "a new episode starts over until it is read")
+            m.assertEqual(probe.callFunc("inspect").readout, {})
+            probe.callFunc("restOnEpisode")
+            at = m.sentIndex(probe, "watch", "/api/v2/watch/episode:s1e3")
+            m.assertTrue(at >= 0)
+            m.answer(probe, at, tests.catalogData.selectionWatch({ type: "episode", content_id: "episode:s1e3", series_id: "series:show" }))
+            m.assertEqual(m.sentIndex(probe, "audioPreference", "/api/v2/audio-prefs/series:show"), 5, "read once per page")
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.PLAY).tracks, { fileId: "101", pinsVersion: false, audioIndex: 2, subtitleIndex: catalog.pickers.AUTO })
+        end sub
+    end class
+end namespace

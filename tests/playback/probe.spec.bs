@@ -1,0 +1,234 @@
+namespace tests
+
+    @suite("playback probe")
+    class PlaybackProbeTests extends rooibos.BaseTestSuite
+
+        ' A 4K HDR10 player; every probe the answers leave out says no.
+        function device(answers = {} as Object, facts = {} as Object) as Object
+            base = {
+                GetModel: "3941X",
+                GetModelType: "STB",
+                GetModelDetails: { VendorName: "Roku", ModelNumber: "3941X" },
+                GetOSVersion: { major: "15", minor: "3", revision: "4", build: "1" },
+                GetUIResolution: { name: "FHD", width: 1920, height: 1080 },
+                GetVideoMode: "2160p60",
+                GetDisplayProperties: { Hdr10: true, Hdr10Plus: false, HLG: false, DolbyVision: false }
+            }
+            base.Append(facts)
+            return tests.devices.fake(base, answers, false)
+        end function
+
+        @describe("key")
+
+        @it("names the codec, then the other options sorted, all lowercase")
+        sub _()
+            m.assertEqual(playback.probe.key("audio", { Codec: "DTS", PassThru: 1, ChCnt: 6 }), "audio:dts;chcnt=6;passthru=1")
+            m.assertEqual(playback.probe.key("video", { Codec: "hevc", Profile: "main 10", Level: "5.1" }), "video:hevc;level=5.1;profile=main 10")
+            m.assertEqual(playback.probe.key("video", { Codec: "av1" }), "video:av1")
+        end sub
+
+        @describe("H.264 ladder")
+
+        @it("reports level 4.2 at 60 fps with every profile")
+        sub _()
+            video = playback.probe.videoLadder(m.device({ "video:mpeg4 avc;level=4.2;profile=high": true, "video:mpeg4 avc;level=4.1;profile=high": true }))
+            m.assertEqual(video.evidence, "exact")
+            m.assertEqual(video.decode, [{ codec: "h264", hardware: true, profiles: ["constrained baseline", "main", "high"], levels: [42], bit_depths: [8], max_width: 1920, max_height: 1080, max_frame_rate: 60 }])
+        end sub
+
+        @it("keeps level 4.1 at 30 fps when 4.2 cannot run")
+        sub _()
+            video = playback.probe.videoLadder(m.device({ "video:mpeg4 avc;level=4.2;profile=high": invalid, "video:mpeg4 avc;level=4.1;profile=high": true }))
+            m.assertEqual(video.evidence, "exact")
+            m.assertEqual(video.decode[0].levels, [41])
+            m.assertEqual(video.decode[0].max_frame_rate, 30)
+            m.assertInvalid(video.answers["video:mpeg4 avc;level=4.2;profile=high"])
+        end sub
+
+        @it("drops High when only Main answers yes")
+        sub _()
+            video = playback.probe.videoLadder(m.device({ "video:mpeg4 avc;level=4.1;profile=main": true }))
+            m.assertEqual(video.decode[0].profiles, ["constrained baseline", "main"])
+            m.assertEqual(video.decode[0].levels, [41])
+        end sub
+
+        @describe("HEVC ladder")
+
+        @it("counts levels above 5.1 only after H4")
+        sub _()
+            answers = { "video:hevc;level=6.2;profile=main 10": true, "video:hevc;level=5.1;profile=main 10": true, "video:hevc;level=6.2;profile=main": true, "video:hevc;level=5.1;profile=main": true }
+            documented = playback.probe.videoLadder(m.device(answers))
+            m.assertEqual(documented.decode, [{ codec: "hevc", hardware: true, profiles: ["main", "main 10"], levels: [153], bit_depths: [8, 10], max_width: 3840, max_height: 2160, max_frame_rate: 60 }])
+            measured = playback.probe.videoLadder(m.device(answers), { countUndocumentedHevcLevels: true })
+            m.assertEqual(measured.decode[0].levels, [186])
+            m.assertEqual(playback.gates.probeOptions(), { countUndocumentedHevcLevels: false })
+        end sub
+
+        @it("gives Main and Main 10 their own bounds when they differ")
+        sub _()
+            video = playback.probe.videoLadder(m.device({ "video:hevc;level=5.0;profile=main 10": true, "video:hevc;level=4.1;profile=main": true }))
+            m.assertEqual(video.decode, [
+                { codec: "hevc", hardware: true, profiles: ["main"], levels: [123], bit_depths: [8], max_width: 1920, max_height: 1080, max_frame_rate: 60 },
+                { codec: "hevc", hardware: true, profiles: ["main 10"], levels: [150], bit_depths: [10], max_width: 3840, max_height: 2160, max_frame_rate: 30 }
+            ])
+        end sub
+
+        @it("removes a codec whose every probe says no")
+        sub _()
+            video = playback.probe.videoLadder(m.device({ "video:mpeg4 avc;level=4.2;profile=high": true }))
+            m.assertEqual(video.decode.Count(), 1)
+            m.assertEqual(video.decode[0].codec, "h264")
+        end sub
+
+        @describe("whole ladder")
+
+        @it("falls back to the attested platform floor when no probe can run")
+        sub _()
+            device = m.device()
+            device.unrecorded = invalid
+            video = playback.probe.videoLadder(device)
+            m.assertEqual(video.evidence, "platform_attested")
+            m.assertEqual(video.decode, [{ codec: "h264", hardware: true, bit_depths: [8], max_width: 1920, max_height: 1080, max_frame_rate: 30 }])
+        end sub
+
+        @it("reports gated shapes separately: VP9 with no other codec's bounds, AV1 bounded by the measured ladder")
+        sub _()
+            video = playback.probe.videoLadder(m.device({ "video:hevc;level=5.1;profile=main 10": true, "video:vp9;profile=profile 2": true, "video:av1": true }))
+            m.assertEqual(video.gated.vp9, { codec: "vp9", hardware: true, profiles: ["profile 2"], bit_depths: [10] }, "the VP9 answers carry no size or frame rate")
+            m.assertEqual(video.gated.av1.profiles, ["main"])
+            m.assertEqual(video.gated.av1.max_height, 2160)
+            m.assertEqual(video.decode.Count(), 1)
+        end sub
+
+        @describe("audio")
+
+        @it("always has aac and mp3, and ac3 or eac3 only when every container answers yes")
+        sub _()
+            audio = playback.probe.audioSupport(m.device({ "audio:ac3;container=mkv": true, "audio:ac3;container=mp4": true, "audio:eac3;container=mkv": true, "audio:eac3;container=mp4": false }))
+            m.assertEqual(audio.codecs, ["aac", "mp3", "ac3"])
+            m.assertFalse(audio.multichannelAac)
+        end sub
+
+        @it("records diagnostics and gated answers without claiming them")
+        sub _()
+            audio = playback.probe.audioSupport(m.device({ "audio:aac;chcnt=6": true, "audio:eac3;atmos=1": true, "audio:dts;chcnt=6;passthru=1": true, "audio:flac": true }))
+            m.assertTrue(audio.multichannelAac)
+            m.assertEqual(audio.codecs, ["aac", "mp3"])
+            m.assertEqual(audio.gated, { dts: true, flac: true, opus: false, pcm: false })
+            m.assertTrue(audio.answers["audio:eac3;atmos=1"])
+            m.assertFalse(audio.answers["audio:ac3;passthru=1"])
+        end sub
+
+        @it("never probes TrueHD, MLP, or DTS-HD")
+        sub _()
+            device = m.device()
+            playback.probe.audioSupport(device)
+            for each name in device.missing
+                m.assertFalse(name.Instr("truehd") >= 0 or name.Instr("mlp") >= 0 or name.Instr("dtshd") >= 0, name)
+            end for
+        end sub
+
+        @describe("display")
+
+        @it("normalizes the mode to its resolution class")
+        @params("2160p60", 2160, false)
+        @params("2160p60b10", 2160, false)
+        @params("2160p24Dv", 2160, true)
+        @params("4320p60", 2160, false)
+        @params("1080i", 1080, false)
+        @params("720p", 720, false)
+        @params("", 0, false)
+        sub _(mode as String, resolution as Integer, modeDolbyVision as Boolean)
+            device = m.device({}, { GetVideoMode: mode })
+            result = playback.probe.normalizedDisplay(device, playback.probe.deviceFacts(device))
+            m.assertEqual(result.resolution, resolution)
+            m.assertEqual(result.modeDolbyVision, modeDolbyVision)
+        end sub
+
+        @it("asks for display properties once more before reporting unknown")
+        sub _()
+            device = m.device({}, { GetDisplayProperties: [invalid, { Hdr10: true, HLG: true, DolbyVision: true, Hdr10Plus: false }] })
+            result = playback.probe.normalizedDisplay(device, playback.probe.deviceFacts(device))
+            m.assertEqual(device.displayCalls, 2)
+            m.assertEqual(result.evidence, "exact")
+            m.assertTrue(result.dolbyVision)
+
+            device = m.device({}, { GetDisplayProperties: [invalid, {}] })
+            result = playback.probe.normalizedDisplay(device, playback.probe.deviceFacts(device))
+            m.assertEqual(device.displayCalls, 2)
+            m.assertEqual(result.evidence, "unknown")
+            m.assertFalse(result.hdr10)
+        end sub
+
+        @it("treats a Roku TV's display as internal")
+        sub _()
+            device = m.device({}, { GetModelType: "TV" })
+            m.assertEqual(playback.probe.normalizedDisplay(device, playback.probe.deviceFacts(device)).sink, "internal")
+            device = m.device()
+            m.assertEqual(playback.probe.normalizedDisplay(device, playback.probe.deviceFacts(device)).sink, "hdmi")
+        end sub
+
+        @describe("collect")
+
+        @it("reuses a cached video ladder and still runs the audio probe")
+        sub _()
+            first = playback.probe.collect(m.device({ "video:mpeg4 avc;level=4.2;profile=high": true }))
+            device = m.device()
+            again = playback.probe.collect(device, invalid, first.video)
+            m.assertEqual(again.video.decode, first.video.decode)
+            for each name in device.missing
+                m.assertFalse(name.StartsWith("video:"), name)
+            end for
+            m.assertTrue(device.decodeCalls > 0)
+        end sub
+
+        @it("keeps one video ladder per output context and probes audio each time")
+        sub _()
+            ladders = {}
+            device = m.device({ "video:mpeg4 avc;level=4.2;profile=high": true })
+            first = playback.probe.collectCached(device, invalid, ladders)
+            m.assertEqual(ladders.Keys(), [first.outputContextId])
+            calls = device.decodeCalls
+            again = playback.probe.collectCached(device, invalid, ladders)
+            m.assertEqual(again.video.decode, first.video.decode)
+            m.assertEqual(again.outputContextId, first.outputContextId)
+            audioCalls = device.decodeCalls - calls
+            m.assertTrue(audioCalls > 0 and audioCalls < calls, "only the audio probe ran again")
+            ' Another output (a 1080p TV) gets a ladder of its own.
+            other = playback.probe.collectCached(m.device({ "video:mpeg4 avc;level=4.2;profile=high": true }, { GetVideoMode: "1080p60" }), invalid, ladders)
+            m.assertNotEqual(other.outputContextId, first.outputContextId)
+            m.assertEqual(ladders.Count(), 2)
+        end sub
+
+        @it("describes the device and falls back to Roku as the manufacturer")
+        sub _()
+            result = playback.probe.collect(m.device({}, { GetModelDetails: {} }))
+            m.assertEqual(result.device, { osVersion: "15.3.4", manufacturer: "Roku", model: "3941X", modelType: "STB", uiResolution: "fhd" })
+        end sub
+
+        @describe("outputContextId")
+
+        @it("names the resolution class, the display ranges, and the output audio")
+        sub _()
+            display = { evidence: "exact", resolution: 2160, dolbyVision: true, hdr10: true, hdr10Plus: true, hlg: true }
+            audio = { codecs: ["aac", "mp3", "ac3", "eac3"], multichannelAac: true, gated: { dts: true } }
+            m.assertEqual(playback.probe.outputContextId(display, audio), "roku:2160:dv.hdr10.hdr10plus.hlg:aac6.ac3.eac3.dts")
+        end sub
+
+        @it("marks SDR, unknown displays, and stereo-only output")
+        sub _()
+            audio = { codecs: ["aac", "mp3"], multichannelAac: false, gated: { dts: false } }
+            m.assertEqual(playback.probe.outputContextId({ evidence: "exact", resolution: 1080, dolbyVision: false, hdr10: false, hdr10Plus: false, hlg: false }, audio), "roku:1080:sdr:stereo")
+            m.assertEqual(playback.probe.outputContextId({ evidence: "unknown", resolution: 2160, dolbyVision: false, hdr10: false, hdr10Plus: false, hlg: false }, audio), "roku:2160:unknown:stereo")
+        end sub
+
+        @it("ignores the refresh rate and the mode suffix")
+        sub _()
+            a = playback.probe.collect(m.device({}, { GetVideoMode: "2160p60" }))
+            b = playback.probe.collect(m.device({}, { GetVideoMode: "2160p24b10" }))
+            m.assertEqual(a.outputContextId, b.outputContextId)
+        end sub
+
+    end class
+
+end namespace

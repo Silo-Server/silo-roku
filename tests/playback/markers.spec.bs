@@ -1,0 +1,127 @@
+namespace tests
+
+    @suite("playback markers")
+    class PlaybackMarkersTests extends rooibos.BaseTestSuite
+
+        function range(kind as String, first as Dynamic, last as Dynamic) as Object
+            return { kind: kind, start_seconds: first, end_seconds: last }
+        end function
+
+        ' Compared as JSON: brs-node boxes Doubles as Floats by how they pass
+        ' through calls (tests.viaJson).
+        sub same(actual as Dynamic, expected as Dynamic)
+            m.assertEqual(tests.viaJson(actual), tests.viaJson(expected))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("fromWatch (get_watch_state_ok.json)")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("reads the chosen version's marker_segments without their thumbnails")
+        sub _()
+            detail = tests.catalogData.fixture("get_watch_state_ok")
+            m.same(playback.markers.fromWatch(detail, "42"), [m.range("intro", 0, 90)])
+        end sub
+
+        @it("gives no markers for a version the projection does not list")
+        sub _()
+            detail = tests.catalogData.fixture("get_watch_state_ok")
+            m.same(playback.markers.fromWatch(detail, "3"), [])
+            m.same(playback.markers.fromWatch(detail, ""), [])
+            m.same(playback.markers.fromWatch(invalid, "42"), [])
+            m.same(playback.markers.fromWatch({ versions: "x" }, "42"), [])
+        end sub
+
+        @it("takes each version's own markers")
+        sub _()
+            detail = { versions: [{ file_id: "1", marker_segments: [m.range("credits", 100, 120)] }, { file_id: "2", marker_segments: [m.range("intro", 5, 50)] }] }
+            m.same(playback.markers.fromWatch(detail, "2"), [m.range("intro", 5, 50)])
+        end sub
+
+        @it("falls back to a version's single markers when it has no marker_segments")
+        sub _()
+            version = { file_id: "7", intro: { start_seconds: 10, end_seconds: 70 }, credits: { start_seconds: 2500, end_seconds: 2600 }, recap: invalid, preview: {} }
+            m.same(playback.markers.fromWatch({ versions: [version] }, "7"), [m.range("intro", 10, 70), m.range("credits", 2500, 2600)])
+        end sub
+
+        @it("keeps an empty marker_segments empty rather than falling back")
+        sub _()
+            version = { file_id: "7", marker_segments: [], intro: { start_seconds: 10, end_seconds: 70 } }
+            m.same(playback.markers.fromVersion(version), [])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("parse")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("sorts by start, then end, then kind")
+        sub _()
+            parsed = playback.markers.parse([m.range("credits", 2500, 2600), m.range("recap", 0, 30), m.range("intro", 30, 90), m.range("preview", 2500, 2550), m.range("intro", 0, 30)])
+            m.same(parsed, [m.range("intro", 0, 30), m.range("recap", 0, 30), m.range("intro", 30, 90), m.range("preview", 2500, 2550), m.range("credits", 2500, 2600)])
+        end sub
+
+        @it("drops zero, negative, and malformed ranges and unknown kinds")
+        sub _()
+            parsed = playback.markers.parse([
+                m.range("intro", 40, 40)
+                m.range("intro", 50, 45)
+                m.range("intro", -1, 20)
+                m.range("intro", "0", 20)
+                m.range("intro", 0, invalid)
+                m.range("commercial", 0, 20)
+                { start_seconds: 0, end_seconds: 20 }
+                invalid
+                "intro"
+                m.range("INTRO", 1.5, 20.25)
+            ])
+            m.same(parsed, [m.range("intro", 1.5, 20.25)])
+            m.same(playback.markers.parse(invalid), [])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("ranges")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("finds the intro holding a position, start inclusive and end exclusive")
+        sub _()
+            markers = playback.markers.parse([m.range("intro", 10, 70), m.range("intro", 600, 640)])
+            m.assertInvalid(playback.markers.activeIntro(markers, 9.9))
+            m.same(playback.markers.activeIntro(markers, 10), m.range("intro", 10, 70))
+            m.same(playback.markers.activeIntro(markers, 69.9), m.range("intro", 10, 70))
+            m.assertInvalid(playback.markers.activeIntro(markers, 70))
+            m.assertInvalid(playback.markers.activeIntro(markers, 300))
+            m.same(playback.markers.activeIntro(markers, 620), m.range("intro", 600, 640))
+            m.assertInvalid(playback.markers.activeIntro(markers, invalid))
+        end sub
+
+        @it("prefers the later of two overlapping intros and ignores other kinds")
+        sub _()
+            markers = playback.markers.parse([m.range("intro", 0, 100), m.range("intro", 50, 80), m.range("recap", 0, 200)])
+            m.same(playback.markers.activeIntro(markers, 60), m.range("intro", 50, 80))
+            m.same(playback.markers.activeIntro(markers, 90), m.range("intro", 0, 100))
+            m.assertInvalid(playback.markers.activeIntro(markers, 150))
+        end sub
+
+        @it("opens Up Next at the last credits range")
+        sub _()
+            markers = playback.markers.parse([m.range("credits", 2500, 2600), m.range("credits", 30, 60), m.range("intro", 0, 30)])
+            m.same(playback.markers.creditsStart(markers), 2500)
+            m.assertInvalid(playback.markers.creditsStart(playback.markers.parse([m.range("intro", 0, 30)])))
+        end sub
+
+        @it("gives the scrubber intro, recap, and credits bands, clamped to the runtime")
+        sub _()
+            markers = playback.markers.parse([m.range("intro", 10, 70), m.range("recap", 0, 10), m.range("preview", 2590, 2600), m.range("credits", 2500, 2601), m.range("credits", 2700, 2800)])
+            m.same(playback.markers.bands(markers, 2600), [m.range("recap", 0, 10), m.range("intro", 10, 70), m.range("credits", 2500, 2600)])
+            m.same(playback.markers.bands(markers).Count(), 4)
+        end sub
+
+        @it("returns band copies the caller may change")
+        sub _()
+            markers = playback.markers.parse([m.range("intro", 10, 70)])
+            bands = playback.markers.bands(markers)
+            bands[0].end_seconds = 0
+            m.same(markers[0].end_seconds, 70)
+        end sub
+    end class
+end namespace

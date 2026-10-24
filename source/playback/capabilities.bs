@@ -1,0 +1,334 @@
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/gates.bs"
+
+' The protocol v3 capability serializer (implementation plan sections 5 and
+' 6.1). Probe results, evaluated gates, and per-request inputs go in; the
+' PlaybackStartBody of contracts/api/v2/openapi.json comes out, with every
+' required member and optional members only where section 5 says they change
+' planning on purpose. The client reports facts: URLs, recipes, track ordinals,
+' and plan identities come from the server. Callers store FormatJson(body) with
+' its identity and replay that string; a body is never serialized twice.
+'
+' request: {
+'   installationId, fileId, profileId, playbackAttemptId (strings),
+'   qualityPreference ("auto" when absent), subtitleFidelity ("compatible"),
+'   startPosition (seconds, or invalid to let the server apply its resume),
+'   audioTrack: { id, index, codec, channels } or invalid, from the watch state,
+'   subtitleTrack: { id, index } or invalid,
+'   pinsVersion: true when a detail page's Version button chose fileId, so
+'     the attempt keeps it (allow_alternate_versions false),
+'   stereoAacRestart: true for the new attempt after a multichannel AAC plan,
+'   app: { version, build, channel },
+'   serverFeatures: the capabilities document's features (TS_COPY_FEATURE,
+'     DV8_BASE_LAYER_IDS_FEATURE)
+' }
+' A track is named by its id with its index, or by index alone when the
+' watch projection gives no id; one with neither (codec and channels only)
+' is not named and only informs the interim AAC rule.
+namespace playback.capabilities
+
+    const PROTOCOL_VERSION = 3
+    ' Signed-URL media mode (decision D-1): never header_authenticated_media_v1
+    ' or authorized_media_origins_v1, and never plan_invalidated_v1.
+    const DV8_BASE_LAYER_CLAIM = "client_dv8_base_layer_fallback_v1"
+    ' A lab prototype on a local silo-server branch (assumption AG-35): copy
+    ' remuxes packaged as MPEG-TS. Asked for on hls only when the server's
+    ' capabilities advertise it, since a server without it rejects unknown
+    ' delivery features.
+    const TS_COPY_FEATURE = "hls_copy_mpegts_v1"
+    ' G7's claim and its base-layer IDs are sent only when the server's
+    ' capabilities advertise this (assumption AG-171), since a server without
+    ' it ignores the IDs and admits every standard base layer.
+    const DV8_BASE_LAYER_IDS_FEATURE = "dv8_base_layer_compatibility_ids_v1"
+
+    ' The start body, or invalid while gate G1 keeps playback closed in this build.
+    function startBody(probe as Object, gates as Object, request as Object) as Dynamic
+        if not playback.gates.claims(gates, "G1")
+            log.warn("capabilities", "playback is closed in this build until gate G1 has evidence")
+            return invalid
+        end if
+        parts = replanParts(probe, gates, request)
+        body = {
+            installation_id: util.text(request.installationId),
+            protocol_version: PROTOCOL_VERSION,
+            client_features: parts.client_features,
+            file_id: util.text(request.fileId),
+            profile_id: util.text(request.profileId),
+            playback_attempt_id: util.text(request.playbackAttemptId),
+            quality_preference: textOr(request.qualityPreference, "auto"),
+            subtitle_fidelity_preference: textOr(request.subtitleFidelity, "compatible"),
+            client_capabilities: parts.client_capabilities,
+            client_playback_context: parts.client_playback_context
+        }
+        if util.isNumber(request.startPosition) then body.start_position = request.startPosition
+        ' A version the viewer chose on a detail page is the one this attempt
+        ' plays (tvOS's pinsVersion); otherwise the server may fall back to
+        ' another version, which omitting the member allows.
+        if util.isTrue(request.pinsVersion) then body.allow_alternate_versions = false
+        addTrack(body, "audio", request.audioTrack)
+        addTrack(body, "subtitle", request.subtitleTrack)
+        return body
+    end function
+
+    ' What a replan carries from the serializer, rebuilt from the request's own
+    ' selected track; the session adds its identities, operation, and position.
+    function replanParts(probe as Object, gates as Object, request as Object) as Object
+        return {
+            client_features: clientFeatures(gates),
+            client_capabilities: clientCapabilities(probe, gates),
+            client_playback_context: playbackContext(probe, gates, request)
+        }
+    end function
+
+    function clientFeatures(gates as Object) as Object
+        features = ["seek_reanchor_v1", "direct_stream_resume_v1"]
+        if playback.gates.claims(gates, "G13") then features.Append(["subrip_sidecar_v1", "hls_subtitle_renditions_v1"])
+        return features
+    end function
+
+    ' Decoder facts and the native output: Roku cannot enumerate sink layouts,
+    ' so audio is platform_attested and audio_passthrough is never sent.
+    function clientCapabilities(probe as Object, gates as Object) as Object
+        decode = videoDecode(probe, gates)
+        hdr = outputHdr(probe, gates)
+        return {
+            video_evidence: probe.video.evidence,
+            audio_evidence: "platform_attested",
+            codecs_video: codecsOf(decode),
+            codecs_video_hardware: codecsOf(decode),
+            codecs_audio: audioCodecs(probe, gates),
+            containers: ["mp4", "mkv"],
+            max_resolution: maxResolution(decode),
+            hdr: hdr.hdr10 or hdr.hdr10_plus or hdr.hlg or hdr.dolby_vision_profiles.Count() > 0,
+            hdr_details: hdr,
+            video_decode: decode
+        }
+    end function
+
+    function playbackContext(probe as Object, gates as Object, request as Object) as Object
+        app = request.app
+        if not util.isObject(app) then app = {}
+        context = {
+            protocol_version: PROTOCOL_VERSION,
+            form_factor: "tv",
+            app_version: util.text(app.version),
+            device: deviceContext(probe),
+            output: outputContext(probe, gates),
+            deliveries: deliveries(probe, gates, request)
+        }
+        if util.text(app.build) <> "" then context.app_build = util.text(app.build)
+        if util.text(app.channel) <> "" then context.app_channel = util.text(app.channel)
+        return context
+    end function
+
+    ' -- Video and audio -------------------------------------------------------
+
+    ' The probed H.264 and HEVC shapes, plus AV1 under G10 and VP9, narrowed
+    ' to G11's profiles, under G11.
+    function videoDecode(probe as Object, gates as Object) as Object
+        decode = []
+        for each decoder in probe.video.decode
+            decode.Push(copy(decoder))
+        end for
+        if playback.gates.claims(gates, "G11") then decode.Push(playback.gates.vp9Decoder(probe, gates))
+        if playback.gates.claims(gates, "G10") then decode.Push(copy(probe.video.gated.av1))
+        return decode
+    end function
+
+    function codecsOf(decode as Object) as Object
+        codecs = []
+        for each decoder in decode
+            if not util.contains(codecs, decoder.codec) then codecs.Push(decoder.codec)
+        end for
+        return codecs
+    end function
+
+    ' Bounded by the decoder, not the output mode (decision D-2): the Roku
+    ' downscales a 4K original on a 1080p output.
+    function maxResolution(decode as Object) as String
+        for each decoder in decode
+            if decoder.max_height >= 2160 then return "2160p"
+        end for
+        return "1080p"
+    end function
+
+    ' aac, mp3, and ac3 as probed; eac3 under G8; dts under G9; G12's codecs
+    ' (flac; opus and the tested pcm_* names only in a debug context). A codec
+    ' listed here is copied as the original bitstream.
+    function audioCodecs(probe as Object, gates as Object) as Object
+        codecs = []
+        for each codec in probe.audio.codecs
+            if codec <> "eac3" or playback.gates.claims(gates, "G8") then codecs.Push(codec)
+        end for
+        if playback.gates.claims(gates, "G9") then codecs.Push("dts")
+        if playback.gates.claims(gates, "G12") then codecs.Append(playback.gates.gatedAudioCodecs(probe, gates))
+        return codecs
+    end function
+
+    ' -- Output ---------------------------------------------------------------
+
+    ' The native output: HDR10 and HLG under G3, HDR10+ under G4 (with HDR10),
+    ' Dolby Vision P5 and P8 under G5. Each gate's predicate already applies the
+    ' section 6.1 output rule. A new AA on every call, so no two members share one.
+    function outputHdr(probe as Object, gates as Object) as Object
+        display = probe.display
+        hdr10 = playback.gates.claims(gates, "G3") and display.hdr10
+        hdr = {
+            hdr10: hdr10,
+            hdr10_plus: hdr10 and playback.gates.claims(gates, "G4"),
+            hlg: playback.gates.claims(gates, "G3") and display.hlg,
+            dolby_vision_profiles: []
+        }
+        if playback.gates.claims(gates, "G5")
+            hdr.dolby_vision_profiles = [5, 8]
+            hdr.dolby_vision_profile_levels = playback.gates.dolbyVisionLevels(gates)
+        end if
+        return hdr
+    end function
+
+    ' hdr_types mirrors hdr_details: the server rejects an exact display record
+    ' narrower than hdr_details, and an unknown record carries no types at all.
+    function outputContext(probe as Object, gates as Object) as Object
+        display = probe.display
+        record = { hdr_evidence: display.evidence, display_id: display.sink }
+        if display.evidence = "exact" then record.hdr_types = outputHdr(probe, gates)
+        return {
+            hdr_details: outputHdr(probe, gates),
+            current_sink: display.sink,
+            sink_type: display.sink,
+            display: record,
+            output_context_id: probe.outputContextId
+        }
+    end function
+
+    function deviceContext(probe as Object) as Object
+        device = probe.device
+        videoMode = "unknown"
+        if probe.display.resolution > 0 then videoMode = probe.display.resolution.ToStr() + "p"
+        return {
+            platform: "roku",
+            os_version: device.osVersion,
+            manufacturer: device.manufacturer,
+            model: device.model,
+            platform_details: { model_type: device.modelType, video_mode: videoMode, ui_resolution: device.uiResolution }
+        }
+    end function
+
+    ' -- Deliveries -----------------------------------------------------------
+
+    function deliveries(probe as Object, gates as Object, request as Object) as Object
+        decoded = codecsOf(videoDecode(probe, gates))
+        audio = audioCodecs(probe, gates)
+        copyRemux = playback.gates.claims(gates, "G14")
+        subtitles = subtitleSupport(playback.gates.claims(gates, "G13"))
+
+        original = delivery(["mp4", "mkv"], [], audio, subtitles)
+        for each codec in decoded
+            if codec <> "hevc" or playback.gates.claims(gates, "G2") then original.video_codecs.Push(codec)
+        end for
+        ' Dolby Vision reaches the device through hls; gate G6 stays off.
+        original.hdr_details = outputHdr(probe, gates)
+        if not playback.gates.claims(gates, "G6")
+            original.hdr_details.dolby_vision_profiles = []
+            original.hdr_details.Delete("dolby_vision_profile_levels")
+        end if
+        if playback.gates.claims(gates, "G7") and util.contains(request.serverFeatures, DV8_BASE_LAYER_IDS_FEATURE)
+            original.validated_claims.Push(DV8_BASE_LAYER_CLAIM)
+            original.dv8_base_layer_compatibility_ids = gates.dv8BaseLayerIds
+        end if
+
+        ' Until G14, hls lists only what a server transcode emits, so the
+        ' planner cannot choose an HEVC, AC-3, or E-AC-3 copy remux.
+        hlsVideo = ["h264"]
+        hlsAudio = ["aac"]
+        if copyRemux
+            hlsVideo = ["h264", "hevc"]
+            hlsAudio = ["aac", "ac3", "eac3"]
+        end if
+        hls = delivery(["hls"], intersect(hlsVideo, decoded), intersect(hlsAudio, audio), subtitles)
+        hls.features.Push("native_hls_playback_v1")
+        if util.contains(request.serverFeatures, TS_COPY_FEATURE) then hls.features.Push(TS_COPY_FEATURE)
+
+        ceilings = stereoCeilings(probe, request, hls.audio_decode_codecs)
+        if ceilings.original then original.max_channels = 2
+        if ceilings.hls then hls.max_channels = 2
+
+        progressive = delivery([], [], [], subtitleSupport(false))
+        progressive.enabled = false
+        progressive.supported_on_device = false
+        progressive.failure_reason = "disabled_pending_seekable_transport"
+        return { original_http: original, progressive: progressive, hls: hls }
+    end function
+
+    ' Every required DeliveryCapabilityV3 member. No passthrough, features,
+    ' transformations, or header refresh: signed URLs need no refresh.
+    function delivery(containers as Object, video as Object, audio as Object, subtitles as Object) as Object
+        return {
+            enabled: true,
+            supported_on_device: true,
+            containers: containers,
+            video_codecs: video,
+            audio_decode_codecs: audio,
+            audio_passthrough_codecs: [],
+            subtitles: subtitles,
+            features: [],
+            auth_header_refresh: false,
+            validated_claims: [],
+            transformations: []
+        }
+    end function
+
+    ' Section 6.8: sidecar text under G13, nothing styled, embedded, or bitmap.
+    function subtitleSupport(sidecar as Boolean) as Object
+        return { embedded_text: false, sidecar_text: sidecar, ass_styling: false, embedded_bitmap: false, sidecar_bitmap: false, font_attachments: false }
+    end function
+
+    ' Decision D-6, until server issue S-13: on a device without multichannel
+    ' AAC, a two-channel ceiling where the selected track would otherwise reach
+    ' it as multichannel AAC. A multichannel track that hls cannot copy is
+    ' converted there, and multichannel AAC is not offered as an original
+    ' either. The restart after a multichannel AAC plan caps hls whatever the
+    ' track. Unknown channel counts leave both off.
+    function stereoCeilings(probe as Object, request as Object, hlsAudio as Object) as Object
+        ceilings = { original: false, hls: false }
+        if probe.audio.multichannelAac then return ceilings
+        ceilings.hls = util.isTrue(request.stereoAacRestart)
+        track = request.audioTrack
+        if not util.isObject(track) or not util.isNumber(track.channels) then return ceilings
+        if track.channels <= 2 then return ceilings
+        codec = LCase(util.text(track.codec))
+        if codec = "aac" then ceilings.original = true
+        if codec = "aac" or not util.contains(hlsAudio, codec) then ceilings.hls = true
+        return ceilings
+    end function
+
+    ' -- Helpers --------------------------------------------------------------
+
+    ' Sends the server's own track identity; the client never mints ordinals.
+    sub addTrack(body as Object, kind as String, track as Dynamic)
+        if not util.isObject(track) then return
+        if util.text(track.id) <> "" then body[kind + "_track_id"] = util.text(track.id)
+        if util.isNumber(track.index) then body[kind + "_track_index"] = track.index
+    end sub
+
+    function intersect(wanted as Object, available as Object) as Object
+        out = []
+        for each item in wanted
+            if util.contains(available, item) then out.Push(item)
+        end for
+        return out
+    end function
+
+    function copy(aa as Object) as Object
+        out = {}
+        out.Append(aa)
+        return out
+    end function
+
+    function textOr(value as Dynamic, fallback as String) as String
+        if util.text(value) = "" then return fallback
+        return util.text(value)
+    end function
+
+end namespace

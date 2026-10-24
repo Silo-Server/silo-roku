@@ -1,0 +1,146 @@
+' Development-only transport harness: origin parsing and credential header selection.
+' Pure functions over strings, so they run headless. Excluded from release builds.
+namespace harness
+
+    ' Splits an absolute http(s) URL into a normalised origin, or returns invalid.
+    ' Scheme and host are lowercased and a default port is dropped, so
+    ' "HTTPS://Silo.Example:443/x" and "https://silo.example/y" share an origin.
+    ' URLs carrying credentials (user@host) are refused.
+    function parseOrigin(url as String) as Object
+        text = url.Trim()
+        schemeEnd = Instr(1, text, "://")
+        if schemeEnd < 2 then return invalid
+        scheme = LCase(Left(text, schemeEnd - 1))
+        if scheme = "https"
+            defaultPort = 443
+        else if scheme = "http"
+            defaultPort = 80
+        else
+            return invalid
+        end if
+
+        rest = Mid(text, schemeEnd + 3)
+        authorityEnd = Len(rest)
+        for each delimiter in ["/", "?", "#"]
+            position = Instr(1, rest, delimiter)
+            if position > 0 and position - 1 < authorityEnd then authorityEnd = position - 1
+        end for
+        authority = Left(rest, authorityEnd)
+        if authority = "" or Instr(1, authority, "@") > 0 or Instr(1, authority, " ") > 0 then return invalid
+
+        portText = ""
+        if Left(authority, 1) = "["
+            closing = Instr(1, authority, "]")
+            if closing = 0 then return invalid
+            host = LCase(Left(authority, closing))
+            after = Mid(authority, closing + 1)
+            if after <> ""
+                if Left(after, 1) <> ":" then return invalid
+                portText = Mid(after, 2)
+            end if
+        else
+            colon = Instr(1, authority, ":")
+            if colon > 0
+                host = LCase(Left(authority, colon - 1))
+                portText = Mid(authority, colon + 1)
+            else
+                host = LCase(authority)
+            end if
+        end if
+        if host = "" or host = "[]" then return invalid
+
+        port = defaultPort
+        if portText <> ""
+            if not isDigits(portText) or Len(portText) > 5 then return invalid
+            port = portText.ToInt()
+            if port < 1 or port > 65535 then return invalid
+        end if
+
+        origin = scheme + "://" + host
+        if port <> defaultPort then origin = origin + ":" + port.ToStr()
+        return { scheme: scheme, host: host, port: port, origin: origin, rest: Mid(rest, authorityEnd + 1) }
+    end function
+
+    ' True when both URLs are absolute http(s) URLs with the same normalised origin.
+    function sameOrigin(a as String, b as String) as Boolean
+        first = parseOrigin(a)
+        second = parseOrigin(b)
+        if first = invalid or second = invalid then return false
+        return first.origin = second.origin
+    end function
+
+    ' Validates what the viewer typed as the server address. A bare host gets
+    ' https://; plain http is reported through `insecure` so the caller can ask
+    ' before using it. Only an origin is accepted: no path, query, or fragment.
+    function normalizeServerInput(text as String) as Object
+        value = text.Trim()
+        if value = "" then return { error: "Enter a server address." }
+        if Instr(1, value, "://") = 0 then value = "https://" + value
+        parsed = parseOrigin(value)
+        if parsed = invalid then return { error: "Enter an http or https server address without a user name or password." }
+        rest = parsed.rest
+        while Right(rest, 1) = "/"
+            rest = Left(rest, Len(rest) - 1)
+        end while
+        if rest <> "" then return { error: "Enter only the server address, without a path." }
+        return { origin: parsed.origin, insecure: parsed.scheme = "http" }
+    end function
+
+    ' Resolves a plan or API URL against the configured origin. Absolute URLs are
+    ' kept as they are; the client never rewrites a server-issued URL.
+    function resolveUrl(origin as String, ref as String) as String
+        lower = LCase(ref)
+        if Left(lower, 7) = "http://" or Left(lower, 8) = "https://" then return ref
+        if Left(ref, 2) = "//"
+            parsed = parseOrigin(origin)
+            if parsed = invalid then return ref
+            return parsed.scheme + ":" + ref
+        end if
+        if Left(ref, 1) = "/" then return origin + ref
+        return origin + "/" + ref
+    end function
+
+    ' "api" when the URL is on the configured origin, otherwise "proxy".
+    function mediaOriginKind(url as String, configuredOrigin as String) as String
+        if sameOrigin(url, configuredOrigin) then return "api"
+        return "proxy"
+    end function
+
+    ' Account and profile headers for a request to `url`, or an empty map when
+    ' the URL is not on the configured origin (AGENTS.md: credentials only go to
+    ' the configured origin). `auth` holds accessToken, profileId, profileToken.
+    ' X-Profile-Token is only ever sent together with X-Profile-Id.
+    function credentialHeaders(url as String, configuredOrigin as String, auth as Object) as Object
+        headers = {}
+        if auth = invalid or not sameOrigin(url, configuredOrigin) then return headers
+        if nonEmpty(auth.accessToken) then headers["Authorization"] = "Bearer " + auth.accessToken
+        if nonEmpty(auth.profileId)
+            headers["X-Profile-Id"] = auth.profileId
+            if nonEmpty(auth.profileToken) then headers["X-Profile-Token"] = auth.profileToken
+        end if
+        return headers
+    end function
+
+    ' Converts a header map to the "Name: value" lines ContentNode.HttpHeaders takes.
+    function headerLines(headers as Object) as Object
+        lines = []
+        for each name in headers
+            lines.Push(name + ": " + headers[name])
+        end for
+        return lines
+    end function
+
+    function nonEmpty(value as Dynamic) as Boolean
+        return (type(value) = "String" or type(value) = "roString") and value <> ""
+    end function
+
+    function isDigits(text as String) as Boolean
+        if text = "" then return false
+        for i = 1 to Len(text)
+            code = Asc(Mid(text, i, 1))
+            if code < 48 or code > 57 then return false
+        end for
+        return true
+    end function
+
+end namespace

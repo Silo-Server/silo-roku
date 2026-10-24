@@ -1,0 +1,449 @@
+' Development-only transport harness worker. Runs every HTTP request the harness
+' makes, one at a time, against the configured origin only. Tokens, the profile
+' token, and request bodies stay in this thread; responses carry non-secret facts.
+' The one exception is the ContentNode handed to the player, whose HttpHeaders
+' carry credentials only when the media URL is on the configured origin.
+' Each outcome is logged to the console from allow-listed, redacted fields.
+
+const LOG_TAG = "harness"
+const REQUEST_TIMEOUT_MS = 20000
+const SUBTITLE_TIMEOUT_MS = 10000
+const SUBTITLE_DIR = "tmp:/harness"
+' Each send() names what happens when a request gets no HTTP answer. A lost
+' answer does not mean the server did nothing, so only requests that are safe
+' to repeat are sent again, once, with the identical body: reads, and playback
+' operations whose protocol identities (attempt, sequence, replan, and stop
+' IDs) make a repeat idempotent. Sign-in and PIN checks are never repeated;
+' each PIN check counts toward the lockout and must not be retried
+' automatically (server: verifyProfilePIN is RetrySafetyNonRetryable).
+const RETRY_VERBATIM = "verbatim"
+const RETRY_NEVER = "never"
+
+sub init()
+    m.top.functionName = "work"
+end sub
+
+sub work()
+    port = CreateObject("roMessagePort")
+    m.top.observeField("request", port)
+    info = CreateObject("roDeviceInfo")
+    appInfo = CreateObject("roAppInfo")
+    m.client = {
+        deviceId: "roku-dev-harness-" + harness.newUuid(),
+        deviceName: info.GetModelDisplayName(),
+        version: appInfo.GetVersion(),
+        build: appInfo.GetValue("build_version")
+    }
+    m.origin = ""
+    m.subtitleSlot = 0
+    clearAccount()
+
+    while true
+        msg = wait(0, port)
+        if type(msg) = "roSGNodeEvent"
+            request = msg.getData()
+            if request.op = "quit"
+                stopSession()
+                return
+            end if
+            if request.op <> "cleared"
+                result = handle(request)
+                logOutcome(request, result)
+                result.op = request.op
+                result.owner = request.owner
+                m.top.response = result
+            end if
+        end if
+    end while
+end sub
+
+function handle(request as Object) as Object
+    if request.op = "connect" then return connect(request.origin)
+    if request.op = "login" then return login(request)
+    if request.op = "profiles" then return listProfiles()
+    if request.op = "selectProfile" then return selectProfile(request)
+    if request.op = "watch" then return watch(request.itemId)
+    if request.op = "start" then return start(request)
+    if request.op = "progress" then return progress(request)
+    if request.op = "replan" then return replan(request)
+    if request.op = "stop" then return stopSession(harness.numberOr(request.position, 0), util.isTrue(request.isPaused))
+    return failure("unknown request")
+end function
+
+' One console line per outcome. Successful progress posts are left out, and
+' stopSession() logs its own, since start, sign-in, and profile changes stop too.
+sub logOutcome(request as Object, result as Object)
+    if request.op = "stop" or (request.op = "progress" and util.isTrue(result.ok)) then return
+    message = request.op
+    if request.op = "replan" then message = "replan " + request.operation + " at " + harness.formatDecimal(request.position)
+    if util.isTrue(result.ok)
+        log.info(LOG_TAG, message, harness.outcomeFields(result))
+    else
+        log.warn(LOG_TAG, message + " failed", harness.outcomeFields(result))
+    end if
+end sub
+
+' --- Account ---------------------------------------------------------------
+
+sub clearAccount()
+    m.auth = { accessToken: "", profileId: "", profileToken: "" }
+    m.installationId = ""
+    m.session = invalid
+end sub
+
+' Checks the origin with the unauthenticated system info route before any
+' credential is sent to it. Changing the origin drops every credential.
+function connect(text as String) as Object
+    stopSession()
+    clearAccount()
+    m.origin = ""
+    normalized = harness.normalizeServerInput(text)
+    if normalized.error <> invalid then return failure(normalized.error)
+    m.origin = normalized.origin
+    reply = send("GET", "/api/v2/system/info", invalid, false, RETRY_VERBATIM)
+    if reply.status <> 200 or reply.json = invalid
+        m.origin = ""
+        return problem("Server check failed", reply)
+    end if
+    if reply.json.api_major <> 2
+        m.origin = ""
+        return failure("Server update required (api_major is not 2)")
+    end if
+    return { ok: true, serverVersion: harness.stringOr(reply.json.server_version, "") }
+end function
+
+' The password exists only in this request; the Task overwrites the request
+' field as soon as the body is built, and nothing keeps or logs it.
+function login(request as Object) as Object
+    if m.origin = "" then return failure("Check the server first")
+    stopSession()
+    clearAccount()
+    body = { username: request.username, password: request.password }
+    m.top.request = { op: "cleared" }
+    reply = send("POST", "/api/v2/auth/login", body, false, RETRY_NEVER)
+    if reply.status <> 200 or reply.json = invalid or not harness.nonEmpty(reply.json.access_token) then return problem("Sign-in failed", reply)
+    m.auth.accessToken = reply.json.access_token
+    username = ""
+    if reply.json.user <> invalid then username = harness.stringOr(reply.json.user.username, "")
+    return { ok: true, username: username }
+end function
+
+function listProfiles() as Object
+    reply = send("GET", "/api/v2/profiles", invalid, true, RETRY_VERBATIM)
+    if reply.status <> 200 or reply.json = invalid then return problem("Profiles failed", reply)
+    profiles = []
+    for each item in harness.arrayOr(reply.json.items)
+        profiles.Push({ id: item.id, name: harness.stringOr(item.name, item.id), hasPin: item.has_pin = true })
+    end for
+    return { ok: true, profiles: profiles }
+end function
+
+' Verifies the PIN when one is given and keeps the profile token in this
+' thread. A wrong PIN is 200 with valid false; a lockout is 429 with Retry-After.
+function selectProfile(request as Object) as Object
+    stopSession()
+    m.auth.profileId = ""
+    m.auth.profileToken = ""
+    m.installationId = ""
+    if harness.nonEmpty(request.pin)
+        body = { pin: request.pin }
+        m.top.request = { op: "cleared" }
+        reply = send("POST", "/api/v2/profiles/" + escape(request.profileId) + "/verify-pin", body, true, RETRY_NEVER)
+        if reply.status < 0 then return failure("The PIN check got no answer, and the server may have counted it. Enter the PIN again to retry.")
+        if reply.status = 429 then return failure("Too many incorrect PINs. Try again in " + retryAfter(reply) + ".")
+        if reply.status <> 200 or reply.json = invalid then return problem("PIN check failed", reply)
+        if reply.json.valid <> true or not harness.nonEmpty(reply.json.profile_token) then return failure("Wrong PIN")
+        m.auth.profileToken = reply.json.profile_token
+    end if
+    m.auth.profileId = request.profileId
+    return { ok: true, profileId: request.profileId }
+end function
+
+' --- Catalog ---------------------------------------------------------------
+
+' Summarises GET /api/v2/watch/{id}: file versions with their audio and
+' subtitle track choices, each carrying the ordinal the start request sends.
+function watch(itemId as String) as Object
+    if m.auth.profileId = "" then return failure("Choose a profile first")
+    reply = send("GET", "/api/v2/watch/" + escape(itemId), invalid, true, RETRY_VERBATIM)
+    if reply.status <> 200 or reply.json = invalid then return problem("Item failed", reply)
+    detail = reply.json
+    versions = []
+    for each version in harness.arrayOr(detail.versions)
+        label = harness.stringOr(version.resolution, "") + " " + harness.stringOr(version.codec_video, "") + "/" + harness.stringOr(version.codec_audio, "") + " " + harness.stringOr(version.container, "")
+        if util.isTrue(version.hdr) then label = label + " HDR"
+        versions.Push({ fileId: version.file_id, label: label, audioTracks: harness.audioChoices(version.audio_tracks), subtitleTracks: harness.subtitleChoices(version.subtitle_tracks) })
+    end for
+    defaultFileId = ""
+    variants = harness.arrayOr(detail.playback_variants)
+    if variants.Count() > 0 then defaultFileId = harness.stringOr(variants[0].default_file_id, "")
+    if defaultFileId = "" and versions.Count() > 0 then defaultFileId = versions[0].fileId
+    return { ok: true, title: harness.stringOr(detail.title, ""), versions: versions, defaultFileId: defaultFileId }
+end function
+
+' --- Playback --------------------------------------------------------------
+
+' Reads capabilities, probes the device, and posts a hand-built v3 start.
+function start(request as Object) as Object
+    if m.auth.profileId = "" then return failure("Choose a profile first")
+    stopSession()
+    reply = send("GET", "/api/v2/playback/capabilities", invalid, true, RETRY_VERBATIM)
+    if reply.status <> 200 or reply.json = invalid then return problem("Capabilities failed", reply, true)
+    capability = reply.json
+    protocols = harness.arrayOr(capability.protocol_versions)
+    features = harness.arrayOr(capability.features)
+    if capability.state <> "available" or capability.allowed <> true or not contains(protocols, 3) or not contains(features, "sequenced_progress_v1") or not harness.nonEmpty(capability.installation_id)
+        return failure("Playback is not available for this profile")
+    end if
+    m.installationId = capability.installation_id
+
+    facts = harness.probeDevice(CreateObject("roDeviceInfo"), CreateObject("roAppInfo"))
+    caps = harness.capabilities(facts, request.toggles)
+    attemptId = harness.newUuid()
+    body = harness.startBody({
+        installationId: m.installationId,
+        profileId: m.auth.profileId,
+        fileId: request.fileId,
+        attemptId: attemptId,
+        startPosition: request.startPosition,
+        audioTrackIndex: request.audioTrackIndex,
+        subtitleTrackIndex: request.subtitleTrackIndex
+    }, caps)
+    reply = send("POST", "/api/v2/playback/start", body, true, RETRY_VERBATIM)
+    if reply.status <> 201 or reply.json = invalid then return problem("Start failed", reply, true)
+    m.session = {
+        sessionId: "",
+        attemptId: attemptId,
+        caps: caps,
+        toggles: request.toggles,
+        sequence: 0,
+        stopId: harness.newUuid(),
+        attemptedKeys: []
+    }
+    return adopt(reply.json)
+end function
+
+function progress(request as Object) as Object
+    if m.session = invalid or m.session.sessionId = "" then return failure("No session")
+    m.session.sequence = m.session.sequence + 1
+    body = harness.progressBody(m.installationId, m.session.sequence, request.position, request.isPaused)
+    reply = send("POST", "/api/v2/playback/" + escape(m.session.sessionId) + "/progress", body, true, RETRY_VERBATIM)
+    if reply.status <> 200 or reply.json = invalid then return problem("Progress failed", reply, true)
+    return { ok: true, outcome: harness.stringOr(reply.json.outcome, ""), sequence: m.session.sequence }
+end function
+
+' failure_recovery after a Video error, or seek_reanchor when the plan's
+' timeline cannot seek locally. Echoes the current plan's identity.
+function replan(request as Object) as Object
+    if m.session = invalid or m.session.plan = invalid then return failure("No plan to replan")
+    session = m.session
+    plan = session.plan
+    replanRequest = {
+        installationId: m.installationId,
+        attemptId: session.attemptId,
+        planAttemptId: session.planAttemptId,
+        replanRequestId: harness.newUuid(),
+        operation: request.operation,
+        position: request.position,
+        attemptedPlanKeys: [],
+        attemptCount: 1
+    }
+    if request.operation = "failure_recovery"
+        if not contains(session.attemptedKeys, plan.plan_attempt_key) then session.attemptedKeys.Push(plan.plan_attempt_key)
+        replanRequest.attemptedPlanKeys = session.attemptedKeys
+        replanRequest.attemptCount = session.attemptedKeys.Count()
+        replanRequest.failure = { classification: harness.failureClassification(request.errorCode), message: "Roku Video errorCode " + request.errorCode.ToStr() }
+    end if
+    body = harness.replanBody(replanRequest, plan, session.caps)
+    reply = send("POST", "/api/v2/playback/" + escape(session.sessionId) + "/replan", body, true, RETRY_VERBATIM)
+    if reply.status <> 200 or reply.json = invalid then return problem("Replan failed", reply, true)
+    return adopt(reply.json)
+end function
+
+' Takes a start or replan decision: a playable plan becomes the session's
+' current plan with a freshly minted plan_attempt_id; a terminal is reported.
+function adopt(decision as Object) as Object
+    facts = harness.planFacts(decision, m.origin)
+    plan = decision.playback_plan
+    if decision.outcome <> "playable" or plan = invalid
+        m.session.plan = invalid
+        return { ok: true, playable: false, facts: facts }
+    end if
+    sessionId = harness.stringOr(decision.session_id, harness.stringOr(plan.session_id, ""))
+    if sessionId <> "" then m.session.sessionId = sessionId
+    m.session.plan = plan
+    m.session.planAttemptId = harness.newUuid()
+    if facts.streamFormat = "" then return { ok: false, playable: false, facts: facts, message: "The harness cannot map this stream's protocol and container" }
+    built = buildContent(plan)
+    m.top.content = built.content
+    return { ok: true, playable: true, facts: facts, timeline: plan.timeline, subtitles: built.subtitles, headersAttached: built.headersAttached, toggles: m.session.toggles }
+end function
+
+' DELETE /api/v2/playback/{session_id} with the session's lowercase stop_id.
+function stopSession(position = 0 as Float, isPaused = false as Boolean) as Object
+    if m.session = invalid or m.session.sessionId = ""
+        m.session = invalid
+        return { ok: true, outcome: "no_session" }
+    end if
+    session = m.session
+    m.session = invalid
+    session.sequence = session.sequence + 1
+    body = harness.stopBody(m.installationId, session.stopId, session.sequence, position, isPaused)
+    reply = send("DELETE", "/api/v2/playback/" + escape(session.sessionId), body, true, RETRY_VERBATIM)
+    if reply.status <> 200 or reply.json = invalid
+        result = problem("Stop failed", reply, true)
+        log.warn(LOG_TAG, "stop at " + harness.formatDecimal(position) + " failed", harness.outcomeFields(result))
+        return result
+    end if
+    result = { ok: true, outcome: harness.stringOr(reply.json.outcome, "") }
+    log.info(LOG_TAG, "stop at " + harness.formatDecimal(position), harness.outcomeFields(result))
+    return result
+end function
+
+' One ContentNode per plan. Headers only for the configured origin; the
+' subtitle sidecar is offered as a native URL track and as a tmp:/ copy.
+function buildContent(plan as Object) as Object
+    url = harness.resolveUrl(m.origin, plan.stream.url)
+    headers = harness.credentialHeaders(url, m.origin, m.auth)
+    content = CreateObject("roSGNode", "ContentNode")
+    content.title = "Transport harness"
+    content.url = url
+    content.streamFormat = harness.streamFormat(plan.stream)
+    content.playStart = plan.timeline.player_start_seconds
+    if headers.Count() > 0 then content.httpHeaders = harness.headerLines(headers)
+    if m.session.toggles.forwardQueryParams = false then content.forwardQueryStringParams = false
+
+    subtitles = { format: "none", native: false, local: false, localStatus: 0, offsetApplied: false }
+    artifact = harness.subtitleArtifact(plan)
+    if artifact <> invalid
+        offset = harness.numberOr(plan.timeline.timeline_offset_seconds, 0)
+        subtitleUrl = harness.subtitleUrlForPlayer(harness.resolveUrl(m.origin, artifact.url), artifact.format, offset)
+        subtitles.format = artifact.format
+        subtitles.offsetApplied = offset = 0 or artifact.format = "vtt"
+        tracks = [{ Language: artifact.language, TrackName: subtitleUrl, Description: "Native URL" }]
+        subtitles.native = true
+        if artifact.format = "vtt" or artifact.format = "srt"
+            ' Two names in turn: the previous plan may still be reading the last copy.
+            m.subtitleSlot = 1 - m.subtitleSlot
+            path = SUBTITLE_DIR + "/sidecar" + m.subtitleSlot.ToStr() + "." + artifact.format
+            subtitles.localStatus = download(subtitleUrl, path)
+            if subtitles.localStatus = 200
+                tracks.Push({ Language: artifact.language, TrackName: path, Description: "tmp copy" })
+                subtitles.local = true
+            end if
+        end if
+        content.subtitleTracks = tracks
+    end if
+    return { content: content, subtitles: subtitles, headersAttached: headers.Count() > 0 }
+end function
+
+' --- Transport -------------------------------------------------------------
+
+function baseHeaders() as Object
+    return {
+        "Accept": "application/json, application/problem+json",
+        "X-Silo-Client": "Silo Roku",
+        "X-Silo-Client-Version": m.client.version,
+        "X-Silo-Client-Build": m.client.build,
+        "X-Silo-Client-Channel": "dev",
+        "X-Silo-Device-Id": m.client.deviceId,
+        "X-Silo-Device-Name": m.client.deviceName,
+        "X-Silo-Device-Platform": "roku"
+    }
+end function
+
+' Sends one request to the configured origin. A transport failure (no HTTP
+' answer) is retried once with the identical body string only when retry is
+' RETRY_VERBATIM.
+function send(method as String, path as String, body as Dynamic, authenticated as Boolean, retry as String) as Object
+    url = m.origin + path
+    headers = baseHeaders()
+    if authenticated then headers.Append(harness.credentialHeaders(url, m.origin, m.auth))
+    payload = invalid
+    if body <> invalid
+        payload = FormatJson(body)
+        headers["Content-Type"] = "application/json"
+    end if
+    reply = transfer(method, url, headers, payload)
+    if reply.status < 0 and retry = RETRY_VERBATIM then reply = transfer(method, url, headers, payload)
+    return reply
+end function
+
+function transfer(method as String, url as String, headers as Object, payload as Dynamic) as Object
+    port = CreateObject("roMessagePort")
+    xfer = newTransfer(url, headers, port)
+    xfer.SetRequest(method)
+    if payload = invalid
+        started = xfer.AsyncGetToString()
+    else
+        started = xfer.AsyncPostFromString(payload)
+    end if
+    if not started then return { status: -1000, json: invalid }
+    msg = wait(REQUEST_TIMEOUT_MS, port)
+    if type(msg) <> "roUrlEvent"
+        xfer.AsyncCancel()
+        return { status: -1001, json: invalid }
+    end if
+    text = msg.GetString()
+    json = invalid
+    if text <> "" then json = ParseJson(text)
+    return { status: msg.GetResponseCode(), json: json, headers: msg.GetResponseHeaders() }
+end function
+
+' Downloads an API-origin subtitle artifact under the same header rule as media.
+function download(url as String, path as String) as Integer
+    CreateDirectory(SUBTITLE_DIR)
+    DeleteFile(path)
+    port = CreateObject("roMessagePort")
+    headers = { "X-Silo-Client": "Silo Roku" }
+    headers.Append(harness.credentialHeaders(url, m.origin, m.auth))
+    xfer = newTransfer(url, headers, port)
+    if not xfer.AsyncGetToFile(path) then return -1000
+    msg = wait(SUBTITLE_TIMEOUT_MS, port)
+    if type(msg) <> "roUrlEvent"
+        xfer.AsyncCancel()
+        return -1001
+    end if
+    return msg.GetResponseCode()
+end function
+
+function newTransfer(url as String, headers as Object, port as Object) as Object
+    xfer = CreateObject("roUrlTransfer")
+    xfer.SetMessagePort(port)
+    xfer.SetUrl(url)
+    xfer.SetCertificatesFile("common:/certs/ca-bundle.crt")
+    xfer.EnableEncodings(true)
+    xfer.RetainBodyOnError(true)
+    xfer.SetHeaders(headers)
+    return xfer
+end function
+
+' --- Helpers ---------------------------------------------------------------
+
+function failure(message as String) as Object
+    return { ok: false, message: message }
+end function
+
+' Summarises a failed reply by status and Problem type. Playback routes
+' (`withDetail`) add the Problem's redacted detail and field errors, so a
+' rejected start or replan says why; sign-in and PIN replies never do, since
+' their Problems may echo input. Transport failure reasons are not shown.
+function problem(context as String, reply as Object, withDetail = false as Boolean) as Object
+    return { ok: false, status: reply.status, message: harness.problemMessage(context, reply.status, reply.json, withDetail) }
+end function
+
+function retryAfter(reply as Object) as String
+    if reply.headers <> invalid and harness.nonEmpty(reply.headers["retry-after"]) then return reply.headers["retry-after"] + " seconds"
+    return "a few minutes"
+end function
+
+function escape(text as String) as String
+    return CreateObject("roUrlTransfer").Escape(text)
+end function
+
+function contains(values as Object, wanted as Dynamic) as Boolean
+    for each value in values
+        if value = wanted then return true
+    end for
+    return false
+end function

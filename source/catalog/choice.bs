@@ -1,0 +1,184 @@
+import "pkg:/source/catalog/pickers.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/playback/tracks.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' A detail page's Version, Audio, and Subtitles choices over a
+' catalog.selection (spec section 5.6), pure, for the render thread, as
+' tvOS makes them (silo-apple b90a86ea, TVItemDetailView and
+' TVPlaybackSelectorRow). A choice is
+'
+'     { fileId, audio, subtitle, cleared }
+'
+' fileId is the version the viewer chose, or "" for Auto, which plays the
+' selection's defaultFile; audio an ordinal or playback.tracks.AUTO;
+' subtitle an ordinal, playback.tracks.OFF, or AUTO; cleared whether the
+' viewer's last Subtitles pick on the page was Auto, which deleted the
+' subtitle the profile last chose on the item, so Auto no longer plays it
+' (tvOS's subtitleOverrideCleared). Version lasts while the
+' page does, as on tvOS (the server's last_file_id makes the version played
+' Auto's next time); Audio and Subtitles are remembered as track preferences
+' (preferenceWrite).
+namespace catalog.choice
+    ' The choice a page starts with for a selection: Auto, with the
+    ' subtitle the profile chose on this item (catalog.selection's
+    ' subtitleSeed). The remembered audio track arrives separately
+    ' (seedAudio).
+    function initial(selection as Dynamic) as Object
+        out = { fileId: "", audio: playback.tracks.AUTO, subtitle: playback.tracks.AUTO, cleared: false }
+        if selection <> invalid then out.subtitle = versionOf(selection, out).subtitleSeed
+        return out
+    end function
+
+    ' The version the choice plays: the one chosen, else Auto's.
+    function versionOf(selection as Object, choice as Object) as Object
+        wanted = choice.fileId
+        if wanted = "" then wanted = selection.defaultFile
+        for each entry in selection.versions
+            if entry.fileId = wanted then return entry
+        end for
+        return selection.versions[0]
+    end function
+
+    ' The Version menu's value for the choice: its place in the versions,
+    ' or AUTO.
+    function versionValue(selection as Object, choice as Object) as Integer
+        if choice.fileId = "" then return playback.tracks.AUTO
+        for i = 0 to selection.versions.Count() - 1
+            if selection.versions[i].fileId = choice.fileId then return i
+        end for
+        return playback.tracks.AUTO
+    end function
+
+    ' The choice after the Version menu's value: a version, or AUTO. As on
+    ' tvOS, an audio or subtitle choice stays when the version has a track
+    ' at the same ordinal, and otherwise goes back to Auto; Auto stays Auto.
+    function withVersion(selection as Object, choice as Object, value as Integer) as Object
+        out = { fileId: "", audio: choice.audio, subtitle: choice.subtitle, cleared: util.isTrue(choice.cleared) }
+        if value >= 0 and value < selection.versions.Count() then out.fileId = selection.versions[value].fileId
+        entry = versionOf(selection, out)
+        if out.audio >= entry.audio.Count() then out.audio = playback.tracks.AUTO
+        if out.subtitle >= entry.subtitles.Count() then out.subtitle = playback.tracks.AUTO
+        return out
+    end function
+
+    ' The audio track the start plays, as far as the page can tell: the one
+    ' chosen, else Auto's (catalog.selection's autoAudio); -1 without tracks.
+    function audioInEffect(entry as Object, choice as Object) as Integer
+        if choice.audio >= 0 and choice.audio < entry.audio.Count() then return choice.audio
+        return entry.autoAudio
+    end function
+
+    ' The subtitle Auto plays beside the audio in effect: an ordinal or OFF,
+    ' without the item's remembered subtitle once the page cleared it.
+    function autoSubtitle(entry as Object, choice as Object) as Integer
+        plays = entry.autoSubtitles
+        if util.isTrue(choice.cleared) then plays = entry.clearedAutoSubtitles
+        at = audioInEffect(entry, choice)
+        if at < 0 or at >= plays.Count() then at = 0
+        return plays[at]
+    end function
+
+    ' The readout above the action row, { version, audio, subtitles }, as
+    ' tvOS's TVPlaybackSelectionSummary words it: "Auto · 2160p · DV",
+    ' "Auto · English · EAC3 · 5.1", "Auto · None" or "Off" or "English
+    ' (SDH) · SRT". A value Auto chose carries "Auto · ".
+    function readout(selection as Object, choice as Object, copy as Object) as Object
+        entry = versionOf(selection, choice)
+        auto = i18n.lookup(copy, "detail.auto")
+        version = entry.compact
+        if choice.fileId = "" and version <> auto then version = catalog.pickers.autoValue(version, copy)
+        at = audioInEffect(entry, choice)
+        audio = i18n.lookup(copy, "detail.unknown")
+        if at >= 0 then audio = entry.audio[at].summary
+        if choice.audio < 0 then audio = catalog.pickers.autoValue(audio, copy)
+        if choice.subtitle = playback.tracks.OFF
+            subtitles = i18n.lookup(copy, "detail.off")
+        else if choice.subtitle >= 0 and choice.subtitle < entry.subtitles.Count()
+            subtitles = entry.subtitles[choice.subtitle].summary
+        else
+            resolved = autoSubtitle(entry, choice)
+            name = i18n.lookup(copy, "detail.none")
+            if resolved >= 0 then name = entry.subtitles[resolved].summary
+            subtitles = catalog.pickers.autoValue(name, copy)
+        end if
+        return { version: version, audio: audio, subtitles: subtitles }
+    end function
+
+    ' Which buttons open a menu, as tvOS enables them: Version once the
+    ' item has a version, Audio when the version has a track, and Subtitles
+    ' always, since Auto may play none.
+    function enabled(selection as Dynamic, choice as Object) as Object
+        if selection = invalid then return { version: false, audio: false, subtitles: false }
+        return { version: true, audio: versionOf(selection, choice).audio.Count() > 0, subtitles: true }
+    end function
+
+    ' The audio a page starts with when the profile chose a track for this
+    ' series or movie (catalog.selection.audioPreferenceOf's answer, or
+    ' invalid), as the server resolves the choice for a start without one
+    ' (silo-server playback.SelectAudioTrack): the track matching its
+    ' signature, the exact language tag first; else the track at its
+    ' ordinal when that is still in its language; else the best track in
+    ' its language (catalog.selection's audioByLanguage). AUTO otherwise.
+    function seedAudio(entry as Object, preference as Dynamic) as Integer
+        if not util.isObject(preference) then return playback.tracks.AUTO
+        language = playback.tracks.languageKey(preference.language)
+        signature = preference.signature
+        if util.isObject(signature)
+            found = playback.tracks.AUTO
+            rank = 2
+            for i = 0 to entry.audio.Count() - 1
+                track = entry.audio[i].pref.track_signature
+                if matchesSignature(track, signature)
+                    exact = 1
+                    if LCase(track.language) = LCase(signature.language) then exact = 0
+                    if exact < rank
+                        found = i
+                        rank = exact
+                    end if
+                end if
+            end for
+            if found >= 0 then return found
+        end if
+        at = preference.index
+        if at >= 0 and at < entry.audio.Count() and playback.tracks.languageKey(entry.audio[at].pref.audio_language) = language then return at
+        if language <> "" and entry.audioByLanguage.DoesExist(language) then return entry.audioByLanguage[language]
+        return playback.tracks.AUTO
+    end function
+
+    ' The server's audioTrackMatchesSignature: the same language, and the
+    ' same title, embedded title, codec, layout, and channel count, any case.
+    function matchesSignature(track as Object, signature as Object) as Boolean
+        if playback.tracks.languageKey(track.language) <> playback.tracks.languageKey(signature.language) then return false
+        for each name in ["title", "embedded_title", "codec", "layout"]
+            if LCase(track[name]) <> LCase(signature[name]) then return false
+        end for
+        return track.channels = signature.channels
+    end function
+
+    ' The request that remembers the choice's audio (kind "audio") or
+    ' subtitle ("subtitle") for the selection's series or movie, as tvOS's
+    ' TrackSelectionPersistence does: the track, Off (subtitles), or for
+    ' Auto a delete, so the profile's own preferences apply again.
+    function preferenceWrite(selection as Object, choice as Object, kind as String) as Object
+        entry = versionOf(selection, choice)
+        body = invalid
+        if kind = "audio"
+            if choice.audio >= 0 then body = entry.audio[choice.audio].pref
+        else if choice.subtitle = playback.tracks.OFF
+            body = { subtitle_language: "", subtitle_track_index: -1, subtitle_mode: "off" }
+        else if choice.subtitle >= 0
+            body = entry.subtitles[choice.subtitle].pref
+        end if
+        return catalog.request.savePreference(kind, selection.key, body)
+    end function
+
+    ' The audio preference a write leaves on the server, for later episodes
+    ' of the series (seedAudio): the chosen track's, or invalid for Auto.
+    function rememberedAudio(selection as Object, choice as Object) as Dynamic
+        if choice.audio < 0 then return invalid
+        pref = versionOf(selection, choice).audio[choice.audio].pref
+        return { index: pref.audio_track_index, language: pref.audio_language, signature: pref.track_signature }
+    end function
+end namespace

@@ -1,0 +1,282 @@
+import "pkg:/components/screens/firstRun.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/onboarding/address.bs"
+import "pkg:/source/onboarding/signin.bs"
+
+' The server card 44 px above the headline; the fields 20 px apart, and
+' Show/Hide 16 px after the password. Without the fields, the error goes 20
+' px under the body and the buttons 56 px under it, as on tvOS's message
+' screens.
+const LEAD_GAP = 44
+const FIELD_GAP = 20
+const REVEAL_GAP = 16
+const ALONE_ERROR_GAP = 20
+const ALONE_BUTTONS_GAP = 56
+
+sub init()
+    m.layout = m.top.findNode("layout")
+    m.layout.headline = i18n.text("signIn.headline")
+    m.server = m.top.findNode("server")
+    m.form = m.top.findNode("form")
+    m.usernameField = styleField(m.top.findNode("username"), i18n.text("signIn.username"), i18n.text("signIn.username"))
+    m.passwordRow = m.top.findNode("passwordRow")
+    ' Show/Hide is as wide as its wider label, so the field beside it keeps
+    ' its width.
+    m.reveal = styleButton(m.top.findNode("reveal"), i18n.text("signIn.hide"))
+    hideWidth = Int(m.reveal.localBoundingRect().width)
+    m.reveal.text = i18n.text("signIn.show")
+    revealWidth = Int(m.reveal.localBoundingRect().width)
+    if hideWidth > revealWidth then revealWidth = hideWidth
+    m.reveal.width = revealWidth
+    m.passwordField = styleField(m.top.findNode("password"), i18n.text("signIn.password"), i18n.text("signIn.password"))
+    m.passwordField.width = FORM_WIDTH - REVEAL_GAP - revealWidth
+    m.reveal.translation = [FORM_WIDTH - revealWidth, (theme.firstRun.FIELD_HEIGHT - theme.firstRun.BUTTON_HEIGHT) \ 2]
+    m.errorLabel = styleFormLabel(m.top.findNode("error"), theme.textStyle.FIELD_ERROR, theme.color.ERROR)
+    m.buttonRow = m.top.findNode("buttons")
+    m.signIn = styleButton(m.top.findNode("signIn"), i18n.text("signIn.submit"))
+    m.retry = styleButton(m.top.findNode("retry"), i18n.text("common.tryAgain"))
+    m.changeServer = styleButton(m.top.findNode("changeServer"), i18n.text("common.changeServer"), true)
+    ' Down from Show/Hide lands on Sign in.
+    m.controlEnterFirst = [2]
+    m.spinner = m.top.findNode("spinner")
+    m.username = ""
+    m.password = ""
+    ' The field the keyboard is open for.
+    m.typing = ""
+    m.revealed = false
+    m.errorKey = ""
+    m.errorValues = invalid
+    ' "loading", "ready", or "unavailable" (auth/providers).
+    m.state = "loading"
+    m.request = invalid
+end sub
+
+sub onShow(event as Object)
+    if event.first
+        m.host = onboarding.address.hostOf(sessionOrigin())
+        m.server.url = sessionOrigin()
+        m.layout.body = i18n.text("signIn.body", { server: m.host })
+        checkSetup()
+    end if
+    m.layout.callFunc("showMesh", true)
+    m.top.prompting = m.state <> "loading"
+    focusScreen()
+end sub
+
+sub onHide()
+    m.top.prompting = false
+    m.layout.callFunc("showMesh", false)
+end sub
+
+sub onRelease()
+    m.top.prompting = false
+    m.password = ""
+end sub
+
+' GET /api/v2/system/setup first: a server still waiting for its first
+' administrator shows tvOS's "This server isn't ready" instead (F15).
+sub checkSetup()
+    m.state = "loading"
+    m.top.prompting = false
+    send("onSetup")
+    api.session.setupStatus(m.request)
+    refresh()
+end sub
+
+sub onSetup(event as Object)
+    result = takeResult(event)
+    if result = invalid then return
+    if onboarding.signin.setupState(result) = onboarding.signin.SETUP_NEEDED
+        nav.replace(nav.route.SERVER_NOT_READY, {})
+        return
+    end if
+    loadProviders()
+end sub
+
+' GET /api/v2/auth/providers: whether this server allows password sign-in.
+sub loadProviders()
+    m.state = "loading"
+    m.errorKey = ""
+    m.top.prompting = false
+    send("onProviders")
+    api.session.providers(m.request)
+    refresh()
+end sub
+
+sub onProviders(event as Object)
+    result = takeResult(event)
+    if result = invalid then return
+    providers = onboarding.signin.providersState(result)
+    if providers = onboarding.signin.PASSWORD_OFF
+        nav.replace(nav.route.PASSWORD_UNAVAILABLE, {})
+        return
+    end if
+    if providers = onboarding.signin.READY
+        enter("ready")
+    else
+        enter("unavailable")
+    end if
+end sub
+
+' The fields once the server allows password sign-in, or, when it could not
+' say, the error with Try again, said before it (spec section 12.5).
+sub enter(state as String)
+    m.state = state
+    if state = "unavailable"
+        m.errorKey = "signIn.error.providers"
+        m.errorValues = { server: m.host }
+    end if
+    refresh()
+    setControlRows(controlRowsNow(), true, [m.errorLabel.text])
+    m.top.prompting = true
+end sub
+
+function controlRowsNow() as Object
+    if m.state = "ready" then return [[m.usernameField], [m.passwordField, m.reveal], [m.signIn, m.changeServer]]
+    if m.state = "unavailable" then return [[m.retry, m.changeServer]]
+    return []
+end function
+
+sub refresh()
+    m.usernameField.text = m.username
+    m.passwordField.text = onboarding.signin.shown(m.password, m.revealed)
+    if m.revealed
+        m.reveal.text = i18n.text("signIn.hide")
+        m.reveal.audioText = i18n.text("signIn.hidePassword")
+    else
+        m.reveal.text = i18n.text("signIn.show")
+        m.reveal.audioText = i18n.text("signIn.showPassword")
+    end if
+    if m.request <> invalid and m.state = "ready"
+        m.signIn.text = i18n.text("signIn.submitting")
+    else
+        m.signIn.text = i18n.text("signIn.submit")
+    end if
+    m.errorLabel.text = ""
+    if m.errorKey <> "" then m.errorLabel.text = i18n.text(m.errorKey, m.errorValues)
+    ready = m.state = "ready"
+    m.passwordField.error = ready and m.errorKey <> ""
+    m.form.visible = m.state <> "loading"
+    m.usernameField.visible = ready
+    m.passwordRow.visible = ready
+    m.errorLabel.visible = m.errorKey <> ""
+    m.signIn.visible = ready
+    m.retry.visible = m.state = "unavailable"
+    placeInRow([m.signIn, m.retry, m.changeServer], BUTTON_GAP)
+    field = theme.firstRun.FIELD_HEIGHT
+    if ready
+        parts = [[m.usernameField, field, 0], [m.passwordRow, field, FIELD_GAP]]
+        if m.errorKey <> "" then parts.Push([m.errorLabel, labelHeight(m.errorLabel), ERROR_GAP])
+        parts.Push([m.buttonRow, theme.firstRun.BUTTON_HEIGHT, BUTTONS_GAP])
+        arrangeColumn(m.layout, m.server, LEAD_GAP, m.form, FORM_GAP, stackForm(parts))
+    else if m.state = "unavailable"
+        parts = [[m.errorLabel, labelHeight(m.errorLabel), 0], [m.buttonRow, theme.firstRun.BUTTON_HEIGHT, ALONE_BUTTONS_GAP]]
+        arrangeColumn(m.layout, m.server, LEAD_GAP, m.form, ALONE_ERROR_GAP, stackForm(parts))
+    else
+        ' The spinner holds the fields' place, so they appear where it was.
+        height = 2 * field + FIELD_GAP
+        top = arrangeColumn(m.layout, m.server, LEAD_GAP, invalid, FORM_GAP, height)
+        spin(m.spinner, true, [theme.firstRun.SIDE + FORM_WIDTH \ 2, top + height \ 2])
+        return
+    end if
+    spin(m.spinner, false, [0, 0])
+end sub
+
+sub showError(key as String)
+    m.errorKey = key
+    m.errorValues = invalid
+    refresh()
+    speak(m.errorLabel.text)
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if m.request <> invalid
+        ' Back stops a sign-in, and nothing else acts until it answers. While
+        ' system/setup or auth/providers loads, Back acts as it would without
+        ' the spinner.
+        if key <> "back" then return true
+        if m.state = "loading" then return false
+        stopRequest()
+        return true
+    end if
+    if moveHighlight(key) then return true
+    if key = "OK"
+        activate(highlightedControl())
+        return true
+    end if
+    return false
+end function
+
+sub activate(control as Dynamic)
+    if control = invalid then return
+    if control.isSameNode(m.usernameField)
+        m.typing = "username"
+        m.panel = openKeyboard(m.panel, { title: i18n.text("signIn.username"), text: m.username, hint: "", secure: false, revealable: false, domain: "alphanumeric", maxLength: 128 })
+    else if control.isSameNode(m.passwordField)
+        m.typing = "password"
+        m.panel = openKeyboard(m.panel, { title: i18n.text("signIn.password"), text: m.password, hint: "", secure: true, revealable: true, domain: "password", maxLength: 256 })
+    else if control.isSameNode(m.reveal)
+        m.revealed = not m.revealed
+        refresh()
+        speak(m.reveal.audioText)
+    else if control.isSameNode(m.signIn)
+        submit()
+    else if control.isSameNode(m.retry)
+        loadProviders()
+    else if control.isSameNode(m.changeServer)
+        nav.push(nav.route.SETUP, { pushed: true })
+    end if
+end sub
+
+sub onKeyboardClosed()
+    entry = m.panel.callFunc("takeText")
+    focusScreen()
+    if m.typing = "username"
+        m.username = entry
+        if entry.Trim() <> "" then highlightControl(m.passwordField)
+    else
+        m.password = entry
+        if entry <> "" then highlightControl(m.signIn)
+    end if
+    m.errorKey = ""
+    refresh()
+end sub
+
+' POST /api/v2/auth/login, once per press: a sign-in is never sent again on
+' its own, whatever the answer.
+sub submit()
+    missing = onboarding.signin.missingField(m.username, m.password)
+    if missing <> ""
+        showError(onboarding.signin.missingKey(missing))
+        if missing = "username"
+            highlightControl(m.usernameField)
+        else
+            highlightControl(m.passwordField)
+        end if
+        return
+    end if
+    m.errorKey = ""
+    send("onSignedIn")
+    api.session.signIn(m.username.Trim(), m.password, m.request)
+    refresh()
+end sub
+
+' A signed-in session moves the app on to the profiles, so only a failure
+' answers here. A wrong password is cleared for the next try.
+sub onSignedIn(event as Object)
+    result = takeResult(event)
+    if result = invalid then return
+    if result.ok then return
+    key = onboarding.signin.errorKey(result)
+    if key = "signIn.error.invalid"
+        m.password = ""
+        highlightControl(m.passwordField)
+    end if
+    showError(key)
+end sub
+
+sub stopRequest()
+    dropRequest()
+    refresh()
+end sub

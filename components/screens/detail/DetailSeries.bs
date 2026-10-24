@@ -1,0 +1,401 @@
+' A series detail page's seasons, episode rail, and active episode (spec
+' section 5.6, catalog.series): the seasons in tvOS's order, Specials last;
+' one rail across the run of loaded seasons around the season shown, keeping
+' theme.detail.RAIL_SEASONS seasons' episodes; the season pill following
+' focus across a season's edge, and the next season read as focus nears the
+' rail's end. Part of DetailScreen.
+
+sub initSeries()
+    ' The seasons in tvOS's order (catalog.series.ordered): their cards, their
+    ' catalog.series.rollup facts, and each one's episodes once read (a
+    ' RowContent, empty for a season without any; invalid until read or once
+    ' let go). m.seasonIndex is the season shown, its pill selected.
+    m.seasonNodes = []
+    m.seasonRollups = []
+    m.pages = []
+    m.seasonIndex = -1
+    m.seasonsLoading = false
+    ' The episodes on the rail, in play order over the loaded run of seasons
+    ' m.window ({ first, last } positions) around the season shown, and the
+    ' active one's index. A rail let go under memory pressure (detachRail)
+    ' shows them again on attach.
+    m.railItems = []
+    m.window = { first: -1, last: -1 }
+    m.activeIndex = -1
+    m.railAttached = true
+    ' Whether the hero describes the active episode rather than the series:
+    ' from the first episode focused or asked for, as tvOS's hero keeps it.
+    m.describing = false
+    ' Each episode's air date, runtime, and ratings (catalog.detail
+    ' .episodeFacts), by ID, from its item, read as the hero describes it.
+    m.episodeFacts = {}
+end sub
+
+sub loadSeasons()
+    m.seasonsLoading = true
+    m.seasons.loading = true
+    m.rail.loading = true
+    m.rail.message = ""
+    m.rail.action = ""
+    send(catalog.request.seasons(m.detail.id, m.libraryId), { kind: "seasons" })
+end sub
+
+sub onSeasons(result as Object, content as Dynamic)
+    m.seasonsLoading = false
+    m.seasons.loading = false
+    if result.ok <> true or content = invalid or content.getChildCount() = 0
+        m.seasonNodes = []
+        m.seasonRollups = []
+        m.pages = []
+        m.seasons.labels = { items: [] }
+        m.seasons.visible = false
+        if result.ok = true
+            showEpisodeStatus("detail.episodes.empty", false)
+        else
+            showEpisodeStatus("detail.episodes.error", true)
+        end if
+        return
+    end if
+    ' The map step keeps a season's card and its rollup in the same order.
+    nodes = content.getChildren(-1, 0)
+    rollups = result.body.seasons
+    m.seasonNodes = []
+    m.seasonRollups = []
+    m.pages = []
+    labels = []
+    for each at in catalog.series.ordered(rollups)
+        m.seasonNodes.Push(nodes[at])
+        m.seasonRollups.Push(rollups[at])
+        m.pages.Push(invalid)
+        labels.Push(catalog.series.seasonLabel(nodes[at].title, nodes[at].seasonNumber, m.copy))
+    end for
+    wanted = m.wantedSeason
+    if wanted < 0 then wanted = m.detail.playSeasonNumber
+    index = catalog.series.initialSeason(m.seasonRollups, wanted)
+    m.seasons.selected = index
+    m.seasons.labels = { items: labels }
+    m.seasons.visible = true
+    ' An episode asked for (a card's, or the player's last) is described at
+    ' once, as tvOS describes its entry episode.
+    showSeason(index, false, m.wantedEpisode <> "")
+end sub
+
+' Shows a season. chosen says the viewer switched to it, which makes its
+' first episode active (Android TV and tvOS); describe puts the active
+' episode on the hero, as a viewer's choice does. A season already read
+' moves the rail to it; another is read first, the rail keeping what it
+' shows meanwhile.
+sub showSeason(index as Integer, chosen as Boolean, describe = false as Boolean)
+    m.seasonIndex = index
+    m.seasons.selected = index
+    if m.pages[index] <> invalid
+        showPage(index, chosen, chosen or describe, true)
+        return
+    end if
+    cancelKind("episodes")
+    m.rail.message = ""
+    m.rail.action = ""
+    m.rail.loading = true
+    send(episodesRequest(index), { kind: "episodes", season: index, chosen: chosen, describe: chosen or describe })
+end sub
+
+' The read of the season at position (in tvOS's order).
+function episodesRequest(position as Integer) as Object
+    return catalog.request.episodes(m.detail.id, m.seasonNodes[position].seasonNumber, m.libraryId)
+end function
+
+' The position of season number seasonNumber in tvOS's order, or -1.
+function positionOf(seasonNumber as Integer) as Integer
+    for i = 0 to m.seasonNodes.Count() - 1
+        if m.seasonNodes[i].seasonNumber = seasonNumber then return i
+    end for
+    return -1
+end function
+
+sub onSeasonChosen()
+    index = m.seasons.chosen
+    if index <> m.seasonIndex and index >= 0 and index < m.seasonNodes.Count() then showSeason(index, true)
+end sub
+
+sub onEpisodes(entry as Object, result as Object, content as Dynamic)
+    if entry.season >= m.pages.Count() then return
+    if entry.kind = "refresh"
+        if result.ok = true and content <> invalid and m.pages[entry.season] <> invalid
+            updateEpisodes(m.pages[entry.season], content)
+            if m.railAttached then m.rail.callFunc("redraw")
+        end if
+        return
+    end if
+    if entry.kind = "neighbour"
+        ' Only a season still unread joins, and only around a season shown:
+        ' while a pill's season is on its way, it waits in m.pages.
+        if result.ok <> true or content = invalid or m.pages[entry.season] <> invalid then return
+        keepPage(entry.season, content)
+        if m.pages[m.seasonIndex] = invalid then return
+        retain()
+        id = activeId()
+        before = m.activeIndex
+        if buildWindow()
+            m.activeIndex = catalog.series.indexOf(m.railItems, id)
+            ' The cards on screen stay put as a season joins before them, and
+            ' the row slides as one joins after them.
+            presentRail(m.activeIndex, true, (m.activeIndex - before) * theme.detail.STILL_STEP)
+        end if
+        return
+    end if
+    if entry.season <> m.seasonIndex then return
+    if result.ok <> true
+        showEpisodeStatus("detail.episodes.error", true)
+        return
+    end if
+    ' A neighbour's read may have brought the season first.
+    if m.pages[entry.season] = invalid
+        if content = invalid then content = CreateObject("roSGNode", "RowContent")
+        keepPage(entry.season, content)
+    end if
+    showPage(entry.season, entry.chosen, entry.describe, false)
+    if m.refreshOnLoad then refreshAfterPlayback()
+end sub
+
+' Keeps a season's episodes for the rail, drawn by its cards at its size.
+sub keepPage(position as Integer, content as Object)
+    content.lowTier = m.lowTier
+    content.cardRoom = [0, 0]
+    ' "S01E02 · Title" over the air date and runtime (spec section 5.6).
+    content.captionStyle = "episode"
+    m.pages[position] = content
+end sub
+
+' Shows a season whose episodes are read: the rail over the run of loaded
+' seasons around it, its active episode the wanted one (else the play
+' target, else the season's suggestion), or its first when chosen. animate
+' slides the rail when it already shows the season.
+sub showPage(position as Integer, chosen as Boolean, describe as Boolean, animate as Boolean)
+    episodes = m.pages[position].getChildren(-1, 0)
+    if episodes.Count() = 0
+        showEpisodeStatus("detail.episodes.empty", false)
+        return
+    end if
+    at = 0
+    if not chosen then at = catalog.series.activeEpisode(episodes, m.wantedEpisode, m.detail.playId)
+    id = episodes[at].id
+    m.wantedEpisode = ""
+    m.rail.message = ""
+    m.rail.action = ""
+    retain()
+    changed = buildWindow()
+    index = catalog.series.indexOf(m.railItems, id)
+    if changed
+        presentRail(index, false, 0)
+    else if m.railAttached
+        m.rail.callFunc("jumpTo", index, animate)
+    end if
+    setActive(index, describe, false)
+    showActionPlaceholders()
+    layout()
+    focusRestored()
+end sub
+
+' Lets go of the episodes of all but the RAIL_SEASONS seasons nearest the
+' one shown (catalog.series.retained).
+sub retain()
+    sizes = []
+    for each page in m.pages
+        if page = invalid
+            sizes.Push(-1)
+        else
+            sizes.Push(page.getChildCount())
+        end if
+    end for
+    kept = catalog.series.retained(sizes, m.seasonIndex, theme.detail.RAIL_SEASONS)
+    for i = 0 to m.pages.Count() - 1
+        if not util.contains(kept, i) then m.pages[i] = invalid
+    end for
+end sub
+
+' The rail's episodes: the run of loaded seasons around the one shown
+' (catalog.series.window). True when they changed.
+function buildWindow() as Boolean
+    loaded = []
+    for each page in m.pages
+        loaded.Push(page <> invalid)
+    end for
+    window = catalog.series.window(loaded, m.seasonIndex)
+    items = []
+    if window.first >= 0
+        for i = window.first to window.last
+            items.Append(m.pages[i].getChildren(-1, 0))
+        end for
+    end if
+    changed = window.first <> m.window.first or window.last <> m.window.last or items.Count() <> m.railItems.Count()
+    m.window = window
+    m.railItems = items
+    return changed
+end function
+
+' Puts the rail's episodes on it, focused at index, unless it is detached;
+' shift is how far the cards it shows moved along the row (rebase).
+sub presentRail(index as Integer, animate as Boolean, shift as Integer)
+    m.rail.loading = false
+    if m.railAttached then m.rail.callFunc("present", m.railItems, index, animate, shift)
+end sub
+
+function activeId() as String
+    if m.activeIndex < 0 or m.activeIndex >= m.railItems.Count() then return ""
+    return m.railItems[m.activeIndex].id
+end function
+
+' Copies fresh progress onto the cards of a season, keeping focus where it is.
+sub updateEpisodes(page as Object, content as Object)
+    episodes = page.getChildren(-1, 0)
+    for each fresh in content.getChildren(-1, 0)
+        at = catalog.series.indexOf(episodes, fresh.id)
+        if at >= 0 then episodes[at].setFields({ progress: fresh.progress, resumeSeconds: fresh.resumeSeconds, played: fresh.played })
+    end for
+    ' Until its watch state is read, the active episode's card decides Resume.
+    if m.target <> invalid and m.target.episode and m.activeIndex >= 0 and currentWatch() = invalid
+        m.target.resumeSeconds = m.railItems[m.activeIndex].resumeSeconds
+        updateActions()
+    end if
+end sub
+
+' No episodes, or a failed read: the rail shows the message in place of its
+' cards, with Retry for a failure (tvOS's empty and error states).
+sub showEpisodeStatus(key as String, retry as Boolean)
+    m.railItems = []
+    m.window = { first: -1, last: -1 }
+    m.activeIndex = -1
+    m.rail.message = i18n.text(key)
+    m.rail.action = ""
+    if retry then m.rail.action = i18n.text("states.retry")
+    presentRail(-1, false, 0)
+    ' Play goes back to the series' play target (spec section 8.3).
+    if m.detail <> invalid and m.series
+        m.target = invalid
+        if m.detail.playId <> "" then m.target = { contentId: m.detail.playId, episode: false, seasonNumber: -1, episodeNumber: -1, resumeSeconds: -1.0 }
+        resetChoices()
+        updateActions()
+    end if
+    showActionPlaceholders()
+    layout()
+    focusRestored()
+end sub
+
+sub onEpisodeRetry()
+    if m.seasonNodes.Count() = 0
+        loadSeasons()
+    else
+        showSeason(m.seasonIndex, false)
+    end if
+    focusZone(ZONE_SEASONS)
+end sub
+
+' Whether the rail still waits for its first episodes.
+function railLoading() as Boolean
+    return m.railItems.Count() = 0 and m.rail.message = ""
+end function
+
+' Memory pressure on the hidden page: the rail lets go of its cards and
+' their textures, keeping the episodes to show again (attachRail).
+sub detachRail()
+    if not m.railAttached then return
+    m.railAttached = false
+    m.rail.callFunc("release")
+end sub
+
+sub attachRail()
+    if m.railAttached then return
+    m.railAttached = true
+    if m.railItems.Count() > 0 then presentRail(m.activeIndex, false, 0)
+end sub
+
+' Focus landing on the rail, or moving along it, makes the episode active
+' (tvOS, Android TV), and near either end reads the season beyond it.
+sub onRailFocused()
+    index = m.rail.focusedIndex
+    if index <> m.activeIndex then setActive(index, true, true)
+    readEdges(index)
+end sub
+
+sub readEdges(index as Integer)
+    if index < 0 then return
+    if index >= m.railItems.Count() - theme.detail.RAIL_EDGE then readNeighbour(m.window.last + 1)
+    if index < theme.detail.RAIL_EDGE then readNeighbour(m.window.first - 1)
+end sub
+
+' Reads the season at position for the rail's end, unless it is read or on
+' its way.
+sub readNeighbour(position as Integer)
+    if position < 0 or position >= m.pages.Count() or m.pages[position] <> invalid then return
+    for each entry in m.pending
+        if (entry.kind = "neighbour" or entry.kind = "episodes") and entry.season = position then return
+    end for
+    send(episodesRequest(position), { kind: "neighbour", season: position })
+end sub
+
+' OK on an episode plays it, resuming as Play does (spec section 5.6).
+sub onRailSelected()
+    index = m.rail.selectedIndex
+    if index <> m.activeIndex then setActive(index, true, false)
+    play(catalog.action.PLAY)
+end sub
+
+' Makes the rail's episode at index active: the action row's target, its
+' season's pill selected, and with describe (or once the hero describes
+' episodes) the hero's metadata line and synopsis. rest waits for focus to
+' settle before reading its tracks.
+sub setActive(index as Integer, describe as Boolean, rest as Boolean)
+    if index < 0 or index >= m.railItems.Count() then return
+    m.activeIndex = index
+    card = m.railItems[index]
+    m.target = catalog.actions.episodeTarget(card, card.resumeSeconds)
+    position = positionOf(card.seasonNumber)
+    if position >= 0 and position <> m.seasonIndex
+        m.seasonIndex = position
+        m.seasons.selected = position
+    end if
+    if describe then m.describing = true
+    if m.describing then describeEpisode(card)
+    resetChoices()
+    updateActions()
+    m.watchTimer.control = "stop"
+    if rest
+        m.watchTimer.control = "start"
+    else
+        readEpisode(card.id)
+    end if
+end sub
+
+sub onEpisodeRest()
+    if m.target <> invalid then readEpisode(m.target.contentId)
+end sub
+
+' Reads an episode's tracks, and while the hero describes it, its facts.
+sub readEpisode(id as String)
+    loadWatch(id, false)
+    if not m.describing or m.episodeFacts.DoesExist(id) then return
+    cancelKind("episodeItem")
+    send(catalog.request.item(id, m.libraryId, m.lowTier), { kind: "episodeItem", id: id })
+end sub
+
+sub onEpisodeItem(entry as Object, result as Object)
+    if result.ok <> true or not util.isObject(result.body) then return
+    facts = result.body.episodeFacts
+    if type(facts) <> "roArray" then facts = []
+    m.episodeFacts[entry.id] = facts
+    if m.describing and activeId() = entry.id then describeEpisode(m.railItems[m.activeIndex])
+end sub
+
+' The hero describes an episode as tvOS's series hero does: the series'
+' title, logo, backdrop, and credit line stay; the metadata line becomes
+' the series' rating, the episode's air date, runtime, and ratings once
+' read, and "Season N · Episode M"; the synopsis "Title · overview".
+sub describeEpisode(card as Object)
+    synopsis = card.synopsis
+    if card.title <> "" and synopsis <> "" then synopsis = card.title + catalog.cards.SEPARATOR + synopsis
+    if synopsis = "" then synopsis = card.title
+    known = m.episodeFacts[card.id]
+    if known = invalid then known = []
+    metadata = catalog.detail.episodeLine(m.detail.contentRating, known, card.seasonNumber, card.episodeNum, m.copy)
+    m.hero.content = { title: m.detail.title, metadata: metadata, synopsis: synopsis, credit: creditText(m.detail.credit) }
+end sub

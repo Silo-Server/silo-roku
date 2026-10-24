@@ -1,0 +1,75 @@
+' Main thread: owns the screen's port and the platform objects, and forwards each
+' platform message to the scene as one platformEvent (source/platform/events.bs).
+sub Main(args as Dynamic)
+    ' The registry is read before the scene exists and handed to ApiTask, the
+    ' only writer from then on (plan section 4.3).
+    snapshot = storage.load(CreateObject("roRegistrySection", storage.SECTION_NAME))
+    screen = CreateObject("roSGScreen")
+    port = CreateObject("roMessagePort")
+    screen.setMessagePort(port)
+    scene = screen.CreateScene("AppScene")
+    ' show() first: on a device, callFunc on the scene before show() never
+    ' returns (the render thread is not running yet), so the app hangs on the
+    ' splash screen. The headless runner is single-threaded and cannot catch it.
+    screen.show()
+    scene.callFunc("apiStart", snapshot)
+
+    input = CreateObject("roInput")
+    input.setMessagePort(port)
+
+    deviceInfo = CreateObject("roDeviceInfo")
+    deviceInfo.setMessagePort(port)
+    deviceInfo.EnableCodecCapChangedEvent(true)
+
+    ' Where the monitor cannot send warnings, the general memory level stands in.
+    memoryMonitor = CreateObject("roAppMemoryMonitor")
+    memoryMonitor.setMessagePort(port)
+    memoryWarnings = memoryMonitor.EnableMemoryWarningEvent(true)
+    if not memoryWarnings then deviceInfo.EnableLowGeneralMemoryEvent(true)
+
+    ' roHdmiStatus does not apply to Roku TVs.
+    if deviceInfo.GetModelType() <> "TV"
+        hdmiStatus = CreateObject("roHdmiStatus")
+        hdmiStatus.setMessagePort(port)
+    end if
+
+    scene.platformEvent = platform.launchEvent(args)
+    ' What the memory policy picks the tier from; logged as the device class's
+    ' raw values (plan section 4.7).
+    scene.platformEvent = platform.memoryEvent({
+        warnings: memoryWarnings,
+        percent: memoryMonitor.GetMemoryLimitPercent(),
+        availableKb: memoryMonitor.GetChannelAvailableMemory(),
+        limits: memoryMonitor.GetChannelMemoryLimit(),
+        ui: deviceInfo.GetUIResolution(),
+        graphics: deviceInfo.GetGraphicsPlatform(),
+        os: deviceInfo.GetOSVersion(),
+        general: deviceInfo.GetGeneralMemoryLevel()
+    })
+    ' The player reads the caption mode from AppScene before any change arrives.
+    scene.platformEvent = platform.captionModeEvent(deviceInfo.GetCaptionsOption("Mode"), deviceInfo.GetCaptionsMode())
+
+    while true
+        msg = wait(0, port)
+        msgType = type(msg)
+        event = invalid
+        if msgType = "roSGScreenEvent"
+            if msg.isScreenClosed() then return
+        else if msgType = "roInputEvent"
+            if msg.IsInput()
+                event = platform.inputEvent(msg.GetInfo())
+            end if
+        else if msgType = "roAppMemoryNotificationEvent"
+            event = platform.memoryWarningEvent(msg.GetInfo(), memoryMonitor.GetMemoryLimitPercent(), memoryMonitor.GetChannelAvailableMemory())
+        else if msgType = "roDeviceInfoEvent"
+            if msg.isCaptionModeChanged()
+                event = platform.captionModeEvent(deviceInfo.GetCaptionsOption("Mode"), deviceInfo.GetCaptionsMode())
+            else if msg.isStatusMessage()
+                event = platform.deviceStatusEvent(msg.GetInfo())
+            end if
+        else if msgType = "roHdmiStatusEvent"
+            if msg.isHdmiStatus() then event = platform.hdmiEvent(msg.GetInfo())
+        end if
+        if event <> invalid then scene.platformEvent = event
+    end while
+end sub

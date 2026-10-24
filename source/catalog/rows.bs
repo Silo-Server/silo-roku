@@ -1,0 +1,112 @@
+import "pkg:/source/util/values.bs"
+
+' Row states (catalog.rows).
+namespace catalog.rowState
+    ' Holds its items.
+    const LOADED = "loaded"
+    ' The server sent the section without items; load them when near.
+    const PENDING = "pending"
+    const LOADING = "loading"
+    ' Its items were dropped far from focus; load them again when near.
+    const DROPPED = "dropped"
+end namespace
+
+' The data budget of Home and library rows (plan section 4.8), pure: which
+' rows load their items, and which drop them, as focus moves. A row is
+' { key, state, loadedAt, refreshed }: its section ID, a catalog.rowState,
+' the wall-clock second its items arrived, and whether a failed image has
+' already refreshed it (one refresh per load).
+namespace catalog.rows
+    ' At most this many rows, and items per row, are loaded.
+    const MAX_ROWS = 20
+    const MAX_ITEMS = 40
+    ' Rows on screen from the focused one down: the band shows about two.
+    const VISIBLE_ROWS = 2
+    ' Items load this many rows ahead of the rows on screen, both ways.
+    const LOAD_AHEAD = 2
+    ' Rows further than this from focus drop their items.
+    const RETAIN = 5
+    ' Section loads at once, as Android TV hydrates Home.
+    const MAX_LOADING = 4
+    ' Signed artwork URLs last 4 hours by default (plan section 4.6): rows
+    ' loaded longer ago than this reload when they come near again.
+    const STALE_SECONDS = 12600
+    ' A row waiting for its items shows this many placeholder cards, so it
+    ' keeps its height and can take focus.
+    const PLACEHOLDERS = 8
+
+    function newRow(key as String, state as String, now as Integer) as Object
+        return { key: key, state: state, loadedAt: now, refreshed: false }
+    end function
+
+    ' What to do with focus on row focus at wall-clock second now:
+    ' { load: [index], drop: [index] }. load is nearest first, holds rows
+    ' that are pending, dropped, or stale within reach, and stops at
+    ' MAX_LOADING loads at once; drop holds loaded rows beyond RETAIN.
+    function plan(rowList as Object, focus as Integer, now as Integer) as Object
+        loading = 0
+        for each row in rowList
+            if row.state = catalog.rowState.LOADING then loading = loading + 1
+        end for
+        loads = []
+        for each index in reachOrder(rowList.Count(), focus)
+            if loading >= MAX_LOADING then exit for
+            if wantsLoad(rowList[index], now)
+                loads.Push(index)
+                loading = loading + 1
+            end if
+        end for
+        drops = []
+        for index = 0 to rowList.Count() - 1
+            if Abs(index - focus) > RETAIN and rowList[index].state = catalog.rowState.LOADED then drops.Push(index)
+        end for
+        return { load: loads, drop: drops }
+    end function
+
+    ' The rows within reach of focus, nearest first, below before above (the
+    ' viewer more often moves down).
+    function reachOrder(count as Integer, focus as Integer) as Object
+        out = []
+        first = focus - LOAD_AHEAD
+        last = focus + VISIBLE_ROWS - 1 + LOAD_AHEAD
+        for distance = 0 to last - focus
+            for each index in [focus + distance, focus - distance]
+                if index >= 0 and index < count and index >= first and index <= last and not util.contains(out, index) then out.Push(index)
+            end for
+        end for
+        return out
+    end function
+
+    function wantsLoad(row as Object, now as Integer) as Boolean
+        if row.state = catalog.rowState.PENDING or row.state = catalog.rowState.DROPPED then return true
+        return row.state = catalog.rowState.LOADED and now - row.loadedAt > STALE_SECONDS
+    end function
+
+    ' The lane for loading a row: interactive when it is on screen, else
+    ' prefetch, which memory pressure sheds first (plan section 4.2).
+    function lane(index as Integer, focus as Integer) as String
+        if index >= focus and index < focus + VISIBLE_ROWS then return "interactive"
+        return "prefetch"
+    end function
+
+    ' Whether a failed image in a row should refresh its items: once per load.
+    function shouldRefresh(row as Object) as Boolean
+        return row.state = catalog.rowState.LOADED and not row.refreshed
+    end function
+
+    ' The focus restoration layout (nav.focus.target) for rows with their
+    ' item keys: a row is complete once loaded; the layout once every row is.
+    function layout(rowList as Object, itemKeys as Object) as Object
+        out = []
+        complete = true
+        for index = 0 to rowList.Count() - 1
+            row = rowList[index]
+            loaded = row.state = catalog.rowState.LOADED
+            if not loaded then complete = false
+            keys = []
+            if loaded then keys = itemKeys[index]
+            out.Push({ key: row.key, items: keys, complete: loaded })
+        end for
+        return { rows: out, complete: complete }
+    end function
+end namespace

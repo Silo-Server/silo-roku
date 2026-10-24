@@ -1,0 +1,205 @@
+namespace tests
+
+    ' The Search screen's query reducer, Back, count copy, and detail params
+    ' (source/search/search.bs), on an injected clock in ms.
+    @suite("search")
+    class SearchTests extends rooibos.BaseTestSuite
+
+        ' A query state whose search capability has answered.
+        function ready(videoWithEpisodes = true as Boolean) as Object
+            state = search.create()
+            search.capabilities(state, videoWithEpisodes)
+            return state
+        end function
+
+        function english(key as String, values = invalid as Dynamic) as String
+            return i18n.format(i18n.lookup(i18n.load("en_US"), key), values)
+        end function
+
+        @describe("normalize")
+
+        @it("trims the query and cuts it to 200 characters")
+        sub _()
+            m.assertEqual(search.normalize("  the heat  "), "the heat")
+            m.assertEqual(search.normalize("   "), "")
+            m.assertEqual(Len(search.normalize(" " + string(250, "a"))), 200)
+        end sub
+
+        @describe("debounce")
+
+        @it("runs a query 300 ms after typing stops")
+        sub _()
+            state = m.ready()
+            m.assertEqual(search.typed(state, "h", 0), { action: search.step.WAIT, delayMs: 300 })
+            m.assertEqual(search.typed(state, "he", 200), { action: search.step.WAIT, delayMs: 300 })
+            ' The first Timer fired before the second keystroke's 300 ms.
+            m.assertEqual(search.tick(state, 300), { action: search.step.WAIT, delayMs: 200 })
+            m.assertEqual(search.tick(state, 500), { action: search.step.RUN, q: "he", scope: catalog.searchScope.ALL, videoWithEpisodes: true })
+            m.assertEqual(search.tick(state, 800), { action: search.step.NONE })
+            m.assertEqual(state.shown, { q: "he", scope: catalog.searchScope.ALL })
+        end sub
+
+        @it("ignores spaces that do not change the query")
+        sub _()
+            state = m.ready()
+            search.typed(state, "heat", 0)
+            m.assertEqual(search.typed(state, "heat ", 250), { action: search.step.NONE })
+            m.assertEqual(search.tick(state, 300).action, search.step.RUN)
+        end sub
+
+        @it("clears at once when the query is emptied")
+        sub _()
+            state = m.ready()
+            search.typed(state, "heat", 0)
+            search.tick(state, 300)
+            m.assertEqual(search.typed(state, " ", 400), { action: search.step.CLEAR })
+            m.assertInvalid(state.shown)
+            m.assertEqual(search.tick(state, 700), { action: search.step.NONE })
+        end sub
+
+        @it("does nothing when typing returns to the query the grid holds")
+        sub _()
+            state = m.ready()
+            search.typed(state, "heat", 0)
+            search.tick(state, 300)
+            search.typed(state, "heat2", 400)
+            m.assertEqual(search.typed(state, "heat", 500), { action: search.step.NONE })
+            m.assertEqual(search.tick(state, 700), { action: search.step.NONE })
+        end sub
+
+        @it("holds a due query until the search capability answers")
+        sub _()
+            state = search.create()
+            search.typed(state, "heat", 0)
+            m.assertEqual(search.tick(state, 300), { action: search.step.NONE })
+            m.assertTrue(state.held)
+            m.assertEqual(search.capabilities(state, false), { action: search.step.RUN, q: "heat", scope: catalog.searchScope.ALL, videoWithEpisodes: false })
+            m.assertFalse(state.held)
+            m.assertEqual(search.capabilities(state, true), { action: search.step.NONE })
+        end sub
+
+        @describe("filter")
+
+        @it("runs the query again at once when a segment is chosen")
+        sub _()
+            state = m.ready()
+            search.typed(state, "heat", 0)
+            search.tick(state, 300)
+            m.assertEqual(search.choose(state, catalog.searchScope.MOVIES), { action: search.step.RUN, q: "heat", scope: catalog.searchScope.MOVIES, videoWithEpisodes: true })
+            m.assertEqual(search.choose(state, catalog.searchScope.MOVIES), { action: search.step.NONE })
+        end sub
+
+        @it("runs a pending query at once in the new scope")
+        sub _()
+            state = m.ready()
+            search.typed(state, "heat", 0)
+            m.assertEqual(search.choose(state, catalog.searchScope.SERIES).action, search.step.RUN)
+            m.assertEqual(search.tick(state, 300), { action: search.step.NONE })
+        end sub
+
+        @it("keeps the segment for the next query when there is none")
+        sub _()
+            state = m.ready()
+            m.assertEqual(search.choose(state, catalog.searchScope.SERIES), { action: search.step.NONE })
+            search.typed(state, "heat", 0)
+            m.assertEqual(search.tick(state, 300).scope, catalog.searchScope.SERIES)
+        end sub
+
+        @it("maps each segment to a type, searching episodes in All only when the server can (spec section 8.1)")
+        sub _()
+            cases = [
+                [true, catalog.searchScope.ALL, "video_with_episodes"]
+                [false, catalog.searchScope.ALL, "video"]
+                [true, catalog.searchScope.MOVIES, "movie"]
+                [true, catalog.searchScope.SERIES, "series"]
+                [false, catalog.searchScope.SERIES, "series"]
+            ]
+            for each entry in cases
+                state = m.ready(entry[0])
+                search.choose(state, entry[1])
+                search.typed(state, "heat", 0)
+                due = search.tick(state, 300)
+                request = catalog.request.search(due.q, due.scope, due.videoWithEpisodes, "", catalog.grid.PAGE_SIZE, false)
+                m.assertEqual(request.query.type, entry[2])
+                m.assertEqual(request.query.limit, 40)
+            end for
+        end sub
+
+        @it("lists All, Movies, and Series in order")
+        sub _()
+            m.assertEqual(search.segments(), [[catalog.searchScope.ALL, "search.filter.all"], [catalog.searchScope.MOVIES, "search.filter.movies"], [catalog.searchScope.SERIES, "search.filter.series"]])
+        end sub
+
+        @describe("submit and retry")
+
+        @it("runs a waiting query at once, and nothing when the grid already holds it")
+        sub _()
+            state = m.ready()
+            m.assertEqual(search.submit(state), { action: search.step.NONE })
+            search.typed(state, "heat", 0)
+            m.assertEqual(search.submit(state).action, search.step.RUN)
+            m.assertEqual(search.submit(state), { action: search.step.NONE })
+            m.assertEqual(search.tick(state, 300), { action: search.step.NONE })
+            m.assertEqual(search.retry(state).action, search.step.RUN)
+        end sub
+
+        @describe("back")
+
+        @it("returns to the keyboard from below it, then leaves Search (spec section 5.6)")
+        sub _()
+            m.assertEqual(search.back(search.zone.RESULTS), search.zone.KEYBOARD)
+            m.assertEqual(search.back(search.zone.FILTER), search.zone.KEYBOARD)
+            m.assertEqual(search.back(search.zone.KEYBOARD), "")
+        end sub
+
+        @describe("countKey")
+
+        @it("words the count as the apps do, and leaves the states to say the rest")
+        sub _()
+            m.assertEqual(search.countKey("loading", -1), "search.searching")
+            m.assertEqual(search.countKey("ready", 1), "search.resultOne")
+            m.assertEqual(search.countKey("ready", 57), "search.resultOther")
+            m.assertEqual(search.countKey("ready", -1), "")
+            m.assertEqual(search.countKey("empty", 0), "")
+            m.assertEqual(search.countKey("error", -1), "")
+            m.assertEqual(search.countKey("", -1), "")
+            m.assertEqual(m.english(search.countKey("ready", 57), { count: 57 }), "57 results")
+            m.assertEqual(m.english(search.countKey("ready", 1), { count: 1 }), "1 result")
+            m.assertEqual(m.english(search.countKey("loading", -1)), "Searching…")
+        end sub
+
+        @it("has tvOS's copy for the initial and empty states (spec section 5.6)")
+        sub _()
+            m.assertEqual(m.english("search.initial"), "Search Silo")
+            m.assertEqual(m.english("search.initialBody"), "Find movies and series")
+            m.assertEqual(m.english("search.empty"), "No results")
+            m.assertEqual(m.english("search.emptyBody"), "Try a different search term")
+            m.assertEqual(m.english("search.hint"), "Search movies and series…")
+        end sub
+
+        @describe("detailParams")
+
+        ' The route params without the seed catalog.detail.routeParams adds.
+        function routed(params as Object) as Object
+            params.Delete("seed")
+            return params
+        end function
+
+        @it("opens an episode's series with that episode selected, and the rest themselves")
+        sub _()
+            m.assertEqual(m.routed(search.detailParams({ id: "movie:heat-1995", itemType: "movie", seriesId: "", seasonNumber: -1 })), { itemId: "movie:heat-1995" })
+            m.assertEqual(m.routed(search.detailParams({ id: "series:sev", itemType: "series", seriesId: "", seasonNumber: -1 })), { itemId: "series:sev" })
+            m.assertEqual(m.routed(search.detailParams({ id: "episode:sev-1-2", itemType: "episode", seriesId: "series:sev", seasonNumber: 1 })), { itemId: "series:sev", episodeId: "episode:sev-1-2", seasonNumber: 1 })
+            m.assertEqual(m.routed(search.detailParams({ id: "episode:sev-1-2", itemType: "episode", seriesId: "series:sev", seasonNumber: -1 })), { itemId: "series:sev", episodeId: "episode:sev-1-2" })
+            m.assertEqual(m.routed(search.detailParams({ id: "episode:x", itemType: "episode", seriesId: "", seasonNumber: 1 })), { itemId: "episode:x" })
+        end sub
+
+        @it("reads a CardContent node")
+        sub _()
+            card = CreateObject("roSGNode", "CardContent")
+            card.setFields({ id: "episode:sev-1-2", itemType: "episode", seriesId: "series:sev", seasonNumber: 1 })
+            m.assertEqual(m.routed(search.detailParams(card)), { itemId: "series:sev", episodeId: "episode:sev-1-2", seasonNumber: 1 })
+            m.assertTrue(search.detailParams(card).seed.series, "seeded for the series page")
+        end sub
+    end class
+end namespace

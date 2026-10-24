@@ -1,0 +1,179 @@
+namespace tests
+
+    ' Registration is plain data. Delivery uses real RequestHandle nodes; these
+    ' suites run on the main thread, where setRef is unavailable on a device, so
+    ' results are read through api.resultOf as screens do.
+    @suite("api router")
+    class ApiRouterTests extends rooibos.BaseTestSuite
+
+        @describe("register, take, and release")
+
+        @it("gives each handle a new request ID")
+        sub _()
+            router = api.router.create()
+            m.assertEqual(api.router.register(router, "home", { name: "a" }), "r1")
+            m.assertEqual(api.router.register(router, "home", { name: "b" }), "r2")
+            m.assertEqual(api.router.pending(router), 2)
+        end sub
+
+        @it("hands a result's handle over once")
+        sub _()
+            router = api.router.create()
+            handle = { name: "a" }
+            id = api.router.register(router, "home", handle)
+            m.assertEqual(api.router.take(router, id).name, "a")
+            m.assertInvalid(api.router.take(router, id))
+            m.assertInvalid(api.router.take(router, "r99"))
+            m.assertEqual(api.router.pending(router), 0)
+        end sub
+
+        @it("releases only the owner's handles")
+        sub _()
+            router = api.router.create()
+            home1 = api.router.register(router, "home", {})
+            detail = api.router.register(router, "detail", {})
+            home2 = api.router.register(router, "home", {})
+            m.assertEqual(api.router.release(router, "home"), 2)
+            m.assertInvalid(api.router.take(router, home1))
+            m.assertInvalid(api.router.take(router, home2))
+            m.assertNotInvalid(api.router.take(router, detail))
+            m.assertEqual(api.router.release(router, "home"), 0)
+        end sub
+
+        @it("forgets an owner once its last handle is taken")
+        sub _()
+            router = api.router.create()
+            api.router.take(router, api.router.register(router, "home", {}))
+            m.assertFalse(router.owners.DoesExist("home"))
+        end sub
+
+        @describe("startup backlog")
+
+        @it("keeps every field set made before ApiTask is ready and hands them over in order, once")
+        sub _()
+            router = api.router.create()
+            first = { requestId: "r1", path: "/api/v2/system/info" }
+            m.assertFalse(api.router.admit(router, "config", { maxConcurrent: 6 }))
+            m.assertFalse(api.router.admit(router, "request", first))
+            m.assertFalse(api.router.admit(router, "request", { requestId: "r2", session: "signIn" }))
+            m.assertFalse(api.router.admit(router, "cancel", { requestId: "r1" }))
+            m.assertFalse(api.router.admit(router, "cancel", { owner: "setup" }))
+            kept = api.router.taskReady(router)
+            fields = []
+            for each item in kept
+                fields.Push(item.field)
+            end for
+            m.assertEqual(fields, ["config", "request", "request", "cancel", "cancel"])
+            m.assertEqual(kept[1].value.requestId, "r1")
+            m.assertEqual(kept[2].value.requestId, "r2")
+            m.assertEqual(api.router.taskReady(router), [], "handed over once")
+        end sub
+
+        @it("lets field sets through once ApiTask is ready")
+        sub _()
+            router = api.router.create()
+            api.router.taskReady(router)
+            m.assertTrue(api.router.admit(router, "request", { requestId: "r1" }))
+            m.assertEqual(router.backlog, [])
+        end sub
+
+        @describe("lines (orderKey, W12 review)")
+
+        ' A request registered under owner with the next request ID, as
+        ' AppScene's apiSend registers it.
+        function registered(router as Object, owner as String, request as Object) as Object
+            request.requestId = api.router.register(router, owner, {})
+            request.owner = owner
+            return request
+        end function
+
+        function preference(method as String, key as String) as Object
+            path = "/api/v2/audio-prefs/" + key
+            return { method: method, path: path, auth: "profile", orderKey: path }
+        end function
+
+        @it("sends a key's requests one at a time, in order, the latest waiting write replacing an earlier one, whoever is released")
+        sub _()
+            router = api.router.create()
+            japanese = m.registered(router, "trackPreferences", m.preference("PUT", "series:show"))
+            m.assertEqual(api.router.order(router, japanese), { send: true, superseded: invalid })
+            auto = m.registered(router, "trackPreferences", m.preference("DELETE", "series:show"))
+            m.assertEqual(api.router.order(router, auto), { send: false, superseded: invalid }, "Auto waits for Japanese's result")
+            m.assertEqual(api.router.release(router, "detail:e1"), 0, "the page goes; its writes are not its owner's")
+            m.assertInvalid(api.router.advance(router, auto.requestId), "Auto has not been sent")
+            english = m.registered(router, "trackPreferences", m.preference("PUT", "series:show"))
+            turn = api.router.order(router, english)
+            m.assertFalse(turn.send)
+            m.assertEqual(turn.superseded.requestId, auto.requestId, "a newer page's choice replaces Auto, which never goes")
+            m.assertEqual(api.router.advance(router, japanese.requestId).requestId, english.requestId, "only after Japanese's result")
+            m.assertInvalid(api.router.advance(router, english.requestId))
+            m.assertEqual(router.lines, {})
+            m.assertEqual(router.lineOf, {})
+            again = m.registered(router, "trackPreferences", m.preference("PUT", "series:show"))
+            m.assertTrue(api.router.order(router, again).send, "an empty line sends at once")
+        end sub
+
+        @it("keeps keys apart, sends a request without an orderKey at once, and never drops a read")
+        sub _()
+            router = api.router.create()
+            first = m.registered(router, "trackPreferences", m.preference("PUT", "series:show"))
+            api.router.order(router, first)
+            m.assertTrue(api.router.order(router, m.registered(router, "trackPreferences", m.preference("PUT", "movie:heat-1995"))).send, "another key")
+            m.assertTrue(api.router.order(router, m.registered(router, "detail:e1", { path: "/api/v2/watch/x" })).send, "no orderKey")
+            read = m.registered(router, "detail:e2", { path: "/api/v2/audio-prefs/series:show", orderKey: "/api/v2/audio-prefs/series:show" })
+            m.assertFalse(api.router.order(router, read).send, "a read waits for the write before it")
+            write = m.registered(router, "trackPreferences", m.preference("DELETE", "series:show"))
+            turn = api.router.order(router, write)
+            m.assertEqual(turn, { send: false, superseded: invalid }, "a write behind a read waits; neither replaces the other")
+            m.assertEqual(api.router.advance(router, first.requestId).requestId, read.requestId)
+            m.assertEqual(api.router.advance(router, read.requestId).requestId, write.requestId)
+        end sub
+
+        @it("takes a waiting request out of its line when it is cancelled or its owner goes, and moves on from a sent one's result")
+        sub _()
+            router = api.router.create()
+            first = m.registered(router, "trackPreferences", m.preference("PUT", "series:show"))
+            api.router.order(router, first)
+            read = m.registered(router, "detail:e1", { path: "/api/v2/audio-prefs/series:show", orderKey: "/api/v2/audio-prefs/series:show" })
+            api.router.order(router, read)
+            m.assertFalse(api.router.withdraw(router, first.requestId), "sent: ApiTask cancels it, and its result moves the line on")
+            m.assertTrue(api.router.withdraw(router, read.requestId), "never sent")
+            m.assertFalse(api.router.withdraw(router, read.requestId))
+            second = m.registered(router, "detail:e1", m.preference("PUT", "series:show"))
+            api.router.order(router, second)
+            m.assertEqual(api.router.release(router, "detail:e1"), 2, "the withdrawn read and the waiting write")
+            api.router.take(router, first.requestId)
+            m.assertInvalid(api.router.advance(router, first.requestId), "nothing left waiting")
+            m.assertEqual([router.lines, router.lineOf], [{}, {}])
+        end sub
+
+        @describe("deliver")
+
+        @it("stores the envelope, then sets status")
+        sub _()
+            handle = api.newHandle("home")
+            result = api.response.failure({ requestId: "r1" }, "timeout")
+            api.router.deliver(handle, result)
+            m.assertEqual(handle.status, "error")
+            m.assertEqual(api.resultOf(handle).error.kind, "timeout")
+            ok = { requestId: "r2", ok: true, status: 200, headers: {}, body: { api_major: 2 }, error: invalid }
+            handle2 = api.newHandle("home")
+            api.router.deliver(handle2, ok)
+            m.assertEqual(handle2.status, "ok")
+            m.assertEqual(api.resultOf(handle2).body.api_major, 2)
+        end sub
+
+        @it("moves a node tree to the handle's content field")
+        sub _()
+            root = CreateObject("roSGNode", "ContentNode")
+            root.CreateChild("ContentNode").title = "Item 1"
+            handle = api.newHandle("home")
+            api.router.deliver(handle, { requestId: "r1", ok: true, status: 200, headers: {}, body: invalid, error: invalid, content: root })
+            m.assertEqual(handle.content.getChildCount(), 1)
+            m.assertEqual(handle.content.getChild(0).title, "Item 1")
+            m.assertFalse(api.resultOf(handle).DoesExist("content"))
+        end sub
+
+    end class
+
+end namespace

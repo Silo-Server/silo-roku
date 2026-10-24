@@ -1,0 +1,159 @@
+namespace tests
+
+    @suite("catalog series")
+    class CatalogSeriesTests extends rooibos.BaseTestSuite
+
+        function season(number as Integer, state as Object, extra = invalid as Dynamic) as Object
+            out = { content_id: "series:s-S" + number.ToStr(), season_number: number, title: "", user_data: state }
+            if extra <> invalid then out.Append(extra)
+            return catalog.series.rollup(out)
+        end function
+
+        function episode(id as String, resumeSeconds as Float, played as Boolean) as Object
+            return { id: id, resumeSeconds: resumeSeconds, played: played }
+        end function
+
+        @describe("the season a page opens on (spec section 8.3)")
+
+        @it("asks for an episode card's episode and season, Specials included")
+        sub _()
+            m.assertEqual(catalog.series.opening({ itemId: "series:s", episodeId: "episode:e", seasonNumber: 2 }, invalid), { episode: "episode:e", season: 2 })
+            m.assertEqual(catalog.series.opening({ itemId: "series:s", episodeId: "episode:e", seasonNumber: 0 }, invalid), { episode: "episode:e", season: 0 })
+            m.assertEqual(catalog.series.opening({ itemId: "series:s" }, invalid), { episode: "", season: -1 })
+            m.assertEqual(catalog.series.opening({ itemId: "series:s", seasonNumber: -1 }, invalid).season, -1)
+            m.assertEqual(catalog.series.opening({ itemId: "series:s", seasonNumber: "2" }, invalid).season, -1)
+        end sub
+
+        @it("lets a rebuilt page's own season and episode win over the route's")
+        sub _()
+            params = { itemId: "series:s", episodeId: "episode:s2e3", seasonNumber: 2 }
+            m.assertEqual(catalog.series.opening(params, { season: 3, episode: "episode:s3e1" }), { episode: "episode:s3e1", season: 3 })
+            m.assertEqual(catalog.series.opening(params, { season: 0, episode: "" }), { episode: "episode:s2e3", season: 0 })
+            ' A page covered before its seasons arrived names none.
+            m.assertEqual(catalog.series.opening(params, { season: -1, episode: "" }), { episode: "episode:s2e3", season: 2 })
+        end sub
+
+        @it("opens on the season asked for: the passed episode's, else the play target's")
+        sub _()
+            rollups = [m.season(1, {}), m.season(2, {}), m.season(3, {})]
+            m.assertEqual(catalog.series.initialSeason(rollups, 2), 1)
+            m.assertEqual(catalog.series.initialSeason(rollups, 9), 0, "a season not listed falls back")
+        end sub
+
+        @it("else prefers a season in progress, then partly watched, then unplayed")
+        sub _()
+            watched = { watched_count: 8, unplayed_count: 0 }
+            partly = { watched_count: 2, unplayed_count: 6 }
+            fresh = { watched_count: 0, unplayed_count: 8 }
+            m.assertEqual(catalog.series.initialSeason([m.season(1, watched), m.season(2, partly), m.season(3, { in_progress_count: 1, unplayed_count: 3 })], -1), 2)
+            m.assertEqual(catalog.series.initialSeason([m.season(1, watched), m.season(2, fresh), m.season(3, partly)], -1), 2)
+            m.assertEqual(catalog.series.initialSeason([m.season(1, watched), m.season(2, fresh)], -1), 1)
+        end sub
+
+        @it("passes over Specials unless asked for them")
+        sub _()
+            rollups = [m.season(0, { in_progress_count: 1 }), m.season(1, { watched_count: 3 })]
+            m.assertTrue(rollups[0].specials)
+            m.assertEqual(catalog.series.initialSeason(rollups, -1), 1)
+            m.assertEqual(catalog.series.initialSeason(rollups, 0), 0)
+            m.assertTrue(m.season(5, {}, { is_specials: true }).specials)
+            m.assertEqual(catalog.series.initialSeason([m.season(0, {})], -1), 0)
+            m.assertEqual(catalog.series.initialSeason([], 1), -1)
+        end sub
+
+        @it("labels capsules with the server's title, Specials, or Season N")
+        sub _()
+            copy = i18n.load("en_US")
+            m.assertEqual(catalog.series.seasonLabel("Book One", 1, copy), "Book One")
+            m.assertEqual(catalog.series.seasonLabel("", 0, copy), "Specials")
+            m.assertEqual(catalog.series.seasonLabel(" ", 4, copy), "Season 4")
+        end sub
+
+        @describe("the active episode")
+
+        @it("selects the episode asked for, else the play target")
+        sub _()
+            episodes = [m.episode("e1", -1, true), m.episode("e2", -1, false), m.episode("e3", -1, false)]
+            m.assertEqual(catalog.series.activeEpisode(episodes, "e3", "e2"), 2)
+            m.assertEqual(catalog.series.activeEpisode(episodes, "", "e2"), 1)
+            m.assertEqual(catalog.series.activeEpisode(episodes, "gone", "e3"), 2)
+        end sub
+
+        @it("else suggests the first in progress, then the first unplayed, then the first")
+        sub _()
+            m.assertEqual(catalog.series.activeEpisode([m.episode("e1", -1, true), m.episode("e2", -1, false), m.episode("e3", 600, false)], "", ""), 2)
+            m.assertEqual(catalog.series.activeEpisode([m.episode("e1", -1, true), m.episode("e2", -1, false)], "", ""), 1)
+            m.assertEqual(catalog.series.activeEpisode([m.episode("e1", -1, true), m.episode("e2", -1, true)], "", ""), 0)
+            m.assertEqual(catalog.series.activeEpisode([], "e1", "e1"), -1)
+        end sub
+
+        @describe("focus after the player closes (spec section 5.6)")
+
+        @it("moves past a finished episode to the next in play order, played or not (tvOS, D8)")
+        sub _()
+            episodes = [m.episode("e1", -1, true), m.episode("e2", -1, true), m.episode("e3", 300, false)]
+            for each episode in episodes
+                episode.seasonNumber = 1
+            end for
+            m.assertEqual(catalog.series.successor(episodes, 0), 1, "a watched episode is not passed over")
+            m.assertEqual(catalog.series.successor(episodes, 1), 2)
+            m.assertEqual(catalog.series.successor(episodes, 2), -1, "the last loaded")
+            m.assertEqual(catalog.series.successor(episodes, -1), -1)
+        end sub
+
+        @it("crosses into the next season in the rail, but never from a regular episode into Specials")
+        sub _()
+            episodes = [{ id: "s1e9", seasonNumber: 1 }, { id: "s2e1", seasonNumber: 2 }, { id: "s0e1", seasonNumber: 0 }, { id: "s0e2", seasonNumber: 0 }]
+            m.assertEqual(catalog.series.successor(episodes, 0), 1)
+            m.assertEqual(catalog.series.successor(episodes, 1), -1)
+            m.assertEqual(catalog.series.successor(episodes, 2), 3, "within Specials")
+        end sub
+
+        @it("takes the next numbered season by number, wherever it is listed and across gaps (P-20)")
+        sub _()
+            seasons = [m.season(0, {}), m.season(1, {}), m.season(3, {}), m.season(2, {})]
+            m.assertEqual(catalog.series.nextSeason(seasons, 1), 3, "season 1 to season 2")
+            m.assertEqual(catalog.series.nextSeason(seasons, 3), 2, "season 2 to season 3")
+            seasons = [m.season(1, {}), m.season(4, {})]
+            m.assertEqual(catalog.series.nextSeason(seasons, 0), 1, "a gap in the numbers")
+        end sub
+
+        @it("has no next season after the last numbered one, from Specials, or out of range")
+        sub _()
+            seasons = [m.season(1, {}), m.season(2, {}), m.season(0, {}), m.season(9, {}, { is_specials: true })]
+            m.assertEqual(catalog.series.nextSeason(seasons, 1), -1, "Specials never follow the finale")
+            m.assertEqual(catalog.series.nextSeason(seasons, 2), -1)
+            m.assertEqual(catalog.series.nextSeason(seasons, 3), -1)
+            m.assertEqual(catalog.series.nextSeason(seasons, -1), -1)
+            m.assertEqual(catalog.series.nextSeason(seasons, 4), -1)
+            seasons = [m.season(1, {}), m.season(2, {}, { episode_count: 0 }), m.season(3, {}, { episode_count: 6 })]
+            m.assertEqual(catalog.series.nextSeason(seasons, 0), 2, "a season with no episodes is passed over")
+        end sub
+
+        @describe("the seasons and the cross-season rail (spec section 5.6)")
+
+        @it("orders numbered seasons by number, then Specials, each number once")
+        sub _()
+            seasons = [m.season(0, {}), m.season(3, {}), m.season(1, {}), m.season(2, {}), m.season(1, {}), m.season(7, {}, { is_specials: true })]
+            m.assertEqual(catalog.series.ordered(seasons), [2, 3, 1, 0, 5])
+            m.assertEqual(catalog.series.ordered([]), [])
+            m.assertEqual(m.season(4, {}, { episode_count: 9 }).episodes, 9)
+            m.assertEqual(m.season(4, {}).episodes, -1)
+        end sub
+
+        @it("shows the run of loaded seasons around the selected one, empty ones included")
+        sub _()
+            m.assertEqual(catalog.series.window([true, true, false, true, true, true], 4), { first: 3, last: 5 })
+            m.assertEqual(catalog.series.window([true, true, false], 0), { first: 0, last: 1 })
+            m.assertEqual(catalog.series.window([true, false], 1), { first: -1, last: -1 })
+            m.assertEqual(catalog.series.window([], 0), { first: -1, last: -1 })
+        end sub
+
+        @it("keeps the nearest seasons' episodes, the earlier on a tie, and every empty season")
+        sub _()
+            m.assertEqual(catalog.series.retained([8, 10, 0, 10, 12, -1], 3, 3), [3, 4, 1, 2])
+            m.assertEqual(catalog.series.retained([8, 10, 10], 1, 3), [1, 0, 2])
+            m.assertEqual(catalog.series.retained([8, 10, 10, 10], 1, 2), [1, 0])
+        end sub
+    end class
+end namespace

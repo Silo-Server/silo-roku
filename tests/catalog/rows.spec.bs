@@ -1,0 +1,112 @@
+namespace tests
+
+    @suite("catalog rows")
+    class CatalogRowsTests extends rooibos.BaseTestSuite
+
+        function rowsIn(states as Object) as Object
+            out = []
+            for i = 0 to states.Count() - 1
+                out.Push(catalog.rows.newRow("s" + i.ToStr(), states[i], 1000))
+            end for
+            return out
+        end function
+
+        function all(count as Integer, state as String) as Object
+            states = []
+            for i = 1 to count
+                states.Push(state)
+            end for
+            return m.rowsIn(states)
+        end function
+
+        @describe("lazy loading two rows ahead (plan section 4.8)")
+
+        @it("loads the rows on screen first, then two ahead, at most four at once")
+        sub _()
+            rowList = m.all(10, catalog.rowState.PENDING)
+            m.assertEqual(catalog.rows.plan(rowList, 0, 1000).load, [0, 1, 2, 3])
+            rowList[0].state = catalog.rowState.LOADING
+            rowList[1].state = catalog.rowState.LOADING
+            m.assertEqual(catalog.rows.plan(rowList, 0, 1000).load, [2, 3])
+        end sub
+
+        @it("loads nearest first, below before above, within reach only")
+        sub _()
+            rowList = m.all(12, catalog.rowState.DROPPED)
+            m.assertEqual(catalog.rows.plan(rowList, 6, 1000).load, [6, 7, 5, 8])
+            rowList[6].state = catalog.rowState.LOADED
+            rowList[7].state = catalog.rowState.LOADED
+            rowList[5].state = catalog.rowState.LOADED
+            m.assertEqual(catalog.rows.plan(rowList, 6, 1000).load, [8, 4, 9])
+        end sub
+
+        @it("leaves loaded and loading rows alone")
+        sub _()
+            rowList = m.rowsIn([catalog.rowState.LOADED, catalog.rowState.LOADING, catalog.rowState.LOADED])
+            m.assertEqual(catalog.rows.plan(rowList, 0, 1000).load, [])
+        end sub
+
+        @it("reloads a row whose signed artwork URLs have gone stale")
+        sub _()
+            rowList = m.all(3, catalog.rowState.LOADED)
+            m.assertEqual(catalog.rows.plan(rowList, 0, 1000 + catalog.rows.STALE_SECONDS).load, [])
+            m.assertEqual(catalog.rows.plan(rowList, 0, 1001 + catalog.rows.STALE_SECONDS).load, [0, 1, 2])
+        end sub
+
+        @describe("the retention window")
+
+        @it("drops loaded rows more than five from focus")
+        sub _()
+            rowList = m.all(14, catalog.rowState.LOADED)
+            m.assertEqual(catalog.rows.plan(rowList, 6, 1000).drop, [0, 12, 13])
+            m.assertEqual(catalog.rows.plan(rowList, 0, 1000).drop, [6, 7, 8, 9, 10, 11, 12, 13])
+            rowList[0].state = catalog.rowState.DROPPED
+            m.assertEqual(catalog.rows.plan(rowList, 6, 1000).drop, [12, 13])
+        end sub
+
+        @it("loads rows on screen on the interactive lane and the rest as prefetch")
+        sub _()
+            m.assertEqual(catalog.rows.lane(3, 3), "interactive")
+            m.assertEqual(catalog.rows.lane(4, 3), "interactive")
+            m.assertEqual(catalog.rows.lane(5, 3), "prefetch")
+            m.assertEqual(catalog.rows.lane(2, 3), "prefetch")
+        end sub
+
+        @it("refreshes a row's artwork once per load")
+        sub _()
+            row = catalog.rows.newRow("s", catalog.rowState.LOADED, 0)
+            m.assertTrue(catalog.rows.shouldRefresh(row))
+            row.refreshed = true
+            m.assertFalse(catalog.rows.shouldRefresh(row))
+            m.assertFalse(catalog.rows.shouldRefresh(catalog.rows.newRow("s", catalog.rowState.PENDING, 0)))
+        end sub
+
+        @describe("focus restoration targets (spec section 5.3)")
+
+        @it("finds the same item, waits for an unloaded row, then falls back")
+        sub _()
+            rowList = m.rowsIn([catalog.rowState.LOADED, catalog.rowState.PENDING, catalog.rowState.LOADED])
+            keys = [["a", "b", "c"], invalid, ["x", "y"]]
+            layout = catalog.rows.layout(rowList, keys)
+            m.assertFalse(layout.complete)
+            m.assertEqual(layout.rows[1].items, [])
+            same = nav.focus.target(nav.focus.newKey("s2", "y", 2, 1), layout, false)
+            m.assertEqual(same, { kind: nav.restore.ITEM, row: 2, item: 1 })
+            waiting = nav.focus.target(nav.focus.newKey("s1", "q", 1, 4), layout, false)
+            m.assertEqual(waiting, { kind: nav.restore.WAIT, row: 1, item: 4 })
+            ' After nav.focus.WAIT_MS the empty row falls back to the nearest row below.
+            fallback = nav.focus.target(nav.focus.newKey("s1", "q", 1, 4), layout, true)
+            m.assertEqual(fallback, { kind: nav.restore.NEAREST_ROW, row: 2, item: 1 })
+        end sub
+
+        @it("goes to the same position when the item is gone from a loaded row")
+        sub _()
+            rowList = m.all(2, catalog.rowState.LOADED)
+            layout = catalog.rows.layout(rowList, [["a", "b", "c"], ["d"]])
+            m.assertTrue(layout.complete)
+            m.assertEqual(nav.focus.target(nav.focus.newKey("s0", "gone", 0, 2), layout, false), { kind: nav.restore.POSITION, row: 0, item: 2 })
+            ' A row left out after a failure: the nearest row below takes its place.
+            m.assertEqual(nav.focus.target(nav.focus.newKey("s9", "a", 1, 0), layout, false), { kind: nav.restore.NEAREST_ROW, row: 1, item: 0 })
+        end sub
+    end class
+end namespace

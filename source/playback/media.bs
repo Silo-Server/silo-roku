@@ -1,0 +1,253 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/values.bs"
+
+' What the player takes from a plan to play it (plan sections 6.4 and 6.8).
+' Pure. URLs are server output: relative ones are resolved against the
+' configured base URL, as API paths are, and absolute ones are used as they
+' are. StreamFormat comes from the stream's protocol and container, never
+' from the URL. Account headers are not decided here: ApiTask gives them per
+' URL (api.session.mediaHeaders), and only for the configured origin.
+namespace playback.media
+    ' Inventory codecs a subtitle sidecar can carry as text. Bitmap tracks
+    ' are burned in by the server, so the test player offers them too.
+    const TEXT_FORMATS = "|srt|vtt|ass|ssa|"
+    ' The path a proxy node serves an original file from, before its token.
+    const DIRECT_ROUTE = "/stream/direct/"
+
+    ' Roku's StreamFormat for a plan's stream: "hls", "mp4", or "mkv", or ""
+    ' when the client cannot map it, in which case the player refuses the
+    ' plan rather than guess.
+    function streamFormat(stream as Dynamic) as String
+        if not util.isObject(stream) then return ""
+        protocol = LCase(util.text(stream.protocol))
+        container = LCase(util.text(stream.container))
+        if protocol = "hls" then return "hls"
+        if protocol = "http_progressive" and (container = "mp4" or container = "mkv") then return container
+        return ""
+    end function
+
+    ' A plan URL as the Video node or ApiTask fetches it: an absolute http(s)
+    ' URL as it is, a scheme-relative one with the base URL's scheme, and a
+    ' path against the base URL, as ApiTask resolves API paths. "" when it
+    ' cannot be resolved.
+    function resolve(baseUrl as String, ref as Dynamic) as String
+        target = util.text(ref)
+        if target = "" then return ""
+        if api.request.isHttpUrl(target) then return target
+        origin = api.request.originOf(baseUrl)
+        if origin = invalid then return ""
+        if Left(target, 2) = "//" then return Left(origin, Instr(1, origin, "://") - 1) + ":" + target
+        if Left(target, 1) = "/" then return baseUrl + target
+        return baseUrl + "/" + target
+    end function
+
+    ' Whether a resolved URL is on a proxy node rather than the configured
+    ' origin. Proxy URLs are signed and get no account headers.
+    function isProxy(target as String, baseUrl as String) as Boolean
+        return not api.request.isSameOrigin(target, baseUrl)
+    end function
+
+    ' A media URL without its signed stream token, which the server signs
+    ' afresh, with new issue and expiry times, for every plan of a session.
+    ' An attempt without header_authenticated_media_v1 (signed-URL mode,
+    ' decision D-1) carries it as `st` on its API-origin media URLs: a
+    ' transport credential, not a playback parameter (protocol section
+    ' 4.2). A proxy node's direct-play URL carries it as its path's last
+    ' segment, {proxy}/stream/direct/{token} (the server's proxy routes),
+    ' with the original file's bytes behind it whatever the token. The rest
+    ' stays: the origin, seek, and the token of any other proxy route (a
+    ' remux or transcode, whose job a new token may replace). For
+    ' comparing plans only; the player always plays the URL as the plan
+    ' gives it.
+    function withoutStreamToken(url as Dynamic) as String
+        path = util.text(url)
+        query = ""
+        cut = Instr(1, path, "?")
+        if cut > 0
+            for each part in Mid(path, cut + 1).Split("&")
+                if part <> "st" and Left(part, 3) <> "st="
+                    if query <> "" then query = query + "&"
+                    query = query + part
+                end if
+            end for
+            path = Left(path, cut - 1)
+        end if
+        path = withoutDirectToken(path)
+        if query = "" then return path
+        return path + "?" + query
+    end function
+
+    ' Why two stream URLs are other streams once their tokens are removed
+    ' (withoutStreamToken), as check names, none when they are the same:
+    ' "stream_origin" for another origin, else "stream_path" and
+    ' "stream_query" for the part that differs. Never the URLs, which carry
+    ' credentials.
+    function urlDifferences(before as Dynamic, after as Dynamic) as Object
+        first = withoutStreamToken(before)
+        second = withoutStreamToken(after)
+        if first = second then return []
+        if not sameOrigin(first, second) then return ["stream_origin"]
+        out = []
+        firstPath = pathPart(first)
+        secondPath = pathPart(second)
+        if firstPath <> secondPath then out.Push("stream_path")
+        if Mid(first, Len(firstPath) + 1) <> Mid(second, Len(secondPath) + 1) then out.Push("stream_query")
+        return out
+    end function
+
+    ' Whether two stream URLs are the same original on two proxy nodes:
+    ' each a node's direct-play route (an absolute URL whose path ends in
+    ' DIRECT_ROUTE once withoutStreamToken removes its token), on other
+    ' origins, with the same query. Another route or query, or the token of
+    ' a remux or transcode, is another stream (assumption AG-218).
+    function otherNode(before as Dynamic, after as Dynamic) as Boolean
+        first = withoutStreamToken(before)
+        second = withoutStreamToken(after)
+        a = api.request.originOf(first)
+        b = api.request.originOf(second)
+        if a = invalid or b = invalid or a = b then return false
+        route = directRoute(first)
+        return route <> "" and route = directRoute(second)
+    end function
+
+    ' A token-free URL from its DIRECT_ROUTE on, query included, or "" when
+    ' its path does not end there.
+    function directRoute(url as String) as String
+        path = pathPart(url)
+        if Right(path, Len(DIRECT_ROUTE)) <> DIRECT_ROUTE then return ""
+        return Mid(url, Len(path) - Len(DIRECT_ROUTE) + 1)
+    end function
+
+    ' A URL up to its query.
+    function pathPart(url as String) as String
+        cut = Instr(1, url, "?")
+        if cut = 0 then return url
+        return Left(url, cut - 1)
+    end function
+
+    ' Whether two media URLs are on one origin: both relative (the
+    ' configured origin's), or both absolute with the same scheme, host,
+    ' and port (api.request.originOf).
+    function sameOrigin(first as Dynamic, second as Dynamic) as Boolean
+        a = api.request.originOf(util.text(first))
+        b = api.request.originOf(util.text(second))
+        if a = invalid or b = invalid then return a = invalid and b = invalid
+        return a = b
+    end function
+
+    ' A URL without its query, less the token a proxy's direct-play route
+    ' ends in when it is an absolute one on that route.
+    function withoutDirectToken(path as String) as String
+        if not api.request.isHttpUrl(path) then return path
+        at = Instr(1, path, DIRECT_ROUTE)
+        if at = 0 then return path
+        tokenAt = at + Len(DIRECT_ROUTE)
+        if Instr(tokenAt, path, "/") > 0 then return path
+        return Left(path, tokenAt - 1)
+    end function
+
+    ' The ContentNode fields for a plan, without headers or subtitles:
+    ' { url, streamFormat, playStart, title }, or invalid when the stream
+    ' cannot be played. playStart is the player position to start at:
+    ' player_start_seconds for a new plan, the current position for a reopen.
+    function contentFields(plan as Object, baseUrl as String, playStart as Dynamic, title as String) as Dynamic
+        stream = plan.stream
+        format = streamFormat(stream)
+        if format = "" then return invalid
+        target = resolve(baseUrl, stream.url)
+        if target = "" then return invalid
+        return { url: target, streamFormat: format, playStart: playback.values.toDouble(playStart), title: title }
+    end function
+
+    ' The sidecar the plan asks the client to render, or invalid: a render or
+    ' convert decision with an artifact. An embedded selection or an HLS
+    ' rendition travels in the stream; off and burn-in carry no artifact.
+    ' { trackId, url, format, language, label }: format is the artifact's
+    ' served format (srt, vtt, or ass), url as the plan gives it.
+    function subtitleArtifact(plan as Object) as Dynamic
+        subtitle = plan.subtitle
+        if not util.isObject(subtitle) or not util.isObject(subtitle.artifact) then return invalid
+        mode = util.text(subtitle.mode)
+        if mode <> "render" and mode <> "convert" then return invalid
+        artifact = subtitle.artifact
+        format = LCase(util.text(artifact.format))
+        if format = "ssa" then format = "ass"
+        if not playback.values.isText(artifact.url) or Instr(1, TEXT_FORMATS, "|" + format + "|") = 0 then return invalid
+        out = { trackId: util.text(subtitle.track_id), url: artifact.url, format: format, language: "und", label: "" }
+        entry = inventoryEntry(subtitle, out.trackId)
+        if entry <> invalid
+            if playback.values.isText(entry.language) then out.language = entry.language
+            out.label = util.text(entry.label)
+        end if
+        return out
+    end function
+
+    ' The URL to download a sidecar from. A WebVTT artifact asks the server to
+    ' move its cues onto the player clock with timestamp_offset, the negative
+    ' of the plan's timeline offset (protocol section 4.2); SRT and ASS cannot,
+    ' so MediaTask shifts them (shiftSeconds).
+    function subtitleUrl(artifactUrl as String, format as String, offsetSeconds as Dynamic) as String
+        offset = playback.values.roundMs(offsetSeconds)
+        if format <> "vtt" or offset = 0 then return artifactUrl
+        separator = "?"
+        if Instr(1, artifactUrl, "?") > 0 then separator = "&"
+        return artifactUrl + separator + "timestamp_offset=" + decimal(-offset)
+    end function
+
+    ' How far MediaTask moves a downloaded sidecar's cues: the timeline
+    ' offset for SRT and ASS, nothing for WebVTT, which the server shifted.
+    function shiftSeconds(format as String, offsetSeconds as Dynamic) as Double
+        if format = "vtt" then return 0
+        return playback.values.roundMs(offsetSeconds)
+    end function
+
+    ' The selected subtitle's track ID, or "" when subtitles are off.
+    function selectedSubtitle(plan as Object) as String
+        subtitle = plan.subtitle
+        if not util.isObject(subtitle) or util.text(subtitle.mode) = "off" then return ""
+        return util.text(subtitle.track_id)
+    end function
+
+    function inventoryEntry(subtitle as Object, trackId as String) as Dynamic
+        if not playback.values.isArray(subtitle.inventory) then return invalid
+        for each entry in subtitle.inventory
+            if util.isObject(entry) and util.text(entry.track_id) = trackId then return entry
+        end for
+        return invalid
+    end function
+
+    ' Seconds as "h:mm:ss", or "m:ss" under an hour; negative and unknown
+    ' values as "0:00".
+    function clock(seconds as Dynamic) as String
+        total = 0
+        if util.isNumber(seconds) and seconds > 0 then total = Int(seconds)
+        hours = total \ 3600
+        minutes = (total mod 3600) \ 60
+        secs = total mod 60
+        tail = Right("0" + secs.ToStr(), 2)
+        if hours = 0 then return minutes.ToStr() + ":" + tail
+        return hours.ToStr() + ":" + Right("0" + minutes.ToStr(), 2) + ":" + tail
+    end function
+
+    ' Seconds as a short decimal ("596.5", "-3", "0.125") at millisecond
+    ' precision.
+    function decimal(value as Dynamic) as String
+        number = playback.values.toDouble(value)
+        sign = ""
+        if number < 0
+            sign = "-"
+            number = -number
+        end if
+        millis = Int(number * 1000# + 0.5#)
+        whole = millis \ 1000
+        fraction = millis - whole * 1000
+        text = sign + whole.ToStr()
+        if fraction = 0 then return text
+        digits = Right("00" + fraction.ToStr(), 3)
+        while Right(digits, 1) = "0"
+            digits = Left(digits, Len(digits) - 1)
+        end while
+        return text + "." + digits
+    end function
+end namespace

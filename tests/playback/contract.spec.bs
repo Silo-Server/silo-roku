@@ -1,0 +1,160 @@
+namespace tests
+
+    ' Drives the probe, gates, and serializer from every recorded device fixture
+    ' (tests/fixtures/probes/) and compares each scenario's body with its golden
+    ' in tests/fixtures/golden/start/ or replan/, which
+    ' scripts/validate-contract.py checks against the server's schemas. After an
+    ' intended change, scripts/update-goldens.sh rewrites the goldens from the
+    ' "GOLDEN <path> <body>" failures reported here.
+    @suite("playback contract")
+    class PlaybackContractTests extends rooibos.BaseTestSuite
+
+        @describe("golden bodies per device class")
+
+        @it("produces the golden bodies for")
+        @params("dev-tv-tcl-55r625")
+        @params("4k-ultra-dv-tv-atmos-avr")
+        @params("4k-nodv-stick-dv-tv")
+        @params("hd-512mb-stick-sdr-tv")
+        @params("no-multichannel-aac-player")
+        sub _(deviceClass as String)
+            recorded = tests.devices.fixture(deviceClass)
+            if recorded = invalid
+                m.fail("missing tests/fixtures/probes/" + deviceClass + ".json")
+                return
+            end if
+            problems = []
+            if not util.contains(["synthetic", "self-reported, not yet probed", "recorded"], recorded.label) then problems.Push(deviceClass + ": unknown label")
+            for each scenario in recorded.scenarios
+                device = tests.devices.fromFixture(recorded)
+                probe = playback.probe.collect(device, playback.gates.probeOptions())
+                gates = playback.gates.evaluate(probe, scenario.context)
+                if scenario.replan = invalid
+                    path = "start/" + scenario.name + ".json"
+                    body = playback.capabilities.startBody(probe, gates, scenario.request)
+                else
+                    path = "replan/" + scenario.name + ".json"
+                    body = m.replanBody(playback.capabilities.replanParts(probe, gates, scenario.request), scenario)
+                end if
+                for each name in device.missing
+                    problems.Push(deviceClass + ": no recorded answer for " + name)
+                end for
+                if body = invalid
+                    problems.Push(path + ": no body")
+                else
+                    golden = tests.devices.loadJson("pkg:/tests/fixtures/golden/" + path)
+                    actual = FormatJson(body)
+                    if golden = invalid or FormatJson(golden) <> actual then problems.Push("GOLDEN " + path + " " + actual)
+                end if
+            end for
+            if problems.Count() > 0 then m.fail(problems.Join(Chr(10)))
+        end sub
+
+        @it("produces the golden session bodies")
+        sub _()
+            recorded = tests.devices.fixture("dev-tv-tcl-55r625")
+            scenario = recorded.scenarios[0]
+            probe = playback.probe.collect(tests.devices.fromFixture(recorded), playback.gates.probeOptions())
+            gates = playback.gates.evaluate(probe, scenario.context)
+            parts = playback.capabilities.replanParts(probe, gates, scenario.request)
+            decision = tests.devices.loadJson("pkg:/tests/fixtures/v2/playback_start_opaque_ids.json")
+            context = { identity: { server: "srv", account: "acc", profile: "1" }, installationId: scenario.request.installationId, features: ["output_change_v1"], multichannelAac: probe.audio.multichannelAac, outputContextId: probe.outputContextId }
+            bodies = {}
+
+            ' A played session: first frame, progress, a failure, then track,
+            ' quality, and seek replans on the recorded plan, then Back.
+            env = tests.fakeEnv()
+            state = playback.session.create(context)
+            m.reduce(state, env, { type: "play", intent: {}, quality: "auto", autoplay: false })
+            m.reduce(state, env, { type: "startResult", playback_attempt_id: state.mutation.command.playback_attempt_id, kind: "ok", decision: decision })
+            env.t = env.t + 1800
+            bodies["route-event/first-frame"] = m.reduce(state, env, { type: "player", load: state.plan.load, state: "playing" })[0].body
+            m.reduce(state, env, { type: "position", load: state.plan.load, position: 42.125 })
+            bodies["progress/playing"] = ParseJson(m.reduce(state, env, { type: "tick" })[0].bodyText)
+            m.reduce(state, env, { type: "progressResult", session_id: state.attempt.sessionId, sequence: 1, kind: "ok" })
+            cmds = m.reduce(state, env, { type: "failure", load: state.plan.load, kind: "decode", message: "decoder init failed" })
+            bodies["route-event/plan-failed"] = cmds[0].body
+            bodies["replan/session-failure-recovery"] = m.sessionReplanBody(cmds[1], parts)
+            m.replanned(state, env, decision)
+            bodies["replan/session-track-change"] = m.sessionReplanBody(m.reduce(state, env, { type: "trackChange", tracks: decision.playback_plan.selected_tracks })[0], parts)
+            m.replanned(state, env, decision)
+            bodies["replan/session-quality-change"] = m.sessionReplanBody(m.reduce(state, env, { type: "qualityChange", quality: "1080p" })[0], parts)
+            remux = ParseJson(FormatJson(decision))
+            remux.playback_plan.timeline = { source_start_seconds: 600, stream_origin_seconds: 596.5, player_start_seconds: 3.5, timeline_offset_seconds: 596.5, can_seek_anywhere: false, seek_restoration: "source_position", seek_window_start_seconds: 596.5 }
+            m.replanned(state, env, remux)
+            bodies["replan/session-seek-reanchor"] = m.sessionReplanBody(m.reduce(state, env, { type: "seekTo", position: 1800.5 })[0], parts)
+            m.replanned(state, env, remux)
+            bodies["stop/played"] = ParseJson(m.reduce(state, env, { type: "back" })[0].job.bodyText)
+
+            ' Back during a start that the server accepts: nothing played.
+            env = tests.fakeEnv()
+            state = playback.session.create(context)
+            m.reduce(state, env, { type: "play", intent: {}, quality: "auto", autoplay: true })
+            id = state.mutation.command.playback_attempt_id
+            m.reduce(state, env, { type: "back" })
+            bodies["stop/unplayed"] = ParseJson(m.reduce(state, env, { type: "startResult", playback_attempt_id: id, kind: "ok", decision: decision })[0].job.bodyText)
+
+            ' A start that ends in a terminal.
+            env = tests.fakeEnv()
+            state = playback.session.create(context)
+            m.reduce(state, env, { type: "play", intent: {}, quality: "auto", autoplay: true })
+            terminal = { protocol_version: 3, outcome: "adaptation_unavailable", server_features: [], terminal: { reason: "transcoding_disabled", message: "Transcoding is disabled.", retryable: false } }
+            bodies["route-event/terminal-start"] = m.reduce(state, env, { type: "startResult", playback_attempt_id: state.mutation.command.playback_attempt_id, kind: "ok", decision: terminal })[0].body
+
+            ' Options' audio row for the plan's second track, as the player
+            ' sends it (run 6: an index alone was refused).
+            env = tests.fakeEnv()
+            state = playback.session.create(context)
+            m.reduce(state, env, { type: "play", intent: {}, quality: "auto", autoplay: true })
+            m.reduce(state, env, { type: "startResult", playback_attempt_id: state.mutation.command.playback_attempt_id, kind: "ok", decision: decision })
+            m.reduce(state, env, { type: "player", load: state.plan.load, state: "playing" })
+            version = { audio_tracks: [{ language: "eng", codec: "aac", default: true }, { language: "jpn", codec: "aac" }] }
+            chosen = playback.options.choose({ plan: state.plan.data, version: version, captionMode: "Off" }, { kind: "audio", value: 1 })
+            bodies["replan/options-audio-change"] = m.sessionReplanBody(m.reduce(state, env, chosen.event)[0], parts)
+
+            problems = []
+            for each path in bodies
+                golden = tests.devices.loadJson("pkg:/tests/fixtures/golden/" + path + ".json")
+                actual = FormatJson(bodies[path])
+                if golden = invalid or FormatJson(golden) <> actual then problems.Push("GOLDEN " + path + ".json " + actual)
+            end for
+            if problems.Count() > 0 then m.fail(problems.Join(Chr(10)))
+        end sub
+
+        function reduce(state as Object, env as Object, event as Object) as Object
+            return playback.session.reduce(state, event, env)
+        end function
+
+        ' Answers the replan in flight with decision's plan and shows its frame.
+        sub replanned(state as Object, env as Object, decision as Object)
+            m.reduce(state, env, { type: "replanResult", replan_request_id: state.mutation.command.replan_request_id, kind: "ok", decision: decision })
+            m.reduce(state, env, { type: "player", load: state.plan.load, state: "playing" })
+        end sub
+
+        ' The body ApiTask sends for a replan command: the session's members
+        ' and the serializer's capability parts.
+        function sessionReplanBody(command as Object, parts as Object) as Object
+            body = playback.values.copy(command.members)
+            body.Append(parts)
+            return body
+        end function
+
+        ' The server's seek_reanchor replan fixture with this client's members:
+        ' plan identities, keys, and position stay the server's opaque values.
+        function replanBody(parts as Object, scenario as Object) as Object
+            body = invalid
+            index = tests.devices.loadJson("pkg:/tests/fixtures/v2/index.json")
+            for each entry in index.fixtures
+                if entry.name = "playback_replan_reanchored" then body = ParseJson(entry.request.body)
+            end for
+            body.Delete("metered")
+            body.installation_id = scenario.request.installationId
+            body.operation = scenario.replan.operation
+            body.selected_tracks = scenario.replan.selected_tracks
+            body.Append(parts)
+            return body
+        end function
+
+    end class
+
+end namespace

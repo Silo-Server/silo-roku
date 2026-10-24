@@ -1,0 +1,149 @@
+namespace tests
+
+    @suite("nav phase")
+    class NavPhaseTests extends rooibos.BaseTestSuite
+
+        ' A session as api.auth.coordinator.view gives it.
+        function view(status as String, profileId as String) as Object
+            origin = "https://silo.example"
+            if status = "no_server" then origin = ""
+            selected = invalid
+            if profileId <> "" then selected = { id: profileId, name: "Profile " + profileId, hasPin: false, isChild: false }
+            return { status: status, origin: origin, accountId: "1", rememberedProfileId: profileId, profile: selected, reason: "" }
+        end function
+
+        function after(session as Object) as Object
+            return nav.phase.onSession(nav.phase.create(), session)
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("phases from the session")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("shows nothing before ApiTask has published a session")
+        sub _()
+            shell = nav.phase.create()
+            m.assertEqual(shell.phase, nav.phase.LAUNCH)
+            m.assertEqual(nav.phase.rootRoute(nav.phase.LAUNCH), "")
+        end sub
+
+        @it("follows setup, sign-in, profile selection, and the main shell (spec section 6.2)")
+        sub _()
+            cases = [
+                ["no_server", "", nav.phase.SETUP, nav.route.SETUP]
+                ["signed_out", "", nav.phase.SIGN_IN, nav.route.SIGN_IN]
+                ["signed_in", "", nav.phase.PROFILE, nav.route.PROFILE]
+                ["signed_in", "p1", nav.phase.MAIN, nav.route.HOME]
+            ]
+            for each c in cases
+                decision = m.after(m.view(c[0], c[1]))
+                m.assertEqual(decision.shell.phase, c[2], c[0])
+                m.assertTrue(decision.reset, c[0])
+                m.assertEqual(decision.root, c[3], c[0])
+            end for
+        end sub
+
+        @it("shows server update required for a stored server whose origin check refused it")
+        sub _()
+            refused = m.view("signed_in", "p1")
+            refused.originStatus = "refused"
+            refused.originProblem = "origin_unconfirmed"
+            decision = m.after(refused)
+            m.assertEqual([decision.shell.phase, decision.root], [nav.phase.UPDATE_REQUIRED, nav.route.UPDATE_REQUIRED])
+            setup = m.view("no_server", "")
+            setup.originStatus = "refused"
+            m.assertEqual(m.after(setup).shell.phase, nav.phase.SETUP, "no stored server to refuse")
+            checking = m.view("signed_in", "p1")
+            checking.originStatus = "checking"
+            m.assertEqual(nav.phase.onSession(decision.shell, checking).shell.phase, nav.phase.MAIN)
+        end sub
+
+        @it("keeps the stack when the same identity is published again")
+        sub _()
+            decision = m.after(m.view("signed_in", "p1"))
+            again = m.view("signed_in", "p1")
+            again.reason = "expired"
+            decision = nav.phase.onSession(decision.shell, again)
+            m.assertEqual(decision.shell.phase, nav.phase.MAIN)
+            m.assertFalse(decision.reset)
+        end sub
+
+        @it("starts over at Home when the profile changes within the main shell")
+        sub _()
+            decision = m.after(m.view("signed_in", "p1"))
+            decision = nav.phase.onSession(decision.shell, m.view("signed_in", "p2"))
+            m.assertEqual(decision.shell.phase, nav.phase.MAIN)
+            m.assertTrue(decision.reset)
+            m.assertEqual(decision.root, nav.route.HOME)
+        end sub
+
+        @it("starts sign-in over when the server changes from it")
+        sub _()
+            decision = m.after(m.view("signed_out", ""))
+            moved = m.view("signed_out", "")
+            moved.origin = "https://other.example"
+            decision = nav.phase.onSession(decision.shell, moved)
+            m.assertEqual(decision.shell.phase, nav.phase.SIGN_IN)
+            m.assertTrue(decision.reset)
+        end sub
+
+        @it("returns to sign-in when the session ends")
+        sub _()
+            decision = m.after(m.view("signed_in", "p1"))
+            ended = m.view("signed_out", "")
+            ended.reason = "expired"
+            decision = nav.phase.onSession(decision.shell, ended)
+            m.assertEqual(decision.shell.phase, nav.phase.SIGN_IN)
+            m.assertTrue(decision.reset)
+            m.assertEqual(decision.root, nav.route.SIGN_IN)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("server update required")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("shows the update screen over any phase, and leaves it for the session's phase")
+        sub _()
+            decision = m.after(m.view("no_server", ""))
+            decision = nav.phase.onUpdateRequired(decision.shell, true)
+            m.assertEqual(decision.shell.phase, nav.phase.UPDATE_REQUIRED)
+            m.assertTrue(decision.reset)
+            m.assertEqual(decision.root, nav.route.UPDATE_REQUIRED)
+            decision = nav.phase.onUpdateRequired(decision.shell, false)
+            m.assertEqual(decision.shell.phase, nav.phase.SETUP)
+            m.assertTrue(decision.reset)
+        end sub
+
+        @it("drops the update screen when the identity changes")
+        sub _()
+            decision = m.after(m.view("signed_in", "p1"))
+            decision = nav.phase.onUpdateRequired(decision.shell, true)
+            decision = nav.phase.onSession(decision.shell, m.view("signed_in", "p1"))
+            m.assertEqual(decision.shell.phase, nav.phase.UPDATE_REQUIRED)
+            m.assertFalse(decision.reset)
+            decision = nav.phase.onSession(decision.shell, m.view("no_server", ""))
+            m.assertEqual(decision.shell.phase, nav.phase.SETUP)
+            m.assertFalse(decision.shell.updateRequired)
+        end sub
+
+        @it("shows no update screen before the session, and the session clears it")
+        sub _()
+            decision = nav.phase.onUpdateRequired(nav.phase.create(), true)
+            m.assertEqual(decision.shell.phase, nav.phase.LAUNCH)
+            m.assertFalse(decision.reset)
+            decision = nav.phase.onSession(decision.shell, m.view("signed_out", ""))
+            m.assertEqual(decision.shell.phase, nav.phase.SIGN_IN)
+        end sub
+
+        @it("leaves the shell it is given unchanged")
+        sub _()
+            shell = m.after(m.view("signed_out", "")).shell
+            before = FormatJson(shell)
+            nav.phase.onUpdateRequired(shell, true)
+            nav.phase.onSession(shell, m.view("no_server", ""))
+            m.assertEqual(FormatJson(shell), before)
+        end sub
+
+    end class
+
+end namespace

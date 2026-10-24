@@ -1,0 +1,114 @@
+import "pkg:/source/util/values.bs"
+
+' Converted subtitle sidecars kept in tmp:/ for the rest of the app session
+' (assumption AG-220), so content that carries a track again needs no
+' download and no conversion: hardware run 24 downloaded and converted file
+' A's 10.24 MiB ASS again on each of its 16 attempts, about 8 s each time.
+' An entry is keyed by the configured server and what the plan says the
+' track is (playback.sidecars.cacheKey), never by its URL, and names the
+' SRT file MediaTask wrote for it. The player keeps the index (create) in
+' m.global and is its only reader and writer, on the render thread, where
+' Roku refuses roFileSystem (hardware run 25), but for AppScene, which
+' empties it when the session ends (assumption AG-289); nothing here
+' touches a file:
+' MediaTask looks for a kept file and deletes those the index no longer
+' needs (playback.sidecarFiles). The files hold at most MAX_BYTES of tmp:/,
+' which Roku counts as the app's memory, and at most MAX_ENTRIES files; the
+' least recently used go first, but never one that content carries or a
+' conversion is writing (pinned). An entry whose file MediaTask finds gone
+' is dropped (forget), and a file no entry names is deleted (trim).
+namespace playback.sidecarCache
+    const DIR = "tmp:/sidecar-cache"
+    ' Under 1% of the 484-519 MB the app had free in hardware run 24, and
+    ' about a tenth of the 36-43 MB it used on Detail; it holds file A's
+    ' four converted tracks (about 1.4 MB) or two at the 20,000-cue limit.
+    const MAX_BYTES = 4194304
+    const MAX_ENTRIES = 32
+
+    ' An empty index: entries [{ key, path, bytes, used }], their bytes in
+    ' all, the last use's number, and the last file's.
+    function create() as Object
+        return { entries: [], bytes: 0, uses: 0, files: 0 }
+    end function
+
+    ' The kept file for key, marked as just used, or "" when there is none
+    ' (a key of "" is never kept). MediaTask then looks for the file
+    ' (playback.sidecarFiles.check); one that is gone is forgotten.
+    function take(index as Object, key as String) as String
+        if key = "" then return ""
+        at = find(index, key)
+        if at < 0 then return ""
+        entry = index.entries[at]
+        index.uses = index.uses + 1
+        entry.used = index.uses
+        return entry.path
+    end function
+
+    ' A new file's path in DIR. MediaTask writes the conversion there;
+    ' no path contains another (playback.sidecars.listedName).
+    function newPath(index as Object) as String
+        index.files = index.files + 1
+        return DIR + "/sidecar" + index.files.ToStr() + ".srt"
+    end function
+
+    ' Keeps the file at path, bytes long, for key, in place of any file kept
+    ' for it before (which trim then leaves out once nothing pins it).
+    sub put(index as Object, key as String, path as String, bytes as Dynamic)
+        if key = "" or path = "" then return
+        at = find(index, key)
+        if at >= 0 then drop(index, at)
+        size = 0
+        if util.isNumber(bytes) and bytes > 0 then size = bytes
+        index.uses = index.uses + 1
+        index.entries.Push({ key: key, path: path, bytes: size, used: index.uses })
+        index.bytes = index.bytes + size
+    end sub
+
+    ' Drops the entry for the file at path, which MediaTask found gone.
+    sub forget(index as Object, path as String)
+        for at = 0 to index.entries.Count() - 1
+            if index.entries[at].path = path
+                drop(index, at)
+                return
+            end if
+        end for
+    end sub
+
+    ' Drops the least recently used entries until those kept hold at most
+    ' limit bytes and MAX_ENTRIES files, but none of pinned (paths content
+    ' carries, or conversions still to write). Gives MediaTask's request
+    ' { keep }: the files in DIR to keep, every entry's and pinned; it
+    ' deletes the others (playback.sidecarFiles.sweep).
+    function trim(index as Object, pinned as Object, limit as Integer) as Object
+        while index.bytes > limit or index.entries.Count() > MAX_ENTRIES
+            oldest = -1
+            for at = 0 to index.entries.Count() - 1
+                entry = index.entries[at]
+                if not util.contains(pinned, entry.path) and (oldest < 0 or entry.used < index.entries[oldest].used) then oldest = at
+            end for
+            if oldest < 0 then exit while
+            drop(index, oldest)
+        end while
+        paths = []
+        for each entry in index.entries
+            paths.Push(entry.path)
+        end for
+        for each path in pinned
+            if path <> "" then paths.Push(path)
+        end for
+        return { keep: paths }
+    end function
+
+    ' The position of key's entry, or -1 for none.
+    function find(index as Object, key as String) as Integer
+        for at = 0 to index.entries.Count() - 1
+            if index.entries[at].key = key then return at
+        end for
+        return -1
+    end function
+
+    sub drop(index as Object, at as Integer)
+        index.bytes = index.bytes - index.entries[at].bytes
+        index.entries.Delete(at)
+    end sub
+end namespace

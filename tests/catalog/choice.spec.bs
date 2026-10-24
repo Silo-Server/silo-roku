@@ -1,0 +1,143 @@
+namespace tests
+
+    ' A detail page's Version, Audio, and Subtitles choices over a selection
+    ' (tests.catalogData.selectionWatch), as tvOS makes them.
+    @suite("catalog choice")
+    class CatalogChoiceTests extends rooibos.BaseTestSuite
+
+        function copy() as Object
+            return i18n.load("en_US")
+        end function
+
+        function selection(extra = invalid as Dynamic) as Object
+            return catalog.selection.fromWatch(tests.catalogData.selectionWatch(extra), m.copy())
+        end function
+
+        function choice(fileId as String, audio as Integer, subtitle as Integer, cleared = false as Boolean) as Object
+            return { fileId: fileId, audio: audio, subtitle: subtitle, cleared: cleared }
+        end function
+
+        @describe("the readout (tvOS TVPlaybackSelectionSummary)")
+
+        @it("names what Auto plays, marked Auto")
+        sub _()
+            selection = m.selection()
+            auto = catalog.choice.initial(selection)
+            m.assertEqual(auto, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO))
+            m.assertEqual(catalog.choice.readout(selection, auto, m.copy()), { version: "Auto · 2160p · DV", audio: "Auto · English · EAC3 · 5.1", subtitles: "Auto · English (Forced) · PGS" })
+            ' Japanese audio: Auto's subtitle follows it.
+            m.assertEqual(catalog.choice.readout(selection, m.choice("", 2, catalog.pickers.AUTO), m.copy()).subtitles, "Auto · English · SRT")
+            ' A version whose Auto plays no subtitle.
+            m.assertEqual(catalog.choice.readout(selection, m.choice("102", catalog.pickers.AUTO, catalog.pickers.AUTO), m.copy()).subtitles, "Auto · None")
+        end sub
+
+        @it("stops naming the subtitle the profile chose on the item once the page cleared it, at once (run 26)")
+        sub _()
+            ' The profile chose the Spanish sidecar here: the page starts on it,
+            ' and Auto would play it too while the choice stands.
+            signature = { source: "external", language: "es", codec: "subrip", label: "", forced: false, hearing_impaired: false }
+            selection = m.selection({ effective_subtitle_track_signature: signature })
+            seeded = catalog.choice.initial(selection)
+            m.assertEqual(seeded, m.choice("", catalog.pickers.AUTO, 0))
+            m.assertEqual(catalog.choice.readout(selection, seeded, m.copy()).subtitles, "Spanish · SRT")
+            m.assertEqual(catalog.choice.readout(selection, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO), m.copy()).subtitles, "Auto · Spanish · SRT")
+            ' Auto picked on the page deletes that choice: Auto names what the
+            ' profile's own preferences play, without waiting for a read.
+            cleared = m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO, true)
+            m.assertEqual(catalog.choice.readout(selection, cleared, m.copy()).subtitles, "Auto · English (Forced) · PGS")
+            m.assertEqual(catalog.choice.readout(selection, m.choice("", 2, catalog.pickers.AUTO, true), m.copy()).subtitles, "Auto · English · SRT", "beside Japanese audio")
+            m.assertTrue(catalog.choice.withVersion(selection, cleared, catalog.pickers.AUTO).cleared, "kept across a version change")
+            ' Without a remembered subtitle, clearing changes nothing.
+            plain = m.selection()
+            m.assertEqual(catalog.choice.readout(plain, cleared, m.copy()), catalog.choice.readout(plain, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO), m.copy()))
+        end sub
+
+        @it("names what the viewer chose without Auto")
+        sub _()
+            selection = m.selection()
+            m.assertEqual(catalog.choice.readout(selection, m.choice("102", 0, playback.tracks.OFF), m.copy()), { version: "1080p", audio: "English · AC3 · 5.1", subtitles: "Off" })
+            m.assertEqual(catalog.choice.readout(selection, m.choice("", catalog.pickers.AUTO, 0), m.copy()).subtitles, "Spanish · SRT")
+        end sub
+
+        @it("says Unknown for a version without audio, and Auto alone for a version without facts")
+        sub _()
+            body = tests.catalogData.selectionWatch()
+            body.versions[1].Delete("audio_tracks")
+            body.versions[1].Delete("resolution")
+            body.playback_variants[0].default_file_id = "102"
+            selection = catalog.selection.fromWatch(body, m.copy())
+            values = catalog.choice.readout(selection, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO), m.copy())
+            m.assertEqual([values.version, values.audio], ["Auto", "Auto · Unknown"])
+            m.assertEqual(catalog.choice.readout(selection, m.choice("101", catalog.pickers.AUTO, catalog.pickers.AUTO), m.copy()).version, "2160p · DV")
+            m.assertEqual(catalog.choice.enabled(selection, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO)), { version: true, audio: false, subtitles: true })
+            m.assertEqual(catalog.choice.enabled(invalid, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO)), { version: false, audio: false, subtitles: false })
+        end sub
+
+        @describe("changing the version (spec section 5.6)")
+
+        @it("keeps a track the new version has at the same ordinal, else goes back to Auto, as tvOS does")
+        sub _()
+            selection = m.selection()
+            moved = catalog.choice.withVersion(selection, m.choice("", 3, 2), 1)
+            m.assertEqual(moved, m.choice("102", catalog.pickers.AUTO, catalog.pickers.AUTO))
+            kept = catalog.choice.withVersion(selection, m.choice("", 0, 0), 1)
+            m.assertEqual(kept, m.choice("102", 0, 0))
+            off = catalog.choice.withVersion(selection, m.choice("", catalog.pickers.AUTO, playback.tracks.OFF), 1)
+            m.assertEqual(off, m.choice("102", catalog.pickers.AUTO, playback.tracks.OFF), "Auto stays Auto, and Off stays Off")
+            m.assertEqual(catalog.choice.withVersion(selection, m.choice("102", 0, 0), catalog.pickers.AUTO).fileId, "")
+        end sub
+
+        @it("gives the Version menu's value for a choice")
+        sub _()
+            selection = m.selection()
+            m.assertEqual(catalog.choice.versionValue(selection, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO)), catalog.pickers.AUTO)
+            m.assertEqual(catalog.choice.versionValue(selection, m.choice("102", catalog.pickers.AUTO, catalog.pickers.AUTO)), 1)
+            m.assertEqual(catalog.choice.versionOf(selection, m.choice("gone", catalog.pickers.AUTO, catalog.pickers.AUTO)).fileId, "101", "a file no longer listed falls back")
+        end sub
+
+        @describe("the remembered audio track (silo-server SelectAudioTrack)")
+
+        @it("starts on the track matching the remembered signature")
+        sub _()
+            version = m.selection().versions[0]
+            pref = { index: 0, language: "ja", signature: { language: "ja", title: "", embedded_title: "", codec: "AAC", layout: "Stereo", channels: 2 } }
+            m.assertEqual(catalog.choice.seedAudio(version, pref), 2)
+        end sub
+
+        @it("falls back to the remembered ordinal in its language, then the language's best track")
+        sub _()
+            version = m.selection().versions[0]
+            m.assertEqual(catalog.choice.seedAudio(version, { index: 1, language: "en", signature: invalid }), 1)
+            m.assertEqual(catalog.choice.seedAudio(version, { index: 1, language: "ja", signature: invalid }), 2)
+            m.assertEqual(catalog.choice.seedAudio(version, { index: 0, language: "fr", signature: invalid }), catalog.pickers.AUTO)
+            m.assertEqual(catalog.choice.seedAudio(version, invalid), catalog.pickers.AUTO)
+        end sub
+
+        @describe("remembering a choice (tvOS TrackSelectionPersistence)")
+
+        @it("puts a chosen track, Off, or for Auto deletes, under the series or movie")
+        sub _()
+            selection = m.selection({ type: "episode", content_id: "episode:a-1", series_id: "series:a" })
+            audio = catalog.choice.preferenceWrite(selection, m.choice("", 2, catalog.pickers.AUTO), "audio")
+            m.assertEqual([audio.method, audio.path, audio.auth], ["PUT", "/api/v2/audio-prefs/series:a", "profile"])
+            m.assertEqual(audio.body.audio_track_index, 2)
+            auto = catalog.choice.preferenceWrite(selection, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO), "audio")
+            m.assertEqual([auto.method, auto.path], ["DELETE", "/api/v2/audio-prefs/series:a"])
+            m.assertAANotHasKey(auto, "body")
+            off = catalog.choice.preferenceWrite(selection, m.choice("", catalog.pickers.AUTO, playback.tracks.OFF), "subtitle")
+            m.assertEqual([off.method, off.path, off.body], ["PUT", "/api/v2/subtitle-prefs/series:a", { subtitle_language: "", subtitle_track_index: -1, subtitle_mode: "off" }])
+            track = catalog.choice.preferenceWrite(selection, m.choice("102", catalog.pickers.AUTO, 0), "subtitle")
+            m.assertEqual(track.body.subtitle_language, "en", "the chosen version's track")
+            m.assertEqual(catalog.choice.preferenceWrite(selection, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO), "subtitle").method, "DELETE")
+        end sub
+
+        @it("remembers the written audio track for the series' next episode")
+        sub _()
+            selection = m.selection()
+            remembered = catalog.choice.rememberedAudio(selection, m.choice("", 2, catalog.pickers.AUTO))
+            m.assertEqual([remembered.index, remembered.language, remembered.signature.codec], [2, "ja", "aac"])
+            m.assertEqual(catalog.choice.seedAudio(selection.versions[0], remembered), 2)
+            m.assertInvalid(catalog.choice.rememberedAudio(selection, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO)))
+        end sub
+    end class
+end namespace

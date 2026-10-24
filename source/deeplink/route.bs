@@ -1,0 +1,250 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/auth/profiles.bs"
+import "pkg:/source/nav/phase.bs"
+import "pkg:/source/nav/player.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/util/values.bs"
+
+' Where the reducer is with its link (deeplink.route).
+namespace deeplink.stage
+    ' No link under way.
+    const IDLE = ""
+    ' No session yet (setup, sign-in): the link waits for one.
+    const WAITING = "waiting"
+    ' No profile open: the account's profiles are loading for the profile rule.
+    const PROFILES = "profiles"
+    ' A profile chosen by the rule is being opened.
+    const SELECTING = "selecting"
+    ' The catalog item is loading under the open profile.
+    const RESOLVING = "resolving"
+end namespace
+
+' The kinds of decision deeplink.route returns.
+namespace deeplink.step
+    ' { deepLink }: start the profile phase over at its root. true shows a
+    ' spinner in place of the picker, leaving any PIN screen; false gives the
+    ' viewer the picker back.
+    const PICKER = "picker"
+    ' GET /api/v2/profiles, answered through onProfiles.
+    const PROFILES = "profiles"
+    ' { profile }: open a profile (api.session.selectProfile), answered
+    ' through onSelected.
+    const SELECT = "select"
+    ' { contentId }: GET itemPath(contentId), answered through onResolved.
+    const RESOLVE = "resolve"
+    ' Drop the request in flight.
+    const CANCEL = "cancel"
+    ' Close the open keyboard or dialog.
+    const CLOSE = "close"
+    ' { intent, replace }: push nav.route.PLAYER with { intent }, or with
+    ' replace, put it in place of the player on top, whose release hands its
+    ' stop and final progress to ApiTask.
+    const PLAY = "play"
+    ' { reason }: the link ends without playing, and the app stays where it
+    ' is: Home on launch, the current screen while running. reason is one of
+    ' invalid, no_profile, profiles_failed, select_failed, inaccessible,
+    ' not_playable, or unavailable.
+    const DROP = "drop"
+end namespace
+
+' Where a deep link goes (spec section 10.1, plan section 7), as a reducer
+' over plain data that AppScene runs (components/AppSceneDeepLink.bs):
+'
+'     App state when the link arrives   What happens
+'     no session (setup, sign-in)       it waits, and continues after sign-in
+'     profile picker or PIN at launch   both close; the profile rule picks
+'     keyboard or dialog open           it closes, then the player opens
+'     browse screens                    the player opens above the stack
+'     player                            the new player replaces it
+'     invalid or inaccessible           nothing changes: Home on launch
+'
+' A valid link resolves its item with GET /api/v2/catalog/items/{id} under the
+' open profile; a movie or episode plays itself, and a series or season its
+' play target (playableId). Each event changes state and returns the
+' decisions AppScene carries out, in order (deeplink.step). A request
+' decision replaces the request in flight. Events take a context (context()),
+' read just before the call.
+namespace deeplink.route
+    const ITEM_PATH = "/api/v2/catalog/items/"
+
+    ' link is the link under way, trying the profile being opened, first the
+    ' first profile that opened, and candidates the profiles left to try.
+    function create() as Object
+        return { stage: deeplink.stage.IDLE, link: invalid, candidates: [], trying: invalid, first: invalid }
+    end function
+
+    ' What the reducer reads about the app: phase (nav.phase), the open
+    ' profile's ID or "", the profile last chosen on this device, the top
+    ' screen's route, and whether a keyboard or dialog is open.
+    function context(phase as String, profileId as String, rememberedId as String, topRoute as String, overlay as Boolean) as Object
+        return { phase: phase, profileId: profileId, rememberedId: rememberedId, topRoute: topRoute, overlay: overlay }
+    end function
+
+    ' Whether a link is under way. Until it ends, AppLaunchComplete waits for
+    ' the player rather than Home, and the profile phase opens with a spinner
+    ' in place of the picker.
+    function busy(state as Object) as Boolean
+        return state.stage <> deeplink.stage.IDLE
+    end function
+
+    function itemPath(contentId as String) as String
+        return ITEM_PATH + api.request.escape(contentId)
+    end function
+
+    ' A link from deeplink.parse. A valid one replaces any link under way; an
+    ' invalid one changes nothing.
+    function onLink(state as Object, link as Dynamic, ctx as Object) as Object
+        if link = invalid then return []
+        if not link.valid then return [{ kind: deeplink.step.DROP, reason: "invalid" }]
+        clear(state)
+        state.link = link
+        return advance(state, ctx)
+    end function
+
+    ' The phase or identity changed (nav.phase.onSession reset the stack).
+    function onPhase(state as Object, ctx as Object) as Object
+        current = state.stage
+        if current = deeplink.stage.IDLE then return []
+        if ctx.phase <> nav.phase.PROFILE and ctx.phase <> nav.phase.MAIN
+            ' The session ended or the server changed: wait for the next one.
+            decisions = []
+            if current <> deeplink.stage.WAITING then decisions.Push({ kind: deeplink.step.CANCEL })
+            link = state.link
+            clear(state)
+            state.link = link
+            state.stage = deeplink.stage.WAITING
+            return decisions
+        end if
+        ' The rule picks when the list arrives, even if a profile opened
+        ' meanwhile.
+        if current = deeplink.stage.PROFILES then return []
+        if current = deeplink.stage.SELECTING
+            if ctx.phase = nav.phase.PROFILE then return []
+            return opened(state, ctx)
+        end if
+        return advance(state, ctx)
+    end function
+
+    ' The GET /api/v2/profiles answer.
+    function onProfiles(state as Object, result as Object, ctx as Object) as Object
+        if state.stage <> deeplink.stage.PROFILES then return []
+        if result.ok <> true then return giveUp(state, ctx, "profiles_failed")
+        state.candidates = profileOrder(api.auth.profiles.list(result.body), ctx.rememberedId)
+        return selectNext(state, ctx, "no_profile")
+    end function
+
+    ' The answer to opening a profile. A PIN-locked one answers pin_required
+    ' and is skipped (decision D-4).
+    function onSelected(state as Object, result as Object, ctx as Object) as Object
+        if state.stage <> deeplink.stage.SELECTING then return []
+        if result.ok = true
+            ' Opening the profile already open publishes no new identity, so
+            ' no onPhase follows.
+            if ctx.phase = nav.phase.MAIN and ctx.profileId = state.trying.id then return opened(state, ctx)
+            return []
+        end if
+        if result.error <> invalid and util.text(result.error.kind) = "pin_required" then return selectNext(state, ctx, "no_profile")
+        return giveUp(state, ctx, "select_failed")
+    end function
+
+    ' The GET /api/v2/catalog/items/{id} answer. When the profile rule opened
+    ' the profile, one that cannot see the item (403 or 404) gives way to the
+    ' next.
+    function onResolved(state as Object, result as Object, ctx as Object) as Object
+        if state.stage <> deeplink.stage.RESOLVING then return []
+        if result.ok = true
+            contentId = playableId(result.body)
+            if contentId = "" then return giveUp(state, ctx, "not_playable")
+            decisions = []
+            if ctx.overlay then decisions.Push({ kind: deeplink.step.CLOSE })
+            decisions.Push({ kind: deeplink.step.PLAY, intent: nav.player.intent(contentId, nav.player.RESUME), replace: ctx.topRoute = nav.route.PLAYER })
+            clear(state)
+            return decisions
+        end if
+        if result.status = 403 or result.status = 404 then return selectNext(state, ctx, "inaccessible")
+        return giveUp(state, ctx, "unavailable")
+    end function
+
+    ' The profiles a deep link may open, in the order it tries them (plan
+    ' section 7, decision D-4): the one last chosen on this device, then the
+    ' account's others in the server's order, never a child profile. A
+    ' PIN-locked profile opens only with the profile token this device
+    ' already holds; otherwise the session answers pin_required and the next
+    ' is tried, so a deep link never asks for a PIN.
+    function profileOrder(profiles as Object, rememberedId as String) as Object
+        ordered = []
+        for each profile in profiles
+            if not profile.isChild
+                if profile.id = rememberedId
+                    ordered.Unshift(profile)
+                else
+                    ordered.Push(profile)
+                end if
+            end if
+        end for
+        return ordered
+    end function
+
+    ' The content ID to play for a catalog item body, or "": a movie or
+    ' episode plays itself, a series or season its play target
+    ' (play_content_id, spec section 8.3). Other types (audiobook, ebook,
+    ' podcast) are not video.
+    function playableId(body as Dynamic) as String
+        if not util.isObject(body) then return ""
+        itemType = LCase(util.text(body.type))
+        if itemType = "movie" or itemType = "episode" then return util.text(body.content_id)
+        if itemType = "series" or itemType = "season" then return util.text(body.play_content_id)
+        return ""
+    end function
+
+    ' The next step for the link from the app's phase.
+    function advance(state as Object, ctx as Object) as Object
+        if ctx.phase = nav.phase.MAIN
+            state.stage = deeplink.stage.RESOLVING
+            return [{ kind: deeplink.step.RESOLVE, contentId: state.link.contentId }]
+        end if
+        if ctx.phase = nav.phase.PROFILE
+            state.stage = deeplink.stage.PROFILES
+            return [{ kind: deeplink.step.PICKER, deepLink: true }, { kind: deeplink.step.PROFILES }]
+        end if
+        state.stage = deeplink.stage.WAITING
+        return []
+    end function
+
+    ' The profile the rule chose is open.
+    function opened(state as Object, ctx as Object) as Object
+        if state.first = invalid and state.trying <> invalid and state.trying.id = ctx.profileId then state.first = state.trying
+        return advance(state, ctx)
+    end function
+
+    ' Opens the next candidate, or gives up with reason when none is left.
+    function selectNext(state as Object, ctx as Object, reason as String) as Object
+        if state.candidates.Count() = 0 then return giveUp(state, ctx, reason)
+        state.trying = state.candidates.Shift()
+        state.stage = deeplink.stage.SELECTING
+        return [{ kind: deeplink.step.SELECT, profile: state.trying }]
+    end function
+
+    ' Ends the link without playing. Before a profile is open the viewer gets
+    ' the picker back, as on an ordinary launch; after the rule has moved on
+    ' from the first profile that opened, that one opens again.
+    function giveUp(state as Object, ctx as Object, reason as String) as Object
+        decisions = []
+        if ctx.phase = nav.phase.PROFILE
+            decisions.Push({ kind: deeplink.step.PICKER, deepLink: false })
+        else if state.first <> invalid and state.first.id <> ctx.profileId
+            decisions.Push({ kind: deeplink.step.SELECT, profile: state.first })
+        end if
+        decisions.Push({ kind: deeplink.step.DROP, reason: reason })
+        clear(state)
+        return decisions
+    end function
+
+    sub clear(state as Object)
+        state.stage = deeplink.stage.IDLE
+        state.link = invalid
+        state.candidates = []
+        state.trying = invalid
+        state.first = invalid
+    end sub
+end namespace

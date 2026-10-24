@@ -1,0 +1,147 @@
+import "pkg:/source/api/response.bs"
+import "pkg:/source/api/router.bs"
+import "pkg:/source/playback/sidecarCache.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/components/theme/helpers.bs"
+
+' The root scene: the result router (below), the screen host
+' (AppSceneNav.bs), platform events with the memory policy
+' (AppScenePlatform.bs), and deep links (AppSceneDeepLink.bs). Screens appear
+' once ApiTask publishes the session.
+sub init()
+    theme.install()
+    ' backgroundColor shows only while backgroundURI is empty.
+    m.top.backgroundColor = theme.color.BACKGROUND
+    m.top.backgroundURI = ""
+    m.apiRouter = api.router.create()
+    navInit()
+    platformInit()
+    deepLinkInit()
+end sub
+
+' The result router (plan section 4.2): AppScene owns the one ApiTask, and only
+' AppScene sets or observes its fields. Screens reach it through
+' source/api/client.bs and source/api/session.bs.
+
+' Main calls this once, before the screen shows, with the registry snapshot
+' (source/storage/registry.bs). ApiTask reads it at start and is the only
+' registry writer from then on (plan section 4.3).
+sub apiStart(snapshot as Object)
+    if m.apiTask <> invalid then return
+    #if debug
+        m.apiTask = CreateObject("roSGNode", "DevApiTask")
+    #else
+        m.apiTask = CreateObject("roSGNode", "ApiTask")
+    #end if
+    #if api_field_delivery
+        m.apiTask.observeField("result", "onApiResultField")
+    #else
+        m.apiQueue = CreateObject("roRenderThreadQueue")
+        m.apiQueueHandler = m.apiQueue.AddMessageHandler(api.response.MESSAGE_ID, "onApiResult")
+    #end if
+    m.apiTask.observeField("session", "onApiSession")
+    m.apiTask.snapshot = snapshot
+    m.apiTask.control = "run"
+end sub
+
+' callFunc("apiSend", request, handle): registers handle and queues request,
+' or, with an orderKey, puts it in its line (api.router.order). A request
+' that may wait its turn is fenced to the identity it was sent under, so it
+' never goes out with another's credentials.
+function apiSend(request as Object, handle as Object) as String
+    id = api.router.register(m.apiRouter, handle.owner, handle)
+    handle.requestId = id
+    request.requestId = id
+    request.owner = handle.owner
+    if api.router.isOrdered(request) then request.fence = sessionIdentity()
+    turn = api.router.order(m.apiRouter, request)
+    if turn.superseded <> invalid then supersede(turn.superseded)
+    if turn.send then setApiField("request", request)
+    return id
+end function
+
+' A waiting write a newer one replaced in its line: its handle hears it was
+' cancelled.
+sub supersede(request as Object)
+    handle = api.router.take(m.apiRouter, request.requestId)
+    if handle <> invalid then api.router.deliver(handle, api.response.failure(request, "cancelled", "superseded"))
+end sub
+
+' One still waiting in its line never reached ApiTask.
+sub apiCancel(requestId as String)
+    api.router.take(m.apiRouter, requestId)
+    if not api.router.withdraw(m.apiRouter, requestId) then setApiField("cancel", { requestId: requestId })
+end sub
+
+sub apiRelease(owner as String)
+    api.router.release(m.apiRouter, owner)
+    setApiField("cancel", { owner: owner })
+end sub
+
+' { maxConcurrent }; debug builds also take baseUrl (components/tasks/ApiTask.xml).
+sub apiConfigure(config as Object)
+    setApiField("config", config)
+end sub
+
+' The session without tokens (api.auth.coordinator.view), or invalid before
+' ApiTask has published one.
+function apiSession() as Dynamic
+    return m.apiSession
+end function
+
+' The identity requests carry now, as the session says it: { server,
+' account, profile } (api.auth.coordinator.identity).
+function sessionIdentity() as Object
+    identity = { server: "", account: "", profile: "" }
+    view = m.apiSession
+    if view = invalid then return identity
+    identity.server = view.origin
+    identity.account = view.accountId
+    if view.profile <> invalid then identity.profile = view.profile.id
+    return identity
+end function
+
+' ApiTask publishes its session at start and on each change. The first one
+' also means it observes its fields, so the sets kept until then go through.
+' Each one then reaches the screen host, which may change screens.
+sub onApiSession()
+    m.apiSession = m.apiTask.session
+    log.info("session", "state", { status: m.apiSession.status, reason: m.apiSession.reason })
+    forgetSidecars()
+    for each pending in api.router.taskReady(m.apiRouter)
+        m.apiTask.setField(pending.field, pending.value)
+    end for
+    navSessionChanged()
+end sub
+
+' A session that ended takes the converted subtitles' index with it
+' (playback.sidecarCache): its keys name files by the server's IDs, and the
+' next sign-in can reach another server at the same address. The next
+' player's trim deletes their files.
+sub forgetSidecars()
+    if m.apiSession.status <> "signed_in" and m.global.hasField("sidecarCache") then m.global.sidecarCache = playback.sidecarCache.create()
+end sub
+
+' Sets an ApiTask field, or keeps it, in order, until ApiTask is ready.
+sub setApiField(field as String, value as Object)
+    if api.router.admit(m.apiRouter, field, value) then m.apiTask.setField(field, value)
+end sub
+
+#if api_field_delivery
+    sub onApiResultField(event as Object)
+        routeApiResult(event.getData())
+    end sub
+#else
+    ' roRenderThreadQueue handler for every envelope ApiTask posts.
+    sub onApiResult(result as Object, _info as Object)
+        routeApiResult(result)
+    end sub
+#end if
+
+' A result also lets the next request in its line go.
+sub routeApiResult(result as Object)
+    handle = api.router.take(m.apiRouter, result.requestId)
+    following = api.router.advance(m.apiRouter, result.requestId)
+    if following <> invalid then setApiField("request", following)
+    if handle <> invalid then api.router.deliver(handle, result)
+end sub

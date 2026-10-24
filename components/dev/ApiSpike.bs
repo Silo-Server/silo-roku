@@ -1,0 +1,114 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/api/request.bs"
+import "pkg:/source/util/log.bs"
+
+' Dev builds only: the M0-6 threading spike (plan section 9.3).
+'   Play: type a server URL, then GET /api/v2/system/info through ApiTask.
+'   Replay: ApiTask builds a 200-item ContentNode tree and posts it.
+' Results show at the bottom of the diagnostic screen and in the debug console.
+' The server URL is kept in memory only.
+const OWNER = "dev.apiSpike"
+const TREE_ITEMS = 200
+
+sub init()
+    m.status = m.top.findNode("spikeStatus")
+    m.lastUrl = "https://"
+    show("API spike: Play for server info, Replay for a " + TREE_ITEMS.ToStr() + "-item tree")
+end sub
+
+function onKey(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if key = "play"
+        askForServer()
+        return true
+    else if key = "replay"
+        requestTree()
+        return true
+    end if
+    return false
+end function
+
+sub askForServer()
+    dialog = CreateObject("roSGNode", "StandardKeyboardDialog")
+    dialog.title = "Silo server URL"
+    dialog.message = ["Fetches /api/v2/system/info. The address is not stored."]
+    dialog.buttons = ["Fetch", "Cancel"]
+    dialog.text = m.lastUrl
+    dialog.observeField("buttonSelected", "onServerDialogButton")
+    m.dialog = dialog
+    m.top.getScene().dialog = dialog
+end sub
+
+sub onServerDialogButton()
+    text = m.dialog.text
+    selected = m.dialog.buttonSelected
+    m.dialog.close = true
+    m.dialog = invalid
+    if selected <> 0 then return
+    base = api.request.baseUrl(text)
+    if base = invalid
+        show("Server info: not an http or https URL without credentials, query, or fragment")
+        return
+    end if
+    m.lastUrl = base
+    m.top.getScene().callFunc("apiConfigure", { baseUrl: base })
+    m.info = api.newHandle(OWNER)
+    m.info.observeField("status", "onServerInfo")
+    api.send({ path: "/api/v2/system/info", timeoutMs: 10000 }, m.info)
+    show("Server info: fetching")
+end sub
+
+sub onServerInfo()
+    result = api.resultOf(m.info)
+    body = result.body
+    if result.ok and type(body) = "roAssociativeArray"
+        show("Server info: api_major " + FormatJson(body.api_major) + ", server_version " + FormatJson(body.server_version))
+    else
+        show("Server info failed: " + describeError(result.error))
+    end if
+    log.info("spike", "server info", { status: result.status, ok: result.ok })
+end sub
+
+sub requestTree()
+    m.tree = api.newHandle(OWNER)
+    m.tree.observeField("status", "onTree")
+    m.treeClock = CreateObject("roTimespan")
+    api.send({ dev: "tree", count: TREE_ITEMS }, m.tree)
+end sub
+
+' The handle callback slice; reading the items is a separate slice (readTree),
+' since the frame-budget check excludes list population.
+sub onTree()
+    arrivedMs = m.treeClock.TotalMilliseconds()
+    content = m.tree.content
+    if content = invalid
+        show("Tree failed: " + describeError(api.resultOf(m.tree).error))
+        return
+    end if
+    clock = CreateObject("roTimespan")
+    read = readTree(content)
+    readMs = clock.TotalMilliseconds()
+    log.info("spike", "tree arrived", { items: read, buildMs: api.resultOf(m.tree).body.buildMs, sendToCallbackMs: arrivedMs, readMs: readMs })
+    show("Tree: " + read.ToStr() + " items, send to callback " + arrivedMs.ToStr() + " ms, read " + readMs.ToStr() + " ms")
+end sub
+
+' Reads every item's title, as a list would, so a rendezvous would show here.
+function readTree(content as Object) as Integer
+    read = 0
+    for i = 0 to content.getChildCount() - 1
+        if content.getChild(i).title <> "" then read = read + 1
+    end for
+    return read
+end function
+
+function describeError(error as Dynamic) as String
+    if type(error) <> "roAssociativeArray" then return "unknown"
+    text = error.kind
+    if error.status > 0 then text = text + " " + error.status.ToStr()
+    if error.problemType <> invalid then text = text + " " + error.problemType
+    return text
+end function
+
+sub show(text as String)
+    m.status.text = text
+end sub

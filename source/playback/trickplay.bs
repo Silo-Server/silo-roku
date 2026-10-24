@@ -1,0 +1,294 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/memory/policy.bs"
+import "pkg:/source/playback/media.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/util/values.bs"
+
+' Seek-bar previews (plan section 6.9, spec section 5.7) as pure functions:
+' which files have them, the manifest request and its parse, which tile shows
+' a position, how a sheet decodes and is drawn, which sheets stay loaded, and
+' when the manifest is read again. ApiTask's map step parses the manifest
+' (source/catalog/map.bs); components/player/trickplay/TrickplayPreview draws
+' it; source/playback/trickplayFetch.bs has the player's render-thread helpers.
+'
+' A parsed manifest:
+'   fileId           the file the sheets were cut from
+'   intervalMs       media time per thumbnail: thumbnail i shows source
+'                    time [i * intervalMs, (i + 1) * intervalMs)
+'   thumbnailWidth, thumbnailHeight   one tile in the sheet, px
+'   columns, rows    tiles across and down; every sheet has the full grid,
+'                    black after the last thumbnail
+'   count            thumbnails in all
+'   perSheet         columns * rows
+'   sheets           one absolute URL per sheet, in index order
+'   expiresAt        when the sheet URLs stop working, epoch seconds
+'
+' Sheet URLs carry their own authorization (exp and sig): a Poster loads them
+' with no headers, and they are never logged. The server's own signer gives
+' relative /api/v2/artwork/trickplay/... paths, resolved against the
+' configured base URL as API paths are; a server whose sheets live in an
+' object store with direct URLs gives absolute URLs on that store's origin,
+' which are used as they are. Either way no account credential goes with them.
+namespace playback.trickplay
+    ' The capability that says the server serves previews.
+    const FEATURE = "trickplay_v1"
+    ' ApiTask's map kind for the manifest (source/catalog/map.bs).
+    const KIND = "trickplay"
+    ' The server keeps sheets within 3200 px wide (internal/trickplay/recipe.go)
+    ' and 16384 px tall (mediasample's sheet limit); larger ones are refused.
+    const MAX_SHEET_WIDTH = 3200
+    const MAX_SHEET_HEIGHT = 16384
+    ' A sheet decodes within this box, at its own size when smaller.
+    const MAX_LOAD_SIZE = 1600
+    ' The preview on an FHD UI: this wide at the tile's aspect, or this tall
+    ' for tiles taller than wide.
+    const DISPLAY_WIDTH = 240
+    const MAX_DISPLAY_HEIGHT = 240
+    ' The manifest is read again this long before its URLs expire.
+    const RENEW_MARGIN_SECONDS = 30
+
+    ' Whether to read fileId's previews: the watch state (GET
+    ' /api/v2/watch/{id}) lists the file, among its versions or a playback
+    ' variant's parts, with trickplay_available, and the playback
+    ' capabilities' features list FEATURE.
+    function isEligible(watch as Dynamic, fileId as String, features as Dynamic) as Boolean
+        if fileId = "" or not util.contains(features, FEATURE) or not util.isObject(watch) then return false
+        if versionHasPreviews(watch.versions, fileId) then return true
+        if not playback.values.isArray(watch.playback_variants) then return false
+        for each variant in watch.playback_variants
+            if util.isObject(variant) and playback.values.isArray(variant.parts)
+                for each part in variant.parts
+                    if util.isObject(part) and versionHasPreviews(part.versions, fileId) then return true
+                end for
+            end if
+        end for
+        return false
+    end function
+
+    ' Whether versions lists fileId with trickplay_available.
+    function versionHasPreviews(versions as Dynamic, fileId as String) as Boolean
+        if not playback.values.isArray(versions) then return false
+        for each version in versions
+            if util.isObject(version) and util.text(version.file_id) = fileId then return util.isTrue(version.trickplay_available)
+        end for
+        return false
+    end function
+
+    ' GET /api/v2/watch/{itemId}/trickplay?file_id={fileId} as the profile,
+    ' parsed in ApiTask by parseManifest. baseUrl is the configured base URL
+    ' (api.session.current().origin), which relative sheet URLs resolve against.
+    function manifestRequest(itemId as String, fileId as String, baseUrl as String) as Object
+        path = "/api/v2/watch/" + catalog.request.segment(itemId) + "/trickplay"
+        return catalog.request.read(path, { file_id: fileId }, { kind: KIND, fileId: fileId, baseUrl: baseUrl })
+    end function
+
+    ' A WatchTrickplay body as a manifest (above), or invalid when it is not
+    ' one this client can draw: another file than fileId (unless fileId is
+    ' ""), a size, grid, interval, or count that is not a positive integer, a
+    ' sheet wider than MAX_SHEET_WIDTH or taller than MAX_SHEET_HEIGHT, sheets
+    ' that are not exactly indexes 0 to the last the count needs (one beyond
+    ' the grid, a gap, or a repeat), a sheet URL that is not http(s), or an
+    ' unreadable expires_at.
+    function parseManifest(body as Dynamic, fileId as String, baseUrl as String) as Dynamic
+        if not util.isObject(body) then return invalid
+        id = util.text(body.file_id)
+        if id = "" or (fileId <> "" and id <> fileId) then return invalid
+        out = { fileId: id }
+        names = { intervalMs: "interval_ms", thumbnailWidth: "thumbnail_width", thumbnailHeight: "thumbnail_height", columns: "tile_columns", rows: "tile_rows", count: "thumbnail_count" }
+        for each name in names
+            value = body[names[name]]
+            if not api.request.isInteger(value) or value <= 0 then return invalid
+            out[name] = value
+        end for
+        ' Each factor is bounded first, so the products cannot overflow.
+        if out.columns > MAX_SHEET_WIDTH or out.thumbnailWidth > MAX_SHEET_WIDTH or out.columns * out.thumbnailWidth > MAX_SHEET_WIDTH then return invalid
+        if out.rows > MAX_SHEET_HEIGHT or out.thumbnailHeight > MAX_SHEET_HEIGHT or out.rows * out.thumbnailHeight > MAX_SHEET_HEIGHT then return invalid
+        out.perSheet = out.columns * out.rows
+        out.sheets = sheetUrls(body.sheets, (out.count - 1) \ out.perSheet + 1, baseUrl)
+        out.expiresAt = playback.values.epochSeconds(body.expires_at)
+        if out.sheets = invalid or out.expiresAt <= 0 then return invalid
+        return out
+    end function
+
+    ' The resolved URL of each of sheetCount sheets in index order, or invalid
+    ' unless entries holds each index once and resolvable URLs.
+    function sheetUrls(entries as Dynamic, sheetCount as Integer, baseUrl as String) as Dynamic
+        if not playback.values.isArray(entries) or entries.Count() <> sheetCount then return invalid
+        urls = []
+        for i = 1 to sheetCount
+            urls.Push("")
+        end for
+        for each entry in entries
+            if not util.isObject(entry) or not api.request.isInteger(entry.index) then return invalid
+            index = entry.index
+            if index < 0 or index >= sheetCount or urls[index] <> "" then return invalid
+            urls[index] = sheetUrl(baseUrl, entry.url)
+            if urls[index] = "" then return invalid
+        end for
+        return urls
+    end function
+
+    ' A sheet URL as a Poster loads it: an absolute http(s) URL as it is, a
+    ' path or scheme-relative URL against the base URL (playback.media.resolve),
+    ' or "" for anything else, such as another scheme.
+    function sheetUrl(baseUrl as String, ref as Dynamic) as String
+        target = util.text(ref)
+        if target = "" then return ""
+        if api.request.isHttpUrl(target) then return target
+        colon = Instr(1, target, ":")
+        slash = Instr(1, target, "/")
+        if colon > 0 and (slash = 0 or colon < slash) then return ""
+        return playback.media.resolve(baseUrl, target)
+    end function
+
+    ' Whether value is a parsed manifest, not pending() or {} (none).
+    function isParsed(value as Dynamic) as Boolean
+        return util.isObject(value) and playback.values.isArray(value.sheets) and api.request.isInteger(value.perSheet)
+    end function
+
+    ' What TrickplayPreview.manifest takes while the manifest is being read.
+    ' {} means the title has no previews.
+    function pending() as Object
+        return { pending: true }
+    end function
+
+    ' The thumbnail for a source position in seconds: floor(position /
+    ' interval), the first before the start and the last past the end.
+    function thumbnailAt(manifest as Object, seconds as Dynamic) as Integer
+        position = playback.values.toDouble(seconds) * 1000# / manifest.intervalMs
+        if position <= 0 then return 0
+        if position >= manifest.count then return manifest.count - 1
+        return Int(position)
+    end function
+
+    ' Where the thumbnail for seconds is, written into tile (a new AA when
+    ' invalid) so a caller moving the position reuses one: { index, sheet,
+    ' column, row }. The last sheet may be partly filled; the thumbnail is
+    ' always one the count includes.
+    function tileAt(manifest as Object, seconds as Dynamic, tile = invalid as Dynamic) as Object
+        if tile = invalid then tile = {}
+        index = thumbnailAt(manifest, seconds)
+        cell = index mod manifest.perSheet
+        tile.index = index
+        tile.sheet = index \ manifest.perSheet
+        tile.column = cell mod manifest.columns
+        tile.row = cell \ manifest.columns
+        return tile
+    end function
+
+    ' How a sheet decodes: a Poster with loadDisplayMode "limitSize" and
+    ' these loadWidth and loadHeight, set before its uri, keeps the sheet's
+    ' aspect within MAX_LOAD_SIZE px on each side, so the default 3000 px
+    ' sheet of 300 px tiles decodes 1600 px wide with 160 px tiles.
+    ' { loadWidth, loadHeight, scale, tileWidth, tileHeight }: scale is
+    ' decoded over original px, tile sizes are in decoded px.
+    function decodeSize(manifest as Object) as Object
+        sheetWidth = manifest.columns * manifest.thumbnailWidth
+        sheetHeight = manifest.rows * manifest.thumbnailHeight
+        scale = 1#
+        if sheetWidth > MAX_LOAD_SIZE then scale = MAX_LOAD_SIZE / (sheetWidth * 1#)
+        if sheetHeight * scale > MAX_LOAD_SIZE then scale = MAX_LOAD_SIZE / (sheetHeight * 1#)
+        return {
+            loadWidth: Int(sheetWidth * scale + 0.5#),
+            loadHeight: Int(sheetHeight * scale + 0.5#),
+            scale: scale,
+            tileWidth: manifest.thumbnailWidth * scale,
+            tileHeight: manifest.thumbnailHeight * scale
+        }
+    end function
+
+    ' The preview on an FHD UI: { width, height } of one tile, boxWidth
+    ' (DISPLAY_WIDTH by default) wide at the tile's aspect, or boxHeight
+    ' (MAX_DISPLAY_HEIGHT) tall when that would be taller, in even px for
+    ' Roku's FHD-to-HD scaling. The Poster stretches the decoded sheet to
+    ' columns * width by rows * height, so a tile's offset is a whole number
+    ' of display tiles whatever the decoded scale. The drawn size costs no
+    ' texture: the decode size (decodeSize) is the same for every box.
+    function displaySize(manifest as Object, boxWidth = DISPLAY_WIDTH as Integer, boxHeight = MAX_DISPLAY_HEIGHT as Integer) as Object
+        width = boxWidth
+        height = evenPx(boxWidth * manifest.thumbnailHeight / manifest.thumbnailWidth)
+        if height > boxHeight
+            height = boxHeight
+            width = evenPx(boxHeight * manifest.thumbnailWidth / manifest.thumbnailHeight)
+        end if
+        return { width: width, height: height }
+    end function
+
+    ' The nearest even whole number, at least 2.
+    function evenPx(value as Dynamic) as Integer
+        rounded = 2 * Int(value / 2 + 0.5)
+        if rounded < 2 then return 2
+        return rounded
+    end function
+
+    ' The sheets to keep loaded (plan section 6.9): the current one on the
+    ' low tier, and anything but memory.tier.STANDARD counts as low;
+    ' elsewhere also its neighbour in the direction of travel (the previous
+    ' one while moving back), or the other neighbour at either end. The
+    ' current sheet comes first.
+    function retainedSheets(tier as String, sheet as Integer, sheetCount as Integer, backward as Boolean) as Object
+        if tier <> memory.tier.STANDARD or sheetCount < 2 then return [sheet]
+        direction = 1
+        if backward then direction = -1
+        neighbour = sheet + direction
+        if neighbour < 0 or neighbour >= sheetCount then neighbour = sheet - direction
+        return [sheet, neighbour]
+    end function
+
+    ' Why a parsed manifest must be read again (plan section 6.9), or "".
+    ' context members, each checked only when present, in this order:
+    '   fileId  the file now playing: "file" when a replan changed it
+    '   failed  true when a sheet reported loadStatus "failed": "failed"
+    '   now     epoch seconds: "expired" from RENEW_MARGIN_SECONDS before expiresAt
+    function refreshReason(manifest as Dynamic, context as Object) as String
+        if not isParsed(manifest) then return ""
+        if util.isString(context.fileId) and context.fileId <> manifest.fileId then return "file"
+        if util.isTrue(context.failed) then return "failed"
+        if util.isNumber(context.now) and context.now >= manifest.expiresAt - RENEW_MARGIN_SECONDS then return "expired"
+        return ""
+    end function
+
+    ' Whether two parsed manifests cut the same thumbnails, so the second's
+    ' URLs can replace the first's without moving any tile.
+    function hasSameLayout(a as Dynamic, b as Dynamic) as Boolean
+        if not isParsed(a) or not isParsed(b) then return false
+        for each name in ["fileId", "intervalMs", "thumbnailWidth", "thumbnailHeight", "columns", "rows", "count"]
+            if a[name] <> b[name] then return false
+        end for
+        return a.sheets.Count() = b.sheets.Count()
+    end function
+
+    ' The scrub point on screen: the x of a source position on a scrubber
+    ' drawn from minX to maxX for runtime seconds, kept between its ends, and
+    ' minX while the runtime is unknown.
+    function scrubPointX(position as Dynamic, runtime as Dynamic, minX as Integer, maxX as Integer) as Double
+        if not util.isNumber(runtime) or runtime <= 0 then return minX
+        fraction = playback.values.toDouble(position) / runtime
+        if fraction < 0 then fraction = 0
+        if fraction > 1 then fraction = 1
+        return minX + (maxX - minX) * fraction
+    end function
+
+    ' The tier TrickplayPreview keeps sheets for: the memory policy's tier
+    ' (memory.policy.actions, as platform.current().memory and the
+    ' MEMORY_LEVEL event carry it), but memory.tier.LOW while its level is
+    ' pressure or critical, and when it says nothing.
+    function previewTier(policy as Dynamic) as String
+        if not util.isObject(policy) then return memory.tier.LOW
+        level = util.text(policy.level)
+        if level = memory.level.PRESSURE or level = memory.level.CRITICAL then return memory.tier.LOW
+        if util.text(policy.tier) = memory.tier.STANDARD then return memory.tier.STANDARD
+        return memory.tier.LOW
+    end function
+
+    ' Where to centre a preview frameWidth wide over the scrubber: the scrub
+    ' point's x, moved in so the frame stays between minX and maxX.
+    function centerX(scrubX as Dynamic, frameWidth as Integer, minX as Integer, maxX as Integer) as Integer
+        half = frameWidth \ 2
+        x = Int(playback.values.toDouble(scrubX) + 0.5#)
+        if x - half < minX then x = minX + half
+        if x + (frameWidth - half) > maxX then x = maxX - (frameWidth - half)
+        return x
+    end function
+end namespace

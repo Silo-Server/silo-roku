@@ -1,0 +1,91 @@
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' Development-only transport harness: what the harness shows and logs about a
+' run, so a screenshot or a console capture explains it. Server replies and
+' Video errors pass through the logger's redactor, and console fields come
+' from allow-lists, never from whole responses. Pure functions, so they run
+' headless. Excluded from release builds.
+namespace harness
+
+    ' "Start failed (422 validation_failed)" from a failed reply's status and
+    ' Problem type. With `withDetail`, the Problem's detail and each field
+    ' error's location and detail follow, redacted; the v2 contract keeps them
+    ' free of rejected values. Callers ask for detail only on playback routes,
+    ' whose bodies carry no credentials.
+    function problemMessage(context as String, status as Integer, json as Dynamic, withDetail as Boolean) as String
+        message = context + " (" + status.ToStr()
+        if type(json) <> "roAssociativeArray" then return message + ")"
+        if nonEmpty(json.type)
+            segments = json.type.Split("/")
+            message = message + " " + segments[segments.Count() - 1]
+        end if
+        message = message + ")"
+        if not withDetail then return message
+        parts = []
+        if nonEmpty(json.detail) then parts.Push(json.detail)
+        for each item in arrayOr(json.errors)
+            if type(item) = "roAssociativeArray"
+                part = (stringOr(item.location, "") + " " + stringOr(item.detail, stringOr(item.code, ""))).Trim()
+                if part <> "" then parts.Push(part)
+            end if
+        end for
+        if parts.Count() = 0 then return message
+        return message + ": " + redact.text(parts.Join("; "))
+    end function
+
+    ' Console fields for a Task result: whether it worked, the status and
+    ' message of a failure, and for a start or replan decision the plan facts
+    ' that explain the run (delivery, decision reason, stream, recipe, media
+    ' origin, timeline, the harness toggles) or the terminal reason. Toggles go
+    ' by name: the redactor would mask the longer prototype feature tokens.
+    function outcomeFields(result as Object) as Object
+        fields = { ok: util.isTrue(result.ok) }
+        if isNumber(result.status) then fields.status = result.status
+        if nonEmpty(result.message) then fields.message = result.message
+        if nonEmpty(result.outcome) then fields.outcome = result.outcome
+        facts = result.facts
+        if type(facts) <> "roAssociativeArray" then return fields
+        if nonEmpty(facts.outcome) then fields.outcome = facts.outcome
+        if not util.isTrue(result.playable)
+            if nonEmpty(facts.terminalReason) then fields.terminal = facts.terminalReason + " " + stringOr(facts.terminalMessage, "")
+            return fields
+        end if
+        fields.Append({
+            delivery: facts.delivery,
+            reason: facts.decisionReason,
+            stream: facts.protocol + "/" + facts.container + " as " + facts.streamFormat,
+            recipe: facts.videoCodec + "/" + facts.audioCodec,
+            media: facts.mediaOrigin,
+            accountHeaders: util.isTrue(result.headersAttached),
+            offset: facts.timelineOffset,
+            playerStart: facts.playerStart,
+            seekAnywhere: facts.canSeekAnywhere
+        })
+        subtitles = result.subtitles
+        if type(subtitles) = "roAssociativeArray" and subtitles.format <> "none" then fields.subtitle = subtitles.format + ", tmp copy " + subtitles.localStatus.ToStr()
+        if type(result.toggles) = "roAssociativeArray" then fields.toggles = result.toggles
+        return fields
+    end function
+
+    ' A Video node error made safe to show and log. errorMsg and errorStr can
+    ' quote the media URL, so they go through the redactor (a URL keeps only
+    ' its scheme, host, and leading path words); errorInfo is copied with
+    ' credential-like members masked. The code is "error" because the
+    ' redactor masks members named "...code".
+    function videoError(code as Dynamic, message as Dynamic, detail as Dynamic, info as Dynamic) as Object
+        number = 0
+        if isNumber(code) then number = code
+        errorInfo = invalid
+        if type(info) = "roAssociativeArray" then errorInfo = redact.value(info)
+        return { error: number, errorMsg: redact.text(stringOr(message, "")), errorStr: redact.text(stringOr(detail, "")), errorInfo: errorInfo }
+    end function
+
+    ' Screen lines for a videoError() report.
+    function videoErrorLines(report as Object) as Object
+        info = "none"
+        if report.errorInfo <> invalid then info = FormatJson(report.errorInfo)
+        return ["errorCode: " + report.error.ToStr(), "errorMsg: " + report.errorMsg, "errorStr: " + report.errorStr, "errorInfo: " + info]
+    end function
+
+end namespace

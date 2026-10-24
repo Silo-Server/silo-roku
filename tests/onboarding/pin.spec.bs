@@ -1,0 +1,132 @@
+namespace tests
+
+    @suite("onboarding pin")
+    class OnboardingPinTests extends rooibos.BaseTestSuite
+
+        @describe("digits and dots")
+
+        @it("keeps at most four digits of the pad's text")
+        sub _()
+            m.assertEqual(onboarding.pin.digits("12"), "12")
+            m.assertEqual(onboarding.pin.digits("1a2 3"), "123")
+            m.assertEqual(onboarding.pin.digits("123456"), "1234")
+            m.assertEqual(onboarding.pin.digits(""), "")
+        end sub
+
+        @it("fills a dot per digit")
+        sub _()
+            m.assertEqual(onboarding.pin.dotStates(0, false), ["empty", "empty", "empty", "empty"])
+            m.assertEqual(onboarding.pin.dotStates(3, false), ["filled", "filled", "filled", "empty"])
+            m.assertEqual(onboarding.pin.dotStates(4, false), ["filled", "filled", "filled", "filled"])
+        end sub
+
+        @it("turns the dots red after a wrong PIN")
+        sub _()
+            m.assertEqual(onboarding.pin.dotStates(0, true), ["error", "error", "error", "error"])
+        end sub
+
+        @describe("answers")
+
+        @it("reads the outcome the session gives, or error without one")
+        sub _()
+            m.assertEqual(onboarding.pin.outcomeOf({ ok: true, body: { outcome: "wrong", retryAfterSeconds: invalid } }), "wrong")
+            m.assertEqual(onboarding.pin.outcomeOf({ ok: false, body: invalid }), "error")
+        end sub
+
+        @it("says Wrong PIN for 200 valid false (verify_profile_pin_wrong.json)")
+        sub _()
+            raw = { ok: true, status: 200, body: tests.sessions.fixture("verify_profile_pin_wrong"), error: invalid }
+            outcome = api.auth.profiles.pinOutcome(raw).outcome
+            m.assertEqual(outcome, "wrong")
+            m.assertEqual(onboarding.pin.feedback(outcome, invalid), { key: "pin.wrong", values: invalid, failed: true })
+        end sub
+
+        @it("rounds the lockout up to whole minutes, at least one")
+        sub _()
+            m.assertEqual(onboarding.pin.lockoutMinutes(300), 5)
+            m.assertEqual(onboarding.pin.lockoutMinutes(299), 5)
+            m.assertEqual(onboarding.pin.lockoutMinutes(301), 6)
+            m.assertEqual(onboarding.pin.lockoutMinutes(1), 1)
+            m.assertEqual(onboarding.pin.lockoutMinutes(60), 1)
+            m.assertInvalid(onboarding.pin.lockoutMinutes(invalid))
+            m.assertInvalid(onboarding.pin.lockoutMinutes(0))
+            m.assertEqual(onboarding.pin.lockoutMinutes(86400), 1440)
+            m.assertInvalid(onboarding.pin.lockoutMinutes(86401))
+        end sub
+
+        @it("words the lockout from the server's Retry-After")
+        sub _()
+            strings = i18n.load("en_US")
+            cases = [
+                [300, "Too many incorrect PINs. Try again in 5 minutes."]
+                [45, "Too many incorrect PINs. Try again in 1 minute."]
+                [invalid, "Too many incorrect PINs. Try again later."]
+                [90000, "Too many incorrect PINs. Try again later."]
+            ]
+            for each c in cases
+                shown = onboarding.pin.feedback("locked", c[0])
+                m.assertTrue(shown.failed)
+                m.assertEqual(i18n.format(i18n.lookup(strings, shown.key), shown.values), c[1])
+            end for
+        end sub
+
+        @it("reads the lockout from a 429's Retry-After")
+        sub _()
+            raw = { ok: false, status: 429, body: invalid, error: { kind: "http", status: 429, problemType: "rate_limited", instance: invalid, retryAfterSeconds: 300 } }
+            answer = api.auth.profiles.pinOutcome(raw)
+            m.assertEqual(answer.outcome, "locked")
+            m.assertEqual(onboarding.pin.feedback(answer.outcome, answer.retryAfterSeconds).values, { minutes: 5 })
+        end sub
+
+        @it("reports an unanswered check without retrying it, and clears nothing on success")
+        sub _()
+            m.assertEqual(onboarding.pin.feedback("uncertain", invalid), { key: "pin.error.network", values: invalid, failed: false })
+            m.assertEqual(onboarding.pin.feedback("error", invalid).key, "pin.error.failed")
+            m.assertEqual(onboarding.pin.feedback("verified", invalid).key, "")
+            m.assertEqual(onboarding.pin.feedback("cancelled", invalid).key, "")
+            strings = i18n.load("en_US")
+            for each key in ["pin.prompt", "pin.checking", "pin.audio", "pin.wrong", "pin.error.network", "pin.error.failed"]
+                m.assertTrue(strings.DoesExist(key), key)
+            end for
+        end sub
+
+        @describe("layout")
+
+        @it("stacks everything in one centred column when the pad fits, spaced as tvOS's")
+        sub _()
+            spot = onboarding.pin.layout(400, 360)
+            m.assertFalse(spot.split)
+            m.assertEqual(spot.infoX, 960)
+            m.assertEqual(spot.padX, 760)
+            m.assertTrue(spot.avatarY >= onboarding.pin.MARGIN)
+            m.assertEqual(spot.nameY, spot.avatarY + theme.firstRun.PIN_AVATAR + 14)
+            m.assertEqual(spot.dotsY, spot.nameY + onboarding.pin.NAME_HEIGHT + 34)
+            m.assertEqual(spot.statusY, spot.dotsY + theme.firstRun.PIN_DOT + 18)
+            m.assertEqual(spot.padY, spot.statusY + onboarding.pin.LINE_HEIGHT + 30)
+            m.assertEqual(spot.cancelY, spot.padY + 360 + 30)
+            m.assertTrue(spot.cancelY + onboarding.pin.CANCEL_HEIGHT <= 1080 - onboarding.pin.MARGIN)
+            ' Centred: as much room above the avatar as below Cancel.
+            m.assertTrue(Abs(spot.avatarY - (1080 - spot.cancelY - onboarding.pin.CANCEL_HEIGHT)) <= 1)
+        end sub
+
+        @it("puts a tall pad beside the avatar and dots")
+        sub _()
+            spot = onboarding.pin.layout(500, 700)
+            m.assertTrue(spot.split)
+            m.assertEqual(spot.infoX, 480)
+            m.assertEqual(spot.padX, 1440 - 250)
+            m.assertTrue(spot.padY >= onboarding.pin.MARGIN)
+            m.assertEqual(spot.cancelY, spot.padY + 700 + 30)
+        end sub
+
+        @describe("withoutLastDigit")
+
+        @it("drops the last digit, and gives invalid with none so Back cancels")
+        sub _()
+            m.assertEqual(onboarding.pin.withoutLastDigit("123"), "12")
+            m.assertEqual(onboarding.pin.withoutLastDigit("1"), "")
+            m.assertInvalid(onboarding.pin.withoutLastDigit(""))
+            m.assertEqual(onboarding.pin.withoutLastDigit("1a2"), "1")
+        end sub
+    end class
+end namespace

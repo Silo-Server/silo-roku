@@ -1,0 +1,219 @@
+namespace tests
+
+    @suite("home shell")
+    class HomeShellTests extends rooibos.BaseTestSuite
+
+        function library(id as String, kind as String) as Object
+            return { id: id, name: "Library " + id, type: kind, sort_order: Val(id) }
+        end function
+
+        function summary(items as Object) as Object
+            return catalog.summary.libraries({ items: items })
+        end function
+
+        function hiddenBody(value as Dynamic) as Object
+            return { revision: 8, items: [{ key: "ui.theme", value: "dark", source: "default", definition_revision: 1 }, { key: "ui.disabled_library_ids", value: value, source: "profile", definition_revision: 1 }] }
+        end function
+
+        @describe("library tabs (spec section 5.3)")
+
+        @it("shows a tab for each kind of library the profile sees")
+        sub _()
+            both = m.summary([m.library("1", "movies"), m.library("2", "series")])
+            m.assertEqual(mainShell.visibleTabs(both, {}), { movies: true, series: true })
+            mixed = m.summary([m.library("3", "mixed")])
+            m.assertEqual(mainShell.visibleTabs(mixed, {}), { movies: true, series: true })
+            m.assertEqual(mainShell.visibleTabs(m.summary([m.library("4", "music")]), {}), { movies: false, series: false })
+        end sub
+
+        @it("leaves out the libraries the profile hid from navigation")
+        sub _()
+            libraries = m.summary([m.library("1", "movies"), m.library("2", "series"), m.library("3", "movie")])
+            m.assertEqual(mainShell.visibleTabs(libraries, { "2": true }), { movies: true, series: false })
+            m.assertEqual(mainShell.visibleTabs(libraries, { "1": true, "3": true }), { movies: false, series: true })
+        end sub
+
+        @it("shows no library tab without a library list")
+        sub _()
+            m.assertEqual(mainShell.visibleTabs(invalid, {}), { movies: false, series: false })
+            m.assertEqual(mainShell.visibleTabs({ libraries: "x" }, {}), { movies: false, series: false })
+        end sub
+
+        @it("asks the effective settings for the hidden libraries and title art, as the profile")
+        sub _()
+            request = mainShell.settingsRequest()
+            m.assertEqual(request.path, "/api/v2/settings/values/effective")
+            m.assertEqual(request.auth, "profile")
+            m.assertEqual(api.request.queryString(request.query), "keys=ui.disabled_library_ids&keys=ui.title_art")
+        end sub
+
+        @it("shows title art unless the profile's ui.title_art is false (tvOS e5e13323)")
+        sub _()
+            setting = { key: "ui.title_art", value: false, source: "profile_device", definition_revision: 1 }
+            m.assertFalse(mainShell.titleArtShown({ revision: 8, items: [setting] }))
+            setting.value = true
+            m.assertTrue(mainShell.titleArtShown({ revision: 8, items: [setting] }))
+            for each value in [invalid, "false", 0]
+                setting.value = value
+                m.assertTrue(mainShell.titleArtShown({ revision: 8, items: [setting] }), util.kind(value))
+            end for
+            m.assertTrue(mainShell.titleArtShown(m.hiddenBody([2])))
+            m.assertTrue(mainShell.titleArtShown(invalid))
+        end sub
+
+        @it("reads the hidden library IDs as an array or its legacy JSON text")
+        sub _()
+            m.assertEqual(mainShell.hiddenLibraryIds(m.hiddenBody([2, 5])), { "2": true, "5": true })
+            m.assertEqual(mainShell.hiddenLibraryIds(m.hiddenBody("[7]")), { "7": true })
+        end sub
+
+        @it("drops entries that are not positive whole numbers, and reads anything else as none")
+        sub _()
+            m.assertEqual(mainShell.hiddenLibraryIds(m.hiddenBody([0, -1, 2.5, "3", 4, invalid])), { "4": true })
+            for each value in [invalid, "", "not json", "{}", 3, { a: 1 }]
+                m.assertEqual(mainShell.hiddenLibraryIds(m.hiddenBody(value)), {})
+            end for
+            m.assertEqual(mainShell.hiddenLibraryIds(invalid), {})
+            m.assertEqual(mainShell.hiddenLibraryIds({ revision: 8, items: [] }), {})
+        end sub
+
+        @describe("top bar")
+
+        @it("selects Home, or the library tab of a library page")
+        sub _()
+            m.assertEqual(mainShell.selectedTab(nav.route.HOME, {}), "home")
+            m.assertEqual(mainShell.selectedTab(nav.route.LIBRARY, { type: "series" }), "series")
+            m.assertEqual(mainShell.selectedTab(nav.route.LIBRARY, { type: "music" }), "home")
+            m.assertEqual(mainShell.selectedTab(nav.route.LIBRARY, invalid), "home")
+        end sub
+
+        @it("makes another tab's page the root, and pushes Search")
+        sub _()
+            m.assertEqual(mainShell.barAction("movies", "home"), { kind: "switch", route: nav.route.LIBRARY, params: { type: "movies" } })
+            m.assertEqual(mainShell.barAction("series", "movies"), { kind: "switch", route: nav.route.LIBRARY, params: { type: "series" } })
+            m.assertEqual(mainShell.barAction("home", "movies"), { kind: "switch", route: nav.route.HOME, params: { bar: true } })
+            m.assertEqual(mainShell.barAction("search", "home"), { kind: "push", route: nav.route.SEARCH, params: {} })
+        end sub
+
+        @it("takes the selected tab to its content, and the avatar to its menu")
+        sub _()
+            m.assertEqual(mainShell.barAction("home", "home"), { kind: "content" })
+            m.assertEqual(mainShell.barAction("movies", "movies"), { kind: "content" })
+            m.assertEqual(mainShell.barAction("avatar", "home"), { kind: "menu" })
+        end sub
+
+        @describe("Search (D3)")
+
+        @it("selects no Search tab: Search is a pushed page without the bar, and Back leaves it")
+        sub _()
+            m.assertEqual(mainShell.selectedTab(nav.route.SEARCH, {}), "home")
+            roots = [[nav.route.HOME, {}], [nav.route.LIBRARY, { type: "movies" }]]
+            for each root in roots
+                stack = nav.stack.reset(nav.stack.create(), root[0], root[1]).stack
+                stack = nav.stack.push(stack, nav.route.SEARCH, {}).stack
+                left = nav.stack.back(stack, { overlay: false, zone: nav.zone.CONTENT })
+                m.assertEqual(left.action, nav.action.POP)
+                m.assertEqual(left.show.route, root[0])
+            end for
+        end sub
+
+        @describe("avatar menu")
+
+        @it("offers Switch Profile, then Switch Server and Sign Out, and Diagnostics only in development builds")
+        sub _()
+            m.assertEqual(mainShell.menuGroups(false), [["switchProfile"], ["switchServer", "signOut"]])
+            m.assertEqual(mainShell.menuGroups(true), [["switchProfile"], ["switchServer", "signOut"], ["diagnostics"]])
+        end sub
+
+        @it("pushes the profile picker or server entry, signs out, or opens diagnostics")
+        sub _()
+            m.assertEqual(mainShell.menuAction("switchProfile"), { kind: "push", route: nav.route.PROFILE, params: { choose: true } })
+            m.assertEqual(mainShell.menuAction("switchServer"), { kind: "push", route: nav.route.SETUP, params: { pushed: true } })
+            m.assertEqual(mainShell.menuAction("signOut"), { kind: "signOut" })
+            m.assertEqual(mainShell.menuAction("diagnostics"), { kind: "push", route: nav.route.DIAGNOSTIC, params: {} })
+            m.assertInvalid(mainShell.menuAction("settings"))
+        end sub
+
+        @it("draws the open profile's uploaded avatar, resolved against the server, over its initials on its colour (P-17)")
+        sub _()
+            profile = { id: "p-owner", name: "Laura Palmer", hasPin: false, isChild: false, avatarUrl: "/api/v2/profiles/p-owner/avatar.png" }
+            badge = mainShell.profileBadge(profile, "https://media.example.com/silo")
+            m.assertEqual(badge, { initials: "L", name: "Laura Palmer", tint: onboarding.profiles.tintIndex("p-owner"), uri: "https://media.example.com/api/v2/profiles/p-owner/avatar.png" })
+            ' SVG presets and DiceBear keep the initials, as on the picker.
+            profile.avatarUrl = "/avatars/presets/fox.svg"
+            m.assertEqual(mainShell.profileBadge(profile, "https://media.example.com").uri, "")
+            profile.avatarUrl = ""
+            m.assertEqual(mainShell.profileBadge(profile, "https://media.example.com").uri, "")
+            m.assertEqual(mainShell.profileBadge(invalid, "https://media.example.com"), { initials: "?", name: "", tint: onboarding.profiles.tintIndex(""), uri: "" })
+        end sub
+
+        @it("names the server by its own name in capitals, else by its host")
+        sub _()
+            m.assertEqual(mainShell.serverLabel("https://media.example.com", " Palmer Media "), "PALMER MEDIA")
+            m.assertEqual(mainShell.serverLabel("https://media.example.com"), "MEDIA.EXAMPLE.COM")
+            m.assertEqual(mainShell.serverLabel("http://192.168.1.20:8096/silo", ""), "192.168.1.20:8096")
+            m.assertEqual(mainShell.serverLabel(""), "")
+        end sub
+
+        @describe("focus on return (spec section 5.3)")
+
+        @it("starts in the content, or on the bar when the page opens from another tab's bar")
+        sub _()
+            m.assertEqual(mainShell.restoreTarget(invalid, "home", {}), { zone: nav.zone.CONTENT, barItem: "home", content: invalid })
+            m.assertEqual(mainShell.restoreTarget(invalid, "home", { bar: true }), { zone: nav.zone.BAR, barItem: "home", content: invalid })
+            m.assertEqual(mainShell.restoreTarget(invalid, "movies", invalid), { zone: nav.zone.CONTENT, barItem: "movies", content: invalid })
+        end sub
+
+        @it("returns to the same card in the content")
+        sub _()
+            card = nav.focus.newKey("next_up", "episode:e2", 1, 3)
+            key = mainShell.newKey(nav.zone.CONTENT, "home", card)
+            m.assertEqual(mainShell.restoreTarget(key, "home", {}), { zone: nav.zone.CONTENT, barItem: "home", content: card })
+        end sub
+
+        @it("returns to the avatar after its menu's screens, and to the selected tab from elsewhere on the bar (D3)")
+        sub _()
+            card = nav.focus.newKey("continue", "movie:a", 0, 0)
+            target = mainShell.restoreTarget(mainShell.newKey(nav.zone.BAR, "avatar", card), "movies", {})
+            m.assertEqual(target, { zone: nav.zone.BAR, barItem: "avatar", content: card })
+            for each item in ["search", "movies", "series", "home", ""]
+                target = mainShell.restoreTarget(mainShell.newKey(nav.zone.BAR, item, card), "series", {})
+                m.assertEqual(target, { zone: nav.zone.BAR, barItem: "series", content: card }, item)
+            end for
+        end sub
+
+        @describe("Back (spec section 5.3, criterion 4.6)")
+
+        @it("goes from content to the selected tab, from a library tab to Home's bar, and from Home's bar out")
+        sub _()
+            libraryPage = nav.stack.reset(nav.stack.create(), nav.route.LIBRARY, { type: "movies" }).stack
+            m.assertEqual(nav.stack.back(libraryPage, { overlay: false, zone: nav.zone.CONTENT }).action, nav.action.FOCUS_BAR)
+            toHome = nav.stack.back(libraryPage, { overlay: false, zone: nav.zone.BAR })
+            m.assertEqual(toHome.action, nav.action.HOME)
+            m.assertEqual(toHome.show.params, { bar: true })
+            target = mainShell.restoreTarget(toHome.restore, mainShell.selectedTab(toHome.show.route, toHome.show.params), toHome.show.params)
+            m.assertEqual(target.zone, nav.zone.BAR)
+            m.assertEqual(target.barItem, "home")
+            m.assertEqual(nav.stack.back(toHome.stack, { overlay: false, zone: nav.zone.BAR }).action, nav.action.EXIT_APP)
+        end sub
+
+        @it("closes the avatar menu before anything else")
+        sub _()
+            homePage = nav.stack.reset(nav.stack.create(), nav.route.HOME, {}).stack
+            m.assertEqual(nav.stack.back(homePage, { overlay: true, zone: nav.zone.BAR }).action, nav.action.CLOSE_OVERLAY)
+        end sub
+
+        @it("goes from another item on Home's bar to its Home tab, then out (tvOS)")
+        sub _()
+            homePage = nav.stack.reset(nav.stack.create(), nav.route.HOME, {}).stack
+            for each item in ["search", "movies", "avatar"]
+                m.assertEqual(nav.stack.back(homePage, { overlay: false, zone: nav.zone.BAR, barItem: item }).action, nav.action.FOCUS_BAR, item)
+            end for
+            m.assertEqual(nav.stack.back(homePage, { overlay: false, zone: nav.zone.BAR, barItem: "home" }).action, nav.action.EXIT_APP)
+            libraryPage = nav.stack.reset(nav.stack.create(), nav.route.LIBRARY, { type: "movies" }).stack
+            m.assertEqual(nav.stack.back(libraryPage, { overlay: false, zone: nav.zone.BAR, barItem: "search" }).action, nav.action.HOME)
+        end sub
+
+    end class
+
+end namespace

@@ -1,0 +1,327 @@
+namespace tests
+
+    @suite("memory policy")
+    class MemoryPolicyTests extends rooibos.BaseTestSuite
+
+        ' The dev TV's launch facts (TCL 55R625, Roku OS 15.3.4), with overrides.
+        function facts(overrides = {} as Object) as Object
+            values = {
+                warnings: true,
+                percent: 4,
+                availableKb: 580000,
+                limits: { maxForegroundMemory: 593920, maxBackgroundMemory: 362496, maxRokuManagedHeapMemory: 455680 },
+                ui: "FHD",
+                graphics: "opengl",
+                os: "15.3.4",
+                general: "normal"
+            }
+            values.Append(overrides)
+            return values
+        end function
+
+        function launch(overrides = {} as Object) as Object
+            return memory.policy.create(m.facts(overrides))
+        end function
+
+        function warn(state as Object, percent as Integer) as Object
+            return memory.policy.onWarning(state, { percent: percent, usage: invalid })
+        end function
+
+        ' Applies warnings in turn, giving each resulting level.
+        function warnAll(state as Object, percents as Object) as Object
+            out = { state: state, levels: [], timers: [] }
+            for each percent in percents
+                out.state = m.warn(out.state, percent)
+                out.levels.Push(out.state.level)
+                out.timers.Push(out.state.timer)
+            end for
+            return out
+        end function
+
+        ' Applies ticks with each sample in turn, giving each resulting level.
+        function tickAll(state as Object, samples as Object) as Object
+            out = { state: state, levels: [], timers: [] }
+            for each sample in samples
+                out.state = memory.policy.onTick(out.state, sample)
+                out.levels.Push(out.state.level)
+                out.timers.Push(out.state.timer)
+            end for
+            return out
+        end function
+
+        function generalAll(state as Object, names as Object) as Object
+            out = { state: state, levels: [], timers: [] }
+            for each name in names
+                out.state = memory.policy.onGeneral(out.state, name)
+                out.levels.Push(out.state.level)
+                out.timers.Push(out.state.timer)
+            end for
+            return out
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("tier at launch")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("is standard on the dev TV's reported values")
+        sub _()
+            state = m.launch()
+            m.assertEqual(state.tier, memory.tier.STANDARD)
+            m.assertEqual(state.reasons, [])
+            m.assertEqual(state.level, memory.level.NORMAL)
+            m.assertEqual(state.percent, 4)
+            m.assertFalse(state.timer)
+        end sub
+
+        @it("is low with an HD or SD UI")
+        sub _()
+            m.assertEqual(m.launch({ ui: "HD" }).reasons, ["ui"])
+            m.assertEqual(m.launch({ ui: "HD" }).tier, memory.tier.LOW)
+            m.assertEqual(m.launch({ ui: "SD" }).reasons, ["ui"])
+        end sub
+
+        @it("is low without OpenGL")
+        sub _()
+            state = m.launch({ graphics: "directfb" })
+            m.assertEqual(state.tier, memory.tier.LOW)
+            m.assertEqual(state.reasons, ["graphics"])
+        end sub
+
+        @it("is low when memory warnings cannot be enabled")
+        sub _()
+            state = m.launch({ warnings: false })
+            m.assertEqual(state.tier, memory.tier.LOW)
+            m.assertEqual(state.reasons, ["monitor"])
+        end sub
+
+        @it("is low below the provisional foreground limit, and standard at it")
+        sub _()
+            below = { maxForegroundMemory: memory.policy.LOW_TIER_FOREGROUND_KB - 1 }
+            m.assertEqual(m.launch({ limits: below }).reasons, ["foregroundLimit"])
+            atLimit = { maxForegroundMemory: memory.policy.LOW_TIER_FOREGROUND_KB }
+            m.assertEqual(m.launch({ limits: atLimit }).tier, memory.tier.STANDARD)
+        end sub
+
+        @it("counts a missing value against the device")
+        sub _()
+            m.assertEqual(m.launch({ limits: invalid }).reasons, ["foregroundLimit"])
+            m.assertEqual(m.launch({ limits: { maxForegroundMemory: "big" } }).reasons, ["foregroundLimit"])
+            state = memory.policy.create({})
+            m.assertEqual(state.tier, memory.tier.LOW)
+            m.assertEqual(state.reasons, ["ui", "graphics", "monitor", "foregroundLimit"])
+            m.assertEqual(state.signal, memory.signal.GENERAL)
+            m.assertEqual(state.level, memory.level.NORMAL)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("signal at launch")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("uses threshold warnings from Roku OS 15.2")
+        sub _()
+            for each version in ["15.2.0", "15.3.4", "16.0.0", "17.1.2"]
+                m.assertEqual(m.launch({ os: version }).signal, memory.signal.THRESHOLDS, version)
+            end for
+        end sub
+
+        @it("polls on Roku OS 15.1 and on an unreadable version")
+        sub _()
+            for each version in ["15.1.0", "15.1.4", "14.6.0", "", "15", invalid]
+                m.assertEqual(m.launch({ os: version }).signal, memory.signal.POLLING, FormatJson(version))
+            end for
+        end sub
+
+        @it("uses the general memory level without the monitor, on any OS")
+        sub _()
+            state = m.launch({ warnings: false, os: "15.3.4", percent: 95 })
+            m.assertEqual(state.signal, memory.signal.GENERAL)
+            m.assertInvalid(state.percent)
+            m.assertEqual(state.level, memory.level.NORMAL)
+        end sub
+
+        @it("starts above normal when usage or the general level already calls for it")
+        sub _()
+            m.assertEqual(m.launch({ percent: 82 }).level, memory.level.TRIM)
+            m.assertEqual(m.launch({ warnings: false, general: "low" }).level, memory.level.PRESSURE)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("Roku OS 15.2+: threshold warnings, rising and falling")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("rises with each warning, without polling")
+        sub _()
+            steps = m.warnAll(m.launch(), [80, 85, 90, 95])
+            m.assertEqual(steps.levels, [memory.level.TRIM, memory.level.PRESSURE, memory.level.CRITICAL, memory.level.CRITICAL])
+            m.assertEqual(steps.timers, [false, false, false, false])
+        end sub
+
+        @it("holds through falling warnings, and polls once usage is below 80%")
+        sub _()
+            steps = m.warnAll(m.launch(), [80, 85, 90, 95, 89, 84, 79])
+            m.assertEqual(steps.levels, [memory.level.TRIM, memory.level.PRESSURE, memory.level.CRITICAL, memory.level.CRITICAL, memory.level.CRITICAL, memory.level.CRITICAL, memory.level.CRITICAL])
+            m.assertEqual(steps.timers, [false, false, false, false, false, false, true])
+        end sub
+
+        @it("restores one level per tick once usage is below 75%, then stops polling")
+        sub _()
+            state = m.warnAll(m.launch(), [90, 79]).state
+            steps = m.tickAll(state, [78, 75, 74, 73, 72])
+            m.assertEqual(steps.levels, [memory.level.CRITICAL, memory.level.CRITICAL, memory.level.PRESSURE, memory.level.TRIM, memory.level.NORMAL])
+            m.assertEqual(steps.timers, [true, true, true, true, false])
+        end sub
+
+        @it("rises again at once when a tick finds usage back above a threshold")
+        sub _()
+            state = m.tickAll(m.warnAll(m.launch(), [85, 79]).state, [70]).state
+            m.assertEqual(state.level, memory.level.TRIM)
+            steps = m.tickAll(state, [86])
+            m.assertEqual(steps.levels, [memory.level.PRESSURE])
+            m.assertEqual(steps.timers, [false])
+        end sub
+
+        @it("prefers the usage read with the warning to the percent it reports")
+        sub _()
+            state = m.warnAll(m.launch(), [90]).state
+            state = memory.policy.onWarning(state, { percent: 80, usage: 72 })
+            m.assertEqual(state.percent, 72)
+            m.assertEqual(state.level, memory.level.CRITICAL)
+            m.assertTrue(state.timer)
+            state = memory.policy.onWarning(m.launch(), { percent: 80, usage: invalid })
+            m.assertEqual(state.percent, 80)
+            m.assertEqual(state.level, memory.level.TRIM)
+        end sub
+
+        @it("ignores a warning without a percent")
+        sub _()
+            state = memory.policy.onWarning(m.launch(), {})
+            m.assertEqual(state.level, memory.level.NORMAL)
+            m.assertEqual(state.percent, 4)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("Roku OS 15.1: one 80% warning, then polling")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("trims on the warning and starts polling")
+        sub _()
+            state = m.warn(m.launch({ os: "15.1.2" }), 80)
+            m.assertEqual(state.level, memory.level.TRIM)
+            m.assertTrue(state.timer)
+        end sub
+
+        @it("derives the 85, 90, and 95% crossings from polling")
+        sub _()
+            state = m.warn(m.launch({ os: "15.1.2" }), 80)
+            steps = m.tickAll(state, [83, 86, 89, 91, 96])
+            m.assertEqual(steps.levels, [memory.level.TRIM, memory.level.PRESSURE, memory.level.PRESSURE, memory.level.CRITICAL, memory.level.CRITICAL])
+            m.assertEqual(steps.timers, [true, true, true, true, true])
+        end sub
+
+        @it("holds between 75% and the crossing, then restores one level per tick")
+        sub _()
+            state = m.tickAll(m.warn(m.launch({ os: "15.1.2" }), 80), [92]).state
+            steps = m.tickAll(state, [84, 76, 75, 74, 70, 60])
+            m.assertEqual(steps.levels, [memory.level.CRITICAL, memory.level.CRITICAL, memory.level.CRITICAL, memory.level.PRESSURE, memory.level.TRIM, memory.level.NORMAL])
+            m.assertEqual(steps.timers, [true, true, true, true, true, false])
+        end sub
+
+        @it("rises during a restore and keeps polling")
+        sub _()
+            state = m.tickAll(m.warn(m.launch({ os: "15.1.2" }), 80), [92, 70]).state
+            m.assertEqual(state.level, memory.level.PRESSURE)
+            steps = m.tickAll(state, [88, 90])
+            m.assertEqual(steps.levels, [memory.level.PRESSURE, memory.level.CRITICAL])
+            m.assertEqual(steps.timers, [true, true])
+        end sub
+
+        @it("holds on a tick without a sample")
+        sub _()
+            state = m.tickAll(m.warn(m.launch({ os: "15.1.2" }), 80), [92]).state
+            steps = m.tickAll(state, [invalid, invalid])
+            m.assertEqual(steps.levels, [memory.level.CRITICAL, memory.level.CRITICAL])
+            m.assertEqual(steps.timers, [true, true])
+            m.assertEqual(steps.state.percent, 92)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("without the monitor: the general memory level")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("maps low to pressure and critical to critical, without the Timer")
+        sub _()
+            steps = m.generalAll(m.launch({ warnings: false }), ["low", "critical"])
+            m.assertEqual(steps.levels, [memory.level.PRESSURE, memory.level.CRITICAL])
+            m.assertEqual(steps.timers, [false, false])
+        end sub
+
+        @it("restores one level per tick once the level is normal again")
+        sub _()
+            steps = m.generalAll(m.launch({ warnings: false }), ["critical", "normal"])
+            m.assertEqual(steps.levels, [memory.level.CRITICAL, memory.level.CRITICAL])
+            m.assertEqual(steps.timers, [false, true])
+            steps = m.tickAll(steps.state, [invalid, invalid, invalid])
+            m.assertEqual(steps.levels, [memory.level.PRESSURE, memory.level.TRIM, memory.level.NORMAL])
+            m.assertEqual(steps.timers, [true, true, false])
+        end sub
+
+        @it("steps down only as far as the general level allows")
+        sub _()
+            steps = m.generalAll(m.launch({ warnings: false }), ["critical", "low"])
+            m.assertTrue(steps.state.timer)
+            steps = m.tickAll(steps.state, [invalid, invalid])
+            m.assertEqual(steps.levels, [memory.level.PRESSURE, memory.level.PRESSURE])
+            m.assertEqual(steps.timers, [false, false])
+        end sub
+
+        @it("ignores usage samples and unknown levels")
+        sub _()
+            state = m.generalAll(m.launch({ warnings: false }), ["low", "unknown", invalid]).state
+            m.assertEqual(state.general, "low")
+            m.assertEqual(state.level, memory.level.PRESSURE)
+            state = memory.policy.onTick(m.launch({ warnings: false }), 97)
+            m.assertInvalid(state.percent)
+            m.assertEqual(state.level, memory.level.NORMAL)
+            m.assertEqual(memory.policy.onGeneral(m.launch({ warnings: false }), "CRITICAL").level, memory.level.CRITICAL)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("actions (plan section 4.7)")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("keeps full budgets at normal")
+        sub _()
+            m.assertEqual(memory.policy.actions(m.launch()), { level: "normal", tier: "standard", shedPrefetch: false, gridPages: 10, navPressure: nav.pressure.NORMAL, dropResponses: false })
+            m.assertEqual(memory.policy.actions(m.launch({ ui: "HD" })).gridPages, memory.policy.LOW_TIER_GRID_PAGES)
+        end sub
+
+        @it("drops prefetch and shrinks grid retention at trim")
+        sub _()
+            m.assertEqual(memory.policy.actions(m.warn(m.launch(), 80)), { level: "trim", tier: "standard", shedPrefetch: true, gridPages: memory.policy.TRIMMED_GRID_PAGES, navPressure: nav.pressure.NORMAL, dropResponses: false })
+        end sub
+
+        @it("also detaches hidden screens' lists at pressure")
+        sub _()
+            m.assertEqual(memory.policy.actions(m.warn(m.launch(), 85)), { level: "pressure", tier: "standard", shedPrefetch: true, gridPages: memory.policy.TRIMMED_GRID_PAGES, navPressure: nav.pressure.DETACH, dropResponses: false })
+        end sub
+
+        @it("also drops cached responses and every hidden screen at critical")
+        sub _()
+            m.assertEqual(memory.policy.actions(m.warn(m.launch({ ui: "HD" }), 90)), { level: "critical", tier: "low", shedPrefetch: true, gridPages: memory.policy.TRIMMED_GRID_PAGES, navPressure: nav.pressure.SHED, dropResponses: true })
+        end sub
+
+        @it("never changes the state it is given")
+        sub _()
+            state = m.launch({ os: "15.1.2" })
+            memory.policy.onWarning(state, { percent: 92 })
+            memory.policy.onTick(state, 92)
+            memory.policy.onGeneral(state, "critical")
+            m.assertEqual(state.level, memory.level.NORMAL)
+            m.assertEqual(state.percent, 4)
+            m.assertEqual(state.general, "normal")
+            m.assertFalse(state.timer)
+        end sub
+
+    end class
+
+end namespace

@@ -1,0 +1,166 @@
+namespace tests
+
+    @suite("onboarding address")
+    class OnboardingAddressTests extends rooibos.BaseTestSuite
+
+        @describe("chips")
+
+        @it("offers https://, http://, and .com in the spec's order")
+        sub _()
+            m.assertEqual(onboarding.address.chips(), ["https://", "http://", ".com"])
+        end sub
+
+        @it("puts a scheme chip in front of the address without its leading spaces")
+        sub _()
+            m.assertEqual(onboarding.address.withChip("media.example.com", "https://"), "https://media.example.com")
+            m.assertEqual(onboarding.address.withChip("  silo.local:8096", "http://"), "http://silo.local:8096")
+            m.assertEqual(onboarding.address.withChip("", "https://"), "https://")
+        end sub
+
+        @it("never swaps one scheme for the other")
+        sub _()
+            m.assertEqual(onboarding.address.withChip("http://silo.local", "https://"), "http://silo.local")
+            m.assertEqual(onboarding.address.withChip(" HTTPS://silo.example", "http://"), " HTTPS://silo.example")
+        end sub
+
+        @it("adds .com at the end, as the Android TV app does")
+        sub _()
+            m.assertEqual(onboarding.address.withChip("https://media.example", ".com"), "https://media.example.com")
+            m.assertEqual(onboarding.address.withChip("", ".com"), ".com")
+        end sub
+
+        @it("warns about addresses that ask for plain HTTP")
+        sub _()
+            m.assertTrue(onboarding.address.isCleartext(" HTTP://silo.local"))
+            m.assertFalse(onboarding.address.isCleartext("https://silo.example"))
+            m.assertFalse(onboarding.address.isCleartext("silo.local"))
+        end sub
+
+        @describe("attempt")
+
+        @it("asks for an address before connecting")
+        sub _()
+            for each typed in ["", "   "]
+                result = onboarding.address.attempt(typed)
+                m.assertEqual(result.step, onboarding.address.SHOW_ERROR)
+                m.assertEqual(result.error, "setup.error.empty")
+            end for
+        end sub
+
+        @it("tries HTTPS first for an address without a scheme, and may offer HTTP")
+        sub _()
+            result = onboarding.address.attempt(" media.example.com ")
+            m.assertEqual(result, { step: onboarding.address.CONNECT, error: "", allowHttp: false, canTryHttp: true, host: "media.example.com" })
+        end sub
+
+        @it("never offers HTTP for an https:// address")
+        sub _()
+            result = onboarding.address.attempt("https://silo.example:8443/silo/")
+            m.assertEqual(result.step, onboarding.address.CONNECT)
+            m.assertFalse(result.canTryHttp)
+            m.assertEqual(result.host, "silo.example:8443")
+        end sub
+
+        @it("asks before connecting to an http:// address")
+        sub _()
+            result = onboarding.address.attempt("http://192.168.1.20:8096")
+            m.assertEqual(result, { step: onboarding.address.CONFIRM_HTTP, error: "", allowHttp: true, canTryHttp: false, host: "192.168.1.20:8096" })
+        end sub
+
+        @it("explains addresses it cannot use")
+        sub _()
+            cases = [
+                ["ftp://silo.example", "setup.error.unsupportedScheme"]
+                ["https://me:secret@silo.example", "setup.error.credentials"]
+                ["http://me:secret@silo.example", "setup.error.credentials"]
+                ["silo example", "setup.error.invalidAddress"]
+                ["https://silo.example?x=1", "setup.error.invalidAddress"]
+            ]
+            for each c in cases
+                result = onboarding.address.attempt(c[0])
+                m.assertEqual(result.step, onboarding.address.SHOW_ERROR, c[0])
+                m.assertEqual(result.error, c[1], c[0])
+            end for
+        end sub
+
+        @describe("afterFailure")
+
+        @it("offers HTTP only after HTTPS got no answer for an address without a scheme")
+        sub _()
+            tried = onboarding.address.attempt("silo.local")
+            m.assertEqual(onboarding.address.afterFailure("unreachable", tried).step, onboarding.address.CONFIRM_HTTP)
+            tried.allowHttp = true
+            m.assertEqual(onboarding.address.afterFailure("unreachable", tried), { step: onboarding.address.SHOW_ERROR, error: "setup.error.unreachable" })
+            explicit = onboarding.address.attempt("https://silo.local")
+            m.assertEqual(onboarding.address.afterFailure("unreachable", explicit).step, onboarding.address.SHOW_ERROR)
+        end sub
+
+        @it("sends any answer but api_major 2 to the update screen, and never to HTTP")
+        sub _()
+            tried = onboarding.address.attempt("silo.local")
+            m.assertEqual(onboarding.address.afterFailure("server_update_required", tried).step, onboarding.address.UPDATE_REQUIRED)
+        end sub
+
+        @it("sends a server that cannot confirm the origin to the update screen")
+        sub _()
+            tried = onboarding.address.attempt("silo.local")
+            m.assertEqual(onboarding.address.afterFailure("origin_unconfirmed", tried), { step: onboarding.address.UPDATE_REQUIRED, error: "", problem: "origin_unconfirmed" })
+            m.assertEqual(onboarding.address.updateCopy("origin_unconfirmed").body, "update.originBody")
+            m.assertEqual(i18n.text("update.originBody"), "This server needs an update to sign in on Roku. Update Silo on the server, then try again.")
+            m.assertEqual(onboarding.address.updateCopy("origin_mismatch").headline, "update.mismatchHeadline")
+            m.assertEqual(onboarding.address.updateCopy("").body, "update.body")
+        end sub
+
+        @it("shows nothing for a cancelled check and an error for the rest")
+        sub _()
+            tried = onboarding.address.attempt("silo.local")
+            m.assertEqual(onboarding.address.afterFailure("cancelled", tried).step, onboarding.address.IDLE)
+            m.assertEqual(onboarding.address.afterFailure("origin_mismatch", tried).error, "setup.error.originMismatch")
+            m.assertEqual(onboarding.address.afterFailure("invalid_request", tried).error, "setup.error.unreachable")
+        end sub
+
+        @it("has copy for every message it gives")
+        sub _()
+            strings = i18n.load("en_US")
+            keys = ["setup.error.empty"]
+            for each kind in ["invalid_address", "unsupported_scheme", "credentials_in_address", "origin_mismatch", "unreachable"]
+                keys.Push(onboarding.address.errorKey(kind))
+            end for
+            for each problem in ["origin_unconfirmed", "origin_mismatch", "server_update_required"]
+                copy = onboarding.address.updateCopy(problem)
+                keys.Append([copy.headline, copy.body])
+            end for
+            for each key in keys
+                m.assertTrue(strings.DoesExist(key), key)
+            end for
+        end sub
+
+        @describe("hostOf")
+
+        @it("gives host and port of a base URL")
+        sub _()
+            m.assertEqual(onboarding.address.hostOf("https://media.example.com"), "media.example.com")
+            m.assertEqual(onboarding.address.hostOf("http://[fd00::1]:8096/silo"), "[fd00::1]:8096")
+            m.assertEqual(onboarding.address.hostOf(invalid), "")
+        end sub
+
+        @describe("serverCard")
+
+        @it("shows the host over the URL, Secure for HTTPS and a warning HTTP otherwise")
+        sub _()
+            m.assertEqual(onboarding.address.serverCard("https://media.example.com/silo"), { name: "media.example.com", address: "https://media.example.com/silo", badge: "firstRun.badge.secure", warning: false })
+            m.assertEqual(onboarding.address.serverCard("http://10.0.0.5:8096"), { name: "10.0.0.5:8096", address: "http://10.0.0.5:8096", badge: "firstRun.badge.http", warning: true })
+        end sub
+
+        @it("names an update screen's badge for its problem")
+        sub _()
+            m.assertEqual(onboarding.address.updateBadge("origin_mismatch"), "firstRun.badge.mismatch")
+            m.assertEqual(onboarding.address.updateBadge("origin_unconfirmed"), "firstRun.badge.update")
+            m.assertEqual(onboarding.address.updateBadge(""), "firstRun.badge.update")
+            strings = i18n.load("en_US")
+            for each key in ["firstRun.badge.secure", "firstRun.badge.http", "firstRun.badge.update", "firstRun.badge.mismatch"]
+                m.assertTrue(strings.DoesExist(key), key)
+            end for
+        end sub
+    end class
+end namespace

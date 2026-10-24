@@ -1,0 +1,340 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/values.bs"
+
+' Durable playback jobs (plan sections 4.8 and 6.6), held by ApiTask so they
+' outlive the player: a stop with its stop_id and final sample, and a
+' progress sample whose post had an uncertain result. Each job's body was
+' built once by the session reducer and is sent byte for byte on every try.
+'
+' A job is fenced by server, account, profile, attempt, and session. due()
+' hands out only jobs fenced to the identity whose credentials ApiTask holds,
+' so a job is never sent with another identity's credentials. On an identity
+' change ApiTask keeps the previous credentials until pending() reaches 0 or
+' SETTLE_MS passes, sending only that identity's jobs, then release()s what is
+' left with the reason "identity_changed"; releaseOthers() drops jobs that
+' arrive fenced to an identity that is already gone.
+'
+' Sessions of one title. The server writes a title's resume point from
+' whichever progress or stop of any session reaches it last, an older
+' session's included (it rebuilds a session lost in a restart from its
+' stored attempt). So a fence may name the title (contentId), and then a
+' newer session's position retires the older sessions' jobs: one that is
+' queued with a position (add), or a progress post the server accepted
+' (supersede). The newest session is the one whose position arrived
+' last, since a player retires a session before it starts the next; each
+' title remembers it with a serial, so an older job that was in flight
+' meanwhile is retired when it comes back for a retry (finish), and an
+' answer to a post sent before a newer session's position retires
+' nothing. And while one session's job for a title is in flight, no other
+' session's job for that title goes, so an older answer never lands after
+' a newer one. A title is the content of one identity (titleOf): the same
+' content under another server, account, or profile is another title, so
+' a job of an identity that has gone never retires, holds, or outranks the
+' current identity's (playback.worker releases such a job before it is
+' queued).
+namespace playback.jobs
+    const PROGRESS_TTL_MS = 600000
+    const STOP_TTL_MS = 1800000
+    const SETTLE_MS = 10000
+    ' Across all sessions; the oldest progress job goes first when it is full.
+    const MAX_JOBS = 24
+    ' Titles whose newest session is remembered; the oldest goes first.
+    const MAX_TITLES = 16
+
+    ' serial counts the titles' newest sessions as they are noted; titles
+    ' maps a titleOf key to { session, serial }.
+    function create() as Object
+        return { queue: [], serial: 0, titles: {} }
+    end function
+
+    ' Delay before retry n (1-based): 1, 2, 4, 8, 16 s, then every 30 s.
+    function backoffMs(tries as Integer) as Integer
+        if tries > 5 then return 30000
+        delay = 1000
+        for i = 2 to tries
+            delay = delay * 2
+        end for
+        return delay
+    end function
+
+    ' Queues a job from a session "job" command. Per session the queue holds
+    ' at most one progress sample that has been tried, one that has not, and
+    ' one stop: a stop replaces an untried sample (its final sample is newer),
+    ' a sample replaces an untried one, and nothing is queued behind a stop
+    ' except that stop. A job marked uncertain was already posted once by the
+    ' player, so it counts as tried and goes first, byte for byte. A job with
+    ' a position also retires the jobs of the title's older sessions that
+    ' are not in flight. Returns the jobs it displaced, as {id, kind,
+    ' reason}.
+    function add(state as Object, job as Object, now as Dynamic) as Object
+        dropped = []
+        entry = playback.values.copy(job)
+        entry.tries = 0
+        entry.tried = util.isTrue(job.uncertain)
+        entry.nextAt = now
+        entry.sending = false
+        entry.serial = state.serial
+        entry.expiresAt = now + PROGRESS_TTL_MS
+        if job.kind = "stop" then entry.expiresAt = now + STOP_TTL_MS
+
+        for each item in state.queue
+            ' The first stop for a session wins; its stop_id is reused on every try.
+            if item.sessionId = job.sessionId and item.kind = "stop"
+                if job.kind = "stop" then return dropped
+                dropped.Push(record(job, "stopping"))
+                return dropped
+            end if
+        end for
+        title = ""
+        if hasPosition(job) then title = titleOf(job.fence)
+        kept = []
+        for each item in state.queue
+            if (item.sessionId = job.sessionId and not item.tried) or olderSession(item, title, job.sessionId)
+                dropped.Push(record(item, "superseded"))
+            else
+                kept.Push(item)
+            end if
+        end for
+        kept.Push(entry)
+        if title <> "" then noteNewest(state, title, job.sessionId)
+        while kept.Count() > MAX_JOBS
+            index = oldest(kept)
+            dropped.Push(record(kept[index], "overflow"))
+            kept.Delete(index)
+        end while
+        state.queue = kept
+        return dropped
+    end function
+
+    ' The jobs to send now with identity's credentials ({server, account,
+    ' profile}): for each session, its first job if it is due, unexpired, not
+    ' already in flight, fenced to identity, and not held behind another
+    ' session's job for its title. They are marked in flight.
+    function due(state as Object, now as Dynamic, identity as Object) as Object
+        out = []
+        seen = {}
+        titles = titlesInFlight(state)
+        for each item in state.queue
+            if not seen.DoesExist(item.sessionId)
+                seen[item.sessionId] = true
+                if not item.sending and now >= item.nextAt and now < item.expiresAt and sameIdentity(item.fence, identity) and not heldBehind(item, titles)
+                    item.sending = true
+                    item.tried = true
+                    item.tries = item.tries + 1
+                    title = titleOf(item.fence)
+                    if title <> "" then titles[title] = item.sessionId
+                    out.Push(item)
+                end if
+            end if
+        end for
+        return out
+    end function
+
+    ' A progress post of sessionId, fenced by fence, was accepted; since is
+    ' the serial when it was sent. Unless a newer session's position has been
+    ' noted since, the jobs of the title's other sessions that are not in
+    ' flight go, as {id, kind, reason: "superseded"}.
+    function supersede(state as Object, fence as Object, sessionId as String, since as Integer) as Object
+        title = titleOf(fence)
+        if title = "" or newerSession(state, title, sessionId, since) then return []
+        noteNewest(state, title, sessionId)
+        dropped = []
+        kept = []
+        for each item in state.queue
+            if olderSession(item, title, sessionId)
+                dropped.Push(record(item, "superseded"))
+            else
+                kept.Push(item)
+            end if
+        end for
+        state.queue = kept
+        return dropped
+    end function
+
+    ' Records a try's result, a playback.results kind. A retryable result
+    ' schedules the next try; anything else removes the job. A stop answered
+    ' 404 is done (the session had already ended). Returns {id, kind, reason}
+    ' for a removed job, else invalid.
+    function finish(state as Object, id as String, result as String, now as Dynamic) as Dynamic
+        index = indexOf(state, id)
+        if index < 0 then return invalid
+        item = state.queue[index]
+        item.sending = false
+        if result = "offline" or result = "retry"
+            if newerSession(state, titleOf(item.fence), item.sessionId, item.serial)
+                state.queue.Delete(index)
+                return record(item, "superseded")
+            end if
+            item.nextAt = now + backoffMs(item.tries)
+            return invalid
+        end if
+        reason = "rejected"
+        if result = "ok" or (result = "notFound" and item.kind = "stop")
+            reason = "done"
+        else if result = "notFound" or result = "ended"
+            reason = "session_ended"
+        end if
+        state.queue.Delete(index)
+        return record(item, reason)
+    end function
+
+    ' Removes expired jobs that are not in flight, as {id, kind, reason: "expired"}.
+    function expire(state as Object, now as Dynamic) as Object
+        expired = []
+        kept = []
+        for each item in state.queue
+            if now >= item.expiresAt and not item.sending
+                expired.Push(record(item, "expired"))
+            else
+                kept.Push(item)
+            end if
+        end for
+        state.queue = kept
+        return expired
+    end function
+
+    ' The number of jobs fenced to identity, in flight or not.
+    function pending(state as Object, identity as Object) as Integer
+        count = 0
+        for each item in state.queue
+            if sameIdentity(item.fence, identity) then count = count + 1
+        end for
+        return count
+    end function
+
+    ' Removes every job fenced to identity, as {id, kind, reason}.
+    function release(state as Object, identity as Object, reason as String) as Object
+        released = []
+        kept = []
+        for each item in state.queue
+            if sameIdentity(item.fence, identity)
+                released.Push(record(item, reason))
+            else
+                kept.Push(item)
+            end if
+        end for
+        state.queue = kept
+        return released
+    end function
+
+    ' Removes every job not in flight that is fenced to an identity other than
+    ' identity, as {id, kind, reason}. due() never hands such a job out, so it
+    ' could only wait for its expiry: a job handed over after the identity
+    ' changed, or one that came back unsent because the identity changed
+    ' while it was queued.
+    function releaseOthers(state as Object, identity as Object, reason as String) as Object
+        released = []
+        kept = []
+        for each item in state.queue
+            if not item.sending and not sameIdentity(item.fence, identity)
+                released.Push(record(item, reason))
+            else
+                kept.Push(item)
+            end if
+        end for
+        state.queue = kept
+        return released
+    end function
+
+    ' The earliest time a queued job becomes due or expires, or invalid. As in
+    ' due(), only each session's first job can become due, and not while it or
+    ' another session's job for its title is in flight, so a job queued
+    ' behind another never sets a retry time that has already passed; every
+    ' job not in flight still counts its expiry.
+    ' A job in flight wakes the Task through its request's deadline.
+    function nextWake(state as Object) as Dynamic
+        wake = invalid
+        seen = {}
+        titles = titlesInFlight(state)
+        for each item in state.queue
+            first = not seen.DoesExist(item.sessionId) and not heldBehind(item, titles)
+            seen[item.sessionId] = true
+            if not item.sending
+                at = item.expiresAt
+                if first and item.nextAt < at then at = item.nextAt
+                if not util.isNumber(wake) or at < wake then wake = at
+            end if
+        end for
+        return wake
+    end function
+
+    ' The title a fence names, as a key of its identity and content, or ""
+    ' for a fence without contentId.
+    function titleOf(fence as Object) as String
+        contentId = util.text(fence.contentId)
+        if contentId = "" then return ""
+        return FormatJson([util.text(fence.server), util.text(fence.account), util.text(fence.profile), contentId])
+    end function
+
+    ' Whether a job carries a position: every progress sample, and a stop
+    ' with a final sample (a sequence).
+    function hasPosition(job as Object) as Boolean
+        return job.kind = "progress" or util.isNumber(job.sequence)
+    end function
+
+    ' Whether item is a job of title (titleOf) from a session other than
+    ' sessionId, and not in flight.
+    function olderSession(item as Object, title as String, sessionId as String) as Boolean
+        return title <> "" and not item.sending and item.sessionId <> sessionId and titleOf(item.fence) = title
+    end function
+
+    ' Marks sessionId the newest session of title.
+    sub noteNewest(state as Object, title as String, sessionId as String)
+        state.serial = state.serial + 1
+        state.titles[title] = { session: sessionId, serial: state.serial }
+        if state.titles.Count() <= MAX_TITLES then return
+        stalest = invalid
+        for each key in state.titles
+            if stalest = invalid or state.titles[key].serial < state.titles[stalest].serial then stalest = key
+        end for
+        state.titles.Delete(stalest)
+    end sub
+
+    ' Whether a session of title other than sessionId has had a position
+    ' noted after serial.
+    function newerSession(state as Object, title as String, sessionId as String, serial as Integer) as Boolean
+        newest = state.titles[title]
+        return newest <> invalid and newest.session <> sessionId and newest.serial > serial
+    end function
+
+    ' The titles with a job in flight, each to its session.
+    function titlesInFlight(state as Object) as Object
+        titles = {}
+        for each item in state.queue
+            title = titleOf(item.fence)
+            if item.sending and title <> "" then titles[title] = item.sessionId
+        end for
+        return titles
+    end function
+
+    ' Whether another session's job for item's title is in flight.
+    function heldBehind(item as Object, titles as Object) as Boolean
+        title = titleOf(item.fence)
+        return title <> "" and titles.DoesExist(title) and titles[title] <> item.sessionId
+    end function
+
+    function sameIdentity(fence as Object, identity as Object) as Boolean
+        return fence.server = identity.server and fence.account = identity.account and fence.profile = identity.profile
+    end function
+
+    function record(item as Object, reason as String) as Object
+        return { id: item.id, kind: item.kind, reason: reason }
+    end function
+
+    function indexOf(state as Object, id as String) as Integer
+        for i = 0 to state.queue.Count() - 1
+            if state.queue[i].id = id then return i
+        end for
+        return -1
+    end function
+
+    ' The oldest progress job not in flight, else the oldest job not in flight.
+    function oldest(queue as Object) as Integer
+        for each kind in ["progress", "stop"]
+            for i = 0 to queue.Count() - 1
+                if queue[i].kind = kind and not queue[i].sending then return i
+            end for
+        end for
+        return 0
+    end function
+end namespace

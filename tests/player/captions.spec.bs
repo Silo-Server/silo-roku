@@ -1,0 +1,676 @@
+namespace tests
+
+    ' The player's subtitle selection while content starts and settles,
+    ' Roku's caption mode, burned-in subtitles, and its focus and keys,
+    ' through a PlayerProbe (tests/components/PlayerProbe.bs): the
+    ' track_change the player asks for is read where the reducer queues it.
+    ' Sidecars and in-place switches are in captionSidecars.spec.bs.
+    @suite("player captions and keys")
+    class PlayerCaptionsTests extends tests.PlayerCaptionsSuite
+
+        @describe("selections while content starts (hardware run 20)")
+
+        ' The directory Roku put in front of the paths it listed in run 20.
+        function rokuDir() as String
+            return "/tmp/plugin/CEECAAZJdjY8/"
+        end function
+
+        ' English selected on an MKV original, carried with Spanish on new
+        ' content (load 2) that went onto a stopped Video node, as T1f's
+        ' logging build saw it: Roku lists the sidecars with the content,
+        ' before it starts, and reports no selection then, so the player
+        ' selects English by its listed name.
+        function assignedEnglish() as Object
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: m.english(), captionMode: "On", carried: [] })
+            view = node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.activeLoad, view.carried], [2, 2])
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "", listed: m.rokuDir() })
+            m.assertEqual(view.subtitleTrack, m.rokuDir() + "tmp:/probe/file-42-subtitle-0.srt", "selected while the content is set up")
+            return node
+        end function
+
+        @it("never selects again a sidecar Roku reports by its bare path when Roku lists the MKV's own tracks and plays mkv/3 (run 20, T1a-T1c)")
+        sub _()
+            english = "tmp:/probe/file-42-subtitle-0.srt"
+            node = m.assignedEnglish()
+            node.callFunc("probeVideoState", "buffering")
+            ' Roku reports the bare path for the listed name the player wrote,
+            ' then, about 1 s in, lists the tracks again with the MKV's own and
+            ' names mkv/3 as the one it plays. The stock build selected again
+            ' here, and Roku stopped the content 0.17 s later.
+            node.callFunc("probeRokuReports", { subtitleTrack: english })
+            view = node.callFunc("probeRokuReports", { current: "mkv/3", listed: m.rokuDir(), mkv: true })
+            m.assertEqual(view.subtitleTrack, english, "no selection while the content buffers")
+            view = node.callFunc("probeVideoState", "playing")
+            m.assertEqual([view.subtitleTrack, view.played, view.planLoad, view.failedLoad], [english, true, 2, 0], "its first frame selects nothing Roku reports selected")
+            node.callFunc("probeElapse", 1000)
+            view = node.callFunc("probePosition")
+            m.assertEqual([view.subtitleTrack, view.suppressed, view.planLoad], [english, false, 2], "nor within the settle time")
+            ' After it, mkv/3 playing gets the one selection, though it is
+            ' English too (run 22: such a track drew nothing).
+            node.callFunc("probeElapse", 2500)
+            view = node.callFunc("probePosition")
+            m.assertEqual([view.subtitleTrack, view.suppressed, view.planLoad], [m.rokuDir() + english, false, 2], "one selection by its listed name")
+            m.assertInvalid(view.queued, "no reload")
+            node.callFunc("probeRokuReports", { subtitleTrack: english, overlay: true })
+            node.callFunc("probeElapse", 10000)
+            view = node.callFunc("probePosition")
+            m.assertEqual([view.subtitleTrack, view.planLoad], [english, 2], "nor later")
+            m.assertInvalid(view.queued, "nor does it reload")
+        end sub
+
+        @it("plays on, drawing the sidecar Roku then reports by its listed name, as the build that skipped the selection did (run 20, T1f: FX-022 and S3E1)")
+        sub _()
+            english = "tmp:/probe/file-42-subtitle-0.srt"
+            node = m.assignedEnglish()
+            node.callFunc("probeVideoState", "buffering")
+            node.callFunc("probeRokuReports", { subtitleTrack: english })
+            node.callFunc("probeRokuReports", { current: "mkv/3", listed: m.rokuDir(), mkv: true })
+            node.callFunc("probeElapse", 7000)
+            view = node.callFunc("probeVideoState", "playing")
+            m.assertEqual([view.played, view.planLoad, view.subtitleTrack], [true, 2, english], "the first frame 8.3 s after assignment, and no write")
+            ' Later Roku reported the listed name as both selected and
+            ' playing, and its cues drew.
+            node.callFunc("probeElapse", 10000)
+            node.callFunc("probeRokuReports", { subtitleTrack: m.rokuDir() + english, current: m.rokuDir() + english, overlay: true })
+            view = node.callFunc("probePosition")
+            m.assertEqual([view.subtitleTrack, view.suppressed, view.planLoad, view.failedLoad], [m.rokuDir() + english, false, 2, 0])
+            m.assertInvalid(view.queued, "the same sidecar under another name is no viewer's choice")
+        end sub
+
+        @it("selects the sidecar once the content settles when Roku reports no selection while it starts")
+        sub _()
+            english = "tmp:/probe/file-42-subtitle-0.srt"
+            node = m.assignedEnglish()
+            node.callFunc("probeVideoState", "buffering")
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "", current: "mkv/3", listed: m.rokuDir(), mkv: true })
+            m.assertEqual(view.subtitleTrack, "", "nothing written while the content buffers")
+            view = node.callFunc("probeVideoState", "playing")
+            m.assertEqual(view.subtitleTrack, "", "nor at its first frame")
+            node.callFunc("probeElapse", 2000)
+            m.assertEqual(node.callFunc("probePosition").subtitleTrack, "", "nor within the settle time")
+            node.callFunc("probeElapse", 1000)
+            m.assertEqual(node.callFunc("probePosition").subtitleTrack, m.rokuDir() + english, "once, by its listed name")
+            node.callFunc("probeRokuReports", { subtitleTrack: "" })
+            node.callFunc("probeElapse", 5000)
+            m.assertEqual(node.callFunc("probePosition").subtitleTrack, "", "and not again")
+        end sub
+
+        @it("puts back nothing Roku changes while the content settles, and selects the sidecar after it")
+        sub _()
+            node = m.assignedEnglish()
+            node.callFunc("probeVideoState", "buffering")
+            node.callFunc("probeVideoState", "playing")
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "mkv/3", overlay: true })
+            m.assertEqual(view.subtitleTrack, "mkv/3", "not written back within the settle time")
+            node.callFunc("probeElapse", 3000)
+            m.assertEqual(node.callFunc("probePosition").subtitleTrack, m.rokuDir() + "tmp:/probe/file-42-subtitle-0.srt")
+        end sub
+
+        @it("selects the viewer's switch in place at once, and reloads it once when Roku still plays the sidecar before (run 17)")
+        sub _()
+            node = m.assignedEnglish()
+            node.callFunc("probeVideoState", "buffering")
+            node.callFunc("probeRokuReports", { subtitleTrack: "tmp:/probe/file-42-subtitle-0.srt" })
+            node.callFunc("probeVideoState", "playing")
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            view = node.callFunc("probeRetrack", m.spanish())
+            m.assertEqual(view.subtitleTrack, m.rokuDir() + "tmp:/probe/file-42-subtitle-1.srt", "the viewer's choice is written within the settle time")
+            view = node.callFunc("probeRokuPlays", { name: "tmp:/probe/file-42-subtitle-0.srt", elapsedMs: 3000 })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(1), inPlace: false })
+        end sub
+
+        @it("reloads at the position when Roku finishes the content right after the player's change, and selects the sidecar on its own once more on the reload (AG-202 decision 2, AG-204)")
+        sub _()
+            node = m.assignedEnglish()
+            node.callFunc("probeVideoState", "buffering")
+            node.callFunc("probeRokuReports", { subtitleTrack: "tmp:/probe/file-42-subtitle-0.srt" })
+            node.callFunc("probeVideoState", "playing")
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            node.callFunc("probeRetrack", m.spanish())
+            node.callFunc("probeElapse", 170)
+            view = node.callFunc("probeFinished")
+            m.assertEqual([view.afterWrite, view.commands], [[true], ["log", "reopen"]])
+            m.assertEqual([view.phase, view.planLoad, view.failedLoad, view.played], ["active", 3, 0, false], "a reload of the plan, not the end")
+            ' The reload's content: selected as it is set up, and once more
+            ' after it settles when Roku reports no selection.
+            node.callFunc("probeNewLoad", { subtitle: m.spanish(), captionMode: "On", sidecarState: "ready", headers: true, videoState: "finished" })
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "", listed: m.rokuDir() })
+            m.assertEqual(view.subtitleTrack, m.rokuDir() + "tmp:/probe/file-42-subtitle-1.srt")
+            node.callFunc("probeVideoState", "buffering")
+            node.callFunc("probeRokuReports", { subtitleTrack: "" })
+            node.callFunc("probeVideoState", "playing")
+            node.callFunc("probeElapse", 3000)
+            m.assertEqual(node.callFunc("probePosition").subtitleTrack, m.rokuDir() + "tmp:/probe/file-42-subtitle-1.srt", "the reload's one selection")
+        end sub
+
+        @it("leaves a finished the player did not cause to the session as before")
+        sub _()
+            node = m.assignedEnglish()
+            node.callFunc("probeVideoState", "buffering")
+            view = node.callFunc("probeFinished")
+            m.assertEqual([view.afterWrite, view.commands, view.planLoad], [[], [], 2], "content that never played: the stall clock judges it")
+            node.callFunc("probeVideoState", "playing")
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            node.callFunc("probeRetrack", m.spanish())
+            node.callFunc("probeElapse", 2500)
+            view = node.callFunc("probeFinished")
+            m.assertEqual(view.afterWrite, [false], "too long after the change")
+            m.assertEqual(view.phase, "ended")
+            m.assertArrayContains(view.commands, "finished", invalid, "the content's end")
+        end sub
+
+        @describe("the selection once content settles (hardware runs 21 and 22, AG-204, AG-206)")
+
+        ' S3E1's subtitle inventory as the run 21 loads carried it: Arabic,
+        ' English, and Spanish sidecars.
+        function s3e1Inventory() as Object
+            out = []
+            for each entry in [["3", "ara", "Saudi Arabia"], ["0", "eng", "ASS"], ["1", "spa", "Latin American"]]
+                out.Push({ track_id: "file:42:subtitle:" + entry[0], combined_index: entry[0].ToInt(), source: "embedded", codec: "ass", language: entry[1], label: entry[2], delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/" + entry[0] + ".srt?file_id=42" })
+            end for
+            return out
+        end function
+
+        ' The tracks Roku found in S3E1's MKV, listed after the sidecars.
+        function s3e1Stream() as Object
+            out = []
+            for each entry in [["mkv/3", "eng"], ["mkv/4", "ara"], ["mkv/5", "spa"], ["mkv/6", "spa"], ["mkv/7", "fre"], ["mkv/8", "ita"], ["mkv/9", "rus"]]
+                out.Push({ TrackName: entry[0], Language: entry[1], Description: "" })
+            end for
+            return out
+        end function
+
+        function sidecar(index as String) as Object
+            return { mode: "render", track_id: "file:42:subtitle:" + index, artifact: { url: "/api/v2/stream/s-1/subtitles/" + index + ".srt?file_id=42", format: "srt" } }
+        end function
+
+        function probePath(index as String) as String
+            return "tmp:/probe/file-42-subtitle-" + index + ".srt"
+        end function
+
+        ' A load of content carrying the sidecar at index, selected, and the
+        ' other sidecars of inventory, as run 21's console showed it to its first
+        ' frame and the settle time: Roku lists the sidecars before the
+        ' content starts and the player selects the chosen one by its listed
+        ' name; Roku then reports it by its bare path, lists the file's own
+        ' tracks (stream) beside them about 1 s in, and reports playing as
+        ' the track it plays, at that listing and at the first frame. Gives
+        ' the view 3 s after the first frame, before the next position.
+        function settling(node as Object, index as String, inventory as Object, stream as Object, playing as String) as Object
+            path = m.probePath(index)
+            node.callFunc("probeNewLoad", { subtitle: m.sidecar(index), captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped", inventory: inventory })
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "", listed: m.rokuDir() })
+            m.assertEqual(view.subtitleTrack, m.rokuDir() + path, "selected while the content is set up")
+            node.callFunc("probeVideoState", "buffering")
+            node.callFunc("probeRokuReports", { subtitleTrack: path })
+            view = node.callFunc("probeRokuReports", { current: playing, listed: m.rokuDir(), stream: stream })
+            m.assertEqual(view.subtitleTrack, path, "nothing written while the content buffers (run 20)")
+            node.callFunc("probeElapse", 2500)
+            view = node.callFunc("probeVideoState", "playing")
+            m.assertEqual([view.subtitleTrack, view.played], [path, true], "nor at its first frame")
+            node.callFunc("probeElapse", 2000)
+            m.assertEqual(node.callFunc("probePosition").subtitleTrack, path, "nor within the settle time")
+            return node.callFunc("probeElapse", 1000)
+        end function
+
+        ' Session playing English on load 1, then a reload with Arabic on
+        ' S3E1, Roku drawing the file's English track (mkv/3).
+        function arabicDrawnEnglish() as Object
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: m.english(), captionMode: "On", carried: [] })
+            view = m.settling(node, "3", m.s3e1Inventory(), m.s3e1Stream(), "mkv/3")
+            m.assertEqual([view.activeLoad, view.carried], [2, 3], "Arabic, English, and Spanish")
+            return node
+        end function
+
+        @it("selects the Arabic sidecar once after the settle time when Roku plays the file's English track (run 21, T5: S3E1)")
+        sub _()
+            arabic = m.probePath("3")
+            node = m.arabicDrawnEnglish()
+            view = node.callFunc("probePosition")
+            m.assertEqual(view.subtitleTrack, m.rokuDir() + arabic, "by its listed name")
+            m.assertEqual([view.planLoad, view.failedLoad, view.suppressed], [2, 0, false])
+            m.assertInvalid(view.queued, "a selection, no reload")
+            ' Roku follows: it reports Arabic selected and playing.
+            node.callFunc("probeRokuReports", { subtitleTrack: arabic, current: m.rokuDir() + arabic, overlay: true })
+            for each elapsed in [3000, 10000]
+                node.callFunc("probeElapse", elapsed)
+                view = node.callFunc("probePosition")
+                m.assertEqual([view.subtitleTrack, view.planLoad], [arabic, 2], "nothing more")
+                m.assertInvalid(view.queued)
+            end for
+        end sub
+
+        @it("selects the Italian sidecar once after the settle time when Roku plays the English sidecar (run 21, T5: S3E12)")
+        sub _()
+            italian = m.probePath("4")
+            english = m.probePath("0")
+            inventory = [
+                { track_id: "file:42:subtitle:4", combined_index: 4, source: "embedded", codec: "ass", language: "ita", label: "ASS", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/4.srt?file_id=42" },
+                { track_id: "file:42:subtitle:0", combined_index: 0, source: "embedded", codec: "ass", language: "eng", label: "ASS", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/0.srt?file_id=42" }
+            ]
+            stream = [{ TrackName: "mkv/3", Language: "eng", Description: "" }, { TrackName: "mkv/4", Language: "ita", Description: "" }]
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: m.english(), captionMode: "On", carried: [] })
+            view = m.settling(node, "4", inventory, stream, m.rokuDir() + english)
+            m.assertEqual(view.carried, 2, "Italian and English")
+            view = node.callFunc("probePosition")
+            m.assertEqual([view.subtitleTrack, view.planLoad], [m.rokuDir() + italian, 2])
+            m.assertInvalid(view.queued, "another sidecar playing after the settle time is selected, not reloaded")
+        end sub
+
+        @it("selects the English sidecar once after the settle time when Roku plays the file's only English track, and writes no more (run 22, T2b: file B)")
+        sub _()
+            english = m.probePath("0")
+            ' File B: the content carries the English sidecar alone, and Roku
+            ' lists it beside the file's one English track it lists, mkv/4.
+            inventory = [{ track_id: "file:42:subtitle:0", combined_index: 0, source: "external", codec: "srt", language: "eng", label: "English", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/0.srt?file_id=42" }]
+            stream = [{ TrackName: "mkv/4", Language: "eng", Description: "" }]
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: m.sidecar("3"), captionMode: "On", carried: [] })
+            view = m.settling(node, "0", inventory, stream, "mkv/4")
+            m.assertEqual([view.activeLoad, view.carried], [2, 1])
+            view = node.callFunc("probePosition")
+            m.assertEqual([view.subtitleTrack, view.suppressed, view.planLoad], [m.rokuDir() + english, false, 2], "one selection by its listed name, though mkv/4 is English")
+            m.assertInvalid(view.queued, "a selection, no reload")
+            ' Whatever Roku plays after it, the player writes nothing more.
+            node.callFunc("probeRokuReports", { subtitleTrack: english, current: "mkv/4", overlay: true })
+            for each elapsed in [3000, 10000]
+                node.callFunc("probeElapse", elapsed)
+                view = node.callFunc("probePosition")
+                m.assertEqual([view.subtitleTrack, view.planLoad, view.failedLoad], [english, 2, 0], "left as it is")
+                m.assertInvalid(view.queued)
+            end for
+        end sub
+
+        @it("leaves a track Roku still plays after the one selection, with no further write or reload (no loop)")
+        sub _()
+            arabic = m.probePath("3")
+            node = m.arabicDrawnEnglish()
+            node.callFunc("probePosition")
+            ' Roku reports the bare path again and keeps playing mkv/3.
+            node.callFunc("probeRokuReports", { subtitleTrack: arabic, current: "mkv/3", overlay: true })
+            node.callFunc("probeRokuReports", { listed: m.rokuDir(), stream: m.s3e1Stream() })
+            ' The probe's position stands still, so this stays within the
+            ' stall clock's 20 s.
+            for each elapsed in [1000, 2000, 3000, 8000]
+                node.callFunc("probeElapse", elapsed)
+                view = node.callFunc("probePosition")
+                m.assertEqual([view.subtitleTrack, view.planLoad, view.failedLoad], [arabic, 2, 0], "left as it is")
+                m.assertInvalid(view.queued)
+            end for
+        end sub
+
+        @it("reloads when Roku finishes the content right after the selection; the reload selects once more, and after a second such stop not again until the viewer chooses")
+        sub _()
+            arabic = m.probePath("3")
+            node = m.arabicDrawnEnglish()
+            node.callFunc("probePosition")
+            node.callFunc("probeElapse", 170)
+            view = node.callFunc("probeFinished")
+            m.assertEqual([view.afterWrite, view.commands], [[true], ["log", "reopen"]], "AG-203's client-caused stop")
+            m.assertEqual([view.phase, view.failedLoad, view.played], ["active", 0, false], "a reload of the plan, not the end")
+            ' The reload carries the choice and makes its own one selection.
+            m.settling(node, "3", m.s3e1Inventory(), m.s3e1Stream(), "mkv/3")
+            m.assertEqual(node.callFunc("probePosition").subtitleTrack, m.rokuDir() + arabic, "the reload's one selection")
+            node.callFunc("probeElapse", 170)
+            m.assertEqual(node.callFunc("probeFinished").afterWrite, [true])
+            ' The next reload's content is left as Roku plays it.
+            m.settling(node, "3", m.s3e1Inventory(), m.s3e1Stream(), "mkv/3")
+            for each elapsed in [0, 3000, 8000]
+                node.callFunc("probeElapse", elapsed)
+                view = node.callFunc("probePosition")
+                m.assertEqual(view.subtitleTrack, arabic, "no selection after two such stops")
+                m.assertInvalid(view.queued)
+            end for
+            ' A viewer's choice clears it: their next load is checked again.
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:3" })
+            m.settling(node, "3", m.s3e1Inventory(), m.s3e1Stream(), "mkv/3")
+            m.assertEqual(node.callFunc("probePosition").subtitleTrack, m.rokuDir() + arabic)
+        end sub
+
+        @it("leaves the check to the viewer's switch in place within the settle time")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: m.english(), captionMode: "On", carried: [] })
+            node.callFunc("probeNewLoad", { subtitle: m.sidecar("3"), captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped", inventory: m.s3e1Inventory() })
+            node.callFunc("probeRokuReports", { subtitleTrack: "", listed: m.rokuDir() })
+            node.callFunc("probeVideoState", "buffering")
+            node.callFunc("probeRokuReports", { subtitleTrack: m.probePath("3"), current: "mkv/3", listed: m.rokuDir(), stream: m.s3e1Stream() })
+            node.callFunc("probeVideoState", "playing")
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            view = node.callFunc("probeRetrack", m.english())
+            m.assertEqual(view.subtitleTrack, m.rokuDir() + m.probePath("0"), "the viewer's choice, at once")
+            ' Roku reports English by its bare path and plays the file's
+            ' English track: the switch was the one write, its own check
+            ' leaves a stream track as it is, and the check after the settle
+            ' time does not run again.
+            node.callFunc("probeRokuReports", { subtitleTrack: m.probePath("0"), current: "mkv/3", overlay: true })
+            node.callFunc("probeElapse", 3000)
+            view = node.callFunc("probePosition")
+            m.assertEqual(view.subtitleTrack, m.probePath("0"))
+            m.assertInvalid(view.queued)
+        end sub
+
+        @describe("captions that change while content loads (W8-3)")
+
+        @it("carries no sidecars when captions came on while headers and downloads were awaited")
+        sub _()
+            node = m.playingOff()
+            node.callFunc("probeNewLoad", { subtitle: { mode: "off" }, captionMode: "Off", sidecarState: "loading", headers: false, videoState: "stopped" })
+            m.assertInvalid(node.callFunc("probeCaption", "On").queued, "no content carries them yet")
+            view = node.callFunc("probeSidecarsReady")
+            m.assertEqual(view.activeLoad, 1, "the headers are still awaited")
+            view = node.callFunc("probeHeaders")
+            m.assertEqual([view.activeLoad, view.carried], [2, 0])
+            view = node.callFunc("probeVideoState", "playing")
+            m.assertEqual([view.subtitleTrack, view.carried], ["", 0])
+            m.assertInvalid(view.queued, "nothing to reload at the first frame")
+        end sub
+
+        @it("drops the sidecars when captions came on while the content waited for the stop")
+        sub _()
+            node = m.playingOff()
+            view = node.callFunc("probeNewLoad", { subtitle: { mode: "off" }, captionMode: "Off", sidecarState: "ready", headers: true, videoState: "playing" })
+            m.assertEqual(view.activeLoad, 1, "the earlier content stops first")
+            m.assertInvalid(node.callFunc("probeCaption", "On").queued)
+            view = node.callFunc("probeVideoState", "stopped")
+            m.assertEqual([view.activeLoad, view.carried], [2, 0])
+            view = node.callFunc("probeVideoState", "playing")
+            m.assertEqual([view.subtitleTrack, view.carried], ["", 0])
+            m.assertInvalid(view.queued)
+        end sub
+
+        @it("keeps the sidecars while captions stay off, and beside a selected one whatever the mode")
+        sub _()
+            node = m.playingOff()
+            node.callFunc("probeNewLoad", { subtitle: { mode: "off" }, captionMode: "Off", sidecarState: "ready", headers: true, videoState: "playing" })
+            m.assertEqual(node.callFunc("probeVideoState", "stopped").carried, 2)
+            node = m.playingOff()
+            node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "Off", sidecarState: "ready", headers: true, videoState: "playing" })
+            node.callFunc("probeCaption", "On")
+            m.assertEqual(node.callFunc("probeVideoState", "stopped").carried, 2)
+            view = node.callFunc("probeVideoState", "playing")
+            m.assertEqual(view.subtitleTrack, "tmp:/probe/file-42-subtitle-0.srt")
+            m.assertInvalid(view.queued)
+        end sub
+
+        @it("reloads without the sidecars when captions come on after the content reached the Video node")
+        sub _()
+            node = m.playingOff()
+            view = node.callFunc("probeNewLoad", { subtitle: { mode: "off" }, captionMode: "Off", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.activeLoad, view.carried], [2, 2])
+            view = node.callFunc("probeCaption", "On")
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: false })
+        end sub
+
+        @describe("On mute (runs 6, 7, and 17)")
+
+        ' A caption-mode event as Main sends it: Roku's setting, and what a
+        ' Roku TV shows under it (GetCaptionsMode()).
+        function roku(setting as String, shown as String) as Object
+            return platform.captionModeEvent(setting, shown)
+        end function
+
+        @it("keeps On mute through mutes and unmutes, which change no plan (run 17, T2c)")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "Off", carried: ["file:42:subtitle:0", "file:42:subtitle:1"], modelType: "TV" })
+            view = node.callFunc("probeChoose", { kind: "caption", value: "When mute" })
+            m.assertEqual([view.captionMode, view.globalCaptionMode], ["When mute", "When mute"])
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: false }, "captions came on over carried sidecars")
+            for each event in [m.roku("When mute", "Off"), m.roku("When mute", "Off")]
+                m.assertEqual(node.callFunc("probeCaption", event).captionMode, "When mute", "Roku's events for the write, the TV unmuted")
+            end for
+            view = node.callFunc("probeNewLoad", { subtitle: { mode: "off" }, captionMode: "When mute", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.activeLoad, view.carried, view.suppressed], [2, 0, true], "the reload carries no sidecars")
+            for each shown in ["On", "Off", "On", "Off", "On", "Off"]
+                view = node.callFunc("probeCaption", m.roku("When mute", shown))
+                m.assertEqual([view.captionMode, view.globalCaptionMode], ["When mute", "When mute"], shown)
+                m.assertInvalid(view.queued, shown)
+            end for
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            m.assertEqual([view.queued.tracks.subtitle.id, view.globalCaptionMode], ["file:42:subtitle:0", "When mute"], "a track keeps On mute")
+        end sub
+
+        @it("shows On mute set in Roku's own menu as On mute, and a later mode as it is")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: m.english(), captionMode: "Off", carried: ["file:42:subtitle:0"], modelType: "TV" })
+            m.assertEqual(node.callFunc("probeCaption", m.roku("When mute", "Off")).captionMode, "When mute")
+            m.assertEqual(node.callFunc("probeCaption", m.roku("When mute", "On")).captionMode, "When mute", "muted")
+            m.assertEqual(node.callFunc("probeCaption", m.roku("On", "On")).captionMode, "On")
+        end sub
+
+        @it("ignores Roku's first event when it repeats the mode before Silo's write (runs 7 and 17)")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: m.english(), captionMode: "Instant replay", carried: ["file:42:subtitle:0"], modelType: "TV" })
+            node.callFunc("probeChoose", { kind: "caption", value: "When mute" })
+            m.assertEqual(node.callFunc("probeCaption", m.roku("Instant replay", "Instant replay")).captionMode, "When mute", "the stale repeat")
+            m.assertEqual(node.callFunc("probeCaption", m.roku("When mute", "Off")).captionMode, "When mute", "then the write")
+            m.assertEqual(node.callFunc("probeCaption", m.roku("Instant replay", "Instant replay")).captionMode, "Instant replay", "a later change is the viewer's")
+            node.callFunc("probeChoose", { kind: "caption", value: "Off" })
+            m.assertEqual(node.callFunc("probeCaption", m.roku("Instant replay", "Instant replay")).captionMode, "Off", "run 17: the mode before Off")
+            m.assertEqual(node.callFunc("probeCaption", m.roku("Off", "Off")).captionMode, "Off")
+        end sub
+
+        @describe("focus and keys (DP-1)")
+
+        ' The probe in the test scene, so focus can move; afterEach takes it out.
+        function onScreen() as Object
+            node = m.player()
+            m.top.appendChild(node)
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "Off", carried: [] })
+            return node
+        end function
+
+        @afterEach
+        sub leaveScreen()
+            for each child in m.top.getChildren(-1, 0)
+                if child.subtype() = "PlayerProbe" then m.top.removeChild(child)
+            end for
+        end sub
+
+        @it("gives the overlay's empty keyFocus focus while the controls show, and the Video node while they hide")
+        sub _()
+            node = m.onScreen()
+            view = node.callFunc("probeKey", "up", true)
+            node.callFunc("probeKey", "up", false)
+            m.assertEqual([view.handled, view.shown, view.focused], [true, true, "keyFocus"])
+            focus = node.callFunc("probeFocus", invalid)
+            m.assertFalse(focus.video)
+            m.assertFalse(focus.player, "not an ancestor of the Video node")
+            view = node.callFunc("probeKey", "back", true)
+            m.assertEqual([view.shown, view.focused], [false, "video"])
+        end sub
+
+        @it("opens Options on Video's tab with Down while the controls hide, the panel's tabs focused (run 6, tvOS)")
+        sub _()
+            node = m.onScreen()
+            view = node.callFunc("probeKey", "down", true)
+            node.callFunc("probeKey", "down", false)
+            m.assertEqual([view.options, view.picker, view.listFocus, view.focused], [true, false, false, "optionsPanel"], "Down with the controls hidden")
+            panel = node.findNode("optionsLayer").getChild(0)
+            m.assertEqual(panel.current, "video")
+            m.assertTrue(panel.findNode("tabFocus").hasFocus())
+        end sub
+
+        @it("keeps Options open after a track pick that reloads, as after one in place, and closes it on the first Back across the reload (run 22)")
+        sub _()
+            node = m.onScreen()
+            node.callFunc("probeKey", "down", true)
+            node.callFunc("probeKey", "down", false)
+            ' English is not on the playing content, so the pick reloads.
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            m.assertEqual(view.queued.op, "track_change")
+            m.assertFalse(view.queued.inPlace, "a reload")
+            m.assertEqual(node.callFunc("probeFocus", invalid).focused, "optionsPanel", "the panel stays open and keeps focus")
+            node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            view = node.callFunc("probeVideoState", "playing")
+            m.assertEqual(view.activeLoad, 2, "the reload's first frame")
+            m.assertEqual(node.findNode("optionsLayer").getChildCount(), 1)
+            m.assertEqual(node.callFunc("probeFocus", invalid).focused, "optionsPanel", "still the panel's")
+            view = node.callFunc("probeKey", "back", true)
+            node.callFunc("probeKey", "back", false)
+            m.assertEqual([view.options, view.leaving], [false, false], "one Back closes it, and the player stays")
+            m.assertEqual(node.findNode("optionsLayer").getChildCount(), 0)
+        end sub
+
+        @it("opens Options on Info from the Options button, a Roku TV's route (AG-117), and on the tab shown last after that (tvOS)")
+        sub _()
+            node = m.onScreen()
+            node.callFunc("probeKey", "up", true)
+            node.callFunc("probeKey", "up", false)
+            for each key in ["down", "right", "right"]
+                node.callFunc("probeKey", key, true)
+                node.callFunc("probeKey", key, false)
+            end for
+            view = node.callFunc("probeKey", "OK", true)
+            node.callFunc("probeKey", "OK", false)
+            m.assertEqual([view.options, view.picker, view.focused], [true, false, "optionsPanel"], "on Info's tabs")
+            panel = node.findNode("optionsLayer").getChild(0)
+            m.assertEqual(panel.tab, "info")
+            m.assertFalse(node.findNode("overlay").shown, "the controls step aside while it is open")
+            panel.tab = "stats"
+            node.callFunc("probeKey", "back", true)
+            node.callFunc("probeKey", "back", false)
+            m.assertEqual(node.findNode("optionsLayer").getChildCount(), 0)
+            m.assertTrue(node.findNode("overlay").shown, "and come back")
+            node.callFunc("probeKey", "OK", true)
+            m.assertEqual(node.findNode("optionsLayer").getChild(0).tab, "stats")
+        end sub
+
+        @it("opens Options on * while the controls show, and acts on Back's press once")
+        sub _()
+            node = m.onScreen()
+            node.callFunc("probeKey", "up", true)
+            node.callFunc("probeKey", "up", false)
+            view = node.callFunc("probeKey", "options", true)
+            m.assertEqual([view.handled, view.options], [true, true], "Silo's Options, not Roku's menu")
+            m.assertEqual([view.focused, view.listFocus], ["optionsPanel", false], "on Video's tab")
+            m.assertEqual(node.findNode("optionsLayer").getChild(0).current, "video")
+            m.assertTrue(node.callFunc("probeKey", "options", false).handled)
+
+            ' The busy capsule shows under the open panel, not under its
+            ' corner (run 10, T2b): tvOS's 560.
+            status = node.findNode("status")
+            panel = node.findNode("optionsLayer").getChild(0)
+            m.assertEqual(panel.bottom, 532)
+            m.assertEqual(status.below, panel.bottom)
+            view = node.callFunc("probeKey", "back", true)
+            node.callFunc("probeKey", "back", false)
+            m.assertEqual(node.findNode("optionsLayer").getChildCount(), 0, "the first Back closes it (run 22)")
+            m.assertEqual(status.below, 0, "back at the top right once it closes")
+            m.assertEqual([view.shown, view.leaving], [true, false], "and does nothing else")
+
+            node = m.onScreen()
+            node.callFunc("probeKey", "up", true)
+            node.callFunc("probeKey", "up", false)
+            view = node.callFunc("probeKey", "back", true)
+            m.assertEqual([view.handled, view.shown, view.leaving], [true, false, false], "Back hides the controls")
+            view = node.callFunc("probeKey", "back", false)
+            m.assertEqual([view.handled, view.shown, view.leaving], [true, false, false], "its release does nothing more, and AppScene never sees it")
+        end sub
+
+        @describe("burned-in subtitles (W7-6)")
+
+        function japanese() as Object
+            return { id: "file:42:subtitle:2", index: 2 }
+        end function
+
+        @it("turns a burned-in subtitle off with Captions Off in Options, and back on with On")
+        sub _()
+            node = m.burning("On")
+            view = node.callFunc("probeChoose", { kind: "caption", value: "Off" })
+            m.assertEqual(view.globalCaptionMode, "Off")
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: false })
+            m.assertEqual(view.burnWanted, m.japanese())
+            view = node.callFunc("probeLoad", { subtitle: { mode: "off" } })
+            m.assertInvalid(view.queued, "the plan follows the mode")
+            view = node.callFunc("probeChoose", { kind: "caption", value: "On" })
+            tracks = m.audioOnly()
+            tracks.subtitle = m.japanese()
+            m.assertEqual(view.queued, { op: "track_change", tracks: tracks, inPlace: false })
+            m.assertInvalid(view.burnWanted)
+        end sub
+
+        @it("follows Roku's own caption mode for a burned-in subtitle: Off removes it, On replay keeps it")
+        sub _()
+            node = m.burning("On")
+            m.assertInvalid(node.callFunc("probeCaption", "Instant replay").queued)
+            view = node.callFunc("probeCaption", "Off")
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: false })
+            node.callFunc("probeLoad", { subtitle: { mode: "off" } })
+            view = node.callFunc("probeCaption", "When mute")
+            m.assertEqual(view.queued.tracks.subtitle, m.japanese())
+        end sub
+
+        @it("asks once per mode when a plan arrives burned in with captions off")
+        sub _()
+            node = m.burning("Off")
+            view = node.callFunc("probeLoad", { subtitle: { mode: "burn_in", track_id: "file:42:subtitle:2" } })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: false }, "a Detail pick, or a replan, burned it in")
+            view = node.callFunc("probeLoad", { subtitle: { mode: "burn_in", track_id: "file:42:subtitle:2" } })
+            m.assertInvalid(view.queued, "the server burned it in again: not asked twice")
+            view = node.callFunc("probeCaption", "On")
+            m.assertInvalid(view.queued, "it shows now")
+        end sub
+
+        @it("sets aside a subtitle the preferences choose that only a burn-in shows while captions are off")
+        sub _()
+            node = m.burning("Off")
+            view = node.callFunc("probeLoad", { subtitle: { mode: "off" }, first: true, subtitleLanguage: "jpn", subtitleMode: "always" })
+            m.assertInvalid(view.queued, "no burn-in while captions are off")
+            m.assertEqual(view.burnWanted, m.japanese())
+            view = node.callFunc("probeCaption", "On")
+            m.assertEqual(view.queued.tracks.subtitle, m.japanese())
+
+            node = m.burning("On")
+            view = node.callFunc("probeLoad", { subtitle: { mode: "off" }, first: true, subtitleLanguage: "jpn", subtitleMode: "always" })
+            m.assertEqual(view.queued.tracks.subtitle, m.japanese(), "with captions on it is asked for at once")
+            m.assertInvalid(view.burnWanted)
+        end sub
+
+        @it("forgets the subtitle set aside once the viewer chooses a track")
+        sub _()
+            node = m.burning("On")
+            node.callFunc("probeChoose", { kind: "caption", value: "Off" })
+            node.callFunc("probeLoad", { subtitle: { mode: "off" } })
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            m.assertInvalid(view.burnWanted)
+            m.assertInvalid(view.queued, "Off is already the plan's")
+            m.assertInvalid(node.callFunc("probeCaption", "On").queued)
+        end sub
+
+        @describe("a subtitle failure while the content buffers (hardware run 23)")
+
+        @it("shows the failure's notice once buffering ends, for its full time")
+        sub _()
+            node = m.showingEnglish()
+            node.callFunc("probeVideoState", "buffering")
+            m.assertEqual(node.callFunc("probeStatus"), "Loading…")
+            node.callFunc("probeSidecarFailed", { trackId: "file:42:subtitle:0", kind: "too_large" })
+            m.assertEqual(node.callFunc("probeStatus"), "Loading…", "Buffering outranks notices")
+            node.callFunc("probeElapse", 5000)
+            m.assertEqual(node.callFunc("probeStatus"), "Loading…", "longer than a notice lasts")
+            node.callFunc("probeVideoState", "playing")
+            m.assertEqual(node.callFunc("probeStatus"), "Subtitles are too large to show.")
+            node.callFunc("probeElapse", 3900)
+            m.assertEqual(node.callFunc("probeStatus"), "Subtitles are too large to show.")
+            node.callFunc("probeElapse", 100)
+            m.assertEqual(node.callFunc("probeStatus"), "", "4 s on screen")
+        end sub
+
+        @it("says nothing for a sidecar that was not selected")
+        sub _()
+            node = m.showingEnglish()
+            node.callFunc("probeVideoState", "buffering")
+            node.callFunc("probeSidecarFailed", { trackId: "file:42:subtitle:1", kind: "too_large" })
+            node.callFunc("probeVideoState", "playing")
+            m.assertEqual(node.callFunc("probeStatus"), "")
+        end sub
+    end class
+end namespace

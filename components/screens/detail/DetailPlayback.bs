@@ -1,0 +1,393 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/actions.bs"
+import "pkg:/source/catalog/choice.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/catalog/series.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/player.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/log.bs"
+
+' The detail page's action row, its Version, Audio, and Subtitles menus and
+' the readout above it, the player handoff, and the refresh after the player
+' closes (spec section 5.6, plan section 4.5).
+
+' Track preference writes outlive the page, so they go under their own owner,
+' which is never released (api.release), and wait in their key's line in
+' AppScene's router (catalog.request.savePreference).
+const PREFERENCE_OWNER = "trackPreferences"
+
+' Rebuilds the row and the readout for the target and the selection read for
+' it. Play keeps one width on movies and series alike, so the buttons after
+' it stay put as the episode changes (spec section 5.6). The selectors say
+' their value through the audio guide, as tvOS labels them.
+sub updateActions()
+    selection = currentSelection()
+    values = {}
+    if selection <> invalid then values = catalog.choice.readout(selection, m.choice, m.copy)
+    items = catalog.actions.row(m.target, catalog.choice.enabled(selection, m.choice), m.copy)
+    for each item in items
+        if values.DoesExist(item.key) then item.speech = item.label + ", " + values[item.key]
+    end for
+    m.actions.buttons = { items: items, primaryWidth: theme.detail.PLAY_WIDTH }
+    showActionPlaceholders()
+    ' The readout keeps its place while the page loads, as tvOS's does.
+    m.selectionView.visible = m.target <> invalid or m.actionPlaceholders.visible
+    m.selectionView.values = values
+end sub
+
+' The target's watch state (catalog.map.watchState) once read, or invalid.
+function currentWatch() as Dynamic
+    if m.target = invalid or m.watch = invalid or m.watch.id <> m.target.contentId then return invalid
+    return m.watch
+end function
+
+' The target's selection (catalog.selection) once read, or invalid, as for
+' an item without a version.
+function currentSelection() as Dynamic
+    watch = currentWatch()
+    if watch = invalid then return invalid
+    return watch.selection
+end function
+
+' A new target starts with Auto everywhere until its selection is read.
+sub resetChoices()
+    m.choice = catalog.choice.initial(invalid)
+end sub
+
+' Reads id's resume point and tracks, replacing the read for an earlier
+' target. afterPlayback marks the read after the player closed, which a new
+' target does not cancel, and which moves on from an episode the player
+' reported finished.
+sub loadWatch(id as String, afterPlayback as Boolean)
+    kind = "watch"
+    if afterPlayback
+        kind = "played"
+    else
+        cancelKind(kind)
+    end if
+    finished = afterPlayback and m.playing <> invalid and util.isTrue(m.playing.finished)
+    send(catalog.request.watch(id), { kind: kind, id: id, afterPlayback: afterPlayback, finished: finished })
+end sub
+
+' A first read starts the target's choice as tvOS does: the subtitle the
+' profile chose on the item, and the audio track it chose for the series or
+' movie once that is read (seedAudio). A read after the player closed keeps
+' what the viewer chose, as tvOS's selectors outlive its player, where the
+' item still has it (catalog.choice.withVersion).
+sub onWatch(entry as Object, result as Object)
+    if result.ok <> true then return
+    if entry.afterPlayback and advanceAfterPlayback(entry.id, entry.finished) then return
+    if m.target = invalid or entry.id <> m.target.contentId then return
+    kept = currentWatch() <> invalid
+    m.watch = result.body
+    m.target.resumeSeconds = m.watch.resumeSeconds
+    selection = m.watch.selection
+    if selection <> invalid
+        if kept
+            m.choice = catalog.choice.withVersion(selection, m.choice, catalog.choice.versionValue(selection, m.choice))
+        else
+            m.choice = catalog.choice.initial(selection)
+            seedAudio()
+            readAudioPreference(selection.key)
+        end if
+    end if
+    updateActions()
+end sub
+
+' The audio track the profile chose for this series or movie, read once per
+' page (the key does not change between a series' episodes), after the
+' writes to it still on their way (catalog.request.audioPreference). An
+' audio choice made before it answers cancels it (onPicked).
+sub readAudioPreference(key as String)
+    if key = "" or key = m.preferenceKey then return
+    m.preferenceKey = key
+    m.audioPreference = invalid
+    send(catalog.request.audioPreference(key), { kind: "audioPreference", key: key })
+end sub
+
+sub onAudioPreference(entry as Object, result as Object)
+    if entry.key <> m.preferenceKey then return
+    ' 404: the profile chose none.
+    if result.ok = true then m.audioPreference = result.body
+    seedAudio()
+    updateActions()
+end sub
+
+' Starts the audio on the remembered track (catalog.choice.seedAudio): the
+' one read, or the one the viewer chose on this page since.
+sub seedAudio()
+    selection = currentSelection()
+    if selection = invalid then return
+    m.choice.audio = catalog.choice.seedAudio(catalog.choice.versionOf(selection, m.choice), m.audioPreference)
+end sub
+
+sub onAction()
+    key = m.actions.activated
+    if key = catalog.action.PLAY or key = catalog.action.START_OVER
+        play(key)
+    else if key = catalog.action.VERSION or key = catalog.action.AUDIO or key = catalog.action.SUBTITLES
+        openPicker(key)
+    end if
+end sub
+
+' Pushes the player for the target (spec sections 5.6 and 5.7): Play and
+' Resume resume, Start Over starts at 0, and the version and tracks the
+' menus chose go with the intent, Auto as Auto, for the player to resolve
+' against the plan it gets (assumption AG-105); a version the viewer chose
+' is pinned (nav.player.pinnedFile).
+sub play(key as String)
+    wanted = playIntent(key)
+    if wanted = invalid then return
+    m.playing = { contentId: m.target.contentId, finished: false }
+    m.refreshTimer.control = "stop"
+    nav.push(nav.route.PLAYER, { intent: wanted })
+end sub
+
+' The nav.player intent the button key starts, or invalid without a target.
+function playIntent(key as String) as Dynamic
+    if m.target = invalid then return invalid
+    wanted = nav.player.intent(m.target.contentId, catalog.actions.startRule(key))
+    selection = currentSelection()
+    if selection <> invalid
+        version = catalog.choice.versionOf(selection, m.choice)
+        nav.player.withTracks(wanted, version.fileId, m.choice.audio, m.choice.subtitle, m.choice.fileId <> "")
+    end if
+    return wanted
+end function
+
+' Opens the menu for a selector button. Audio checks the track Auto plays
+' beside Auto, as tvOS's menu does.
+sub openPicker(key as String)
+    selection = currentSelection()
+    if selection = invalid then return
+    version = catalog.choice.versionOf(selection, m.choice)
+    m.pickerKey = key
+    if key = catalog.action.VERSION
+        m.picker.setFields({ title: i18n.text("detail.version"), options: { items: selection.versionOptions }, chosen: catalog.choice.versionValue(selection, m.choice) })
+    else if key = catalog.action.AUDIO
+        items = []
+        resolved = -1
+        if m.choice.audio < 0 then resolved = catalog.choice.audioInEffect(version, m.choice)
+        for each item in version.audioOptions
+            items.Push({ value: item.value, title: item.title, detail: item.detail, marked: item.value = resolved })
+        end for
+        m.picker.setFields({ title: i18n.text("detail.audio"), options: { items: items }, chosen: m.choice.audio })
+    else
+        m.picker.setFields({ title: i18n.text("detail.subtitles"), options: { items: version.subtitleOptions }, chosen: m.choice.subtitle })
+    end if
+    m.actions.held = true
+    row = m.actions.translation
+    m.picker.anchor = [row[0] + m.actions.highlightX, row[1] + m.page.translation[1]]
+    ' A menu opening above its button stays clear of the readout too.
+    m.picker.clearTop = m.selectionView.translation[1] + m.page.translation[1]
+    m.picker.callFunc("open")
+end sub
+
+' A menu's choice. Version re-resolves the tracks for the version chosen
+' (catalog.choice.withVersion); Audio and Subtitles are remembered for the
+' series or movie (catalog.choice.preferenceWrite) when they change: OK on
+' the value already chosen, a seeded Off included, writes nothing, so the
+' profile's own setting still applies to the title (a Roku deviation, spec
+' section 5.9). An audio choice outranks the remembered track still being
+' read, which is dropped, and goes on to the series' later episodes. Auto
+' in Subtitles stops naming the subtitle the profile chose on the item at
+' once (catalog.choice's cleared), and either Auto reads the target's
+' tracks again once its write lands (onPreferenceWritten).
+sub onPicked()
+    selection = currentSelection()
+    if selection = invalid then return
+    picked = m.picker.picked
+    if m.pickerKey = catalog.action.VERSION
+        m.choice = catalog.choice.withVersion(selection, m.choice, picked)
+    else if m.pickerKey = catalog.action.AUDIO
+        if picked = m.choice.audio then return
+        m.choice.audio = picked
+        cancelKind("audioPreference")
+        m.audioPreference = catalog.choice.rememberedAudio(selection, m.choice)
+        sendPreference("audio", catalog.choice.preferenceWrite(selection, m.choice, "audio"), picked = playback.tracks.AUTO)
+    else
+        if picked = m.choice.subtitle then return
+        m.choice.subtitle = picked
+        m.choice.cleared = picked = playback.tracks.AUTO
+        sendPreference("subtitle", catalog.choice.preferenceWrite(selection, m.choice, "subtitle"), m.choice.cleared)
+    end if
+    updateActions()
+end sub
+
+sub onPickerClosed()
+    if m.top.visible then m.actions.setFocus(true)
+    m.actions.held = false
+end sub
+
+sub closePicker()
+    m.picker.visible = false
+    onPickerClosed()
+end sub
+
+' --- Track preference writes ------------------------------------------------------
+
+' Sends a kind's write at once. The router's line for its key keeps it
+' behind the writes before it, this page's or an earlier one's, so a
+' choice followed by Auto cannot be overtaken by the earlier write (tvOS
+' chains them the same way), and a newer choice replaces one still
+' waiting (assumption AG-286). Writes are not retried: a failure costs
+' the remembered track, never playback. reread marks an Auto write, after
+' which the target's tracks are read again.
+sub sendPreference(kind as String, request as Object, reread as Boolean)
+    handle = api.newHandle(PREFERENCE_OWNER)
+    handle.addFields({ preferenceKind: kind, rereadId: rereadTarget(reread) })
+    handle.observeField("status", "onPreferenceWritten")
+    api.send(request, handle)
+end sub
+
+' The target whose tracks a write is to read again once it lands, or "".
+function rereadTarget(reread as Boolean) as String
+    if not reread or m.target = invalid then return ""
+    return m.target.contentId
+end function
+
+sub onPreferenceWritten(event as Object)
+    handle = event.getRoSGNode()
+    result = api.resultOf(handle)
+    if result <> invalid then preferenceWritten(handle.preferenceKind, handle.rereadId, result)
+end sub
+
+' A write of kind landed with result. A failure is logged while the page is
+' there to hear it; a write a newer one replaced is not a failure. Once an
+' Auto write lands, the projection read before it still resolves Auto with
+' the item's remembered tracks (the server's effective audio track, the
+' series' subtitle language and mode), so the target's tracks are read
+' again (rereadId), keeping the viewer's choices, while the page still
+' shows that target.
+sub preferenceWritten(kind as String, rereadId as String, result as Object)
+    if result.ok = true
+        if rereadId <> "" and not m.released and m.target <> invalid and m.target.contentId = rereadId then loadWatch(rereadId, false)
+        return
+    end if
+    if util.isObject(result.error) and result.error.reason = "superseded" then return
+    log.warn("detail", "a track preference was not saved", { kind: kind, status: result.status })
+end sub
+
+' --- After the player closes ---------------------------------------------------
+
+' The player closed. played ({ contentId, seasonNumber, finished }, the
+' onShow event's) is the item it played last and whether this playback
+' finished it; after Up Next's chain, that episode becomes the played one and
+' the active one, in its season. The refresh then moves on only from an
+' episode this playback finished, so a rewatch stopped partway keeps its
+' episode although the server already counts it watched (spec section 5.6).
+sub returnFromPlayer(played as Dynamic)
+    last = playedItemId(played)
+    if m.playing <> invalid and last <> ""
+        chained = last <> m.playing.contentId
+        m.playing = { contentId: last, finished: util.isTrue(played.finished) }
+        if chained and not selectPlayed(last, catalog.series.seasonOf(played.seasonNumber)) then return
+    end if
+    refreshAfterPlayback()
+end sub
+
+' The content ID of the item the player played last, or "" when it handed
+' nothing back.
+function playedItemId(played as Dynamic) as String
+    if not util.isObject(played) then return ""
+    return util.text(played.contentId)
+end function
+
+' Makes the chain's last episode active: at once when its season's episodes
+' are read, else once they arrive, which the refresh waits for
+' (refreshOnLoad). True when the refresh can go now.
+function selectPlayed(id as String, season as Integer) as Boolean
+    at = catalog.series.indexOf(m.railItems, id)
+    if at >= 0
+        setActive(at, true, false)
+        if m.railAttached then m.rail.callFunc("jumpTo", at, false)
+        return true
+    end if
+    position = positionOf(season)
+    ' A season the page does not list: the refresh reads what it shows.
+    if m.seasonNodes.Count() > 0 and position < 0 then return true
+    m.wantedEpisode = id
+    if season >= 0 then m.wantedSeason = season
+    if position >= 0 and m.pages[position] <> invalid
+        showSeason(position, false, true)
+        return true
+    end if
+    m.refreshOnLoad = true
+    ' Without seasons yet, the page opens on them as they arrive.
+    if position >= 0 then showSeason(position, false, true)
+    return false
+end function
+
+' Re-reads watch state now and once more after REFRESH_AGAIN_SECONDS, since
+' the player's stop may still be on its way to the server (plan section
+' 4.5, assumption AG-40).
+sub refreshAfterPlayback()
+    m.refreshOnLoad = false
+    if m.playing = invalid then return
+    readAfterPlayback()
+    m.refreshTimer.control = "stop"
+    m.refreshTimer.control = "start"
+end sub
+
+sub onRefreshAgain()
+    if m.playing = invalid then return
+    readAfterPlayback()
+    m.playing = invalid
+end sub
+
+' Reads the active episode's season again for its cards' progress, and the
+' played item's watch state.
+sub readAfterPlayback()
+    if m.series and m.activeIndex >= 0
+        position = positionOf(m.railItems[m.activeIndex].seasonNumber)
+        if position >= 0 then send(episodesRequest(position), { kind: "refresh", season: position })
+    end if
+    loadWatch(m.playing.contentId, true)
+end sub
+
+' An episode this playback finished hands the active place to the next one
+' in play order, played or not, and focus follows (spec section 5.6, D8, as
+' tvOS's SeriesPlaybackReturn chooses): along the rail, which never moves
+' from a regular season into Specials, else the next numbered season's
+' first (findSuccessor). Only the episode still active hands it on, so a
+' later read never pulls back a viewer who has moved along the rail. True
+' when the active episode moved.
+function advanceAfterPlayback(id as String, finished as Boolean) as Boolean
+    if not finished or not m.series then return false
+    at = catalog.series.indexOf(m.railItems, id)
+    if at < 0 or at <> m.activeIndex then return false
+    nextIndex = catalog.series.successor(m.railItems, at)
+    if nextIndex < 0
+        findSuccessor(id, m.railItems[at].seasonNumber)
+        return false
+    end if
+    setActive(nextIndex, true, false)
+    if m.railAttached then m.rail.callFunc("jumpTo", nextIndex, false)
+    if m.rail.isInFocusChain() then readEdges(nextIndex)
+    return true
+end function
+
+' id ends what the rail holds of its season's run: reads the next numbered
+' season's episodes (catalog.series.nextSeason) for its successor. Without
+' a next season the finished episode stays, and Specials never follow it.
+sub findSuccessor(id as String, seasonNumber as Integer)
+    nextIndex = catalog.series.nextSeason(m.seasonRollups, positionOf(seasonNumber))
+    if nextIndex < 0 then return
+    cancelKind("successor")
+    send(episodesRequest(nextIndex), { kind: "successor", season: nextIndex, after: id })
+end sub
+
+' The next season's episodes: the page shows that season with its first
+' episode active, played or not, unless the viewer has moved from the
+' finished episode meanwhile. A season without episodes, or one that fails
+' to load, keeps the finished episode.
+sub onSuccessor(entry as Object, result as Object, content as Dynamic)
+    if result.ok <> true or content = invalid or content.getChildCount() = 0 then return
+    if m.target = invalid or m.target.contentId <> entry.after then return
+    cancelKind("episodes")
+    if m.pages[entry.season] = invalid then keepPage(entry.season, content)
+    m.seasonIndex = entry.season
+    m.seasons.selected = entry.season
+    showPage(entry.season, true, true, false)
+end sub

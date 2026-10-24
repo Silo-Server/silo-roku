@@ -1,0 +1,228 @@
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/util/values.bs"
+
+' The memory policy (plan section 4.7) as pure functions over plain data.
+' AppScene builds one state from the memory facts Main sends at launch
+' (platform.memoryEvent), feeds it each later memory event and each tick of
+' its Timer, and acts on memory.policy.actions(state) when the level changes.
+' No call changes the state it is given; each returns a new one:
+'
+'     { tier, signal, reasons, level, percent, general, timer }
+'
+'     tier     memory.tier, fixed at launch from what the device reports
+'     signal   how pressure is learned (memory.signal), fixed at launch
+'     reasons  why the tier is low: "ui", "graphics", "monitor", "foregroundLimit"
+'     level    the memory.level the app acts on
+'     percent  the latest usage sample, as a percent of the app's limit
+'     general  the latest general memory level: "normal", "low", or "critical"
+'     timer    whether AppScene's Timer should tick every POLL_INTERVAL_MS,
+'              sampling GetMemoryLimitPercent() and pacing the way down
+'
+' The level rises as soon as a sample, warning, or general level calls for
+' more. It falls one level per tick, and only once usage is below
+' RESTORE_PERCENT (without the monitor, once the general level has eased).
+
+' What the app does at each level (memory.policy.actions). Each level keeps
+' the responses of the ones below it.
+namespace memory.level
+    const NORMAL = "normal"
+    ' 80%: drop prefetch and shrink grid retention.
+    const TRIM = "trim"
+    ' 85%, or general "low": hidden screens detach their lists' content.
+    const PRESSURE = "pressure"
+    ' 90% and above, or general "critical": drop cached responses, and every
+    ' screen but the top one.
+    const CRITICAL = "critical"
+end namespace
+
+namespace memory.tier
+    const STANDARD = "standard"
+    ' An HD UI, no OpenGL, no memory monitor, or a small foreground limit:
+    ' smaller budgets throughout.
+    const LOW = "low"
+end namespace
+
+' How pressure reaches the app (plan section 3).
+namespace memory.signal
+    ' Roku OS 15.2+: warnings at 80, 85, 90, and 95%, rising and falling. The
+    ' Timer runs only below 80%, to see usage fall under RESTORE_PERCENT.
+    const THRESHOLDS = "thresholds"
+    ' Roku OS 15.1: one warning at 80%; the Timer polls for the rest while the
+    ' level is above normal.
+    const POLLING = "polling"
+    ' No memory monitor (EnableMemoryWarningEvent(true) returned false):
+    ' roDeviceInfo's general memory level only.
+    const GENERAL = "general"
+end namespace
+
+namespace memory.policy
+    ' Provisional until H17 measures the 512 MB player: a foreground limit
+    ' below 400 MB is the low tier. The dev TV reports 593920 KB.
+    const LOW_TIER_FOREGROUND_KB = 409600
+    const POLL_INTERVAL_MS = 2000
+    const TRIM_PERCENT = 80
+    const PRESSURE_PERCENT = 85
+    const CRITICAL_PERCENT = 90
+    const RESTORE_PERCENT = 75
+    ' Browse and Search grid pages retained (plan section 4.8). The low-tier
+    ' and trimmed values are provisional until H17.
+    const GRID_PAGES = 10
+    const LOW_TIER_GRID_PAGES = 5
+    const TRIMMED_GRID_PAGES = 3
+
+    ' The state at launch, from platform.memoryEvent's facts. Missing or
+    ' unexpected values count against the device: they make the tier low.
+    function create(facts as Object) as Object
+        warnings = util.isTrue(facts.warnings)
+        reasons = []
+        if UCase(util.text(facts.ui)) <> "FHD" then reasons.Push("ui")
+        if LCase(util.text(facts.graphics)) <> "opengl" then reasons.Push("graphics")
+        if not warnings then reasons.Push("monitor")
+        foregroundKb = 0
+        if util.isObject(facts.limits) and util.isNumber(facts.limits.maxForegroundMemory) then foregroundKb = facts.limits.maxForegroundMemory
+        if foregroundKb < LOW_TIER_FOREGROUND_KB then reasons.Push("foregroundLimit")
+
+        state = { tier: memory.tier.STANDARD, signal: memory.signal.POLLING, reasons: reasons, level: memory.level.NORMAL, percent: invalid, general: generalName(facts.general, "normal"), timer: false }
+        if reasons.Count() > 0 then state.tier = memory.tier.LOW
+        if not warnings
+            state.signal = memory.signal.GENERAL
+        else
+            if osAtLeast(facts.os, 15, 2) then state.signal = memory.signal.THRESHOLDS
+            if util.isNumber(facts.percent) then state.percent = facts.percent
+        end if
+        return settle(state, false)
+    end function
+
+    ' A memory warning (platform.memoryWarningEvent). Its usage, read when
+    ' the event arrived, is preferred to the percent the event reports.
+    function onWarning(state as Object, event as Object) as Object
+        nextState = copy(state)
+        sample = event.usage
+        if not util.isNumber(sample) then sample = event.percent
+        if util.isNumber(sample) then nextState.percent = sample
+        return settle(nextState, false)
+    end function
+
+    ' A general memory level event. An unknown level is ignored.
+    function onGeneral(state as Object, name as Dynamic) as Object
+        nextState = copy(state)
+        nextState.general = generalName(name, state.general)
+        return settle(nextState, false)
+    end function
+
+    ' A Timer tick, with GetMemoryLimitPercent() or invalid when it could not
+    ' be read. Without the monitor the sample is ignored.
+    function onTick(state as Object, sample as Dynamic) as Object
+        nextState = copy(state)
+        if state.signal <> memory.signal.GENERAL and util.isNumber(sample) then nextState.percent = sample
+        return settle(nextState, true)
+    end function
+
+    ' What the app does at the state's level:
+    '
+    '     shedPrefetch   ApiTask drops the prefetch lane
+    '     gridPages      pages a Browse or Search grid keeps
+    '     navPressure    the nav.pressure level for hidden screens
+    '     dropResponses  ApiTask drops its cached responses
+    function actions(state as Object) as Object
+        trimmed = rank(state.level) >= rank(memory.level.TRIM)
+        pages = GRID_PAGES
+        if state.tier = memory.tier.LOW then pages = LOW_TIER_GRID_PAGES
+        if trimmed then pages = TRIMMED_GRID_PAGES
+        hidden = nav.pressure.NORMAL
+        if state.level = memory.level.PRESSURE
+            hidden = nav.pressure.DETACH
+        else if state.level = memory.level.CRITICAL
+            hidden = nav.pressure.SHED
+        end if
+        return { level: state.level, tier: state.tier, shedPrefetch: trimmed, gridPages: pages, navPressure: hidden, dropResponses: state.level = memory.level.CRITICAL }
+    end function
+
+    ' Raises the level to what the inputs call for; on a tick, may lower it
+    ' one step toward that. Then decides whether the Timer runs.
+    function settle(state as Object, ticked as Boolean) as Object
+        wanted = target(state)
+        if rank(state.level) < rank(wanted)
+            state.level = wanted
+        else if ticked and rank(state.level) > rank(wanted) and eased(state)
+            state.level = lower(state.level)
+        end if
+        state.timer = needsTimer(state)
+        return state
+    end function
+
+    ' The level the latest usage sample and general level call for.
+    function target(state as Object) as String
+        fromUsage = memory.level.NORMAL
+        sample = state.percent
+        if not util.isNumber(sample)
+            ' No sample yet.
+        else if sample >= CRITICAL_PERCENT
+            fromUsage = memory.level.CRITICAL
+        else if sample >= PRESSURE_PERCENT
+            fromUsage = memory.level.PRESSURE
+        else if sample >= TRIM_PERCENT
+            fromUsage = memory.level.TRIM
+        end if
+        fromGeneral = memory.level.NORMAL
+        if state.general = "critical"
+            fromGeneral = memory.level.CRITICAL
+        else if state.general = "low"
+            fromGeneral = memory.level.PRESSURE
+        end if
+        if rank(fromGeneral) > rank(fromUsage) then return fromGeneral
+        return fromUsage
+    end function
+
+    ' Whether the level may step down: usage is below RESTORE_PERCENT, or,
+    ' without the monitor, always (the general level has its own hysteresis).
+    function eased(state as Object) as Boolean
+        if state.signal = memory.signal.GENERAL then return true
+        return util.isNumber(state.percent) and state.percent < RESTORE_PERCENT
+    end function
+
+    function needsTimer(state as Object) as Boolean
+        if state.level = memory.level.NORMAL then return false
+        if state.signal = memory.signal.GENERAL then return rank(state.level) > rank(target(state))
+        if state.signal = memory.signal.THRESHOLDS and util.isNumber(state.percent)
+            ' Falling and rising warnings cover everything above 80%.
+            return state.percent < TRIM_PERCENT
+        end if
+        return true
+    end function
+
+    function rank(name as String) as Integer
+        if name = memory.level.TRIM then return 1
+        if name = memory.level.PRESSURE then return 2
+        if name = memory.level.CRITICAL then return 3
+        return 0
+    end function
+
+    function lower(name as String) as String
+        if name = memory.level.CRITICAL then return memory.level.PRESSURE
+        if name = memory.level.PRESSURE then return memory.level.TRIM
+        return memory.level.NORMAL
+    end function
+
+    function generalName(value as Dynamic, fallback as String) as String
+        name = LCase(util.text(value))
+        if name = "normal" or name = "low" or name = "critical" then return name
+        return fallback
+    end function
+
+    ' Whether an OS version such as "15.3.4" is at least major.minor. An
+    ' unreadable version is not.
+    function osAtLeast(version as Dynamic, major as Integer, minor as Integer) as Boolean
+        parts = util.text(version).Split(".")
+        if parts.Count() < 2 then return false
+        found = parts[0].ToInt()
+        if found <> major then return found > major
+        return parts[1].ToInt() >= minor
+    end function
+
+    function copy(state as Object) as Object
+        copied = {}
+        copied.Append(state)
+        return copied
+    end function
+end namespace

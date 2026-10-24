@@ -1,0 +1,187 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/util/values.bs"
+
+' Server setup (spec section 7.1). A typed address becomes a base URL, and the
+' unauthenticated GET /api/v2/system/info must report api_major 2 before
+' sign-in is offered, and the origin the request reached, which must be the
+' configured one before any credential goes there. Pure.
+namespace api.auth.server
+    const INFO_PATH = "/api/v2/system/info"
+    const SETUP_PATH = "/api/v2/system/setup"
+    const PROVIDERS_PATH = "/api/v2/auth/providers"
+    const API_MAJOR = 2
+    ' The SystemInfo member with the origin the server saw the request reach,
+    ' "scheme://host[:port]". Roku follows redirects without telling the app
+    ' and re-sends a login body on a 307 (assumption A-14,
+    ' docs/hardware-evidence.md H1), so this is how a redirected or proxied
+    ' check shows.
+    const ORIGIN_MEMBER = "request_origin"
+
+    ' A typed server address as { url, error, canTryHttp }. url is the base URL
+    ' (api.request.baseUrl) or invalid; error is invalid or one of
+    '   invalid_address         not a usable http(s) address
+    '   unsupported_scheme      a scheme other than http or https
+    '   credentials_in_address  user:password@ in the address
+    '   needs_http_confirmation an http:// address the viewer has not yet
+    '                           confirmed ("Connect without encryption?")
+    ' An address without a scheme is tried over HTTPS; canTryHttp then says the
+    ' screen may offer HTTP if that fails, and allowHttp, set once the viewer
+    ' confirms, gives the http:// URL. An https:// address is never downgraded.
+    function normalize(text as Dynamic, allowHttp as Boolean) as Object
+        if not util.isString(text) then return invalidAddress("invalid_address")
+        s = text.Trim()
+        sep = Instr(1, s, "://")
+        canTryHttp = false
+        if sep = 0
+            scheme = "https"
+            if allowHttp then scheme = "http"
+            canTryHttp = not allowHttp
+            s = scheme + "://" + s
+            sep = Len(scheme) + 1
+        else
+            scheme = LCase(Left(s, sep - 1))
+            if scheme <> "http" and scheme <> "https" then return invalidAddress("unsupported_scheme")
+            if scheme = "http" and not allowHttp then return invalidAddress("needs_http_confirmation")
+        end if
+        authority = Mid(s, sep + 3)
+        for each mark in ["/", "?", "#"]
+            cut = Instr(1, authority, mark)
+            if cut > 0 then authority = Left(authority, cut - 1)
+        end for
+        if Instr(1, authority, "@") > 0 then return invalidAddress("credentials_in_address")
+        url = api.request.baseUrl(s)
+        if url = invalid or not isAuthority(authority) then return invalidAddress("invalid_address")
+        return { url: url, error: invalid, canTryHttp: canTryHttp }
+    end function
+
+    ' The system/info answer for the base URL configured, as { ok, error,
+    ' warning }. error is one of
+    '   server_update_required  any answer but api_major 2, a v1-only server's
+    '                           404 included
+    '   unreachable             no HTTP answer (network, timeout)
+    '   cancelled               the check was cancelled
+    '   origin_unconfirmed      no request_origin: a server too old to confirm
+    '                           where the request arrived, so credentials must
+    '                           not be sent
+    '   origin_mismatch         request_origin is another origin than the
+    '                           configured one, or not an origin at all: the
+    '                           request was redirected or proxied elsewhere
+    ' allowUnconfirmed (debug builds) accepts an answer without request_origin,
+    ' with warning "origin_unconfirmed"; a mismatch is refused in every build.
+    function checkInfo(result as Object, configured as String, allowUnconfirmed = false as Boolean) as Object
+        if result.ok <> true
+            if result.status <> 0 then return checkFailed("server_update_required")
+            if result.error <> invalid and result.error.kind = "cancelled" then return checkFailed("cancelled")
+            return checkFailed("unreachable")
+        end if
+        info = result.body
+        if not util.isObject(info) or not api.request.isInteger(info.api_major) then return checkFailed("server_update_required")
+        if info.api_major <> API_MAJOR then return checkFailed("server_update_required")
+        reported = info[ORIGIN_MEMBER]
+        if reported = invalid or (util.isString(reported) and reported = "")
+            if not allowUnconfirmed then return checkFailed("origin_unconfirmed")
+            return { ok: true, error: invalid, warning: "origin_unconfirmed" }
+        end if
+        expected = canonicalOrigin(api.request.originOf(configured))
+        actual = canonicalOrigin(reported)
+        if expected = invalid or actual = invalid or actual <> expected then return checkFailed("origin_mismatch")
+        return { ok: true, error: invalid, warning: invalid }
+    end function
+
+    ' "scheme://host[:port]" with the scheme and host lowercased, the port as
+    ' a number, and a default port removed, or invalid for anything else: a
+    ' scheme other than http or https, credentials, a path other than "/", a
+    ' query, a fragment, or an authority that is not host[:port]. Both the
+    ' configured origin and request_origin go through it before they are
+    ' compared.
+    function canonicalOrigin(value as Dynamic) as Dynamic
+        if not api.request.isHttpUrl(value) then return invalid
+        sep = Instr(1, value, "://")
+        scheme = LCase(Left(value, sep - 1))
+        authority = LCase(Mid(value, sep + 3))
+        if Right(authority, 1) = "/" then authority = Left(authority, Len(authority) - 1)
+        for each mark in ["/", "?", "#", "@"]
+            if Instr(1, authority, mark) > 0 then return invalid
+        end for
+        if not isAuthority(authority) then return invalid
+        host = authority
+        port = ""
+        colon = Instr(1, authority, ":")
+        if Left(authority, 1) = "["
+            bracket = Instr(1, authority, "]")
+            host = Left(authority, bracket)
+            if bracket < Len(authority) then port = Mid(authority, bracket + 2)
+        else if colon > 0
+            host = Left(authority, colon - 1)
+            port = Mid(authority, colon + 1)
+        end if
+        if port <> "" then port = port.ToInt().ToStr()
+        if (scheme = "http" and port = "80") or (scheme = "https" and port = "443") then port = ""
+        if port = "" then return scheme + "://" + host
+        return scheme + "://" + host + ":" + port
+    end function
+
+    function checkFailed(kind as String) as Object
+        return { ok: false, error: kind, warning: invalid }
+    end function
+
+    ' GET /api/v2/auth/providers: whether a username and password sign-in is
+    ' offered (spec section 7.2 step 1), or invalid for any other body. When
+    ' false the screen explains that the administrator must enable password
+    ' sign-in, and stops.
+    function passwordLogin(body as Dynamic) as Dynamic
+        if not util.isObject(body) or not util.isBoolean(body.password_login) then return invalid
+        return body.password_login
+    end function
+
+    ' GET /api/v2/system/setup: whether the server still needs its first
+    ' administrator (needs_setup), which the client leaves to the server's
+    ' own setup (spec sections 3.4 and 7.2).
+    function needsSetup(body as Dynamic) as Boolean
+        return util.isObject(body) and util.isTrue(body.needs_setup)
+    end function
+
+    function invalidAddress(kind as String) as Object
+        return { url: invalid, error: kind, canTryHttp: false }
+    end function
+
+    ' host[:port]: a DNS name or IPv4 address of letters, digits, ".", "-",
+    ' and "_", or a bracketed IPv6 literal, then an optional port 1 to 65535.
+    function isAuthority(authority as String) as Boolean
+        host = authority
+        port = ""
+        if Left(host, 1) = "["
+            bracket = Instr(1, host, "]")
+            if bracket < 3 then return false
+            rest = Mid(host, bracket + 1)
+            host = Mid(host, 2, bracket - 2)
+            if rest <> ""
+                if Left(rest, 1) <> ":" then return false
+                port = Mid(rest, 2)
+                if port = "" then return false
+            end if
+            for i = 1 to Len(host)
+                c = LCase(Mid(host, i, 1))
+                if Instr(1, "0123456789abcdef:.%", c) = 0 then return false
+            end for
+        else
+            colon = Instr(1, host, ":")
+            if colon > 0
+                port = Mid(host, colon + 1)
+                host = Left(host, colon - 1)
+                if port = "" then return false
+            end if
+            if host = "" then return false
+            for i = 1 to Len(host)
+                c = LCase(Mid(host, i, 1))
+                if Instr(1, "abcdefghijklmnopqrstuvwxyz0123456789.-_", c) = 0 then return false
+            end for
+        end if
+        if port = "" then return true
+        if Len(port) > 5 then return false
+        for i = 1 to Len(port)
+            if Instr(1, "0123456789", Mid(port, i, 1)) = 0 then return false
+        end for
+        return port.ToInt() >= 1 and port.ToInt() <= 65535
+    end function
+end namespace

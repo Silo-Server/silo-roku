@@ -1,0 +1,159 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/catalog/requests.bs"
+
+' The episode after the playing one (spec section 9.8), resolved as Android
+' TV's player does (NextEpisodeResolver, TvPlayerViewModel.resolveNextEpisode)
+' when playback starts. The next episode is the smallest (season, episode)
+' after the current one among the current season's episodes and the next
+' regular season's; the current episode need not be listed. A failed
+' current-season read means no next episode. The next regular season is the
+' lowest-numbered season above the current one, never the specials (season 0
+' is never above a current season); a failed or empty read of it, or of the
+' season list, only means no rollover, and later seasons are never tried.
+' Android TV reads all three lists; this reads the season list and the next
+' season only when the current season has nothing after the episode, which
+' gives the same answer.
+'
+' A request plan, pure but for reading the answers' nodes. The requests are
+' catalog.request.episodes and catalog.request.seasons, so ApiTask's map
+' step answers each with a RowContent of CardContent cards (episode cards
+' carry the still, "S1 · E2", title, and audio guide text UpNextPanel shows).
+' The player sends what start and answer return with api.send and passes
+' each answer back with its stage:
+'
+'     m.next = playback.nextEpisode.create(playback.nextEpisode.currentFromWatch(watchBody, libraryId))
+'     for each item in playback.nextEpisode.start(m.next)
+'         m.nextStages[api.send(item.request, handle)] = item.stage
+'     end for
+'     ' On each answer, with its handle's stage:
+'     follow = playback.nextEpisode.answer(m.next, stage, result.ok = true, handle.content)
+'     ' Send follow the same way; once settled(m.next), episode(m.next) is the
+'     ' episode for playback.upNext's { type: "next" } event, or invalid.
+namespace playback.nextEpisode
+    ' Request stages.
+    const SEASON = "season"
+    const SEASONS = "seasons"
+    const NEXT_SEASON = "nextSeason"
+
+    ' The playing episode from its watch projection (GET /api/v2/watch/{id}):
+    ' { itemId, seriesId, seasonNumber, episodeNumber, libraryId }, or invalid
+    ' for anything but an episode with a series and both numbers.
+    function currentFromWatch(detail as Dynamic, libraryId = "" as String) as Dynamic
+        if not util.isObject(detail) or util.text(detail.type) <> "episode" then return invalid
+        seriesId = util.text(detail.series_id)
+        if seriesId = "" or util.text(detail.content_id) = "" or not util.isNumber(detail.season_number) or not util.isNumber(detail.episode_number) then return invalid
+        return { itemId: detail.content_id, seriesId: seriesId, seasonNumber: Int(detail.season_number), episodeNumber: Int(detail.episode_number), libraryId: libraryId }
+    end function
+
+    ' A resolution for current (currentFromWatch); invalid current settles at
+    ' once with no next episode. phase is "pending", "found", or "none".
+    function create(current as Dynamic) as Object
+        state = { current: current, phase: "pending", found: invalid, nextSeason: invalid }
+        if not util.isObject(current) then state.phase = "none"
+        return state
+    end function
+
+    ' The first request: the current season's episodes. [] once settled.
+    function start(state as Object) as Object
+        if state.phase <> "pending" then return []
+        c = state.current
+        return [plan(SEASON, catalog.request.episodes(c.seriesId, c.seasonNumber, c.libraryId))]
+    end function
+
+    ' One answer: ok is the result's ok, content its RowContent (the
+    ' handle's content; invalid when it failed). Returns the next requests,
+    ' [] when there are none.
+    function answer(state as Object, stage as String, ok as Boolean, content as Dynamic) as Object
+        if state.phase <> "pending" then return []
+        c = state.current
+        if stage = SEASON
+            if not ok then return settle(state, invalid)
+            later = after(entries(content), c.seasonNumber, c.episodeNumber)
+            if later <> invalid then return settle(state, later)
+            return [plan(SEASONS, catalog.request.seasons(c.seriesId, c.libraryId))]
+        else if stage = SEASONS
+            if not ok then return settle(state, invalid)
+            number = nextSeasonNumber(content, c.seasonNumber)
+            if number = invalid then return settle(state, invalid)
+            state.nextSeason = number
+            return [plan(NEXT_SEASON, catalog.request.episodes(c.seriesId, number, c.libraryId))]
+        else if stage = NEXT_SEASON
+            if not ok then return settle(state, invalid)
+            return settle(state, after(entries(content), c.seasonNumber, c.episodeNumber))
+        end if
+        return []
+    end function
+
+    function settled(state as Object) as Boolean
+        return state.phase <> "pending"
+    end function
+
+    ' { itemId, seasonNumber, episodeNumber, card }, or invalid while pending
+    ' or with none. card is the episode's CardContent, for UpNextPanel's
+    ' content.
+    function episode(state as Object) as Dynamic
+        return state.found
+    end function
+
+    ' --- Pure resolution ----------------------------------------------------------
+
+    ' Android TV's NextEpisodeResolver: the smallest (season, episode) after
+    ' (seasonNumber, episodeNumber), the first listed on a tie, or invalid.
+    function after(candidates as Object, seasonNumber as Integer, episodeNumber as Integer) as Dynamic
+        best = invalid
+        for each candidate in candidates
+            later = candidate.seasonNumber > seasonNumber or (candidate.seasonNumber = seasonNumber and candidate.episodeNumber > episodeNumber)
+            if later and (best = invalid or earlier(candidate, best)) then best = candidate
+        end for
+        return best
+    end function
+
+    function earlier(a as Object, b as Object) as Boolean
+        if a.seasonNumber <> b.seasonNumber then return a.seasonNumber < b.seasonNumber
+        return a.episodeNumber < b.episodeNumber
+    end function
+
+    ' The lowest regular season above seasonNumber in a season list, or invalid.
+    function nextSeasonNumber(content as Dynamic, seasonNumber as Integer) as Dynamic
+        best = invalid
+        for each card in children(content)
+            number = whole(card.seasonNumber)
+            if number > 0 and number > seasonNumber and (best = invalid or number < best) then best = number
+        end for
+        return best
+    end function
+
+    ' An episode list's cards as { itemId, seasonNumber, episodeNumber, card },
+    ' skipping cards without an ID. A card without a number has -1
+    ' (catalog.cards.whole), so it is never after a real episode.
+    function entries(content as Dynamic) as Object
+        out = []
+        for each card in children(content)
+            if card.id <> "" then out.Push({ itemId: card.id, seasonNumber: whole(card.seasonNumber), episodeNumber: whole(card.episodeNum), card: card })
+        end for
+        return out
+    end function
+
+    ' A card's number as an Integer, or -1 when it has none.
+    function whole(value as Dynamic) as Integer
+        if util.isNumber(value) then return Int(value)
+        if util.isString(value) and value <> "" then return Int(Val(value))
+        return -1
+    end function
+
+    function children(content as Dynamic) as Object
+        if type(content) <> "roSGNode" then return []
+        return content.getChildren(-1, 0)
+    end function
+
+    function settle(state as Object, chosen as Dynamic) as Object
+        state.found = chosen
+        state.phase = "none"
+        if chosen <> invalid then state.phase = "found"
+        return []
+    end function
+
+    function plan(stage as String, request as Object) as Object
+        return { stage: stage, request: request }
+    end function
+end namespace

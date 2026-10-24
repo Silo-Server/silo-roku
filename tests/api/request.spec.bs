@@ -1,0 +1,185 @@
+namespace tests
+
+    @suite("api request")
+    class ApiRequestTests extends rooibos.BaseTestSuite
+
+        @describe("normalize")
+
+        @it("fills in defaults without changing the input")
+        sub _()
+            input = { requestId: "r1", path: "/api/v2/system/info" }
+            request = api.request.normalize(input)
+            m.assertEqual(request, { requestId: "r1", path: "/api/v2/system/info", method: "GET", lane: "interactive", owner: "", auth: "none", timeoutMs: 15000, query: {}, headers: {}, responseHeaders: [] })
+            m.assertEqual(input, { requestId: "r1", path: "/api/v2/system/info" })
+        end sub
+
+        @it("keeps the caller's choices and lowercases response header names")
+        sub _()
+            request = api.request.normalize({ requestId: "r2", method: "delete", path: "/api/v2/me/favorites/x", lane: "prefetch", owner: "home", auth: "profile", timeoutMs: 4000, responseHeaders: ["ETag", "Retry-After", 3] })
+            m.assertEqual(request.method, "DELETE")
+            m.assertEqual(request.lane, "prefetch")
+            m.assertEqual(request.owner, "home")
+            m.assertEqual(request.auth, "profile")
+            m.assertEqual(request.timeoutMs, 4000)
+            m.assertEqual(request.responseHeaders, ["etag", "retry-after"])
+        end sub
+
+        @it("clamps the timeout")
+        sub _()
+            m.assertEqual(api.request.normalize({ requestId: "r", path: "/x", timeoutMs: 10 }).timeoutMs, 1000)
+            m.assertEqual(api.request.normalize({ requestId: "r", path: "/x", timeoutMs: 999999 }).timeoutMs, 120000)
+        end sub
+
+        @it("prefers an absolute url over a path")
+        sub _()
+            request = api.request.normalize({ requestId: "r", url: "https://silo.example/api/v2/catalog?cursor=abc", path: "/ignored" })
+            m.assertFalse(request.DoesExist("path"))
+            m.assertEqual(request.url, "https://silo.example/api/v2/catalog?cursor=abc")
+        end sub
+
+        @it("refuses requests that cannot be sent")
+        sub _()
+            m.assertInvalid(api.request.normalize({ path: "/x" }))
+            m.assertInvalid(api.request.normalize({ requestId: "", path: "/x" }))
+            m.assertInvalid(api.request.normalize({ requestId: "r", path: "api/v2/x" }))
+            m.assertInvalid(api.request.normalize({ requestId: "r", path: "//evil.example/x" }))
+            m.assertInvalid(api.request.normalize({ requestId: "r" }))
+            m.assertInvalid(api.request.normalize({ requestId: "r", url: "ftp://silo.example/x" }))
+            m.assertInvalid(api.request.normalize({ requestId: "r", path: "/x", method: "HEAD" }))
+            m.assertInvalid(api.request.normalize({ requestId: "r", path: "/x", lane: "bulk" }))
+            m.assertInvalid(api.request.normalize({ requestId: "r", path: "/x", auth: "admin" }))
+            m.assertInvalid(api.request.normalize("GET /x"))
+        end sub
+
+        @describe("url and escape")
+
+        @it("joins the base URL, path, and query")
+        sub _()
+            request = api.request.normalize({ requestId: "r", path: "/api/v2/catalog", query: { include_watched: false, limit: 40, scope: "home", skip: invalid } })
+            m.assertEqual(api.request.url("https://silo.example/silo", request), "https://silo.example/silo/api/v2/catalog?include_watched=false&limit=40&scope=home")
+        end sub
+
+        @it("repeats array values and escapes names and values")
+        sub _()
+            request = api.request.normalize({ requestId: "r", path: "/api/v2/search?type=movie", query: { "genre": ["drama", "sci fi"], "q": "Amélie & co/2" } })
+            m.assertEqual(api.request.url("http://10.0.0.5:8096", request), "http://10.0.0.5:8096/api/v2/search?type=movie&genre=drama&genre=sci%20fi&q=Am%C3%A9lie%20%26%20co%2F2")
+        end sub
+
+        @it("uses an absolute url as it is and needs a base for a path")
+        sub _()
+            m.assertEqual(api.request.url("", api.request.normalize({ requestId: "r", url: "https://silo.example/api/v2/next?cursor=a%2Bb" })), "https://silo.example/api/v2/next?cursor=a%2Bb")
+            m.assertInvalid(api.request.url("", api.request.normalize({ requestId: "r", path: "/api/v2/system/info" })))
+        end sub
+
+        @it("keeps only unreserved characters")
+        sub _()
+            m.assertEqual(api.request.escape("AZaz09-._~"), "AZaz09-._~")
+            m.assertEqual(api.request.escape("a b+c=d?e#f"), "a%20b%2Bc%3Dd%3Fe%23f")
+            m.assertEqual(api.request.escape("日本"), "%E6%97%A5%E6%9C%AC")
+            m.assertEqual(api.request.escape(""), "")
+        end sub
+
+        @describe("headers and body")
+
+        @it("refuses credential and identity headers from the caller, in any case")
+        sub _()
+            for each name in ["Authorization", "authorization", "Proxy-Authorization", "Cookie", "X-Profile-Id", "x-profile-token", " X-Profile-Token ", "X-Silo-Device-Id", "x-silo-client"]
+                headers = {}
+                headers[name] = "spoofed"
+                m.assertInvalid(api.request.normalize({ requestId: "r", path: "/api/v2/x", headers: headers }), name)
+                m.assertInvalid(api.request.normalize({ requestId: "r", url: "https://elsewhere.example/x", auth: "none", headers: headers }), name + " elsewhere")
+            end for
+            m.assertNotInvalid(api.request.normalize({ requestId: "r", path: "/api/v2/x", headers: { "If-None-Match": "v1", "X-Silo": "not the prefix" } }))
+        end sub
+
+        @it("sends Accept, Content-Type with a body, the caller's headers, then credentials")
+        sub _()
+            request = api.request.normalize({ requestId: "r", method: "POST", path: "/api/v2/x", body: { a: 1 }, headers: { "If-None-Match": """v1""" } })
+            headers = api.request.headers(request, { "Authorization": "Bearer t" })
+            m.assertEqual(headers["Accept"], "application/json")
+            m.assertEqual(headers["Content-Type"], "application/json")
+            m.assertEqual(headers["If-None-Match"], """v1""")
+            m.assertEqual(headers["Authorization"], "Bearer t")
+            m.assertEqual(api.request.bodyText(request), `{"a":1}`)
+        end sub
+
+        @it("receives every response into a file but keeps secret bodies in memory")
+        sub _()
+            get = api.request.normalize({ requestId: "r", path: "/api/v2/home" })
+            post = api.request.normalize({ requestId: "r", method: "POST", path: "/api/v2/auth/login", body: { password: "pw" } })
+            delete = api.request.normalize({ requestId: "r", method: "DELETE", path: "/api/v2/me/favorites/x" })
+            m.assertEqual(api.request.transport(get, false), "file")
+            m.assertEqual(api.request.transport(get, true), "file", "a GET has no body")
+            m.assertEqual(api.request.transport(post, false), "upload")
+            m.assertEqual(api.request.transport(delete, false), "upload")
+            m.assertEqual(api.request.transport(post, true), "memory")
+        end sub
+
+        @it("sends no body or Content-Type without one")
+        sub _()
+            request = api.request.normalize({ requestId: "r", method: "DELETE", path: "/api/v2/x" })
+            m.assertFalse(api.request.headers(request, {}).DoesExist("Content-Type"))
+            m.assertEqual(api.request.bodyText(request), "")
+        end sub
+
+        @it("sends stored body text byte for byte, never re-serialized")
+        sub _()
+            text = `{"position":1800.125,"b":[1, 2],"a":"x"}`
+            request = api.request.normalize({ requestId: "r", method: "POST", path: "/api/v2/playback/start", bodyText: text, body: { other: true } })
+            m.assertEqual(api.request.bodyText(request), text)
+            m.assertEqual(api.request.headers(request, {})["Content-Type"], "application/json")
+            m.assertEqual(api.request.transport(request, false), "upload")
+            m.assertInvalid(api.request.normalize({ requestId: "r", method: "POST", path: "/api/v2/x", bodyText: { a: 1 } }), "text only")
+        end sub
+
+        @it("saves a download to a kept file named by its extension")
+        sub _()
+            request = api.request.normalize({ requestId: "r", url: "https://silo.example/api/v2/stream/s/subtitles/0.srt", download: "srt" })
+            m.assertEqual(api.request.transport(request, false), "download")
+            for each bad in ["", "SRT", "../x", "toolong", 3]
+                m.assertInvalid(api.request.normalize({ requestId: "r", path: "/api/v2/x", download: bad }), util.text(bad))
+            end for
+            m.assertInvalid(api.request.normalize({ requestId: "r", method: "POST", path: "/api/v2/x", download: "srt" }), "GET only")
+        end sub
+
+        @it("lets a transfer stall for 30 s, or for a longer allowance")
+        sub _()
+            m.assertEqual(api.request.stallSeconds(api.request.normalize({ requestId: "r", path: "/api/v2/x" })), 30)
+            m.assertEqual(api.request.stallSeconds(api.request.normalize({ requestId: "r", path: "/api/v2/x", timeoutMs: 120000, download: "vtt" })), 120, "a sidecar still being extracted")
+            m.assertEqual(api.request.stallSeconds(api.request.normalize({ requestId: "r", method: "POST", path: "/api/v2/auth/refresh", timeoutMs: 15000, rotatesCredentials: true })), api.scheduler.ROTATING_CAP_MS \ 1000)
+        end sub
+
+        @describe("baseUrl and origins")
+
+        @it("normalizes a typed server address")
+        sub _()
+            m.assertEqual(api.request.baseUrl(" HTTPS://Silo.Example:443/ "), "https://silo.example")
+            m.assertEqual(api.request.baseUrl("http://192.168.1.20:8096//"), "http://192.168.1.20:8096")
+            m.assertEqual(api.request.baseUrl("http://silo.example:80/Media/"), "http://silo.example/Media")
+            m.assertEqual(api.request.baseUrl("https://[fd00::1]:8443"), "https://[fd00::1]:8443")
+        end sub
+
+        @it("refuses other schemes, credentials, queries, and fragments")
+        sub _()
+            m.assertInvalid(api.request.baseUrl("silo.example"))
+            m.assertInvalid(api.request.baseUrl("ftp://silo.example"))
+            m.assertInvalid(api.request.baseUrl("https://user:pass@silo.example"))
+            m.assertInvalid(api.request.baseUrl("https://silo.example/?a=1"))
+            m.assertInvalid(api.request.baseUrl("https://silo.example/#x"))
+            m.assertInvalid(api.request.baseUrl("https://"))
+            m.assertInvalid(api.request.baseUrl(invalid))
+        end sub
+
+        @it("compares origins by scheme, host, and port")
+        sub _()
+            m.assertTrue(api.request.isSameOrigin("https://silo.example:443/api/v2/x", "https://silo.example/silo"))
+            m.assertFalse(api.request.isSameOrigin("http://silo.example/api/v2/x", "https://silo.example"))
+            m.assertFalse(api.request.isSameOrigin("https://proxy.example/api/v2/x", "https://silo.example"))
+            m.assertFalse(api.request.isSameOrigin("https://silo.example:8443/x", "https://silo.example"))
+            m.assertFalse(api.request.isSameOrigin("https://silo.example@evil.example/x", "https://silo.example"))
+            m.assertFalse(api.request.isSameOrigin("https://silo.example/x", ""))
+        end sub
+
+    end class
+
+end namespace

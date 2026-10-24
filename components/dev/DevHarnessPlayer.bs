@@ -1,0 +1,336 @@
+' Development-only transport harness player. Executes server-issued plans as
+' they are: the ContentNode comes from the harness Task, which decides headers
+' by origin. This component shows and logs only non-secret facts: Video state
+' changes, seeks, and redacted Video errors go to the console.
+'
+' Keys: OK/Play pause or resume; Left/Right seek 30 s; Rewind/Fast Forward seek
+' 5 minutes; Up shows or hides stats; Down cycles subtitles (off, native URL,
+' tmp:/ copy); Back stops the session and returns to the harness menu. A Video
+' error stays on screen until Back.
+
+const LOG_TAG = "harness.player"
+const SUBTITLE_CHOICES = 3
+
+sub init()
+    m.video = m.top.findNode("video")
+    ' The Video node's own agent, set before any content, keeps HttpHeaders off
+    ' the global agent that Posters share.
+    agent = CreateObject("roHttpAgent")
+    agent.SetCertificatesFile("common:/certs/ca-bundle.crt")
+    m.video.setHttpAgent(agent)
+    m.video.asyncStopSemantics = true
+    m.video.observeField("state", "onVideoState")
+    m.video.observeField("position", "onVideoPosition")
+
+    m.overlay = m.top.findNode("overlay")
+    m.stats = m.top.findNode("stats")
+    m.errorPanel = m.top.findNode("errorPanel")
+    m.errorDetail = m.top.findNode("errorDetail")
+    m.notice = m.top.findNode("notice")
+    m.progressTimer = m.top.findNode("progressTimer")
+    m.progressTimer.observeField("fire", "onProgressTimer")
+    m.statsTimer = m.top.findNode("statsTimer")
+    m.statsTimer.observeField("fire", "updateStats")
+    m.deviceInfo = CreateObject("roDeviceInfo")
+    m.captionModeBefore = m.video.globalCaptionMode
+end sub
+
+' A playable start: the response facts, with the ContentNode on task.content.
+sub onLoad()
+    m.plan = invalid
+    m.pending = invalid
+    m.exiting = false
+    m.contentFailed = false
+    m.recovered = false
+    m.replanInFlight = false
+    m.replanPosition = 0
+    m.queuedSeek = invalid
+    m.replans = 0
+    m.subtitleChoice = 0
+    m.lastAction = "start"
+    m.progressText = "none yet"
+    m.errors = 0
+    m.errorText = "none"
+    m.top.lastError = ""
+    m.errorPanel.visible = false
+    m.notice.text = ""
+    adoptPlan(m.top.load)
+    m.progressTimer.control = "start"
+    m.statsTimer.control = "start"
+    m.top.setFocus(true)
+end sub
+
+' Plays a new plan from a clean node: a playing node is stopped first and the
+' content is assigned once it reports "stopped"; from error it is assigned directly.
+sub adoptPlan(response as Object)
+    m.plan = response
+    m.content = m.top.task.content
+    m.sourcePosition = harness.sourcePosition(response.timeline, harness.numberOr(response.timeline.player_start_seconds, 0))
+    state = m.video.state
+    if state = "none" or state = "stopped" or state = "error" or state = "finished"
+        play(m.content)
+    else
+        m.pending = m.content
+        m.video.control = "stop"
+    end if
+end sub
+
+sub play(content as Object)
+    m.pending = invalid
+    m.contentFailed = false
+    m.video.content = content
+    applySubtitleChoice()
+    m.video.control = "play"
+end sub
+
+sub onVideoState()
+    state = m.video.state
+    log.info(LOG_TAG, "Video " + state, { position: m.video.position, source: m.sourcePosition })
+    if state = "stopped" and m.pending <> invalid and not m.exiting
+        play(m.pending)
+    else if state = "error"
+        onVideoError()
+    else if state = "finished"
+        ' The node can report finished right after an error; only content
+        ' that played without one has reached its end.
+        if not m.contentFailed and not m.replanInFlight then exitPlayer()
+    else if state = "playing" or state = "paused"
+        applyQueuedSeek()
+    end if
+    updateStats()
+end sub
+
+sub onVideoPosition()
+    state = m.video.state
+    if m.plan <> invalid and (state = "playing" or state = "paused")
+        m.sourcePosition = harness.sourcePosition(m.plan.timeline, m.video.position)
+    end if
+end sub
+
+' One failure_recovery replan per playback. Every error is logged and shown
+' with the node's own fields until Back, including errors after recovery.
+sub onVideoError()
+    m.contentFailed = true
+    m.errors = m.errors + 1
+    info = m.video.errorInfo
+    report = harness.videoError(m.video.errorCode, m.video.errorMsg, m.video.errorStr, info)
+    category = ""
+    if type(info) = "roAssociativeArray" then category = harness.stringOr(info.category, "") + " " + harness.stringOr(info.source, "")
+    m.errorText = report.error.ToStr() + " " + category.Trim()
+    m.top.lastError = m.errorText
+    log.warn(LOG_TAG, "Video error", report)
+    if m.exiting then return
+    if m.replanInFlight
+        nextStep = "a replan is already in flight"
+    else if m.recovered
+        nextStep = "recovery already used; not retrying"
+        m.notice.text = "Playback failed again after recovery. Back returns to the menu."
+    else
+        nextStep = "requesting failure_recovery"
+    end if
+    showVideoError(report, nextStep)
+    if m.replanInFlight or m.recovered then return
+    m.recovered = true
+    requestReplan("failure_recovery", m.sourcePosition, report.error)
+end sub
+
+' Fills the error panel, which stays visible until Back.
+sub showVideoError(report as Object, nextStep as String)
+    lines = ["Video error " + m.errors.ToStr() + " at source " + harness.formatDecimal(m.sourcePosition) + " (" + nextStep + ")"]
+    lines.Append(harness.videoErrorLines(report))
+    lines.Push("Back stops the session and returns to the menu.")
+    m.errorDetail.text = lines.Join(Chr(10))
+    m.errorPanel.visible = true
+end sub
+
+sub requestReplan(operation as String, position as Float, errorCode as Integer)
+    m.replanInFlight = true
+    m.replanOperation = operation
+    m.replanPosition = position
+    m.lastAction = operation + " requested"
+    m.notice.text = "Replanning (" + operation + ")…"
+    m.top.task.request = { op: "replan", owner: "player", operation: operation, position: position, errorCode: errorCode }
+end sub
+
+sub onTaskResponse()
+    response = m.top.taskResponse
+    if response.op = "replan"
+        m.replanInFlight = false
+        if util.isTrue(response.playable)
+            m.replans = m.replans + 1
+            m.lastAction = m.replanOperation + " adopted"
+            m.notice.text = ""
+            adoptPlan(response)
+        else if util.isTrue(response.ok) and response.facts <> invalid
+            m.notice.text = "Terminal: " + harness.stringOr(response.facts.terminalReason, "") + " " + harness.stringOr(response.facts.terminalMessage, "")
+        else
+            m.notice.text = harness.stringOr(response.message, "Replan failed")
+        end if
+        applyQueuedSeek()
+    else if response.op = "progress"
+        if util.isTrue(response.ok)
+            m.progressText = "sequence " + response.sequence.ToStr() + " " + response.outcome
+        else
+            m.progressText = harness.stringOr(response.message, "failed")
+        end if
+    else if response.op = "stop" and m.exiting
+        m.statsTimer.control = "stop"
+        m.top.finished = true
+    end if
+    updateStats()
+end sub
+
+sub onProgressTimer()
+    state = m.video.state
+    if m.exiting or m.replanInFlight or m.plan = invalid then return
+    if state = "playing" or state = "paused" or state = "buffering"
+        m.top.task.request = { op: "progress", owner: "player", position: m.sourcePosition, isPaused: state = "paused" }
+    end if
+end sub
+
+' Seeks locally when the plan's timeline covers the target; otherwise asks
+' the server to reanchor (copy remuxes always do). While a replan is in
+' flight, or a queued seek still waits, the newest target replaces the queued
+' one, counted from it or from the in-flight reanchor's position.
+sub seekBy(delta as Float)
+    if m.plan = invalid or m.exiting then return
+    pending = m.queuedSeek
+    if pending = invalid and m.replanInFlight and m.replanOperation = "seek_reanchor" then pending = m.replanPosition
+    target = harness.seekTarget(m.sourcePosition, pending, delta, harness.numberOr(m.plan.facts.durationSeconds, 0))
+    if m.replanInFlight or m.queuedSeek <> invalid
+        m.queuedSeek = target
+        m.lastAction = "seek to " + harness.formatDecimal(target) + " queued"
+        log.info(LOG_TAG, "seek queued behind the replan", { target: target })
+        return
+    end if
+    seekTo(target)
+end sub
+
+sub seekTo(target as Float)
+    decision = harness.seekDecision(m.plan.timeline, target)
+    if decision.kind = "local"
+        m.lastAction = "local seek"
+        log.info(LOG_TAG, "local seek", { target: target, player: decision.playerPosition })
+        m.video.seek = decision.playerPosition
+    else
+        requestReplan("seek_reanchor", decision.sourcePosition, 0)
+    end if
+end sub
+
+' Applies the queued seek once the replan has settled and the plan it left
+' playing (a new one, or the old one after a refusal) is playing or paused.
+sub applyQueuedSeek()
+    if m.queuedSeek = invalid or m.replanInFlight or m.pending <> invalid or m.exiting then return
+    state = m.video.state
+    if state <> "playing" and state <> "paused" then return
+    target = m.queuedSeek
+    m.queuedSeek = invalid
+    log.info(LOG_TAG, "applying the queued seek", { target: target })
+    seekTo(target)
+end sub
+
+sub cycleSubtitles()
+    m.subtitleChoice = (m.subtitleChoice + 1) mod SUBTITLE_CHOICES
+    applySubtitleChoice()
+    log.info(LOG_TAG, "subtitles " + subtitleChoiceName(), { source: m.sourcePosition })
+end sub
+
+function subtitleChoiceName() as String
+    names = ["off", "native URL", "tmp copy"]
+    return names[m.subtitleChoice]
+end function
+
+' 0 is off, 1 the native URL track, 2 the tmp:/ copy (when it downloaded).
+sub applySubtitleChoice()
+    tracks = invalid
+    if m.content <> invalid then tracks = m.content.subtitleTracks
+    if m.subtitleChoice = 0 or tracks = invalid or m.subtitleChoice > tracks.Count()
+        m.video.globalCaptionMode = "Off"
+        return
+    end if
+    m.video.globalCaptionMode = "On"
+    m.video.subtitleTrack = tracks[m.subtitleChoice - 1].TrackName
+end sub
+
+' Stops the Video node and the server session, restores the caption mode the
+' device had, and reports finished once the stop has an answer.
+sub exitPlayer()
+    if m.exiting then return
+    m.exiting = true
+    m.progressTimer.control = "stop"
+    isPaused = m.video.state = "paused"
+    log.info(LOG_TAG, "stopping the session", { source: m.sourcePosition, state: m.video.state })
+    m.video.control = "stop"
+    m.video.globalCaptionMode = m.captionModeBefore
+    m.notice.text = "Stopping the session…"
+    m.top.task.request = { op: "stop", owner: "player", position: m.sourcePosition, isPaused: isPaused }
+end sub
+
+sub updateStats()
+    if not m.overlay.visible or m.plan = invalid then return
+    facts = m.plan.facts
+    subtitles = m.plan.subtitles
+    origin = "proxy (no account headers)"
+    if facts.mediaOrigin = "api" then origin = "API origin (headers attached: " + yesNo(m.plan.headersAttached = true) + ")"
+    playStart = "?"
+    if m.content <> invalid then playStart = harness.formatDecimal(harness.numberOr(m.content.playStart, -1))
+    subtitleText = "none in plan"
+    if subtitles <> invalid and subtitles.format <> "none"
+        subtitleText = subtitles.format + "; native " + yesNo(subtitles.native) + "; tmp copy " + yesNo(subtitles.local) + " (" + subtitles.localStatus.ToStr() + "); offset applied " + yesNo(subtitles.offsetApplied)
+    end if
+    prototypes = harness.prototypeFeatures(m.plan.toggles)
+    prototypeText = "none"
+    if prototypes.Count() > 0 then prototypeText = prototypes.Join(" ")
+    errorText = m.errorText
+    if m.errors > 1 then errorText = errorText + " (" + m.errors.ToStr() + " errors)"
+    lines = [
+        "Delivery: " + facts.delivery + "   reason: " + facts.decisionReason,
+        "Stream: " + facts.protocol + "/" + facts.container + " -> StreamFormat " + facts.streamFormat + "   recipe " + facts.videoCodec + "/" + facts.audioCodec,
+        "Media: " + origin,
+        "Timeline offset: " + harness.formatDecimal(facts.timelineOffset) + "   player start: " + harness.formatDecimal(facts.playerStart) + " (PlayStart read back " + playStart + ")   local seek anywhere: " + yesNo(facts.canSeekAnywhere),
+        "Video state: " + m.video.state + "   position: " + harness.formatDecimal(m.video.position) + " (source " + harness.formatDecimal(m.sourcePosition) + ")",
+        "videoFormat: " + harness.stringOr(m.video.videoFormat, "") + "   audioFormat: " + harness.stringOr(m.video.audioFormat, "") + "   passthrough active: " + yesNo(m.deviceInfo.IsPassthruCodecActive()),
+        "Subtitles: " + subtitleText + "   showing: " + subtitleChoiceName(),
+        "Last action: " + m.lastAction + "   replans adopted: " + m.replans.ToStr() + "   recovery used: " + yesNo(m.recovered),
+        "Prototype features: " + prototypeText,
+        "Progress: " + m.progressText,
+        "Video error: " + errorText,
+        "OK pause  Left/Right 30 s  Rew/FF 5 min  Up stats  Down subtitles  Back stop"
+    ]
+    m.stats.text = lines.Join(Chr(10))
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if m.exiting then return true
+    if key = "back"
+        exitPlayer()
+    else if key = "OK" or key = "play"
+        if m.video.state = "paused"
+            m.video.control = "resume"
+        else
+            m.video.control = "pause"
+        end if
+    else if key = "left"
+        seekBy(-30)
+    else if key = "right"
+        seekBy(30)
+    else if key = "rewind"
+        seekBy(-300)
+    else if key = "fastforward"
+        seekBy(300)
+    else if key = "up"
+        m.overlay.visible = not m.overlay.visible
+        updateStats()
+    else if key = "down"
+        cycleSubtitles()
+    else
+        return false
+    end if
+    return true
+end function
+
+function yesNo(value as Dynamic) as String
+    if value = true then return "yes"
+    return "no"
+end function

@@ -1,0 +1,283 @@
+' Decides when ApiTask starts, cancels, times out, and delivers requests
+' (implementation plan section 4.2). Pure: plain AAs in and out, the clock passed
+' in as milliseconds, no Roku objects. Every call that changes state takes the
+' clock and first times out each request past its deadline, so no call starts
+' or delivers one. Each returns a list of decisions for the Task to execute,
+' in order:
+'   { kind: "start", requestId, request }               begin the transfer
+'   { kind: "deliver", requestId, request }             send the transfer's result
+'   { kind: "cancel", requestId, request, running, reason: "owner" | "request" | "shed" | "server" }
+'   { kind: "timeout", requestId, request, running }
+'   { kind: "reject", requestId, request, reason: "duplicate" }
+' cancel and timeout mean: AsyncCancel the transfer when running is true, then
+' send a cancelled or timeout result. reject sends nothing, since that request
+' ID already has, or will have, its one result.
+'
+' A request with rotatesCredentials (sign-in and token refresh) times out at
+' its deadline only while queued. Once started, the server may already have
+' rotated the refresh token, so its answer must still arrive and be applied:
+' it runs until it completes or reaches ROTATING_CAP_MS from submission.
+namespace api.scheduler
+    const LANE_PLAYBACK = "playback"
+    const LANE_INTERACTIVE = "interactive"
+    const LANE_PREFETCH = "prefetch"
+    const DEFAULT_CONCURRENCY = 4
+    const MAX_CONCURRENCY = 6
+    ' Finished request IDs remembered so a reused ID is rejected. Request IDs come
+    ' from a counter in the router, so only a bug reuses one.
+    const FINISHED_MEMORY = 128
+    ' The hard cap on a started credential-rotating request.
+    const ROTATING_CAP_MS = 120000
+
+    ' options.maxConcurrent: transfers at once, 2 to 6 (default 4). One slot is
+    ' kept for the playback lane.
+    function create(options = invalid as Dynamic) as Object
+        state = { maxConcurrent: DEFAULT_CONCURRENCY, shedPrefetch: false, holdCredentials: false, holdConfidential: false, jobs: [], finished: {}, finishedOrder: [] }
+        if type(options) = "roAssociativeArray" then setLimit(state, options.maxConcurrent, 0)
+        return state
+    end function
+
+    function isLane(lane as Dynamic) as Boolean
+        return lane = LANE_PLAYBACK or lane = LANE_INTERACTIVE or lane = LANE_PREFETCH
+    end function
+
+    ' Queues a request ({requestId, lane, owner, timeoutMs, auth, confidential},
+    ' passed back as each decision's request) and starts what fits. The deadline
+    ' counts from now, so time spent queued counts against it. confidential
+    ' marks a request whose body or headers carry a credential without auth
+    ' (sign-in, refresh, sign-out).
+    function submit(state as Object, request as Object, now as Integer) as Object
+        decisions = expire(state, now)
+        id = request.requestId
+        if find(state, id) <> invalid or state.finished.DoesExist(id)
+            decisions.Push({ kind: "reject", requestId: id, request: request, reason: "duplicate" })
+        else if request.lane = LANE_PREFETCH and state.shedPrefetch
+            remember(state, id)
+            decisions.Push({ kind: "cancel", requestId: id, request: request, running: false, reason: "shed" })
+        else
+            credentialed = (type(request.auth) = "String" or type(request.auth) = "roString") and request.auth <> "none"
+            flag = request.confidential
+            confidential = credentialed or ((type(flag) = "Boolean" or type(flag) = "roBoolean") and flag)
+            entry = { requestId: id, lane: request.lane, owner: request.owner, deadline: now + request.timeoutMs, hardDeadline: invalid, running: false, credentialed: credentialed, confidential: confidential, request: request }
+            rotates = request.rotatesCredentials
+            if (type(rotates) = "Boolean" or type(rotates) = "roBoolean") and rotates then entry.hardDeadline = now + ROTATING_CAP_MS
+            state.jobs.Push(entry)
+        end if
+        return startReady(state, decisions)
+    end function
+
+    ' A started transfer completed, or could not be issued. Gives deliver while the
+    ' request is still running and within its deadline; after a cancel or timeout
+    ' it gives nothing, so each request ID gets at most one result.
+    function finish(state as Object, requestId as String, now as Integer) as Object
+        decisions = expire(state, now)
+        entry = find(state, requestId)
+        if entry <> invalid and entry.running
+            remove(state, entry)
+            remember(state, requestId)
+            decisions.Push({ kind: "deliver", requestId: requestId, request: entry.request })
+        end if
+        return startReady(state, decisions)
+    end function
+
+    ' A running request goes back to the queue, keeping its place and deadline,
+    ' as when a 401 sends it to wait for a token refresh. Gives what the freed
+    ' slot starts, which may be the request itself.
+    function requeue(state as Object, requestId as String, now as Integer) as Object
+        decisions = expire(state, now)
+        entry = find(state, requestId)
+        if entry <> invalid then entry.running = false
+        return startReady(state, decisions)
+    end function
+
+    ' While held, queued requests that carry account credentials (auth other
+    ' than "none") wait, as during a token refresh; others still start.
+    ' Releasing starts what fits.
+    function holdCredentials(state as Object, held as Boolean, now as Integer) as Object
+        state.holdCredentials = held
+        return tick(state, now)
+    end function
+
+    ' While held, every queued request that carries a credential in any form
+    ' waits, as while the configured origin is being confirmed; others still
+    ' start. Releasing starts what fits.
+    function holdConfidential(state as Object, held as Boolean, now as Integer) as Object
+        state.holdConfidential = held
+        return tick(state, now)
+    end function
+
+    ' Moves a queued request to the playback lane, as when a playback request
+    ' waits for a token refresh (plan section 4.2), and starts what fits.
+    function promote(state as Object, requestId as String, now as Integer) as Object
+        decisions = expire(state, now)
+        entry = find(state, requestId)
+        if entry <> invalid and not entry.running
+            entry.lane = LANE_PLAYBACK
+            entry.request.lane = LANE_PLAYBACK
+        end if
+        return startReady(state, decisions)
+    end function
+
+    ' The server changed: cancels every interactive and prefetch request.
+    function cancelAll(state as Object, now as Integer) as Object
+        return cancelWhere(state, now, "server", { all: true })
+    end function
+
+    ' Times out every request past its deadline, queued or running, and starts
+    ' what fits.
+    function tick(state as Object, now as Integer) as Object
+        return startReady(state, expire(state, now))
+    end function
+
+    ' The owner went away: cancels its interactive and prefetch requests. Playback
+    ' requests run to completion (plan section 6.6); their results find no handle.
+    function cancelOwner(state as Object, owner as String, now as Integer) as Object
+        return cancelWhere(state, now, "owner", { owner: owner })
+    end function
+
+    ' Cancels one interactive or prefetch request, such as a superseded search.
+    function cancelRequest(state as Object, requestId as String, now as Integer) as Object
+        return cancelWhere(state, now, "request", { requestId: requestId })
+    end function
+
+    ' Memory pressure: while shed is true the prefetch lane is cancelled, queued
+    ' and running, and new prefetch requests are cancelled on arrival.
+    function setShedding(state as Object, shed as Boolean, now as Integer) as Object
+        state.shedPrefetch = shed
+        if not shed then return tick(state, now)
+        return cancelWhere(state, now, "shed", { lane: LANE_PREFETCH })
+    end function
+
+    ' Changes the concurrency limit; a raised limit can start queued requests.
+    function setLimit(state as Object, limit as Dynamic, now as Integer) as Object
+        t = type(limit)
+        if t = "Integer" or t = "roInt" or t = "roInteger"
+            if limit < 2 then limit = 2
+            if limit > MAX_CONCURRENCY then limit = MAX_CONCURRENCY
+            state.maxConcurrent = limit
+        end if
+        return tick(state, now)
+    end function
+
+    ' Whether requestId is started and not yet past its deadline, which ApiTask
+    ' checks immediately before issuing its transfer: a decision earlier in the
+    ' same list may have ended it, and time passes while decisions run.
+    function isLive(state as Object, requestId as String, now as Integer) as Boolean
+        entry = find(state, requestId)
+        return entry <> invalid and entry.running and deadlineOf(entry) > now
+    end function
+
+    ' The earliest deadline of any queued or running request, or invalid when
+    ' there is none. The Task waits on its port until then.
+    function nextDeadline(state as Object) as Dynamic
+        nearest = invalid
+        for each entry in state.jobs
+            deadline = deadlineOf(entry)
+            if nearest = invalid or deadline < nearest then nearest = deadline
+        end for
+        return nearest
+    end function
+
+    function stats(state as Object) as Object
+        out = { queued: 0, running: 0, runningPlayback: 0 }
+        for each entry in state.jobs
+            if entry.running
+                out.running = out.running + 1
+                if entry.lane = LANE_PLAYBACK then out.runningPlayback = out.runningPlayback + 1
+            else
+                out.queued = out.queued + 1
+            end if
+        end for
+        return out
+    end function
+
+    ' Starts queued requests in lane order, oldest first within a lane, while
+    ' slots remain. Other lanes never take the last free slot, so a playback
+    ' request always finds one.
+    function startReady(state as Object, decisions as Object) as Object
+        counts = stats(state)
+        for each lane in [LANE_PLAYBACK, LANE_INTERACTIVE, LANE_PREFETCH]
+            for each entry in state.jobs
+                if counts.running >= state.maxConcurrent then return decisions
+                if lane <> LANE_PLAYBACK and counts.running - counts.runningPlayback >= state.maxConcurrent - 1 then exit for
+                if not entry.running and entry.lane = lane and not (entry.credentialed and state.holdCredentials) and not (entry.confidential and state.holdConfidential)
+                    entry.running = true
+                    counts.running = counts.running + 1
+                    if lane = LANE_PLAYBACK then counts.runningPlayback = counts.runningPlayback + 1
+                    decisions.Push({ kind: "start", requestId: entry.requestId, request: entry.request })
+                end if
+            end for
+        end for
+        return decisions
+    end function
+
+    ' Ends every request past its deadline at now with a timeout decision.
+    function expire(state as Object, now as Integer) as Object
+        return sweep(state, "timeout", "", { deadline: now })
+    end function
+
+    ' Times out what is past its deadline, then cancels what the rule matches
+    ' with reason, and starts what fits.
+    function cancelWhere(state as Object, now as Integer, reason as String, rule as Object) as Object
+        decisions = expire(state, now)
+        decisions.Append(sweep(state, "cancel", reason, rule))
+        return startReady(state, decisions)
+    end function
+
+    ' Ends every request the rule matches with a kind decision (carrying reason
+    ' unless it is ""). Starts nothing; callers do once their own changes are made.
+    function sweep(state as Object, kind as String, reason as String, rule as Object) as Object
+        decisions = []
+        kept = []
+        for each entry in state.jobs
+            if matches(entry, rule)
+                remember(state, entry.requestId)
+                decision = { kind: kind, requestId: entry.requestId, request: entry.request, running: entry.running }
+                if reason <> "" then decision.reason = reason
+                decisions.Push(decision)
+            else
+                kept.Push(entry)
+            end if
+        end for
+        state.jobs = kept
+        return decisions
+    end function
+
+    function matches(entry as Object, rule as Object) as Boolean
+        if rule.DoesExist("deadline") then return deadlineOf(entry) <= rule.deadline
+        ' Nothing but a deadline ends a playback request.
+        if entry.lane = LANE_PLAYBACK then return false
+        if rule.DoesExist("all") then return true
+        if rule.DoesExist("owner") then return entry.owner = rule.owner
+        if rule.DoesExist("requestId") then return entry.requestId = rule.requestId
+        return entry.lane = rule.lane
+    end function
+
+    ' When the entry times out: its deadline, or its hard cap once a
+    ' credential-rotating request has started.
+    function deadlineOf(entry as Object) as Integer
+        if entry.running and entry.hardDeadline <> invalid then return entry.hardDeadline
+        return entry.deadline
+    end function
+
+    function find(state as Object, requestId as String) as Dynamic
+        for each entry in state.jobs
+            if entry.requestId = requestId then return entry
+        end for
+        return invalid
+    end function
+
+    sub remove(state as Object, target as Object)
+        kept = []
+        for each entry in state.jobs
+            if entry.requestId <> target.requestId then kept.Push(entry)
+        end for
+        state.jobs = kept
+    end sub
+
+    sub remember(state as Object, requestId as String)
+        state.finished[requestId] = true
+        state.finishedOrder.Push(requestId)
+        if state.finishedOrder.Count() > FINISHED_MEMORY then state.finished.Delete(state.finishedOrder.Shift())
+    end sub
+end namespace

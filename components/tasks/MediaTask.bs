@@ -1,0 +1,99 @@
+import "pkg:/source/playback/sidecarCache.bs"
+import "pkg:/source/playback/sidecarFiles.bs"
+import "pkg:/source/playback/subtitles.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' Converts subtitle sidecars for the Video node (plan section 6.8): reads the
+' file ApiTask downloaded in pieces (playback.subtitles.convertFile), moves
+' its cues by shiftSeconds, writes SRT to OUTPUT_DIR, and deletes the
+' download. The newest KEEP_OUTPUTS files stay:
+' a content's tracks (up to playback.sidecars.MAX_TRACKS), and the previous
+' plan's, which the Video node may still read. A conversion the session's
+' cache keeps goes to the path the player names in
+' playback.sidecarCache.DIR instead; the player keeps the cache's index,
+' and MediaTask does its file work (playback.sidecarFiles).
+const OUTPUT_DIR = "tmp:/subtitles"
+const KEEP_OUTPUTS = 8
+
+sub init()
+    m.top.functionName = "serve"
+end sub
+
+sub serve()
+    port = CreateObject("roMessagePort")
+    m.top.observeFieldScopedEx("request", port)
+    m.outputs = []
+    m.count = 0
+    CreateDirectory(OUTPUT_DIR)
+    CreateDirectory(playback.sidecarCache.DIR)
+    clearOutputs()
+    m.top.ready = true
+    while true
+        msg = wait(0, port)
+        if type(msg) = "roSGNodeEvent" and msg.getField() = "request"
+            request = msg.getData()
+            ' The player stopped: its tracks are deleted (plan section 4.8).
+            if util.isObject(request) and util.isTrue(request.finish)
+                clearOutputs()
+                return
+            end if
+            work(request)
+        end if
+    end while
+end sub
+
+' A conversion, or the session cache's file work: whether a kept file is
+' still there ({ id, track, kept }), or which files go ({ keep }).
+sub work(request as Dynamic)
+    if not util.isObject(request) then return
+    if request.DoesExist("kept")
+        m.top.result = playback.sidecarFiles.check(request)
+        return
+    end if
+    if request.DoesExist("keep")
+        playback.sidecarFiles.sweep(request.keep)
+        return
+    end if
+    input = util.text(request.input)
+    converted = playback.subtitles.convertFile(input, util.text(request.format), request.shiftSeconds)
+    if input <> "" then DeleteFile(input)
+    result = { id: request.id, track: request.track, ok: false, path: "", cues: converted.cues, error: converted.error, cacheKey: "", bytes: 0 }
+    if converted.error = invalid
+        path = util.text(request.output)
+        cached = path <> ""
+        if not cached
+            m.count = m.count + 1
+            path = OUTPUT_DIR + "/track" + m.count.ToStr() + ".srt"
+        end if
+        if WriteAsciiFile(path, converted.srt)
+            result.ok = true
+            result.path = path
+            if cached
+                result.cacheKey = util.text(request.cacheKey)
+                info = CreateObject("roFileSystem").Stat(path)
+                if type(info) = "roAssociativeArray" and util.isNumber(info.size) then result.bytes = info.size
+            else
+                keep(path)
+            end if
+        else
+            result.error = "write_failed"
+        end if
+    end if
+    if not result.ok then log.warn("media", "subtitle conversion failed", { format: request.format, error: result.error })
+    m.top.result = result
+end sub
+
+sub keep(path as String)
+    m.outputs.Push(path)
+    while m.outputs.Count() > KEEP_OUTPUTS
+        DeleteFile(m.outputs.Shift())
+    end while
+end sub
+
+sub clearOutputs()
+    for each name in ListDir(OUTPUT_DIR)
+        DeleteFile(OUTPUT_DIR + "/" + name)
+    end for
+    m.outputs = []
+end sub

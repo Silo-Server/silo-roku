@@ -1,0 +1,186 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/values.bs"
+
+' What Play asks for (plan section 6.3): the file version, its audio tracks,
+' and where to start, read from GET /api/v2/watch/{item_id}. Pure. Track
+' ordinals and file IDs are the server's; nothing is derived but a track's
+' position in the version's audio_tracks, which is the server's audio
+' ordinal (assumption AG-16).
+namespace playback.intent
+    ' The default of the device-local player.resume_rewind_seconds (spec
+    ' section 5.7).
+    const RESUME_REWIND_SECONDS = 7
+    ' Spec section 5.6: a saved position this close to the end is not resumed.
+    const END_MARGIN = 5
+
+    ' The play intent for a watch projection, or invalid when it has no file:
+    ' { itemId, title, fileId, pinned, runtime, audioTracks,
+    ' effectiveAudioIndex, resumeSeconds, kind, name, seriesTitle,
+    ' seasonNumber, episodeNumber, year }. The
+    ' version is pinnedFile when the projection lists it (a detail page's
+    ' Version choice, nav.player.pinnedFile), which pinned then says; else
+    ' chooseVersion's. audioTracks are { index, codec, channels, language, title,
+    ' default, bitrate }, what playback.options.initialAudio ranks: title is
+    ' the track's title, else its embedded title; effectiveAudioIndex is the
+    ' version's effective_audio_track_index (the track the server's
+    ' preferences choose), or -1; resumeSeconds is the saved
+    ' position to resume (resumeOf), or invalid. kind is the projection's
+    ' type ("movie", "episode"), and name its own title; playback.markers
+    ' reads the version's markers.
+    function fromWatch(detail as Dynamic, itemId as String, pinnedFile = "" as String) as Dynamic
+        if not util.isObject(detail) or not playback.values.isArray(detail.versions) then return invalid
+        version = listedVersion(detail, pinnedFile)
+        pinned = version <> invalid
+        if not pinned then version = chooseVersion(detail)
+        if version = invalid then return invalid
+        tracks = []
+        if playback.values.isArray(version.audio_tracks)
+            for each track in version.audio_tracks
+                if util.isObject(track)
+                    title = util.text(track.title)
+                    if title = "" then title = util.text(track.embedded_title)
+                    tracks.Push({ index: tracks.Count(), codec: LCase(util.text(track.codec)), channels: track.channels, language: LCase(util.text(track.language)), title: title, default: util.isTrue(track.default), bitrate: track.bitrate })
+                end if
+            end for
+        end if
+        runtime = invalid
+        if util.isNumber(version.duration_seconds) and version.duration_seconds > 0 then runtime = version.duration_seconds
+        effectiveAudio = -1
+        if util.isNumber(version.effective_audio_track_index) then effectiveAudio = Int(version.effective_audio_track_index)
+        return {
+            itemId: itemId,
+            title: titleOf(detail),
+            fileId: util.text(version.file_id),
+            pinned: pinned,
+            runtime: runtime,
+            audioTracks: tracks,
+            effectiveAudioIndex: effectiveAudio,
+            resumeSeconds: resumeOf(detail),
+            kind: util.text(detail.type),
+            name: util.text(detail.title),
+            seriesTitle: util.text(detail.series_title),
+            seasonNumber: detail.season_number,
+            episodeNumber: detail.episode_number,
+            year: detail.year
+        }
+    end function
+
+    ' The saved position a resume starts from, before the rewind, or invalid:
+    ' position when past 0 and more than END_MARGIN from the end of duration
+    ' (when known). The detail page's Resume (catalog.detail.resumePoint) and
+    ' the start (fromWatch) both ask here, so the button and the start agree.
+    ' Whether the server counts the item played does not matter: it zeroes the
+    ' position when it marks an item played and keeps played through a
+    ' rewatch, so a played item with a position is a rewatch stopped partway,
+    ' which tvOS and Android TV resume (assumption AG-189).
+    function savedPosition(position as Dynamic, duration as Dynamic) as Dynamic
+        if not util.isNumber(position) or position <= 0 then return invalid
+        if util.isNumber(duration) and duration > 0 and duration - position <= END_MARGIN then return invalid
+        return position
+    end function
+
+    ' savedPosition for a watch projection: its user_data's position, against
+    ' its duration, else the runtime of the version a start plays.
+    function resumeOf(detail as Dynamic) as Dynamic
+        if not util.isObject(detail) or not util.isObject(detail.user_data) then return invalid
+        duration = detail.user_data.duration_seconds
+        if not util.isNumber(duration) and playback.values.isArray(detail.versions)
+            version = chooseVersion(detail)
+            if version <> invalid then duration = version.duration_seconds
+        end if
+        return savedPosition(detail.user_data.position_seconds, duration)
+    end function
+
+    ' The projection's version for fileId, or invalid for "" or a file it
+    ' does not list.
+    function listedVersion(detail as Object, fileId as String) as Dynamic
+        if fileId = "" then return invalid
+        for each version in detail.versions
+            if util.isObject(version) and util.text(version.file_id) = fileId then return version
+        end for
+        return invalid
+    end function
+
+    ' The version last played, else the server's default variant, else the
+    ' first: what a start plays unless a detail page pinned one, and Auto on
+    ' a detail page's Version button.
+    function chooseVersion(detail as Object) as Dynamic
+        lastPlayed = ""
+        if util.isObject(detail.user_data) then lastPlayed = util.text(detail.user_data.last_file_id)
+        variantDefault = ""
+        if playback.values.isArray(detail.playback_variants) and detail.playback_variants.Count() > 0 and util.isObject(detail.playback_variants[0]) then variantDefault = util.text(detail.playback_variants[0].default_file_id)
+        found = { first: invalid, lastPlayed: invalid, variantDefault: invalid }
+        for each version in detail.versions
+            fileId = ""
+            if util.isObject(version) then fileId = util.text(version.file_id)
+            if fileId <> ""
+                if found.first = invalid then found.first = version
+                if fileId = lastPlayed then found.lastPlayed = version
+                if fileId = variantDefault then found.variantDefault = version
+            end if
+        end for
+        if found.lastPlayed <> invalid then return found.lastPlayed
+        if found.variantDefault <> invalid then return found.variantDefault
+        return found.first
+    end function
+
+    ' The watch projection's version for fileId, among its versions or a
+    ' playback variant's parts, else the version a start plays
+    ' (chooseVersion): Options describes the file the plan plays.
+    function versionOf(detail as Object, fileId as String) as Dynamic
+        if fileId = "" then return chooseVersion(detail)
+        lists = [detail.versions]
+        if playback.values.isArray(detail.playback_variants)
+            for each variant in detail.playback_variants
+                if util.isObject(variant) and playback.values.isArray(variant.parts)
+                    for each part in variant.parts
+                        if util.isObject(part) then lists.Push(part.versions)
+                    end for
+                end if
+            end for
+        end if
+        for each list in lists
+            if playback.values.isArray(list)
+                for each version in list
+                    if util.isObject(version) and util.text(version.file_id) = fileId then return version
+                end for
+            end if
+        end for
+        return chooseVersion(detail)
+    end function
+
+    ' The file a plan plays: its effective_media_file_id, else fallback (the
+    ' file the start asked for).
+    function playingFile(playbackPlan as Dynamic, fallback as String) as String
+        if util.isObject(playbackPlan) and playback.values.isText(playbackPlan.effective_media_file_id) then return playbackPlan.effective_media_file_id
+        return fallback
+    end function
+
+    ' "Series · S1:E2 · Episode" for an episode, else the title.
+    function titleOf(detail as Object) as String
+        title = util.text(detail.title)
+        if util.text(detail.type) <> "episode" or util.text(detail.series_title) = "" then return title
+        parts = [util.text(detail.series_title)]
+        if util.isNumber(detail.season_number) and util.isNumber(detail.episode_number) then parts.Push("S" + detail.season_number.ToStr() + ":E" + detail.episode_number.ToStr())
+        if title <> "" then parts.Push(title)
+        return parts.Join(" · ")
+    end function
+
+    ' Where Resume starts: the saved position less the rewind, never below 0
+    ' (the server applies no rewind of its own); invalid with nothing saved.
+    function resumeAt(savedSeconds as Dynamic) as Dynamic
+        if not util.isNumber(savedSeconds) then return invalid
+        position = savedSeconds - RESUME_REWIND_SECONDS
+        if position < 0 then return 0
+        return position
+    end function
+
+    ' The audio track with the server ordinal index, or invalid.
+    function audioTrack(tracks as Dynamic, index as Dynamic) as Dynamic
+        if not playback.values.isArray(tracks) or not util.isNumber(index) then return invalid
+        for each track in tracks
+            if util.isObject(track) and track.index = index then return track
+        end for
+        return invalid
+    end function
+end namespace

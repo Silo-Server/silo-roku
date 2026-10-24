@@ -1,0 +1,415 @@
+namespace tests
+
+    @suite("api scheduler")
+    class ApiSchedulerTests extends rooibos.BaseTestSuite
+
+        @describe("create and setLimit")
+
+        @it("defaults to four transfers and clamps the limit to 2..6")
+        sub _()
+            m.assertEqual(api.scheduler.create().maxConcurrent, 4)
+            m.assertEqual(api.scheduler.create({ maxConcurrent: 6 }).maxConcurrent, 6)
+            m.assertEqual(api.scheduler.create({ maxConcurrent: 9 }).maxConcurrent, 6)
+            m.assertEqual(api.scheduler.create({ maxConcurrent: 1 }).maxConcurrent, 2)
+            m.assertEqual(api.scheduler.create({ maxConcurrent: "6" }).maxConcurrent, 4)
+        end sub
+
+        @it("starts queued requests when the limit rises")
+        sub _()
+            state = api.scheduler.create()
+            m.submitAll(state, ["a", "b", "c", "d", "e"], "interactive", 0)
+            m.assertEqual(m.summary(api.scheduler.setLimit(state, 6, 0)), ["start d", "start e"])
+            m.assertEqual(m.summary(api.scheduler.setLimit(state, "x", 0)), [])
+        end sub
+
+        @describe("submit and lanes")
+
+        @it("starts a request at once and passes the request back")
+        sub _()
+            state = api.scheduler.create()
+            request = m.job("a", "interactive", "home", 5000)
+            decisions = api.scheduler.submit(state, request, 100)
+            m.assertEqual(m.summary(decisions), ["start a"])
+            request.marker = "same object"
+            m.assertEqual(decisions[0].request.marker, "same object")
+        end sub
+
+        @it("keeps one of four slots for the playback lane")
+        sub _()
+            state = api.scheduler.create()
+            m.assertEqual(m.submitAll(state, ["a", "b", "c", "d"], "interactive", 0), ["start a", "start b", "start c"])
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.job("p", "playback", "player", 5000), 0)), ["start p"])
+            m.assertEqual(api.scheduler.stats(state), { queued: 1, running: 4, runningPlayback: 1 })
+        end sub
+
+        @it("keeps one of six slots for the playback lane")
+        sub _()
+            state = api.scheduler.create({ maxConcurrent: 6 })
+            m.assertEqual(m.submitAll(state, ["a", "b", "c", "d", "e", "f"], "prefetch", 0), ["start a", "start b", "start c", "start d", "start e"])
+        end sub
+
+        @it("lets the playback lane use every slot")
+        sub _()
+            state = api.scheduler.create()
+            m.assertEqual(m.submitAll(state, ["p1", "p2", "p3", "p4", "p5"], "playback", 0), ["start p1", "start p2", "start p3", "start p4"])
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.job("a", "interactive", "home", 5000), 0)), [])
+        end sub
+
+        @it("does not let other lanes take a slot playback frees while others wait")
+        sub _()
+            state = api.scheduler.create()
+            m.submitAll(state, ["a", "b", "c"], "interactive", 0)
+            m.submitAll(state, ["p"], "playback", 0)
+            m.submitAll(state, ["d"], "interactive", 0)
+            m.assertEqual(m.summary(api.scheduler.finish(state, "p", 0)), ["deliver p"])
+            m.assertEqual(api.scheduler.stats(state), { queued: 1, running: 3, runningPlayback: 0 })
+        end sub
+
+        @it("starts playback, then interactive, then prefetch, oldest first")
+        sub _()
+            state = api.scheduler.create({ maxConcurrent: 2 })
+            m.submitAll(state, ["x"], "interactive", 0)
+            m.submitAll(state, ["f1"], "prefetch", 0)
+            m.submitAll(state, ["i1", "i2"], "interactive", 0)
+            m.submitAll(state, ["p1", "p2"], "playback", 0)
+            m.assertEqual(m.summary(api.scheduler.finish(state, "p1", 0)), ["deliver p1", "start p2"])
+            m.assertEqual(m.summary(api.scheduler.finish(state, "x", 0)), ["deliver x", "start i1"])
+            m.assertEqual(m.summary(api.scheduler.finish(state, "p2", 0)), ["deliver p2"])
+            m.assertEqual(m.summary(api.scheduler.finish(state, "i1", 0)), ["deliver i1", "start i2"])
+            m.assertEqual(m.summary(api.scheduler.finish(state, "i2", 0)), ["deliver i2", "start f1"])
+        end sub
+
+        @describe("finish and at-most-once results")
+
+        @it("delivers a running request once and starts the next")
+        sub _()
+            state = api.scheduler.create()
+            m.submitAll(state, ["a", "b", "c", "d"], "interactive", 0)
+            m.assertEqual(m.summary(api.scheduler.finish(state, "a", 0)), ["deliver a", "start d"])
+            m.assertEqual(m.summary(api.scheduler.finish(state, "a", 0)), [])
+        end sub
+
+        @it("ignores finish for queued and unknown requests")
+        sub _()
+            state = api.scheduler.create()
+            m.submitAll(state, ["a", "b", "c", "d"], "interactive", 0)
+            m.assertEqual(m.summary(api.scheduler.finish(state, "d", 0)), [])
+            m.assertEqual(m.summary(api.scheduler.finish(state, "zz", 0)), [])
+            m.assertEqual(api.scheduler.stats(state).queued, 1)
+        end sub
+
+        @it("rejects a request ID that is pending or already answered")
+        sub _()
+            state = api.scheduler.create()
+            m.submitAll(state, ["a"], "interactive", 0)
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.job("a", "interactive", "home", 5000), 0)), ["reject a duplicate"])
+            api.scheduler.finish(state, "a", 0)
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.job("a", "interactive", "home", 5000), 0)), ["reject a duplicate"])
+            m.assertEqual(api.scheduler.stats(state), { queued: 0, running: 0, runningPlayback: 0 })
+        end sub
+
+        @it("gives nothing when a timed-out transfer completes late")
+        sub _()
+            state = api.scheduler.create()
+            m.submitAll(state, ["a"], "interactive", 0)
+            api.scheduler.tick(state, 5000)
+            m.assertEqual(m.summary(api.scheduler.finish(state, "a", 5000)), [])
+        end sub
+
+        @it("remembers a bounded number of answered IDs")
+        sub _()
+            state = api.scheduler.create()
+            for i = 1 to 140
+                id = "r" + i.ToStr()
+                api.scheduler.submit(state, m.job(id, "interactive", "home", 5000), 0)
+                api.scheduler.finish(state, id, 0)
+            end for
+            m.assertEqual(state.finished.Count(), 128)
+            m.assertFalse(state.finished.DoesExist("r12"))
+            m.assertTrue(state.finished.DoesExist("r13"))
+        end sub
+
+        @describe("deadlines")
+
+        @it("times out running and queued requests at their deadline")
+        sub _()
+            state = api.scheduler.create({ maxConcurrent: 2 })
+            api.scheduler.submit(state, m.job("a", "interactive", "home", 1000), 0)
+            api.scheduler.submit(state, m.job("b", "interactive", "home", 3000), 0)
+            api.scheduler.submit(state, m.job("c", "interactive", "home", 1500), 500)
+            m.assertEqual(m.summary(api.scheduler.tick(state, 999)), [])
+            m.assertEqual(m.summary(api.scheduler.tick(state, 1000)), ["timeout a running", "start b"])
+            m.assertEqual(m.summary(api.scheduler.tick(state, 2000)), ["timeout c queued"])
+        end sub
+
+        @it("counts time spent queued against the deadline")
+        sub _()
+            state = api.scheduler.create({ maxConcurrent: 2 })
+            api.scheduler.submit(state, m.job("a", "interactive", "home", 10000), 0)
+            api.scheduler.submit(state, m.job("b", "interactive", "home", 2000), 0)
+            m.assertEqual(m.summary(api.scheduler.tick(state, 2000)), ["timeout b queued"])
+        end sub
+
+        @it("times out playback requests too")
+        sub _()
+            state = api.scheduler.create()
+            api.scheduler.submit(state, m.job("p", "playback", "player", 2000), 0)
+            m.assertEqual(m.summary(api.scheduler.tick(state, 2000)), ["timeout p running"])
+        end sub
+
+        @it("times out an expired queued request before a completion can start it")
+        sub _()
+            state = api.scheduler.create({ maxConcurrent: 2 })
+            api.scheduler.submit(state, m.job("running", "interactive", "home", 10000), 0)
+            api.scheduler.submit(state, m.job("queued", "interactive", "home", 1000), 0)
+            m.assertEqual(m.summary(api.scheduler.finish(state, "running", 1001)), ["timeout queued queued", "deliver running"])
+            m.assertEqual(api.scheduler.stats(state), { queued: 0, running: 0, runningPlayback: 0 })
+        end sub
+
+        @it("times out a running request rather than deliver it after its deadline")
+        sub _()
+            state = api.scheduler.create()
+            api.scheduler.submit(state, m.job("a", "interactive", "home", 1000), 0)
+            m.assertEqual(m.summary(api.scheduler.finish(state, "a", 1000)), ["timeout a running"])
+            m.assertEqual(m.summary(api.scheduler.finish(state, "a", 1000)), [])
+        end sub
+
+        @it("times out expired requests before a limit change, a cancellation, or a submission starts others")
+        sub _()
+            for each change in ["limit", "cancel", "submit"]
+                state = api.scheduler.create({ maxConcurrent: 2 })
+                api.scheduler.submit(state, m.job("a", "interactive", "home", 10000), 0)
+                api.scheduler.submit(state, m.job("b", "interactive", "home", 1000), 0)
+                api.scheduler.submit(state, m.job("c", "interactive", "home", 10000), 0)
+                if change = "limit"
+                    m.assertEqual(m.summary(api.scheduler.setLimit(state, 6, 1001)), ["timeout b queued", "start c"], change)
+                else if change = "cancel"
+                    m.assertEqual(m.summary(api.scheduler.cancelRequest(state, "a", 1001)), ["timeout b queued", "cancel a running request", "start c"], change)
+                else
+                    m.assertEqual(m.summary(api.scheduler.submit(state, m.job("p", "playback", "player", 5000), 1001)), ["timeout b queued", "start p"], change)
+                end if
+            end for
+        end sub
+
+        @it("times out held and requeued requests rather than start them after their deadline")
+        sub _()
+            state = api.scheduler.create()
+            api.scheduler.holdCredentials(state, true, 0)
+            api.scheduler.submit(state, m.credentialed("held", "interactive"), 0)
+            m.assertEqual(m.summary(api.scheduler.holdCredentials(state, false, 5000)), ["timeout held queued"])
+            api.scheduler.submit(state, m.job("again", "interactive", "home", 1000), 6000)
+            m.assertEqual(m.summary(api.scheduler.requeue(state, "again", 7000)), ["timeout again running"])
+        end sub
+
+        @it("says whether a started request may still be issued")
+        sub _()
+            state = api.scheduler.create({ maxConcurrent: 2 })
+            api.scheduler.submit(state, m.job("a", "interactive", "home", 1000), 0)
+            api.scheduler.submit(state, m.job("b", "interactive", "home", 1000), 0)
+            m.assertTrue(api.scheduler.isLive(state, "a", 999))
+            m.assertFalse(api.scheduler.isLive(state, "a", 1000), "past its deadline")
+            m.assertFalse(api.scheduler.isLive(state, "b", 0), "queued")
+            api.scheduler.cancelRequest(state, "a", 0)
+            m.assertFalse(api.scheduler.isLive(state, "a", 0), "cancelled")
+        end sub
+
+        @it("reports the nearest deadline, or invalid when idle")
+        sub _()
+            state = api.scheduler.create()
+            m.assertInvalid(api.scheduler.nextDeadline(state))
+            api.scheduler.submit(state, m.job("a", "interactive", "home", 8000), 100)
+            api.scheduler.submit(state, m.job("b", "prefetch", "home", 3000), 200)
+            m.assertEqual(api.scheduler.nextDeadline(state), 3200)
+            api.scheduler.finish(state, "b", 0)
+            m.assertEqual(api.scheduler.nextDeadline(state), 8100)
+        end sub
+
+        @describe("credential-rotating requests")
+
+        @it("lets a started sign-in or refresh run past its deadline, to its hard cap")
+        sub _()
+            state = api.scheduler.create()
+            request = m.job("auth1", "interactive", "", 15000)
+            request.rotatesCredentials = true
+            m.assertEqual(m.summary(api.scheduler.submit(state, request, 0)), ["start auth1"])
+            m.assertEqual(m.summary(api.scheduler.tick(state, 15000)), [], "not at its deadline")
+            m.assertTrue(api.scheduler.isLive(state, "auth1", 60000))
+            m.assertEqual(api.scheduler.nextDeadline(state), api.scheduler.ROTATING_CAP_MS)
+            m.assertEqual(m.summary(api.scheduler.finish(state, "auth1", 60000)), ["deliver auth1"], "a late answer is delivered")
+
+            late = m.job("auth2", "interactive", "", 15000)
+            late.rotatesCredentials = true
+            api.scheduler.submit(state, late, 70000)
+            m.assertEqual(m.summary(api.scheduler.tick(state, 70000 + api.scheduler.ROTATING_CAP_MS)), ["timeout auth2 running"])
+        end sub
+
+        @it("times out a rotating request at its deadline while it is still queued")
+        sub _()
+            state = api.scheduler.create({ maxConcurrent: 2 })
+            m.submitAll(state, ["p1", "p2"], "playback", 0)
+            request = m.job("auth1", "interactive", "", 15000)
+            request.rotatesCredentials = true
+            m.assertEqual(m.summary(api.scheduler.submit(state, request, 0)), [])
+            m.assertEqual(m.summary(api.scheduler.tick(state, 15000)), ["timeout p1 running", "timeout p2 running", "timeout auth1 queued"])
+        end sub
+
+        @it("ignores a rotatesCredentials that is not true")
+        sub _()
+            state = api.scheduler.create()
+            request = m.job("a", "interactive", "home", 5000)
+            request.rotatesCredentials = "yes"
+            api.scheduler.submit(state, request, 0)
+            m.assertEqual(m.summary(api.scheduler.tick(state, 5000)), ["timeout a running"])
+        end sub
+
+        @describe("cancellation")
+
+        @it("cancels an owner's interactive and prefetch requests, queued and running")
+        sub _()
+            state = api.scheduler.create({ maxConcurrent: 3 })
+            api.scheduler.submit(state, m.job("a", "interactive", "home", 5000), 0)
+            api.scheduler.submit(state, m.job("b", "prefetch", "detail", 5000), 0)
+            api.scheduler.submit(state, m.job("c", "prefetch", "home", 5000), 0)
+            m.assertEqual(m.summary(api.scheduler.cancelOwner(state, "home", 0)), ["cancel a running owner", "cancel c queued owner"])
+            m.assertEqual(api.scheduler.stats(state), { queued: 0, running: 1, runningPlayback: 0 })
+            m.assertEqual(m.summary(api.scheduler.finish(state, "a", 0)), [])
+        end sub
+
+        @it("never cancels a playback request for its owner")
+        sub _()
+            state = api.scheduler.create()
+            api.scheduler.submit(state, m.job("p", "playback", "player", 5000), 0)
+            api.scheduler.submit(state, m.job("i", "interactive", "player", 5000), 0)
+            m.assertEqual(m.summary(api.scheduler.cancelOwner(state, "player", 0)), ["cancel i running owner"])
+            m.assertEqual(m.summary(api.scheduler.cancelRequest(state, "p", 0)), [])
+            m.assertEqual(m.summary(api.scheduler.finish(state, "p", 0)), ["deliver p"])
+        end sub
+
+        @it("cancels one request by ID")
+        sub _()
+            state = api.scheduler.create()
+            api.scheduler.submit(state, m.job("q1", "interactive", "search", 5000), 0)
+            api.scheduler.submit(state, m.job("q2", "interactive", "search", 5000), 0)
+            m.assertEqual(m.summary(api.scheduler.cancelRequest(state, "q1", 0)), ["cancel q1 running request"])
+            m.assertEqual(api.scheduler.stats(state).running, 1)
+        end sub
+
+        @describe("prefetch shedding")
+
+        @it("cancels the prefetch lane and refuses new prefetch while shedding")
+        sub _()
+            state = api.scheduler.create({ maxConcurrent: 3 })
+            api.scheduler.submit(state, m.job("f1", "prefetch", "home", 5000), 0)
+            api.scheduler.submit(state, m.job("i1", "interactive", "home", 5000), 0)
+            api.scheduler.submit(state, m.job("f2", "prefetch", "home", 5000), 0)
+            api.scheduler.submit(state, m.job("i2", "interactive", "home", 5000), 0)
+            m.assertEqual(m.summary(api.scheduler.setShedding(state, true, 0)), ["cancel f1 running shed", "cancel f2 queued shed", "start i2"])
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.job("f3", "prefetch", "home", 5000), 0)), ["cancel f3 queued shed"])
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.job("p", "playback", "player", 5000), 0)), ["start p"])
+        end sub
+
+        @it("accepts prefetch again when pressure ends")
+        sub _()
+            state = api.scheduler.create()
+            api.scheduler.setShedding(state, true, 0)
+            m.assertEqual(m.summary(api.scheduler.setShedding(state, false, 0)), [])
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.job("f", "prefetch", "home", 5000), 0)), ["start f"])
+        end sub
+
+        @describe("token refresh support")
+
+        @it("requeues a running request in its place, keeping its deadline")
+        sub _()
+            state = api.scheduler.create({ maxConcurrent: 2 })
+            m.submitAll(state, ["a", "b"], "interactive", 0)
+            m.assertEqual(m.summary(api.scheduler.requeue(state, "a", 0)), ["start a"])
+            m.assertEqual(m.summary(api.scheduler.requeue(state, "missing", 0)), [])
+            m.assertEqual(api.scheduler.nextDeadline(state), 5000)
+        end sub
+
+        @it("holds only requests that carry credentials")
+        sub _()
+            state = api.scheduler.create()
+            m.assertEqual(api.scheduler.holdCredentials(state, true, 0), [])
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.credentialed("a", "interactive"), 0)), [])
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.credentialed("p", "playback"), 0)), [])
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.job("open", "interactive", "home", 5000), 0)), ["start open"])
+            m.assertEqual(m.summary(api.scheduler.holdCredentials(state, false, 0)), ["start p", "start a"])
+        end sub
+
+        @it("holds every request carrying a credential while the origin is confirmed")
+        sub _()
+            state = api.scheduler.create()
+            api.scheduler.holdConfidential(state, true, 0)
+            login = m.job("login", "interactive", "", 5000)
+            login.confidential = true
+            m.assertEqual(m.summary(api.scheduler.submit(state, login, 0)), [])
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.credentialed("a", "interactive"), 0)), [])
+            m.assertEqual(m.summary(api.scheduler.submit(state, m.job("check", "interactive", "", 5000), 0)), ["start check"])
+            m.assertEqual(m.summary(api.scheduler.holdConfidential(state, false, 0)), ["start login", "start a"])
+        end sub
+
+        @it("keeps a requeued request waiting while credentials are held")
+        sub _()
+            state = api.scheduler.create()
+            api.scheduler.submit(state, m.credentialed("a", "interactive"), 0)
+            api.scheduler.holdCredentials(state, true, 0)
+            m.assertEqual(m.summary(api.scheduler.requeue(state, "a", 0)), [])
+            m.assertEqual(api.scheduler.stats(state), { queued: 1, running: 0, runningPlayback: 0 })
+        end sub
+
+        @it("moves a queued request into the playback slot")
+        sub _()
+            state = api.scheduler.create()
+            m.submitAll(state, ["a", "b", "c", "refresh"], "interactive", 0)
+            m.assertEqual(m.summary(api.scheduler.promote(state, "refresh", 0)), ["start refresh"])
+            m.assertEqual(api.scheduler.stats(state).runningPlayback, 1)
+            m.assertEqual(m.summary(api.scheduler.promote(state, "a", 0)), [])
+        end sub
+
+        @it("cancels everything but playback when the server changes")
+        sub _()
+            state = api.scheduler.create()
+            m.submitAll(state, ["a"], "interactive", 0)
+            m.submitAll(state, ["f"], "prefetch", 0)
+            m.submitAll(state, ["p"], "playback", 0)
+            m.assertEqual(m.summary(api.scheduler.cancelAll(state, 0)), ["cancel a running server", "cancel f running server"])
+            m.assertEqual(api.scheduler.stats(state).runningPlayback, 1)
+        end sub
+
+        function credentialed(id as String, lane as String) as Object
+            request = m.job(id, lane, "home", 5000)
+            request.auth = "account"
+            return request
+        end function
+
+        ' A request as api.request.normalize leaves it.
+        function job(id as String, lane as String, owner as String, timeoutMs as Integer) as Object
+            return { requestId: id, lane: lane, owner: owner, timeoutMs: timeoutMs, path: "/api/v2/x" }
+        end function
+
+        function submitAll(state as Object, ids as Object, lane as String, now as Integer) as Object
+            out = []
+            for each id in ids
+                out.Append(m.summary(api.scheduler.submit(state, m.job(id, lane, "home", 5000), now)))
+            end for
+            return out
+        end function
+
+        ' "kind id [running|queued] [reason]" for each decision.
+        function summary(decisions as Object) as Object
+            out = []
+            for each decision in decisions
+                line = decision.kind + " " + decision.requestId
+                if decision.DoesExist("running")
+                    if decision.running then line = line + " running" else line = line + " queued"
+                end if
+                if decision.DoesExist("reason") then line = line + " " + decision.reason
+                out.Push(line)
+            end for
+            return out
+        end function
+
+    end class
+
+end namespace

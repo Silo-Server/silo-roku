@@ -1,0 +1,398 @@
+namespace tests
+
+    @suite("playback jobs")
+    class PlaybackJobsTests extends rooibos.BaseTestSuite
+
+        function identity(profile as String) as Object
+            return { server: "srv-1", account: "acc-1", profile: profile }
+        end function
+
+        function job(kind as String, sessionId as String, sequence as Integer, profile as String) as Object
+            fence = m.identity(profile)
+            fence.attempt = "attempt-" + sessionId
+            fence.session = sessionId
+            id = sessionId + ":" + kind
+            if kind = "progress" then id = id + ":" + sequence.ToStr()
+            bodyText = `{"installation_id":"inst-1","sequence":${sequence},"position":12.5,"is_paused":false}`
+            if kind = "stop" then bodyText = `{"installation_id":"inst-1","is_paused":false,"position":12.5,"sequence":${sequence},"stop_id":"00000000-0000-4000-8000-000000000009"}`
+            return { kind: kind, id: id, fence: fence, sessionId: sessionId, sequence: sequence, bodyText: bodyText }
+        end function
+
+        function ids(items as Object) as Object
+            out = []
+            for each item in items
+                out.Push(item.id)
+            end for
+            return out
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("retries")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("backs off 1, 2, 4, 8, 16, then every 30 s")
+        sub _()
+            delays = []
+            for i = 1 to 8
+                delays.Push(playback.jobs.backoffMs(i))
+            end for
+            m.assertEqual(delays, [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000])
+        end sub
+
+        @it("resends a stop with the same body and stop_id until it lands")
+        sub _()
+            state = playback.jobs.create()
+            stopJob = m.job("stop", "s-1", 4, "p-1")
+            playback.jobs.add(state, stopJob, 0)
+            first = playback.jobs.due(state, 0, m.identity("p-1"))
+            m.assertEqual(m.ids(first), ["s-1:stop"])
+            m.assertInvalid(playback.jobs.finish(state, "s-1:stop", "offline", 100))
+            m.assertEqual(playback.jobs.due(state, 1099, m.identity("p-1")), [], "waits out the backoff")
+            again = playback.jobs.due(state, 1100, m.identity("p-1"))
+            m.assertEqual(again[0].bodyText, stopJob.bodyText)
+            m.assertInvalid(playback.jobs.finish(state, "s-1:stop", "retry", 1200))
+            m.assertEqual(playback.jobs.nextWake(state), 3200)
+            playback.jobs.due(state, 3200, m.identity("p-1"))
+            m.assertEqual(playback.jobs.finish(state, "s-1:stop", "ok", 3300), { id: "s-1:stop", kind: "stop", reason: "done" })
+            m.assertEqual(state.queue, [])
+        end sub
+
+        @it("treats a stop answered 404 as done, and a progress 404 as an ended session")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.job("stop", "s-1", 4, "p-1"), 0)
+            playback.jobs.add(state, m.job("progress", "s-2", 3, "p-1"), 0)
+            playback.jobs.due(state, 0, m.identity("p-1"))
+            m.assertEqual(playback.jobs.finish(state, "s-1:stop", "notFound", 10).reason, "done")
+            m.assertEqual(playback.jobs.finish(state, "s-2:progress:3", "notFound", 10).reason, "session_ended")
+        end sub
+
+        @it("sends one job per session at a time, progress before its stop")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.job("progress", "s-1", 3, "p-1"), 0)
+            first = playback.jobs.due(state, 0, m.identity("p-1"))
+            playback.jobs.add(state, m.job("stop", "s-1", 4, "p-1"), 0)
+            m.assertEqual(m.ids(first), ["s-1:progress:3"])
+            m.assertEqual(playback.jobs.due(state, 10, m.identity("p-1")), [], "the stop waits for the sample in flight")
+            playback.jobs.finish(state, "s-1:progress:3", "ok", 20)
+            m.assertEqual(m.ids(playback.jobs.due(state, 20, m.identity("p-1"))), ["s-1:stop"])
+        end sub
+
+        @it("wakes for the first job of a session, not for a stop queued behind it")
+        sub _()
+            state = playback.jobs.create()
+            sample = m.job("progress", "s-1", 3, "p-1")
+            sample.uncertain = true
+            playback.jobs.add(state, sample, 100)
+            playback.jobs.add(state, m.job("stop", "s-1", 4, "p-1"), 100)
+            m.assertEqual(m.ids(playback.jobs.due(state, 100, m.identity("p-1"))), ["s-1:progress:3"])
+            ' The stop cannot go while the sample is in flight: only expiry wakes.
+            m.assertEqual(playback.jobs.due(state, 200, m.identity("p-1")), [])
+            m.assertEqual(playback.jobs.nextWake(state), 100 + playback.jobs.STOP_TTL_MS)
+            playback.jobs.finish(state, "s-1:progress:3", "offline", 200)
+            m.assertEqual(playback.jobs.nextWake(state), 1200, "the sample's retry, not the stop's past time")
+            ' Another session's first job still counts.
+            playback.jobs.add(state, m.job("stop", "s-2", 5, "p-1"), 300)
+            m.assertEqual(playback.jobs.nextWake(state), 300)
+        end sub
+
+        @it("still wakes to expire a job queued behind another")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.job("progress", "s-1", 3, "p-1"), 0)
+            playback.jobs.due(state, 0, m.identity("p-1"))
+            playback.jobs.finish(state, "s-1:progress:3", "offline", 0)
+            ' Behind the tried sample (retry at 1000), an untried one that
+            ' expires at 500.
+            playback.jobs.add(state, m.job("progress", "s-1", 4, "p-1"), 500 - playback.jobs.PROGRESS_TTL_MS)
+            m.assertEqual(playback.jobs.nextWake(state), 500)
+            m.assertEqual(m.ids(playback.jobs.expire(state, 500)), ["s-1:progress:4"])
+            m.assertEqual(playback.jobs.nextWake(state), 1000)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("sessions of one title")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        ' A job of the title c-1.
+        function titled(kind as String, sessionId as String, sequence as Dynamic) as Object
+            job = m.job(kind, sessionId, 1, "p-1")
+            job.sequence = sequence
+            job.fence.contentId = "c-1"
+            return job
+        end function
+
+        ' The fence of a progress post by profile's sessionId for contentId.
+        function post(contentId as String, sessionId as String, profile = "p-1" as String) as Object
+            fence = m.identity(profile)
+            fence.session = sessionId
+            fence.contentId = contentId
+            return fence
+        end function
+
+        @it("retires an older session's queued jobs once a newer session's position is queued")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.titled("stop", "s-1", 4), 0)
+            playback.jobs.due(state, 0, m.identity("p-1"))
+            playback.jobs.finish(state, "s-1:stop", "offline", 0)
+            other = m.job("stop", "s-9", 2, "p-1")
+            playback.jobs.add(state, other, 0)
+            ' A stop without a sample (a session that never played) retires nothing.
+            m.assertEqual(playback.jobs.add(state, m.titled("stop", "s-2", invalid), 10), [])
+            dropped = playback.jobs.add(state, m.titled("progress", "s-3", 7), 20)
+            m.assertEqual(dropped, [{ id: "s-1:stop", kind: "stop", reason: "superseded" }, { id: "s-2:stop", kind: "stop", reason: "superseded" }])
+            m.assertEqual(m.ids(state.queue), ["s-9:stop", "s-3:progress:1"], "another title's job stays")
+        end sub
+
+        @it("retires an older session's queued jobs once a newer session's progress is accepted")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.titled("stop", "s-1", 4), 0)
+            m.assertEqual(playback.jobs.supersede(state, m.post("c-2", "s-2"), "s-2", state.serial), [], "another title")
+            m.assertEqual(playback.jobs.supersede(state, m.post("c-1", "s-1"), "s-1", state.serial), [], "the same session")
+            m.assertEqual(playback.jobs.supersede(state, m.post("", "s-2"), "s-2", state.serial), [], "a session without a title")
+            m.assertEqual(playback.jobs.supersede(state, m.post("c-1", "s-2"), "s-2", state.serial), [{ id: "s-1:stop", kind: "stop", reason: "superseded" }])
+            m.assertEqual(state.queue, [])
+        end sub
+
+        @it("retires an older session's job that was in flight once it comes back for a retry")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.titled("stop", "s-1", 4), 0)
+            playback.jobs.due(state, 0, m.identity("p-1"))
+            playback.jobs.add(state, m.titled("stop", "s-2", 9), 10)
+            m.assertEqual(playback.jobs.finish(state, "s-1:stop", "offline", 20), { id: "s-1:stop", kind: "stop", reason: "superseded" })
+            m.assertEqual(m.ids(playback.jobs.due(state, 20, m.identity("p-1"))), ["s-2:stop"])
+
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.titled("stop", "s-1", 4), 0)
+            playback.jobs.due(state, 0, m.identity("p-1"))
+            m.assertEqual(playback.jobs.supersede(state, m.post("c-1", "s-2"), "s-2", state.serial), [], "s-1's stop is in flight")
+            m.assertEqual(playback.jobs.finish(state, "s-1:stop", "retry", 20).reason, "superseded", "a newer session's progress landed meanwhile")
+        end sub
+
+        @it("lets a late answer to an older session's post retire nothing")
+        sub _()
+            state = playback.jobs.create()
+            since = state.serial
+            playback.jobs.add(state, m.titled("stop", "s-2", 9), 10)
+            m.assertEqual(playback.jobs.supersede(state, m.post("c-1", "s-1"), "s-1", since), [], "s-2's position came after s-1's post was sent")
+            m.assertEqual(m.ids(state.queue), ["s-2:stop"])
+        end sub
+
+        @it("remembers the newest session of the 16 titles noted last")
+        sub _()
+            state = playback.jobs.create()
+            for i = 0 to playback.jobs.MAX_TITLES
+                job = m.titled("progress", "s-" + i.ToStr(), 1)
+                job.fence.contentId = "c-" + i.ToStr()
+                playback.jobs.add(state, job, 0)
+            end for
+            m.assertEqual(state.titles.Count(), playback.jobs.MAX_TITLES)
+            m.assertFalse(state.titles.DoesExist(playback.jobs.titleOf(m.post("c-0", "s-0"))))
+            m.assertEqual(state.titles[playback.jobs.titleOf(m.post("c-16", "s-16"))].session, "s-16")
+        end sub
+
+        @it("sends a newer session's job only after an older one's for the title answers")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.titled("stop", "s-1", 4), 0)
+            m.assertEqual(m.ids(playback.jobs.due(state, 0, m.identity("p-1"))), ["s-1:stop"])
+            ' In flight, the older stop is neither retired nor overtaken.
+            m.assertEqual(playback.jobs.add(state, m.titled("stop", "s-2", 9), 10), [])
+            m.assertEqual(playback.jobs.supersede(state, m.post("c-1", "s-2"), "s-2", state.serial), [], "s-1's stop is in flight")
+            m.assertEqual(playback.jobs.due(state, 20, m.identity("p-1")), [])
+            m.assertEqual(playback.jobs.nextWake(state), 10 + playback.jobs.STOP_TTL_MS, "no past retry time while it waits")
+            playback.jobs.finish(state, "s-1:stop", "ok", 30)
+            m.assertEqual(m.ids(playback.jobs.due(state, 30, m.identity("p-1"))), ["s-2:stop"])
+        end sub
+
+        ' c-1's job, like titled's, under another server, account, or profile.
+        function elsewhere(kind as String, sessionId as String, sequence as Dynamic, member as String, value as String) as Object
+            job = m.titled(kind, sessionId, sequence)
+            job.fence[member] = value
+            return job
+        end function
+
+        @it("keeps the same content under another server, account, or profile a title of its own (W9-2)")
+        sub _()
+            for each member in ["server", "account", "profile"]
+                state = playback.jobs.create()
+                playback.jobs.add(state, m.titled("stop", "s-new", 9), 0)
+                playback.jobs.due(state, 0, m.identity("p-1"))
+                playback.jobs.finish(state, "s-new:stop", "retry", 0)
+                old = m.elsewhere("stop", "s-old", 5, member, "other")
+                m.assertEqual(playback.jobs.add(state, old, 10), [], member + ": a position retires nothing of another identity")
+                m.assertEqual(playback.jobs.supersede(state, old.fence, "s-old", state.serial), [], member + ": nor does an accepted post")
+                m.assertEqual(m.ids(state.queue), ["s-new:stop", "s-old:stop"], member)
+                m.assertEqual(m.ids(playback.jobs.due(state, 1000, m.identity("p-1"))), ["s-new:stop"], member + ": the current stop still goes")
+            end for
+        end sub
+
+        @it("neither holds a current job behind another identity's in flight nor retires it when that one comes back (W9-2)")
+        sub _()
+            for each member in ["server", "account", "profile"]
+                state = playback.jobs.create()
+                old = m.elsewhere("stop", "s-old", 5, member, "other")
+                playback.jobs.add(state, old, 0)
+                oldIdentity = { server: old.fence.server, account: old.fence.account, profile: old.fence.profile }
+                m.assertEqual(m.ids(playback.jobs.due(state, 0, oldIdentity)), ["s-old:stop"])
+                playback.jobs.add(state, m.titled("stop", "s-new", 9), 10)
+                m.assertEqual(m.ids(playback.jobs.due(state, 10, m.identity("p-1"))), ["s-new:stop"], member + ": not held behind the old stop")
+                playback.jobs.finish(state, "s-new:stop", "retry", 20)
+                m.assertInvalid(playback.jobs.finish(state, "s-old:stop", "offline", 40), member + ": the newer stop is another title's")
+                m.assertEqual(m.ids(state.queue), ["s-old:stop", "s-new:stop"], member)
+            end for
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("bounds")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("keeps one tried sample, the latest untried one, and the stop per session")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.job("progress", "s-1", 3, "p-1"), 0)
+            playback.jobs.due(state, 0, m.identity("p-1"))
+            playback.jobs.finish(state, "s-1:progress:3", "offline", 10)
+            playback.jobs.add(state, m.job("progress", "s-1", 4, "p-1"), 20)
+            dropped = playback.jobs.add(state, m.job("progress", "s-1", 5, "p-1"), 30)
+            m.assertEqual(dropped, [{ id: "s-1:progress:4", kind: "progress", reason: "superseded" }])
+            m.assertEqual(m.ids(state.queue), ["s-1:progress:3", "s-1:progress:5"])
+            dropped = playback.jobs.add(state, m.job("stop", "s-1", 6, "p-1"), 40)
+            m.assertEqual(m.ids(dropped), ["s-1:progress:5"], "the stop's final sample is newer")
+            m.assertEqual(m.ids(state.queue), ["s-1:progress:3", "s-1:stop"])
+        end sub
+
+        @it("keeps a sample the player posted with an uncertain result ahead of the stop")
+        sub _()
+            state = playback.jobs.create()
+            sample = m.job("progress", "s-1", 3, "p-1")
+            sample.uncertain = true
+            playback.jobs.add(state, sample, 0)
+            m.assertEqual(playback.jobs.add(state, m.job("stop", "s-1", 4, "p-1"), 0), [], "the stop does not supersede it")
+            m.assertEqual(m.ids(playback.jobs.due(state, 0, m.identity("p-1"))), ["s-1:progress:3"])
+            m.assertEqual(playback.jobs.due(state, 0, m.identity("p-1")), [], "the stop waits for it")
+            playback.jobs.finish(state, "s-1:progress:3", "ok", 10)
+            m.assertEqual(m.ids(playback.jobs.due(state, 10, m.identity("p-1"))), ["s-1:stop"])
+        end sub
+
+        @it("keeps the first stop and nothing new behind it")
+        sub _()
+            state = playback.jobs.create()
+            first = m.job("stop", "s-1", 4, "p-1")
+            playback.jobs.add(state, first, 0)
+            second = m.job("stop", "s-1", 5, "p-1")
+            second.bodyText = "different"
+            m.assertEqual(playback.jobs.add(state, second, 10), [])
+            m.assertEqual(m.ids(playback.jobs.add(state, m.job("progress", "s-1", 6, "p-1"), 10)), ["s-1:progress:6"])
+            m.assertEqual(state.queue.Count(), 1)
+            m.assertEqual(state.queue[0].bodyText, first.bodyText)
+        end sub
+
+        @it("drops the oldest progress job when the queue is full")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.job("progress", "s-0", 1, "p-1"), 0)
+            for i = 1 to playback.jobs.MAX_JOBS - 1
+                playback.jobs.add(state, m.job("stop", "s-" + i.ToStr(), 1, "p-1"), 0)
+            end for
+            dropped = playback.jobs.add(state, m.job("stop", "s-99", 1, "p-1"), 0)
+            m.assertEqual(dropped, [{ id: "s-0:progress:1", kind: "progress", reason: "overflow" }])
+            m.assertEqual(state.queue.Count(), playback.jobs.MAX_JOBS)
+        end sub
+
+        @it("expires progress after 10 minutes and a stop after 30")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.job("progress", "s-1", 3, "p-1"), 0)
+            playback.jobs.add(state, m.job("stop", "s-2", 4, "p-1"), 0)
+            m.assertEqual(playback.jobs.expire(state, 599999), [])
+            m.assertEqual(playback.jobs.expire(state, 600000), [{ id: "s-1:progress:3", kind: "progress", reason: "expired" }])
+            m.assertEqual(playback.jobs.due(state, 1799999, m.identity("p-1")).Count(), 1)
+            playback.jobs.finish(state, "s-2:stop", "offline", 1799999)
+            m.assertEqual(playback.jobs.expire(state, 1800000), [{ id: "s-2:stop", kind: "stop", reason: "expired" }])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("identity fencing")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("never hands a job to another identity's credentials")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.job("stop", "s-1", 4, "p-1"), 0)
+            m.assertEqual(playback.jobs.due(state, 0, m.identity("p-2")), [])
+            m.assertEqual(playback.jobs.due(state, 0, { server: "srv-2", account: "acc-1", profile: "p-1" }), [])
+            m.assertEqual(playback.jobs.due(state, 0, m.identity("p-1")).Count(), 1)
+        end sub
+
+        @it("lets a pending stop finish before a profile change completes")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.job("stop", "s-1", 4, "p-1"), 0)
+            playback.jobs.add(state, m.job("progress", "s-2", 9, "p-2"), 0)
+            ' Settling the change to p-2: ApiTask still holds p-1's credentials.
+            m.assertEqual(playback.jobs.pending(state, m.identity("p-1")), 1)
+            m.assertEqual(m.ids(playback.jobs.due(state, 0, m.identity("p-1"))), ["s-1:stop"])
+            playback.jobs.finish(state, "s-1:stop", "ok", 500)
+            m.assertEqual(playback.jobs.pending(state, m.identity("p-1")), 0, "the change can complete")
+            m.assertEqual(m.ids(state.queue), ["s-2:progress:9"])
+        end sub
+
+        @it("releases what is left with a reason once settling times out")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.job("stop", "s-1", 4, "p-1"), 0)
+            playback.jobs.due(state, 0, m.identity("p-1"))
+            playback.jobs.finish(state, "s-1:stop", "offline", 100)
+            released = playback.jobs.release(state, m.identity("p-1"), "identity_changed")
+            m.assertEqual(released, [{ id: "s-1:stop", kind: "stop", reason: "identity_changed" }])
+            m.assertEqual(state.queue, [])
+        end sub
+
+        @it("drops jobs of an identity that is gone, but not one in flight")
+        sub _()
+            state = playback.jobs.create()
+            playback.jobs.add(state, m.job("stop", "s-1", 4, "p-1"), 0)
+            playback.jobs.add(state, m.job("stop", "s-2", 2, "p-1"), 0)
+            playback.jobs.add(state, m.job("progress", "s-3", 9, "p-2"), 0)
+            playback.jobs.due(state, 0, m.identity("p-1"))
+            playback.jobs.finish(state, "s-2:stop", "offline", 0)
+            released = playback.jobs.releaseOthers(state, m.identity("p-2"), "identity_changed")
+            m.assertEqual(released, [{ id: "s-2:stop", kind: "stop", reason: "identity_changed" }])
+            m.assertEqual(m.ids(state.queue), ["s-1:stop", "s-3:progress:9"], "s-1 is in flight")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("result kinds")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("maps statuses and Problem types to the reducers' result kinds")
+        sub _()
+            base = "https://siloserver.org/docs/api/v2/problems/"
+            m.assertEqual(playback.results.kind(0, invalid), "offline")
+            m.assertEqual(playback.results.kind(200, invalid), "ok")
+            m.assertEqual(playback.results.kind(201, invalid), "ok")
+            m.assertEqual(playback.results.kind(404, base + "not_found"), "notFound")
+            m.assertEqual(playback.results.kind(410, base + "playback_session_ended"), "ended")
+            m.assertEqual(playback.results.kind(409, base + "installation_changed"), "installationChanged")
+            m.assertEqual(playback.results.kind(409, "conflict"), "conflict")
+            m.assertEqual(playback.results.kind(409, base + "progress_conflict"), "progressConflict")
+            m.assertEqual(playback.results.kind(409, base + "idempotency_conflict"), "idempotencyConflict")
+            m.assertEqual(playback.results.kind(503, base + "dependency_unavailable"), "retry")
+            m.assertEqual(playback.results.kind(500, base + "internal_error"), "retry")
+            m.assertEqual(playback.results.kind(429, base + "rate_limited"), "retry")
+            m.assertEqual(playback.results.kind(401, base + "invalid_token"), "retry")
+            m.assertEqual(playback.results.kind(422, base + "validation_failed"), "rejected")
+            m.assertEqual(playback.results.kind(403, base + "profile_verification_required"), "rejected")
+            m.assertEqual(playback.results.kind(410, base + "client_upgrade_required"), "rejected")
+            m.assertEqual(playback.results.kind(501, base + "capability_unsupported"), "rejected")
+            m.assertEqual(playback.results.kind(409, invalid), "rejected", "a 409 without a Problem body")
+        end sub
+
+    end class
+
+end namespace

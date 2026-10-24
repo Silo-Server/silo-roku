@@ -1,0 +1,129 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/values.bs"
+
+' Marker ranges of the playing file version (spec section 9.8). Pure.
+' GET /api/v2/watch/{id} gives each version's marker_segments in source-time
+' order; a server without them (no marker_segments_v1) still gives the
+' version's single intro, credits, recap, and preview objects, which stand in.
+' A list here is { kind, start_seconds, end_seconds } AAs in source seconds,
+' sorted by start, then end, then kind, without zero, negative, or unknown
+' ranges. A kind may occur more than once: each occurrence is its own range,
+' and the gaps between them are never skipped. Positions are source seconds,
+' as playback.session keeps them; a range holds start <= position < end.
+namespace playback.markers
+    const INTRO = "intro"
+    const CREDITS = "credits"
+    const RECAP = "recap"
+    const PREVIEW = "preview"
+
+    ' The markers of the version with fileId (playback.intent.fromWatch's
+    ' fileId), or [] when the projection has no such version.
+    function fromWatch(detail as Dynamic, fileId as String) as Object
+        if not util.isObject(detail) or not playback.values.isArray(detail.versions) or fileId = "" then return []
+        for each version in detail.versions
+            if util.isObject(version) and util.text(version.file_id) = fileId then return fromVersion(version)
+        end for
+        return []
+    end function
+
+    ' A WatchFileVersion's marker_segments, else its legacy single markers.
+    function fromVersion(version as Object) as Object
+        if playback.values.isArray(version.marker_segments) then return parse(version.marker_segments)
+        legacy = []
+        for each kind in [INTRO, CREDITS, RECAP, PREVIEW]
+            single = version[kind]
+            if util.isObject(single) then legacy.Push({ kind: kind, start_seconds: single.start_seconds, end_seconds: single.end_seconds })
+        end for
+        return parse(legacy)
+    end function
+
+    ' MarkerOccurrence entries as a sorted list: an entry needs a known kind,
+    ' start_seconds >= 0, and end_seconds above it; other members are dropped.
+    function parse(segments as Dynamic) as Object
+        out = []
+        if not playback.values.isArray(segments) then return out
+        ' An insertion sort: a file has a handful of markers, and chained
+        ' SortBy calls did not keep the earlier keys' order under brs-node.
+        for each segment in segments
+            entry = occurrence(segment)
+            if entry <> invalid
+                i = out.Count()
+                out.Push(entry)
+                while i > 0 and before(entry, out[i - 1])
+                    out[i] = out[i - 1]
+                    i = i - 1
+                end while
+                out[i] = entry
+            end if
+        end for
+        return out
+    end function
+
+    function before(a as Object, b as Object) as Boolean
+        if a.start_seconds <> b.start_seconds then return a.start_seconds < b.start_seconds
+        if a.end_seconds <> b.end_seconds then return a.end_seconds < b.end_seconds
+        return a.kind < b.kind
+    end function
+
+    function occurrence(segment as Dynamic) as Dynamic
+        if not util.isObject(segment) then return invalid
+        kind = LCase(util.text(segment.kind))
+        if kind <> INTRO and kind <> CREDITS and kind <> RECAP and kind <> PREVIEW then return invalid
+        first = segment.start_seconds
+        last = segment.end_seconds
+        if not util.isNumber(first) or not util.isNumber(last) or first < 0 or last <= first then return invalid
+        return { kind: kind, start_seconds: playback.values.toDouble(first), end_seconds: playback.values.toDouble(last) }
+    end function
+
+    ' The occurrence of kind whose range holds position, or invalid. When
+    ' ranges of one kind overlap, the one that started last wins: it is the
+    ' range the viewer is in most recently.
+    function activeRange(markers as Object, kind as String, position as Dynamic) as Dynamic
+        if not util.isNumber(position) then return invalid
+        found = invalid
+        for each entry in markers
+            if entry.start_seconds > position then exit for
+            if entry.kind = kind and position < entry.end_seconds then found = entry
+        end for
+        return found
+    end function
+
+    function activeIntro(markers as Object, position as Dynamic) as Dynamic
+        return activeRange(markers, INTRO, position)
+    end function
+
+    ' The ranges of one kind, in order.
+    function ofKind(markers as Object, kind as String) as Object
+        out = []
+        for each entry in markers
+            if entry.kind = kind then out.Push(entry)
+        end for
+        return out
+    end function
+
+    ' Where Up Next opens: the start of the last credits range, or invalid
+    ' without one. Earlier credits ranges (a cold open's, a mid-episode
+    ' recap's end card) are drawn but do not open Up Next.
+    function creditsStart(markers as Object) as Dynamic
+        ranges = ofKind(markers, CREDITS)
+        if ranges.Count() = 0 then return invalid
+        return ranges[ranges.Count() - 1].start_seconds
+    end function
+
+    ' The scrubber's bands (spec section 5.7): intro, recap, and credits
+    ' ranges as new { kind, start_seconds, end_seconds } AAs. With a positive
+    ' runtime, ends are clamped to it (a range may end up to a second past
+    ' the file's whole-second duration) and ranges from it on are dropped.
+    function bands(markers as Object, runtime = invalid as Dynamic) as Object
+        out = []
+        limited = util.isNumber(runtime) and runtime > 0
+        for each entry in markers
+            if entry.kind <> PREVIEW and (not limited or entry.start_seconds < runtime)
+                last = entry.end_seconds
+                if limited and last > runtime then last = playback.values.toDouble(runtime)
+                out.Push({ kind: entry.kind, start_seconds: entry.start_seconds, end_seconds: last })
+            end if
+        end for
+        return out
+    end function
+end namespace

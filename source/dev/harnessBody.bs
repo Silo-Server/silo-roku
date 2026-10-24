@@ -1,0 +1,359 @@
+' Development-only transport harness: device probe and playback protocol v3 bodies.
+' The probe reads a roDeviceInfo-shaped facade, and the builders are pure, so
+' both run headless against recorded answers. Excluded from release builds.
+'
+' Signed-URL media mode (decision D-1): the client never sends
+' header_authenticated_media_v1 or authorized_media_origins_v1.
+namespace harness
+
+    ' Server prototype features (assumption A-13), not in the vendored v2
+    ' contract. A server without them may ignore or reject them.
+    const TS_COPY_REMUX_FEATURE = "hls_copy_mpegts_v1"
+    const NO_PLAYLIST_VARIABLES_FEATURE = "hls_no_variable_substitution_v1"
+
+    ' What the client advertises, switchable to steer the server legitimately:
+    ' originalHttp off forces a remux, hevcEac3 off forces an HEVC transcode and
+    ' E-AC-3 conversion, sidecarSubtitles off withholds sidecar_text. Two
+    ' prototype toggles, off by default: tsCopyRemux asks for MPEG-TS copy
+    ' remux segments (S-15), noPlaylistVariables for playlists without
+    ' #EXT-X-DEFINE (S-21). The last one is player-only: forwardQueryParams off
+    ' sets ForwardQueryStringParams false on the content (test H2), instead of
+    ' Roku's default.
+    function defaultToggles() as Object
+        return { originalHttp: true, hevcEac3: true, sidecarSubtitles: true, tsCopyRemux: false, noPlaylistVariables: false, forwardQueryParams: true }
+    end function
+
+    ' The prototype feature tokens the toggles add, for the overlay and console.
+    function prototypeFeatures(toggles as Object) as Object
+        features = []
+        if util.isTrue(toggles.tsCopyRemux) then features.Push(TS_COPY_REMUX_FEATURE)
+        if util.isTrue(toggles.noPlaylistVariables) then features.Push(NO_PLAYLIST_VARIABLES_FEATURE)
+        return features
+    end function
+
+    ' Live answers from `info` (roDeviceInfo) and `appInfo` (roAppInfo), kept as
+    ' raw facts so capabilities() can be tested against recorded devices.
+    ' Only documented HEVC levels are probed; higher strings wait for test H4.
+    function probeDevice(info as Object, appInfo as Object) as Object
+        hevcMain10Level = ""
+        for each level in ["5.1", "5.0", "4.1"]
+            if canDecodeVideo(info, { Codec: "hevc", Profile: "main 10", Level: level })
+                hevcMain10Level = level
+                exit for
+            end if
+        end for
+
+        display = info.GetDisplayProperties()
+        displayKnown = type(display) = "roAssociativeArray"
+        if not displayKnown then display = {}
+        os = info.GetOSVersion()
+        details = info.GetModelDetails()
+        manufacturer = "Roku"
+        if type(details) = "roAssociativeArray" and nonEmpty(details.VendorName) then manufacturer = details.VendorName
+
+        return {
+            model: info.GetModel(),
+            modelType: info.GetModelType(),
+            manufacturer: manufacturer,
+            osVersion: os.major + "." + os.minor + "." + os.revision,
+            videoMode: info.GetVideoMode(),
+            uiResolution: LCase(info.GetUIResolution().name),
+            mkv: appInfo.GetValue("requires_mkv") = "1",
+            appVersion: appInfo.GetVersion(),
+            appBuild: appInfo.GetValue("build_version"),
+            display: {
+                known: displayKnown,
+                hdr10: display.Hdr10 = true,
+                hlg: display.HLG = true,
+                hdr10Plus: display.Hdr10Plus = true,
+                dolbyVision: display.DolbyVision = true
+            },
+            video: {
+                h264High42: canDecodeVideo(info, { Codec: "mpeg4 avc", Profile: "high", Level: "4.2" }),
+                h264High41: canDecodeVideo(info, { Codec: "mpeg4 avc", Profile: "high", Level: "4.1" }),
+                h264Main: canDecodeVideo(info, { Codec: "mpeg4 avc", Profile: "main", Level: "4.1" }),
+                hevcMain: canDecodeVideo(info, { Codec: "hevc", Profile: "main" }),
+                hevcMain10Level: hevcMain10Level
+            },
+            audio: {
+                ac3: canDecodeAudioInBoth(info, "ac3"),
+                eac3: canDecodeAudioInBoth(info, "eac3"),
+                aacMultichannel: canDecodeAudio(info, { Codec: "aac", ChCnt: 6 })
+            }
+        }
+    end function
+
+    ' The capability half of start and replan bodies: client_features,
+    ' client_capabilities, and client_playback_context, shaped per Appendix A of
+    ' the implementation plan with every hardware gate except G1, G13, G14 off
+    ' (no Dolby Vision, no HDR10+, no DTS or lossless audio, no passthrough).
+    function capabilities(facts as Object, toggles as Object) as Object
+        videoDecode = []
+        h264 = h264Entry(facts.video)
+        if h264 <> invalid then videoDecode.Push(h264)
+        hevc = invalid
+        if toggles.hevcEac3 then hevc = hevcEntry(facts.video)
+        if hevc <> invalid then videoDecode.Push(hevc)
+
+        videoCodecs = []
+        maxHeight = 0
+        for each entry in videoDecode
+            videoCodecs.Push(entry.codec)
+            if entry.max_height > maxHeight then maxHeight = entry.max_height
+        end for
+        maxResolution = "1080p"
+        if maxHeight >= 2160 then maxResolution = "2160p"
+
+        surround = []
+        if facts.audio.ac3 then surround.Push("ac3")
+        if facts.audio.eac3 and toggles.hevcEac3 then surround.Push("eac3")
+        decodeAudio = ["aac", "mp3"]
+        decodeAudio.Append(surround)
+        hlsAudio = ["aac"]
+        hlsAudio.Append(surround)
+
+        containers = ["mp4"]
+        if facts.mkv then containers.Push("mkv")
+
+        ' HDR10 and HLG only with an HEVC Main 10 decoder and a 2160-line output.
+        lines = videoModeLines(facts.videoMode)
+        hdrAllowed = hevc <> invalid and lines >= 2160 and facts.display.known
+        hdr = hdrDetails(hdrAllowed and facts.display.hdr10, hdrAllowed and facts.display.hlg)
+        hdrTag = []
+        if hdr.hdr10 then hdrTag.Push("hdr10")
+        if hdr.hlg then hdrTag.Push("hlg")
+        if hdrTag.Count() = 0 then hdrTag.Push("sdr")
+
+        display = { hdr_evidence: "unknown", display_id: sinkName(facts) }
+        if facts.display.known
+            display.hdr_evidence = "exact"
+            ' The panel's own flags; Dolby Vision profiles stay empty until gate G5.
+            display.hdr_types = hdrDetails(facts.display.hdr10, facts.display.hlg)
+            display.hdr_types.hdr10_plus = facts.display.hdr10Plus
+        end if
+
+        subtitles = deliverySubtitles(toggles.sidecarSubtitles)
+        originalHttp = delivery(toggles.originalHttp, true, containers, videoCodecs, decodeAudio, subtitles, [])
+        originalHttp.hdr_details = hdrDetails(hdr.hdr10, hdr.hlg)
+        if not toggles.originalHttp then originalHttp.failure_reason = "disabled_by_dev_harness"
+        progressive = delivery(false, false, [], [], [], deliverySubtitles(false), [])
+        progressive.failure_reason = "disabled_pending_seekable_transport"
+        hlsFeatures = ["native_hls_playback_v1"]
+        if util.isTrue(toggles.tsCopyRemux) then hlsFeatures.Push(TS_COPY_REMUX_FEATURE)
+        hls = delivery(true, true, ["hls"], videoCodecs, hlsAudio, subtitles, hlsFeatures)
+
+        features = ["seek_reanchor_v1", "direct_stream_resume_v1"]
+        if toggles.sidecarSubtitles then features.Append(["subrip_sidecar_v1", "hls_subtitle_renditions_v1"])
+        if util.isTrue(toggles.noPlaylistVariables) then features.Push(NO_PLAYLIST_VARIABLES_FEATURE)
+
+        return {
+            client_features: features,
+            client_capabilities: {
+                video_evidence: "exact",
+                audio_evidence: "platform_attested",
+                codecs_video: videoCodecs,
+                codecs_video_hardware: videoCodecs,
+                codecs_audio: decodeAudio,
+                containers: containers,
+                max_resolution: maxResolution,
+                hdr: hdr.hdr10 or hdr.hlg,
+                hdr_details: hdr,
+                video_decode: videoDecode
+            },
+            client_playback_context: {
+                protocol_version: 3,
+                form_factor: "tv",
+                app_version: facts.appVersion,
+                app_build: facts.appBuild,
+                app_channel: "dev",
+                device: {
+                    platform: "roku",
+                    os_version: facts.osVersion,
+                    manufacturer: facts.manufacturer,
+                    model: facts.model,
+                    platform_details: { model_type: facts.modelType, video_mode: lines.ToStr() + "p", ui_resolution: facts.uiResolution }
+                },
+                output: {
+                    hdr_details: hdrDetails(hdr.hdr10, hdr.hlg),
+                    current_sink: sinkName(facts),
+                    sink_type: sinkName(facts),
+                    display: display,
+                    output_context_id: "roku:" + lines.ToStr() + ":" + hdrTag.Join(".") + ":" + hlsAudio.Join(".")
+                },
+                deliveries: { original_http: originalHttp, progressive: progressive, hls: hls }
+            }
+        }
+    end function
+
+    ' POST /api/v2/playback/start body. `request` holds installationId,
+    ' profileId, fileId, attemptId, and optionally startPosition (seconds),
+    ' audioTrackIndex (the file's audio ordinal), and subtitleTrackIndex (the
+    ' combined subtitle ordinal); omitted or negative ones are left to the
+    ' server. Protocol v3 selects a subtitle only from the request, never from
+    ' profile preferences, so without subtitleTrackIndex the plan has none.
+    function startBody(request as Object, caps as Object) as Object
+        body = {
+            installation_id: request.installationId,
+            protocol_version: 3,
+            client_features: caps.client_features,
+            file_id: request.fileId,
+            profile_id: request.profileId,
+            playback_attempt_id: request.attemptId,
+            quality_preference: "auto",
+            subtitle_fidelity_preference: "compatible",
+            client_capabilities: caps.client_capabilities,
+            client_playback_context: caps.client_playback_context
+        }
+        if isNumber(request.startPosition) then body.start_position = request.startPosition
+        if isNumber(request.audioTrackIndex) and request.audioTrackIndex >= 0 then body.audio_track_index = request.audioTrackIndex
+        if isNumber(request.subtitleTrackIndex) and request.subtitleTrackIndex >= 0 then body.subtitle_track_index = request.subtitleTrackIndex
+        return body
+    end function
+
+    ' POST /api/v2/playback/{session_id}/replan body. Echoes the current plan's
+    ' identity and tracks; `request` holds installationId, attemptId,
+    ' planAttemptId (minted when the plan was adopted), replanRequestId,
+    ' operation, position (source seconds), attemptedPlanKeys, attemptCount, and
+    ' failure (only for failure_recovery and seek_failure_recovery).
+    function replanBody(request as Object, plan as Object, caps as Object) as Object
+        position = request.position
+        if position < 0 then position = 0
+        body = {
+            installation_id: request.installationId,
+            protocol_version: 3,
+            operation: request.operation,
+            replan_request_id: request.replanRequestId,
+            playback_attempt_id: request.attemptId,
+            failed_plan_id: plan.plan_id,
+            plan_attempt_id: request.planAttemptId,
+            plan_attempt_key: plan.plan_attempt_key,
+            attempted_plan_keys: request.attemptedPlanKeys,
+            attempt_count: request.attemptCount,
+            position_seconds: position,
+            quality_preference: "auto",
+            selected_tracks: selectedTracks(plan.selected_tracks),
+            client_features: caps.client_features,
+            client_capabilities: caps.client_capabilities,
+            client_playback_context: caps.client_playback_context
+        }
+        if request.failure <> invalid then body.failure = request.failure
+        return body
+    end function
+
+    function progressBody(installationId as String, sequence as Integer, position as Float, isPaused as Boolean) as Object
+        if position < 0 then position = 0
+        return { installation_id: installationId, sequence: sequence, position: position, is_paused: isPaused }
+    end function
+
+    ' DELETE /api/v2/playback/{session_id} body; `stopId` is minted once per
+    ' session and reused on every retry.
+    function stopBody(installationId as String, stopId as String, sequence as Integer, position as Float, isPaused as Boolean) as Object
+        body = progressBody(installationId, sequence, position, isPaused)
+        body.stop_id = lowerUuid(stopId)
+        return body
+    end function
+
+    ' The plan's track identities, copied member by member so nothing the
+    ' replan schema does not know is echoed back.
+    function selectedTracks(tracks as Object) as Object
+        result = {}
+        if tracks = invalid then return result
+        for each kind in ["audio", "subtitle"]
+            track = tracks[kind]
+            if track <> invalid and nonEmpty(track.id)
+                identity = { id: track.id }
+                if isNumber(track.index) then identity.index = track.index
+                result[kind] = identity
+            end if
+        end for
+        return result
+    end function
+
+    function h264Entry(video as Object) as Object
+        entry = { codec: "h264", hardware: true, bit_depths: [8], max_width: 1920, max_height: 1080 }
+        if video.h264High42
+            entry.append({ profiles: ["constrained baseline", "main", "high"], levels: [42], max_frame_rate: 60 })
+        else if video.h264High41
+            entry.append({ profiles: ["constrained baseline", "main", "high"], levels: [41], max_frame_rate: 30 })
+        else if video.h264Main
+            entry.append({ profiles: ["constrained baseline", "main"], levels: [41], max_frame_rate: 30 })
+        else
+            return invalid
+        end if
+        return entry
+    end function
+
+    ' HEVC Main 10 at the highest documented level that answered yes, with the
+    ' size and frame rate that level allows (levels in ffprobe units, level x 30).
+    function hevcEntry(video as Object) as Object
+        bounds = {
+            "5.1": { level: 153, width: 3840, height: 2160, fps: 60 },
+            "5.0": { level: 150, width: 3840, height: 2160, fps: 30 },
+            "4.1": { level: 123, width: 1920, height: 1080, fps: 60 }
+        }
+        bound = bounds[video.hevcMain10Level]
+        if bound = invalid then return invalid
+        profiles = ["main 10"]
+        if video.hevcMain then profiles = ["main", "main 10"]
+        return { codec: "hevc", hardware: true, profiles: profiles, levels: [bound.level], bit_depths: [8, 10], max_width: bound.width, max_height: bound.height, max_frame_rate: bound.fps }
+    end function
+
+    function delivery(enabled as Boolean, supported as Boolean, containers as Object, videoCodecs as Object, audioCodecs as Object, subtitles as Object, features as Object) as Object
+        return {
+            enabled: enabled,
+            supported_on_device: supported,
+            containers: containers,
+            video_codecs: videoCodecs,
+            audio_decode_codecs: audioCodecs,
+            audio_passthrough_codecs: [],
+            subtitles: subtitles,
+            features: features,
+            auth_header_refresh: false,
+            validated_claims: [],
+            transformations: []
+        }
+    end function
+
+    function deliverySubtitles(sidecarText as Boolean) as Object
+        return { embedded_text: false, sidecar_text: sidecarText, ass_styling: false, embedded_bitmap: false, sidecar_bitmap: false, font_attachments: false }
+    end function
+
+    function hdrDetails(hdr10 as Boolean, hlg as Boolean) as Object
+        return { hdr10: hdr10, hdr10_plus: false, hlg: hlg, dolby_vision_profiles: [] }
+    end function
+
+    ' Lines of a Roku video mode ("2160p60b10" -> 2160), ignoring refresh rate
+    ' and range suffixes so playback's own mode switches do not change it.
+    function videoModeLines(mode as String) as Integer
+        digits = ""
+        for i = 1 to Len(mode)
+            character = Mid(mode, i, 1)
+            if not isDigits(character) then exit for
+            digits = digits + character
+        end for
+        if digits = "" then return 0
+        return digits.ToInt()
+    end function
+
+    function sinkName(facts as Object) as String
+        if facts.modelType = "TV" then return "builtin"
+        return "hdmi"
+    end function
+
+    function canDecodeVideo(info as Object, query as Object) as Boolean
+        answer = info.CanDecodeVideo(query)
+        return type(answer) = "roAssociativeArray" and answer.result = true
+    end function
+
+    function canDecodeAudio(info as Object, query as Object) as Boolean
+        answer = info.CanDecodeAudio(query)
+        return type(answer) = "roAssociativeArray" and answer.result = true
+    end function
+
+    ' AC-3 and E-AC-3 count only when the current output can play them from
+    ' both containers the client advertises (PassThru unset: Roku or sink).
+    function canDecodeAudioInBoth(info as Object, codec as String) as Boolean
+        return canDecodeAudio(info, { Codec: codec, Container: "mp4" }) and canDecodeAudio(info, { Codec: codec, Container: "mkv" })
+    end function
+
+end namespace

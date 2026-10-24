@@ -1,0 +1,404 @@
+import "pkg:/components/theme/helpers.bs"
+
+namespace tests
+
+    ' The Options panel built headless, through an OptionsPanelProbe
+    ' (tests/components/OptionsPanelProbe.bs), so its scripts run: the tab
+    ' pills, the columns each tab draws, the Quality picker, its keys, and
+    ' the choice a row reports. How it looks on a TV is a device check.
+    @suite("options panel")
+    class OptionsPanelTests extends rooibos.BaseTestSuite
+
+        function model(overrides = {} as Object) as Object
+            data = tests.sessions.fixture("playback_start_opaque_ids").playback_plan
+            data.available_qualities = [{ label: "1080p-medium", display_name: "1080p", bitrate_kbps: 8000, preserves_source: false }, { label: "720p", bitrate_kbps: 3000 }]
+            data.selected_tracks.audio = { id: "file:42:audio:1", index: 1 }
+            state = {
+                plan: data,
+                version: { resolution: "1080p", audio_tracks: [{ language: "eng", codec: "eac3", channels: 6, default: true }, { language: "jpn", codec: "aac", channels: 2 }] },
+                quality: "auto",
+                switching: false,
+                captionMode: "Off",
+                modelType: "STB",
+                autoplay: true,
+                episode: true,
+                info: { series: "Severance", title: "Pilot", tag: "S1 · E1" },
+                stats: playback.player.statsColumns(data, false, {})
+            }
+            state.Append(overrides)
+            return playback.options.model(state, playback.options.words(i18n.load("en_US")))
+        end function
+
+        ' The model on a Roku TV (four caption modes), with the plan's first
+        ' subtitle track copied count times.
+        function trackModel(count as Integer) as Object
+            data = tests.sessions.fixture("playback_start_opaque_ids").playback_plan
+            first = data.subtitle.inventory[0]
+            inventory = []
+            for i = 0 to count - 1
+                entry = {}
+                entry.Append(first)
+                entry.track_id = "file:42:subtitle:" + i.ToStr()
+                entry.combined_index = i
+                inventory.Push(entry)
+            end for
+            data.subtitle.inventory = inventory
+            return m.model({ plan: data, modelType: "TV" })
+        end function
+
+        ' The model with count qualities, q0 to q{count - 1}, the one at
+        ' active playing under its own preference.
+        function qualityModel(count as Integer, active as Integer) as Object
+            data = tests.sessions.fixture("playback_start_opaque_ids").playback_plan
+            data.available_qualities = []
+            for i = 0 to count - 1
+                data.available_qualities.Push({ label: "q" + i.ToStr(), bitrate_kbps: 1000 * (count - i) })
+            end for
+            data.active_quality = "q" + active.ToStr()
+            return m.model({ plan: data, quality: data.active_quality })
+        end function
+
+        ' Each visible row lies whole within the column's 305 px, and each
+        ' other row would cross its top or foot.
+        sub assertWholeRows(column as Object)
+            for each row in column.rows
+                top = row.y - column.scroll
+                inside = top >= 0 and top + row.height <= 305
+                m.assertEqual(row.visible, inside, row.label + " at " + top.ToStr())
+            end for
+        end sub
+
+        function panel(model as Object) as Object
+            theme.install()
+            node = CreateObject("roSGNode", "OptionsPanelProbe")
+            node.model = model
+            return node
+        end function
+
+        function tabs(node as Object) as Object
+            out = []
+            for each group in node.findNode("tabs").getChildren(-1, 0)
+                if group.visible
+                    for each part in group.getChildren(-1, 0)
+                        if part.subtype() = "Label" then out.Push(part.text)
+                    end for
+                end if
+            end for
+            return out
+        end function
+
+        function view(node as Object) as Object
+            return node.callFunc("probeList", invalid)
+        end function
+
+        ' Each column's row labels.
+        function rowLabels(node as Object) as Object
+            out = []
+            for each column in m.view(node).columns
+                labels = []
+                for each row in column.rows
+                    labels.Push(row.label)
+                end for
+                out.Push(labels)
+            end for
+            return out
+        end function
+
+        ' The labels of the lit rows, in every column.
+        function lit(node as Object) as Object
+            out = []
+            for each column in m.view(node).columns
+                for each row in column.rows
+                    if row.lit then out.Push(row.label)
+                end for
+            end for
+            return out
+        end function
+
+        sub press(node as Object, key as String, times = 1 as Integer)
+            for i = 1 to times
+                node.callFunc("probeKey", key)
+            end for
+        end sub
+
+        @describe("OptionsPanel")
+
+        @it("centres the tab pills at y 92 over a 1100 by 380 panel, the active one white (tvOS)")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "info"
+            m.assertEqual(m.tabs(node), ["Info", "Stats", "Video", "Audio", "Subtitles"])
+            groups = node.findNode("tabs").getChildren(-1, 0)
+            first = groups[0]
+            last = groups[4]
+            right = Int(last.translation[0] + last.getChild(0).width)
+            m.assertEqual(Int(first.translation[1]), 92)
+            m.assertTrue(Abs((Int(first.translation[0]) + right) - 1920) <= 1, "centred")
+            m.assertEqual(first.getChild(0).blendColor, &hFFFFFFFF)
+            m.assertFalse(first.getChild(1).visible, "the active pill has no outline")
+            m.assertTrue(groups[1].getChild(1).visible)
+            panel = node.findNode("panel")
+            m.assertEqual([Int(panel.translation[0]), Int(panel.translation[1]), Int(panel.width), Int(panel.height)], [410, 152, 1100, 380])
+            m.assertEqual(node.bottom, 532)
+            m.assertEqual(node.current, "info")
+            m.assertTrue(m.view(node).tabFocus)
+        end sub
+
+        @it("lays a tab out in columns under uppercase headers, Info's and Stats' without rows")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "info"
+            columns = m.view(node).columns
+            m.assertEqual([columns[0].title, columns[1].title], ["Title", "Stream"])
+            m.assertEqual(columns[0].header, theme.tracked("TITLE"))
+            m.assertEqual([Int(columns[0].x), Int(columns[1].x), columns[0].width], [0, 546, 498], "two shares of 1044 px, 48 apart")
+            m.assertEqual(columns[0].texts, ["SEVERANCE", "Pilot", "S1 · E1"])
+            m.assertEqual(columns[0].rows, [])
+            m.press(node, "down")
+            m.assertTrue(m.view(node).tabFocus, "nothing to enter")
+            m.press(node, "right")
+            m.assertEqual(node.current, "stats")
+            m.assertEqual(m.view(node).columns[1].texts[0], "Offset")
+        end sub
+
+        @it("fixes Subtitles' columns at 470 and 440 px, 58 apart, with Tracks then Captions")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "subtitles"
+            columns = m.view(node).columns
+            m.assertEqual([Int(columns[0].x), columns[0].width, Int(columns[1].x), columns[1].width], [0, 470, 528, 440])
+            m.assertEqual(m.rowLabels(node), [["Off", "English", "English", "French", "Japanese", "Spanish"], ["Off", "On", "On replay"]])
+            m.assertEqual([columns[0].rows[1].height, columns[0].rows[0].height], [72, 48], "two lines with attributes, one without")
+        end sub
+
+        @it("enters a tab's first column on the row that holds now, and OK reports the row shown lit")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "audio"
+            m.assertFalse(node.picker)
+            m.press(node, "down")
+            m.assertTrue(node.picker)
+            m.assertTrue(m.view(node).listFocus)
+            m.assertEqual(m.lit(node), ["Japanese"])
+            m.press(node, "up")
+            m.assertEqual(m.lit(node), ["English"])
+            m.press(node, "OK")
+            m.assertEqual(node.choice, { kind: "audio", value: 0 })
+            m.press(node, "up")
+            m.assertTrue(m.view(node).tabFocus, "Up from the top row returns to the tabs")
+            m.assertFalse(node.picker)
+            m.assertEqual(m.lit(node), [])
+        end sub
+
+        @it("moves between columns with Left and Right, saying a column's header as focus enters it")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "subtitles"
+            m.press(node, "down")
+            m.assertEqual(m.lit(node), ["Off"])
+            m.press(node, "right")
+            m.assertEqual(m.lit(node), ["Off"])
+            m.assertEqual(m.view(node).columns[1].rows[0].lit, true, "Captions' Off")
+            m.press(node, "down")
+            m.assertEqual(m.lit(node), ["On"])
+            m.press(node, "left")
+            m.assertEqual(m.view(node).columns[0].rows[1].lit, true, "the nearest row")
+            m.press(node, "left")
+            m.assertEqual(m.view(node).columns[0].rows[1].lit, true, "no column further left")
+        end sub
+
+        @it("scrolls a column a row at a time to keep the focused row in view, showing whole rows only (run 26)")
+        sub _()
+            node = m.panel(m.trackModel(9))
+            node.tab = "subtitles"
+            column = m.view(node).columns[0]
+            m.assertWholeRows(column)
+            m.assertEqual([column.rows[3].visible, column.rows[4].visible], [true, false], "Off and three tracks fit; the fourth would be cut")
+            m.press(node, "down")
+            m.press(node, "down", 4)
+            column = m.view(node).columns[0]
+            m.assertTrue(column.rows[4].lit)
+            m.assertEqual(column.scroll, column.rows[1].y, "one row up")
+            m.assertWholeRows(column)
+            m.press(node, "down", 5)
+            column = m.view(node).columns[0]
+            last = column.rows[column.rows.Count() - 1]
+            m.assertTrue(last.lit)
+            m.assertWholeRows(column)
+            m.assertTrue(last.visible)
+            m.press(node, "up", 9)
+            column = m.view(node).columns[0]
+            m.assertEqual(Int(column.scroll), 0)
+            m.assertWholeRows(column)
+        end sub
+
+        @it("ends Info's overview on the whole lines left, which Roku ellipsizes (run 26)")
+        sub _()
+            model = m.model({ info: { series: "Severance", title: "Pilot", tag: "S1 · E1", year: 2022, runtime: "57 min", overview: string(40, "Mark leads a team of office workers. ") } })
+            node = m.panel(model)
+            node.tab = "info"
+            column = m.view(node).columns[0]
+            m.assertEqual(column.texts[column.texts.Count() - 1], string(40, "Mark leads a team of office workers. "))
+            labels = []
+            for each label in node.findNode("pane").getChild(0).getChild(1).getChild(0).getChildren(-1, 0)
+                if label.subtype() = "Label" and label.visible then labels.Push(label)
+            end for
+            overview = labels[labels.Count() - 1]
+            m.assertEqual([overview.wrap, overview.maxLines, overview.displayPartialLines], [true, 0, false], "Roku keeps the lines that fit whole")
+            m.assertEqual(Int(overview.translation[1] + overview.height), 305, "to the column's foot")
+            for i = 0 to labels.Count() - 2
+                m.assertTrue(labels[i].translation[1] + labels[i].boundingRect().height <= overview.translation[1], "the lines above stand clear")
+            end for
+        end sub
+
+        @it("opens the Quality picker on the row that holds, over the dimmed pane, and Back closes it first")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "video"
+            m.press(node, "down")
+            m.assertEqual(m.lit(node), ["Quality"])
+            m.press(node, "OK")
+            view = m.view(node)
+            m.assertTrue(view.picker.visible)
+            m.assertEqual(view.picker.title, "Quality")
+            m.assertEqual(view.picker.rows, [{ label: "Auto", checked: true, lit: true, check: &h000000FF }, { label: "1080p (8 Mbps)", checked: false, lit: false, check: invalid }, { label: "720p (3 Mbps)", checked: false, lit: false, check: invalid }], "the lit row that holds keeps its check, in black")
+            m.assertEqual(view.dim, 0.28)
+            m.assertInvalid(node.choice, "opening it chooses nothing")
+            m.press(node, "back")
+            m.assertFalse(m.view(node).picker.visible)
+            m.assertFalse(node.closed, "the panel stays")
+            m.assertEqual(m.view(node).dim, 1.0)
+            m.press(node, "OK")
+            m.press(node, "down")
+            m.press(node, "OK")
+            m.assertEqual(node.choice, { kind: "quality", value: "1080p-medium" })
+            m.assertFalse(m.view(node).picker.visible, "a choice closes it")
+            m.assertEqual(m.lit(node), ["Quality"])
+        end sub
+
+        @it("keeps the Quality picker inside the panel, under the tabs, with whole rows (run 26)")
+        sub _()
+            for each count in [2, 10]
+                node = m.panel(m.qualityModel(count, 0))
+                node.tab = "video"
+                m.press(node, "down")
+                m.press(node, "OK")
+                picker = m.view(node).picker
+                shown = count + 1
+                if shown > 4 then shown = 4
+                m.assertEqual(Int(picker.listHeight), shown * 56 - 4, count.ToStr() + " qualities: whole 52 px rows, 4 apart")
+                m.assertEqual(Int(picker.height), 28 + 36 + 18 + Int(picker.listHeight) + 28)
+                m.assertEqual(Int(picker.x), 650, "centred on the panel")
+                m.assertTrue(picker.y >= 152 + 22 and picker.y + picker.height <= 532 - 22, "inside the panel's padding, clear of the tabs (y 92 to 138)")
+                m.assertEqual(Int(2 * picker.y + picker.height), 2 * 174 + 336, "centred in it")
+            end for
+        end sub
+
+        @it("opens a long Quality picker with the row that holds near its middle, and scrolls a row at a time")
+        sub _()
+            node = m.panel(m.qualityModel(10, 5))
+            node.tab = "video"
+            m.press(node, "down")
+            m.press(node, "OK")
+            picker = m.view(node).picker
+            m.assertEqual(picker.rows[6].label, "q5 (5 Mbps)")
+            m.assertTrue(picker.rows[6].lit and picker.rows[6].checked)
+            m.assertEqual(Int(picker.scroll), 5 * 56, "q5 second of the four rows shown")
+            m.press(node, "down", 3)
+            m.assertEqual(Int(m.view(node).picker.scroll), 6 * 56, "q8 last of the four")
+            m.press(node, "down", 5)
+            m.assertEqual(Int(m.view(node).picker.scroll), 7 * 56, "the last four, q6 to q9")
+            node = m.panel(m.qualityModel(10, 9))
+            node.tab = "video"
+            m.press(node, "down")
+            m.press(node, "OK")
+            m.assertEqual(Int(m.view(node).picker.scroll), 7 * 56, "the last row that holds opens the last four")
+        end sub
+
+        @it("toggles Auto-play next in SYNC")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "video"
+            m.press(node, "down")
+            m.press(node, "right")
+            m.assertEqual(m.lit(node), ["Auto-play next"])
+            m.press(node, "OK")
+            m.assertEqual(node.choice, { kind: "autoplay", value: false })
+        end sub
+
+        @it("closes with the first Back, from the columns or the tabs (run 22)")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "subtitles"
+            m.press(node, "down")
+            m.assertTrue(node.callFunc("probeKey", "back"))
+            m.assertTrue(node.closed)
+            node = m.panel(m.model())
+            node.tab = "info"
+            m.assertTrue(node.callFunc("probeKey", "back"))
+            m.assertTrue(node.closed)
+        end sub
+
+        @it("returns to the row last focused in a tab, and keeps the tab and row when the model changes")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "subtitles"
+            m.press(node, "down")
+            m.press(node, "down", 2)
+            m.assertEqual(m.lit(node), ["English"])
+            m.assertEqual(m.view(node).columns[0].rows[2].lit, true)
+            node.tab = "audio"
+            node.tab = "subtitles"
+            m.assertTrue(m.view(node).tabFocus)
+            m.press(node, "down")
+            m.assertEqual(m.view(node).columns[0].rows[2].lit, true, "the row last focused")
+            node.model = m.model({ captionMode: "On" })
+            m.assertEqual(node.current, "subtitles")
+            m.assertEqual(m.view(node).columns[0].rows[2].lit, true, "kept across the model")
+            m.assertTrue(m.view(node).listFocus)
+        end sub
+
+        @it("keeps the tab shown by its key when Audio comes or goes, and gives a dropped tab's place to the next (P-14)")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "subtitles"
+            node.model = m.model({ version: { resolution: "1080p", audio_tracks: [] } })
+            m.assertEqual(m.tabs(node), ["Info", "Stats", "Video", "Subtitles"])
+            m.assertEqual(node.current, "subtitles")
+            node.tab = "video"
+            node.model = m.model()
+            m.assertEqual(node.current, "video")
+            node.tab = "audio"
+            node.model = m.model({ version: { resolution: "1080p", audio_tracks: [] } })
+            m.assertEqual(node.current, "subtitles", "the tab that takes its place")
+        end sub
+
+        @it("reports the columns' focus as its picker")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "video"
+            m.assertFalse(node.picker)
+            m.press(node, "down")
+            m.assertTrue(node.picker)
+            m.press(node, "OK")
+            m.assertTrue(node.picker, "the Quality picker too")
+            m.press(node, "back")
+            m.press(node, "up")
+            m.assertFalse(node.picker)
+        end sub
+
+        @it("reuses its nodes as the tabs change")
+        sub _()
+            node = m.panel(m.model())
+            node.tab = "subtitles"
+            for each key in ["left", "left", "left", "left", "right", "right", "right", "right"]
+                m.press(node, key)
+            end for
+            before = tests.countNodes(node)
+            for each key in ["left", "left", "left", "left", "right", "right", "right", "right"]
+                m.press(node, key)
+            end for
+            m.assertEqual(tests.countNodes(node), before)
+        end sub
+    end class
+end namespace

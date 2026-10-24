@@ -1,0 +1,223 @@
+namespace tests
+
+    @suite("catalog requests")
+    class CatalogRequestsTests extends rooibos.BaseTestSuite
+
+        ' Every builder once, with the server operation it calls.
+        function built() as Object
+            browse = catalog.request.browse({ libraryId: "12", type: "movie", sort: "-added_at", namePrefix: "B" }, "c1", 40, false)
+            return [
+                ["listUserLibraries", catalog.request.libraries()]
+                ["listHomeSections", catalog.request.homeSections(false)]
+                ["getHomeSectionItems", catalog.request.homeSectionItems("continue_watching", true)]
+                ["listLibrarySections", catalog.request.librarySections("12", false)]
+                ["getLibrarySectionItems", catalog.request.librarySectionItems("12", "recently_added", false)]
+                ["listCatalogItems", catalog.request.sectionPage("library", "recently_added", "12", "c2", 40, false)]
+                ["listCatalogItems", browse]
+                ["listCatalogItems", catalog.request.search("heat", catalog.searchScope.ALL, true, "", 40, false)]
+                ["listCatalogItems", catalog.request.continued(browse, "c9", 200, catalog.kind.SKIP)]
+                ["getCatalogSearchCapabilities", catalog.request.searchCapabilities()]
+                ["getCatalogItem", catalog.request.item("movie:heat-1995", "12", false)]
+                ["listSeriesSeasons", catalog.request.seasons("series:severance", "12")]
+                ["listSeasonEpisodes", catalog.request.episodes("series:severance", 1, "")]
+                ["getWatchState", catalog.request.resume("movie:heat-1995")]
+                ["getWatchState", catalog.request.watch("episode:severance-s01e02")]
+                ["getAudioPreference", catalog.request.audioPreference("series:severance")]
+                ["getBranding", catalog.request.branding()]
+            ]
+        end function
+
+        ' Whether path fits an OpenAPI path template such as /a/{id}/b.
+        function fits(path as String, template as String) as Boolean
+            parts = path.Split("/")
+            pattern = template.Split("/")
+            if parts.Count() <> pattern.Count() then return false
+            for i = 0 to parts.Count() - 1
+                if Left(pattern[i], 1) = "{"
+                    if parts[i] = "" then return false
+                else if parts[i] <> pattern[i]
+                    return false
+                end if
+            end for
+            return true
+        end function
+
+        @describe("the server contract (catalog-operations.json)")
+
+        @it("calls each operation's path with only its declared query parameters, in range")
+        sub _()
+            operations = tests.catalogData.operations()
+            for each entry in m.built()
+                operation = operations[entry[0]]
+                request = entry[1]
+                m.assertTrue(m.fits(request.path, operation.path), request.path + " is not " + operation.path)
+                m.assertEqual(operation.method, "GET")
+                for each name in request.query
+                    declared = operation.query[name]
+                    m.assertNotInvalid(declared, entry[0] + " has no query parameter " + name)
+                    value = request.query[name]
+                    if declared.minimum <> invalid then m.assertTrue(value >= declared.minimum and value <= declared.maximum, name)
+                    if declared["enum"] <> invalid then m.assertArrayContains(declared["enum"], value, invalid, name)
+                end for
+            end for
+        end sub
+
+        @it("remembers a detail page's tracks with the preference operations, as the profile")
+        sub _()
+            operations = tests.catalogData.operations()
+            writes = [
+                ["updateAudioPreference", catalog.request.savePreference("audio", "series:severance", { audio_track_index: 1 })]
+                ["deleteAudioPreference", catalog.request.savePreference("audio", "movie:heat-1995", invalid)]
+                ["updateSubtitlePreference", catalog.request.savePreference("subtitle", "series:severance", { subtitle_track_index: -1, subtitle_mode: "off" })]
+                ["deleteSubtitlePreference", catalog.request.savePreference("subtitle", "series:severance", invalid)]
+            ]
+            for each entry in writes
+                operation = operations[entry[0]]
+                request = entry[1]
+                m.assertTrue(m.fits(request.path, operation.path), request.path + " is not " + operation.path)
+                m.assertEqual([request.method, request.auth, request.lane], [operation.method, "profile", "interactive"], entry[0])
+                m.assertEqual(request.DoesExist("body"), operation.method = "PUT", entry[0])
+                m.assertEqual(request.orderKey, request.path, entry[0] + ": one line per kind and key (api.router.order)")
+            end for
+            read = catalog.request.audioPreference("series:severance")
+            m.assertEqual(read.orderKey, catalog.request.savePreference("audio", "series:severance", invalid).orderKey, "the read waits behind the key's writes")
+        end sub
+
+        @it("reads as the profile, except public branding")
+        sub _()
+            for each entry in m.built()
+                expected = "profile"
+                if entry[0] = "getBranding" then expected = "none"
+                m.assertEqual(entry[1].auth, expected, entry[0])
+                m.assertNotInvalid(entry[1].map.kind, entry[0])
+            end for
+        end sub
+
+        @describe("builders")
+
+        @it("asks for artwork at the card and hero sizes, smaller heroes on the low tier")
+        sub _()
+            standard = catalog.request.homeSections(false)
+            m.assertEqual(standard.query, { poster_width: 202, backdrop_width: 1229, logo_width: 880 })
+            m.assertEqual(standard.map, { kind: catalog.kind.ROWS })
+            m.assertEqual(catalog.request.homeSectionItems("next_up", true).query.backdrop_width, 819)
+            m.assertEqual(catalog.request.item("movie:a", "", false).query, { poster_width: 202, backdrop_width: 1229, logo_width: 650 })
+            m.assertEqual(catalog.request.episodes("series:a", 2, "").query, { still_width: 389 })
+        end sub
+
+        @it("keeps content IDs' colons in the path and escapes the rest")
+        sub _()
+            m.assertEqual(catalog.request.item("movie:heat-1995", "", false).path, "/api/v2/catalog/items/movie:heat-1995")
+            m.assertEqual(catalog.request.homeSectionItems("a b/c", false).path, "/api/v2/home/sections/a%20b%2Fc/items")
+            m.assertEqual(catalog.request.episodes("series:severance", 0, "3").path, "/api/v2/catalog/series/series:severance/seasons/0/episodes")
+        end sub
+
+        @it("pages a section through /catalog with its scope, library, and cursor")
+        sub _()
+            request = catalog.request.sectionPage("home", "next_up", "", "", 40, false)
+            m.assertEqual(request.query.source, "section")
+            m.assertEqual(request.query.scope, "home")
+            m.assertEqual(request.query.section_id, "next_up")
+            m.assertEqual(request.query.limit, 40)
+            m.assertAANotHasKeys(request.query, ["library_id", "cursor"])
+            m.assertEqual(request.map.kind, catalog.kind.ROW)
+            library = catalog.request.sectionPage("library", "s", "12", "abc", 20, false)
+            m.assertEqual(library.query.library_id, "12")
+            m.assertEqual(library.query.cursor, "abc")
+        end sub
+
+        @it("sends only the browse options given, and the cursor after the first page")
+        sub _()
+            first = catalog.request.browse({ libraryId: "12", sort: "title", namePrefix: "" }, "", 40, false)
+            m.assertEqual(first.path, "/api/v2/catalog")
+            m.assertEqual(first.query.library_id, "12")
+            m.assertEqual(first.query.sort, "title")
+            m.assertEqual(first.query.limit, 40)
+            m.assertAANotHasKeys(first.query, ["name_prefix", "type", "cursor"])
+            m.assertEqual(first.map.kind, catalog.kind.PAGE)
+            m.assertEqual(catalog.request.browse({}, "next", 40, false).query.cursor, "next")
+        end sub
+
+        @it("continues a /catalog request from another cursor, without nodes when skipping")
+        sub _()
+            first = catalog.request.browse({ libraryId: "12", sort: "-year" }, "c1", 40, false)
+            skip = catalog.request.continued(first, "c5", 200, catalog.kind.SKIP)
+            m.assertEqual(skip.query.cursor, "c5")
+            m.assertEqual(skip.query.limit, 200)
+            m.assertEqual(skip.query.sort, "-year")
+            m.assertEqual(skip.map.kind, catalog.kind.SKIP)
+            m.assertEqual(first.query.cursor, "c1")
+            fromStart = catalog.request.continued(first, "", 42, catalog.kind.PAGE)
+            m.assertAANotHasKey(fromStart.query, "cursor")
+        end sub
+
+        @it("searches episodes too in All when the server can (spec section 8.1)")
+        sub _()
+            m.assertEqual(catalog.request.search("heat", catalog.searchScope.ALL, true, "", 40, false).query.type, "video_with_episodes")
+            m.assertEqual(catalog.request.search("heat", catalog.searchScope.ALL, false, "", 40, false).query.type, "video")
+            m.assertEqual(catalog.request.search("heat", catalog.searchScope.MOVIES, true, "", 40, false).query.type, "movie")
+            m.assertEqual(catalog.request.search("heat", catalog.searchScope.SERIES, true, "", 40, false).query.type, "series")
+            request = catalog.request.search("  heat  ", catalog.searchScope.ALL, true, "", 40, false)
+            m.assertEqual(request.query.q, "heat")
+            m.assertEqual(request.query.source, "query")
+        end sub
+
+        @it("cuts a search query to 200 characters")
+        sub _()
+            long = string(250, "a")
+            m.assertEqual(Len(catalog.request.search(long, catalog.searchScope.ALL, true, "", 40, false).query.q), 200)
+        end sub
+
+        @it("tags search results' episodes, and keeps the map options on later pages")
+        sub _()
+            first = catalog.request.search("heat", catalog.searchScope.ALL, true, "", 40, false)
+            m.assertEqual(first.map, { kind: catalog.kind.PAGE, episodeTags: true })
+            later = catalog.request.continued(first, "c2", 40, catalog.kind.SKIP)
+            m.assertEqual(later.map, { kind: catalog.kind.SKIP, episodeTags: true })
+            m.assertEqual(first.map.kind, catalog.kind.PAGE)
+            m.assertEqual(later.query.q, "heat")
+        end sub
+
+        @it("reads seasons as text only and sends no library without one")
+        sub _()
+            m.assertEqual(catalog.request.seasons("series:a", "").query, { include_artwork: false })
+            m.assertEqual(catalog.request.seasons("series:a", "4").query.library_id, "4")
+        end sub
+
+        @describe("sort and alphabet rail (spec section 5.5)")
+
+        @it("sends descending sorts with a leading minus")
+        sub _()
+            m.assertEqual(catalog.sort.param("title", false), "title")
+            m.assertEqual(catalog.sort.param("added_at", true), "-added_at")
+        end sub
+
+        @it("reverses the active sort and starts others in their default direction")
+        sub _()
+            title = { field: "title", descending: false }
+            m.assertEqual(catalog.sort.choose(title, "title"), { field: "title", descending: true })
+            m.assertEqual(catalog.sort.choose(title, "added_at"), { field: "added_at", descending: true })
+            m.assertEqual(catalog.sort.choose({ field: "year", descending: true }, "title"), { field: "title", descending: false })
+            m.assertEqual(catalog.sort.choose(title, "bogus"), title)
+        end sub
+
+        @it("lists the seven sorts with Android TV's fields")
+        sub _()
+            fields = []
+            for each option in catalog.sort.options()
+                fields.Push(option[1])
+            end for
+            m.assertEqual(fields, ["title", "added_at", "release_date", "year", "rating_imdb", "runtime", "resolution"])
+        end sub
+
+        @it("offers All, #, and A to Z")
+        sub _()
+            letters = catalog.sort.letters()
+            m.assertEqual(letters.Count(), 28)
+            m.assertEqual(letters[0], "")
+            m.assertEqual(letters[1], "#")
+            m.assertEqual(letters[2], "A")
+            m.assertEqual(letters[27], "Z")
+        end sub
+    end class
+end namespace

@@ -1,0 +1,264 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/util/values.bs"
+
+' The app's registry section (plan section 4.3, spec sections 7.2 to 7.4).
+' Main() reads one snapshot before the scene starts and hands it to ApiTask,
+' which is the only writer afterwards. A record is:
+'   version        the layout it was read from (VERSION, or newer)
+'   origin         the configured server base URL, or ""
+'   deviceId       the installation ID sent as X-Silo-Device-Id; "" until
+'                  ApiTask generates it, once
+'   accountId      the signed-in account, kept when a session expires so the
+'                  same account resumes its remembered profile
+'   accessToken, refreshToken   both "" when signed out
+'   expiresAt      when the access token expires, in wall-clock seconds
+'   refreshAt      when ApiTask refreshes it ahead of expiry, likewise
+'   profileId      the last profile the viewer chose on this device, or ""
+'   profileTokens  [{ id, token }], oldest first: X-Profile-Token values the
+'                  current login session verified
+' Each value is stored as a string under its KEYS name. A value over its byte
+' bound is not stored, which keeps the section under BUDGET_BYTES.
+namespace storage
+    const SECTION_NAME = "silo"
+    ' Layout version. A layout change bumps it and adds a step to migrations(),
+    ' so an app update never signs the viewer out (spec section 7.2).
+    const VERSION = 1
+    ' Roku gives an app 32 KB of registry; the section keeps to half of it.
+    const BUDGET_BYTES = 16384
+    const MAX_PROFILE_TOKENS = 6
+    ' Byte bounds per stored value. Token bounds follow the contract's 4096-byte
+    ' refresh_token limit; profile tokens are short opaque strings.
+    const MAX_ORIGIN_BYTES = 1024
+    const MAX_ID_BYTES = 128
+    const MAX_TOKEN_BYTES = 4096
+    const MAX_PROFILE_TOKEN_BYTES = 512
+    const MAX_PROFILE_TOKENS_BYTES = 4096
+    const MAX_SECONDS_BYTES = 10
+    ' Every key this module writes; write() never touches others, such as keys
+    ' a newer layout added.
+    const KEYS = "schema|origin|device|account|access_token|refresh_token|expires_at|refresh_at|profile|profile_tokens"
+
+    ' The record of a fresh install.
+    function empty() as Object
+        return { version: VERSION, origin: "", deviceId: "", accountId: "", accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileId: "", profileTokens: [] }
+    end function
+
+    ' Reads the section and decodes it (Main, before the scene starts).
+    function load(section as Object) as Object
+        return decode(read(section))
+    end function
+
+    ' The section's values by key.
+    function read(section as Object) as Object
+        raw = {}
+        for each key in section.GetKeyList()
+            raw[key] = section.Read(key)
+        end for
+        return raw
+    end function
+
+    ' The record a raw section holds, after migrating it to VERSION. Values that
+    ' do not validate are dropped one by one; tokens survive only as a pair,
+    ' with their server.
+    function decode(raw as Object) as Object
+        upgraded = migrate(raw, migrations(), VERSION)
+        record = empty()
+        record.version = versionOf(upgraded)
+        if record.version < VERSION then record.version = VERSION
+        origin = api.request.baseUrl(upgraded.origin)
+        if origin <> invalid and origin = upgraded.origin and fits(origin, MAX_ORIGIN_BYTES) then record.origin = origin
+        if isDeviceId(upgraded.device) then record.deviceId = upgraded.device
+        record.accountId = boundedText(upgraded.account, MAX_ID_BYTES)
+        record.profileId = boundedText(upgraded.profile, MAX_ID_BYTES)
+        if record.origin = ""
+            record.accountId = ""
+            record.profileId = ""
+            return record
+        end if
+        access = boundedText(upgraded.access_token, MAX_TOKEN_BYTES)
+        refresh = boundedText(upgraded.refresh_token, MAX_TOKEN_BYTES)
+        if access = "" or refresh = "" then return record
+        record.accessToken = access
+        record.refreshToken = refresh
+        record.expiresAt = seconds(upgraded.expires_at)
+        record.refreshAt = seconds(upgraded.refresh_at)
+        record.profileTokens = decodeProfileTokens(upgraded.profile_tokens)
+        return record
+    end function
+
+    ' The raw section for a record: strings by key, empty values left out.
+    function encode(record as Object) as Object
+        layout = VERSION
+        if util.isNumber(record.version) and record.version > VERSION then layout = record.version
+        raw = { schema: layout.ToStr() }
+        put(raw, "origin", record.origin, MAX_ORIGIN_BYTES)
+        put(raw, "device", record.deviceId, MAX_ID_BYTES)
+        put(raw, "account", record.accountId, MAX_ID_BYTES)
+        put(raw, "profile", record.profileId, MAX_ID_BYTES)
+        put(raw, "access_token", record.accessToken, MAX_TOKEN_BYTES)
+        put(raw, "refresh_token", record.refreshToken, MAX_TOKEN_BYTES)
+        if not raw.DoesExist("access_token") or not raw.DoesExist("refresh_token")
+            raw.Delete("access_token")
+            raw.Delete("refresh_token")
+            return raw
+        end if
+        if util.isNumber(record.expiresAt) and record.expiresAt > 0 then raw.expires_at = record.expiresAt.ToStr()
+        if util.isNumber(record.refreshAt) and record.refreshAt > 0 then raw.refresh_at = record.refreshAt.ToStr()
+        tokens = encodeProfileTokens(record.profileTokens)
+        if tokens <> "" then raw.profile_tokens = tokens
+        return raw
+    end function
+
+    ' Writes the raw section's changed keys, deletes the managed keys it lacks,
+    ' and flushes. Gives whether the flush succeeded.
+    function write(section as Object, raw as Object) as Boolean
+        for each key in KEYS.Split("|")
+            if raw.DoesExist(key)
+                if not section.Exists(key) or section.Read(key) <> raw[key] then section.Write(key, raw[key])
+            else if section.Exists(key)
+                section.Delete(key)
+            end if
+        end for
+        return section.Flush()
+    end function
+
+    ' The bytes a raw section takes: its keys and values as UTF-8.
+    function bytes(raw as Object) as Integer
+        total = 0
+        for each key in raw
+            total = total + byteLength(key) + byteLength(util.text(raw[key]))
+        end for
+        return total
+    end function
+
+    ' The most the section can hold: every managed key with a value at its bound.
+    function maxBytes() as Integer
+        values = { schema: MAX_SECONDS_BYTES, origin: MAX_ORIGIN_BYTES, device: MAX_ID_BYTES, account: MAX_ID_BYTES, profile: MAX_ID_BYTES, access_token: MAX_TOKEN_BYTES, refresh_token: MAX_TOKEN_BYTES, expires_at: MAX_SECONDS_BYTES, refresh_at: MAX_SECONDS_BYTES, profile_tokens: MAX_PROFILE_TOKENS_BYTES }
+        total = 0
+        for each key in KEYS.Split("|")
+            total = total + Len(key) + values[key]
+        end for
+        return total
+    end function
+
+    ' X-Silo-Device-Id (spec section 7.4): letters, digits, ".", "_", ":", and
+    ' "-", at most 128 characters.
+    function isDeviceId(value as Dynamic) as Boolean
+        if not util.isString(value) or value = "" or Len(value) > MAX_ID_BYTES then return false
+        for i = 1 to Len(value)
+            c = Asc(Mid(value, i, 1))
+            letterOrDigit = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+            if not letterOrDigit and c <> 46 and c <> 95 and c <> 58 and c <> 45 then return false
+        end for
+        return true
+    end function
+
+    ' Each step upgrades a raw section from version `from` to from + 1 with
+    ' run(raw), carrying every session value forward. VERSION 1 is the first
+    ' layout, so there are none yet.
+    function migrations() as Object
+        return []
+    end function
+
+    ' Upgrades raw one step at a time to version target. A section without a
+    ' schema key is version 1. A newer section is left alone: later layouts add
+    ' keys and never change what an existing key means, so its known keys still
+    ' read. Without a step for some version, the section is kept as it is.
+    function migrate(raw as Object, steps as Object, target as Integer) as Object
+        out = {}
+        out.Append(raw)
+        layout = versionOf(out)
+        while layout < target
+            found = invalid
+            for each candidate in steps
+                if candidate.from = layout then found = candidate
+            end for
+            if found = invalid then return out
+            out = found.run(out)
+            layout = layout + 1
+            out.schema = layout.ToStr()
+        end while
+        return out
+    end function
+
+    function versionOf(raw as Object) as Integer
+        value = raw.schema
+        if not util.isString(value) or value = "" or Len(value) > 4 or not isDigits(value) then return 1
+        return value.ToInt()
+    end function
+
+    function decodeProfileTokens(text as Dynamic) as Object
+        out = []
+        if not util.isString(text) or Left(text, 1) <> "[" then return out
+        list = ParseJson(text)
+        if type(list) <> "roArray" then return out
+        for each entry in list
+            if util.isObject(entry)
+                id = boundedText(entry.id, MAX_ID_BYTES)
+                token = boundedText(entry.token, MAX_PROFILE_TOKEN_BYTES)
+                if id <> "" and token <> "" then out.Push({ id: id, token: token })
+            end if
+        end for
+        while out.Count() > MAX_PROFILE_TOKENS
+            out.Shift()
+        end while
+        return out
+    end function
+
+    ' The newest MAX_PROFILE_TOKENS valid entries as JSON within
+    ' MAX_PROFILE_TOKENS_BYTES, dropping the oldest first; "" for none.
+    function encodeProfileTokens(list as Dynamic) as String
+        kept = []
+        if type(list) = "roArray"
+            for each entry in list
+                if util.isObject(entry) and boundedText(entry.id, MAX_ID_BYTES) <> "" and boundedText(entry.token, MAX_PROFILE_TOKEN_BYTES) <> "" then kept.Push({ id: entry.id, token: entry.token })
+            end for
+        end if
+        while kept.Count() > MAX_PROFILE_TOKENS
+            kept.Shift()
+        end while
+        while kept.Count() > 0
+            text = FormatJson(kept)
+            if byteLength(text) <= MAX_PROFILE_TOKENS_BYTES then return text
+            kept.Shift()
+        end while
+        return ""
+    end function
+
+    sub put(raw as Object, key as String, value as Dynamic, limit as Integer)
+        text = boundedText(value, limit)
+        if text <> "" then raw[key] = text
+    end sub
+
+    ' value when it is a non-empty string within limit bytes, otherwise "".
+    function boundedText(value as Dynamic, limit as Integer) as String
+        if not util.isString(value) or not fits(value, limit) then return ""
+        return value
+    end function
+
+    function fits(text as String, limit as Integer) as Boolean
+        return Len(text) <= limit and byteLength(text) <= limit
+    end function
+
+    ' Whole seconds from digits, at most 2147483647; anything else gives 0.
+    function seconds(value as Dynamic) as Integer
+        if not util.isString(value) or value = "" or Len(value) > MAX_SECONDS_BYTES or not isDigits(value) then return 0
+        if Len(value) = MAX_SECONDS_BYTES and value > "2147483647" then return 0
+        return value.ToInt()
+    end function
+
+    function isDigits(text as String) as Boolean
+        for i = 1 to Len(text)
+            c = Asc(Mid(text, i, 1))
+            if c < 48 or c > 57 then return false
+        end for
+        return true
+    end function
+
+    function byteLength(text as String) as Integer
+        if text = "" then return 0
+        buffer = CreateObject("roByteArray")
+        buffer.FromAsciiString(text)
+        return buffer.Count()
+    end function
+end namespace

@@ -1,0 +1,455 @@
+namespace tests
+
+    @suite("playback sidecars")
+    class PlaybackSidecarsTests extends rooibos.BaseTestSuite
+
+        ' The fixture plan: subtitles off, and an inventory of English (VTT),
+        ' English Signs (ASS), Japanese (PGS), French (burn-in only), and
+        ' Spanish (VTT).
+        function plan() as Object
+            return tests.sessions.fixture("playback_start_opaque_ids").playback_plan
+        end function
+
+        function planWith(subtitle as Object) as Object
+            plan = m.plan()
+            plan.subtitle.Append(subtitle)
+            return plan
+        end function
+
+        function ids(tracks as Object) as Object
+            out = []
+            for each track in tracks
+                out.Push(track.trackId)
+            end for
+            return out
+        end function
+
+        function track(trackId as String, state as String, selected = false as Boolean) as Object
+            return { trackId: trackId, state: state, selected: selected, path: "tmp:/subtitles/" + trackId + ".srt" }
+        end function
+
+        @describe("offered")
+
+        @it("offers the inventory's text sidecars while captions are off and none is selected")
+        sub _()
+            tracks = playback.sidecars.offered(m.plan(), "https://silo.example", "Off")
+            m.assertEqual(m.ids(tracks), ["file:42:subtitle:0", "file:42:subtitle:1", "file:42:subtitle:4"])
+            m.assertEqual(tracks[0], { trackId: "file:42:subtitle:0", url: "https://silo.example/api/v2/stream/11111111-1111-4111-8111-111111111111/subtitles/0.vtt?file_id=42&external_subtitle_key=f903db1c5624c46c4a2c20f2fd8cd247fc0d46e6471c91d4ddb651ae4e039448", format: "vtt", language: "eng", label: "English", shiftSeconds: tests.dbl(0), selected: false, cacheKey: "" })
+            m.assertEqual([tracks[1].format, tracks[1].label], ["ass", "English (Signs)"])
+        end sub
+
+        @it("offers nothing with none selected while captions are on, since Roku would pick one")
+        sub _()
+            m.assertEqual(playback.sidecars.offered(m.plan(), "https://silo.example", "On"), [])
+            m.assertEqual(playback.sidecars.offered(m.plan(), "https://silo.example", "Instant replay"), [])
+        end sub
+
+        @it("puts the selected sidecar first, from the plan's artifact, then the others")
+        sub _()
+            plan = m.planWith({ mode: "render", track_id: "file:42:subtitle:4", artifact: { url: "/api/v2/stream/s/subtitles/4.srt?file_id=42", format: "srt" } })
+            tracks = playback.sidecars.offered(plan, "https://silo.example", "On")
+            m.assertEqual(m.ids(tracks), ["file:42:subtitle:4", "file:42:subtitle:0", "file:42:subtitle:1"])
+            m.assertEqual([tracks[0].url, tracks[0].format, tracks[0].selected, tracks[0].label], ["https://silo.example/api/v2/stream/s/subtitles/4.srt?file_id=42", "srt", true, "Spanish (downloaded)"])
+            m.assertFalse(tracks[1].selected)
+        end sub
+
+        @it("keeps to MAX_TRACKS and the configured origin")
+        sub _()
+            plan = m.plan()
+            inventory = []
+            for i = 0 to 5
+                inventory.Push({ track_id: "t" + i.ToStr(), delivery: "sidecar", url: "/s/" + i.ToStr() + ".vtt", language: "eng", label: "" })
+            end for
+            inventory[0].url = "https://proxy.example/s/0.vtt"
+            plan.subtitle.inventory = inventory
+            m.assertEqual(m.ids(playback.sidecars.offered(plan, "https://silo.example", "Off")), ["t1", "t2", "t3", "t4"])
+        end sub
+
+        @it("asks WebVTT for the plan's offset and shifts SRT and ASS itself")
+        sub _()
+            plan = m.planWith({ mode: "render", track_id: "file:42:subtitle:4", artifact: { url: "/s/4.srt", format: "srt" } })
+            plan.timeline.timeline_offset_seconds = 600
+            tracks = playback.sidecars.offered(plan, "https://silo.example", "On")
+            m.assertEqual(tracks[0].shiftSeconds, tests.dbl(600))
+            m.assertTrue(tracks[1].url.EndsWith("&timestamp_offset=-600"), tracks[1].url)
+            m.assertEqual(tracks[1].shiftSeconds, tests.dbl(0))
+            m.assertEqual(tracks[2].shiftSeconds, tests.dbl(600))
+        end sub
+
+        @it("offers nothing more when the stream carries the subtitles")
+        sub _()
+            m.assertEqual(playback.sidecars.offered(m.planWith({ mode: "burn_in", track_id: "file:42:subtitle:3" }), "https://silo.example", "Off"), [])
+            m.assertEqual(playback.sidecars.offered(m.planWith({ mode: "hls_rendition", track_id: "file:42:subtitle:0", artifact: { url: "/s/0.vtt", format: "vtt" } }), "https://silo.example", "Off"), [])
+            plan = m.plan()
+            plan.Delete("subtitle")
+            m.assertEqual(playback.sidecars.offered(plan, "https://silo.example", "Off"), [])
+        end sub
+
+        @it("reads a sidecar's format from its path")
+        sub _()
+            m.assertEqual(playback.sidecars.formatOf("/s/0.VTT?file_id=42#x"), "vtt")
+            m.assertEqual(playback.sidecars.formatOf("https://silo.example/s/1.ssa"), "ass")
+            m.assertEqual(playback.sidecars.formatOf("/s/2.srt"), "srt")
+            m.assertEqual(playback.sidecars.formatOf("/s/2.sup"), "")
+            m.assertEqual(playback.sidecars.formatOf("/s.v2/track"), "")
+            m.assertEqual(playback.sidecars.formatOf(invalid), "")
+        end sub
+
+        @describe("sameMedia")
+
+        @it("matches a plan that changes only the subtitle and where it starts")
+        sub _()
+            before = m.plan()
+            after = m.planWith({ mode: "render", track_id: "file:42:subtitle:4", artifact: { url: "/s/4.srt", format: "srt" } })
+            after.plan_id = "plan:other"
+            after.timeline.player_start_seconds = 300
+            after.timeline.source_start_seconds = 300
+            m.assertTrue(playback.sidecars.sameMedia(before, after))
+            m.assertTrue(playback.sidecars.sameMedia(after, before))
+        end sub
+
+        ' A signed-URL session's consecutive plans for one original
+        ' (hardware run 5, test 1e): Off, English, then Off again. Each replan
+        ' is a new plan_id and plan_attempt_key, starts where it was asked,
+        ' and carries a newly signed st token (other issue and expiry times).
+        function signedPlans() as Object
+            sid = "11111111-1111-4111-8111-111111111111"
+            off = m.plan()
+            off.stream.url = "/api/v2/stream/" + sid + "?st=eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3OTI2NjQwMDAsImV4cCI6MTc5Mjc1MDQwMH0.c2lnbmF0dXJlLTE"
+            english = m.planWith({ mode: "render", track_id: "file:42:subtitle:0", artifact: { url: "/api/v2/stream/" + sid + "/subtitles/0.srt?file_id=42&original=1", format: "srt" } })
+            english.plan_id = "plan:8f2c1a"
+            english.plan_attempt_key = "v3:2b7e91"
+            english.stream.url = "/api/v2/stream/" + sid + "?st=eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3OTI2NjQwNDIsImV4cCI6MTc5Mjc1MDQ0Mn0.c2lnbmF0dXJlLTI"
+            english.timeline.source_start_seconds = 836.4
+            english.timeline.player_start_seconds = 836.4
+            offAgain = m.plan()
+            offAgain.plan_id = "plan:5d0e77"
+            offAgain.plan_attempt_key = "v3:c41f09"
+            offAgain.stream.url = "/api/v2/stream/" + sid + "?st=eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3OTI2NjQwNTgsImV4cCI6MTc5Mjc1MDQ1OH0.c2lnbmF0dXJlLTM"
+            offAgain.timeline.source_start_seconds = 852.9
+            offAgain.timeline.player_start_seconds = 852.9
+            return [off, english, offAgain]
+        end function
+
+        @it("matches consecutive plans of a signed-URL session whose st token is renewed")
+        sub _()
+            plans = m.signedPlans()
+            m.assertTrue(playback.sidecars.sameMedia(plans[0], plans[1]), "Off to English")
+            m.assertTrue(playback.sidecars.sameMedia(plans[1], plans[2]), "English to Off")
+        end sub
+
+        @it("still tells apart a signed stream with another seek or session")
+        sub _()
+            plans = m.signedPlans()
+            before = plans[0]
+            after = plans[1]
+            after.stream.url = after.stream.url + "&seek=836.4"
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "a progressive remux restarted elsewhere")
+            after = m.signedPlans()[1]
+            after.stream.url = after.stream.url.Replace("11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222")
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "another session")
+        end sub
+
+        ' A signed-URL session's consecutive plans for one original routed
+        ' through a proxy node (hardware run 22, T3): Off, English, then Off
+        ' again. Each direct-play URL ends in a newly signed path token
+        ' (other issue and expiry times), on the same node.
+        function proxyPlans() as Object
+            plans = m.signedPlans()
+            tokens = ["eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3OTI2NjQwMDB9.c2lnLTE", "eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3OTI2NjQwNDJ9.c2lnLTI", "eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3OTI2NjQwNTh9.c2lnLTM"]
+            for i = 0 to plans.Count() - 1
+                plans[i].stream.url = "https://proxy.example/stream/direct/" + tokens[i]
+            end for
+            return plans
+        end function
+
+        @it("matches consecutive plans of an original on a proxy node whose path token is renewed (run 22, T3)")
+        sub _()
+            plans = m.proxyPlans()
+            m.assertTrue(playback.sidecars.sameMedia(plans[0], plans[1]), "Off to English")
+            m.assertTrue(playback.sidecars.sameMedia(plans[1], plans[2]), "English to Off")
+        end sub
+
+        @it("tells apart a proxy-routed plan with another node, route, audio, or file")
+        sub _()
+            before = m.proxyPlans()[0]
+            after = m.proxyPlans()[1]
+            after.stream.url = after.stream.url.Replace("proxy.example", "proxy-2.example")
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "another proxy node")
+            after = m.proxyPlans()[1]
+            after.stream.url = "/api/v2/stream/11111111-1111-4111-8111-111111111111?st=eyJhbGciOiJIUzI1NiJ9.e30.c2ln"
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "the configured origin")
+            after = m.proxyPlans()[1]
+            after.selected_tracks.audio = { id: "file:42:audio:1", index: 1 }
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "another audio track")
+            after = m.proxyPlans()[1]
+            after.effective_media_file_id = "43"
+            after.source.media_file_id = "43"
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "another file")
+            after = m.proxyPlans()[1]
+            after.delivery = "server_remux_progressive"
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "a remux of it")
+            ' A proxy's remux keeps its token in the comparison: the server
+            ' replaces the remux job behind a new one.
+            before.delivery = "server_remux_progressive"
+            before.stream.url = "https://proxy.example/stream/remux/eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjF9.c2ln"
+            after.stream.url = "https://proxy.example/stream/remux/eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjJ9.c2ln"
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "a remux token renewed")
+        end sub
+
+        @it("names each check a plan fails, for the player's log, and none for the same media (run 23)")
+        sub _()
+            plans = m.proxyPlans()
+            m.assertEqual(playback.sidecars.mediaDifferences(plans[0], plans[1]), [], "the same node, a renewed token")
+            after = m.proxyPlans()[1]
+            after.stream.url = after.stream.url.Replace("proxy.example", "proxy-2.example")
+            m.assertEqual(playback.sidecars.mediaDifferences(plans[0], after), ["stream_origin"], "round-robin's next node")
+            after = m.proxyPlans()[1]
+            after.stream.url = "https://proxy.example/stream/remux/tok"
+            after.delivery = "server_remux_progressive"
+            m.assertEqual(playback.sidecars.mediaDifferences(plans[0], after), ["delivery", "stream_path"])
+            after = m.proxyPlans()[1]
+            after.selected_tracks.audio = { id: "file:42:audio:1", index: 1 }
+            after.timeline.timeline_offset_seconds = 4
+            after.subtitle = { mode: "burn_in", track_id: "file:42:subtitle:2" }
+            m.assertEqual(playback.sidecars.mediaDifferences(plans[0], after), ["audio", "timeline_offset_seconds", "subtitle_mode"])
+            after = m.proxyPlans()[1]
+            after.Delete("stream")
+            after.Delete("timeline")
+            m.assertEqual(playback.sidecars.mediaDifferences(plans[0], after), ["stream", "timeline"])
+        end sub
+
+        ' What a subtitle-only track_change changes in a proxied original's
+        ' plan on the server (silo-server's prepareIdentityTransportV3 and
+        ' NewPlanExpiryV3, read for run 23): the path token, expires_at,
+        ' plan_id and key, where it starts, and the subtitle decision; never
+        ' the sidecar URLs, which carry no token of the plan's.
+        @it("matches a proxied original's subtitle-only replan as the server builds it")
+        sub _()
+            before = m.proxyPlans()[0]
+            before.expires_at = "2026-10-24T19:50:00Z"
+            after = m.proxyPlans()[1]
+            after.expires_at = "2026-10-24T19:51:44Z"
+            after.timeline.source_start_seconds = 755.088
+            after.timeline.player_start_seconds = 755.088
+            after.claims = { subtitles: { reason: "sidecar_text", ass_styling_preserved: false } }
+            m.assertEqual(playback.sidecars.mediaDifferences(before, after), [])
+        end sub
+
+        @it("tells apart another stream, timeline mapping, audio track, or subtitles in the stream")
+        sub _()
+            before = m.plan()
+            after = m.plan()
+            after.stream.url = after.stream.url + "?v=2"
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "url")
+            after = m.plan()
+            after.delivery = "server_remux_hls"
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "delivery")
+            after = m.plan()
+            after.timeline.timeline_offset_seconds = 10
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "offset")
+            after = m.plan()
+            after.selected_tracks.audio = { id: "file:42:audio:1", index: 1 }
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "audio")
+            m.assertFalse(playback.sidecars.sameMedia(before, m.planWith({ mode: "burn_in", track_id: "file:42:subtitle:3" })), "burn-in")
+            after = m.plan()
+            after.Delete("stream")
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "no stream")
+        end sub
+
+        ' An original without audio in a signed-URL session (W8-2): the
+        ' server selects no audio, and the URL names the session, not the file.
+        function audioless(fileId as String, token as String) as Object
+            plan = m.plan()
+            plan.selected_tracks = {}
+            plan.effective_recipe = { video_codec: "h264", width: 1920, height: 1080, frame_rate: 23.976023976023978, bitrate_kbps: 8000, dynamic_range: "sdr" }
+            plan.source = { media_file_id: fileId, duration_seconds: 7200, container: "mp4", video_codec: "h264", hdr10_plus: false, dv_enhancement_layer: "none" }
+            plan.effective_media_file_id = fileId
+            plan.requested_media_file_id = "42"
+            plan.stream.url = "/api/v2/stream/s-1?st=" + token
+            return plan
+        end function
+
+        @it("needs the same file, named in both plans, so a renewed st cannot hide another file")
+        sub _()
+            before = m.audioless("42", "original")
+            m.assertTrue(playback.sidecars.sameMedia(before, m.audioless("42", "renewed")), "the same file without audio")
+            m.assertFalse(playback.sidecars.sameMedia(before, m.audioless("43", "replacement")), "an effective-file replacement")
+            after = m.audioless("42", "renewed")
+            after.source.media_file_id = "43"
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "the plan's two identities disagree")
+            after = m.audioless("42", "renewed")
+            after.Delete("effective_media_file_id")
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "no effective file")
+            before.Delete("effective_media_file_id")
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "no effective file in either")
+            before = m.audioless("42", "original")
+            after = m.audioless("42", "renewed")
+            after.selected_tracks.audio = { id: "file:42:audio:0", index: 0 }
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "audio in one only")
+        end sub
+
+        @it("tells apart another recipe, transformation, or audio ordinal from the same file")
+        sub _()
+            before = m.plan()
+            after = m.plan()
+            after.effective_recipe.bitrate_kbps = 4000
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "recipe")
+            after = m.plan()
+            after.effective_recipe.Delete("audio_layout")
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "a recipe member gone")
+            after = m.plan()
+            after.transformations = [{ name: "dv_rpu_strip", executor: "remux", recipe_version: "1", validated_claims: [] }]
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "transformations")
+            after = m.plan()
+            after.selected_tracks.audio.index = 1
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "audio ordinal")
+            before.Delete("effective_recipe")
+            after = m.plan()
+            after.Delete("effective_recipe")
+            m.assertFalse(playback.sidecars.sameMedia(before, after), "no recipe")
+        end sub
+
+        @it("compares parsed JSON by value")
+        sub _()
+            m.assertTrue(playback.values.equal({ a: [1, "x", true, invalid], b: { c: 8000 } }, ParseJson("{""b"":{""c"":8000.0},""a"":[1,""x"",true,null]}")))
+            m.assertFalse(playback.values.equal({ a: 1 }, { a: 1, b: invalid }), "a member more")
+            m.assertFalse(playback.values.equal([1, 2], [2, 1]), "order")
+            m.assertFalse(playback.values.equal("1", 1), "kind")
+            m.assertFalse(playback.values.equal(invalid, ""), "null and empty")
+            m.assertTrue(playback.values.equal(invalid, invalid))
+        end sub
+
+        @describe("switching")
+
+        @it("waits up to 10 s for the selected sidecar and 1 s for the others (run 24)")
+        sub _()
+            m.assertInvalid(playback.sidecars.waitUntil([m.track("a", "ready"), m.track("b", "failed")], 1000))
+            m.assertEqual(playback.sidecars.waitUntil([m.track("a", "ready"), m.track("b", "queued")], 1000), 2000)
+            m.assertEqual(playback.sidecars.waitUntil([m.track("a", "loading", true), m.track("b", "queued")], 1000), 11000)
+            m.assertEqual(playback.sidecars.waitUntil([m.track("a", "queued", true)], 1000), 11000, "still to download")
+            m.assertEqual(playback.sidecars.waitUntil([m.track("a", "ready", true), m.track("b", "loading")], 1000), 2000, "the selected one came")
+            m.assertEqual(playback.sidecars.waitUntil([m.track("a", "failed", true), m.track("b", "loading")], 1000), 2000, "or failed")
+            m.assertInvalid(playback.sidecars.waitUntil(invalid, 1000))
+            m.assertInvalid(playback.sidecars.waitUntil([m.track("a", "queued")], invalid))
+        end sub
+
+        @it("tells whether the selected sidecar is still downloading or converting")
+        sub _()
+            m.assertTrue(playback.sidecars.selectedPending([m.track("a", "loading", true), m.track("b", "ready")]))
+            m.assertTrue(playback.sidecars.selectedPending([m.track("a", "queued", true)]))
+            m.assertFalse(playback.sidecars.selectedPending([m.track("a", "ready", true), m.track("b", "loading")]), "only others")
+            m.assertFalse(playback.sidecars.selectedPending([m.track("a", "failed", true)]))
+            m.assertFalse(playback.sidecars.selectedPending(invalid))
+        end sub
+
+        ' Roku's list as the Video node gives it: an embedded track it found
+        ' in the stream, then the sidecars under names that contain the path
+        ' the player gave (the prefix stands for any such name).
+        function listed() as Object
+            return [{ TrackName: "mkv/3", Language: "eng" }, { TrackName: "srt/tmp:/subtitles/a.srt", Language: "eng" }, { TrackName: "srt/tmp:/subtitles/b.srt", Language: "eng" }]
+        end function
+
+        @it("switches in place to subtitles off or to a sidecar the content carries ready and Roku lists")
+        sub _()
+            tracks = [m.track("a", "ready"), m.track("b", "loading")]
+            m.assertTrue(playback.sidecars.inPlace(tracks, { audio: { id: "x" } }, []))
+            m.assertTrue(playback.sidecars.inPlace(tracks, { subtitle: { id: "a", index: 0 } }, m.listed()))
+            m.assertFalse(playback.sidecars.inPlace(tracks, { subtitle: { id: "b", index: 1 } }, m.listed()))
+            m.assertFalse(playback.sidecars.inPlace(tracks, { subtitle: { id: "c" } }, m.listed()))
+        end sub
+
+        @it("knows a carried sidecar by its track, whatever URL a later plan gives it")
+        sub _()
+            carried = m.track("a", "ready")
+            carried.url = "https://silo.example/api/v2/stream/s-1/subtitles/0.srt?file_id=42&token=first"
+            m.assertTrue(playback.sidecars.inPlace([carried], { subtitle: { id: "a", index: 0 } }, m.listed()))
+        end sub
+
+        @it("reloads for a carried sidecar Roku does not list yet, or lists under another name (hardware run 17)")
+        sub _()
+            tracks = [m.track("a", "ready")]
+            m.assertFalse(playback.sidecars.inPlace(tracks, { subtitle: { id: "a" } }, []), "not listed yet")
+            m.assertFalse(playback.sidecars.inPlace(tracks, { subtitle: { id: "a" } }, invalid))
+            m.assertFalse(playback.sidecars.inPlace(tracks, { subtitle: { id: "a" } }, [{ TrackName: "sideload/1" }]), "a name without the path")
+        end sub
+
+        @it("finds the TrackName Roku lists for a sidecar's path")
+        sub _()
+            m.assertEqual(playback.sidecars.listedName(m.listed(), "tmp:/subtitles/b.srt"), "srt/tmp:/subtitles/b.srt")
+            same = [{ TrackName: "srt/tmp:/subtitles/a.srt" }, { TrackName: "tmp:/subtitles/a.srt" }]
+            m.assertEqual(playback.sidecars.listedName(same, "tmp:/subtitles/a.srt"), "tmp:/subtitles/a.srt", "the path itself first")
+            m.assertEqual(playback.sidecars.listedName([{ TrackName: "tmp:/subtitles/track11.srt" }], "tmp:/subtitles/track1.srt"), "", "another sidecar's file")
+            m.assertEqual(playback.sidecars.listedName(m.listed(), ""), "", "none selected")
+            m.assertEqual(playback.sidecars.listedName([invalid, { Language: "eng" }], "tmp:/subtitles/a.srt"), "")
+            m.assertEqual(playback.sidecars.listedName(invalid, "tmp:/subtitles/a.srt"), "")
+        end sub
+
+        @it("finds the path of a ready sidecar the content carries")
+        sub _()
+            tracks = [m.track("file:42:subtitle:0", "ready"), m.track("file:42:subtitle:4", "loading")]
+            m.assertEqual(playback.sidecars.pathOf(tracks, "file:42:subtitle:0"), "tmp:/subtitles/file:42:subtitle:0.srt")
+            m.assertEqual(playback.sidecars.pathOf(tracks, "file:42:subtitle:4"), "", "still loading")
+            m.assertEqual(playback.sidecars.pathOf(tracks, "file:42:subtitle:1"), "")
+            m.assertEqual(playback.sidecars.pathOf(tracks, ""), "", "none selected")
+        end sub
+
+        @describe("drawn (hardware runs 21 and 22, AG-204, AG-206)")
+
+        @it("takes the sidecar Roku reports selected and plays, or names nothing as playing, as drawn")
+        sub _()
+            arabic = "tmp:/subtitles/ar.srt"
+            for each playing in ["", arabic, "/tmp/plugin/MIECAA39qnXZ/" + arabic]
+                m.assertTrue(playback.sidecars.drawn(arabic, arabic, playing), playing)
+            end for
+        end sub
+
+        @it("selects the sidecar when Roku plays a stream track in another language or another sidecar (run 21, T5)")
+        sub _()
+            arabic = "tmp:/subtitles/ar.srt"
+            m.assertFalse(playback.sidecars.drawn(arabic, arabic, "mkv/3"), "S3E1: the file's English drawn for Arabic")
+            m.assertFalse(playback.sidecars.drawn(arabic, arabic, "/tmp/plugin/MIECAA39qnXZ/tmp:/subtitles/en.srt"), "another sidecar, as S3E12's English for Italian")
+            m.assertFalse(playback.sidecars.drawn(arabic, "", ""), "not selected")
+            m.assertFalse(playback.sidecars.drawn(arabic, "mkv/3", "mkv/3"), "Roku's own selection")
+        end sub
+
+        @it("selects the sidecar when Roku plays a stream track in the sidecar's language, even the stream's only one (run 22, T2b)")
+        sub _()
+            english = "tmp:/subtitles/en.srt"
+            m.assertFalse(playback.sidecars.drawn(english, english, "mkv/4"), "file B: its one English track reported playing, nothing drawn")
+            m.assertFalse(playback.sidecars.drawn(english, "/tmp/plugin/MIECAA39qnXZ/" + english, "mkv/3"), "selected by its listed name")
+        end sub
+
+        @describe("suppressed (hardware run 16, assumption AG-190)")
+
+        @it("draws nothing for subtitles off, whatever the content's container holds")
+        sub _()
+            m.assertTrue(playback.sidecars.suppressed(m.plan(), ""))
+            plan = m.plan()
+            plan.Delete("subtitle")
+            m.assertTrue(playback.sidecars.suppressed(plan, ""), "a plan without a subtitle decision")
+            m.assertTrue(playback.sidecars.suppressed(invalid, ""))
+        end sub
+
+        @it("draws the selected sidecar once the content carries it, and nothing before")
+        sub _()
+            english = m.planWith({ mode: "render", track_id: "file:42:subtitle:0", artifact: { url: "/api/v2/stream/s/subtitles/0.vtt", format: "vtt" } })
+            m.assertFalse(playback.sidecars.suppressed(english, "tmp:/subtitles/file:42:subtitle:0.srt"))
+            m.assertTrue(playback.sidecars.suppressed(english, ""), "still downloading, failed, or not on the configured origin")
+        end sub
+
+        @it("draws nothing beside a burned-in subtitle or an embedded selection it cannot name")
+        sub _()
+            m.assertTrue(playback.sidecars.suppressed(m.planWith({ mode: "burn_in", track_id: "file:42:subtitle:2" }), ""))
+            native = m.planWith({ mode: "render", track_id: "file:42:subtitle:1", embedded: { stream_index: 3 } })
+            m.assertTrue(playback.sidecars.suppressed(native, ""), "Roku's names for a container's tracks are undocumented")
+        end sub
+
+        @it("draws the HLS rendition the plan's stream carries")
+        sub _()
+            rendition = m.planWith({ mode: "render", track_id: "file:42:subtitle:1", hls_rendition: { group_id: "subs", name: "English", format: "webvtt", mime_type: "text/vtt" } })
+            m.assertFalse(playback.sidecars.suppressed(rendition, ""))
+            m.assertTrue(playback.sidecars.suppressed(m.planWith({ mode: "off", hls_rendition: { group_id: "subs" } }), ""))
+        end sub
+    end class
+end namespace

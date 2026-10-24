@@ -1,0 +1,175 @@
+namespace tests
+
+    @suite("auth server")
+    class AuthServerTests extends rooibos.BaseTestSuite
+
+        @describe("normalize")
+
+        @it("tries HTTPS first for an address without a scheme")
+        sub _()
+            m.assertEqual(api.auth.server.normalize(" Silo.Example ", false), { url: "https://silo.example", error: invalid, canTryHttp: true })
+            m.assertEqual(api.auth.server.normalize("silo.local:8096", true), { url: "http://silo.local:8096", error: invalid, canTryHttp: false })
+        end sub
+
+        @it("keeps a reverse proxy's path and drops trailing slashes and default ports")
+        sub _()
+            m.assertEqual(api.auth.server.normalize("HTTPS://Silo.Example:443/silo//", false).url, "https://silo.example/silo")
+            m.assertEqual(api.auth.server.normalize("https://[fd00::1]:8443", false).url, "https://[fd00::1]:8443")
+            m.assertEqual(api.auth.server.normalize("http://192.168.1.20:8096/", true).url, "http://192.168.1.20:8096")
+        end sub
+
+        @it("never downgrades an https address")
+        sub _()
+            m.assertEqual(api.auth.server.normalize("https://silo.example", true), { url: "https://silo.example", error: invalid, canTryHttp: false })
+        end sub
+
+        @it("refuses")
+        @params("http://silo.local:8096", false, "needs_http_confirmation")
+        @params("https://user:pw@silo.example", false, "credentials_in_address")
+        @params("user@silo.example", false, "credentials_in_address")
+        @params("ftp://silo.example", true, "unsupported_scheme")
+        @params("file:///tmp/x", true, "unsupported_scheme")
+        @params("", false, "invalid_address")
+        @params("silo example", false, "invalid_address")
+        @params("https://silo.example:99999", false, "invalid_address")
+        @params("https://silo.example:", false, "invalid_address")
+        @params("https://silo.example/?a=1", false, "invalid_address")
+        @params("https://silo.example/#x", false, "invalid_address")
+        @params("https://", false, "invalid_address")
+        sub _(address as String, allowHttp as Boolean, kind as String)
+            m.assertEqual(api.auth.server.normalize(address, allowHttp), { url: invalid, error: kind, canTryHttp: false })
+        end sub
+
+        @it("refuses a value that is not a string")
+        sub _()
+            m.assertEqual(api.auth.server.normalize(invalid, true).error, "invalid_address")
+        end sub
+
+        @describe("checkInfo")
+
+        @it("accepts api_major 2 from the configured origin")
+        sub _()
+            m.assertEqual(api.auth.server.checkInfo(m.answer(200, m.info(2)), "https://silo.example"), { ok: true, error: invalid, warning: invalid })
+        end sub
+
+        @it("asks for a server update for any other answer")
+        sub _()
+            for each major in [1, 3]
+                m.assertEqual(api.auth.server.checkInfo(m.answer(200, m.info(major)), "https://silo.example").error, "server_update_required")
+            end for
+            info = m.info(2)
+            info.api_major = "2"
+            m.assertEqual(api.auth.server.checkInfo(m.answer(200, info), "https://silo.example").error, "server_update_required")
+            m.assertEqual(api.auth.server.checkInfo(m.answer(200, []), "https://silo.example").error, "server_update_required")
+            m.assertEqual(api.auth.server.checkInfo(m.answer(404, { error: "not found" }), "https://silo.example").error, "server_update_required")
+            m.assertEqual(api.auth.server.checkInfo(m.answer(406, tests.sessions.fixture("not_acceptable")), "https://silo.example").error, "server_update_required")
+        end sub
+
+        @it("tells an unreachable server from a cancelled check")
+        sub _()
+            request = { requestId: "r1" }
+            m.assertEqual(api.auth.server.checkInfo(api.response.failure(request, "network"), "https://silo.example").error, "unreachable")
+            m.assertEqual(api.auth.server.checkInfo(api.response.failure(request, "timeout"), "https://silo.example").error, "unreachable")
+            m.assertEqual(api.auth.server.checkInfo(api.response.failure(request, "cancelled", "owner"), "https://silo.example").error, "cancelled")
+        end sub
+
+        @it("compares request_origin with the configured origin as both normalize")
+        @params("https://silo.example/silo", "https://silo.example")
+        @params("https://silo.example", "HTTPS://Silo.Example")
+        @params("https://silo.example", "https://silo.example/")
+        @params("https://silo.example", "https://silo.example:443")
+        @params("http://192.168.1.20:8096", "http://192.168.1.20:08096")
+        @params("http://silo.local", "http://silo.local:80")
+        @params("https://[fd00::1]:8443/silo", "https://[FD00::1]:8443")
+        sub _(configured as String, reported as String)
+            m.assertTrue(api.auth.server.checkInfo(m.answer(200, m.info(2, reported)), configured).ok)
+        end sub
+
+        @it("refuses credentials for another origin or a value that is not an origin, in every build")
+        @params("https://silo.example", "https://other.example")
+        @params("https://silo.example", "http://silo.example")
+        @params("https://silo.example", "https://silo.example:8443")
+        @params("https://silo.example:8443", "https://silo.example")
+        @params("https://silo.example", "https://silo.example/silo")
+        @params("https://silo.example", "https://silo.example?x=1")
+        @params("https://silo.example", "https://user@silo.example")
+        @params("https://silo.example", "silo.example")
+        @params("https://silo.example", "ftp://silo.example")
+        @params("https://silo.example", "https://silo example")
+        sub _(configured as String, reported as String)
+            for each allowUnconfirmed in [false, true]
+                m.assertEqual(api.auth.server.checkInfo(m.answer(200, m.info(2, reported)), configured, allowUnconfirmed), { ok: false, error: "origin_mismatch", warning: invalid })
+            end for
+        end sub
+
+        @it("refuses a request_origin that is not a string")
+        sub _()
+            info = m.info(2)
+            info.request_origin = 443
+            m.assertEqual(api.auth.server.checkInfo(m.answer(200, info), "https://silo.example", true).error, "origin_mismatch")
+        end sub
+
+        @it("refuses a server that does not report request_origin, unless a debug build allows it with a warning")
+        sub _()
+            missing = m.answer(200, tests.sessions.fixture("get_system_info_ok"))
+            m.assertEqual(api.auth.server.checkInfo(missing, "https://silo.example"), { ok: false, error: "origin_unconfirmed", warning: invalid })
+            m.assertEqual(api.auth.server.checkInfo(missing, "https://silo.example", true), { ok: true, error: invalid, warning: "origin_unconfirmed" })
+            empty = m.info(2, "")
+            m.assertEqual(api.auth.server.checkInfo(m.answer(200, empty), "https://silo.example").error, "origin_unconfirmed")
+            empty.request_origin = invalid
+            m.assertEqual(api.auth.server.checkInfo(m.answer(200, empty), "https://silo.example").error, "origin_unconfirmed")
+        end sub
+
+        @it("asks for an update before it looks at the origin")
+        sub _()
+            m.assertEqual(api.auth.server.checkInfo(m.answer(200, m.info(1, "https://other.example")), "https://silo.example").error, "server_update_required")
+        end sub
+
+        @describe("canonicalOrigin")
+
+        @it("normalizes an origin and refuses anything else")
+        sub _()
+            m.assertEqual(api.auth.server.canonicalOrigin("HTTP://Silo.Local:08096/"), "http://silo.local:8096")
+            m.assertEqual(api.auth.server.canonicalOrigin("https://silo.example:443"), "https://silo.example")
+            m.assertEqual(api.auth.server.canonicalOrigin("https://[fd00::1]"), "https://[fd00::1]")
+            for each value in [invalid, "", "silo.example", "https://", "https://silo.example/x", "https://silo.example#x", "https://a@silo.example", "https://silo.example:0", "https://silo.example:65536", "https://[fd00::1"]
+                m.assertInvalid(api.auth.server.canonicalOrigin(value), FormatJson(value))
+            end for
+        end sub
+
+        @describe("passwordLogin")
+
+        @it("reads password_login from the provider list")
+        sub _()
+            m.assertEqual(api.auth.server.passwordLogin(tests.sessions.fixture("list_auth_providers_ok")), true)
+            m.assertEqual(api.auth.server.passwordLogin({ items: [], password_login: false }), false)
+            m.assertInvalid(api.auth.server.passwordLogin({ items: [] }))
+            m.assertInvalid(api.auth.server.passwordLogin(invalid))
+        end sub
+
+        @describe("needsSetup")
+
+        @it("reads needs_setup from the setup status (get_setup_status_ok.json)")
+        sub _()
+            body = tests.sessions.fixture("get_setup_status_ok")
+            m.assertFalse(api.auth.server.needsSetup(body))
+            body.needs_setup = true
+            m.assertTrue(api.auth.server.needsSetup(body))
+            m.assertFalse(api.auth.server.needsSetup({ needs_setup: "true" }))
+            m.assertFalse(api.auth.server.needsSetup(invalid))
+        end sub
+
+        ' SystemInfo with api_major major, from reported (request_origin).
+        function info(major as Integer, reported = "https://silo.example" as String) as Object
+            body = tests.sessions.systemInfo(reported)
+            body.api_major = major
+            return body
+        end function
+
+        function answer(code as Integer, body as Dynamic) as Object
+            return api.response.fromTransfer({ requestId: "r1", responseHeaders: [] }, { code: code, body: FormatJson(body), headers: [] })
+        end function
+
+    end class
+
+end namespace

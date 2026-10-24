@@ -1,0 +1,356 @@
+import "pkg:/source/catalog/art.bs"
+import "pkg:/source/catalog/cards.bs"
+import "pkg:/source/playback/intent.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' The detail page's fields from catalog/items/{id} (spec section 5.6), and the
+' resume rules its action row uses. Pure. The map step replaces the response
+' body with fromItem's AA, so the cast, crew, versions, and the rest of the
+' server's detail never reach the render thread: only the names the hero's
+' credit line shows.
+namespace catalog.detail
+    ' Spec section 5.6: Resume shows once the saved position the start
+    ' resumes (playback.intent.savedPosition) passes this many seconds.
+    const RESUME_AFTER = 30
+    ' The Details section lists at most this many people or names a row.
+    const MAX_NAMES = 3
+    ' The hero's credit line names up to this many directors on a movie, and
+    ' the first this many of the cast otherwise (tvOS's starringText).
+    const CREDIT_DIRECTORS = 2
+    const CREDIT_CAST = 3
+    ' Within one item of the metadata line ("Season 1 · Episode 2"); the
+    ' hero draws the dots between items (DetailHero).
+    const SEPARATOR = " · "
+
+    function fromItem(item as Dynamic, copy as Object) as Dynamic
+        if not util.isObject(item) or util.text(item.content_id) = "" then return invalid
+        id = item.content_id
+        itemType = util.text(item.type)
+        state = item.user_data
+        if not util.isObject(state) then state = {}
+        duration = state.duration_seconds
+        if not util.isNumber(duration) then duration = item.duration_seconds
+        if not util.isNumber(duration) and util.isNumber(item.runtime) then duration = item.runtime * 60
+        playId = util.text(item.play_content_id)
+        if playId = "" and itemType <> "series" and itemType <> "season" then playId = id
+        backdrop = util.text(item.backdrop_url)
+        tint = item.backdrop_thumbhash
+        if backdrop = ""
+            backdrop = util.text(item.poster_url)
+            tint = item.poster_thumbhash
+        end if
+        crew = []
+        if type(item.crew) = "roArray" then crew = item.crew
+        return {
+            id: id,
+            itemType: itemType,
+            title: util.text(item.title),
+            logoUri: util.text(item.logo_url),
+            backdropUri: backdrop,
+            tint: catalog.art.washColor(tint),
+            posterUri: util.text(item.poster_url),
+            contentRating: UCase(util.text(item.content_rating).Trim()),
+            metadata: metadata(item, copy),
+            synopsis: util.text(item.overview).Trim(),
+            credit: credit(itemType, crew, item.cast),
+            episodeFacts: episodeFactsOf(item, itemType, copy),
+            tagline: util.text(item.tagline),
+            playId: playId,
+            playSeasonNumber: catalog.cards.whole(item.play_season_number),
+            seriesId: util.text(item.series_id),
+            seasonNumber: catalog.cards.whole(item.season_number),
+            episodeNumber: catalog.cards.whole(item.episode_number),
+            seasonCount: catalog.cards.whole(item.season_count),
+            resumeSeconds: resumePoint(state.position_seconds, duration),
+            durationSeconds: numberOr(duration, 0),
+            played: util.isTrue(state.played),
+            facts: facts(item, crew)
+        }
+    end function
+
+    ' The hero's credit line as { key, names }, the locale string
+    ' detail.<key> and the names for it, or invalid without names: "Directed
+    ' by" up to CREDIT_DIRECTORS directors on a movie, else "Starring" the
+    ' first CREDIT_CAST of the cast, as tvOS's starringText chooses.
+    function credit(itemType as String, crew as Object, cast as Dynamic) as Dynamic
+        if itemType = "movie"
+            key = "directedBy"
+            names = jobNames(crew, "|director|")
+            limit = CREDIT_DIRECTORS
+        else
+            key = "starring"
+            names = []
+            if type(cast) = "roArray"
+                for each member in cast
+                    if util.isObject(member) and util.text(member.name).Trim() <> "" then names.Push(member.name.Trim())
+                end for
+            end if
+            limit = CREDIT_CAST
+        end if
+        kept = []
+        for each name in names
+            if kept.Count() < limit then kept.Push(name)
+        end for
+        if kept.Count() = 0 then return invalid
+        return { key: key, names: kept.Join(", ") }
+    end function
+
+    ' The Details section, as the Android TV and tvOS detail pages fill it:
+    ' [{ key, value }], where key names the label (detail.<key> in locale/)
+    ' and value is the text. Director, Writer ("Written by" without a
+    ' Screenplay credit, as tvOS labels it), Studio, Network, and Country list
+    ' up to MAX_NAMES names; Genres lists all (Android TV; spec section 5.9);
+    ' then the dates the item has in long form: Released, First Aired, and
+    ' Last Aired, or Aired for an episode.
+    function facts(item as Object, crew = invalid as Dynamic) as Object
+        rows = []
+        if crew = invalid and type(item.crew) = "roArray" then crew = item.crew
+        if crew = invalid then crew = []
+        addNames(rows, "director", jobNames(crew, "|director|"), MAX_NAMES)
+        writer = "writtenBy"
+        if jobNames(crew, "|screenplay|").Count() > 0 then writer = "writer"
+        addNames(rows, writer, jobNames(crew, "|writer|screenplay|teleplay|story|"), MAX_NAMES)
+        labels = { studios: "studio", networks: "network", countries: "country" }
+        for each field in ["studios", "networks", "countries"]
+            if type(item[field]) = "roArray" then addNames(rows, labels[field], item[field], MAX_NAMES)
+        end for
+        if type(item.genres) = "roArray" then addNames(rows, "genres", item.genres, item.genres.Count())
+        if util.text(item.type) = "episode"
+            addDate(rows, "aired", item.air_date)
+        else
+            addDate(rows, "released", item.release_date)
+            addDate(rows, "firstAired", item.first_air_date)
+            addDate(rows, "lastAired", item.last_air_date)
+        end if
+        return rows
+    end function
+
+    ' The names of crew members whose job is one of jobs ("|a|b|", lower case).
+    function jobNames(crew as Object, jobs as String) as Object
+        names = []
+        for each member in crew
+            if util.isObject(member) and Instr(1, jobs, "|" + LCase(util.text(member.job)) + "|") > 0 and util.text(member.name) <> "" and not util.contains(names, member.name) then names.Push(member.name)
+        end for
+        return names
+    end function
+
+    ' A row of up to limit names, with ", …" when there were more.
+    sub addNames(rows as Object, key as String, names as Object, limit as Integer)
+        kept = []
+        for each name in names
+            if util.text(name).Trim() <> ""
+                if kept.Count() = limit
+                    kept.Push("…")
+                    exit for
+                end if
+                kept.Push(util.text(name).Trim())
+            end if
+        end for
+        if kept.Count() > 0 then rows.Push({ key: key, value: kept.Join(", ") })
+    end sub
+
+    sub addDate(rows as Object, key as String, value as Dynamic)
+        text = dateText(value, "no-weekday")
+        if text <> "" then rows.Push({ key: key, value: text })
+    end sub
+
+    ' A YYYY-MM-DD date as Roku writes it for the device locale in format
+    ' (roDateTime.AsDateString): "no-weekday" gives tvOS's long form,
+    ' "December 15, 1995", and "short-month-no-weekday" its abbreviated
+    ' one, "Dec 15, 1995"; "" for a missing or malformed date.
+    function dateText(value as Dynamic, format as String) as String
+        text = util.text(value)
+        if Len(text) < 10 or Mid(text, 5, 1) <> "-" then return ""
+        ' A Roku device leaves a date-only string unparsed at the epoch (run 5:
+        ' "Jan 1, 1970"; brs-node parses it), so the time is spelled out.
+        date = CreateObject("roDateTime")
+        date.FromISO8601String(Left(text, 10) + "T00:00:00Z")
+        if date.GetYear() < 1000 or Left(text, 4) <> date.GetYear().ToStr() then return ""
+        return date.AsDateString(format)
+    end function
+
+    ' The metadata line as tvOS's hero lays it out (TVDetailHero's factsRow),
+    ' { rating, items, tail } (line): the content rating for the chip that
+    ' leads it; the year, the runtime or "N Seasons" for a series, and the
+    ' external ratings, which the hero never cuts but drops from the end
+    ' when the line is full; and the first two genres, which give way first.
+    function metadata(item as Object, copy as Object) as Object
+        items = []
+        if util.isNumber(item.year) and item.year > 0 then items.Push(Int(item.year).ToStr())
+        if util.text(item.type) = "series"
+            items.Push(seasonsText(item.season_count, copy))
+        else
+            items.Push(catalog.cards.runtimeText(item.runtime, item.duration_seconds, copy))
+        end if
+        items.Append(ratings(item, copy))
+        genres = []
+        if type(item.genres) = "roArray"
+            for each genre in item.genres
+                if genres.Count() < 2 and util.text(genre) <> "" then genres.Push(genre)
+            end for
+        end if
+        return line(util.text(item.content_rating), items, genres.Join(", "))
+    end function
+
+    ' A metadata line: rating in capitals, items without the empty ones, and
+    ' the tail.
+    function line(rating as String, items as Object, tail as String) as Object
+        return { rating: UCase(rating.Trim()), items: nonEmpty(items), tail: tail }
+    end function
+
+    ' parts without the empty ones.
+    function nonEmpty(parts as Object) as Object
+        kept = []
+        for each part in parts
+            if part <> "" then kept.Push(part)
+        end for
+        return kept
+    end function
+
+    ' An episode's facts for the hero, as tvOS lists them for a focused
+    ' episode: its air date ("Feb 18, 2026"), its runtime, and its own
+    ' ratings. The series' content rating leads them and "Season 1 ·
+    ' Episode 2" follows them (episodeLine).
+    function episodeFacts(episode as Object, copy as Object) as Object
+        parts = [dateText(episode.air_date, "short-month-no-weekday"), catalog.cards.runtimeText(episode.runtime, invalid, copy)]
+        parts.Append(ratings(episode, copy))
+        return nonEmpty(parts)
+    end function
+
+    ' episodeFacts for an episode item, none for any other.
+    function episodeFactsOf(item as Object, itemType as String, copy as Object) as Object
+        if itemType <> "episode" then return []
+        return episodeFacts(item, copy)
+    end function
+
+    ' A focused episode's metadata line (line): the series' content rating,
+    ' the episode's facts (episodeFacts, in known), and "Season 1 · Episode
+    ' 2", or "Specials · Episode 2" for season 0, as its tail. copy is the
+    ' strings table.
+    function episodeLine(rating as String, known as Object, seasonNumber as Integer, episodeNumber as Integer, copy as Object) as Object
+        season = ""
+        if seasonNumber = 0
+            season = i18n.lookup(copy, "detail.specials")
+        else if seasonNumber > 0
+            season = i18n.format(i18n.lookup(copy, "detail.season"), { number: seasonNumber })
+        end if
+        episode = ""
+        if episodeNumber > 0 then episode = i18n.format(i18n.lookup(copy, "detail.episode"), { number: episodeNumber })
+        return line(rating, known, nonEmpty([season, episode]).Join(SEPARATOR))
+    end function
+
+    ' The external ratings tvOS shows after the facts: the server's ratings
+    ' list in its order, each as its mark and score ("IMDb 8.3", "RT 93%";
+    ' TMDB as text, since Roku ships no logo), or from a server that sends
+    ' none, IMDb then TMDB (DisplayRating.fallback).
+    function ratings(item as Object, copy as Object) as Object
+        out = []
+        if type(item.ratings) = "roArray"
+            for each entry in item.ratings
+                if util.isObject(entry) and util.text(entry.name).Trim() <> "" and util.text(entry.display).Trim() <> "" then out.Push(entry.name.Trim() + " " + entry.display.Trim())
+            end for
+            return out
+        end if
+        if catalog.cards.outOfTen(item.rating_imdb) then out.Push(i18n.format(copy.ratingImdb, { value: catalog.cards.oneDecimal(item.rating_imdb) }))
+        if catalog.cards.outOfTen(item.rating_tmdb) then out.Push(i18n.format(copy.ratingTmdb, { value: catalog.cards.oneDecimal(item.rating_tmdb) }))
+        return out
+    end function
+
+    ' A title as tvOS's hero sets it: { primary, subtitle }, split at the
+    ' first ": ", " — ", " – ", or " - " that leaves text on both sides
+    ' ("Monarch: Legacy of Monsters"), else the whole title and "". The
+    ' hero writes both in capitals.
+    function titleParts(title as String) as Object
+        for each mark in [": ", " — ", " – ", " - "]
+            at = Instr(1, title, mark)
+            if at > 0
+                head = Left(title, at - 1).Trim()
+                tail = Mid(title, at + Len(mark)).Trim()
+                if head <> "" and tail <> "" then return { primary: head, subtitle: tail }
+            end if
+        end for
+        return { primary: title, subtitle: "" }
+    end function
+
+    function seasonsText(count as Dynamic, copy as Object) as String
+        if not util.isNumber(count) or count <= 0 then return ""
+        if count = 1 then return copy.seasonsOne
+        return i18n.format(copy.seasonsOther, { count: Int(count) })
+    end function
+
+    ' The resume position in seconds, or -1 when the action row offers Play:
+    ' the start's saved position (playback.intent.savedPosition), played or
+    ' not, once past RESUME_AFTER.
+    function resumePoint(position as Dynamic, duration as Dynamic) as Float
+        return pointOf(playback.intent.savedPosition(position, duration))
+    end function
+
+    ' Resume's point for a playback.intent.savedPosition answer.
+    function pointOf(saved as Dynamic) as Float
+        if not util.isNumber(saved) or saved <= RESUME_AFTER then return -1.0
+        return saved
+    end function
+
+    ' "1:02:03", or "12:34" under an hour, for "Resume 1:02:03".
+    function clock(seconds as Dynamic) as String
+        total = 0
+        if util.isNumber(seconds) and seconds > 0 then total = Int(seconds)
+        hours = total \ 3600
+        minutes = (total mod 3600) \ 60
+        text = two(total mod 60)
+        if hours > 0 then return hours.ToStr() + ":" + two(minutes) + ":" + text
+        return minutes.ToStr() + ":" + text
+    end function
+
+    ' watch/{id} after the player closes: { resumeSeconds, durationSeconds,
+    ' played }, resumeSeconds read as the player's start reads it
+    ' (playback.intent.resumeOf).
+    function resume(watch as Dynamic) as Dynamic
+        if not util.isObject(watch) then return invalid
+        state = watch.user_data
+        if not util.isObject(state) then state = {}
+        return { id: util.text(watch.content_id), resumeSeconds: pointOf(playback.intent.resumeOf(watch)), durationSeconds: numberOr(state.duration_seconds, 0), played: util.isTrue(state.played) }
+    end function
+
+    function two(value as Integer) as String
+        if value < 10 then return "0" + value.ToStr()
+        return value.ToStr()
+    end function
+
+    function numberOr(value as Dynamic, fallback as Dynamic) as Dynamic
+        if util.isNumber(value) then return value
+        return fallback
+    end function
+
+    ' --- Opening a page ---------------------------------------------------------
+
+    ' The nav.route.DETAIL params for a card (CardContent fields, as a node
+    ' or an AA). An episode opens its series with that episode selected, as
+    ' Android TV and tvOS do; anything else opens itself. seed is what the
+    ' page paints before its item is read, as tvOS's route seed does (spec
+    ' section 5.8): { title, logoUri, backdropUri, tint, rating, metadata,
+    ' synopsis, series }, the card's hero fields, series true when the page
+    ' will be a series'.
+    function routeParams(card as Object) as Object
+        id = util.text(card.id)
+        itemType = util.text(card.itemType)
+        seriesId = util.text(card.seriesId)
+        episode = itemType = "episode" and seriesId <> ""
+        out = { itemId: id }
+        if episode
+            out = { itemId: seriesId, episodeId: id }
+            if util.isNumber(card.seasonNumber) and card.seasonNumber >= 0 then out.seasonNumber = card.seasonNumber
+        end if
+        if id <> "" then out.seed = { title: util.text(card.heroTitle), logoUri: util.text(card.logoUri), backdropUri: util.text(card.backdropUri), tint: util.text(card.tint), rating: util.text(card.contentRating), metadata: util.text(card.infoLine), synopsis: util.text(card.synopsis), series: episode or itemType = "series" or itemType = "season" }
+        return out
+    end function
+
+    ' A route's seed (routeParams), or invalid when it has none; its
+    ' metadata is the card's rating chip before the card's own meta line.
+    function seedOf(params as Object) as Dynamic
+        seed = params.seed
+        if not util.isObject(seed) then return invalid
+        return { title: util.text(seed.title), logoUri: util.text(seed.logoUri), backdropUri: util.text(seed.backdropUri), tint: util.text(seed.tint), metadata: line(util.text(seed.rating), [], util.text(seed.metadata)), synopsis: util.text(seed.synopsis), series: util.isTrue(seed.series) }
+    end function
+end namespace

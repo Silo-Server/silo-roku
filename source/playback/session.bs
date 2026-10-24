@@ -1,0 +1,1790 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/playback/results.bs"
+import "pkg:/source/playback/seek.bs"
+import "pkg:/source/playback/recovery.bs"
+import "pkg:/source/playback/autoQuality.bs"
+import "pkg:/source/playback/jobs.bs"
+import "pkg:/source/playback/sidecars.bs"
+
+' The playback session reducer (plan section 6.6): the player's in-memory
+' state for its active attempt. reduce(state, event, env) updates state in
+' place and returns the commands to carry out, in order. env supplies now()
+' (monotonic milliseconds), epoch() (the device's wall clock in seconds,
+' for a plan's expires_at), and uuid() (a canonical UUID), so every identity
+' the client mints comes from one injected source; the reducer lowercases it.
+'
+' Retained URLs. A track_change whose plan streams the same media, or the
+' same original from another proxy node (onOtherNode), keeps the content
+' playing (playback.sidecars.sameMedia), and with it the URL, and
+' the signed `st` token in it, of the plan that loaded the content. The
+' server signs that token for the plan's lifetime (expires_at), so once
+' the kept URL has less than RENEW_MARGIN_SECONDS left, the next track
+' change reloads into the new plan's URL instead, and so does the next
+' local seek: a reload at the seek's target. Any reload (a reopen, or a
+' reanchor or replan's new load) plays the current plan's own URL.
+'
+' Media credentials. The content's credential is the access token in its
+' HttpHeaders on the configured origin (header_refresh "none": the media
+' route checks Authorization alone, and the token cannot change on a
+' playing stream), or a proxy URL's own path token, which lasts as long as
+' its plan (expires_at). The player reports the headers' token expiry and
+' the time the account session would refresh it ("credentials"). From
+' that refresh time, the next local seek or in-place track change renews
+' it; CREDENTIAL_LEAD_SECONDS before it expires, playback renews it where
+' it is. A media 401 or 403, or a stall once it has expired, renews it
+' too. A renewal is refreshed headers and a reload of the current plan at
+' the position, or a seek_reanchor there where the timeline does not
+' allow a local reload or the credential is the proxy URL's; it is not the
+' plan's one transport reopen and excludes nothing (plan section 6.4).
+' Every reload plays the current plan's own URL, so a renewal also renews
+' a kept URL (above), and the reverse. A renewal is owed until a load with
+' refreshed headers is scheduled: a media failure while a replan is in
+' flight waits for its answer, whose new load carries the renewal, and
+' failed content is never kept in place (retrackRefusals).
+'
+' Bodies. A command's bodyText is sent byte for byte. Progress and stop
+' bodies are built here once. Start and replan bodies need the probe and
+' capabilities, so ApiTask builds them from the command (a replan's members
+' are the whole body but for client_features, client_capabilities, and
+' client_playback_context, which playback.capabilities.replanParts gives)
+' and reports the text it sent as the result's bodyText. A command that comes
+' back with retry: true carries that text, and ApiTask sends it verbatim
+' under the same playback_attempt_id or replan_request_id: a body is never
+' serialized twice. Obligations that must outlive the player leave as "job"
+' commands for playback.jobs.
+'
+' The host keeps the reducer until it emits "done": after Back during a start,
+' it still has to stop the session the server accepts. A host destroyed
+' before that leaves the start to ApiTask, which stops the session itself
+' (playback.worker).
+namespace playback.session
+    const PROTOCOL_VERSION = 3
+    ' "Playback progress is pending…" shows after this many failed posts in a row.
+    const PENDING_AFTER = 3
+    ' An uncertain start or replan is replayed this many times (1 to 16 s apart).
+    const MAX_RETRIES = 5
+    ' A replan answered conflict is retried once, after this long.
+    const CONFLICT_RETRY_MS = 2000
+    ' New attempts the reducer starts by itself before it shows an error; the
+    ' count resets when an attempt shows its first frame.
+    const MAX_RESTARTS = 3
+    ' A kept URL with less of its credential left than this is renewed at
+    ' the next track change or local seek, and so is a proxy URL.
+    const RENEW_MARGIN_SECONDS = 3600
+    ' Playback renews the content's credential this long before it expires.
+    const CREDENTIAL_LEAD_SECONDS = 60
+    ' An HLS load whose first positions run more than START_SLIP_SECONDS
+    ' ahead of where it should have started, within START_CHECK_SECONDS of
+    ' playing, is sought back there once (checkStart).
+    const START_SLIP_SECONDS = 3
+    const START_CHECK_SECONDS = 3
+    ' A "finished" this close to the runtime is the content's end, whatever
+    ' the player changed just before (stoppedByClient).
+    const END_SLACK_SECONDS = 5
+    const OUTPUT_CHANGE_FEATURE = "output_change_v1"
+    ' Requests wait while a start or replan is in flight; a newer one replaces a
+    ' queued one of the same or lower rank.
+    const RANK_PLAY = 4
+    const RANK_INTENT = 3
+    const RANK_RECOVERY = 2
+    const RANK_AUTOMATIC = 1
+
+    ' context: identity {server, account, profile}; installationId and features
+    ' from capabilities; multichannelAac from the audio probe; outputContextId;
+    ' loads, the last load number a previous session of the same Video node
+    ' used, so its late callbacks never match this one's loads. All but
+    ' identity may be left out: each start result brings the context its body
+    ' was built with (applyContext).
+    function create(context as Object) as Object
+        features = context.features
+        if not playback.values.isArray(features) then features = []
+        loads = 0
+        if util.isNumber(context.loads) and context.loads > 0 then loads = Int(context.loads)
+        return {
+            phase: "idle",
+            identity: context.identity,
+            installationId: context.installationId,
+            features: features,
+            multichannelAac: util.isTrue(context.multichannelAac),
+            ' seen: an outputContext event arrived since the attempt began.
+            output: { current: context.outputContextId, planned: context.outputContextId, seen: false },
+            quality: "auto",
+            ' The profile's playback.max_bitrate_kbps from the first play, or
+            ' invalid for no cap: every start and replan sends it, since a
+            ' replan without it lifts the cap (spec section 8.5).
+            bandwidthCap: invalid,
+            auto: playback.autoQuality.create(),
+            attempt: invalid,
+            plan: invalid,
+            player: newPlayer(0),
+            stall: playback.recovery.newStall(0),
+            skips: playback.seek.newSkips(),
+            ' A seek target, in source seconds, that is queued or in flight as a
+            ' reanchor; skips build on it.
+            seekTarget: invalid,
+            mutation: invalid,
+            queued: invalid,
+            ' A reconnect replan in progress, or due (startReconnect): { playIntent }.
+            reconnect: invalid,
+            ' The outage the attempt is reconnecting from, from the failure
+            ' that began it until a load plays: { startedAt, tries, retryAt }.
+            outage: invalid,
+            ' A credential renewal no load has carried yet (renewAt): { expiry }.
+            renewal: invalid,
+            resume: invalid,
+            reachable: true,
+            identityChanged: false,
+            loads: loads
+        }
+    end function
+
+    function reduce(state as Object, event as Object, env as Object) as Object
+        out = []
+        t = event.type
+        ' A viewer who leaves ends the session without the error.
+        if t <> "back" and t <> "identityChange" then expireOutage(state, env, out)
+        if t = "play"
+            onPlay(state, event, env, out)
+        else if t = "startResult"
+            onStartResult(state, event, env, out)
+        else if t = "replanResult"
+            onReplanResult(state, event, env, out)
+        else if t = "progressResult"
+            onProgressResult(state, event, env, out)
+        else if t = "tick"
+            onTick(state, out)
+        else if t = "seekTo"
+            onSeekTo(state, event, env, out)
+        else if t = "skip"
+            onSkip(state, event, env)
+        else if t = "trackChange"
+            onTrackChange(state, event, env, out)
+        else if t = "qualityChange"
+            onQualityChange(state, event, env, out)
+        else if t = "outputContext"
+            onOutputContext(state, event, env, out)
+        else if t = "back"
+            onViewerBack(state, env, out)
+        else if t = "identityChange"
+            onIdentityChange(state, env, out)
+        else if t = "retry"
+            onRetry(state, env, out)
+        else if t = "unplayable"
+            onUnplayable(state, event, env, out)
+        else if isCurrentLoad(state, event)
+            ' The node reports only on content assigned to it.
+            if t = "assigned" or t = "player" or t = "position" or t = "input" then contentAssigned(state, env)
+            if t = "player"
+                onPlayer(state, event, env, out)
+            else if t = "position"
+                onPosition(state, event, env, out)
+            else if t = "input"
+                ' {load, buffer}: media arrived, a buffer reading (buffer, in
+                ' percent) or a downloaded segment (no buffer).
+                if not util.isNumber(event.buffer) or event.buffer > 0 then state.plan.loadMedia = true
+                playback.recovery.noteMedia(state.stall, event.buffer, waitingForMedia(state), env.now())
+                playback.autoQuality.noteMedia(state.auto, env.now(), event.buffer)
+            else if t = "credentials"
+                onCredentials(state, event)
+            else if t = "subtitleReady"
+                onSubtitleReady(state, event)
+            else if t = "failure"
+                onFailure(state, event, env, out)
+            end if
+        end if
+        dispatchQueued(state, env, out)
+        settleFailure(state, env, out)
+        settleSubtitle(state, env, out)
+        runTimers(state, env, out)
+        return out
+    end function
+
+    ' The next time the host should send {type: "wake"}, or invalid: a retry,
+    ' an outage's next try or its end, a merged skip, the stall clock, an
+    ' Auto quality check, or the credential's renewal. epoch is the
+    ' device's wall clock in seconds (env.epoch()), for the last.
+    function nextWake(state as Object, now as Dynamic, epoch = invalid as Dynamic) as Dynamic
+        wake = invalid
+        if state.mutation <> invalid then wake = earliest(wake, state.mutation.retryAt)
+        if state.outage <> invalid
+            wake = earliest(wake, state.outage.retryAt)
+            wake = earliest(wake, outageDeadline(state.outage))
+        end if
+        wake = earliest(wake, state.skips.at)
+        if stallClockRunning(state) then wake = earliest(wake, playback.recovery.stallDeadline(state.stall))
+        if state.phase = "active" then wake = earliest(wake, playback.autoQuality.wakeAt(state.auto, now))
+        if util.isNumber(epoch) and renewalWaits(state)
+            delay = (renewalTime(state.plan) - epoch) * 1000
+            if delay < 0 then delay = 0
+            wake = earliest(wake, now + Int(delay))
+        end if
+        return wake
+    end function
+
+    ' Whether a track_change is in flight or waiting, whose plan will
+    ' replace the current subtitle selection.
+    function changingTracks(state as Object) as Boolean
+        if state.mutation <> invalid and state.mutation.request.op = "track_change" then return true
+        return state.queued <> invalid and state.queued.op = "track_change"
+    end function
+
+    ' --- Viewer intents -------------------------------------------------------
+
+    ' {intent, quality, bandwidthCapKbps, autoplay, catalogRuntime,
+    ' startPosition}: intent is what ApiTask serializes the start from (file
+    ' and tracks), and may name the title (contentId); quality and
+    ' bandwidthCapKbps are the profile's preferences (absent for Auto and no
+    ' cap); startPosition is Resume's or Start Over's start_position in
+    ' source seconds, absent to let the server resume; autoplay starts, such
+    ' as Up Next, report no first_frame_ms.
+    sub onPlay(state as Object, event as Object, env as Object, out as Object)
+        if state.phase = "leaving" then return
+        quality = event.quality
+        if not playback.values.isText(quality) then quality = "auto"
+        if util.isNumber(event.bandwidthCapKbps) and event.bandwidthCapKbps > 0 then state.bandwidthCap = Int(event.bandwidthCapKbps)
+        request = { rank: RANK_PLAY, op: "play", intent: event.intent, quality: quality, autoplay: util.isTrue(event.autoplay), catalogRuntime: event.catalogRuntime, restarts: 0, requestedAt: invalid }
+        if util.isNumber(event.startPosition) then request.startPosition = event.startPosition
+        if not request.autoplay then request.requestedAt = env.now()
+        submit(state, request, env, out)
+    end sub
+
+    ' {position, resume}: a committed scrubber position, in source seconds.
+    ' resume says Play committed it while paused: playback resumes with the
+    ' seek, so a load it opens (a renewal's reload, a reanchor) plays, not
+    ' only the content playing (hardware run 9, T1e).
+    sub onSeekTo(state as Object, event as Object, env as Object, out as Object)
+        if state.phase <> "active" then return
+        if util.isTrue(event.resume) and state.player.paused
+            ' The stall clock stood still while paused.
+            state.player.paused = false
+            playback.recovery.restartStall(state.stall, env.now(), invalid)
+        end if
+        playback.seek.cancelSkips(state.skips)
+        requestSeek(state, playback.seek.clamp(event.position, state.plan.runtime), env, out)
+    end sub
+
+    ' {seconds}: one skip press; presses within 200 ms merge into one seek,
+    ' counted from a seek that is still pending.
+    sub onSkip(state as Object, event as Object, env as Object)
+        if state.phase <> "active" then return
+        from = state.player.position
+        if util.isNumber(state.seekTarget) then from = state.seekTarget
+        playback.seek.skip(state.skips, from, event.seconds, state.plan.runtime, env.now())
+    end sub
+
+    ' {tracks, inPlace}: the complete selection, {audio, subtitle}; no
+    ' subtitle means off. inPlace says the playing content already carries
+    ' the chosen subtitle (playback.sidecars.inPlace), so a plan that streams
+    ' the same media switches it there instead of reloading.
+    sub onTrackChange(state as Object, event as Object, env as Object, out as Object)
+        if state.phase <> "active" then return
+        submit(state, { rank: RANK_INTENT, op: "track_change", tracks: event.tracks, inPlace: util.isTrue(event.inPlace) }, env, out)
+    end sub
+
+    ' {quality}: "auto" or a label from available_qualities. During a start it
+    ' waits for the plan.
+    sub onQualityChange(state as Object, event as Object, env as Object, out as Object)
+        state.quality = event.quality
+        playback.autoQuality.setQuality(state.auto, event.quality)
+        if state.phase = "active" or state.phase = "starting" then submit(state, { rank: RANK_INTENT, op: "quality_change" }, env, out)
+    end sub
+
+    ' {outputContextId}: the normalized output context after a re-probe.
+    sub onOutputContext(state as Object, event as Object, env as Object, out as Object)
+        state.output.current = event.outputContextId
+        state.output.seen = true
+        if state.phase = "active" then requestOutputChange(state, env, out)
+    end sub
+
+    sub onViewerBack(state as Object, env as Object, out as Object)
+        if state.phase = "starting"
+            leave(state, env, out, "back")
+        else if state.phase = "active" or state.phase = "error"
+            endSession(state, env, out, "back")
+        end if
+    end sub
+
+    ' The account, profile, or server is changing. The attempt's requests carry
+    ' the old identity's fence; none is sent or replayed with the new one.
+    sub onIdentityChange(state as Object, env as Object, out as Object)
+        state.identityChanged = true
+        if state.phase = "starting"
+            leave(state, env, out, "identity_changed")
+        else if state.phase = "active" or state.phase = "error"
+            endSession(state, env, out, "identity_changed")
+        end if
+    end sub
+
+    ' {reason}: the player cannot run the current plan for a reason of its
+    ' own, such as a Video node that would not stop for new content
+    ' (playback.slot) or media headers it could not get: the error with Retry.
+    sub onUnplayable(state as Object, event as Object, env as Object, out as Object)
+        if state.phase = "active" then showError(state, env, out, { reason: util.text(event.reason), retryable: true })
+    end sub
+
+    ' Retry on the error screen: a new attempt at the saved position, which
+    ' plays whether or not the viewer had paused.
+    sub onRetry(state as Object, env as Object, out as Object)
+        if state.phase <> "error" or state.resume = invalid then return
+        request = state.resume
+        state.resume = invalid
+        request.requestedAt = env.now()
+        request.Delete("playIntent")
+        submit(state, request, env, out)
+    end sub
+
+    ' --- Server results -------------------------------------------------------
+
+    ' {playback_attempt_id, kind, decision, bodyText, context, reason}: kind
+    ' from playback.results.kind; bodyText is the body ApiTask sent, and
+    ' context what it was built with (applyContext); reason why ApiTask
+    ' refused to send it, if it did.
+    sub onStartResult(state as Object, event as Object, env as Object, out as Object)
+        mutation = state.mutation
+        if mutation = invalid or mutation.kind <> "start" or event.playback_attempt_id <> mutation.command.playback_attempt_id then return
+        applyContext(state, event.context)
+        kind = event.kind
+        noteResult(state, event)
+        if kind = "offline" or kind = "retry"
+            keepBody(mutation, event)
+            retryLater(state, env, out)
+            return
+        end if
+        state.mutation = invalid
+        a = state.attempt
+        decision = event.decision
+        playable = kind = "ok" and util.isObject(decision) and decision.outcome = "playable" and util.isObject(decision.playback_plan) and playback.values.isText(decision.session_id)
+        if playable
+            a.sessionId = decision.session_id
+            a.fence.session = decision.session_id
+            if playback.values.isArray(decision.server_features) then a.serverFeatures = decision.server_features
+        end if
+
+        if state.phase = "leaving"
+            finishLeaving(state, env, out)
+        else if state.queued <> invalid and state.queued.op = "play"
+            ' A newer play waited for this start: it replaces this attempt, and
+            ' stops the session if there is one, before anything opens.
+        else if playable
+            adopt(state, decision.playback_plan, "start", env, out)
+        else if kind = "ok"
+            terminal = decisionTerminal(decision)
+            out.Push(routeEvent(state, env, "terminal", {}))
+            if terminal.reason = "session_expired" and util.isTrue(terminal.retryable)
+                restart(state, env, out, {})
+            else
+                showError(state, env, out, terminal)
+            end if
+        else if kind = "idempotencyConflict"
+            restart(state, env, out, {})
+        else if kind = "installationChanged"
+            restart(state, env, out, { refreshCapabilities: true })
+        else if kind = "notFound"
+            showError(state, env, out, { reason: "not_found", retryable: false })
+        else if playback.values.isText(event.reason)
+            showError(state, env, out, { reason: event.reason, retryable: true })
+        else
+            showError(state, env, out, { reason: "start_failed", retryable: true })
+        end if
+    end sub
+
+    ' {replan_request_id, kind, decision, bodyText}.
+    sub onReplanResult(state as Object, event as Object, env as Object, out as Object)
+        mutation = state.mutation
+        if mutation = invalid or mutation.kind <> "replan" or event.replan_request_id <> mutation.command.replan_request_id then return
+        kind = event.kind
+        noteResult(state, event)
+        if kind = "offline" or kind = "retry"
+            keepBody(mutation, event)
+            retryLater(state, env, out)
+            return
+        end if
+        if kind = "conflict" and not mutation.conflictRetried
+            ' A newer plan won, the ID was reused with another body, or an
+            ' identical replan is still running: retry the stored body once.
+            keepBody(mutation, event)
+            mutation.conflictRetried = true
+            mutation.retryAt = env.now() + CONFLICT_RETRY_MS
+            return
+        end if
+        state.mutation = invalid
+        request = mutation.request
+        decision = event.decision
+        if kind = "ok" and util.isObject(decision) and util.isObject(decision.playback_plan)
+            if playback.values.isArray(decision.server_features) then state.attempt.serverFeatures = decision.server_features
+            how = "replan"
+            if request.op = "seek_reanchor" then how = "reanchor"
+            if request.op = "track_change"
+                refusals = retrackRefusals(state, mutation, decision.playback_plan, env)
+                if refusals.Count() = 0
+                    how = "retrack"
+                else if onOtherNode(state.plan, decision.playback_plan, refusals)
+                    how = "retrack"
+                    out.Push({ type: "log", level: "debug", message: "kept the content on its proxy node", fields: invalid })
+                else
+                    out.Push(refusalLog(state, decision.playback_plan, refusals, env))
+                end if
+            end if
+            adopt(state, decision.playback_plan, how, env, out)
+        else if kind = "ok"
+            terminal = decisionTerminal(decision)
+            if request.op = "seek_reanchor"
+                seekFailed(state, request.position, playback.recovery.REANCHOR_TERMINAL, terminal.reason, env, out)
+            else
+                out.Push(routeEvent(state, env, "terminal", {}))
+                showError(state, env, out, terminal)
+            end if
+        else if kind = "ended"
+            ' An administrator ended the session: leave, and do not start again.
+            endSession(state, env, out, "session_ended")
+        else if kind = "installationChanged"
+            restart(state, env, out, { refreshCapabilities: true })
+        else if kind = "notFound"
+            restart(state, env, out, { sessionEnded: true })
+        else if kind = "conflict" or kind = "idempotencyConflict" or mutation.reconnect
+            restart(state, env, out, {})
+        else if request.op = "seek_reanchor"
+            seekFailed(state, request.position, playback.recovery.REANCHOR_FAILED, kind, env, out)
+        else if isFailureOp(request.op)
+            showError(state, env, out, { reason: "replan_failed", retryable: true })
+        else
+            ' A refused intent keeps the current plan playing, and the
+            ' player tells the viewer (run 6 refused an audio change in
+            ' silence).
+            out.Push({ type: "log", level: "warn", message: "replan refused", fields: { operation: request.op, kind: kind } })
+            out.Push({ type: "refused", operation: request.op })
+        end if
+    end sub
+
+    ' {session_id, sequence, kind}.
+    sub onProgressResult(state as Object, event as Object, env as Object, out as Object)
+        a = state.attempt
+        if a = invalid or event.session_id <> a.sessionId then return
+        p = a.progress
+        sample = p.sample
+        if sample = invalid or sample.sequence <> event.sequence then return
+        kind = event.kind
+        noteResult(state, event)
+        sample.sending = false
+        if kind = "offline" or kind = "retry"
+            ' Uncertain: the next tick resends this exact body under its sequence.
+            sample.failed = true
+            progressFailed(a, out)
+            return
+        end if
+        p.sample = invalid
+        if kind = "ok"
+            p.failures = 0
+            setPending(a, false, out)
+            ' After an outage, send the latest position now instead of at the next tick.
+            if sample.failed and state.phase = "active" then sendSample(state, a, out)
+        else if kind = "progressConflict"
+            ' A sequence reused with a different payload is a client bug; the
+            ' next sample takes a higher sequence.
+            out.Push({ type: "log", level: "warn", message: "progress_conflict", fields: { sequence: sample.sequence } })
+        else if kind = "notFound"
+            ' The session ended (expiry, a server stop, a restart without Redis).
+            ' Android counts this as a failed post; Roku starts again (plan section 5).
+            restart(state, env, out, { sessionEnded: true })
+        else if kind = "ended"
+            endSession(state, env, out, "session_ended")
+        else if kind = "installationChanged"
+            restart(state, env, out, { refreshCapabilities: true })
+        else
+            progressFailed(a, out)
+        end if
+    end sub
+
+    ' --- Progress -------------------------------------------------------------
+
+    ' The 10 s progress Timer, while playing or paused once the attempt has
+    ' shown a frame. One post is in flight at a time; an uncertain one is
+    ' resent byte for byte before a new sample is taken.
+    sub onTick(state as Object, out as Object)
+        a = state.attempt
+        if state.phase <> "active" or a = invalid or not a.played then return
+        sample = a.progress.sample
+        if sample = invalid
+            sendSample(state, a, out)
+        else if not sample.sending
+            sample.sending = true
+            out.Push(progressCommand(a, sample))
+        end if
+    end sub
+
+    ' A new sample under the session's next sequence.
+    sub sendSample(state as Object, a as Object, out as Object)
+        a.sequence = a.sequence + 1
+        bodyText = FormatJson({ installation_id: state.installationId, sequence: a.sequence, position: playback.values.roundMs(state.player.position), is_paused: state.player.paused })
+        sample = { sequence: a.sequence, bodyText: bodyText, sending: true, failed: false }
+        a.progress.sample = sample
+        out.Push(progressCommand(a, sample))
+    end sub
+
+    function progressCommand(a as Object, sample as Object) as Object
+        return { type: "progress", fence: playback.values.copy(a.fence), session_id: a.sessionId, sequence: sample.sequence, bodyText: sample.bodyText }
+    end function
+
+    sub progressFailed(a as Object, out as Object)
+        a.progress.failures = a.progress.failures + 1
+        if a.progress.failures >= PENDING_AFTER then setPending(a, true, out)
+    end sub
+
+    sub setPending(a as Object, pending as Boolean, out as Object)
+        if a.progress.pending = pending then return
+        a.progress.pending = pending
+        out.Push({ type: "progressPending", pending: pending })
+    end sub
+
+    ' --- Player events --------------------------------------------------------
+
+    ' Player events carry the load they belong to; a late event from an
+    ' earlier load (or an earlier plan) is ignored.
+    function isCurrentLoad(state as Object, event as Object) as Boolean
+        return state.phase = "active" and state.plan <> invalid and util.isNumber(event.load) and event.load = state.plan.load
+    end function
+
+    ' {load}: the player assigned the load's content to a stopped Video
+    ' node. The load's startup stall clock starts here, not at the plan's
+    ' adoption or the reload: the player can wait seconds for the node to
+    ' stop first, and run 10 lost 3.3 s of a cold start's 20 s that way.
+    sub contentAssigned(state as Object, env as Object)
+        plan = state.plan
+        if plan.loadAssigned then return
+        plan.loadAssigned = true
+        playback.recovery.restartStall(state.stall, env.now(), invalid)
+    end sub
+
+    ' {load, state, afterWrite}: "buffering", "playing", "paused", or
+    ' "finished"; afterWrite says the player had just changed the content
+    ' (playback.video.stateEvent).
+    sub onPlayer(state as Object, event as Object, env as Object, out as Object)
+        now = env.now()
+        p = state.player
+        if event.state = "playing" and p.state <> "paused"
+            ' Out of buffering, or a load's start: media reached the node.
+            playback.autoQuality.played(state.auto, now)
+        else if p.state = "buffering" and event.state <> "buffering"
+            playback.autoQuality.bufferingEnded(state.auto, now)
+        end if
+        if event.state = "buffering" and p.state <> "buffering" and state.plan.loadPlayed then playback.recovery.rebufferStarted(state.stall)
+        p.state = event.state
+        plan = state.plan
+        if event.state = "playing"
+            p.paused = false
+            p.seeking = false
+            playback.recovery.restartStall(state.stall, now, p.position)
+            ' The node plays again after the seek back's rebuffering.
+            if plan.seekBack <> invalid and plan.seekBack.buffered then plan.seekBack.resumed = true
+            if not plan.loadPlayed
+                if isHls(plan.data) and util.isNumber(plan.loadStart) then plan.startCheck = { at: now }
+                ' A reload of a plan that has played starts Auto's grace
+                ' again, as the plan's first frame does.
+                if plan.firstFrame then playback.autoQuality.loadStarted(state.auto, now)
+            end if
+            plan.loadPlayed = true
+            plan.loadMedia = true
+            state.attempt.mediaRetried = false
+            if not plan.firstFrame then firstFrame(state, env, out)
+            ' The media is back, unless this is content a reconnect replaces.
+            if state.reconnect = invalid then endOutage(state, out)
+        else if event.state = "paused"
+            p.paused = true
+        else if event.state = "buffering"
+            ' The seek back's own rebuffering, once it has been sent.
+            if plan.seekBack <> invalid then plan.seekBack.buffered = true
+            ' A load buffers until its first frame: a plan's start, or a
+            ' reload of it (a reopen or a credential renewal), which is
+            ' never a bandwidth stall (hardware run 9, T1b).
+            cause = "stall"
+            if p.seeking then cause = "seek"
+            if not plan.loadPlayed then cause = "reload"
+            if not state.reachable then cause = "outage"
+            playback.autoQuality.bufferingStarted(state.auto, now, cause)
+            ' Content whose credential has expired buffers because its
+            ' requests are refused: a progressive original's range request
+            ' answered 401 reports no error, and Roku retries it about 11
+            ' times a second (hardware run 8, T1b).
+            if plan.loadPlayed and credentialExpired(plan, env) then handleFailure(state, "auth", "credential expired", env, out)
+        else if event.state = "finished" and plan.failedLoad <> plan.load
+            ' A Video node reports finished right after an error (hardware
+            ' evidence, harness defect 3); only a load that has not failed ends.
+            if util.isTrue(event.afterWrite) and not atEnd(state)
+                stoppedByClient(state, env, out)
+            else
+                endSession(state, env, out, "finished")
+            end if
+        end if
+    end sub
+
+    ' Whether the load has played to the plan's runtime, give or take
+    ' END_SLACK_SECONDS. Without a runtime it cannot tell and says no: a
+    ' reload at the end plays out to the end again, while taking content
+    ' the client stopped for its end leaves the title.
+    function atEnd(state as Object) as Boolean
+        plan = state.plan
+        if not plan.loadPlayed or not util.isNumber(plan.runtime) then return false
+        return state.player.position >= plan.runtime - END_SLACK_SECONDS
+    end function
+
+    ' The Video node finished before the content's end, right after the
+    ' player changed the content's subtitle, audio, caption drawing, or
+    ' caption mode:
+    ' Roku stopped content it was opening 0.17 s after the player selected
+    ' its sidecar again, and the stall clock then read the stopped node's
+    ' full buffer as no_output (hardware run 20). A player the client
+    ' stopped is never evidence of a failure (spec section 9.6), so the plan
+    ' reloads at the position as a renewal does, a local reload where the
+    ' timeline allows one, else a seek_reanchor there; neither is the plan's
+    ' one reopen, and the new load restarts the stall clock.
+    sub stoppedByClient(state as Object, env as Object, out as Object)
+        plan = state.plan
+        position = state.player.position
+        out.Push({ type: "log", level: "warn", message: "the Video node stopped after the client changed it; the plan reloads at the position", fields: { played: plan.loadPlayed } })
+        target = playback.seek.decide(plan.timeline, position)
+        if target.kind = "local"
+            reload(state, env, out, target.position)
+        else
+            submit(state, { rank: RANK_RECOVERY, op: "seek_reanchor", position: position, planAttemptId: plan.attemptId }, env, out)
+        end if
+    end sub
+
+    ' {load, position}: the Video node's position, in player seconds. Until
+    ' the current load plays, the position stays where the load opens (the
+    ' plan's start, or the saved position a reopen resumes at): a node that
+    ' is still loading reports positions such as 0 that progress and the stop
+    ' must not send.
+    sub onPosition(state as Object, event as Object, env as Object, out as Object)
+        if not state.plan.loadPlayed or not util.isNumber(event.position) then return
+        state.player.position = playback.seek.sourcePosition(state.plan.timeline, event.position)
+        playback.recovery.notePosition(state.stall, state.player.position, env.now())
+        if state.plan.startCheck <> invalid
+            checkStart(state, event.position, env, out)
+        else if state.plan.seekBack <> invalid
+            checkSeekBack(state, event.position, env, out)
+        end if
+    end sub
+
+    ' Where an HLS load starts. Run 8 (defect 6): three of four copy-remux
+    ' resumes, each on a playlist still growing at its first fetch, started
+    ' 6.0 to 9.0 s past PlayStart (player_start_seconds 1.1, 0.5, and 1.5 s;
+    ' first positions 7.2, 9.4, and 8.0 s), losing Resume's rewind, while the
+    ' one whose playlist was complete started at its segment's start, before
+    ' it. The cause in Roku is unconfirmed. A first position more than
+    ' START_SLIP_SECONDS past the load's start, less the time it has played,
+    ' is sought back to that start, once per load, and logged, and so is
+    ' whether it landed (checkSeekBack). Run 9 (defect 3) saw it never land:
+    ' Roku buffered 1.5 to 5 s and played on from 8.17 s. So it is one
+    ' attempt that is not the viewer's: playback does not count as seeking
+    ' (the controls, a renewal, and a failure's recovery treat it as
+    ' playing), the position stays what the node reports, and a viewer's
+    ' seek ends it (requestSeek).
+    sub checkStart(state as Object, playerSeconds as Dynamic, env as Object, out as Object)
+        plan = state.plan
+        now = env.now()
+        elapsed = (now - plan.startCheck.at) / 1000
+        if elapsed > START_CHECK_SECONDS or state.player.seeking
+            plan.startCheck = invalid
+            return
+        end if
+        if playerSeconds - plan.loadStart - elapsed <= START_SLIP_SECONDS then return
+        plan.startCheck = invalid
+        out.Push({ type: "log", level: "warn", message: "the load started past its start; seeking back", fields: { start: plan.loadStart, position: playerSeconds } })
+        plan.seekBack = { from: playerSeconds, at: now, buffered: false, resumed: false }
+        playback.recovery.restartStall(state.stall, now, invalid)
+        out.Push({ type: "seek", load: plan.load, playerPosition: plan.loadStart })
+    end sub
+
+    ' Where the seek back went, from the first position reading once the node
+    ' plays again after the seek's own rebuffering (not one under way when
+    ' it was sent), or START_CHECK_SECONDS after it while not buffering: one
+    ' before where it began means it landed. Earlier readings judge nothing:
+    ' Roku reports 0 while it rebuffers, and run 10 (T3c) logged a landing
+    ' from that 130 ms after the seek, though it played on from 8.17 s.
+    sub checkSeekBack(state as Object, playerSeconds as Dynamic, env as Object, out as Object)
+        plan = state.plan
+        back = plan.seekBack
+        if not back.resumed and (env.now() - back.at < START_CHECK_SECONDS * 1000 or state.player.state = "buffering") then return
+        landed = playerSeconds < back.from
+        plan.seekBack = invalid
+        fields = { start: plan.loadStart, position: playerSeconds }
+        if landed
+            out.Push({ type: "log", level: "info", message: "the seek back landed", fields: fields })
+        else
+            out.Push({ type: "log", level: "warn", message: "the seek back did not land", fields: fields })
+        end if
+    end sub
+
+    ' {load, kind, message}: see playback.recovery.decide for the kinds, plus
+    ' "ended" when API-origin media answered that the session ended.
+    sub onFailure(state as Object, event as Object, env as Object, out as Object)
+        if state.reconnect <> invalid then return
+        handleFailure(state, event.kind, event.message, env, out)
+    end sub
+
+    sub firstFrame(state as Object, env as Object, out as Object)
+        now = env.now()
+        plan = state.plan
+        a = state.attempt
+        plan.firstFrame = true
+        a.played = true
+        a.request.restarts = 0
+        ' The failure chain starts empty with a plan that has played.
+        playback.recovery.resetChain(a.chain)
+        if not a.firstFrameReported
+            a.firstFrameReported = true
+            diagnostics = {}
+            if util.isNumber(a.request.requestedAt) then diagnostics.first_frame_ms = Int(now - a.request.requestedAt).ToStr()
+            out.Push(routeEvent(state, env, "first_frame", { diagnostics: diagnostics }))
+        end if
+        playback.autoQuality.planStarted(state.auto, now, playback.autoQuality.deliveredKbps(plan.data))
+    end sub
+
+    ' One failure is handled per load; a reopen starts a new load. A failure
+    ' while a replan is in flight waits for its answer (plan.failure): a
+    ' replan retires its plan's transport, whose media may answer 404
+    ' meanwhile, and an answer that starts a new load replaces the failed
+    ' one (carrying a renewal the failure needs). An answer that leaves the
+    ' failed load playing is followed by the failure's own recovery
+    ' (settleFailure).
+    sub handleFailure(state as Object, kind as String, message as Dynamic, env as Object, out as Object)
+        plan = state.plan
+        if plan.failedLoad = plan.load then return
+        plan.failedLoad = plan.load
+        playback.autoQuality.loadEnded(state.auto)
+        if state.mutation <> invalid
+            plan.failure = { kind: kind, message: message }
+            if kind = "auth" then oweRenewal(state)
+            out.Push({ type: "log", level: "info", message: "a media failure waits for the replan in flight", fields: { kind: kind } })
+            return
+        end if
+        recoverLoad(state, kind, message, env, out)
+    end sub
+
+    ' The recovery for a failure of the current load, once nothing is in flight.
+    sub recoverLoad(state as Object, kind as String, message as Dynamic, env as Object, out as Object)
+        plan = state.plan
+        if kind = "ended"
+            restart(state, env, out, { sessionEnded: true })
+            return
+        end if
+        if kind = "auth"
+            renewCredential(state, message, env, out)
+            return
+        end if
+        if kind = "audio_unsupported"
+            ' The codec stays refused in later capability reports.
+            recipe = plan.data.effective_recipe
+            if util.isObject(recipe) and playback.values.isText(recipe.audio_codec) then out.Push({ type: "refuseAudioCodec", codec: recipe.audio_codec })
+        end if
+        if kind = "media" then kind = mediaKind(state, out)
+
+        decision = playback.recovery.decide(kind, plan, state.reachable, state.outage <> invalid)
+        if decision.action = "reconnect"
+            startReconnect(state, env, out)
+        else if decision.action = "reopen"
+            reopen(state, env, out)
+        else
+            op = "failure_recovery"
+            if state.player.seeking or (plan.viaSeek and not plan.firstFrame) then op = "seek_failure_recovery"
+            failure = { classification: decision.classification }
+            if playback.values.isText(message) then failure.message = Left(message, 512)
+            submit(state, { rank: RANK_RECOVERY, op: op, failure: failure, planAttemptId: plan.attemptId }, env, out)
+        end if
+    end sub
+
+    ' A media error that names no cause (playback.video's "media") on the
+    ' failed load: the decoder's once media reached the load. Before any
+    ' did, it may be a connection Roku did not name or a decoder that
+    ' refused the stream at once (W11-1): the connection is tried once
+    ' until a load plays, and again while the API does not answer either.
+    ' Another while the API answers is the decoder's (decoder_failure, so
+    ' the server can choose another delivery) and ends the outage, since
+    ' the connection answered.
+    function mediaKind(state as Object, out as Object) as String
+        if state.plan.loadMedia then return "decode"
+        a = state.attempt
+        if a.mediaRetried and state.reachable
+            out.Push({ type: "log", level: "warn", message: "a media error after the connection was tried again is the decoder's", fields: { kind: "media" } })
+            endOutage(state, out)
+            return "decode"
+        end if
+        a.mediaRetried = true
+        out.Push({ type: "log", level: "warn", message: "a media error before any media arrived; trying the connection again", fields: { kind: "media" } })
+        return "network"
+    end function
+
+    ' A failure that waited for a replan whose answer left the failed load
+    ' in place (a refusal, then any seek onto it) is recovered once nothing
+    ' is in flight.
+    sub settleFailure(state as Object, env as Object, out as Object)
+        if state.phase <> "active" or state.mutation <> invalid then return
+        plan = state.plan
+        failure = plan.failure
+        if failure = invalid or plan.failedLoad <> plan.load then return
+        plan.failure = invalid
+        recoverLoad(state, failure.kind, failure.message, env, out)
+    end sub
+
+    ' The one reopen per plan, at the current position: a reload of the same
+    ' plan where the timeline allows a local seek there, else a seek_reanchor.
+    sub reopen(state as Object, env as Object, out as Object)
+        plan = state.plan
+        plan.reopened = true
+        target = playback.seek.decide(plan.timeline, state.player.position)
+        if target.kind = "local"
+            plan.mutations = [playback.recovery.REOPEN_MUTATION]
+            reload(state, env, out, target.position)
+        else
+            submit(state, { rank: RANK_RECOVERY, op: "seek_reanchor", position: target.position, planAttemptId: plan.attemptId }, env, out)
+        end if
+    end sub
+
+    ' A new load of the current plan's content at playerPosition, from the
+    ' plan's own URL; the player keeps its sidecars, and the new content
+    ' carries every one that is ready. refresh asks for its headers from
+    ' refreshed tokens (a renewal). The content it replaces is the client's
+    ' own doing, so nothing it reports, its stop included, reaches the
+    ' stall clock: its callbacks carry the old load, and the clock waits
+    ' for the new content to go onto the Video node (contentAssigned).
+    sub reload(state as Object, env as Object, out as Object, playerPosition as Dynamic, refresh = false as Boolean)
+        plan = state.plan
+        expiry = plan.credentialExpiresAt
+        state.loads = state.loads + 1
+        plan.load = state.loads
+        plan.loadAssigned = false
+        plan.loadPlayed = false
+        plan.loadMedia = false
+        plan.loadStart = playback.values.toDouble(playerPosition)
+        plan.startCheck = invalid
+        plan.seekBack = invalid
+        plan.subtitleReload = invalid
+        playOwnUrl(plan)
+        if not playback.recovery.isProxyStream(plan.data)
+            plan.credentialExpiresAt = 0
+            plan.credentialRenewFrom = 0
+        end if
+        if refresh then renewed(state, expiry)
+        playback.recovery.restartStall(state.stall, env.now(), invalid)
+        playback.autoQuality.loadEnded(state.auto)
+        out.Push({ type: "reopen", load: plan.load, playerPosition: playerPosition, autoplay: not state.player.paused, refresh: refresh })
+    end sub
+
+    ' {load, tracks}: the plan's selected sidecar reached the player after
+    ' the load's content went onto the Video node. tracks is the plan's
+    ' selection for a track_change that keeps it (invalid when the
+    ' inventory does not list the subtitle).
+    sub onSubtitleReady(state as Object, event as Object)
+        state.plan.subtitleReload = { tracks: event.tracks }
+    end sub
+
+    ' Content the Video node plays never takes another track: Roku listed
+    ' only the added sidecar and closed the player (hardware run 19). So
+    ' the content plays on without its subtitle, and one reload of the
+    ' plan at the position carries the sidecar the player kept, where the
+    ' timeline allows a local reload; elsewhere (a copy remux) a
+    ' track_change keeps the selection and reloads, as a switch to a
+    ' sidecar the content lacks does, and its new content downloads the
+    ' sidecar again, once per subtitle and attempt. It waits while anything
+    ' on its way would replace the content or the selection: a replan in
+    ' flight or queued, whose new plan supersedes it (a viewer's track
+    ' change, its own selection), a reconnect, or the failed load's
+    ' recovery, whose reload carries the sidecar anyway (reload).
+    sub settleSubtitle(state as Object, env as Object, out as Object)
+        if state.phase <> "active" or state.mutation <> invalid or state.reconnect <> invalid then return
+        plan = state.plan
+        pending = plan.subtitleReload
+        if pending = invalid or plan.failedLoad = plan.load then return
+        plan.subtitleReload = invalid
+        target = playback.seek.decide(plan.timeline, state.player.position)
+        if target.kind = "local"
+            out.Push({ type: "log", level: "info", message: "the subtitle came after its content started; the plan reloads at the position", fields: { replan: false } })
+            reload(state, env, out, target.position)
+            return
+        end if
+        tracks = pending.tracks
+        if not util.isObject(tracks) or not util.isObject(tracks.subtitle) then return
+        replans = state.attempt.subtitleReplans
+        id = util.text(tracks.subtitle.id)
+        if util.contains(replans, id)
+            out.Push({ type: "log", level: "warn", message: "the subtitle came after its content started again; it shows after the next reload", fields: invalid })
+            return
+        end if
+        replans.Push(id)
+        out.Push({ type: "log", level: "info", message: "the subtitle came after its content started; the plan reloads at the position", fields: { replan: true } })
+        submit(state, { rank: RANK_INTENT, op: "track_change", tracks: tracks, inPlace: false }, env, out)
+    end sub
+
+    ' --- Media credentials ------------------------------------------------------
+
+    ' {load, expiresAt, renewFrom}: the headers the player got for the load,
+    ' in epoch seconds: the access token's expiry, and when the account
+    ' session would refresh it.
+    sub onCredentials(state as Object, event as Object)
+        plan = state.plan
+        if playback.recovery.isProxyStream(plan.data) then return
+        plan.credentialExpiresAt = playback.values.number(event.expiresAt, 0)
+        plan.credentialRenewFrom = playback.values.number(event.renewFrom, 0)
+    end sub
+
+    ' The media refused the content's credential (401 or 403), or the
+    ' content stalled once it had expired: renewed, unless the load already
+    ' renewed it and never played, when the fresh credential was refused
+    ' too.
+    sub renewCredential(state as Object, message as Dynamic, env as Object, out as Object)
+        plan = state.plan
+        if plan.renewLoad = plan.load and not plan.loadPlayed
+            showError(state, env, out, { reason: "media_unauthorized", retryable: true })
+            return
+        end if
+        out.Push({ type: "log", level: "warn", message: "renewing the media credential", fields: { reason: util.text(message) } })
+        renewAt(state, state.player.position, env, out)
+    end sub
+
+    ' A renewal at a source position (plan section 6.4): refreshed headers
+    ' and a reload of the current plan there, or a seek_reanchor there where
+    ' the timeline does not allow a local reload or the credential is a
+    ' proxy URL's path token, which only a new plan renews. Until a load
+    ' carries it, the renewal is owed (state.renewal): the next load
+    ' refreshes its headers, whatever replan brings it, and no plan may
+    ' keep the content in place meanwhile (retrackRefusals).
+    sub renewAt(state as Object, position as Dynamic, env as Object, out as Object)
+        plan = state.plan
+        target = playback.seek.decide(plan.timeline, position)
+        if target.kind = "local" and not playback.recovery.isProxyStream(plan.data)
+            state.player.position = playback.values.toDouble(position)
+            reload(state, env, out, target.position, true)
+        else
+            oweRenewal(state)
+            submit(state, { rank: RANK_RECOVERY, op: "seek_reanchor", position: position, planAttemptId: plan.attemptId }, env, out)
+        end if
+    end sub
+
+    ' The current load's credential needs renewing before any load plays on.
+    sub oweRenewal(state as Object)
+        expiry = state.plan.credentialExpiresAt
+        if state.renewal = invalid then state.renewal = { expiry: 0 }
+        if expiry > state.renewal.expiry then state.renewal.expiry = expiry
+    end sub
+
+    ' The current plan's new load comes from refreshed tokens: it carries the
+    ' renewal owed, and the credential expiry it renews (expiry, or the
+    ' owed one) is not renewed again. Its headers refused before it plays
+    ' show the error (renewCredential).
+    sub renewed(state as Object, expiry as Dynamic)
+        if state.renewal <> invalid and state.renewal.expiry > expiry then expiry = state.renewal.expiry
+        state.renewal = invalid
+        plan = state.plan
+        if expiry > plan.renewedExpiry then plan.renewedExpiry = expiry
+        plan.renewLoad = plan.load
+    end sub
+
+    ' Whether the load's credential has expired by the device's clock.
+    function credentialExpired(plan as Object, env as Object) as Boolean
+        return plan.credentialExpiresAt > 0 and env.epoch() >= plan.credentialExpiresAt
+    end function
+
+    ' Whether the load's credential is past the time it would be refreshed,
+    ' and no renewal has been for it yet: the next local seek or in-place
+    ' track change renews it.
+    function credentialAging(plan as Object, env as Object) as Boolean
+        return plan.credentialExpiresAt > plan.renewedExpiry and plan.credentialRenewFrom > 0 and env.epoch() >= plan.credentialRenewFrom
+    end function
+
+    ' Whether playback waits to renew the credential where it is,
+    ' CREDENTIAL_LEAD_SECONDS before it expires: playing (paused content
+    ' makes no requests, and renews once it plays on), with nothing in
+    ' flight, and not already renewed for this expiry.
+    function renewalWaits(state as Object) as Boolean
+        if state.phase <> "active" or state.mutation <> invalid or state.reconnect <> invalid then return false
+        plan = state.plan
+        if not plan.loadPlayed or state.player.paused or state.player.seeking then return false
+        return plan.credentialExpiresAt > plan.renewedExpiry
+    end function
+
+    ' When playback renews the load's credential where it is, in epoch seconds.
+    function renewalTime(plan as Object) as Dynamic
+        return plan.credentialExpiresAt - CREDENTIAL_LEAD_SECONDS
+    end function
+
+    ' A failed reanchor takes the seek_failure_recovery path (plan section 6.5).
+    sub seekFailed(state as Object, position as Dynamic, classification as String, message as String, env as Object, out as Object)
+        failure = { classification: classification, message: Left(message, 512) }
+        submit(state, { rank: RANK_RECOVERY, op: "seek_failure_recovery", failure: failure, position: position, planAttemptId: state.plan.attemptId }, env, out)
+    end sub
+
+    ' The stream lost its media or its server (spec section 9.6, protocol
+    ' section 6.2): the route did not fail, so a track_change that changes
+    ' nothing, replayed on the reconnect schedule, keeps it eligible. One
+    ' outage spans the loads its reconnects bring until one plays: its
+    ' first reconnect goes at once, and each later one, after its load's
+    ' media failed again, waits the next reconnect delay (1 s doubling to
+    ' 15 s; hardware run 14 lost every route in 2 to 4 s to refused media
+    ' that failed each new load within a second). Two minutes after the
+    ' outage began the error with Retry ends it (expireOutage).
+    sub startReconnect(state as Object, env as Object, out as Object)
+        beginReconnect(state, env, out)
+        outage = state.outage
+        outage.tries = outage.tries + 1
+        if outage.tries = 1
+            sendReconnect(state, env, out)
+        else
+            outage.retryAt = env.now() + playback.recovery.reconnectDelayMs(outage.tries - 1)
+        end if
+    end sub
+
+    sub sendReconnect(state as Object, env as Object, out as Object)
+        submit(state, { rank: RANK_RECOVERY, op: "track_change", reconnect: true, planAttemptId: state.plan.attemptId }, env, out)
+    end sub
+
+    ' A reconnect begins, and with it the outage if none is in progress:
+    ' "Reconnecting" shows until the outage ends.
+    sub beginReconnect(state as Object, env as Object, out as Object)
+        if state.reconnect <> invalid then return
+        state.reconnect = { playIntent: not state.player.paused }
+        if state.outage <> invalid then return
+        state.outage = { startedAt: env.now(), tries: 0, retryAt: invalid }
+        ' Before the first reconnect is built, which carries Auto's estimate.
+        playback.autoQuality.noteOutage(state.auto)
+        out.Push({ type: "reconnecting", active: true })
+    end sub
+
+    ' RECONNECT_BUDGET_MS after an outage began, it ends in the error with
+    ' Retry (spec section 9.6) whatever its reconnects are doing: a try
+    ' waiting, a replan the server has not answered, or a load that is
+    ' not on the Video node yet or buffers without playing, whose media
+    ' restarts the stall clock (W11-2). It is checked before each event,
+    ' so an answer or a player callback that comes later finds the
+    ' attempt retired.
+    sub expireOutage(state as Object, env as Object, out as Object)
+        outage = state.outage
+        if outage = invalid or state.phase <> "active" or env.now() < outageDeadline(outage) then return
+        showError(state, env, out, { reason: "connection_lost", retryable: true, serverUnreachable: not state.reachable })
+    end sub
+
+    function outageDeadline(outage as Object) as Dynamic
+        return outage.startedAt + playback.recovery.RECONNECT_BUDGET_MS
+    end function
+
+    ' A load played, or the attempt ended.
+    sub endOutage(state as Object, out as Object)
+        state.reconnect = invalid
+        if state.outage = invalid then return
+        state.outage = invalid
+        out.Push({ type: "reconnecting", active: false })
+    end sub
+
+    ' --- Seeking --------------------------------------------------------------
+
+    ' A seek waits for a start or replan in flight, then is decided against
+    ' the plan that is current by then (hardware evidence, harness defect 5).
+    ' The viewer's seek wins over the load's own seek back, pending or sent
+    ' (hardware run 9, T4b).
+    sub requestSeek(state as Object, target as Dynamic, env as Object, out as Object)
+        state.seekTarget = target
+        state.plan.startCheck = invalid
+        state.plan.seekBack = invalid
+        submit(state, { rank: RANK_INTENT, op: "seek", position: target }, env, out)
+    end sub
+
+    sub seekTo(state as Object, target as Dynamic, env as Object, out as Object)
+        plan = state.plan
+        if plan.failedLoad = plan.load
+            ' Failed content does not seek: its recovery starts at the target.
+            state.seekTarget = invalid
+            state.player.position = playback.values.toDouble(target)
+            return
+        end if
+        decision = playback.seek.decide(plan.timeline, target)
+        if decision.kind = "local"
+            state.seekTarget = invalid
+            ' The viewer chose where the load plays now.
+            plan.startCheck = invalid
+            if credentialAging(plan, env)
+                ' A quiet moment to renew the credential: the seek reloads anyway.
+                renewAt(state, target, env, out)
+                return
+            end if
+            state.player.seeking = true
+            state.player.position = playback.values.toDouble(target)
+            ' Before the load plays the seek moves where it starts (the player
+            ' sets PlayStart).
+            if not plan.loadPlayed then plan.loadStart = decision.position
+            if renewalDue(plan, streamUrl(plan.data), env)
+                reload(state, env, out, decision.position)
+                return
+            end if
+            playback.recovery.restartStall(state.stall, env.now(), invalid)
+            out.Push({ type: "seek", load: plan.load, playerPosition: decision.position })
+        else
+            submit(state, { rank: RANK_INTENT, op: "seek_reanchor", position: target }, env, out)
+        end if
+    end sub
+
+    ' --- Replans and starts ---------------------------------------------------
+
+    ' Sends a request now, or queues it behind the start or replan in flight.
+    sub submit(state as Object, request as Object, env as Object, out as Object)
+        if state.mutation = invalid
+            send(state, request, env, out)
+        else if state.queued = invalid or request.rank >= state.queued.rank
+            state.queued = request
+        end if
+    end sub
+
+    sub dispatchQueued(state as Object, env as Object, out as Object)
+        while state.mutation = invalid and state.queued <> invalid
+            request = state.queued
+            state.queued = invalid
+            if request.op = "play" or state.phase = "active" then send(state, request, env, out)
+        end while
+    end sub
+
+    sub send(state as Object, request as Object, env as Object, out as Object)
+        if request.op = "play"
+            retire(state, env, out, not util.isTrue(request.sessionEnded))
+            beginAttempt(state, request, env, out)
+            return
+        end if
+        if state.phase <> "active" then return
+        plan = state.plan
+        ' A recovery for a plan that has since been replaced is moot.
+        if util.isString(request.planAttemptId) and request.planAttemptId <> plan.attemptId then return
+        op = request.op
+        if op = "seek"
+            seekTo(state, request.position, env, out)
+            return
+        end if
+
+        a = state.attempt
+        if isFailureOp(op)
+            fields = playback.recovery.failureFields(a.chain, plan, op, request.failure)
+            if fields = invalid
+                showError(state, env, out, { reason: "attempts_exhausted", retryable: true })
+                return
+            end if
+            playback.recovery.recordFailure(a.chain, fields)
+            out.Push(routeEvent(state, env, "plan_failed", { failure_classification: request.failure.classification }))
+        else if op = "seek_reanchor"
+            fields = playback.recovery.seekFields(a.chain, plan)
+        else
+            fields = playback.recovery.intentFields(plan, op)
+            playback.recovery.resetChain(a.chain)
+        end if
+
+        ' A replan carries a pending seek's target, so the plan it returns
+        ' starts there and the seek is done.
+        position = state.player.position
+        if util.isNumber(state.seekTarget) then position = state.seekTarget
+        if util.isNumber(request.position) then position = request.position
+        state.seekTarget = invalid
+        if op = "seek_reanchor" then state.seekTarget = position
+        id = newId(env)
+        fields.installation_id = state.installationId
+        fields.protocol_version = PROTOCOL_VERSION
+        fields.playback_attempt_id = a.id
+        fields.replan_request_id = id
+        fields.position_seconds = playback.values.roundMs(position)
+        fields.quality_preference = state.quality
+        fields.selected_tracks = plan.data.selected_tracks
+        if request.tracks <> invalid then fields.selected_tracks = request.tracks
+        estimate = request.estimate
+        if not util.isNumber(estimate) and state.quality = "auto" then estimate = playback.autoQuality.estimate(state.auto, env.now())
+        if util.isNumber(estimate) then fields.bandwidth_estimate_kbps = estimate
+        if util.isNumber(state.bandwidthCap) then fields.bandwidth_cap_kbps = state.bandwidthCap
+
+        ' Seek replans are rebuilt from the server's stored request, so they do
+        ' not carry the current output context.
+        if op <> "seek_reanchor" and op <> "seek_failure_recovery" then state.output.planned = state.output.current
+        command = { type: "replan", fence: playback.values.copy(a.fence), session_id: a.sessionId, replan_request_id: id, retry: false, stereoAacRestart: a.stereoAacRestart, members: fields }
+        startMutation(state, "replan", command, request, out)
+    end sub
+
+    sub beginAttempt(state as Object, request as Object, env as Object, out as Object)
+        if state.quality <> request.quality or state.auto.quality <> request.quality
+            state.quality = request.quality
+            playback.autoQuality.setQuality(state.auto, request.quality)
+        end if
+        id = newId(env)
+        identity = state.identity
+        fence = { server: identity.server, account: identity.account, profile: identity.profile, attempt: id, session: invalid }
+        ' The title, which lets a newer session's position retire an older
+        ' one's jobs (playback.jobs).
+        if util.isObject(request.intent) and playback.values.isText(request.intent.contentId) then fence.contentId = request.intent.contentId
+        state.attempt = {
+            id: id,
+            fence: fence,
+            request: request,
+            sessionId: invalid,
+            serverFeatures: [],
+            played: false,
+            firstFrameReported: false,
+            sequence: 0,
+            progress: { sample: invalid, failures: 0, pending: false },
+            chain: playback.recovery.newChain(),
+            ' A media error that names no cause has had its connection retry
+            ' since a load last played (mediaKind).
+            mediaRetried: false,
+            ' The subtitles a replan has reloaded to carry because their
+            ' sidecar came after the content started (settleSubtitle).
+            subtitleReplans: [],
+            stereoAacRestart: util.isTrue(request.stereoAacRestart)
+        }
+        state.plan = invalid
+        state.phase = "starting"
+        state.seekTarget = invalid
+        state.player = newPlayer(playback.values.number(request.startPosition, 0))
+
+        command = { type: "start", fence: playback.values.copy(state.attempt.fence), playback_attempt_id: id, retry: false, intent: request.intent, quality_preference: state.quality, stereoAacRestart: state.attempt.stereoAacRestart, refreshCapabilities: util.isTrue(request.refreshCapabilities) }
+        if util.isNumber(request.startPosition) then command.start_position = playback.values.roundMs(request.startPosition)
+        if request.tracks <> invalid then command.selected_tracks = request.tracks
+        if state.quality = "auto"
+            estimate = playback.autoQuality.estimate(state.auto, env.now())
+            if util.isNumber(estimate) then command.bandwidth_estimate_kbps = estimate
+        end if
+        if util.isNumber(state.bandwidthCap) then command.bandwidth_cap_kbps = state.bandwidthCap
+        state.output.planned = state.output.current
+        state.output.seen = false
+        startMutation(state, "start", command, request, out)
+    end sub
+
+    sub startMutation(state as Object, kind as String, command as Object, request as Object, out as Object)
+        state.mutation = { kind: kind, command: command, request: request, bodyText: invalid, tries: 0, retryAt: invalid, conflictRetried: false, reconnect: util.isTrue(request.reconnect) }
+        out.Push(command)
+    end sub
+
+    ' The body text ApiTask sent, kept for a verbatim replay.
+    sub keepBody(mutation as Object, event as Object)
+        if playback.values.isText(event.bodyText) then mutation.bodyText = event.bodyText
+    end sub
+
+    ' An uncertain answer: replay the same command later, or give up.
+    sub retryLater(state as Object, env as Object, out as Object)
+        mutation = state.mutation
+        now = env.now()
+        mutation.tries = mutation.tries + 1
+        if state.identityChanged
+            ' A replay would go out with the new identity's credentials.
+            state.mutation = invalid
+            if state.phase = "leaving" then finishLeaving(state, env, out)
+            return
+        end if
+        if mutation.kind = "replan" and not mutation.reconnect and state.attempt.played
+            if isFailureOp(mutation.request.op)
+                ' A recovery that cannot reach the server says nothing about the
+                ' route (protocol section 6.2): reconnect instead of replaying a
+                ' failure_recovery that would exclude it.
+                state.mutation = invalid
+                startReconnect(state, env, out)
+                return
+            end if
+            if not state.reachable
+                ' Any other replan that cannot reach the server joins the reconnect.
+                mutation.reconnect = true
+                mutation.tries = 1
+                beginReconnect(state, env, out)
+            end if
+        end if
+        if mutation.reconnect
+            mutation.retryAt = now + playback.recovery.reconnectDelayMs(mutation.tries)
+        else if mutation.tries > MAX_RETRIES
+            state.mutation = invalid
+            if state.phase = "leaving"
+                finishLeaving(state, env, out)
+            else
+                showError(state, env, out, { reason: "server_unreachable", retryable: true, serverUnreachable: not state.reachable })
+            end if
+        else
+            mutation.retryAt = now + playback.jobs.backoffMs(mutation.tries)
+        end if
+    end sub
+
+    ' Adopts a returned plan: a fresh plan_attempt_id, a new load from
+    ' player_start_seconds, and the plan's timeline for every later position.
+    ' A new load carries a renewal owed: its headers come from refreshed
+    ' tokens.
+    sub adopt(state as Object, plan as Object, how as String, env as Object, out as Object)
+        a = state.attempt
+        if playback.recovery.needsStereoRestart(plan, state.multichannelAac)
+            if a.stereoAacRestart
+                showError(state, env, out, { reason: "audio_unsupported", retryable: false })
+            else
+                restart(state, env, out, { stereoAacRestart: true })
+            end if
+            return
+        end if
+        previous = state.plan
+        if how = "retrack"
+            ' The content plays on under the new plan, as the same load, from
+            ' the URL it has.
+            state.plan = planState(state, plan, previous.load, env)
+            state.plan.loadAssigned = previous.loadAssigned
+            state.plan.loadPlayed = previous.loadPlayed
+            state.plan.loadMedia = previous.loadMedia
+            state.plan.firstFrame = previous.firstFrame
+            state.plan.failedLoad = previous.failedLoad
+            if state.plan.url <> previous.url
+                state.plan.url = previous.url
+                state.plan.urlExpiresAt = previous.urlExpiresAt
+            end if
+            state.plan.credentialExpiresAt = previous.credentialExpiresAt
+            state.plan.credentialRenewFrom = previous.credentialRenewFrom
+            state.plan.renewedExpiry = previous.renewedExpiry
+            out.Push({ type: "retrack", load: previous.load, plan: plan })
+            requestOutputChange(state, env, out)
+            return
+        end if
+        state.loads = state.loads + 1
+        state.plan = planState(state, plan, state.loads, env)
+        if previous <> invalid then state.plan.reopened = previous.reopened and previous.id = plan.plan_id
+        state.plan.viaSeek = how = "reanchor"
+        timeline = state.plan.timeline
+        state.phase = "active"
+        if how = "reanchor" then state.seekTarget = invalid
+        playerStart = playback.values.toDouble(timeline.player_start_seconds)
+        ' A Double of its own: when loadStart shares playerStart's, brs-node
+        ' hands the load command a Float.
+        state.plan.loadStart = playback.values.toDouble(timeline.player_start_seconds)
+        state.player.position = playback.seek.sourcePosition(timeline, playerStart)
+        state.player.seeking = false
+        state.player.state = "loading"
+        playback.recovery.restartStall(state.stall, env.now(), invalid)
+
+        autoplay = not state.player.paused
+        ' A new attempt the reducer started by itself opens as the viewer
+        ' left the one it replaces, playing or paused.
+        if how = "start" and util.isBoolean(a.request.playIntent) then autoplay = a.request.playIntent
+        if state.reconnect <> invalid
+            autoplay = state.reconnect.playIntent
+            state.reconnect = invalid
+        end if
+        ' The new load replaces the failed one a reconnect was due for; the
+        ' outage lasts until a load plays.
+        if state.outage <> invalid then state.outage.retryAt = invalid
+        renew = state.renewal <> invalid
+        if renew
+            if previous <> invalid then state.plan.renewedExpiry = previous.renewedExpiry
+            renewed(state, 0)
+        end if
+        out.Push({ type: "load", load: state.loads, plan: plan, playerStart: playerStart, autoplay: autoplay, refresh: renew })
+        if how = "reanchor" then out.Push(playback.seek.subtitleShift(timeline))
+        ' The output may have changed while this plan was being chosen.
+        requestOutputChange(state, env, out)
+    end sub
+
+    ' Why a viewer's track_change's plan cannot keep the playing content
+    ' in place, as the names of every condition it fails; none when it
+    ' streams what the content streams, with a subtitle the content
+    ' carries ("in_place": the player asked for a reload), and the content
+    ' is neither reconnecting, which a new load ends ("reconnecting"), nor
+    ' due for renewal ("renewal_owed", "url_expiry" from renewalDue, and
+    ' "credential_aging"). Content that has not played or failed is never
+    ' kept ("not_played", "failed"): the plan's new load replaces it. The
+    ' media checks are playback.sidecars.mediaDifferences'.
+    function retrackRefusals(state as Object, mutation as Object, plan as Object, env as Object) as Object
+        out = []
+        if not util.isTrue(mutation.request.inPlace) then out.Push("in_place")
+        if mutation.reconnect or state.reconnect <> invalid then out.Push("reconnecting")
+        current = state.plan
+        if current = invalid
+            out.Push("not_played")
+            return out
+        end if
+        if not current.loadPlayed then out.Push("not_played")
+        if current.failedLoad = current.load then out.Push("failed")
+        if state.renewal <> invalid then out.Push("renewal_owed")
+        out.Append(playback.sidecars.mediaDifferences(current.data, plan))
+        if renewalDue(current, streamUrl(plan), env) then out.Push("url_expiry")
+        if credentialAging(current, env) then out.Push("credential_aging")
+        return out
+    end function
+
+    ' Whether a track change's plan that fails retrackRefusals only by
+    ' "stream_origin" streams the playing original from another proxy node
+    ' (playback.media.otherNode), so the content plays on from its own node
+    ' (a Roku deviation, spec section 9.7): the server picks a node again
+    ' for every plan, while the old node serves its direct-play URL until
+    ' its token expires or the session stops. Every other condition still
+    ' refuses: the player's reload ("in_place", which every audio change
+    ' and a sidecar the content lacks ask for), the kept URL's expiry
+    ' margin, and any other media difference (assumption AG-218).
+    function onOtherNode(current as Object, plan as Object, refusals as Object) as Boolean
+        return refusals.Count() = 1 and refusals[0] = "stream_origin" and playback.media.otherNode(streamUrl(current.data), streamUrl(plan))
+    end function
+
+    ' The debug line for a track_change's plan that reloads the content
+    ' (hardware run 23: the console could not say why): the refusals,
+    ' whether the plan's stream is on the content's origin, and for an
+    ' expiry refusal the seconds the content's URL and credential have
+    ' left. Never a URL, host, path, or token.
+    function refusalLog(state as Object, plan as Object, refusals as Object, env as Object) as Object
+        current = state.plan
+        fields = { refused: refusals, sameOrigin: playback.media.sameOrigin(current.url, streamUrl(plan)) }
+        if util.contains(refusals, "url_expiry") or util.contains(refusals, "credential_aging")
+            if current.urlExpiresAt > 0 then fields.AddReplace("urlSeconds", current.urlExpiresAt - env.epoch())
+            if current.credentialExpiresAt > 0 then fields.AddReplace("credentialSeconds", current.credentialExpiresAt - env.epoch())
+        end if
+        return { type: "log", level: "debug", message: "the track change's plan does not keep the playing content", fields: fields }
+    end function
+
+    ' Whether the load plays a URL kept from an older plan than the one that
+    ' names url, with less than RENEW_MARGIN_SECONDS of its credential left
+    ' by the device's clock. A URL whose expiry is unknown is not due.
+    function renewalDue(current as Object, url as String, env as Object) as Boolean
+        if current.url = url or current.urlExpiresAt <= 0 then return false
+        return current.urlExpiresAt - env.epoch() < RENEW_MARGIN_SECONDS
+    end function
+
+    ' The load plays its plan's own URL, whose credential lasts as long as
+    ' the plan (expires_at).
+    sub playOwnUrl(current as Object)
+        current.url = streamUrl(current.data)
+        current.urlExpiresAt = playback.values.epochSeconds(current.data.expires_at)
+    end sub
+
+    function isHls(plan as Object) as Boolean
+        return util.isObject(plan.stream) and LCase(util.text(plan.stream.protocol)) = "hls"
+    end function
+
+    function streamUrl(plan as Object) as String
+        if not util.isObject(plan.stream) then return ""
+        return util.text(plan.stream.url)
+    end function
+
+    function planState(state as Object, plan as Object, load as Integer, env as Object) as Object
+        timeline = plan.timeline
+        if not util.isObject(timeline) then timeline = {}
+        current = {
+            data: plan,
+            id: plan.plan_id,
+            key: plan.plan_attempt_key,
+            attemptId: newId(env),
+            timeline: timeline,
+            runtime: playback.seek.runtime(plan, state.attempt.request.catalogRuntime),
+            load: load,
+            failedLoad: 0,
+            ' The failed load's failure while it waits for a replan in flight:
+            ' { kind, message } (handleFailure).
+            failure: invalid,
+            ' The plan's selected sidecar reached the player after the load's
+            ' content went onto the Video node: { tracks } until a reload
+            ' carries it (settleSubtitle).
+            subtitleReload: invalid,
+            ' Whether the current load's content is on the Video node (the
+            ' stall clock waits for it) and whether it has played; a reopen
+            ' starts a new load. firstFrame says whether any load of the plan
+            ' has.
+            loadAssigned: false,
+            loadPlayed: false,
+            ' Whether media reached the current load: a downloaded segment, a
+            ' buffer reading above 0, or its playing.
+            loadMedia: false,
+            firstFrame: false,
+            reopened: false,
+            mutations: [],
+            viaSeek: false,
+            ' The URL the load plays, and its credential's expiry in epoch
+            ' seconds (0 unknown), which a retrack keeps.
+            url: "",
+            urlExpiresAt: 0,
+            ' The load's media credential in epoch seconds (0 unknown): when
+            ' it expires, and from when a seek or track change renews it.
+            credentialExpiresAt: 0,
+            credentialRenewFrom: 0,
+            ' The load opened to renew the credential, and the expiry the last
+            ' renewal was for: one that brings no later expiry is not
+            ' repeated before it expires (a renewing plan carries it on).
+            renewLoad: 0,
+            renewedExpiry: 0,
+            ' Where the load should start, in player seconds, and while its
+            ' first positions are checked against it, { at } (checkStart);
+            ' then, until a reading shows where the seek back went,
+            ' { from, at, buffered, resumed } (checkSeekBack).
+            loadStart: invalid,
+            startCheck: invalid,
+            seekBack: invalid
+        }
+        playOwnUrl(current)
+        if playback.recovery.isProxyStream(plan)
+            current.credentialExpiresAt = current.urlExpiresAt
+            if current.urlExpiresAt > 0 then current.credentialRenewFrom = current.urlExpiresAt - RENEW_MARGIN_SECONDS
+        end if
+        return current
+    end function
+
+    ' output_change only when the normalized output context differs from the
+    ' one the plan was chosen for, and only when the server offers it.
+    sub requestOutputChange(state as Object, env as Object, out as Object)
+        if sameText(state.output.current, state.output.planned) or not hasFeature(state, OUTPUT_CHANGE_FEATURE) then return
+        submit(state, { rank: RANK_AUTOMATIC, op: "output_change" }, env, out)
+    end sub
+
+    ' A new attempt the reducer starts by itself, at the current position with
+    ' the current tracks: the session ended, the installation changed, a
+    ' conflict persisted, or the plan needs the stereo AAC restart.
+    sub restart(state as Object, env as Object, out as Object, options as Object)
+        a = state.attempt
+        if a = invalid then return
+        restarts = a.request.restarts + 1
+        if restarts > MAX_RESTARTS
+            showError(state, env, out, { reason: "playback_failed", retryable: true })
+            return
+        end if
+        request = resumeRequest(state)
+        request.restarts = restarts
+        request.stereoAacRestart = a.stereoAacRestart or util.isTrue(options.stereoAacRestart)
+        request.refreshCapabilities = util.isTrue(options.refreshCapabilities)
+        request.sessionEnded = util.isTrue(options.sessionEnded)
+        submit(state, request, env, out)
+    end sub
+
+    ' A play request that resumes the attempt where it is, with the viewer's
+    ' current quality and play or pause intent. playIntent is the viewer's
+    ' command, which a reconnect in progress holds; it is separate from
+    ' autoplay, the original play's member that decides Up Next and
+    ' first-frame reporting.
+    function resumeRequest(state as Object) as Object
+        a = state.attempt
+        request = playback.values.copy(a.request)
+        request.rank = RANK_PLAY
+        request.op = "play"
+        request.quality = state.quality
+        request.requestedAt = invalid
+        request.restarts = 0
+        request.sessionEnded = false
+        request.refreshCapabilities = false
+        if state.plan <> invalid
+            request.startPosition = state.player.position
+            request.tracks = state.plan.data.selected_tracks
+            request.playIntent = not state.player.paused
+            if state.reconnect <> invalid then request.playIntent = state.reconnect.playIntent
+        end if
+        return request
+    end function
+
+    ' --- Ending ---------------------------------------------------------------
+
+    ' Hands the attempt's durable obligations to ApiTask: an uncertain progress
+    ' sample, then the stop with its stop_id (minted once) and, if the attempt
+    ' played, the final sample under a new, higher sequence. The server applies
+    ' the stop's final sample when it is newer than the last progress, so it is
+    ' the final progress report.
+    sub retire(state as Object, env as Object, out as Object, stopSession as Boolean)
+        a = state.attempt
+        if a = invalid then return
+        if stopSession and playback.values.isText(a.sessionId)
+            sample = a.progress.sample
+            if sample <> invalid and sample.failed then out.Push(jobCommand(a, "progress", sample.sequence, sample.bodyText))
+            body = { installation_id: state.installationId, stop_id: newId(env) }
+            if a.played
+                a.sequence = a.sequence + 1
+                body.sequence = a.sequence
+                body.position = playback.values.roundMs(state.player.position)
+                body.is_paused = state.player.paused
+            end if
+            out.Push(jobCommand(a, "stop", body.sequence, FormatJson(body)))
+        end if
+        setPending(a, false, out)
+        endOutage(state, out)
+        state.attempt = invalid
+        state.plan = invalid
+        state.seekTarget = invalid
+        playback.seek.cancelSkips(state.skips)
+    end sub
+
+    ' A progress job was posted once already, so the queue keeps it ahead of
+    ' the stop.
+    function jobCommand(a as Object, kind as String, sequence as Dynamic, bodyText as String) as Object
+        id = a.sessionId + ":" + kind
+        if kind = "progress" then id = id + ":" + sequence.ToStr()
+        return { type: "job", job: { kind: kind, id: id, fence: playback.values.copy(a.fence), sessionId: a.sessionId, sequence: sequence, uncertain: kind = "progress", bodyText: bodyText } }
+    end function
+
+    ' The viewer is gone or the session is over: stop it and finish. A session
+    ' an administrator ended is already stopped.
+    sub endSession(state as Object, env as Object, out as Object, reason as String)
+        retire(state, env, out, reason <> "session_ended")
+        state.mutation = invalid
+        state.queued = invalid
+        state.phase = "ended"
+        if reason = "finished"
+            out.Push({ type: "finished" })
+        else
+            out.Push({ type: "exit", reason: reason })
+        end if
+        out.Push({ type: "done" })
+    end sub
+
+    ' The viewer left during a start. The start in flight still has to answer,
+    ' so that a session it created can be stopped; a start waiting to be
+    ' replayed after an identity change is dropped instead, because the replay
+    ' would go out with the new identity's credentials.
+    sub leave(state as Object, env as Object, out as Object, reason as String)
+        state.phase = "leaving"
+        state.queued = invalid
+        out.Push({ type: "exit", reason: reason })
+        mutation = state.mutation
+        if mutation = invalid or (state.identityChanged and util.isNumber(mutation.retryAt))
+            state.mutation = invalid
+            finishLeaving(state, env, out)
+        end if
+    end sub
+
+    ' After Back or an identity change during a start: stop what the start
+    ' returned, then finish.
+    sub finishLeaving(state as Object, env as Object, out as Object)
+        retire(state, env, out, true)
+        state.queued = invalid
+        state.phase = "ended"
+        out.Push({ type: "done" })
+    end sub
+
+    ' A full-screen error with Retry, which starts a new attempt at the saved
+    ' position. info is {reason, message, retryable, serverUnreachable}, or a
+    ' decision's terminal. The session is stopped, and an answer still in
+    ' flight is moot.
+    sub showError(state as Object, env as Object, out as Object, info as Object)
+        if state.attempt <> invalid then state.resume = resumeRequest(state)
+        retire(state, env, out, true)
+        state.mutation = invalid
+        state.phase = "error"
+        out.Push({ type: "error", reason: info.reason, message: info.message, retryable: util.isTrue(info.retryable), serverUnreachable: util.isTrue(info.serverUnreachable) })
+    end sub
+
+    ' --- Timers ---------------------------------------------------------------
+
+    sub runTimers(state as Object, env as Object, out as Object)
+        now = env.now()
+        mutation = state.mutation
+        if mutation <> invalid and util.isNumber(mutation.retryAt) and now >= mutation.retryAt
+            mutation.retryAt = invalid
+            command = playback.values.copy(mutation.command)
+            command.retry = true
+            if mutation.bodyText <> invalid then command.bodyText = mutation.bodyText
+            out.Push(command)
+        end if
+        outage = state.outage
+        if outage <> invalid and util.isNumber(outage.retryAt) and now >= outage.retryAt
+            outage.retryAt = invalid
+            if state.phase = "active" then sendReconnect(state, env, out)
+        end if
+        target = playback.seek.dueSkip(state.skips, now)
+        if util.isNumber(target) and state.phase = "active" then requestSeek(state, target, env, out)
+        if stallClockRunning(state)
+            kind = playback.recovery.stallKind(state.stall, now)
+            ' A stall once the credential expired is its refusal (run 8, T1b:
+            ' 20 s of 401s on a range request, then decoder_no_output).
+            if util.isString(kind) and credentialExpired(state.plan, env) then kind = "auth"
+            if util.isString(kind)
+                out.Push({ type: "log", level: "warn", message: "no progress for 20 s", fields: { kind: kind, buffer: state.stall.level } })
+                ' 20 s with nothing arriving is an outage, not a slow network.
+                if kind = "stall" then playback.autoQuality.noteOutage(state.auto)
+                handleFailure(state, kind, invalid, env, out)
+            end if
+        end if
+        if renewalWaits(state) and env.epoch() >= renewalTime(state.plan)
+            out.Push({ type: "log", level: "info", message: "renewing the media credential before it expires", fields: { seconds: state.plan.credentialExpiresAt - env.epoch() } })
+            renewAt(state, state.player.position, env, out)
+        end if
+        ' Auto judges only a load that has played: not a reload of the plan
+        ' while the player prepares it or it starts.
+        if state.phase = "active" and state.plan.firstFrame and state.plan.loadPlayed
+            kbps = playback.autoQuality.check(state.auto, now)
+            if util.isNumber(kbps) then submit(state, { rank: RANK_AUTOMATIC, op: "quality_change", estimate: kbps }, env, out)
+        end if
+    end sub
+
+    ' The stall clock runs while the viewer wants playback on a load whose
+    ' content is on the Video node and has not already failed.
+    function stallClockRunning(state as Object) as Boolean
+        if state.phase <> "active" or state.reconnect <> invalid or state.player.paused then return false
+        return state.plan.loadAssigned and state.plan.failedLoad <> state.plan.load
+    end function
+
+    ' Whether the node is waiting for media: the load has not played yet, or
+    ' it is rebuffering.
+    function waitingForMedia(state as Object) as Boolean
+        return not state.plan.loadPlayed or state.player.state = "buffering"
+    end function
+
+    ' --- Helpers --------------------------------------------------------------
+
+    ' The capability context a start body was built with: { installationId,
+    ' features } from capabilities, { multichannelAac, outputContextId } from
+    ' that start's probe. Later progress, stops, route events, and replans use
+    ' it, so an installation re-read for a new attempt is not lost. The plan
+    ' is for the output the body named; an outputContext event seen during
+    ' the start stays current, so adopt() asks for output_change.
+    sub applyContext(state as Object, context as Dynamic)
+        if not util.isObject(context) then return
+        if playback.values.isText(context.installationId) then state.installationId = context.installationId
+        if playback.values.isArray(context.features) then state.features = context.features
+        if util.isBoolean(context.multichannelAac) then state.multichannelAac = context.multichannelAac
+        if playback.values.isText(context.outputContextId)
+            state.output.planned = context.outputContextId
+            if not state.output.seen then state.output.current = context.outputContextId
+        end if
+    end sub
+
+    function newPlayer(position as Dynamic) as Object
+        return { state: "idle", position: playback.values.toDouble(position), paused: false, seeking: false }
+    end function
+
+    ' Stop and event IDs must be lowercase canonical UUIDs (plan section 5).
+    function newId(env as Object) as String
+        return LCase(env.uuid())
+    end function
+
+    function isFailureOp(op as String) as Boolean
+        return op = "failure_recovery" or op = "seek_failure_recovery"
+    end function
+
+    ' Whether the server answered a start, replan, or progress post. A
+    ' gateway's 502, 503, or 504 is a proxy speaking for a server it cannot
+    ' reach (hardware run 8, defect 4: a stopped server behind a proxy kept
+    ' the error screen from offering Try Anyway).
+    sub noteResult(state as Object, event as Object)
+        status = playback.values.number(event.status, 0)
+        state.reachable = event.kind <> "offline" and not (status = 502 or status = 503 or status = 504)
+        if not state.reachable then playback.autoQuality.noteOutage(state.auto)
+    end sub
+
+    function routeEvent(state as Object, env as Object, name as String, extra as Object) as Object
+        a = state.attempt
+        body = { installation_id: state.installationId, event_id: newId(env), protocol_version: PROTOCOL_VERSION, playback_attempt_id: a.id, event: name, diagnostics: {} }
+        if playback.values.isText(a.sessionId) then body.session_id = a.sessionId
+        plan = state.plan
+        if plan <> invalid
+            body.plan_id = plan.id
+            body.plan_attempt_id = plan.attemptId
+            body.plan_attempt_key = plan.key
+        end if
+        if playback.values.isText(state.output.planned) then body.output_context_id = state.output.planned
+        body.Append(extra)
+        return { type: "routeEvent", fence: playback.values.copy(a.fence), body: body }
+    end function
+
+    function decisionTerminal(decision as Dynamic) as Object
+        terminal = { reason: "playback_failed", message: invalid, retryable: true }
+        if util.isObject(decision) and util.isObject(decision.terminal) then terminal.Append(decision.terminal)
+        if not playback.values.isText(terminal.reason) then terminal.reason = "playback_failed"
+        return terminal
+    end function
+
+    function hasFeature(state as Object, name as String) as Boolean
+        if util.contains(state.features, name) then return true
+        return state.attempt <> invalid and util.contains(state.attempt.serverFeatures, name)
+    end function
+
+    function sameText(a as Dynamic, b as Dynamic) as Boolean
+        if not util.isString(a) or not util.isString(b) then return not util.isString(a) and not util.isString(b)
+        return a = b
+    end function
+
+    function earliest(current as Dynamic, candidate as Dynamic) as Dynamic
+        if not util.isNumber(candidate) then return current
+        if not util.isNumber(current) or candidate < current then return candidate
+        return current
+    end function
+end namespace

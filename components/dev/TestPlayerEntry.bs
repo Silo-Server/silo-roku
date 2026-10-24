@@ -1,0 +1,270 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/api/session.bs"
+import "pkg:/source/auth/profiles.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' Development-only test player entry. Text comes from the standard keyboard
+' and PIN pad dialogs; the password and PIN go from the dialog straight into
+' one session request and are never kept, shown, or logged here.
+
+const OWNER = "dev.testPlayer"
+
+sub init()
+    m.dialog = invalid
+    m.profiles = []
+    m.chosen = invalid
+    m.itemId = ""
+    view = api.session.current()
+    if view = invalid
+        finish("ApiTask has not started yet.")
+    else if view.status = "no_server"
+        showKeyboard("Server address", "HTTPS is used unless you type http://.", "https://", false, "onServerEntered")
+    else if view.status <> "signed_in"
+        showKeyboard("User name", "Signs in to " + view.origin + ".", "", false, "onUsernameEntered")
+    else if not util.isObject(view.profile)
+        m.handle = sendWith("onProfiles")
+        api.session.profiles(m.handle)
+    else
+        showKeyboard("Item ID", "The catalog item to play, as in GET /api/v2/watch/{id}.", "", false, "onItemEntered")
+    end if
+end sub
+
+' --- Setup steps, one per press -------------------------------------------
+
+sub onServerEntered()
+    text = closeDialog()
+    if text = invalid
+        finish("")
+        return
+    end if
+    m.address = text.Trim()
+    api.session.setServer(m.address, false, sendWith("onServerChecked"))
+end sub
+
+sub onServerChecked(event as Object)
+    result = answer(event)
+    if result = invalid then return
+    if result.ok = true
+        finish("Server set. Press OK on the placeholder, then Down to sign in.")
+        return
+    end if
+    if result.error.kind = "needs_http_confirmation"
+        showMessage("Connect without encryption?", ["The user name, password, and viewing activity will be sent unencrypted."], ["Connect without encryption", "Cancel"], "onHttpConfirmed")
+        return
+    end if
+    finish("Server check failed: " + result.error.kind)
+end sub
+
+sub onHttpConfirmed()
+    choice = closeDialog()
+    if choice <> 0
+        finish("")
+        return
+    end if
+    api.session.setServer(m.address, true, sendWith("onServerChecked"))
+end sub
+
+sub onUsernameEntered()
+    text = closeDialog()
+    if text = invalid
+        finish("")
+        return
+    end if
+    m.username = text.Trim()
+    showKeyboard("Password", "Sent once to the server and never stored.", "", true, "onPasswordEntered")
+end sub
+
+sub onPasswordEntered()
+    password = closeDialog()
+    if password = invalid
+        finish("")
+        return
+    end if
+    api.session.signIn(m.username, password, sendWith("onSignedIn"))
+end sub
+
+sub onSignedIn(event as Object)
+    result = answer(event)
+    if result = invalid then return
+    if result.ok = true
+        finish("Signed in. Press OK on the placeholder, then Down to choose a profile.")
+        return
+    end if
+    finish("Sign-in failed: " + result.error.kind + " " + result.status.ToStr())
+end sub
+
+sub onProfiles(event as Object)
+    result = answer(event)
+    if result = invalid then return
+    if result.ok <> true
+        finish("Profiles failed: " + result.status.ToStr())
+        return
+    end if
+    m.profiles = api.auth.profiles.list(result.body)
+    if m.profiles.Count() = 0
+        finish("This account has no profiles.")
+        return
+    end if
+    names = []
+    for each profile in m.profiles
+        name = profile.name
+        if profile.hasPin then name = name + " (PIN)"
+        names.Push(name)
+    end for
+    showMessage("Who's watching?", ["Choose the profile to play with."], names, "onProfileChosen")
+end sub
+
+sub onProfileChosen()
+    choice = closeDialog()
+    if choice = invalid or choice < 0 or choice >= m.profiles.Count()
+        finish("")
+        return
+    end if
+    m.chosen = m.profiles[choice]
+    api.session.selectProfile(m.chosen, sendWith("onProfileSelected"))
+end sub
+
+sub onProfileSelected(event as Object)
+    result = answer(event)
+    if result = invalid then return
+    if result.ok = true
+        finish("Profile chosen. Press Up to play an item.")
+        return
+    end if
+    if result.error.kind <> "pin_required"
+        finish("Profile failed: " + result.error.kind)
+        return
+    end if
+    dialog = CreateObject("roSGNode", "StandardPinPadDialog")
+    dialog.title = "PIN for " + m.chosen.name
+    dialog.buttons = ["OK", "Cancel"]
+    if dialog.pinPad <> invalid then dialog.pinPad.secureMode = true
+    openDialog(dialog, "onPinEntered")
+end sub
+
+sub onPinEntered()
+    pin = closeDialog()
+    if pin = invalid
+        finish("")
+        return
+    end if
+    api.session.verifyPin(m.chosen, pin, sendWith("onPinChecked"))
+end sub
+
+sub onPinChecked(event as Object)
+    result = answer(event)
+    if result = invalid then return
+    outcome = ""
+    if util.isObject(result.body) then outcome = util.text(result.body.outcome)
+    if outcome = "verified"
+        finish("Profile chosen. Press Up to play an item.")
+        return
+    end if
+    finish("PIN check: " + outcome)
+end sub
+
+' --- The item -------------------------------------------------------------
+
+sub onItemEntered()
+    text = closeDialog()
+    if text = invalid or text.Trim() = ""
+        finish("")
+        return
+    end if
+    m.itemId = text.Trim()
+    showMessage("Play " + m.itemId, ["Resume starts 7 s before the saved position."], ["Resume", "Start over", "Cancel"], "onStartChosen")
+end sub
+
+sub onStartChosen()
+    choice = closeDialog()
+    if choice = invalid or choice > 1
+        finish("")
+        return
+    end if
+    ' The diagnostic screen closes this entry, then pushes the player.
+    m.top.chosen = { itemId: m.itemId, startOver: choice = 1 }
+end sub
+
+' --- Dialogs and requests --------------------------------------------------
+
+function sendWith(callback as String) as Object
+    handle = api.newHandle(OWNER)
+    handle.observeField("status", callback)
+    return handle
+end function
+
+' The answer, or invalid when this entry is no longer on screen: a session
+' change may have reset the stack before the answer arrived.
+function answer(event as Object) as Dynamic
+    if m.top.getScene() = invalid then return invalid
+    return api.resultOf(event.getRoSGNode())
+end function
+
+sub finish(message as String)
+    if message <> "" then log.info("dev", "test player: " + message)
+    if m.top.getScene() = invalid then return
+    if message <> ""
+        showMessage("Test player", [message], ["OK"], "onFinished")
+        return
+    end if
+    onFinished()
+end sub
+
+sub onFinished()
+    closeDialog()
+    api.release(OWNER)
+    m.top.closed = true
+end sub
+
+sub showKeyboard(title as String, message as String, text as String, secure as Boolean, callback as String)
+    dialog = CreateObject("roSGNode", "StandardKeyboardDialog")
+    dialog.title = title
+    if message <> "" then dialog.message = [message]
+    dialog.text = text
+    dialog.buttons = ["OK", "Cancel"]
+    if secure and dialog.textEditBox <> invalid then dialog.textEditBox.secureMode = true
+    openDialog(dialog, callback)
+end sub
+
+sub showMessage(title as String, message as Object, buttons as Object, callback as String)
+    dialog = CreateObject("roSGNode", "StandardMessageDialog")
+    dialog.title = title
+    dialog.message = message
+    dialog.buttons = buttons
+    openDialog(dialog, callback)
+end sub
+
+sub openDialog(dialog as Object, callback as String)
+    m.dialog = dialog
+    dialog.observeField("buttonSelected", callback)
+    dialog.observeField("wasClosed", callback)
+    m.top.getScene().dialog = dialog
+end sub
+
+' Closes the open dialog and gives what it produced: the text or PIN when OK
+' was chosen, the button index for message dialogs, or invalid when it was
+' cancelled. Text and PIN are cleared from the dialog first.
+function closeDialog() as Dynamic
+    dialog = m.dialog
+    if dialog = invalid then return invalid
+    m.dialog = invalid
+    choice = dialog.buttonSelected
+    cancelled = dialog.wasClosed = true
+    dialog.unobserveField("buttonSelected")
+    dialog.unobserveField("wasClosed")
+    dialog.close = true
+    if dialog.subtype() = "StandardMessageDialog"
+        if cancelled then return invalid
+        return choice
+    end if
+    if dialog.subtype() = "StandardPinPadDialog"
+        value = dialog.pin
+        dialog.pin = ""
+    else
+        value = dialog.text
+        dialog.text = ""
+    end if
+    if cancelled or choice <> 0 then return invalid
+    return value
+end function

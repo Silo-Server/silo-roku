@@ -1,0 +1,109 @@
+import "pkg:/source/util/values.bs"
+
+' Dev builds only: what the memory check (components/dev/MemoryCheck.xml)
+' does on each tick, as pure functions over plain data. It adds a block of
+' memory per tick until GetMemoryLimitPercent() reaches CEILING_PERCENT,
+' holds, frees one block per tick, and waits for the policy to settle.
+'
+' Hardware run 4 held 510 MB of BrightScript strings (86% of the foreground
+' limit) while GetMemoryLimitPercent() read 2% throughout, so the check
+' trusts only what the API shows: each kind of block gets PROBE_BLOCKS
+' blocks, and a kind that has not moved the API by MIN_RISE points by then
+' is freed and the next one tried. The kinds, in order: BYTES, roByteArray
+' buffers with every page written; TEXTURES, 1920x1080 bitmaps decoded for
+' visible Posters.
+namespace memcheck
+    const CEILING_PERCENT = 92
+    const HOLD_TICKS = 6
+    const SETTLE_TICKS = 10
+    const PROBE_BLOCKS = 2
+    const MIN_RISE = 2
+    ' Adding stops while GetChannelAvailableMemory() has room for fewer
+    ' blocks than this, so a kind the API does not count cannot get the app
+    ' killed.
+    const FREE_BLOCKS = 2
+    const BYTES = "bytes"
+    const TEXTURES = "textures"
+
+    ' blockKb: the size of a block; usage: GetMemoryLimitPercent() now.
+    ' kindStart is the usage before the current kind's first block.
+    function create(blockKb as Integer, usage as Integer) as Object
+        return { phase: "ramp", kinds: [BYTES, TEXTURES], kindIndex: 0, held: 0, kindStart: usage, waited: 0, blockKb: blockKb, uncounted: [] }
+    end function
+
+    ' The kind being added, or "" once every kind has been tried.
+    function currentKind(state as Object) as String
+        if state.kindIndex >= state.kinds.Count() then return ""
+        return state.kinds[state.kindIndex]
+    end function
+
+    ' One tick. usage is GetMemoryLimitPercent(), availableKb
+    ' GetChannelAvailableMemory() (invalid when unknown), and level the
+    ' policy's memory.level. Returns the actions to carry out, in order:
+    '   { action: "allocate", kind }      add a block of kind
+    '   { action: "free" }                free the newest block
+    '   { action: "hold", reason }        "ceiling" or "available"
+    '   { action: "uncounted", kind, rise }   kind did not move the API
+    '   { action: "finish", reason }      free the rest and stop:
+    '                                     "settled" or "uncounted"
+    ' Nothing follows a finish.
+    function tick(state as Object, usage as Integer, availableKb as Dynamic, level as String) as Object
+        if state.phase = "done" then return []
+        if state.phase = "ramp" then return ramp(state, usage, availableKb)
+        if state.phase = "hold"
+            state.waited = state.waited + 1
+            if state.waited >= HOLD_TICKS then enter(state, "release")
+            return []
+        end if
+        if state.phase = "release"
+            if state.held = 0
+                enter(state, "settle")
+                return []
+            end if
+            state.held = state.held - 1
+            if state.held = 0 then enter(state, "settle")
+            return [{ action: "free" }]
+        end if
+        state.waited = state.waited + 1
+        if level = "normal" or state.waited >= SETTLE_TICKS then return [finishWith(state, "settled")]
+        return []
+    end function
+
+    function ramp(state as Object, usage as Integer, availableKb as Dynamic) as Object
+        if usage >= CEILING_PERCENT then return hold(state, "ceiling")
+        if util.isNumber(availableKb) and availableKb < FREE_BLOCKS * state.blockKb then return hold(state, "available")
+        kindNow = currentKind(state)
+        if state.kindStart = invalid then state.kindStart = usage
+        if state.held <> PROBE_BLOCKS or usage - state.kindStart >= MIN_RISE
+            state.held = state.held + 1
+            return [{ action: "allocate", kind: kindNow }]
+        end if
+        ' The probe blocks are in and the API has not moved: free them and
+        ' try the next kind from the next tick's usage.
+        actions = [{ action: "uncounted", kind: kindNow, rise: usage - state.kindStart }]
+        for i = 1 to state.held
+            actions.Push({ action: "free" })
+        end for
+        state.held = 0
+        state.uncounted.Push(kindNow)
+        state.kindIndex = state.kindIndex + 1
+        state.kindStart = invalid
+        if currentKind(state) = "" then actions.Push(finishWith(state, "uncounted"))
+        return actions
+    end function
+
+    function finishWith(state as Object, reason as String) as Object
+        enter(state, "done")
+        return { action: "finish", reason: reason }
+    end function
+
+    function hold(state as Object, reason as String) as Object
+        enter(state, "hold")
+        return [{ action: "hold", reason: reason }]
+    end function
+
+    sub enter(state as Object, phase as String)
+        state.phase = phase
+        state.waited = 0
+    end sub
+end namespace

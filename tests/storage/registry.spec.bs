@@ -1,0 +1,270 @@
+namespace tests
+
+    @suite("storage registry")
+    class StorageRegistryTests extends rooibos.BaseTestSuite
+
+        @describe("decode and encode")
+
+        @it("keeps a signed-in session across a relaunch")
+        sub _()
+            record = m.full()
+            raw = storage.encode(record)
+            m.assertEqual(raw.schema, "1")
+            m.assertEqual(raw.access_token, "acc")
+            m.assertEqual(storage.decode(raw), record)
+        end sub
+
+        @it("reads a fresh install as empty")
+        sub _()
+            m.assertEqual(storage.decode({}), storage.empty())
+            m.assertEqual(storage.encode(storage.empty()), { schema: "1" })
+        end sub
+
+        @it("keeps tokens only as a pair")
+        sub _()
+            raw = storage.encode(m.full())
+            raw.Delete("refresh_token")
+            record = storage.decode(raw)
+            m.assertEqual([record.accessToken, record.refreshToken, record.expiresAt, record.profileTokens], ["", "", 0, []])
+            m.assertEqual([record.accountId, record.profileId], ["1", "p-owner"])
+            unpaired = m.full()
+            unpaired.accessToken = ""
+            m.assertFalse(storage.encode(unpaired).DoesExist("refresh_token"))
+        end sub
+
+        @it("drops the session when the server is missing or invalid")
+        @params("")
+        @params("ftp://silo.example")
+        @params("https://silo.example/")
+        sub _(origin as String)
+            raw = storage.encode(m.full())
+            raw.origin = origin
+            record = storage.decode(raw)
+            m.assertEqual([record.origin, record.accessToken, record.accountId, record.profileId], ["", "", "", ""])
+            m.assertEqual(record.deviceId, "device-1")
+        end sub
+
+        @it("drops values that do not validate")
+        sub _()
+            raw = storage.encode(m.full())
+            raw.device = "has space"
+            raw.expires_at = "12x"
+            raw.refresh_at = "99999999999"
+            raw.profile_tokens = "{not a list"
+            record = storage.decode(raw)
+            m.assertEqual([record.deviceId, record.expiresAt, record.refreshAt, record.profileTokens], ["", 0, 0, []])
+            m.assertEqual(record.accessToken, "acc")
+        end sub
+
+        @describe("migrations")
+
+        @it("carries the session through each layout step")
+        sub _()
+            raw = storage.encode(m.full())
+            steps = [
+                {
+                    from: 2, run: function(section as Object) as Object
+                        section.tokens = FormatJson({ access: section.access, refresh: section.refresh })
+                        section.Delete("access")
+                        section.Delete("refresh")
+                        return section
+                    end function
+                },
+                {
+                    from: 1, run: function(section as Object) as Object
+                        section.access = section.access_token
+                        section.refresh = section.refresh_token
+                        section.Delete("access_token")
+                        section.Delete("refresh_token")
+                        return section
+                    end function
+                }
+            ]
+            upgraded = storage.migrate(raw, steps, 3)
+            m.assertEqual(upgraded.schema, "3")
+            m.assertEqual(ParseJson(upgraded.tokens), { access: "acc", refresh: "ref" })
+            m.assertEqual([upgraded.origin, upgraded.account, upgraded.profile], ["https://silo.example", "1", "p-owner"])
+            ' The input is not changed.
+            m.assertEqual(raw.access_token, "acc")
+        end sub
+
+        @it("stops where no step continues and leaves a newer layout alone")
+        sub _()
+            raw = storage.encode(m.full())
+            m.assertEqual(storage.migrate(raw, [], 2), raw)
+            newer = storage.encode(m.full())
+            newer.schema = "2"
+            m.assertEqual(storage.migrate(newer, [], 1), newer)
+        end sub
+
+        @it("reads the session from a newer layout and keeps its version and keys")
+        sub _()
+            raw = storage.encode(m.full())
+            raw.schema = "2"
+            raw.added_later = "x"
+            record = storage.decode(raw)
+            m.assertEqual([record.version, record.accessToken], [2, "acc"])
+            section = m.section(raw)
+            storage.write(section, storage.encode(record))
+            m.assertEqual(section.data.schema, "2")
+            m.assertEqual(section.data.added_later, "x")
+        end sub
+
+        @it("has no layout step yet: version 1 is the first")
+        sub _()
+            m.assertEqual(storage.VERSION, 1)
+            m.assertEqual(storage.migrations(), [])
+        end sub
+
+        @describe("write")
+
+        @it("writes changed keys, deletes cleared ones, and flushes")
+        sub _()
+            section = m.section({})
+            m.assertTrue(storage.write(section, storage.encode(m.full())))
+            m.assertEqual(section.data.access_token, "acc")
+            m.assertEqual(section.flushes, 1)
+            writes = section.writes
+            storage.write(section, storage.encode(m.full()))
+            m.assertEqual(section.writes, writes)
+
+            signedOut = m.full()
+            signedOut.accessToken = ""
+            signedOut.refreshToken = ""
+            storage.write(section, storage.encode(signedOut))
+            m.assertFalse(section.data.DoesExist("access_token"))
+            m.assertFalse(section.data.DoesExist("profile_tokens"))
+            m.assertEqual(section.data.account, "1")
+            m.assertEqual(storage.load(section).accountId, "1")
+        end sub
+
+        @it("reports a failed flush")
+        sub _()
+            section = m.section({})
+            section.flushResult = false
+            m.assertFalse(storage.write(section, storage.encode(m.full())))
+        end sub
+
+        @describe("budget")
+
+        @it("keeps the largest section within half of Roku's 32 KB")
+        sub _()
+            m.assertTrue(storage.BUDGET_BYTES * 2 <= 32768)
+            m.assertTrue(storage.maxBytes() <= storage.BUDGET_BYTES, "maxBytes " + storage.maxBytes().ToStr())
+            record = m.full()
+            record.origin = "https://" + string(storage.MAX_ORIGIN_BYTES - 8, "a")
+            record.deviceId = string(storage.MAX_ID_BYTES, "d")
+            record.accountId = string(storage.MAX_ID_BYTES, "u")
+            record.profileId = string(storage.MAX_ID_BYTES, "p")
+            record.accessToken = string(storage.MAX_TOKEN_BYTES, "x")
+            record.refreshToken = string(storage.MAX_TOKEN_BYTES, "y")
+            record.expiresAt = Int(2147483647)
+            record.refreshAt = Int(2147483647)
+            record.profileTokens = []
+            for i = 1 to storage.MAX_PROFILE_TOKENS
+                record.profileTokens.Push({ id: string(storage.MAX_ID_BYTES - 1, "i") + i.ToStr(), token: string(storage.MAX_PROFILE_TOKEN_BYTES, "t") })
+            end for
+            raw = storage.encode(record)
+            m.assertEqual(raw.Count(), 10)
+            m.assertEqual(ParseJson(raw.profile_tokens).Count(), storage.MAX_PROFILE_TOKENS)
+            m.assertTrue(storage.bytes(raw) <= storage.maxBytes(), "bytes " + storage.bytes(raw).ToStr())
+            m.assertEqual(storage.decode(raw), record)
+        end sub
+
+        @it("does not store a value over its bound")
+        sub _()
+            record = m.full()
+            record.accessToken = string(storage.MAX_TOKEN_BYTES + 1, "x")
+            raw = storage.encode(record)
+            m.assertFalse(raw.DoesExist("access_token"))
+            m.assertFalse(raw.DoesExist("refresh_token"))
+            record = m.full()
+            record.profileId = string(storage.MAX_ID_BYTES + 1, "p")
+            m.assertFalse(storage.encode(record).DoesExist("profile"))
+        end sub
+
+        @it("keeps the newest profile tokens")
+        sub _()
+            record = m.full()
+            record.profileTokens = []
+            for i = 1 to storage.MAX_PROFILE_TOKENS + 2
+                record.profileTokens.Push({ id: "p" + i.ToStr(), token: "t" + i.ToStr() })
+            end for
+            kept = storage.decode(storage.encode(record)).profileTokens
+            m.assertEqual(kept.Count(), storage.MAX_PROFILE_TOKENS)
+            m.assertEqual(kept[0].id, "p3")
+        end sub
+
+        @it("counts bytes as UTF-8")
+        sub _()
+            m.assertEqual(storage.bytes({ ab: "é" }), 4)
+        end sub
+
+        @describe("device ID")
+
+        @it("accepts letters, digits, and . _ : - up to 128 characters")
+        @params("2f4b8c1e-7a35-4c7e-9a0d-3f2a9d5e6b1c", true)
+        @params("roku.dev_1:a-B", true)
+        @params("has space", false)
+        @params("id,id", false)
+        @params("", false)
+        sub _(value as String, expected as Boolean)
+            m.assertEqual(storage.isDeviceId(value), expected)
+        end sub
+
+        @it("bounds the device ID at 128 characters")
+        sub _()
+            m.assertTrue(storage.isDeviceId(string(128, "a")))
+            m.assertFalse(storage.isDeviceId(string(129, "a")))
+            m.assertFalse(storage.isDeviceId(invalid))
+        end sub
+
+        ' A signed-in record with a remembered profile and its token.
+        function full() as Object
+            record = tests.sessions.signedIn()
+            record.profileId = "p-owner"
+            record.profileTokens = [{ id: "p-owner", token: "pvt_fixture" }]
+            return record
+        end function
+
+        ' A stand-in for roRegistrySection over data.
+        function section(data as Object) as Object
+            copy = {}
+            copy.Append(data)
+            return {
+                data: copy,
+                writes: 0,
+                flushes: 0,
+                flushResult: true,
+                GetKeyList: function() as Object
+                    keys = []
+                    for each key in m.data
+                        keys.Push(key)
+                    end for
+                    return keys
+                end function,
+                Read: function(key as String) as String
+                    if m.data.DoesExist(key) then return m.data[key]
+                    return ""
+                end function,
+                Write: function(key as String, value as String) as Boolean
+                    m.writes = m.writes + 1
+                    m.data[key] = value
+                    return true
+                end function,
+                Delete: function(key as String) as Boolean
+                    return m.data.Delete(key)
+                end function,
+                Exists: function(key as String) as Boolean
+                    return m.data.DoesExist(key)
+                end function,
+                Flush: function() as Boolean
+                    m.flushes = m.flushes + 1
+                    return m.flushResult
+                end function
+            }
+        end function
+
+    end class
+
+end namespace

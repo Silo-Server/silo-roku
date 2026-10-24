@@ -1,0 +1,124 @@
+import "pkg:/source/memory/policy.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/nav/stack.bs"
+import "pkg:/source/platform/bus.bs"
+import "pkg:/source/platform/events.bs"
+import "pkg:/source/util/log.bs"
+
+' AppScene's platform side. Main forwards every platform message to
+' platformEvent (source/platform/events.bs). Memory events drive the memory
+' policy (source/memory/policy.bs), whose level reaches ApiTask (prefetch
+' shedding) and the screen host (hidden screens' onPressure); the caption mode
+' is kept for the player; launch and input events go to the deep-link router
+' (AppSceneDeepLink.bs); and every event, with each memory level change, goes
+' to the nodes subscribed to its type (source/platform/client.bs).
+
+sub platformInit()
+    m.platformListeners = platform.bus.create()
+    m.captionMode = ""
+    ' Set by the launch memory event, which Main sends before any other.
+    m.memoryState = invalid
+    m.memorySampler = invalid
+    m.memoryTimer = m.top.findNode("memoryTimer")
+    m.memoryTimer.duration = memory.policy.POLL_INTERVAL_MS / 1000
+    m.memoryTimer.observeField("fire", "onMemoryTick")
+end sub
+
+sub onPlatformEvent()
+    event = m.top.platformEvent
+    log.info("platform", platform.describe(event))
+    eventType = event.type
+    if eventType = platform.topic.MEMORY
+        memoryLaunch(event)
+    else if eventType = platform.topic.MEMORY_WARNING
+        memoryApply(memory.policy.onWarning(memoryState(), event))
+    else if eventType = platform.topic.GENERAL_MEMORY
+        memoryApply(memory.policy.onGeneral(memoryState(), event.level))
+    else if eventType = platform.topic.CAPTION_MODE
+        m.captionMode = event.mode
+    else if eventType = platform.topic.LAUNCH or eventType = platform.topic.INPUT
+        deepLinkEvent(event)
+    end if
+    platformPublish(event)
+end sub
+
+' The interface functions behind source/platform/client.bs.
+
+sub platformSubscribe(owner as String, types as Object, node as Object, callback as String)
+    platform.bus.subscribe(m.platformListeners, owner, types, node, callback)
+end sub
+
+sub platformUnsubscribe(owner as String)
+    platform.bus.unsubscribe(m.platformListeners, owner)
+end sub
+
+function platformState() as Object
+    return { captionMode: m.captionMode, memory: memory.policy.actions(memoryState()) }
+end function
+
+sub platformPublish(event as Object)
+    for each recipient in platform.bus.recipients(m.platformListeners, event)
+        recipient.node.callFunc(recipient.callback, event)
+    end for
+end sub
+
+' The player calls this before it loads a stream (plan section 4.7): every
+' hidden screen detaches its lists, releasing the browse textures behind it.
+' Pushing nav.route.PLAYER does the same.
+sub memoryBeforePlayback()
+    navApply(nav.stack.detachHidden(m.navStack))
+end sub
+
+sub memoryLaunch(facts as Object)
+    initial = memory.policy.create(facts)
+    log.info("memory", "tier", { tier: initial.tier, signal: initial.signal, reasons: initial.reasons })
+    ' The Timer samples usage here; Main's monitor sends the warnings.
+    if initial.signal <> memory.signal.GENERAL
+        m.memorySampler = CreateObject("roAppMemoryMonitor")
+        if m.memorySampler = invalid then log.warn("memory", "no roAppMemoryMonitor on the render thread: usage is not polled")
+    end if
+    memoryApply(initial)
+end sub
+
+' The policy state, or a low-tier one until the launch facts arrive.
+function memoryState() as Object
+    if m.memoryState = invalid then m.memoryState = memory.policy.create({})
+    return m.memoryState
+end function
+
+sub onMemoryTick()
+    sample = invalid
+    if m.memorySampler <> invalid then sample = m.memorySampler.GetMemoryLimitPercent()
+    memoryApply(memory.policy.onTick(memoryState(), sample))
+end sub
+
+' Takes the policy's new state: starts or stops the Timer and, when the level
+' changed, tells ApiTask, the screen host, and subscribers.
+sub memoryApply(nextState as Object)
+    priorLevel = memory.level.NORMAL
+    priorTimer = false
+    if m.memoryState <> invalid
+        priorLevel = m.memoryState.level
+        priorTimer = m.memoryState.timer
+    end if
+    m.memoryState = nextState
+    if nextState.timer <> priorTimer
+        if nextState.timer
+            m.memoryTimer.control = "start"
+        else
+            m.memoryTimer.control = "stop"
+        end if
+    end if
+    if nextState.level = priorLevel then return
+
+    response = memory.policy.actions(nextState)
+    fields = { from: priorLevel, percent: nextState.percent, general: nextState.general }
+    fields.Append(response)
+    log.info("memory", "level", fields)
+    ' TODO(M1-3): ApiTask has no response cache yet for response.dropResponses.
+    setApiField("shedPrefetch", response.shedPrefetch)
+    if response.navPressure <> m.navStack.level then navPressure(response.navPressure)
+    event = { type: platform.topic.MEMORY_LEVEL }
+    event.Append(response)
+    platformPublish(event)
+end sub

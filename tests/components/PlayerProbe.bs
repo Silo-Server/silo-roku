@@ -1,0 +1,524 @@
+' Test build only. A quality replan stays in flight, so a track_change the
+' player asks for waits in the reducer (state.queued) instead of going to
+' ApiTask, which a headless run has no AppScene for.
+
+' The plan's subtitle inventory is English and Spanish sidecars and a
+' Japanese bitmap track, or the one probeNewLoad was last given.
+function probePlan(subtitle as Object) as Object
+    decision = { mode: "off" }
+    decision.Append(subtitle)
+    decision.inventory = m.probeInventory
+    if decision.inventory = invalid
+        decision.inventory = [
+            { track_id: "file:42:subtitle:0", combined_index: 0, source: "external", codec: "srt", language: "eng", label: "English", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/0.srt?file_id=42" },
+            { track_id: "file:42:subtitle:1", combined_index: 1, source: "external", codec: "srt", language: "spa", label: "Spanish", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/1.srt?file_id=42" },
+            { track_id: "file:42:subtitle:2", combined_index: 2, source: "embedded", codec: "pgs", language: "jpn", label: "Japanese", delivery: "burn_in_only" }
+        ]
+    end if
+    return {
+        plan_id: "plan:" + util.text(decision.mode) + util.text(decision.track_id),
+        plan_attempt_key: "v3:probe",
+        delivery: "original_http",
+        stream: { url: "/api/v2/stream/s-1?st=probe", protocol: "http_progressive", container: "mp4", headers: {}, header_refresh: "none" },
+        timeline: { source_start_seconds: 0, stream_origin_seconds: 0, player_start_seconds: 0, timeline_offset_seconds: 0, can_seek_anywhere: true },
+        selected_tracks: { audio: { id: "file:42:audio:0", index: 0 } },
+        subtitle: decision
+    }
+end function
+
+function probeStart(args as Object) as Object
+    probeMediaTask()
+    m.identity = { server: "https://silo.example", account: "a-1", profile: "p-1" }
+    m.intent = { fileId: "42", audioTracks: [], title: "Probe", name: "Probe", kind: "movie" }
+    m.watch = {}
+    m.state = playback.session.create({ identity: m.identity, installationId: "inst-1", features: [], outputContextId: "out-1" })
+    playback.session.reduce(m.state, { type: "play", intent: { fileId: "42" }, quality: "auto", autoplay: true }, m.env)
+    plan = probePlan(args.subtitle)
+    decision = { protocol_version: 3, outcome: "playable", session_id: "s-1", server_features: [], playback_plan: plan }
+    playback.session.reduce(m.state, { type: "startResult", playback_attempt_id: m.state.mutation.command.playback_attempt_id, kind: "ok", decision: decision }, m.env)
+    load = m.state.plan.load
+    playback.session.reduce(m.state, { type: "player", load: load, state: "playing" }, m.env)
+    selectedId = playback.media.selectedSubtitle(plan)
+    tracks = []
+    path = ""
+    for each trackId in args.carried
+        track = { load: load, trackId: trackId, state: "ready", selected: trackId = selectedId, path: "tmp:/probe/" + trackId.Replace(":", "-") + ".srt", language: "eng", label: trackId, format: "srt" }
+        if track.selected then path = track.path
+        tracks.Push(track)
+    end for
+    content = CreateObject("roSGNode", "ContentNode")
+    if tracks.Count() > 0 then content.subtitleTracks = subtitleTracks(tracks)
+    m.current = { load: load, plan: plan, playStart: 0, autoplay: true, reopen: false, proxy: false, headersReady: true, assigned: true, sidecars: tracks, tracks: tracks, track: path, content: content }
+    m.activeLoad = load
+    m.activePlayed = true
+    m.activeTrack = path
+    m.captionMode = args.captionMode
+    m.video.globalCaptionMode = args.captionMode
+    if args.DoesExist("modelType") then m.modelType = args.modelType
+    m.firstPlan = false
+    if args.DoesExist("listed") then probeRokuLists(args.listed)
+    selectSubtitle(path)
+    m.state.mutation = { kind: "replan", command: { type: "replan", replan_request_id: "probe-busy" }, request: { rank: 3, op: "quality_change" }, bodyText: invalid, tries: 0, retryAt: invalid, conflictRetried: false, reconnect: false }
+    return probeView()
+end function
+
+function probeRokuLists(prefix as String) as Object
+    listed = [{ TrackName: "mkv/3", Language: "eng", Description: "" }]
+    carried = m.current.content.subtitleTracks
+    if type(carried) <> "roArray" then carried = []
+    for each track in carried
+        listed.Push({ TrackName: prefix + track.TrackName, Language: track.Language, Description: track.Description })
+    end for
+    m.video.availableSubtitleTracks = listed
+    onVideoSubtitles()
+    return probeView()
+end function
+
+' Roku's own reports about the content the Video node has, as hardware
+' run 20's console showed them: args.subtitleTrack (Video.subtitleTrack,
+' which Roku gave as the bare path after the player wrote the listed name),
+' args.current (Video.currentSubtitleTrack), and with args.listed, the
+' content's tracks listed: each sidecar under args.listed + the path the
+' player gave it, then, with args.mkv, the MKV's own tracks (mkv/3, mkv/4),
+' or those args.stream lists ({ TrackName, Language }).
+function probeRokuReports(args as Object) as Object
+    if args.DoesExist("subtitleTrack") then m.video.subtitleTrack = args.subtitleTrack
+    if args.DoesExist("current") then m.video.currentSubtitleTrack = args.current
+    if util.isTrue(args.overlay) then onVideoTracks()
+    if args.DoesExist("listed")
+        listed = []
+        carried = m.current.content.subtitleTracks
+        if type(carried) <> "roArray" then carried = []
+        for each track in carried
+            listed.Push({ TrackName: args.listed + track.TrackName, Language: track.Language, Description: track.Description })
+        end for
+        if util.isTrue(args.mkv)
+            listed.Push({ TrackName: "mkv/3", Language: "eng", Description: "" })
+            listed.Push({ TrackName: "mkv/4", Language: "ara", Description: "" })
+        end if
+        if args.DoesExist("stream") then listed.Append(args.stream)
+        m.video.availableSubtitleTracks = listed
+        onVideoSubtitles()
+    end if
+    return probeView()
+end function
+
+' Time passes for the player and its reducer: ms later than their clock.
+function probeElapse(ms as Integer) as Object
+    if m.env.skew = invalid
+        m.env.skew = 0
+        m.env.now = function() as Dynamic
+            return m.clock.TotalMilliseconds() + m.skew
+        end function
+    end if
+    m.env.skew = m.env.skew + ms
+    return probeView()
+end function
+
+' The Video node reports its position, as its observer does.
+function probePosition(_args = invalid as Dynamic) as Object
+    onVideoPosition()
+    return probeView()
+end function
+
+function probeRokuPlays(args as Object) as Object
+    m.video.currentSubtitleTrack = args.name
+    if m.subtitleCheck <> invalid then m.subtitleCheck.at = m.subtitleCheck.at - args.elapsedMs
+    checkSubtitle()
+    return probeView()
+end function
+
+' The server refuses the track change waiting, through the session
+' reducer: it goes in flight in place of the probe's quality replan, and
+' its refusal leaves the plan playing. The quality replan then stays in
+' flight again.
+function probeRefuse(_args = invalid as Dynamic) as Object
+    busy = m.state.mutation
+    m.state.mutation = { kind: "replan", command: { type: "replan", replan_request_id: "probe-track" }, request: m.state.queued, bodyText: invalid, tries: 0, retryAt: invalid, conflictRetried: false, reconnect: false }
+    m.state.queued = invalid
+    for each command in playback.session.reduce(m.state, { type: "replanResult", replan_request_id: "probe-track", kind: "rejected" }, m.env)
+        execute(command)
+    end for
+    m.state.mutation = busy
+    return probeView()
+end function
+
+function probeSubtitleTracks(tracks as Object) as Object
+    return subtitleTracks(tracks)
+end function
+
+function probeChoose(choice as Object) as Object
+    if m.optionsPanel = invalid then m.optionsPanel = m.optionsLayer.createChild("OptionsPanel")
+    m.optionsPanel.choice = choice
+    onOptionsChoice()
+    return probeView()
+end function
+
+function probeCaption(mode as Dynamic) as Object
+    event = mode
+    if type(mode) <> "roAssociativeArray" then event = { type: platform.topic.CAPTION_MODE, mode: mode }
+    onPlatform(event)
+    return probeView()
+end function
+
+function probeRetrack(subtitle as Object) as Object
+    m.state.queued = invalid
+    plan = probePlan(subtitle)
+    m.state.plan.data = plan
+    retrack({ type: "retrack", load: m.current.load, plan: plan })
+    return probeView()
+end function
+
+' A plan that reloads: the answer to the track change waiting, or the
+' session's first plan (args.first) with the profile's subtitle
+' preferences (args.subtitleLanguage, args.subtitleMode), as the reducer's
+' load command hands it to the player before its content is assigned.
+function probeLoad(args as Object) as Object
+    m.state.queued = invalid
+    plan = probePlan(args.subtitle)
+    m.state.plan.data = plan
+    m.state.plan.load = m.state.plan.load + 1
+    m.current = { load: m.state.plan.load, plan: plan, playStart: 0, autoplay: true, reopen: false, proxy: false, headersReady: false, assigned: false, sidecars: [], tracks: [], track: "" }
+    m.firstPlan = util.isTrue(args.first)
+    if args.DoesExist("subtitleLanguage") then m.preferences.subtitleLanguage = args.subtitleLanguage
+    if args.DoesExist("subtitleMode") then m.preferences.subtitleMode = args.subtitleMode
+    planLoaded(plan)
+    return probeView()
+end function
+
+' A new load the reducer adopted, as prepare() leaves it: args.subtitle is
+' its plan's decision, its sidecars those offered under args.captionMode in
+' args.sidecarState ("loading" or "ready"), and args.headers whether its
+' media headers are in. args.videoState is what the Video node reports
+' (the earlier content still "playing", or "stopped"), and args.autoplay
+' false opens it paused. args.inventory replaces the plan's subtitle
+' inventory, for this plan and those after it. The content is not
+' assigned yet.
+function probeNewLoad(args as Object) as Object
+    m.state.queued = invalid
+    if args.DoesExist("inventory") then m.probeInventory = args.inventory
+    plan = probePlan(args.subtitle)
+    m.state.loads = m.state.loads + 1
+    m.state.plan.data = plan
+    m.state.plan.load = m.state.loads
+    m.state.plan.loadAssigned = false
+    m.state.plan.loadPlayed = false
+    item = { load: m.state.loads, plan: plan, playStart: 0, autoplay: args.autoplay <> false, reopen: false, proxy: false, headersReady: false, assigned: false, sidecars: [], sidecarsAt: m.env.now(), headers: {} }
+    if util.isTrue(args.waited) then item.sidecarsAt = item.sidecarsAt - playback.sidecars.SELECTED_WAIT_MS
+    if not item.autoplay then m.pauseLoad = item.load
+    item.fields = playback.media.contentFields(plan, "https://silo.example", 0, "Probe")
+    for each track in playback.sidecars.offered(plan, "https://silo.example", args.captionMode)
+        track.load = item.load
+        track.state = args.sidecarState
+        track.path = ""
+        if track.state = "ready" then track.path = "tmp:/probe/" + track.trackId.Replace(":", "-") + ".srt"
+        if track.selected and track.state = "loading" then m.flags.subtitlesLoading = true
+        item.sidecars.Push(track)
+    end for
+    m.current = item
+    m.video.state = args.videoState
+    if util.isTrue(args.headers)
+        item.headersReady = true
+        tryAssign(item)
+    end if
+    return probeView()
+end function
+
+' The sidecars a new load offers, as startSidecars sets them up with the
+' session's cache before it downloads the others: a plan of args.subtitle
+' on file args.fileId whose inventory is args.inventory, from the server
+' at args.origin (https://silo.example without one). MediaTask has
+' looked for the kept files by the time this returns, and any download
+' waits behind the one startSidecars starts next, which needs ApiTask and
+' is not sent. The sidecars as { trackId, state, path }, and whether
+' "Loading subtitles…" is due.
+function probeOfferSidecars(args as Object) as Object
+    probeMediaTask()
+    m.probeInventory = args.inventory
+    plan = probePlan(args.subtitle)
+    plan.effective_media_file_id = args.fileId
+    plan.source = { media_file_id: args.fileId }
+    m.state.loads = m.state.loads + 1
+    item = { load: m.state.loads, plan: plan, sidecars: [], assigned: false, headersReady: false }
+    m.current = item
+    m.flags.subtitlesLoading = false
+    m.subtitleHandle = { probe: "the next download" }
+    origin = "https://silo.example"
+    if util.isString(args.origin) then origin = args.origin
+    offerSidecars(item, origin)
+    m.subtitleHandle = invalid
+    tracks = []
+    for each track in item.sidecars
+        tracks.Push({ trackId: track.trackId, state: track.state, path: track.path })
+    end for
+    return { tracks: tracks, loading: m.flags.subtitlesLoading }
+end function
+
+' MediaTask's conversion of the current load's sidecar args.trackId, as
+' onSubtitleDownloaded names its file and MediaTask writes args.bytes
+' there and reports it.
+function probeConverted(args as Object) as Object
+    probeMediaTask()
+    track = sidecarOf(m.current.load, args.trackId)
+    path = ""
+    if track.cacheKey <> ""
+        cache = sidecarCache()
+        path = playback.sidecarCache.newPath(cache)
+        keepCache(cache)
+        CreateDirectory(playback.sidecarCache.DIR)
+    else
+        path = "tmp:/probe-" + args.trackId.Replace(":", "-") + ".srt"
+    end if
+    track.output = path
+    WriteAsciiFile(path, string(args.bytes, "x"))
+    onMediaResult(mediaEvent({ id: m.current.load, track: args.trackId, ok: true, path: path, cacheKey: track.cacheKey, bytes: args.bytes }))
+    return { state: track.state, path: track.path }
+end function
+
+' A new app session's cache: none kept.
+function probeClearCache(_args = invalid as Dynamic) as Object
+    probeMediaTask()
+    keepCache(playback.sidecarCache.create())
+    trimCache(sidecarCache(), 0)
+    return probeView()
+end function
+
+' The session cache's files and bytes.
+function probeCache(_args = invalid as Dynamic) as Object
+    cache = sidecarCache()
+    return { entries: cache.entries.Count(), bytes: cache.bytes, files: ListDir(playback.sidecarCache.DIR).Count() }
+end function
+
+'' A FakeMediaTask that still runs once stopMediaTask retires it, and a
+' request after it; the MediaTask that then starts is never run.
+function probeRetireMediaTask(_args = invalid as Dynamic) as Object
+    probeMediaTask()
+    retiring = m.mediaTask
+    retiring.addField("state", "string", false)
+    retiring.state = "run"
+    stopMediaTask()
+    sendMedia({ keep: [] })
+    waiting = { started: m.mediaTask <> invalid, queued: m.mediaQueue.Count() }
+    retiring.state = "stop"
+    ended = { started: m.mediaTask <> invalid and m.mediaTask.subtype() = "MediaTask", queued: m.mediaQueue.Count() }
+    m.mediaTask = invalid
+    m.mediaQueue = []
+    m.global.retiringMediaTask = invalid
+    return { waiting: waiting, ended: ended }
+end function
+
+' The media headers arrive, as onHeaders hands them over.
+function probeHeaders(_args = invalid as Dynamic) as Object
+    m.current.headersReady = true
+    tryAssign(m.current)
+    return probeView()
+end function
+
+' The waiting sidecars download, as MediaTask's results make them ready.
+function probeSidecarsReady(_args = invalid as Dynamic) as Object
+    for each track in m.current.sidecars
+        probeSidecarReady({ load: track.load, trackId: track.trackId })
+    end for
+    return probeView()
+end function
+
+' One sidecar finishes downloading, as MediaTask's result for args.load
+' and args.trackId makes it ready: an answer for a load since replaced
+' included.
+function probeSidecarReady(args as Object) as Object
+    onMediaResult(mediaEvent({ id: args.load, track: args.trackId, ok: true, path: "tmp:/probe/" + args.trackId.Replace(":", "-") + ".srt" }))
+    return probeView()
+end function
+
+' One of the current load's sidecars fails, as MediaTask's result for
+' args.trackId with error args.kind (too_large, no_cues, ...) reports it.
+function probeSidecarFailed(args as Object) as Object
+    onMediaResult(mediaEvent({ id: m.current.load, track: args.trackId, ok: false, path: "", error: args.kind }))
+    return probeView()
+end function
+
+' The status as the chrome shows it now: the busy capsule's text, else
+' the notice card's title, else "".
+function probeStatus(_args = invalid as Dynamic) as String
+    refreshChrome()
+    if m.status.busy <> "" then return m.status.busy
+    card = m.status.notice
+    if util.isObject(card) then return util.text(card.title)
+    return ""
+end function
+
+' The quality replan the probe keeps in flight is refused, through the
+' session reducer, and the player carries out what the reducer asks next
+' while the earlier content plays on. A reopen's media headers, which
+' need ApiTask, answer at once; a replan, which needs it too, is not
+' sent, and nor is anything else but logs and notices. Gives the reducer's
+' command types beside probeView().
+function probeIdle(_args = invalid as Dynamic) as Object
+    m.video.state = "playing"
+    types = []
+    for each command in playback.session.reduce(m.state, { type: "replanResult", replan_request_id: "probe-busy", kind: "rejected" }, m.env)
+        types.Push(command.type)
+        if command.type = "reopen"
+            item = { load: command.load, plan: m.current.plan, playStart: command.playerPosition, autoplay: command.autoplay, reopen: true, proxy: false, headersReady: true, headers: {}, assigned: false, sidecars: m.current.sidecars, sidecarsAt: m.current.sidecarsAt }
+            item.fields = playback.media.contentFields(item.plan, "https://silo.example", command.playerPosition, "Probe")
+            m.current = item
+            tryAssign(item)
+        else if command.type = "log" or command.type = "refused"
+            execute(command)
+        end if
+    end for
+    view = probeView()
+    view.commands = types
+    return view
+end function
+
+' MediaTask as a FakeMediaTask, which answers the session cache's requests
+' at once, as MediaTask does on its thread, so no Task runs.
+sub probeMediaTask()
+    if m.mediaTask <> invalid then return
+    m.mediaTask = CreateObject("roSGNode", "FakeMediaTask")
+    m.mediaTask.observeField("result", "onMediaResult")
+end sub
+
+' What MediaTask's result observer hands onMediaResult.
+function mediaEvent(result as Object) as Object
+    return {
+        result: result,
+        getData: function() as Object
+            return m.result
+        end function
+    }
+end function
+
+' The Video node reports "finished", which its observer hands
+' onVideoState. The events the player sends the session are held as it
+' sends them and reduced here, as probeIdle does, since what the session
+' asks next (a reload's media headers, a stop job) needs ApiTask: only logs
+' are carried out. Gives probeView() with each event's afterWrite as
+' afterWrite and the reducer's command types as commands.
+function probeFinished(_args = invalid as Dynamic) as Object
+    m.dispatching = true
+    m.video.state = "finished"
+    m.dispatching = false
+    afterWrite = []
+    types = []
+    for each event in m.events
+        afterWrite.Push(util.isTrue(event.afterWrite))
+        for each command in playback.session.reduce(m.state, event, m.env)
+            types.Push(command.type)
+            if command.type = "log" then execute(command)
+        end for
+    end for
+    m.events = []
+    view = probeView()
+    view.afterWrite = afterWrite
+    view.commands = types
+    return view
+end function
+
+' The active content shows its first frame, which starts its settle time
+' (onVideoState).
+function probeFirstFrame(_args = invalid as Dynamic) as Object
+    m.activePlayed = false
+    return probeVideoState("playing")
+end function
+
+' The Video node reports state, as its observer does.
+function probeVideoState(state as String) as Object
+    m.video.state = state
+    onVideoState()
+    return probeView()
+end function
+
+function probePrepared(args as Object) as Object
+    m.state.loads = m.state.loads + 1
+    load = m.state.loads
+    m.state.plan.load = load
+    m.state.plan.loadAssigned = false
+    m.state.plan.loadPlayed = false
+    plan = m.current.plan
+    item = { load: load, plan: plan, playStart: 0, autoplay: true, reopen: true, proxy: false, refresh: util.isTrue(args.refresh), headersReady: false, assigned: false, sidecars: [], sidecarsAt: m.env.now() }
+    item.fields = playback.media.contentFields(plan, "https://silo.example", 0, "Probe")
+    m.current = item
+    videoState = "playing"
+    if args.DoesExist("videoState") then videoState = args.videoState
+    m.video.state = videoState
+    id = "probe-headers-" + load.ToStr()
+    m.requests[id] = item
+    return { load: load, requestId: id }
+end function
+
+' The answer names the request it was for in a header line of its own, so
+' the content the Video node ends up with shows whose headers it has.
+function probeHeadersAnswer(args as Object) as Object
+    handle = CreateObject("roSGNode", "RequestHandle")
+    handle.requestId = args.requestId
+    handle.result = { ok: true, body: { httpHeaders: ["X-Probe-Request:" + args.requestId], generation: args.generation, credentialed: true, expiresAt: args.expiresAt, refreshAt: args.expiresAt - 300 } }
+    onHeaders({
+        handle: handle,
+        getRoSGNode: function() as Object
+            return m.handle
+        end function
+    })
+    return probeHeadersView()
+end function
+
+function probeWake(_args = invalid as Dynamic) as Object
+    onWakeTimer()
+    return probeHeadersView()
+end function
+
+function probeHeadersView(_args = invalid as Dynamic) as Object
+    contentHeader = invalid
+    content = m.video.content
+    if content <> invalid and type(content.httpHeaders) = "roArray" and content.httpHeaders.Count() > 0 then contentHeader = content.httpHeaders[0]
+    return { activeLoad: m.activeLoad, currentLoad: m.current.load, assigned: m.current.assigned, onNode: m.state.plan.loadAssigned, generation: m.headerGeneration, credentialExpiresAt: m.state.plan.credentialExpiresAt, contentHeader: contentHeader }
+end function
+
+function probeView(_args = invalid as Dynamic) as Object
+    queued = invalid
+    request = m.state.queued
+    if request <> invalid then queued = { op: request.op, tracks: request.tracks, inPlace: request.inPlace }
+    carried = invalid
+    content = m.video.content
+    if content <> invalid
+        carried = 0
+        if type(content.subtitleTracks) = "roArray" then carried = content.subtitleTracks.Count()
+    end if
+    view = { subtitleTrack: m.video.subtitleTrack, activeTrack: m.activeTrack, captionMode: m.captionMode, globalCaptionMode: m.video.globalCaptionMode, suppressed: m.video.suppressCaptions, queued: queued, burnWanted: m.burnWanted, activeLoad: m.activeLoad, carried: carried, phase: m.state.phase, stopping: playback.slot.isStopping(m.slot) }
+    plan = m.state.plan
+    if plan <> invalid then view.Append({ subtitleReload: plan.subtitleReload <> invalid, planLoad: plan.load, played: plan.loadPlayed, failedLoad: plan.failedLoad })
+    return view
+end function
+
+' A key as the focused node passes it up: onKeyEvent's answer, and the
+' controls and the focused node afterwards.
+function probeKey(key as String, press as Boolean) as Object
+    handled = onKeyEvent(key, press)
+    view = { handled: handled, shown: m.controls.shown, options: m.optionsPanel <> invalid, focused: focusedName(), leaving: m.leaving, picker: false, listFocus: false }
+    if m.optionsPanel <> invalid
+        view.picker = m.optionsPanel.picker
+        view.listFocus = m.optionsPanel.findNode("listFocus").hasFocus()
+    end if
+    return view
+end function
+
+' Play/Pause pressed and released while the Video node reports
+' videoState: what the player told the node, and the load it plays.
+function probePlayKey(videoState as String) as Object
+    m.video.state = videoState
+    m.video.control = "none"
+    onKeyEvent("play", true)
+    onKeyEvent("play", false)
+    return { control: m.video.control, activeLoad: m.activeLoad }
+end function
+
+' The controls appear, as when playback starts (begin).
+function probeShowControls(_args = invalid as Dynamic) as Object
+    dispatchControls({ type: "show" })
+    return probeFocus()
+end function
+
+function probeFocus(_args = invalid as Dynamic) as Object
+    return { shown: m.controls.shown, focused: focusedName(), video: m.video.hasFocus(), player: m.top.hasFocus() }
+end function

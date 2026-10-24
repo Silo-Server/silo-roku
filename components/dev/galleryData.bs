@@ -1,0 +1,213 @@
+' Dev builds only: the browse gallery's server (components/dev/BrowseGallery).
+' DevApiTask answers requests marked dev: "gallery" with bodies in the
+' shape of the vendored v2 fixtures (tests/fixtures/v2/), and ApiTask's map
+' step then builds their nodes as it does for a real server. Artwork is
+' packaged images, plus a URL that never loads and items without art, so
+' the placeholder and the one-time refresh show.
+namespace devGallery
+    ' Items in the synthetic catalog the Browse grid pages through.
+    const CATALOG_SIZE = 1000
+    const SECTION_SIZE = 20
+    ' Never resolves, so a Poster fails and its row refreshes once.
+    const BROKEN_ART = "https://art.invalid/expired.jpg"
+    ' A section whose items request fails, so the row is left out.
+    const FAILING_SECTION = "broken_row"
+
+    function art(n as Integer) as String
+        if n mod 7 = 3 then return BROKEN_ART
+        if n mod 11 = 5 then return ""
+        return ["pkg:/images/firstrun/mesh_setup.png", "pkg:/images/firstrun/mesh_profiles.png", "pkg:/images/splash_fhd.png"][n mod 3]
+    end function
+
+    ' The envelope for a gallery request, as ApiTask would build it.
+    function answer(request as Object) as Object
+        path = request.path
+        query = request.query
+        if type(query) <> "roAssociativeArray" then query = {}
+        body = invalid
+        if path = "/api/v2/home/sections" or (Left(path, 16) = "/api/v2/library/" and Right(path, 9) = "/sections")
+            body = { sections: sections() }
+        else if Right(path, 6) = "/items"
+            parts = path.Split("/")
+            body = sectionItems(parts[parts.Count() - 2])
+            if body = invalid then return failure(request, 503)
+        else if path = "/api/v2/catalog"
+            body = page(query)
+        else if Right(path, 9) = "/episodes"
+            parts = path.Split("/")
+            body = { items: episodes(parts[parts.Count() - 2].ToInt()) }
+        else if Right(path, 8) = "/seasons"
+            body = { items: seasons() }
+        else if Left(path, 22) = "/api/v2/catalog/items/"
+            body = detailItem(Mid(path, 23))
+        else if Left(path, 14) = "/api/v2/watch/"
+            body = watchState(Mid(path, 15))
+        else
+            return failure(request, 404)
+        end if
+        return { requestId: request.requestId, ok: true, status: 200, headers: {}, body: body, error: invalid }
+    end function
+
+    function failure(request as Object, status as Integer) as Object
+        return { requestId: request.requestId, ok: false, status: status, headers: {}, body: invalid, error: { kind: "http", status: status, problemType: invalid, instance: invalid, retryAfterSeconds: invalid } }
+    end function
+
+    ' Continue Watching and Next Up, then poster rows: one the server sends
+    ' without items (loaded lazily), one whose items fail (left out), and
+    ' enough genres to scroll past the retention window.
+    function sections() as Object
+        out = [
+            section("continue_watching", "Continue Watching", "continue_watching", items("cw", 10, true, 0))
+            section("next_up", "Next Up", "next_up", items("nu", 8, true, 1))
+            section("recently_added", "Recently Added", "recently_added", items("ra", SECTION_SIZE, false, 2))
+            section("lazy_row", "Sent Without Items", "genre", [])
+            section(FAILING_SECTION, "Fails to Load", "genre", [])
+        ]
+        seed = 3
+        for each genre in ["Drama", "Comedy", "Thriller", "Documentary", "Animation", "Science Fiction", "Crime", "Family", "Mystery"]
+            out.Push(section(LCase(genre), genre, "genre", items(genre, SECTION_SIZE, false, seed)))
+            seed = seed + 1
+        end for
+        return out
+    end function
+
+    ' A section's own items, as getHomeSectionItems answers: the same cards
+    ' the layout sent, or for the row sent without items, new ones. invalid
+    ' for the failing section.
+    function sectionItems(id as String) as Dynamic
+        if id = FAILING_SECTION then return invalid
+        for each candidate in sections()
+            if candidate.id = id
+                if candidate.items.Count() = 0 then candidate.items = items(id, SECTION_SIZE, false, 7)
+                return candidate
+            end if
+        end for
+        return invalid
+    end function
+
+    function section(id as String, title as String, sectionType as String, list as Object) as Object
+        total = list.Count()
+        if total = 0 then total = SECTION_SIZE
+        return { id: id, section_type: sectionType, title: title, featured: false, item_limit: SECTION_SIZE, total_count: total, is_custom: false, customized: false, items: list }
+    end function
+
+    ' count items of a row, varied by seed; progress rows mix movies and
+    ' episodes with a resume point.
+    function items(prefix as String, count as Integer, progress as Boolean, seed as Integer) as Object
+        out = []
+        for n = 1 to count
+            entry = item(prefix + "-" + n.ToStr(), n + seed * 4)
+            if progress
+                entry.position_seconds = 300 * n
+                entry.duration_seconds = 3600
+                if n mod 2 = 0
+                    entry.Append({ content_id: "episode:gallery-s01e" + n.ToStr(), type: "episode", title: "Episode " + n.ToStr(), series_title: "Gallery Series", series_id: "series:gallery", season_number: 1, episode_number: n })
+                end if
+            end if
+            out.Push(entry)
+        end for
+        return out
+    end function
+
+    function item(id as String, n as Integer) as Object
+        poster = art(n)
+        out = {
+            content_id: "movie:" + id,
+            type: "movie",
+            title: "Gallery Title " + id,
+            year: 1990 + n mod 35,
+            runtime: 80 + n mod 70,
+            genres: ["Drama", "Crime"],
+            keywords: [],
+            content_rating: ["PG", "PG-13", "R"][n mod 3],
+            status: "matched",
+            rating_imdb: 5 + (n mod 50) / 10,
+            overview: "A synthetic title for checking the hero, the cards, and focus on the device. Its synopsis runs long enough to wrap onto a second line.",
+            poster_url: poster,
+            backdrop_url: poster
+        }
+        if n mod 5 = 1 then out.logo_url = "pkg:/images/brand/wordmark.png"
+        return out
+    end function
+
+    ' A /catalog page: cursor "o<offset>", limit items, sorted by title.
+    function page(query as Object) as Object
+        offset = 0
+        cursor = query.cursor
+        if type(cursor) = "roString" or type(cursor) = "String" then offset = Mid(cursor, 2).ToInt()
+        limit = 40
+        if query.limit <> invalid then limit = query.limit
+        last = offset + limit
+        if last > CATALOG_SIZE then last = CATALOG_SIZE
+        list = []
+        for n = offset to last - 1
+            list.Push(item("grid-" + n.ToStr(), n))
+        end for
+        body = { items: list, total: CATALOG_SIZE, total_exact: true, window_cursor: "w" }
+        body.page = { has_more: last < CATALOG_SIZE }
+        if last < CATALOG_SIZE then body.page.next_cursor = "o" + last.ToStr()
+        return body
+    end function
+
+    ' A season's episodes: ten, two for Specials (season 0); season 1 has
+    ' progress (episodeProgress).
+    function episodes(season as Integer) as Object
+        out = []
+        count = 10
+        if season = 0 then count = 2
+        for n = 1 to count
+            id = "episode:gallery-s0" + season.ToStr() + "e" + n.ToStr()
+            state = episodeProgress(id)
+            out.Push({ content_id: id, season_number: season, episode_number: n, title: "Episode " + n.ToStr(), runtime: 45, air_date: "2021-04-0" + (n mod 9 + 1).ToStr(), still_url: art(n + 1), overview: "An episode of the gallery series, long enough to run past one line of the detail hero's synopsis.", user_data: { position_seconds: state.position, duration_seconds: 2700, played: state.played, watched_count: 0, unplayed_count: 1, in_progress_count: 0 } })
+        end for
+        return out
+    end function
+
+    ' { position, played } for a gallery episode ID: season 1's episode n is
+    ' 270 * (n mod 4) seconds in, and its first episode is watched.
+    function episodeProgress(id as String) as Object
+        if Left(id, 18) <> "episode:gallery-s0" or Mid(id, 19, 1) <> "1" then return { position: 0, played: false }
+        n = Mid(id, 21).ToInt()
+        return { position: 270 * (n mod 4), played: n = 1 }
+    end function
+
+    ' The gallery series' seasons: Specials, then two numbered seasons; the
+    ' first is in progress.
+    function seasons() as Object
+        return [
+            { content_id: "series:gallery-S00", season_number: 0, title: "", is_specials: true, user_data: { watched_count: 0, unplayed_count: 2, in_progress_count: 0 } }
+            { content_id: "series:gallery-S01", season_number: 1, title: "Season 1", play_content_id: "episode:gallery-s01e3", user_data: { watched_count: 1, unplayed_count: 9, in_progress_count: 2 } }
+            { content_id: "series:gallery-S02", season_number: 2, title: "Season 2", user_data: { watched_count: 0, unplayed_count: 10, in_progress_count: 0 } }
+        ]
+    end function
+
+    ' catalog/items/{id}: the gallery series, one of its episodes, or a movie.
+    function detailItem(id as String) as Object
+        crew = [{ name: "Ada Lens", job: "Director" }, { name: "Ben Quill", job: "Writer" }, { name: "Cy Draft", job: "Screenplay" }]
+        if id = "series:gallery"
+            return { content_id: id, type: "series", title: "Gallery Series", year: 2021, content_rating: "TV-14", season_count: 2, genres: ["Drama", "Mystery", "Thriller"], overview: "A synthetic series for checking the detail page: its seasons, episodes, action row, and Details section on the device.", poster_url: art(2), backdrop_url: art(2), logo_url: "pkg:/images/brand/wordmark.png", play_content_id: "episode:gallery-s01e3", play_season_number: 1, networks: ["Gallery TV"], countries: ["US", "GB"], first_air_date: "2021-04-02", last_air_date: "2024-11-30", crew: crew }
+        end if
+        if Left(id, 8) = "episode:"
+            return { content_id: id, type: "episode", title: "Episode", series_id: "series:gallery", series_title: "Gallery Series", season_number: Mid(id, 19, 1).ToInt(), episode_number: Mid(id, 21).ToInt() }
+        end if
+        out = item(Mid(id, 7), Len(id))
+        out.Append({ crew: crew, studios: ["Gallery Pictures", "Fixture Films", "Test Card Co.", "Pattern House"], countries: ["US"], release_date: "1999-03-31", user_data: { position_seconds: 754 * (Len(id) mod 2), played: false } })
+        return out
+    end function
+
+    ' watch/{id}: one version with three audio tracks and three subtitles
+    ' (an external SRT, a forced PGS, and a Spanish SRT), and a profile that
+    ' always wants English subtitles.
+    function watchState(id as String) as Object
+        position = 754 * (Len(id) mod 2)
+        played = false
+        if Left(id, 8) = "episode:"
+            state = episodeProgress(id)
+            position = state.position
+            played = state.played
+        end if
+        audio = [{ language: "eng", codec: "eac3", channels: 6, default: true }, { language: "fra", codec: "aac", channels: 2 }, { language: "eng", codec: "aac", channels: 2, title: "Commentary" }]
+        subtitles = [{ language: "eng", codec: "subrip", external: true }, { language: "eng", codec: "hdmv_pgs_subtitle", forced: true, index: 3 }, { language: "spa", codec: "subrip", index: 4 }]
+        return { content_id: id, type: "movie", title: "Gallery", versions: [{ file_id: "gallery-" + id, duration_seconds: 2700, audio_tracks: audio, subtitle_tracks: subtitles }], user_data: { position_seconds: position, duration_seconds: 2700, played: played }, effective_subtitle_mode: "always", effective_subtitle_language: "eng" }
+    end function
+end namespace

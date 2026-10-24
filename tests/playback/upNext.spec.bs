@@ -1,0 +1,392 @@
+namespace tests
+
+    ' Android TV's Up Next rules (spec section 5.7) for an episode whose
+    ' credits start at 2500 s of 2600 s. Commands are summarized as
+    ' "show:90/100" (countdown of total), "show:-" (no countdown),
+    ' "show[end]:..." once the video has ended, "playNext:<id>:<auto>:<streak>",
+    ' "close", and "exit".
+    @suite("playback up next")
+    class PlaybackUpNextTests extends rooibos.BaseTestSuite
+
+        function upNext(extra = invalid as Dynamic) as Object
+            options = { creditsStart: 2500, runtime: 2600, autoPlayNext: true, deviceAutoplay: true, carry: playback.upNext.newCarry() }
+            if extra <> invalid then options.Append(extra)
+            return playback.upNext.create(options)
+        end function
+
+        ' With the next episode known.
+        function ready(extra = invalid as Dynamic) as Object
+            state = m.upNext(extra)
+            m.feed(state, [{ type: "next", next: { itemId: "episode:s1e3", seasonNumber: 1, episodeNumber: 3 } }])
+            return state
+        end function
+
+        function feed(state as Object, events as Object) as Object
+            out = []
+            for each event in events
+                for each command in playback.upNext.reduce(state, event)
+                    out.Push(m.summary(command))
+                end for
+            end for
+            return out
+        end function
+
+        function summary(command as Object) as String
+            if command.type = "show"
+                text = "show"
+                if command.ended then text = text + "[end]"
+                if util.isNumber(command.countdown) then return text + ":" + command.countdown.ToStr() + "/" + command.total.ToStr()
+                return text + ":-"
+            else if command.type = "playNext"
+                return "playNext:" + command.itemId + ":" + command.auto.ToStr() + ":" + command.carry.streak.ToStr()
+            end if
+            return command.type
+        end function
+
+        function at(seconds as Dynamic, now = 0 as Integer) as Object
+            return { type: "position", seconds: seconds, now: now }
+        end function
+
+        ' Playback crossing the start of the credits.
+        function crossing() as Object
+            return [m.at(2499.5), m.at(2500.2)]
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("opening at the credits")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("opens as playback crosses the credits, counting down the runtime left")
+        sub _()
+            state = m.ready()
+            m.assertEqual(m.feed(state, m.crossing()), ["show:100/100"])
+            m.assertTrue(playback.upNext.isOpen(state))
+            m.assertEqual(m.feed(state, [m.at(2510)]), ["show:90/100"])
+            ' Paused: no positions, so the countdown waits.
+            m.assertEqual(m.feed(state, [{ type: "tick", now: 5000 }]), [])
+        end sub
+
+        @it("starts the next episode when the video ends, one more automatic advance")
+        sub _()
+            state = m.ready()
+            m.feed(state, m.crossing())
+            m.assertEqual(m.feed(state, [{ type: "ended", now: 1000 }]), ["playNext:episode:s1e3:true:1"])
+            m.assertEqual(m.feed(state, [m.at(2600), { type: "back" }]), [])
+        end sub
+
+        @it("hands on the toggle with the streak")
+        sub _()
+            state = m.ready({ carry: { streak: 1, autoPlay: true } })
+            m.feed(state, m.crossing())
+            commands = playback.upNext.reduce(state, { type: "ended", now: 1000 })
+            m.assertEqual(commands, [{ type: "playNext", itemId: "episode:s1e3", auto: true, carry: { streak: 2, autoPlay: true } }])
+        end sub
+
+        @it("grows the countdown when the viewer seeks back")
+        sub _()
+            state = m.ready()
+            m.feed(state, m.crossing())
+            m.assertEqual(m.feed(state, [{ type: "seek" }, m.at(2450)]), ["show:150/150"])
+            ' Crossing the credits again does not reopen or restart it.
+            m.assertEqual(m.feed(state, [m.at(2499.5), m.at(2500.5)]), ["show:101/150", "show:100/150"])
+        end sub
+
+        @it("does not open when playback resumes or seeks into the credits")
+        sub _()
+            state = m.ready()
+            m.assertEqual(m.feed(state, [m.at(2550), m.at(2551)]), [])
+            m.assertEqual(m.feed(state, [m.at(2400), { type: "seek" }, m.at(2501)]), [])
+            ' A jump the player did not announce is no crossing either.
+            m.assertEqual(m.feed(state, [m.at(2400), m.at(2505)]), [])
+            m.assertFalse(playback.upNext.isOpen(state))
+        end sub
+
+        @it("opens nothing without a next episode")
+        sub _()
+            state = m.upNext()
+            m.feed(state, [{ type: "next", next: invalid }])
+            m.assertEqual(m.feed(state, m.crossing()), [])
+            m.assertEqual(m.feed(state, [{ type: "open" }, { type: "ended", now: 0 }]), [])
+            m.assertFalse(playback.upNext.canOpen(state))
+            state = m.upNext()
+            m.feed(state, [{ type: "next", next: { itemId: "" } }])
+            m.assertEqual(m.feed(state, [{ type: "ended", now: 0 }]), [])
+        end sub
+
+        @it("opens once the next episode is known when the credits came first")
+        sub _()
+            state = m.upNext()
+            m.assertEqual(m.feed(state, m.crossing()), [])
+            m.assertEqual(m.feed(state, [{ type: "next", next: { itemId: "episode:s1e3" }, now: 0 }]), ["show:100/100"])
+            state = m.upNext()
+            m.assertEqual(m.feed(state, [{ type: "ended", now: 0 }]), [])
+            m.assertEqual(m.feed(state, [{ type: "next", next: { itemId: "episode:s1e3" }, now: 500 }]), ["show[end]:10/10"])
+        end sub
+
+        @it("drops a credits crossing still waiting for the next episode when the viewer seeks back")
+        sub _()
+            state = m.upNext()
+            m.assertEqual(m.feed(state, [m.at(2499), m.at(2500)]), [])
+            m.assertEqual(m.feed(state, [{ type: "seek" }, m.at(100)]), [])
+            m.assertEqual(m.feed(state, [{ type: "next", next: { itemId: "episode:s1e3" }, now: 0 }]), [], "the answer comes back in the episode")
+            m.assertFalse(playback.upNext.isOpen(state))
+            ' A later natural crossing opens it, counting down the runtime left.
+            m.assertEqual(m.feed(state, [m.at(2499), m.at(2500)]), ["show:100/100"])
+        end sub
+
+        @it("opens nothing for a waiting crossing that a jump the player did not announce left")
+        sub _()
+            state = m.upNext()
+            m.feed(state, m.crossing())
+            m.feed(state, [m.at(1200)])
+            m.assertEqual(m.feed(state, [{ type: "next", next: { itemId: "episode:s1e3" }, now: 0 }]), [])
+            m.assertEqual(m.feed(state, m.crossing()), ["show:100/100"])
+        end sub
+
+        @it("keeps the end's wait and deadline through a seek")
+        sub _()
+            state = m.upNext()
+            m.feed(state, m.crossing())
+            m.feed(state, [{ type: "ended", now: 1000 }, { type: "seek" }])
+            m.assertEqual(playback.upNext.nextWake(state, 1000), 11000)
+            m.assertEqual(m.feed(state, [{ type: "next", next: { itemId: "episode:s1e3" }, now: 2000 }]), ["show[end]:10/10"])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("opening at the end")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("counts 10 s of wall clock when the video ends first, then plays next")
+        sub _()
+            state = m.ready({ creditsStart: invalid })
+            m.assertEqual(m.feed(state, m.crossing()), [])
+            m.assertEqual(m.feed(state, [{ type: "ended", now: 0 }]), ["show[end]:10/10"])
+            m.assertEqual(playback.upNext.nextWake(state, 0), 1000)
+            m.assertEqual(m.feed(state, [{ type: "tick", now: 1000 }]), ["show[end]:9/10"])
+            m.assertEqual(playback.upNext.nextWake(state, 1000), 2000)
+            m.assertEqual(m.feed(state, [{ type: "tick", now: 9500 }]), ["show[end]:1/10"])
+            m.assertEqual(playback.upNext.nextWake(state, 9500), 10000)
+            m.assertEqual(m.feed(state, [{ type: "tick", now: 10000 }]), ["playNext:episode:s1e3:true:1"])
+            m.assertInvalid(playback.upNext.nextWake(state, 10000))
+        end sub
+
+        @it("wakes only for the end countdown")
+        sub _()
+            state = m.ready()
+            m.assertInvalid(playback.upNext.nextWake(state, 0))
+            m.feed(state, m.crossing())
+            m.assertInvalid(playback.upNext.nextWake(state, 0))
+        end sub
+
+        @it("holds the end while the next episode is known or still being resolved")
+        sub _()
+            state = m.upNext()
+            m.assertTrue(playback.upNext.holdsEnd(state))
+            m.feed(state, [{ type: "next", next: invalid }])
+            m.assertFalse(playback.upNext.holdsEnd(state), "the last episode leaves as a movie does")
+            state = m.ready()
+            m.assertTrue(playback.upNext.holdsEnd(state))
+            m.feed(state, m.crossing())
+            m.feed(state, [{ type: "back" }])
+            m.assertFalse(playback.upNext.holdsEnd(state))
+        end sub
+
+        @it("waits up to 10 s at the end for the next episode, then exits")
+        sub _()
+            state = m.upNext()
+            m.assertEqual(m.feed(state, [{ type: "ended", now: 1000 }]), [])
+            m.assertEqual(playback.upNext.nextWake(state, 1000), 11000)
+            m.assertEqual(m.feed(state, [{ type: "tick", now: 10999 }]), [])
+            m.assertEqual(m.feed(state, [{ type: "tick", now: 11000 }]), ["exit"])
+            m.assertFalse(playback.upNext.holdsEnd(state))
+            m.assertInvalid(playback.upNext.nextWake(state, 11000))
+            m.assertEqual(m.feed(state, [{ type: "next", next: { itemId: "episode:s1e3" }, now: 11500 }]), [])
+        end sub
+
+        @it("opens as Playing Next when the next episode comes within the wait, and exits when there is none")
+        sub _()
+            state = m.upNext()
+            m.feed(state, [{ type: "ended", now: 0 }])
+            m.assertEqual(m.feed(state, [{ type: "next", next: { itemId: "episode:s1e3" }, now: 9000 }]), ["show[end]:10/10"])
+            m.assertEqual(playback.upNext.nextWake(state, 9000), 10000, "the end countdown's own tick")
+            state = m.upNext()
+            m.feed(state, [{ type: "ended", now: 0 }])
+            m.assertEqual(m.feed(state, [{ type: "next", next: invalid, now: 500 }]), ["exit"])
+            ' Credits that came first wait for nothing and exit nothing.
+            state = m.upNext()
+            m.feed(state, m.crossing())
+            m.assertInvalid(playback.upNext.nextWake(state, 0))
+            m.assertEqual(m.feed(state, [{ type: "next", next: invalid, now: 0 }]), [])
+        end sub
+
+        @it("takes a new credits start and runtime from the playing file")
+        sub _()
+            state = m.ready({ creditsStart: invalid, runtime: invalid })
+            m.assertEqual(m.feed(state, m.crossing()), [])
+            m.feed(state, [{ type: "timeline", creditsStart: 2500, runtime: 2600 }, { type: "seek" }, m.at(2400)])
+            m.assertEqual(m.feed(state, m.crossing()), ["show:100/100"])
+            m.feed(state, [{ type: "timeline", creditsStart: "x", runtime: invalid }])
+            m.assertInvalid(state.creditsStart)
+            m.assertInvalid(state.runtime)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("leaving the item finished (spec section 5.6, tvOS)")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("counts an item finished when its video ended, a movie's included")
+        sub _()
+            m.assertTrue(playback.upNext.leftFinished(m.upNext(), true))
+            m.assertTrue(playback.upNext.leftFinished(invalid, true))
+            m.assertFalse(playback.upNext.leftFinished(invalid, false))
+        end sub
+
+        @it("counts it finished when Up Next shows in the credits, and Back leaves from there")
+        sub _()
+            state = m.ready()
+            m.feed(state, m.crossing())
+            m.assertTrue(playback.upNext.leftFinished(state, false))
+            m.feed(state, [{ type: "back" }])
+            m.assertTrue(playback.upNext.leftFinished(state, false), "Back from the panel exits finished")
+        end sub
+
+        @it("does not count a stop before the credits, Keep Watching, or the Up Next button before the credits")
+        sub _()
+            state = m.ready()
+            m.feed(state, [m.at(1200)])
+            m.assertFalse(playback.upNext.leftFinished(state, false))
+            m.feed(state, [{ type: "open" }])
+            m.assertTrue(playback.upNext.isOpen(state))
+            m.assertFalse(playback.upNext.leftFinished(state, false), "opened by the button mid-episode")
+            state = m.ready()
+            m.feed(state, m.crossing())
+            m.feed(state, [{ type: "keepWatching" }, { type: "seek" }, m.at(1800)])
+            m.assertFalse(playback.upNext.leftFinished(state, false))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("choices")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("Play Now plays the next episode and resets the streak")
+        sub _()
+            state = m.ready({ carry: { streak: 2, autoPlay: invalid } })
+            m.feed(state, m.crossing())
+            m.assertEqual(m.feed(state, [{ type: "playNow" }]), ["playNext:episode:s1e3:false:0"])
+            ' Play Now with the panel closed does nothing.
+            state = m.ready()
+            m.assertEqual(m.feed(state, [{ type: "playNow" }]), [])
+        end sub
+
+        @it("Keep Watching closes it for the rest of the item; the end reopens it without a countdown")
+        sub _()
+            state = m.ready()
+            m.feed(state, m.crossing())
+            m.assertEqual(m.feed(state, [{ type: "keepWatching" }]), ["close"])
+            m.assertEqual(m.feed(state, [{ type: "seek" }, m.at(2400), m.at(2499.5), m.at(2500.5)]), [])
+            m.assertEqual(m.feed(state, [{ type: "ended", now: 0 }]), ["show[end]:-"])
+            ' Keep Watching is gone once the video has ended; Play Now remains.
+            m.assertEqual(m.feed(state, [{ type: "keepWatching" }, { type: "tick", now: 20000 }]), [])
+            m.assertEqual(m.feed(state, [{ type: "playNow" }]), ["playNext:episode:s1e3:false:0"])
+        end sub
+
+        @it("Back exits the player while it shows, and is not its own otherwise")
+        sub _()
+            state = m.ready()
+            m.assertEqual(m.feed(state, [{ type: "back" }]), [])
+            m.feed(state, m.crossing())
+            m.assertEqual(m.feed(state, [{ type: "back" }]), ["exit"])
+            m.assertFalse(playback.upNext.isOpen(state))
+            m.assertEqual(m.feed(state, [{ type: "ended", now: 0 }, { type: "playNow" }]), [])
+        end sub
+
+        @it("opens from the controls without a countdown, which the credits then start")
+        sub _()
+            state = m.ready()
+            m.assertTrue(playback.upNext.canOpen(state))
+            m.assertEqual(m.feed(state, [{ type: "open" }]), ["show:-"])
+            m.assertFalse(playback.upNext.canOpen(state))
+            ' The toggle changes, but no countdown starts until the credits.
+            m.assertEqual(m.feed(state, [{ type: "autoPlay", value: false, now: 0 }, { type: "autoPlay", value: true, now: 0 }]), ["show:-", "show:-"])
+            m.assertEqual(m.feed(state, m.crossing()), ["show:100/100"])
+        end sub
+
+        @it("opened from the controls, counts down at the end; Keep Watching there blocks the credits")
+        sub _()
+            state = m.ready()
+            m.feed(state, [{ type: "open" }])
+            m.assertEqual(m.feed(state, [{ type: "ended", now: 0 }]), ["show[end]:10/10"])
+            state = m.ready()
+            m.feed(state, [{ type: "open" }])
+            m.assertEqual(m.feed(state, [{ type: "keepWatching" }]), ["close"])
+            m.assertEqual(m.feed(state, m.crossing()), [])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("auto-play")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("shows no countdown after three automatic advances in a row")
+        sub _()
+            state = m.ready({ carry: { streak: 3, autoPlay: invalid } })
+            m.assertEqual(m.feed(state, m.crossing()), ["show:-"])
+            m.assertEqual(m.feed(state, [{ type: "ended", now: 0 }, { type: "tick", now: 20000 }]), ["show[end]:-"])
+            m.assertEqual(m.feed(state, [{ type: "autoPlay", value: false, now: 0 }, { type: "autoPlay", value: true, now: 0 }]), ["show[end]:-", "show[end]:-"])
+        end sub
+
+        @it("needs the profile's playback.auto_play_next")
+        sub _()
+            state = m.ready({ autoPlayNext: false })
+            m.assertEqual(m.feed(state, m.crossing()), ["show:-"])
+            m.assertFalse(state.autoPlay)
+            ' The toggle the viewer set last time wins over the profile.
+            state = m.ready({ autoPlayNext: false, carry: { streak: 0, autoPlay: true } })
+            m.assertEqual(m.feed(state, m.crossing()), ["show:100/100"])
+        end sub
+
+        @it("honours roDeviceInfo.IsAutoplayEnabled() and hides the toggle without it")
+        sub _()
+            state = m.ready({ deviceAutoplay: false })
+            commands = []
+            for each event in m.crossing()
+                commands.Append(playback.upNext.reduce(state, event))
+            end for
+            m.assertEqual(commands.Count(), 1)
+            m.assertInvalid(commands[0].countdown)
+            m.assertFalse(commands[0].allowed)
+            m.assertTrue(commands[0].autoPlay)
+            m.assertEqual(m.feed(state, [{ type: "autoPlay", value: false, now: 0 }, { type: "autoPlay", value: true, now: 0 }]), ["show:-", "show:-"])
+        end sub
+
+        @it("the toggle stops and restarts the countdown at once")
+        sub _()
+            state = m.ready()
+            m.feed(state, m.crossing())
+            m.assertEqual(m.feed(state, [{ type: "autoPlay", value: false, now: 1000 }]), ["show:-"])
+            m.assertEqual(m.feed(state, [{ type: "ended", now: 2000 }]), ["show[end]:-"])
+            m.assertEqual(m.feed(state, [{ type: "autoPlay", value: true, now: 3000 }]), ["show[end]:10/10"])
+            m.assertEqual(m.feed(state, [{ type: "autoPlay", value: true, now: 3100 }, { type: "autoPlay", value: "yes", now: 3100 }]), [])
+            commands = playback.upNext.reduce(state, { type: "tick", now: 13000 })
+            m.assertEqual(commands[0].carry, { streak: 1, autoPlay: true })
+        end sub
+
+        @it("restarts a credits countdown from the runtime left")
+        sub _()
+            state = m.ready()
+            m.feed(state, m.crossing())
+            m.feed(state, [{ type: "autoPlay", value: false, now: 1000 }, m.at(2550)])
+            m.assertEqual(m.feed(state, [{ type: "autoPlay", value: true, now: 2000 }]), ["show:50/50"])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("panel fields")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("maps a show command to UpNextPanel's fields, -1 for no countdown")
+        sub _()
+            fields = playback.upNext.panelFields({ type: "show", ended: true, countdown: invalid, total: 10, autoPlay: false, allowed: true })
+            m.assertEqual(fields, { ended: true, countdown: -1, countdownTotal: 10, autoPlay: false, autoPlayAllowed: true })
+            m.assertEqual(playback.upNext.panelFields({ type: "show", ended: false, countdown: 9, total: 10, autoPlay: true, allowed: true }).countdown, 9)
+        end sub
+    end class
+end namespace

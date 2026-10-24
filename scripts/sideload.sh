@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Upload out/silo-roku.zip to a Roku in Developer Mode, replacing the dev app.
+# Upload a package (default out/silo-roku.zip) to a Roku in Developer Mode,
+# replacing the dev app: sideload.sh [package.zip], a path from the repo root.
 # Reads ROKU_HOST, ROKU_PASSWORD, and optional ROKU_DEPLOY_VIA from .env.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
 : "${ROKU_HOST:?set ROKU_HOST in .env}"
 : "${ROKU_PASSWORD:?set ROKU_PASSWORD in .env}"
-zip=out/silo-roku.zip
-[ -f "$zip" ] || { echo "missing $zip; run npm run build" >&2; exit 1; }
+zip=${1:-out/silo-roku.zip}
+[ -f "$zip" ] || { echo "missing $zip; build it first (npm run build)" >&2; exit 1; }
 
 # The uploader reads the password from the first stdin line and the zip from the
 # rest, so the password never appears in a command line or log.

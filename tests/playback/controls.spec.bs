@@ -1,0 +1,753 @@
+namespace tests
+
+    @suite("playback controls")
+    class PlaybackControlsTests extends rooibos.BaseTestSuite
+
+        '-----------------------------------------------------------------------
+        ' Helpers
+        '-----------------------------------------------------------------------
+
+        ' Playing at 600 s of a 3600 s title, controls hidden.
+        function playing() as Object
+            state = playback.controls.create()
+            playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600, paused: false, busy: false }, 0)
+            return state
+        end function
+
+        ' Shown, with nothing keeping them, the last key at now.
+        function shown(now = 0 as Integer) as Object
+            state = m.playing()
+            playback.controls.reduce(state, { type: "show" }, now)
+            return state
+        end function
+
+        function press(state as Object, key as String, now as Integer) as Object
+            return playback.controls.reduce(state, { type: "key", key: key, press: true }, now)
+        end function
+
+        function release(state as Object, key as String, now as Integer) as Object
+            return playback.controls.reduce(state, { type: "key", key: key, press: false }, now)
+        end function
+
+        ' A press and its release 100 ms later, with what both returned.
+        function tap(state as Object, key as String, now as Integer) as Object
+            out = []
+            out.Append(m.press(state, key, now))
+            out.Append(m.release(state, key, now + 100))
+            return out
+        end function
+
+        function wake(state as Object, now as Integer) as Object
+            return playback.controls.reduce(state, { type: "wake" }, now)
+        end function
+
+        function types(cmds as Object) as Object
+            out = []
+            for each c in cmds
+                out.Push(c.type)
+            end for
+            return out
+        end function
+
+        function seekOf(cmds as Object) as Dynamic
+            for each c in cmds
+                if c.type = "seek" then return tests.dbl(c.position)
+            end for
+            return invalid
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("visibility")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("starts hidden, and shows with focus on the scrubber, or on a skip pill that shows (tvOS)")
+        sub _()
+            state = m.playing()
+            m.assertFalse(state.shown)
+            m.assertEqual(playback.controls.reduce(state, { type: "show" }, 0), [{ type: "visibility", shown: true }])
+            m.assertEqual(state.focus, "scrubber")
+            state = m.playing()
+            playback.controls.reduce(state, { type: "flags", recapButton: true }, 0)
+            playback.controls.reduce(state, { type: "show" }, 0)
+            m.assertEqual(state.focus, "skipRecap")
+            state = m.playing()
+            playback.controls.reduce(state, { type: "flags", skipButton: true, recapButton: true }, 0)
+            playback.controls.reduce(state, { type: "show" }, 0)
+            m.assertEqual(state.focus, "skipIntro")
+        end sub
+
+        @it("hides the controls the start showed when the picture plays, so Right then skips (run 9, T4b)")
+        sub _()
+            state = m.shown(0)
+            m.assertEqual(playback.controls.reduce(state, { type: "firstFrame" }, 1400), [{ type: "visibility", shown: false }])
+            out = m.tap(state, "right", 2400)
+            m.assertEqual(m.types(out), ["visibility"])
+            m.assertEqual(state.focus, "scrubber")
+            m.assertEqual(m.seekOf(m.wake(state, 2700)), tests.dbl(630))
+            ' A later load's first frame leaves controls a key showed.
+            m.assertEqual(playback.controls.reduce(state, { type: "firstFrame" }, 3000), [])
+            m.assertTrue(state.shown)
+        end sub
+
+        @it("keeps the controls the start showed once a key came, or while paused or a panel is open")
+        sub _()
+            state = m.shown(0)
+            m.tap(state, "down", 500)
+            m.assertEqual(state.focus, "playPause", "the start's controls move focus")
+            m.assertEqual(playback.controls.reduce(state, { type: "firstFrame" }, 1400), [])
+            state = m.shown(0)
+            playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600, paused: true }, 100)
+            m.assertEqual(playback.controls.reduce(state, { type: "firstFrame" }, 1400), [])
+            state = m.shown(0)
+            playback.controls.reduce(state, { type: "flags", options: true }, 100)
+            m.assertEqual(playback.controls.reduce(state, { type: "firstFrame" }, 1400), [])
+            m.assertEqual(playback.controls.reduce(m.playing(), { type: "firstFrame" }, 1400), [], "hidden ones stay hidden")
+        end sub
+
+        @it("hides 5 s after the last key while playing")
+        sub _()
+            state = m.shown(0)
+            m.assertEqual(playback.controls.nextWake(state), 5000)
+            m.assertEqual(m.wake(state, 4999), [])
+            m.assertEqual(m.wake(state, 5000), [{ type: "visibility", shown: false }])
+            m.assertInvalid(playback.controls.nextWake(state))
+        end sub
+
+        @it("hides on request, dropping a pending seek")
+        sub _()
+            state = m.playing()
+            m.tap(state, "right", 0)
+            m.assertEqual(playback.controls.reduce(state, { type: "hide" }, 150), [{ type: "visibility", shown: false }])
+            m.assertInvalid(state.pending)
+            m.assertEqual(playback.controls.reduce(state, { type: "hide" }, 200), [])
+            m.assertEqual(m.wake(state, 1000), [])
+        end sub
+
+        @it("re-arms the timer on any key")
+        sub _()
+            state = m.shown(0)
+            m.tap(state, "down", 3000)
+            m.assertEqual(m.wake(state, 5000), [])
+            m.assertEqual(m.wake(state, 8000), [{ type: "visibility", shown: false }])
+        end sub
+
+        @it("stays while paused, busy, scrubbing, or Options is open, and hides 5 s after")
+        sub _()
+            state = m.shown(0)
+            playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600, paused: true, busy: false }, 1000)
+            m.assertEqual(m.wake(state, 60000), [])
+            playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600, paused: false, busy: true }, 61000)
+            m.assertEqual(m.wake(state, 90000), [])
+            playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600, paused: false, busy: false }, 91000)
+            m.assertEqual(m.wake(state, 95999), [])
+            m.assertEqual(m.wake(state, 96000), [{ type: "visibility", shown: false }])
+
+            state = m.shown(0)
+            playback.controls.reduce(state, { type: "flags", options: true }, 0)
+            m.assertEqual(m.wake(state, 20000), [])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("keys with the controls hidden")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("shows the controls on OK and Up, focused on the scrubber (tvOS)")
+        sub _()
+            for each key in ["OK", "up"]
+                state = m.playing()
+                m.assertEqual(m.tap(state, key, 0), [{ type: "visibility", shown: true }], key)
+                m.assertEqual(state.focus, "scrubber", key)
+            end for
+        end sub
+
+        @it("opens Options on Video on Down, without the controls")
+        sub _()
+            state = m.playing()
+            m.assertEqual(m.tap(state, "down", 0), [{ type: "openOptions", tab: "video" }])
+            m.assertFalse(state.shown)
+        end sub
+
+        @it("opens Options on Video on the options key, hidden or shown")
+        sub _()
+            m.assertEqual(m.tap(m.playing(), "options", 0), [{ type: "openOptions", tab: "video" }])
+            m.assertEqual(m.tap(m.shown(), "options", 0), [{ type: "openOptions", tab: "video" }])
+        end sub
+
+        @it("toggles on Play/Pause and shows the controls")
+        sub _()
+            state = m.playing()
+            m.assertEqual(m.types(m.tap(state, "play", 0)), ["togglePause", "visibility"])
+            m.assertEqual(m.types(m.tap(state, "play", 500)), ["togglePause"])
+        end sub
+
+        @it("skips on a Left or Right tap, showing the scrubber, and seeks 200 ms later")
+        sub _()
+            state = m.playing()
+            m.assertEqual(m.press(state, "left", 0), [], "a hold would keep them hidden")
+            m.assertInvalid(state.pending, "nothing until the release")
+            m.assertEqual(m.release(state, "left", 100), [{ type: "visibility", shown: true }])
+            m.assertEqual(state.focus, "scrubber")
+            m.assertEqual(tests.dbl(state.pending), tests.dbl(590))
+            m.assertTrue(playback.controls.isScrubbing(state))
+            m.assertEqual(playback.controls.nextWake(state), 300)
+            m.assertEqual(m.wake(state, 299), [])
+            out = m.wake(state, 300)
+            m.assertEqual(m.seekOf(out), tests.dbl(590))
+            m.assertInvalid(state.pending)
+
+            m.tap(state, "right", 1000)
+            m.assertEqual(m.seekOf(m.wake(state, 1300)), tests.dbl(630))
+        end sub
+
+        @it("merges rapid skips into one seek, counted from the pending position")
+        sub _()
+            state = m.playing()
+            m.tap(state, "right", 0)
+            m.tap(state, "right", 150)
+            m.tap(state, "right", 300)
+            m.tap(state, "left", 450)
+            m.assertEqual(m.wake(state, 649), [])
+            out = m.wake(state, 750)
+            m.assertEqual(m.types(out), ["seek"])
+            m.assertEqual(m.seekOf(out), tests.dbl(680))
+        end sub
+
+        @it("clamps skips to the title and drops a seek to where it plays")
+        sub _()
+            state = m.playing()
+            playback.controls.reduce(state, { type: "playback", position: 5, runtime: 3600 }, 0)
+            m.tap(state, "left", 0)
+            m.assertEqual(m.seekOf(m.wake(state, 300)), tests.dbl(0))
+            playback.controls.reduce(state, { type: "playback", position: 0, runtime: 3600 }, 400)
+            m.tap(state, "left", 500)
+            m.assertEqual(m.wake(state, 800), [], "already at the start")
+            playback.controls.reduce(state, { type: "playback", position: 3590, runtime: 3600 }, 900)
+            m.tap(state, "right", 1000)
+            m.assertEqual(m.seekOf(m.wake(state, 1300)), tests.dbl(3600))
+        end sub
+
+        @it("activates the skip button on OK while it shows")
+        sub _()
+            state = m.playing()
+            playback.controls.reduce(state, { type: "flags", skipButton: true }, 0)
+            m.assertEqual(m.tap(state, "OK", 0), [{ type: "activateSkip" }])
+            m.assertFalse(state.shown)
+        end sub
+
+        @it("ignores a repeated press of a key still held")
+        sub _()
+            state = m.playing()
+            m.press(state, "right", 0)
+            m.assertEqual(m.press(state, "right", 100), [])
+            m.release(state, "right", 150)
+            m.assertEqual(m.seekOf(m.wake(state, 350)), tests.dbl(630), "one skip")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("rate ladder")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("starts at 1x after Left or Right is held 300 ms, with no skip")
+        sub _()
+            state = m.playing()
+            m.press(state, "right", 0)
+            m.assertEqual(playback.controls.nextWake(state), 300)
+            m.wake(state, 300)
+            m.assertEqual(state.rate, 1)
+            m.assertEqual(tests.dbl(state.pending), tests.dbl(600))
+            m.assertEqual(playback.controls.nextWake(state), 400)
+            m.wake(state, 400)
+            m.assertEqual(tests.dbl(state.pending), tests.dbl(602), "speed x 2 s every 100 ms")
+            m.release(state, "right", 450)
+            m.assertEqual(state.rate, 1, "runs on after the release")
+            m.wake(state, 1300)
+            m.assertEqual(tests.dbl(state.pending), tests.dbl(620))
+        end sub
+
+        @it("climbs 1, 2, 4, 8 every 1.2 s while held, and no further")
+        sub _()
+            state = m.playing()
+            m.press(state, "left", 0)
+            m.wake(state, 1400)
+            m.assertEqual(state.rate, -1)
+            m.wake(state, 1500)
+            m.assertEqual(state.rate, -2)
+            m.wake(state, 2700)
+            m.assertEqual(state.rate, -4)
+            m.wake(state, 3900)
+            m.assertEqual(state.rate, -8)
+            ' 1.2 s each at 1x, 2x, and 4x: 24 + 48 + 96 s.
+            m.assertEqual(tests.dbl(state.pending), tests.dbl(432))
+            m.wake(state, 9000)
+            m.assertEqual(state.rate, -8)
+            m.assertEqual(tests.dbl(state.pending), tests.dbl(0), "clamped at the start")
+        end sub
+
+        @it("measures movement against elapsed time, at each rate for its own span")
+        sub _()
+            state = m.playing()
+            m.press(state, "right", 0)
+            m.wake(state, 1700)
+            ' 1.2 s at 1x (24 s), then 0.2 s at 2x (8 s).
+            m.assertEqual(tests.dbl(state.pending), tests.dbl(632))
+        end sub
+
+        @it("starts on Rewind or Fast Forward, which step it each press")
+        sub _()
+            state = m.playing()
+            m.assertEqual(m.tap(state, "fastforward", 0), [], "the controls stay hidden: the hold indicator shows")
+            m.assertEqual([state.rate, state.hiddenLadder], [1, true])
+            m.tap(state, "fastforward", 200)
+            m.assertEqual(state.rate, 2)
+            m.tap(state, "right", 300)
+            m.assertEqual(state.rate, 4)
+            m.tap(state, "rewind", 400)
+            m.tap(state, "left", 500)
+            m.assertEqual(state.rate, 1)
+            m.tap(state, "rewind", 600)
+            m.assertEqual(state.rate, -1, "a step past 1x reverses")
+        end sub
+
+        @it("steps the signed ladder up to 32x each way")
+        sub _()
+            m.assertEqual(playback.controls.stepRate(0, 1), 1)
+            m.assertEqual(playback.controls.stepRate(16, 1), 32)
+            m.assertEqual(playback.controls.stepRate(32, 1), 32)
+            m.assertEqual(playback.controls.stepRate(-1, 1), 1)
+            m.assertEqual(playback.controls.stepRate(-32, 1), -16)
+            m.assertEqual(playback.controls.stepRate(-2, 1), -1)
+            m.assertEqual(playback.controls.stepRate(1, -1), -1)
+            m.assertEqual(playback.controls.stepRate(-32, -1), -32)
+        end sub
+
+        @it("commits on OK and cancels on Back")
+        sub _()
+            state = m.playing()
+            m.tap(state, "fastforward", 0)
+            m.wake(state, 500)
+            out = m.tap(state, "OK", 500)
+            m.assertEqual(m.seekOf(out), tests.dbl(610))
+            m.assertEqual(state.rate, 0)
+            m.assertInvalid(state.movedAt, "no ticks")
+
+            m.tap(state, "fastforward", 1000)
+            m.wake(state, 1500)
+            m.assertEqual(m.tap(state, "back", 1500), [])
+            m.assertEqual(state.rate, 0)
+            m.assertInvalid(state.pending)
+            m.assertFalse(state.shown, "a ladder from hidden controls leaves them hidden")
+            m.assertFalse(state.hiddenLadder)
+        end sub
+
+        @it("runs a hold with the controls hidden without showing them, and one with them shown on the scrubber")
+        sub _()
+            state = m.playing()
+            m.press(state, "right", 0)
+            m.wake(state, 300)
+            m.assertEqual([state.rate, state.shown, state.hiddenLadder], [1, false, true])
+            m.release(state, "right", 400)
+            m.assertEqual(m.seekOf(m.tap(state, "OK", 600)), tests.dbl(606))
+            m.assertEqual([state.shown, state.hiddenLadder], [false, false])
+            state = m.shown()
+            m.press(state, "right", 0)
+            m.wake(state, 300)
+            m.assertEqual([state.rate, state.shown, state.hiddenLadder], [1, true, false])
+        end sub
+
+        @it("swallows Up and Down while it runs, and commits and resumes on Play")
+        sub _()
+            state = m.playing()
+            m.tap(state, "rewind", 0)
+            m.assertEqual(m.tap(state, "down", 100), [])
+            m.assertEqual(m.tap(state, "up", 100), [])
+            m.assertEqual(state.focus, "scrubber")
+            playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600, paused: true }, 200)
+            out = m.tap(state, "play", 500)
+            m.assertEqual(m.types(out), ["seek", "togglePause"])
+            m.assertEqual(m.seekOf(out), tests.dbl(590))
+            m.assertTrue(out[0].resume, "a load the seek opens plays (run 9, T1e)")
+        end sub
+
+        @it("says a seek resumes only when Play commits it while paused")
+        sub _()
+            for each key in ["OK", "play"]
+                for each paused in [true, false]
+                    name = key + ", paused " + paused.ToStr()
+                    state = m.playing()
+                    playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600, paused: paused }, 0)
+                    m.tap(state, "rewind", 0)
+                    out = m.tap(state, key, 500)
+                    m.assertEqual(m.seekOf(out), tests.dbl(590), name)
+                    expected = ["seek"]
+                    if key = "play" and paused then expected.Push("togglePause")
+                    m.assertEqual(m.types(out), expected, name)
+                    m.assertEqual(out[0].resume, key = "play" and paused, name)
+                end for
+            end for
+        end sub
+
+        @it("does not skip on the release of a key whose hold ended in a commit")
+        sub _()
+            state = m.playing()
+            m.press(state, "right", 0)
+            m.wake(state, 500)
+            m.press(state, "OK", 600)
+            m.assertEqual(m.release(state, "right", 700), [])
+            m.assertInvalid(state.pending)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("keys with the controls shown")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("moves focus along the buttons without wrapping, and between them and the scrubber")
+        sub _()
+            state = m.shown()
+            m.assertEqual(state.focus, "scrubber")
+            m.tap(state, "down", 0)
+            m.assertEqual(state.focus, "playPause")
+            m.tap(state, "left", 0)
+            m.assertEqual(state.focus, "skipBack")
+            m.tap(state, "left", 0)
+            m.assertEqual(state.focus, "skipBack")
+            for i = 1 to 6
+                m.tap(state, "right", 0)
+            end for
+            m.assertEqual(state.focus, "close")
+            m.assertInvalid(state.pending, "focus moves are not skips")
+            m.tap(state, "up", 0)
+            m.assertEqual(state.focus, "scrubber")
+            m.tap(state, "up", 0)
+            m.assertEqual(state.focus, "scrubber")
+            m.tap(state, "down", 0)
+            m.assertEqual(state.focus, "playPause")
+            m.assertEqual(m.tap(state, "down", 0), [])
+        end sub
+
+        @it("lists Up Next for episodes only, and no Subtitles button (tvOS)")
+        sub _()
+            m.assertEqual(playback.controls.buttons(false), ["skipBack", "playPause", "skipForward", "options", "close"])
+            m.assertEqual(playback.controls.buttons(true), ["skipBack", "playPause", "skipForward", "upNext", "options", "close"])
+            state = m.shown()
+            playback.controls.reduce(state, { type: "content", episode: true }, 0)
+            m.tap(state, "down", 0)
+            for i = 1 to 2
+                m.tap(state, "right", 0)
+            end for
+            m.assertEqual(state.focus, "upNext")
+            m.assertEqual(m.tap(state, "OK", 0), [{ type: "openUpNext" }])
+            playback.controls.reduce(state, { type: "content", episode: false }, 0)
+            m.assertEqual(state.focus, "playPause", "a button that went away")
+        end sub
+
+        @it("skips and holds on the scrubber as when hidden")
+        sub _()
+            state = m.shown()
+            m.tap(state, "up", 0)
+            m.tap(state, "right", 100)
+            m.assertEqual(m.seekOf(m.wake(state, 400)), tests.dbl(630))
+            m.press(state, "left", 1000)
+            m.wake(state, 1300)
+            m.assertEqual(state.rate, -1)
+        end sub
+
+        @it("toggles on OK on the scrubber, or commits a pending seek")
+        sub _()
+            state = m.shown()
+            m.tap(state, "up", 0)
+            m.assertEqual(m.tap(state, "OK", 0), [{ type: "togglePause" }])
+            m.tap(state, "right", 100)
+            out = m.tap(state, "OK", 250)
+            m.assertEqual(m.types(out), ["seek"])
+            m.assertEqual(m.seekOf(out), tests.dbl(630))
+            m.assertEqual(m.wake(state, 1000), [], "nothing left to merge")
+        end sub
+
+        @it("activates the focused button")
+        sub _()
+            cases = [
+                ["playPause", { type: "togglePause" }],
+                ["options", { type: "openOptions", tab: playback.controls.LAST_TAB }],
+                ["skipIntro", { type: "activateSkip" }],
+                ["skipRecap", { type: "activateRecap" }],
+                ["close", { type: "exit" }]
+            ]
+            for each c in cases
+                state = m.shown()
+                state.focus = c[0]
+                m.assertEqual(m.tap(state, "OK", 0), [c[1]], c[0])
+            end for
+        end sub
+
+        @it("skips by the profile's values on the skip buttons, keeping focus there")
+        sub _()
+            state = m.shown()
+            playback.controls.reduce(state, { type: "preferences", skipBackSeconds: 45, skipForwardSeconds: 90 }, 0)
+            state.focus = "skipBack"
+            m.tap(state, "OK", 0)
+            m.tap(state, "OK", 150)
+            m.assertEqual(m.seekOf(m.wake(state, 450)), tests.dbl(510))
+            m.assertEqual(state.focus, "skipBack")
+            state.focus = "skipForward"
+            m.tap(state, "OK", 1000)
+            m.assertEqual(m.seekOf(m.wake(state, 1300)), tests.dbl(690))
+        end sub
+
+        @it("gives a skip pill that appears the focus, unless a seek is being chosen, and moves Up and Down through the pills")
+        sub _()
+            state = m.shown()
+            playback.controls.reduce(state, { type: "flags", skipButton: true }, 0)
+            m.assertEqual(state.focus, "skipIntro", "tvOS's pill takes focus as it appears")
+            playback.controls.reduce(state, { type: "flags", recapButton: true }, 0)
+            m.assertEqual(state.focus, "skipRecap")
+            m.tap(state, "down", 0)
+            m.assertEqual(state.focus, "skipIntro")
+            m.tap(state, "down", 0)
+            m.assertEqual(state.focus, "scrubber")
+            m.tap(state, "up", 0)
+            m.assertEqual(state.focus, "skipIntro")
+            m.tap(state, "left", 0)
+            m.assertEqual(state.focus, "skipIntro", "Left and Right do nothing on a pill")
+            m.assertEqual(m.tap(state, "OK", 0), [{ type: "activateSkip" }])
+            playback.controls.reduce(state, { type: "flags", skipButton: false }, 0)
+            m.assertEqual(state.focus, "scrubber", "a pill that goes leaves focus on the scrubber")
+
+            state = m.shown()
+            m.tap(state, "right", 0)
+            playback.controls.reduce(state, { type: "flags", recapButton: true }, 50)
+            m.assertEqual(state.focus, "scrubber", "never during a scrub")
+            state = m.playing()
+            playback.controls.reduce(state, { type: "flags", recapButton: true }, 0)
+            m.assertEqual(state.focus, "scrubber", "nor with the controls hidden")
+        end sub
+
+        @it("gives OK with the controls hidden to Skip Intro, else Skip Recap")
+        sub _()
+            state = m.playing()
+            playback.controls.reduce(state, { type: "flags", skipButton: true, recapButton: true }, 0)
+            m.assertEqual(m.tap(state, "OK", 0), [{ type: "activateSkip" }])
+            playback.controls.reduce(state, { type: "flags", skipButton: false }, 0)
+            m.assertEqual(m.tap(state, "OK", 0), [{ type: "activateRecap" }])
+            m.assertFalse(state.shown)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("Replay")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("rewinds by skip back clamped to 10 to 25 s")
+        sub _()
+            m.assertEqual(playback.controls.replaySeconds(5), 10)
+            m.assertEqual(playback.controls.replaySeconds(15), 15)
+            m.assertEqual(playback.controls.replaySeconds(90), 25)
+            m.assertEqual(playback.controls.replaySeconds(invalid), 10)
+            state = m.playing()
+            playback.controls.reduce(state, { type: "preferences", skipBackSeconds: 60, skipForwardSeconds: 30 }, 0)
+            out = m.tap(state, "replay", 0)
+            m.assertEqual(m.types(out), ["visibility"], "captions wait for the seek to commit")
+            out = m.wake(state, 300)
+            m.assertEqual(m.types(out), ["replayCaptions", "seek"])
+            m.assertEqual(m.seekOf(out), tests.dbl(575))
+            m.tap(state, "left", 400)
+            m.assertEqual(m.seekOf(m.wake(state, 700)), tests.dbl(540), "Left keeps 60 s")
+        end sub
+
+        ' The player reports the seek's target right after a commit
+        ' (Player.commitSeek, then refreshChrome).
+        @it("forces captions for the replayed span, extended by repeated presses")
+        sub _()
+            state = m.playing()
+            m.assertEqual(m.tap(state, "replay", 0), [{ type: "visibility", shown: true }])
+            m.assertEqual(m.tap(state, "replay", 100), [], "the span grows")
+            out = m.wake(state, 400)
+            m.assertEqual(out[0], { type: "replayCaptions", active: true })
+            m.assertEqual(m.seekOf(out), tests.dbl(580))
+            m.assertEqual(playback.controls.reduce(state, { type: "playback", position: 580, runtime: 3600 }, 400), [], "landed inside")
+            m.assertEqual(playback.controls.reduce(state, { type: "playback", position: 599.5, runtime: 3600 }, 700), [])
+            m.assertEqual(playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600 }, 800), [{ type: "replayCaptions", active: false }])
+            m.assertInvalid(state.replay)
+        end sub
+
+        @it("never forces captions for a Replay that Back cancels before its seek")
+        sub _()
+            state = m.playing()
+            out = m.press(state, "replay", 10)
+            out.Append(m.press(state, "back", 50))
+            out.Append(m.wake(state, 400))
+            m.assertEqual(m.types(out), ["visibility"])
+            m.assertInvalid(state.replay)
+            m.assertEqual(playback.controls.reduce(state, { type: "playback", position: 620, runtime: 3600 }, 1000), [])
+        end sub
+
+        @it("keeps a committed span when Back cancels a later Replay, and ends it where it was pressed")
+        sub _()
+            state = m.playing()
+            m.tap(state, "replay", 0)
+            m.wake(state, 300)
+            playback.controls.reduce(state, { type: "playback", position: 590, runtime: 3600 }, 300)
+            playback.controls.reduce(state, { type: "playback", position: 595, runtime: 3600 }, 5000)
+            m.press(state, "replay", 5100)
+            m.assertEqual(m.press(state, "back", 5200), [], "the earlier span still holds")
+            m.assertEqual(m.wake(state, 5400), [], "no seek")
+            m.assertEqual(playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600 }, 10000), [{ type: "replayCaptions", active: false }])
+        end sub
+
+        @it("opens no span when skips merged after Replay seek past where it was pressed")
+        sub _()
+            state = m.playing()
+            out = m.tap(state, "replay", 0)
+            out.Append(m.tap(state, "right", 50))
+            out.Append(m.wake(state, 500))
+            m.assertEqual(m.types(out), ["visibility", "seek"])
+            m.assertEqual(m.seekOf(out), tests.dbl(620))
+            m.assertInvalid(state.replay)
+        end sub
+
+        @it("ends the span when its seek does not land inside it")
+        sub _()
+            state = m.playing()
+            m.tap(state, "replay", 0)
+            m.assertEqual(m.types(m.wake(state, 300)), ["replayCaptions", "seek"])
+            ' The session dropped the seek: the report still has 600 s.
+            m.assertEqual(playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600 }, 300), [{ type: "replayCaptions", active: false }])
+            m.assertInvalid(state.replay)
+        end sub
+
+        @it("ends the span when a later seek leaves it, or when the player is covered")
+        sub _()
+            state = m.playing()
+            m.tap(state, "replay", 0)
+            m.wake(state, 300)
+            playback.controls.reduce(state, { type: "playback", position: 590, runtime: 3600 }, 300)
+            ' Skip Intro's or another seek's target, past where Replay was pressed.
+            m.assertEqual(playback.controls.reduce(state, { type: "playback", position: 700, runtime: 3600 }, 2000), [{ type: "replayCaptions", active: false }])
+
+            state = m.playing()
+            m.tap(state, "replay", 0)
+            m.wake(state, 300)
+            playback.controls.reduce(state, { type: "playback", position: 590, runtime: 3600 }, 300)
+            ' A failed seek's error screen, or Up Next, covers the player.
+            m.assertEqual(m.types(playback.controls.reduce(state, { type: "hide" }, 2000)), ["replayCaptions", "visibility"])
+            m.assertInvalid(state.replay)
+        end sub
+
+        @it("opens no span from the very start")
+        sub _()
+            state = m.playing()
+            playback.controls.reduce(state, { type: "playback", position: 0.5, runtime: 3600 }, 0)
+            m.assertEqual(m.types(m.tap(state, "replay", 0)), ["visibility"])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("Back")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("cancels a pending skip first")
+        sub _()
+            state = m.playing()
+            m.tap(state, "right", 0)
+            m.assertEqual(m.tap(state, "back", 150), [])
+            m.assertEqual(m.wake(state, 1000), [])
+        end sub
+
+        @it("then dismisses the skip button, exits from Up Next, and closes Options")
+        sub _()
+            state = m.shown()
+            playback.controls.reduce(state, { type: "flags", skipButton: true, upNext: true, options: true }, 0)
+            m.assertEqual(m.tap(state, "back", 0), [{ type: "dismissSkip" }])
+            playback.controls.reduce(state, { type: "flags", skipButton: false }, 0)
+            m.assertEqual(m.tap(state, "back", 0), [{ type: "exit" }])
+            playback.controls.reduce(state, { type: "flags", upNext: false }, 0)
+            m.assertEqual(m.tap(state, "back", 0), [{ type: "closeOptions" }])
+        end sub
+
+        @it("passes over Skip Recap, as tvOS's Menu passes over its segment pill: hides the controls, then exits (W12 review)")
+        sub _()
+            state = m.playing()
+            playback.controls.reduce(state, { type: "flags", recapButton: true }, 0)
+            m.assertEqual(m.tap(state, "back", 100), [{ type: "exit" }], "controls hidden: silo-apple b90a86ea PlayerView's onExitCommand dismisses only the intro pill")
+            state = m.shown()
+            playback.controls.reduce(state, { type: "flags", recapButton: true }, 0)
+            m.assertEqual(m.tap(state, "back", 0), [{ type: "visibility", shown: false }], "controls shown: they hide and the pill stays")
+            m.assertEqual(m.tap(state, "back", 200), [{ type: "exit" }])
+            state = m.playing()
+            playback.controls.reduce(state, { type: "flags", skipButton: true, recapButton: true }, 0)
+            m.assertEqual(m.tap(state, "back", 100), [{ type: "dismissSkip" }], "Skip Intro over it still goes first")
+        end sub
+
+        @it("closes Options at once with a tab's list focused, as tvOS and Android TV close their HUDs (run 22)")
+        sub _()
+            state = m.shown()
+            playback.controls.reduce(state, { type: "flags", options: true, picker: true }, 0)
+            m.assertEqual(m.tap(state, "back", 0), [{ type: "closeOptions" }])
+        end sub
+
+        @it("then hides the controls while playing, and otherwise exits")
+        sub _()
+            state = m.shown()
+            m.assertEqual(m.tap(state, "back", 0), [{ type: "visibility", shown: false }])
+            m.assertEqual(m.tap(state, "back", 0), [{ type: "exit" }])
+            state = m.shown()
+            playback.controls.reduce(state, { type: "playback", position: 600, runtime: 3600, paused: true }, 0)
+            m.assertEqual(m.tap(state, "back", 0), [{ type: "exit" }], "paused")
+        end sub
+
+        @it("leaves other keys to Options, a picker, or Up Next, but for Play/Pause")
+        sub _()
+            for each name in ["options", "picker", "upNext"]
+                state = m.playing()
+                flags = { type: "flags" }
+                flags[name] = true
+                playback.controls.reduce(state, flags, 0)
+                for each key in ["left", "right", "up", "down", "OK", "fastforward", "replay", "options"]
+                    m.assertEqual(m.tap(state, key, 0), [], name + " " + key)
+                end for
+                m.assertEqual(m.tap(state, "play", 0), [{ type: "togglePause" }], name)
+                m.assertFalse(state.shown, name)
+            end for
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("display")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("gives an episode its series line and tag, and a movie neither (tvOS)")
+        sub _()
+            episode = { kind: "episode", seriesTitle: "Severance", seasonNumber: 1, episodeNumber: 2 }
+            m.assertEqual(playback.controls.seriesLine(episode), "Severance")
+            m.assertEqual(playback.controls.episodeTag(episode), "S1 · E2")
+            episode.Delete("seasonNumber")
+            m.assertEqual(playback.controls.episodeTag(episode), "")
+            movie = { kind: "movie", year: 2024, seriesTitle: "" }
+            m.assertEqual([playback.controls.seriesLine(movie), playback.controls.episodeTag(movie)], ["", ""])
+        end sub
+
+        @it("writes time left with a minus sign")
+        sub _()
+            m.assertEqual(playback.controls.remainingText(600, 3600), Chr(&h2212) + "50:00")
+            m.assertEqual(playback.controls.remainingText(0.4, 4000), Chr(&h2212) + "1:06:39")
+            m.assertEqual(playback.controls.remainingText(4000, 3600), Chr(&h2212) + "0:00")
+            m.assertEqual(playback.controls.remainingText(10, invalid), "")
+        end sub
+
+        @it("draws intro, recap, and credits bands clipped to the runtime")
+        sub _()
+            markers = [
+                { kind: "intro", start_seconds: 0, end_seconds: 90 },
+                { kind: "recap", start_seconds: 90, end_seconds: 120 },
+                { kind: "preview", start_seconds: 3500, end_seconds: 3600 },
+                { kind: "credits", start_seconds: 3400, end_seconds: 3700 },
+                { kind: "intro", start_seconds: 50, end_seconds: 50 },
+                { kind: "credits", start_seconds: "3400" },
+                "junk"
+            ]
+            bands = playback.controls.bands(markers, 3600)
+            m.assertEqual(bands.Count(), 3)
+            m.assertEqual([bands[0].kind, tests.dbl(bands[0].start), tests.dbl(bands[0].end)], ["intro", tests.dbl(0), tests.dbl(90)])
+            m.assertEqual(bands[1].kind, "recap")
+            m.assertEqual([bands[2].kind, tests.dbl(bands[2].start), tests.dbl(bands[2].end)], ["credits", tests.dbl(3400), tests.dbl(3600)])
+            m.assertEqual(playback.controls.bands(markers, invalid), [])
+            m.assertEqual(playback.controls.bands(invalid, 3600), [])
+        end sub
+    end class
+end namespace

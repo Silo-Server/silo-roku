@@ -1,0 +1,134 @@
+namespace tests
+
+    @suite("dev harness: what it shows and logs")
+    class HarnessReportTests extends rooibos.BaseTestSuite
+
+        @describe("problemMessage")
+
+        @it("names the status and Problem type")
+        sub _()
+            m.assertEqual(harness.problemMessage("Start failed", 422, m.problem(), false), "Start failed (422 validation_failed)")
+            m.assertEqual(harness.problemMessage("Start failed", -1001, invalid, true), "Start failed (-1001)")
+            m.assertEqual(harness.problemMessage("Start failed", 502, "<html>", true), "Start failed (502)")
+        end sub
+
+        @it("adds the detail and field errors when asked, so a refused prototype token says why")
+        sub _()
+            message = harness.problemMessage("Start failed", 422, m.problem(), true)
+            m.assertEqual(message, "Start failed (422 validation_failed): The request did not pass validation; see errors.; body.client_playback_context.deliveries.hls.features[1] unknown delivery feature; body.client_features required")
+        end sub
+
+        @it("redacts URLs and tokens in the detail")
+        sub _()
+            problem = { type: "https://siloserver.org/docs/api/v2/problems/bad_request", detail: "cannot open https://silo.example/api/v2/stream/s1/abc123?st=SECRET-SIGNED Bearer SECRET-TOKEN-VALUE" }
+            message = harness.problemMessage("Replan failed", 400, problem, true)
+            m.assertEqual(Instr(1, message, "SECRET"), 0, message)
+            m.assertTrue(Instr(1, message, "https://silo.example/api/v2/stream") > 0, message)
+        end sub
+
+        @describe("outcomeFields")
+
+        @it("explains a playable decision from its plan facts")
+        sub _()
+            result = m.playable()
+            fields = harness.outcomeFields(result)
+            m.assertEqual(fields.delivery, "original_http")
+            m.assertEqual(fields.reason, "validated_original_playback")
+            m.assertEqual(fields.stream, "http_progressive/mp4 as mp4")
+            m.assertEqual(fields.media, "api")
+            m.assertTrue(fields.accountHeaders)
+            m.assertEqual(fields.playerStart, 12.5)
+            m.assertEqual(fields.subtitle, "srt, tmp copy -1001")
+            m.assertTrue(fields.toggles.tsCopyRemux)
+            m.assertFalse(fields.toggles.noPlaylistVariables)
+            m.assertTrue(fields.ok)
+        end sub
+
+        @it("keeps URLs, headers, and tracks out of the console line")
+        sub _()
+            line = log.format("INFO", "harness", "start", harness.outcomeFields(m.playable()))
+            m.assertEqual(Instr(1, line, "/api/"), 0, line)
+            m.assertEqual(Instr(1, line, "<redacted>"), 0, line)
+            m.assertEqual(Instr(1, line, "timeline"), 0, line)
+        end sub
+
+        @it("reports a terminal decision and a failure")
+        sub _()
+            terminal = harness.outcomeFields({ ok: true, playable: false, facts: { outcome: "adaptation_unavailable", terminalReason: "audio_conversion_unsupported", terminalMessage: "Cannot play" } })
+            m.assertEqual(terminal, { ok: true, outcome: "adaptation_unavailable", terminal: "audio_conversion_unsupported Cannot play" })
+            failure = harness.outcomeFields({ ok: false, status: 422, message: "Start failed (422 validation_failed)" })
+            m.assertEqual(failure, { ok: false, status: 422, message: "Start failed (422 validation_failed)" })
+            m.assertEqual(harness.outcomeFields({ ok: true, outcome: "completed" }), { ok: true, outcome: "completed" })
+        end sub
+
+        @describe("videoError")
+
+        @it("keeps the node's error fields, with URLs reduced")
+        sub _()
+            report = harness.videoError(-3, "something went wrong", "buffer:loop:reader pick stream error:bad:mpr playlist file is too large. url=https://silo.example/api/v2/playback/transcode/s1/master.m3u8?st=SECRET-SIGNED", { category: "mpr", source: "buffer:loop", clip_id: 1, ignored: false })
+            m.assertEqual(report.error, -3)
+            m.assertEqual(report.errorMsg, "something went wrong")
+            m.assertTrue(Instr(1, report.errorStr, "mpr playlist file is too large") > 0, report.errorStr)
+            m.assertEqual(Instr(1, report.errorStr, "SECRET"), 0, report.errorStr)
+            m.assertEqual(report.errorInfo, { category: "mpr", source: "buffer:loop", clip_id: 1, ignored: false })
+        end sub
+
+        @it("masks credential-like errorInfo members and tolerates missing fields")
+        sub _()
+            report = harness.videoError(invalid, invalid, invalid, { category: "http", auth_token: "SECRET", dbgmsg: "GET https://silo.example/api/v2/stream/x?st=SECRET" })
+            m.assertEqual(report.error, 0)
+            m.assertEqual(report.errorMsg, "")
+            m.assertEqual(report.errorInfo.auth_token, "<redacted>")
+            m.assertEqual(Instr(1, FormatJson(report.errorInfo), "SECRET"), 0)
+            m.assertInvalid(harness.videoError(-1, "", "", invalid).errorInfo)
+        end sub
+
+        @it("shows the four fields and logs the code unmasked")
+        sub _()
+            report = harness.videoError(-5, "decoder", "detail", { category: "decoder" })
+            m.assertEqual(harness.videoErrorLines(report), ["errorCode: -5", "errorMsg: decoder", "errorStr: detail", "errorInfo: {""category"":""decoder""}"])
+            m.assertEqual(harness.videoErrorLines(harness.videoError(-5, "", "", invalid))[3], "errorInfo: none")
+            line = log.format("WARN", "harness.player", "Video error", report)
+            m.assertTrue(Instr(1, line, """error"":-5") > 0, line)
+        end sub
+
+        ' --- Helpers ---
+
+        function problem() as Object
+            return {
+                type: "https://siloserver.org/docs/api/v2/problems/validation_failed",
+                title: "Validation failed",
+                status: 422,
+                detail: "The request did not pass validation; see errors.",
+                instance: "urn:silo:request:000000000000000000000003",
+                errors: [
+                    { location: "body.client_playback_context.deliveries.hls.features[1]", code: "invalid", detail: "unknown delivery feature" },
+                    { location: "body.client_features", code: "required" },
+                    "not an object"
+                ]
+            }
+        end function
+
+        function toggles() as Object
+            toggles = harness.defaultToggles()
+            toggles.tsCopyRemux = true
+            return toggles
+        end function
+
+        ' A start result as adopt() returns it, for the opaque-ids fixture.
+        function playable() as Object
+            decision = tests.contract.fixture("playback_start_opaque_ids")
+            return {
+                ok: true,
+                playable: true,
+                facts: harness.planFacts(decision, "https://silo.example"),
+                timeline: decision.playback_plan.timeline,
+                subtitles: { format: "srt", native: true, local: false, localStatus: -1001, offsetApplied: true },
+                headersAttached: true,
+                toggles: m.toggles()
+            }
+        end function
+
+    end class
+
+end namespace

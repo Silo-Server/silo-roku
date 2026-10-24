@@ -1,0 +1,313 @@
+' A stand-in for ApiTask's glue (components/tasks/ApiTask.bs): the scheduler,
+' the account session, and the playback worker wired as ApiTask wires them,
+' with each transfer answered by the spec. send, start, execute, apply,
+' runWorker, tick, and settle follow ApiTask's submit, start, execute, apply,
+' runWorker, the loop's worker tick, and settle; keep them in step. The
+' worker's clock is loop.ms, and its device loop.device (set it for starts).
+namespace tests.sessions
+    ' Wall-clock seconds. Nine digits: brs-node reads longer integer literals as
+    ' Double, which the device does not.
+    const NOW = 900000000
+
+    function fixture(name as String) as Dynamic
+        return tests.devices.loadJson("pkg:/tests/fixtures/v2/" + name + ".json")
+    end function
+
+    function facts() as Object
+        return api.auth.headers.facts("0.1.0", "7", "dev", "device-1", "Roku Ultra")
+    end function
+
+    ' A server and no session.
+    function signedOut() as Object
+        record = storage.empty()
+        record.origin = "https://silo.example"
+        record.deviceId = "device-1"
+        return record
+    end function
+
+    ' Signed in on https://silo.example with a token that expires in an hour.
+    function signedIn() as Object
+        record = signedOut()
+        record.accountId = "1"
+        record.accessToken = "acc"
+        record.refreshToken = "ref"
+        record.expiresAt = NOW + 3600
+        record.refreshAt = NOW + 1800
+        return record
+    end function
+
+    ' The answer of a server that confirms its origin.
+    function systemInfo(origin = "https://silo.example" as String) as Object
+        info = fixture("get_system_info_ok")
+        info[api.auth.server.ORIGIN_MEMBER] = origin
+        return info
+    end function
+
+    ' A loop on record, as ApiTask starts: a stored server's origin is
+    ' checked first, and with confirm the check is answered for it and the
+    ' launch is cleared from the record of events. allowUnconfirmed is a
+    ' debug build's.
+    function create(record as Object, confirm = true as Boolean, allowUnconfirmed = false as Boolean) as Object
+        loop = newLoop(record, allowUnconfirmed)
+        apply(loop, api.auth.coordinator.start(loop.session))
+        check = runningId(loop, api.auth.server.INFO_PATH)
+        if not confirm or check = invalid then return loop
+        respond(loop, check, 200, systemInfo(api.request.originOf(record.origin)))
+        loop.events = []
+        return loop
+    end function
+
+    function newLoop(record as Object, allowUnconfirmed as Boolean) as Object
+        return {
+            session: api.auth.coordinator.create(record, facts(), allowUnconfirmed),
+            scheduler: api.scheduler.create(),
+            baseUrl: record.origin,
+            ' requestId to { request, url, headers } for each running transfer.
+            running: {},
+            ' What happened, in order: "start <path>", "persist", "publish",
+            ' "hold", "release", "server <origin>", "deliver <requestId>".
+            events: [],
+            ' requestId to the envelope the render thread received.
+            delivered: {},
+            ' The worker's log decisions, in order.
+            logs: [],
+            ' A decoded copy of the record at each persist.
+            persisted: [],
+            now: NOW,
+            ms: 0,
+            worker: playback.worker.create(),
+            device: invalid,
+            ' A playback.gates context; debug opens the development gates.
+            gates: { debug: true }
+        }
+    end function
+
+    ' ApiTask.workerEnv.
+    function workerEnv(loop as Object) as Object
+        appFacts = loop.session.facts
+        return { now: loop.ms, device: loop.device, identity: api.auth.coordinator.identity(loop.session), app: { version: appFacts.version, build: appFacts.build, channel: appFacts.channel }, gates: loop.gates, uuid: tests.sessions.uuid }
+    end function
+
+    function uuid() as String
+        return CreateObject("roDeviceInfo").GetRandomUUID()
+    end function
+
+    ' ApiTask.onField's cancel: { owner } or { requestId }.
+    sub cancel(loop as Object, rule as Object)
+        runWorker(loop, playback.worker.cancel(loop.worker, rule, workerEnv(loop)))
+        if util.isString(rule.owner)
+            execute(loop, api.scheduler.cancelOwner(loop.scheduler, rule.owner, loop.ms))
+        else if util.isString(rule.requestId)
+            execute(loop, api.scheduler.cancelRequest(loop.scheduler, rule.requestId, loop.ms))
+        end if
+    end sub
+
+    ' ApiTask.submit.
+    sub send(loop as Object, input as Object)
+        if util.isString(input.session)
+            if playback.worker.deferSession(loop.worker, input, workerEnv(loop))
+                loop.events.Push("defer " + input.session)
+                return
+            end if
+            apply(loop, api.auth.coordinator.operation(loop.session, input, loop.now))
+            return
+        end if
+        if util.isString(input.playback)
+            runWorker(loop, playback.worker.operation(loop.worker, input, workerEnv(loop)))
+            return
+        end if
+        request = api.request.normalize(input)
+        if request = invalid
+            deliver(loop, api.response.failure(input, "invalid_request"))
+            return
+        end if
+        apply(loop, api.auth.coordinator.submitted(loop.session, request, loop.now))
+        execute(loop, api.scheduler.submit(loop.scheduler, request, loop.ms))
+    end sub
+
+    ' The transfer of a running request completes. body is a JSON value or
+    ' invalid; code 0 or below is a network failure.
+    sub respond(loop as Object, requestId as String, code as Integer, body = invalid as Dynamic, headers = invalid as Dynamic)
+        entry = loop.running[requestId]
+        if entry = invalid then return
+        loop.running.Delete(requestId)
+        text = ""
+        if body <> invalid then text = FormatJson(body)
+        list = []
+        if headers <> invalid then list.Push(headers)
+        result = api.response.fromTransfer(entry.request, { code: code, body: text, headers: list })
+        apply(loop, api.auth.coordinator.answered(loop.session, entry.request, result, loop.now))
+    end sub
+
+    ' The ID of the first running request for path (or a URL ending in it).
+    function runningId(loop as Object, path as String) as Dynamic
+        for each id in loop.running
+            if pathOf(loop.running[id].request) = path then return id
+        end for
+        return invalid
+    end function
+
+    ' How many events equal event.
+    function count(loop as Object, event as String) as Integer
+        total = 0
+        for each item in loop.events
+            if item = event then total = total + 1
+        end for
+        return total
+    end function
+
+    ' The position of the nth (from 1) event equal to event, or -1.
+    function position(loop as Object, event as String, nth = 1 as Integer) as Integer
+        seen = 0
+        for i = 0 to loop.events.Count() - 1
+            if loop.events[i] = event
+                seen = seen + 1
+                if seen = nth then return i
+            end if
+        end for
+        return -1
+    end function
+
+    ' ApiTask.start.
+    sub start(loop as Object, request as Object)
+        if not api.scheduler.isLive(loop.scheduler, request.requestId, loop.ms)
+            execute(loop, api.scheduler.tick(loop.scheduler, loop.ms))
+            return
+        end if
+        url = api.request.url(loop.baseUrl, request)
+        if url = invalid
+            if loop.baseUrl = "" and not util.isString(request.url)
+                fail(loop, request, "no_server")
+            else
+                fail(loop, request, "invalid_request")
+            end if
+            return
+        end if
+        credentials = api.auth.coordinator.credentials(loop.session, request, url)
+        if credentials.error <> invalid
+            fail(loop, request, credentials.error)
+            return
+        end if
+        loop.running[request.requestId] = { request: request, url: url, headers: api.request.headers(request, credentials.headers) }
+        loop.events.Push("start " + pathOf(request))
+    end sub
+
+    sub fail(loop as Object, request as Object, kind as String)
+        execute(loop, api.scheduler.finish(loop.scheduler, request.requestId, loop.ms), api.response.failure(request, kind))
+    end sub
+
+    ' ApiTask.execute.
+    sub execute(loop as Object, decisions as Object, result = invalid as Dynamic)
+        for each decision in decisions
+            kind = decision.kind
+            if kind = "start"
+                start(loop, decision.request)
+            else if kind = "deliver"
+                settle(loop, decision.request, result)
+            else if kind = "reject"
+                loop.events.Push("reject " + decision.requestId)
+            else
+                if decision.running then loop.running.Delete(decision.requestId)
+                if kind = "timeout"
+                    settle(loop, decision.request, api.response.failure(decision.request, "timeout"))
+                else
+                    settle(loop, decision.request, api.response.failure(decision.request, "cancelled", decision.reason))
+                end if
+            end if
+        end for
+    end sub
+
+    ' ApiTask.apply.
+    sub apply(loop as Object, decisions as Object)
+        for each decision in decisions
+            kind = decision.kind
+            if kind = "submit"
+                execute(loop, api.scheduler.submit(loop.scheduler, decision.request, loop.ms))
+            else if kind = "finish"
+                execute(loop, api.scheduler.finish(loop.scheduler, decision.result.requestId, loop.ms), decision.result)
+            else if kind = "reply"
+                deliver(loop, decision.result)
+            else if kind = "requeue"
+                execute(loop, api.scheduler.requeue(loop.scheduler, decision.requestId, loop.ms))
+            else if kind = "hold"
+                if decision.held
+                    loop.events.Push("hold")
+                else
+                    loop.events.Push("release")
+                end if
+                execute(loop, api.scheduler.holdCredentials(loop.scheduler, decision.held, loop.ms))
+            else if kind = "holdOrigin"
+                if decision.held
+                    loop.events.Push("hold origin")
+                else
+                    loop.events.Push("release origin")
+                end if
+                execute(loop, api.scheduler.holdConfidential(loop.scheduler, decision.held, loop.ms))
+            else if kind = "warn"
+                loop.events.Push("warn " + decision.message)
+            else if kind = "promote"
+                execute(loop, api.scheduler.promote(loop.scheduler, decision.requestId, loop.ms))
+            else if kind = "persist"
+                loop.events.Push("persist")
+                loop.persisted.Push(storage.decode(storage.encode(api.auth.coordinator.record(loop.session))))
+            else if kind = "publish"
+                loop.events.Push("publish")
+            else if kind = "server"
+                loop.baseUrl = decision.origin
+                loop.events.Push("server " + decision.origin)
+                execute(loop, api.scheduler.cancelAll(loop.scheduler, loop.ms))
+            end if
+        end for
+    end sub
+
+    ' ApiTask.settle.
+    sub settle(loop as Object, request as Object, result as Object)
+        if api.auth.coordinator.owns(loop.session, request.requestId)
+            apply(loop, api.auth.coordinator.settled(loop.session, request, result, loop.now))
+        else if playback.worker.owns(loop.worker, request.requestId)
+            runWorker(loop, playback.worker.settled(loop.worker, request, result, workerEnv(loop)))
+        else
+            deliver(loop, catalog.map.apply(request, result, tests.catalogData.words()))
+        end if
+    end sub
+
+    ' ApiTask.runWorker.
+    sub runWorker(loop as Object, decisions as Object)
+        for each decision in decisions
+            kind = decision.kind
+            if kind = "submit"
+                apply(loop, api.auth.coordinator.submitted(loop.session, decision.request, loop.now))
+                execute(loop, api.scheduler.submit(loop.scheduler, decision.request, loop.ms))
+            else if kind = "reply"
+                deliver(loop, decision.result)
+            else if kind = "session"
+                loop.events.Push("session " + decision.input.session)
+                apply(loop, api.auth.coordinator.operation(loop.session, decision.input, loop.now))
+            else if kind = "log"
+                loop.events.Push("log " + decision.message)
+                loop.logs.Push(decision)
+            end if
+        end for
+    end sub
+
+    ' The worker's part of ApiTask's loop, after ms more milliseconds.
+    sub tick(loop as Object, ms = 0 as Integer)
+        loop.ms = loop.ms + ms
+        execute(loop, api.scheduler.tick(loop.scheduler, loop.ms))
+        runWorker(loop, playback.worker.tick(loop.worker, workerEnv(loop)))
+    end sub
+
+    sub deliver(loop as Object, result as Object)
+        loop.delivered[result.requestId] = result
+        loop.events.Push("deliver " + result.requestId)
+    end sub
+
+    function pathOf(request as Object) as String
+        if util.isString(request.path) then return request.path
+        url = request.url
+        sep = Instr(1, url, "://")
+        slash = Instr(sep + 3, url, "/")
+        if slash = 0 then return "/"
+        return Mid(url, slash)
+    end function
+end namespace

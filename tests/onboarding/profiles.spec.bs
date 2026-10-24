@@ -1,0 +1,192 @@
+namespace tests
+
+    @suite("onboarding profiles")
+    class OnboardingProfilesTests extends rooibos.BaseTestSuite
+
+        function profile(id as String, hasPin = false as Boolean, isChild = false as Boolean) as Object
+            return { id: id, name: "Profile " + id, hasPin: hasPin, isChild: isChild, isPrimary: false, avatarUrl: "" }
+        end function
+
+        @describe("onLoad")
+
+        @it("reopens the profile last chosen on this device (list_profiles_ok.json)")
+        sub _()
+            list = api.auth.profiles.list(tests.sessions.fixture("list_profiles_ok"))
+            list.Push(m.profile("p-kid", false, true))
+            choice = onboarding.profiles.onLoad(list, "p-owner", false)
+            m.assertEqual(choice.action, onboarding.profiles.OPEN)
+            m.assertEqual(choice.profile.id, "p-owner")
+        end sub
+
+        @it("reopens a remembered PIN-locked profile, and the session asks for its PIN if needed")
+        sub _()
+            choice = onboarding.profiles.onLoad([m.profile("a"), m.profile("b", true)], "b", false)
+            m.assertEqual(choice.action, onboarding.profiles.OPEN)
+            m.assertEqual(choice.profile.id, "b")
+        end sub
+
+        @it("skips the picker for an account with one profile and no PIN")
+        sub _()
+            choice = onboarding.profiles.onLoad([m.profile("only")], "", false)
+            m.assertEqual(choice.action, onboarding.profiles.OPEN)
+            m.assertEqual(choice.profile.id, "only")
+            m.assertEqual(onboarding.profiles.onLoad([m.profile("only", true)], "", false).action, onboarding.profiles.PICK)
+        end sub
+
+        @it("never chooses among several profiles, a child profile included, on its own")
+        sub _()
+            list = [m.profile("kid", false, true), m.profile("adult")]
+            m.assertEqual(onboarding.profiles.onLoad(list, "", false).action, onboarding.profiles.PICK)
+            ' The remembered profile is gone.
+            m.assertEqual(onboarding.profiles.onLoad(list, "deleted", false).action, onboarding.profiles.PICK)
+            m.assertEqual(onboarding.profiles.onLoad([], "", false).action, onboarding.profiles.PICK)
+        end sub
+
+        @it("opens nothing on its own when the viewer asked to switch profiles")
+        sub _()
+            m.assertEqual(onboarding.profiles.onLoad([m.profile("a"), m.profile("b")], "a", true).action, onboarding.profiles.PICK)
+            m.assertEqual(onboarding.profiles.onLoad([m.profile("only")], "", true).action, onboarding.profiles.PICK)
+        end sub
+
+        @describe("gridLayout")
+
+        @it("centres up to six 284 px columns, tvOS's 240 px tiles 44 px apart")
+        sub _()
+            m.assertEqual(onboarding.profiles.gridLayout(1), { columns: 1, rows: 1, width: 284, x: 818 })
+            m.assertEqual(onboarding.profiles.gridLayout(3), { columns: 3, rows: 1, width: 852, x: 534 })
+            m.assertEqual(onboarding.profiles.gridLayout(6), { columns: 6, rows: 1, width: 1704, x: 108 })
+            m.assertEqual(onboarding.profiles.gridLayout(7), { columns: 6, rows: 2, width: 1704, x: 108 })
+            m.assertEqual(onboarding.profiles.gridLayout(13).rows, 3)
+            m.assertEqual(onboarding.profiles.gridLayout(0), { columns: 1, rows: 1, width: 284, x: 818 })
+        end sub
+
+        @it("leaves room in a column for the focused avatar's ring and badges")
+        sub _()
+            ' The 244 px ring scaled 1.12, centred in the column.
+            m.assertTrue(244 * theme.firstRun.AVATAR_SCALE <= onboarding.profiles.COLUMN)
+            ' The ring's scaled overhang above the avatar.
+            m.assertTrue((244 * theme.firstRun.AVATAR_SCALE - theme.firstRun.AVATAR) / 2 <= onboarding.profiles.AVATAR_TOP)
+            ' The focused name's foot inside the tile.
+            nameTop = onboarding.profiles.AVATAR_TOP + theme.firstRun.AVATAR + onboarding.profiles.NAME_GAP + onboarding.profiles.NAME_FOCUS_DROP
+            m.assertTrue(nameTop + 36 <= onboarding.profiles.TILE_HEIGHT)
+            m.assertEqual(onboarding.profiles.ROW_PITCH - onboarding.profiles.ROW_HEIGHT, 60, "rows 60 px apart")
+        end sub
+
+        @it("keeps six columns inside the side insets")
+        sub _()
+            grid = onboarding.profiles.gridLayout(6)
+            m.assertTrue(grid.x >= theme.size.SIDE_INSET)
+        end sub
+
+        @describe("focusIndex")
+
+        @it("starts on the profile last opened on this device, else the first")
+        sub _()
+            list = [{ id: "a" }, { id: "b" }, { id: "c" }]
+            m.assertEqual(onboarding.profiles.focusIndex(list, "b"), 1)
+            m.assertEqual(onboarding.profiles.focusIndex(list, "gone"), 0)
+            m.assertEqual(onboarding.profiles.focusIndex(list, ""), 0)
+        end sub
+
+        @describe("initials")
+
+        @it("takes the name's first letter, uppercased, as tvOS does")
+        sub _()
+            m.assertEqual(onboarding.profiles.initials("laura"), "L")
+            m.assertEqual(onboarding.profiles.initials("Mary Jane Watson"), "M")
+            m.assertEqual(onboarding.profiles.initials("  ana   maría "), "A")
+            m.assertEqual(onboarding.profiles.initials("Ζωή"), "Ζ")
+        end sub
+
+        @it("shows ? for an empty name")
+        sub _()
+            m.assertEqual(onboarding.profiles.initials(""), "?")
+            m.assertEqual(onboarding.profiles.initials("   "), "?")
+        end sub
+
+        @describe("tintIndex")
+
+        @it("matches the apps' DJB2 colour per profile ID")
+        sub _()
+            ' DJB2 over UTF-8 bytes, modulo 8, computed in full by hand.
+            m.assertEqual(onboarding.profiles.tintIndex(""), 5381 mod 8)
+            m.assertEqual(onboarding.profiles.tintIndex("a"), (5381 * 33 + 97) mod 8)
+            m.assertEqual(onboarding.profiles.tintIndex("p-owner"), m.djb2Mod8("p-owner"))
+            ' Worked out independently: DJB2("p-owner") mod 8.
+            m.assertEqual(onboarding.profiles.tintIndex("p-owner"), 5)
+            m.assertEqual(onboarding.profiles.tintIndex("é"), m.djb2Mod8("é"))
+        end sub
+
+        @it("gives a distinct colour for every index")
+        sub _()
+            seen = {}
+            for i = 0 to theme.firstRunArt.AVATAR_TINTS - 1
+                tint = theme.firstRunArt.avatarTint(i)
+                m.assertEqual(Len(tint), 10, tint)
+                m.assertFalse(seen.DoesExist(tint), tint)
+                seen[tint] = true
+            end for
+            ' Coral, as the apps draw rgb(0.85, 0.46, 0.38).
+            m.assertEqual(theme.firstRunArt.avatarTint(0), "0xD97561FF")
+        end sub
+
+        @describe("avatarUri")
+
+        @it("resolves a server path against the server's origin, as the apps do (list_profiles_ok.json)")
+        sub _()
+            list = api.auth.profiles.list(tests.sessions.fixture("list_profiles_ok"))
+            m.assertEqual(onboarding.profiles.avatarUri(list[0].avatarUrl, "https://silo.example"), "https://silo.example/avatars/presets/fox.png")
+            m.assertEqual(onboarding.profiles.avatarUri("/media/avatars/a.png", "https://silo.example/media"), "https://silo.example/media/avatars/a.png")
+            signed = "/api/v2/artwork/profile-avatars/1/p1/w256.webp?exp=1&sig=abc"
+            m.assertEqual(onboarding.profiles.avatarUri(signed, "http://silo.local:8096"), "http://silo.local:8096" + signed)
+        end sub
+
+        @it("uses an absolute image URL as it is")
+        sub _()
+            url = "https://bucket.example/avatars/p1.webp?X-Amz-Signature=abc"
+            m.assertEqual(onboarding.profiles.avatarUri(url, "https://silo.example"), url)
+        end sub
+
+        @it("never requests SVG, which Roku cannot draw")
+        sub _()
+            m.assertEqual(onboarding.profiles.avatarUri("/profile-avatars/avatar-3.svg", "https://silo.example"), "")
+            m.assertEqual(onboarding.profiles.avatarUri("https://api.dicebear.com/9.x/thumbs/svg?seed=p1&size=128", "https://silo.example"), "")
+            m.assertEqual(onboarding.profiles.avatarUri("/a.SVG#x", "https://silo.example"), "")
+        end sub
+
+        @it("shows initials for no URL, a scheme-relative one, or another scheme")
+        sub _()
+            for each url in ["", "  ", "//cdn.example/a.png", "file:///a.png", "avatar.png"]
+                m.assertEqual(onboarding.profiles.avatarUri(url, "https://silo.example"), "", url)
+            end for
+            m.assertEqual(onboarding.profiles.avatarUri("/a.png", ""), "")
+        end sub
+
+        @describe("loadErrorKey")
+
+        @it("explains an account that must change its password")
+        sub _()
+            result = { ok: false, status: 403, error: { kind: "http", problemType: "password_change_required" } }
+            m.assertEqual(onboarding.profiles.loadErrorKey(result), "profiles.error.passwordChange")
+            result.error.problemType = invalid
+            m.assertEqual(onboarding.profiles.loadErrorKey(result), "profiles.error.load")
+            m.assertEqual(onboarding.profiles.loadErrorKey({ ok: false, status: 0, error: invalid }), "profiles.error.load")
+            strings = i18n.load("en_US")
+            for each key in ["profiles.error.passwordChange", "profiles.error.load", "profiles.headline", "profiles.signedInAs", "profiles.pinProtected", "profiles.kidsProfile", "profiles.empty", "profiles.error.select"]
+                m.assertTrue(strings.DoesExist(key), key)
+            end for
+        end sub
+
+        ' The full DJB2 hash in a LongInteger, which holds it for short IDs,
+        ' then modulo 8.
+        function djb2Mod8(id as String) as Integer
+            bytes = CreateObject("roByteArray")
+            bytes.FromAsciiString(id)
+            h& = 5381&
+            for i = 0 to bytes.Count() - 1
+                h& = h& * 33 + bytes[i]
+            end for
+            return h& mod 8
+        end function
+    end class
+end namespace

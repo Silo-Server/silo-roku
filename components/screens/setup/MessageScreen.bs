@@ -1,0 +1,165 @@
+import "pkg:/components/screens/firstRun.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/onboarding/address.bs"
+import "pkg:/source/onboarding/signin.bs"
+
+' tvOS's message screen: the headline 52 px under the server card, the body
+' 26 px under it, and the buttons 56 px under that; a check's error goes 20
+' px under the body, with the buttons 56 px under it.
+const LEAD_GAP = 52
+const BODY_GAP = 26
+const ROW_GAP = 56
+const CHECK_ERROR_GAP = 20
+
+sub init()
+    m.layout = m.top.findNode("layout")
+    m.server = m.top.findNode("server")
+    m.form = m.top.findNode("form")
+    m.errorLabel = styleFormLabel(m.top.findNode("error"), theme.textStyle.FIELD_ERROR, theme.color.ERROR)
+    m.buttonRow = m.top.findNode("buttons")
+    m.retry = styleButton(m.top.findNode("retry"), i18n.text("common.tryAgain"))
+    m.changeServer = styleButton(m.top.findNode("changeServer"), i18n.text("common.changeServer"), true)
+    m.request = invalid
+end sub
+
+sub onShow(event as Object)
+    if event.first then describe()
+    m.layout.callFunc("showMesh", true)
+    m.top.prompting = true
+    focusScreen()
+    ' The headline, body, and any error, then the highlighted button, each
+    ' time the screen shows (spec section 12.5).
+    setControlRows(m.controlRows, true, [m.layout.headline, m.layout.body, m.errorLabel.text])
+end sub
+
+sub onHide()
+    m.top.prompting = false
+    m.layout.callFunc("showMesh", false)
+end sub
+
+sub onRelease()
+    m.top.prompting = false
+    dropRequest()
+end sub
+
+sub describe()
+    origin = sessionOrigin()
+    route = m.top.entry.route
+    if route = nav.route.PASSWORD_UNAVAILABLE
+        m.layout.headline = i18n.text("passwordOff.headline")
+        m.layout.body = i18n.text("passwordOff.body", { server: onboarding.address.hostOf(origin) })
+        m.server.url = origin
+    else if route = nav.route.SERVER_NOT_READY
+        m.layout.headline = i18n.text("notReady.headline")
+        m.layout.body = i18n.text("notReady.body")
+        m.server.url = origin
+        m.server.setFields({ badge: i18n.text("notReady.badge"), warning: true })
+        m.retry.text = i18n.text("notReady.check")
+    else
+        problem = updateProblem()
+        copy = onboarding.address.updateCopy(problem)
+        m.layout.headline = i18n.text(copy.headline)
+        m.layout.body = i18n.text(copy.body, { server: onboarding.address.hostOf(origin) })
+        ' Over setup, the server is the host just checked, which is not stored.
+        params = m.top.entry.params
+        if firstRunIsPushed() and util.isString(params.host)
+            m.server.setFields({ name: params.host, address: "" })
+        else
+            m.server.url = origin
+        end if
+        m.server.setFields({ badge: i18n.text(onboarding.address.updateBadge(problem)), warning: true })
+    end if
+    ' Over setup, Change server just goes back to the typed address.
+    buttons = [m.retry, m.changeServer]
+    if firstRunIsPushed() then buttons = [m.changeServer]
+    m.retry.visible = buttons.Count() > 1
+    placeInRow(buttons, BUTTON_GAP)
+    arrangeForm()
+    setControlRows([buttons], false)
+end sub
+
+' The buttons ROW_GAP under the body, or under the error a check left.
+sub arrangeForm()
+    m.errorLabel.visible = m.errorLabel.text <> ""
+    parts = [[m.buttonRow, theme.firstRun.BUTTON_HEIGHT, 0]]
+    gap = ROW_GAP
+    if m.errorLabel.visible
+        parts = [[m.errorLabel, labelHeight(m.errorLabel), 0], [m.buttonRow, theme.firstRun.BUTTON_HEIGHT, ROW_GAP]]
+        gap = CHECK_ERROR_GAP
+    end if
+    arrangeColumn(m.layout, m.server, LEAD_GAP, m.form, gap, stackForm(parts), BODY_GAP)
+end sub
+
+' Check again (tvOS's): system/setup once more. A server now set up goes on
+' to sign-in; otherwise the error says why. A press while a check runs does
+' nothing.
+sub checkAgain()
+    if m.request <> invalid then return
+    send("onChecked")
+    api.session.setupStatus(m.request)
+    showCheck("")
+end sub
+
+sub onChecked(event as Object)
+    result = takeResult(event)
+    if result = invalid then return
+    state = onboarding.signin.setupState(result)
+    if state = onboarding.signin.READY
+        nav.replace(nav.route.SIGN_IN, {})
+    else if state = onboarding.signin.UNAVAILABLE
+        showCheck("notReady.unreachable")
+    else
+        showCheck("notReady.still")
+    end if
+end sub
+
+' The button reads "Checking…" while a check runs; a check's error (a
+' locale key, or "" for none) shows above the buttons and is said.
+sub showCheck(errorKey as String)
+    if m.request <> invalid
+        m.retry.text = i18n.text("notReady.checking")
+    else
+        m.retry.text = i18n.text("notReady.check")
+    end if
+    m.errorLabel.text = ""
+    if errorKey <> "" then m.errorLabel.text = i18n.text(errorKey)
+    placeInRow([m.retry, m.changeServer], BUTTON_GAP)
+    arrangeForm()
+    speak(m.errorLabel.text)
+end sub
+
+' Why the server needs an update: the setup check's problem over setup, or
+' the stored server's refused origin check.
+function updateProblem() as String
+    params = m.top.entry.params
+    if firstRunIsPushed() then return util.text(params.problem)
+    session = api.session.current()
+    if session = invalid or util.text(session.originStatus) <> "refused" then return ""
+    return util.text(session.originProblem)
+end function
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if moveHighlight(key) then return true
+    if key <> "OK" then return false
+    control = highlightedControl()
+    if control = invalid then return true
+    if firstRunIsPushed()
+        nav.pop()
+    else if control.isSameNode(m.changeServer)
+        dropRequest()
+        nav.push(nav.route.SETUP, { pushed: true })
+    else if m.top.entry.route = nav.route.PASSWORD_UNAVAILABLE
+        ' Sign-in asks auth/providers again.
+        nav.replace(nav.route.SIGN_IN, {})
+    else if m.top.entry.route = nav.route.SERVER_NOT_READY
+        checkAgain()
+    else
+        ' The app state decides again; the screen that found the old server
+        ' checks it again, and a stored server refused at launch is checked
+        ' again.
+        if updateProblem() <> "" then api.session.checkOrigin(api.newHandle(m.top.owner))
+        nav.serverUpdateRequired(false)
+    end if
+    return true
+end function

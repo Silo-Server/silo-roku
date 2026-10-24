@@ -1,0 +1,165 @@
+import "pkg:/source/dev/memoryCheck.bs"
+import "pkg:/source/memory/policy.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' Dev builds only: drives the memory policy (source/memory/policy.bs) on a
+' device. Every tick memcheck.tick (source/dev/memoryCheck.bs) decides
+' whether to add or free a block of STEP_PERCENT of the app's foreground
+' limit, on the render thread, where the policy samples usage. A block is
+' an roByteArray with every page written, or TEXTURES_PER_BLOCK 1920x1080
+' bitmaps decoded for small visible Posters. The console shows each tick
+' ("memcheck", with GetMemoryLimitPercent() and GetChannelAvailableMemory())
+' beside the policy's warnings and levels ("platform", "memory"), and which
+' kinds the API did not count.
+const STEP_PERCENT = 4
+const CHECK_OWNER = "dev.memoryCheck"
+const PAGE_BYTES = 4096
+' A 1920x1080 one-colour PNG (1-bit palette), 347 bytes: PNG_HEAD, then
+' PNG_ZEROS zero bytes, then PNG_TAIL. Each texture decodes a copy of it
+' under its own tmp:/ name, so none shares another's bitmap. Made with
+' Python's zlib.compress(level 9) of 1080 rows of 241 zero bytes.
+const PNG_HEAD = "89504E470D0A1A0A0000000D4948445200000780000004380103000000D21D530000000003504C54454040405145BE8F000001134944415478DAEDC1010D000000C2A0F74F6D0F0714"
+const PNG_ZEROS = 251
+const PNG_TAIL = "C0A701F8E50001FCE18FFE0000000049454E44AE426082"
+' What a decoded 1920x1080 bitmap takes at 4 bytes a pixel.
+const TEXTURE_KB = 8100
+const TEXTURE_DIR = "tmp:/memcheck"
+
+sub init()
+    m.blocks = []
+    m.textureCount = 0
+    m.policyLevel = memory.level.NORMAL
+    m.status = m.top.findNode("status")
+    m.textures = m.top.findNode("textures")
+    m.ticker = m.top.findNode("ticker")
+    m.ticker.observeField("fire", "onTick")
+end sub
+
+sub start()
+    m.monitor = CreateObject("roAppMemoryMonitor")
+    limitKb = 0
+    if m.monitor <> invalid
+        limits = m.monitor.GetChannelMemoryLimit()
+        if util.isObject(limits) and util.isNumber(limits.maxForegroundMemory) then limitKb = limits.maxForegroundMemory
+    end if
+    if limitKb <= 0
+        log.warn("memcheck", "no foreground memory limit: not running")
+        finish()
+        return
+    end if
+    m.stepKb = Int(limitKb * STEP_PERCENT / 100)
+    m.texturesPerBlock = (m.stepKb + TEXTURE_KB \ 2) \ TEXTURE_KB
+    if m.texturesPerBlock < 1 then m.texturesPerBlock = 1
+    usage = m.monitor.GetMemoryLimitPercent()
+    m.plan = memcheck.create(m.stepKb, usage)
+    platform.subscribe(CHECK_OWNER, [platform.topic.MEMORY_LEVEL], "onMemoryLevel")
+    m.policyLevel = platform.current().memory.level
+    log.info("memcheck", "start", { limitKb: limitKb, stepKb: m.stepKb, texturesPerBlock: m.texturesPerBlock, usage: usage, availableKb: m.monitor.GetChannelAvailableMemory() })
+    report(usage, m.monitor.GetChannelAvailableMemory())
+    m.ticker.control = "start"
+end sub
+
+sub finish()
+    m.ticker.control = "stop"
+    while m.blocks.Count() > 0
+        release(m.blocks.Pop())
+    end while
+    DeleteDirectory(TEXTURE_DIR)
+    platform.unsubscribe(CHECK_OWNER)
+    log.info("memcheck", "stopped", { level: m.policyLevel })
+    parent = m.top.getParent()
+    if parent <> invalid then parent.removeChild(m.top)
+end sub
+
+sub onMemoryLevel(event as Object)
+    m.policyLevel = event.level
+    report(m.monitor.GetMemoryLimitPercent(), m.monitor.GetChannelAvailableMemory())
+end sub
+
+sub onTick()
+    usage = m.monitor.GetMemoryLimitPercent()
+    availableKb = m.monitor.GetChannelAvailableMemory()
+    for each move in memcheck.tick(m.plan, usage, availableKb, m.policyLevel)
+        if move.action = "allocate"
+            m.blocks.Push(allocate(move.kind))
+        else if move.action = "free"
+            release(m.blocks.Pop())
+        else if move.action = "hold"
+            log.info("memcheck", "hold", { reason: move.reason, usage: usage, availableKb: availableKb })
+        else if move.action = "uncounted"
+            log.warn("memcheck", "GetMemoryLimitPercent did not count these blocks", { kind: move.kind, blocks: memcheck.PROBE_BLOCKS, heldKb: heldKb(), rise: move.rise, availableKb: availableKb })
+        else if move.action = "finish"
+            log.info("memcheck", "finish", { reason: move.reason, uncounted: m.plan.uncounted })
+            finish()
+            return
+        end if
+    end for
+    report(usage, availableKb)
+end sub
+
+' A block of kind: { kind, kb, data } for bytes, { kind, kb, posters, paths }
+' for textures. kb is what it holds by its own count.
+function allocate(kind as String) as Object
+    if kind = memcheck.BYTES then return allocateBytes()
+    return allocateTextures()
+end function
+
+function allocateBytes() as Object
+    size = m.stepKb * 1024
+    data = CreateObject("roByteArray")
+    data.SetResize(size, true)
+    ' Every page written, so none is left to be mapped lazily.
+    for offset = 0 to size - 1 step PAGE_BYTES
+        data[offset] = 90
+    end for
+    data[size - 1] = 90
+    return { kind: memcheck.BYTES, kb: data.Count() \ 1024, data: data }
+end function
+
+function allocateTextures() as Object
+    block = { kind: memcheck.TEXTURES, kb: m.texturesPerBlock * TEXTURE_KB, posters: [], paths: [] }
+    png = CreateObject("roByteArray")
+    png.FromHexString(PNG_HEAD + string(PNG_ZEROS, "00") + PNG_TAIL)
+    CreateDirectory(TEXTURE_DIR)
+    for i = 1 to m.texturesPerBlock
+        m.textureCount = m.textureCount + 1
+        path = TEXTURE_DIR + "/" + m.textureCount.ToStr() + ".png"
+        png.WriteFile(path)
+        ' Visible, so the texture cache keeps the bitmap; 16x9 px on screen.
+        poster = m.textures.createChild("Poster")
+        poster.width = 16
+        poster.height = 9
+        poster.translation = [(m.textureCount - 1) mod 40 * 18, (m.textureCount - 1) \ 40 * 11]
+        poster.uri = path
+        block.posters.Push(poster)
+        block.paths.Push(path)
+    end for
+    return block
+end function
+
+sub release(block as Dynamic)
+    if block = invalid or block.kind <> memcheck.TEXTURES then return
+    for each poster in block.posters
+        m.textures.removeChild(poster)
+    end for
+    for each path in block.paths
+        DeleteFile(path)
+    end for
+end sub
+
+function heldKb() as Integer
+    total = 0
+    for each block in m.blocks
+        total = total + block.kb
+    end for
+    return total
+end function
+
+sub report(usage as Dynamic, availableKb as Dynamic)
+    heldMb = heldKb() \ 1024
+    kind = memcheck.currentKind(m.plan)
+    log.info("memcheck", "tick", { phase: m.plan.phase, kind: kind, blocks: m.blocks.Count(), heldMb: heldMb, usage: usage, availableKb: availableKb, level: m.policyLevel })
+    m.status.text = "Memory check (Rewind ends it): " + m.plan.phase + " " + kind + ", holding " + heldMb.ToStr() + " MB, usage " + util.text(usage) + "%, available " + util.text(availableKb) + " KB, policy level " + m.policyLevel
+end sub

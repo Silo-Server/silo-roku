@@ -1,0 +1,217 @@
+import "pkg:/source/deeplink/route.bs"
+import "pkg:/source/nav/phase.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/nav/stack.bs"
+import "pkg:/source/onboarding/beacons.bs"
+import "pkg:/source/util/log.bs"
+
+' AppScene as the screen host (spec section 6.2, plan section 4.5). The state
+' machine (source/nav/phase.bs) picks the stack's root from the session, the
+' stack reducer (source/nav/stack.bs) decides which screens exist, and this
+' file creates, shows, hides, and destroys them and routes Back. Screens
+' extend components/screens/Screen.xml and navigate through
+' source/nav/client.bs.
+
+sub navInit()
+    m.navShell = nav.phase.create()
+    m.navStack = nav.stack.create()
+    ' Entry ID to screen node, for live entries.
+    m.navScreens = {}
+    m.navBuilt = 0
+    m.navLaunched = false
+    m.navBeacons = onboarding.beacons.create()
+    m.navLayer = m.top.findNode("screens")
+end sub
+
+' The screen component for a route.
+function navComponent(route as String) as String
+    if route = nav.route.SETUP then return "ServerScreen"
+    if route = nav.route.SIGN_IN then return "SignInScreen"
+    if route = nav.route.PROFILE then return "ProfileScreen"
+    if route = nav.route.PIN then return "PinScreen"
+    if route = nav.route.UPDATE_REQUIRED or route = nav.route.PASSWORD_UNAVAILABLE or route = nav.route.SERVER_NOT_READY then return "MessageScreen"
+    if route = nav.route.HOME then return "HomeScreen"
+    if route = nav.route.SEARCH then return "SearchScreen"
+    if route = nav.route.LIBRARY then return "LibraryScreen"
+    if route = nav.route.DETAIL then return "DetailScreen"
+    if route = nav.route.PLAYER then return "Player"
+    if route = nav.route.DIAGNOSTIC then return "DiagnosticScreen"
+    return "PlaceholderScreen"
+end function
+
+' Called by onApiSession for each session ApiTask publishes.
+sub navSessionChanged()
+    navShellChanged(nav.phase.onSession(m.navShell, m.apiSession))
+end sub
+
+sub navShellChanged(decision as Object)
+    m.navShell = decision.shell
+    if not decision.reset then return
+    log.info("nav", "phase", { phase: decision.shell.phase })
+    onboarding.beacons.enterPhase(m.navBeacons, decision.shell.phase <> nav.phase.MAIN)
+    navApply(nav.stack.reset(m.navStack, decision.root, deepLinkRootParams(decision.root)))
+    deepLinkPhaseChanged()
+end sub
+
+' The interface functions behind source/nav/client.bs.
+
+sub navPush(route as String, params as Object)
+    navSaveFocus()
+    navApply(nav.stack.push(m.navStack, route, params))
+end sub
+
+sub navPop()
+    navApply(nav.stack.pop(m.navStack))
+end sub
+
+sub navReplace(route as String, params as Object)
+    navApply(nav.stack.replace(m.navStack, route, params))
+end sub
+
+sub navPopToRoot()
+    navApply(nav.stack.popToRoot(m.navStack))
+end sub
+
+sub navSwitchTab(route as String, params as Object)
+    navApply(nav.stack.reset(m.navStack, route, params))
+end sub
+
+' A player entry's next episode, for the page it was opened from.
+sub navPlayed(entryId as String, played as Object)
+    m.navStack = nav.stack.notePlayed(m.navStack, entryId, played)
+end sub
+
+sub navServerUpdateRequired(required as Boolean)
+    navShellChanged(nav.phase.onUpdateRequired(m.navShell, required))
+end sub
+
+' A nav.pressure level, from the memory policy (AppScenePlatform.bs).
+sub navPressure(level as String)
+    navApply(nav.stack.setPressure(m.navStack, level))
+end sub
+
+' Back that the focused screen did not handle (spec section 5.3). Returning
+' false lets Roku close the app (criterion 4.6).
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press or key <> "back" then return false
+    top = nav.stack.topEntry(m.navStack)
+    if top = invalid then return false
+    screen = m.navScreens[top.id]
+    plan = nav.stack.back(m.navStack, screen.callFunc("backContext"))
+    if plan.action = nav.action.EXIT_APP then return false
+    if plan.action = nav.action.CLOSE_OVERLAY or plan.action = nav.action.FOCUS_BAR
+        screen.callFunc("onBack", plan.action)
+    else
+        navApply(plan)
+    end if
+    return true
+end function
+
+' Keeps the top screen's focus key in its entry before it is covered.
+sub navSaveFocus()
+    top = nav.stack.topEntry(m.navStack)
+    if top <> invalid then m.navStack = nav.stack.saveFocus(m.navStack, m.navScreens[top.id].callFunc("focusKey"))
+end sub
+
+' Carries out a plan from nav.stack in its documented order. Screens that
+' stop and start waiting for the viewer within it send no dialog beacons;
+' each screen's prompting is read afterwards, whenever its observer runs.
+sub navApply(plan as Object)
+    onboarding.beacons.begin(m.navBeacons)
+    navApplyPlan(plan)
+    for each id in m.navScreens
+        onboarding.beacons.prompt(m.navBeacons, id, m.navScreens[id].prompting)
+    end for
+    navSignal(onboarding.beacons.finish(m.navBeacons))
+    ' A Home that finished rendering while covered counts once it is back on top.
+    if plan.show <> invalid then navLaunchCheck()
+end sub
+
+sub navApplyPlan(plan as Object)
+    m.navStack = plan.stack
+    for each entry in plan.release
+        navDestroy(entry.id)
+    end for
+    for each entry in plan.hide
+        hidden = m.navScreens[entry.id]
+        hidden.visible = false
+        hidden.callFunc("onHide")
+    end for
+    for each entry in plan.detach
+        m.navScreens[entry.id].callFunc("onPressure", nav.pressure.DETACH)
+    end for
+    built = []
+    built.Append(plan.create)
+    built.Append(plan.rebuild)
+    for each entry in built
+        navCreate(entry)
+    end for
+    if plan.show = invalid then return
+    shown = m.navScreens[plan.show.id]
+    shown.visible = true
+    shown.callFunc("onShow", { restore: plan.restore, first: built.Count() > 0, refresh: plan.refresh, played: plan.played })
+    if not shown.isInFocusChain() then shown.setFocus(true)
+end sub
+
+sub navCreate(entry as Object)
+    m.navBuilt = m.navBuilt + 1
+    screen = CreateObject("roSGNode", navComponent(entry.route))
+    screen.id = entry.id
+    ' Unique per node, so a rebuilt entry's requests never meet its old ones.
+    screen.owner = "screen." + m.navBuilt.ToStr()
+    screen.entry = { id: entry.id, route: entry.route, params: entry.params, focusKey: entry.focusKey }
+    screen.visible = false
+    screen.observeField("ready", "onNavScreenReady")
+    screen.observeField("prompting", "onNavScreenPrompting")
+    m.navLayer.appendChild(screen)
+    m.navScreens[entry.id] = screen
+end sub
+
+sub navDestroy(id as String)
+    screen = m.navScreens[id]
+    if screen = invalid then return
+    m.navScreens.Delete(id)
+    screen.callFunc("onRelease")
+    navSignal(onboarding.beacons.prompt(m.navBeacons, id, false))
+    apiRelease(screen.owner)
+    platformUnsubscribe(screen.owner)
+    m.navLayer.removeChild(screen)
+end sub
+
+sub onNavScreenReady()
+    navLaunchCheck()
+end sub
+
+' AppLaunchComplete, once per launch (plan section 7): when Home has
+' rendered, or for a deep link, when the player has started and accepts keys.
+' Home waits while a deep link is under way, and is checked again when the
+' link ends without playing.
+sub navLaunchCheck()
+    if m.navLaunched then return
+    top = nav.stack.topEntry(m.navStack)
+    if top = invalid then return
+    screen = m.navScreens[top.id]
+    if screen = invalid or not screen.ready then return
+    homeRendered = top.route = nav.route.HOME and not deeplink.route.busy(m.deepLink)
+    if top.route <> nav.route.PLAYER and not homeRendered then return
+    m.navLaunched = true
+    navSignal(onboarding.beacons.launch(m.navBeacons))
+    m.top.signalBeacon("AppLaunchComplete")
+end sub
+
+' The launch's one AppDialogInitiate/AppDialogComplete pair, around the
+' screens that wait for the viewer before Home (plan section 7,
+' source/onboarding/beacons.bs).
+sub onNavScreenPrompting(event as Object)
+    screen = event.getRoSGNode()
+    live = m.navScreens[screen.id]
+    if live = invalid or not live.isSameNode(screen) then return
+    navSignal(onboarding.beacons.prompt(m.navBeacons, screen.id, screen.prompting))
+end sub
+
+sub navSignal(beacons as Object)
+    for each beacon in beacons
+        log.info("nav", "beacon", { name: beacon })
+        m.top.signalBeacon(beacon)
+    end for
+end sub

@@ -1,0 +1,393 @@
+import "pkg:/components/theme/detail.bs"
+
+namespace tests
+
+    ' DetailScreen headless through DetailScreenProbe: the test answers the
+    ' requests the page sends with bodies the map step turns into what the
+    ' page receives (catalog.map.apply). Focus moves, artwork, and the
+    ' player itself are device checks; the page after the player and its
+    ' track menus are in detailTracks.spec.bs, the shared helpers in
+    ' tests/helpers/detailScreen.bs.
+    @suite("detail screen")
+    class DetailScreenTests extends tests.DetailScreenSuite
+
+        @describe("the season and episode a page opens on (spec sections 5.6 and 8.3)")
+
+        @it("opens an episode card's season and plays that episode, not the play target's")
+        sub _()
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s2e3", seasonNumber: 2 })
+            m.assertEqual(m.path(probe, 0), "/api/v2/catalog/items/series:show")
+            m.answer(probe, 0, m.series())
+            ' Until the episodes arrive, Play plays the server's play target.
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.PLAY).contentId, "episode:s1e2")
+            m.answer(probe, 1, m.seasons([1, 2, 3]))
+            m.assertEqual(m.path(probe, 2), "/api/v2/catalog/series/series:show/seasons/2/episodes")
+            m.assertEqual(probe.findNode("seasons").selected, 1)
+            m.answer(probe, 2, m.episodes(2, 4))
+            state = probe.callFunc("inspect")
+            m.assertEqual(state.activeIndex, 2)
+            m.assertEqual(state.target.contentId, "episode:s2e3")
+            m.assertEqual(state.railIds[2], "episode:s2e3")
+            m.assertEqual(m.path(probe, 3), "/api/v2/watch/episode:s2e3")
+            intent = probe.callFunc("playIntent", catalog.action.PLAY)
+            m.assertEqual(intent.contentId, "episode:s2e3")
+            m.assertEqual(intent.startPositionRule, nav.player.RESUME)
+            m.assertEqual(probe.findNode("actions").buttons.items[0].label, "Play S2:E3")
+        end sub
+
+        @it("opens Specials for an episode card from season 0")
+        sub _()
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s0e1", seasonNumber: 0 })
+            m.assertTrue(m.throughSeasons(probe, [0, 1, 2], 0))
+            m.answer(probe, 2, m.episodes(0, 2))
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s0e1")
+        end sub
+
+        @it("opens the play target's season without a season asked for")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1, 2], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s1e2")
+        end sub
+
+        @it("reopens a rebuilt page on the season and episode the viewer left")
+        sub _()
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s2e3", seasonNumber: 2 }, { zone: "episodes", button: "", season: 3, episode: "episode:s3e1", played: "" })
+            m.assertTrue(m.throughSeasons(probe, [1, 2, 3], 3))
+            m.answer(probe, 2, m.episodes(3, 2))
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s3e1")
+        end sub
+
+        sub uncover(probe as Object)
+            probe.visible = true
+            probe.callFunc("onShow", { restore: invalid, first: false, refresh: false })
+        end sub
+
+        @describe("title art (spec section 8.5)")
+
+        @it("shows the logo unless the shell read the profile's ui.title_art as off, and reads nothing itself")
+        sub _()
+            if not m.global.hasField("titleArt") then m.global.addFields({ titleArt: { profile: "", show: true } })
+            saved = m.global.titleArt
+            m.global.titleArt = { profile: "p", show: false }
+            probe = m.opened({ itemId: "movie:m" })
+            m.assertFalse(probe.findNode("hero").showLogo)
+            m.assertEqual(probe.callFunc("sent").Count(), 1, "the item alone")
+            m.global.titleArt = { profile: "p", show: true }
+            m.assertTrue(m.opened({ itemId: "movie:m" }).findNode("hero").showLogo)
+            m.global.titleArt = saved
+        end sub
+
+        @describe("a page that fails to load (spec section 5.8)")
+
+        @it("shows tvOS's error state, with Retry")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.failed(probe, 0, 500))
+            status = probe.findNode("status")
+            m.assertTrue(status.visible)
+            m.assertEqual([status.kind, status.message, status.action], ["error", "Can't load this title. Check this TV's connection, then try again.", "Retry"])
+            m.assertTrue(status.findNode("icon").visible, "the warning triangle")
+        end sub
+
+        @describe("the episode rail (spec section 5.6)")
+
+        @it("lays 360x200 cards 400 px apart from x 116 at y 776, behind a mask left of x 100")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            rail = probe.findNode("rail")
+            m.assertEqual(rail.translation, [0, 776])
+            m.assertTrue(m.throughSeasons(probe, [1], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            cards = []
+            for each node in rail.findNode("strip").getChildren(-1, 0)
+                if node.subtype() = "CatalogCard" and node.visible then cards.Push(node)
+            end for
+            m.assertEqual(cards.Count(), 3)
+            m.assertEqual([cards[0].width, cards[0].height], [360.0, 200.0])
+            xs = []
+            for each card in cards
+                xs.Push(Int(card.translation[0]))
+            end for
+            xs.Sort()
+            m.assertEqual(xs, [116, 516, 916])
+            m.assertEqual(cards[0].itemContent.getParent().cardRoom, [0, 0])
+            mask = rail.findNode("mask")
+            m.assertEqual([mask.width, mask.translation[0]], [100.0, 0])
+        end sub
+
+        @it("captions each still with its tag and title over its date and runtime, the rail's room ending at y 1062")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1], 1))
+            body = m.episodes(1, 2)
+            body.items[0].air_date = "2026-02-18"
+            m.answer(probe, 2, body)
+            card = invalid
+            for each node in probe.findNode("rail").findNode("strip").getChildren(-1, 0)
+                if node.subtype() = "CatalogCard" and node.visible and node.itemContent.id = "episode:s1e1" then card = node
+            end for
+            m.assertNotInvalid(card)
+            m.assertEqual(card.itemContent.getParent().captionStyle, "episode")
+            lines = []
+            for each node in card.getChildren(-1, 0)
+                if node.subtype() = "Label" and node.visible then lines.Push([node.text, Int(node.translation[1])])
+            end for
+            m.assertEqual(lines, [["S01E01 · Episode 1", 218], ["Feb 18, 2026 · 50 min", 246]])
+            m.assertEqual(theme.detail.railBottom(), 1062)
+            ' The mask covers the rail's room and the focus scale's reach.
+            m.assertEqual(probe.findNode("rail").findNode("mask").height, 486.0)
+        end sub
+
+        @it("holds the focused card at the leading slot until the last card shows in full")
+        sub _()
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e1", seasonNumber: 1 })
+            m.assertTrue(m.throughSeasons(probe, [1], 1))
+            m.answer(probe, 2, m.episodes(1, 10))
+            rail = probe.findNode("rail")
+            strip = rail.findNode("strip")
+            m.assertEqual([rail.index, Int(strip.translation[0])], [0, 0])
+            rail.callFunc("jumpTo", 3, false)
+            m.assertEqual(Int(strip.translation[0]), -1200, "anchored")
+            ' Ten cards are 3960 px against 1820 px of rail: the row stops at
+            ' the sixth step, where the last card is whole.
+            rail.callFunc("jumpTo", 9, false)
+            m.assertEqual(Int(strip.translation[0]), -2400)
+            m.assertEqual(probe.callFunc("drawnIds")[0], "episode:s1e6", "the card behind the mask")
+        end sub
+
+        @it("runs one rail across adjacent seasons, the pill following focus over the edge")
+        sub _()
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e3", seasonNumber: 1 })
+            m.assertTrue(m.throughSeasons(probe, [2, 1, 0], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            seasons = probe.findNode("seasons")
+            m.assertEqual(seasons.labels.items, ["Season 1", "Season 2", "Specials"], "Specials last")
+            rail = probe.findNode("rail")
+            ' Focus at the end of what the rail holds reads the next season.
+            rail.focusedIndex = 2
+            at = m.sentIndex(probe, "neighbour", "/api/v2/catalog/series/series:show/seasons/2/episodes")
+            m.assertTrue(at >= 0, "season 2 read ahead")
+            m.answer(probe, at, m.episodes(2, 2))
+            state = probe.callFunc("inspect")
+            m.assertEqual(state.rowIds, ["episode:s1e1", "episode:s1e2", "episode:s1e3", "episode:s2e1", "episode:s2e2"])
+            m.assertEqual([state.activeIndex, rail.index], [2, 2], "focus stays")
+            rail.focusedIndex = 3
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s2e1")
+            m.assertEqual(seasons.selected, 1, "the pill follows")
+            ' A pill for a season the rail holds moves the rail without a read.
+            sent = probe.callFunc("sent").Count()
+            seasons.chosen = 0
+            m.assertEqual([rail.index, probe.callFunc("inspect").target.contentId], [0, "episode:s1e1"])
+            m.assertEqual(m.sentIndex(probe, "episodes", "/api/v2/catalog/series/series:show/seasons/1/episodes"), 2, "no second read")
+            m.assertTrue(probe.callFunc("sent").Count() >= sent)
+        end sub
+
+        @it("keeps the rail while a pill's season is read, a neighbour arriving meanwhile")
+        sub _()
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e3", seasonNumber: 1 })
+            m.assertTrue(m.throughSeasons(probe, [1, 2, 3], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            probe.findNode("rail").focusedIndex = 2
+            neighbour = m.sentIndex(probe, "neighbour", m.episodesPath(2))
+            probe.findNode("seasons").chosen = 2
+            chosen = m.sentIndex(probe, "episodes", m.episodesPath(3))
+            m.assertTrue(neighbour >= 0 and chosen >= 0)
+            m.answer(probe, neighbour, m.episodes(2, 2))
+            m.assertEqual(probe.callFunc("inspect").railIds, ["episode:s1e1", "episode:s1e2", "episode:s1e3"], "still season 1")
+            m.answer(probe, chosen, m.episodes(3, 2))
+            state = probe.callFunc("inspect")
+            m.assertEqual(state.rowIds, ["episode:s1e1", "episode:s1e2", "episode:s1e3", "episode:s2e1", "episode:s2e2", "episode:s3e1", "episode:s3e2"])
+            m.assertEqual(state.target.contentId, "episode:s3e1")
+        end sub
+
+        @it("draws fresh progress on the cards shown after the player closes")
+        sub _()
+            probe = m.playedFrom("episode:s1e2", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e2", seasonNumber: 1, finished: false })
+            body = m.episodes(1, 4)
+            body.items[1].user_data = { position_seconds: 1500, duration_seconds: 3000, played: false }
+            m.assertTrue(m.answer(probe, m.sentIndex(probe, "refresh", m.episodesPath(1)), body))
+            for each node in probe.findNode("rail").findNode("strip").getChildren(-1, 0)
+                if node.subtype() = "CatalogCard" and node.visible and node.itemContent <> invalid and node.itemContent.id = "episode:s1e2"
+                    m.assertTrue(node.findNode("bar").visible, "the bar")
+                    m.assertTrue(node.findNode("bar").width > 0)
+                end if
+            end for
+        end sub
+
+        @it("keeps the episodes of three seasons at most")
+        sub _()
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e1", seasonNumber: 1 })
+            m.assertTrue(m.throughSeasons(probe, [1, 2, 3, 4], 1))
+            m.answer(probe, 2, m.episodes(1, 2))
+            rail = probe.findNode("rail")
+            for season = 2 to 4
+                rail.focusedIndex = probe.callFunc("inspect").rowIds.Count() - 1
+                at = m.sentIndex(probe, "neighbour", m.episodesPath(season))
+                m.assertTrue(at >= 0, "season " + season.ToStr())
+                m.answer(probe, at, m.episodes(season, 2))
+            end for
+            ids = probe.callFunc("inspect").rowIds
+            m.assertEqual(ids[0], "episode:s2e1", "season 1 let go")
+            m.assertEqual(ids.Count(), 6)
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s3e2")
+        end sub
+
+        @it("describes the episode a card opened the page on, and an episode focused, by its facts")
+        sub _()
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e2", seasonNumber: 1 })
+            item = m.series()
+            item.content_rating = "TV-MA"
+            item.cast = [{ name: "Adam Scott" }]
+            m.answer(probe, 0, item)
+            m.assertEqual(probe.callFunc("inspect").hero.credit, "Starring Adam Scott")
+            m.answer(probe, 1, m.seasons([1]))
+            m.answer(probe, 2, m.episodes(1, 3))
+            hero = probe.callFunc("inspect").hero
+            m.assertEqual(hero.metadata, { rating: "TV-MA", items: [], tail: "Season 1 · Episode 2" })
+            m.assertEqual(hero.synopsis, "Episode 2")
+            m.assertEqual(hero.credit, "Starring Adam Scott", "the series' credit stays")
+            at = m.sentIndex(probe, "episodeItem", "/api/v2/catalog/items/episode:s1e2")
+            m.assertTrue(at >= 0, "its facts read")
+            m.answer(probe, at, { content_id: "episode:s1e2", type: "episode", air_date: "2022-02-25", runtime: 57, ratings: [{ source: "imdb", name: "IMDb", score: 81, display: "8.1" }] })
+            m.assertEqual(probe.callFunc("inspect").hero.metadata, { rating: "TV-MA", items: ["Feb 25, 2022", "57 min", "IMDb 8.1"], tail: "Season 1 · Episode 2" })
+        end sub
+
+        @describe("a page under the player (plan sections 4.5 and 4.7)")
+
+        @it("keeps a late first answer off a detached rail and shows it on return")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1, 2], 1))
+            ' Play plays the provisional play target while the episodes load.
+            m.cover(probe)
+            m.answer(probe, 2, m.episodes(1, 3))
+            m.assertEqual(probe.callFunc("inspect").railIds, [], "no cards while the player plays")
+            state = probe.callFunc("inspect")
+            m.assertEqual(state.rowIds, ["episode:s1e1", "episode:s1e2", "episode:s1e3"])
+            m.assertEqual(state.target.contentId, "episode:s1e2")
+            m.uncover(probe)
+            state = probe.callFunc("inspect")
+            m.assertEqual(state.railIds, state.rowIds)
+            m.assertEqual(state.railIds[state.activeIndex], "episode:s1e2")
+            m.assertEqual(probe.findNode("rail").index, 1)
+        end sub
+
+        @it("shows the season chosen before playback, not the cards it let go")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1, 2], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            rail = probe.findNode("rail")
+            m.cover(probe)
+            m.uncover(probe)
+            m.assertEqual(probe.callFunc("inspect").railIds, ["episode:s1e1", "episode:s1e2", "episode:s1e3"])
+            ' A season switch whose episodes answer while the player plays.
+            probe.findNode("seasons").chosen = 1
+            m.assertEqual(m.path(probe, 4), "/api/v2/catalog/series/series:show/seasons/2/episodes")
+            m.cover(probe)
+            m.answer(probe, 4, m.episodes(2, 2))
+            m.assertEqual(probe.callFunc("inspect").railIds, [])
+            m.uncover(probe)
+            state = probe.callFunc("inspect")
+            m.assertEqual(state.rowIds, ["episode:s1e1", "episode:s1e2", "episode:s1e3", "episode:s2e1", "episode:s2e2"], "the two seasons on one rail")
+            m.assertEqual(state.railIds, state.rowIds)
+            m.assertEqual(state.target.contentId, "episode:s2e1")
+            m.assertEqual(rail.index, 3)
+            ' OK on a card the rail shows plays that card.
+            rail.selectedIndex = 4
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s2e2")
+            m.assertEqual(probe.callFunc("playIntent", catalog.action.PLAY).contentId, "episode:s2e2")
+        end sub
+
+        @it("puts artwork that arrived while hidden on the hero once shown")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.cover(probe)
+            m.answer(probe, 0, m.series())
+            backdrop = probe.findNode("backdrop")
+            m.assertEqual(backdrop.uri, "", "no texture while hidden")
+            m.uncover(probe)
+            m.assertEqual(backdrop.uri, "https://img.example/b.jpg")
+            m.assertEqual(probe.findNode("hero").backdropUri, "https://img.example/b.jpg")
+            ' Hidden again, its Posters give the artwork back and take it again on show.
+            m.cover(probe)
+            m.assertEqual(backdrop.uri, "")
+            m.uncover(probe)
+            m.assertEqual(backdrop.uri, "https://img.example/b.jpg")
+        end sub
+
+        @describe("after an Up Next chain (spec sections 5.6 and 5.7)")
+
+        @it("selects the chain's last episode, stopped partway, for Resume")
+        sub _()
+            probe = m.playedFrom("episode:s1e1", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e3", seasonNumber: 1 })
+            state = probe.callFunc("inspect")
+            m.assertEqual([state.activeIndex, state.target.contentId], [2, "episode:s1e3"])
+            m.assertEqual(m.sentIndex(probe, "played", "/api/v2/watch/episode:s1e1"), -1, "the first episode is not the one decided on")
+            m.answerPlayed(probe, "episode:s1e3", 120, false)
+            m.assertEqual(probe.callFunc("inspect").activeIndex, 2)
+            m.answer(probe, m.sentIndex(probe, "watch", "/api/v2/watch/episode:s1e3"), m.watched("episode:s1e3", 120, false))
+            intent = probe.callFunc("playIntent", catalog.action.PLAY)
+            m.assertEqual([intent.contentId, intent.startPositionRule], ["episode:s1e3", nav.player.RESUME])
+            m.assertEqual(probe.findNode("actions").buttons.items[0].label, "Resume S1:E3")
+            ' The second read keeps it.
+            probe.callFunc("refreshAgain")
+            m.answerPlayed(probe, "episode:s1e3", 125, false)
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s1e3")
+        end sub
+
+        @it("moves on from the chain's last episode once the viewer finished it, unless the viewer moved first")
+        sub _()
+            probe = m.playedFrom("episode:s1e1", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e3", seasonNumber: 1, finished: true })
+            m.answerPlayed(probe, "episode:s1e3", 0, true)
+            state = probe.callFunc("inspect")
+            m.assertEqual([state.activeIndex, state.target.contentId], [3, "episode:s1e4"])
+            probe.callFunc("refreshAgain")
+            m.answerPlayed(probe, "episode:s1e3", 0, true)
+            m.assertEqual(probe.callFunc("inspect").activeIndex, 3, "once")
+
+            probe = m.playedFrom("episode:s1e1", [1, 2])
+            m.returned(probe, { contentId: "episode:s1e3", seasonNumber: 1, finished: true })
+            probe.callFunc("focusEpisode", 0)
+            m.answerPlayed(probe, "episode:s1e3", 0, true)
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s1e1", "the viewer's own choice stands")
+        end sub
+
+        @it("opens the season a chain crossed into, on its last episode")
+        sub _()
+            probe = m.playedFrom("episode:s1e4", [1, 2])
+            m.returned(probe, { contentId: "episode:s2e1", seasonNumber: 2 })
+            at = m.sentIndex(probe, "episodes", "/api/v2/catalog/series/series:show/seasons/2/episodes")
+            m.assertTrue(at >= 0, "season 2's episodes")
+            m.assertEqual(probe.findNode("seasons").selected, 1)
+            m.assertEqual(m.sentIndex(probe, "played", "/api/v2/watch/episode:s2e1"), -1, "the refresh waits for the episodes")
+            m.answer(probe, at, m.episodes(2, 3))
+            state = probe.callFunc("inspect")
+            m.assertEqual([state.activeIndex, state.target.contentId], [4, "episode:s2e1"])
+            m.assertEqual(state.rowIds, ["episode:s1e1", "episode:s1e2", "episode:s1e3", "episode:s1e4", "episode:s2e1", "episode:s2e2", "episode:s2e3"])
+            m.answerPlayed(probe, "episode:s2e1", 600, false)
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s2e1")
+            m.assertEqual(probe.callFunc("focusKey").played, "episode:s2e1")
+        end sub
+
+        @it("rebuilds a page released during the chain on the chain's last episode")
+        sub _()
+            theme.install()
+            probe = CreateObject("roSGNode", "DetailScreenProbe")
+            probe.entry = { id: "e1", route: nav.route.DETAIL, params: { itemId: "series:show", episodeId: "episode:s1e1", seasonNumber: 1 } }
+            probe.visible = true
+            restore = { zone: "episodes", button: "", season: 1, episode: "episode:s1e1", played: "episode:s1e1" }
+            probe.callFunc("onShow", { restore: restore, first: true, refresh: true, played: { contentId: "episode:s2e2", seasonNumber: 2, finished: true } })
+            m.assertTrue(m.throughSeasons(probe, [1, 2], 2))
+            m.answer(probe, 2, m.episodes(2, 3))
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s2e2")
+            m.answerPlayed(probe, "episode:s2e2", 0, true)
+            m.assertEqual(probe.callFunc("inspect").target.contentId, "episode:s2e3")
+        end sub
+    end class
+end namespace

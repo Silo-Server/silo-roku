@@ -1,0 +1,338 @@
+import "pkg:/components/theme/browse.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/grid.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/memory/policy.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/textures.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/platform/topics.bs"
+import "pkg:/source/search/search.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' tvOS's Search in FHD px, without the top bar: the keyboard, or folded
+' away the query field, from TOP (where root pages put the bar), then 48 px
+' to the filter, 48 to the count, and 48 to the grid. The field, count, and
+' grid share a centred 1520 px column, six 220 px posters 40 px apart.
+const TOP = 56
+const GAP = 48
+const COLUMN_WIDTH = 1520
+const FILTER_WIDTH = 760
+const FILTER_HEIGHT = 60
+' The count's 22 px line.
+const COUNT_HEIGHT = 27
+' The keyboard's height until it has drawn and reports its own (assumption
+' AG-46: Roku sizes it, and it may read zero before the first frame).
+const KEYBOARD_HEIGHT = 480
+
+sub init()
+    m.top.findNode("background").color = theme.color.BACKGROUND
+    m.keyboard = m.top.findNode("keyboard")
+    m.keyboard.domain = "generic"
+    editBox = m.keyboard.textEditBox
+    editBox.maxTextLength = catalog.request.MAX_QUERY
+    editBox.hintText = i18n.text("search.hint")
+    editBox.clearOnDownKey = false
+    editBox.voiceEnabled = true
+    m.keyboard.observeField("text", "onTyped")
+    m.field = m.top.findNode("field")
+    m.field.width = COLUMN_WIDTH
+    m.field.placeholder = i18n.text("search.hint")
+    m.filter = m.top.findNode("filter")
+    labelled = []
+    for each segment in search.segments()
+        labelled.Push([segment[0], i18n.text(segment[1])])
+    end for
+    m.filter.segments = labelled
+    m.filter.observeField("chosen", "onFilterChosen")
+    m.count = m.top.findNode("count")
+    m.count.font = theme.font(theme.textStyle.SEARCH_COUNT)
+    m.count.color = theme.color.TEXT_TERTIARY
+    m.count.height = COUNT_HEIGHT
+    m.count.vertAlign = "center"
+    m.grid = m.top.findNode("grid")
+    m.grid.cardSize = [theme.browse.GRID_SEARCH_CARD_WIDTH, theme.browse.GRID_SEARCH_CARD_HEIGHT]
+    m.grid.observeField("state", "onGridState")
+    m.grid.observeField("total", "showState")
+    m.grid.observeField("selectedItem", "onSelected")
+    m.gridList = m.grid.findNode("grid")
+    m.status = m.top.findNode("status")
+    m.status.observeField("activated", "onRetry")
+    m.spinner = m.top.findNode("spinner")
+    m.debounce = m.top.findNode("debounce")
+    m.debounce.observeField("fire", "onDebounce")
+    m.settle = m.top.findNode("settle")
+    m.settle.observeField("fire", "arrange")
+    m.textures = nav.textures.create()
+    nav.textures.addView(m.textures, m.grid)
+    m.clock = CreateObject("roTimespan")
+    m.query = search.create()
+    m.zone = search.zone.KEYBOARD
+    m.lowTier = false
+    ' The grid's focus key to restore once a rebuilt screen's query runs.
+    m.restoreGrid = invalid
+    arrange()
+    showState()
+end sub
+
+' The screen's requests need the scene and owner, which a new node gets
+' after init. A rebuilt screen (released under memory pressure) runs its
+' saved query again and puts focus back.
+sub onShow(event as Object)
+    restore = event.restore
+    if not util.isObject(restore) then restore = {}
+    if event.first
+        start()
+        resume(restore)
+        m.settle.control = "start"
+        m.top.ready = true
+    else if nav.textures.restore(m.textures)
+        m.grid.callFunc("restoreFocus", restore.grid)
+    end if
+    zone = util.text(restore.zone)
+    if zone = "" then zone = search.zone.KEYBOARD
+    focusZone(zone)
+end sub
+
+sub onPressure(_level as String)
+    nav.textures.detach(m.textures)
+end sub
+
+sub onRelease()
+    m.debounce.control = "stop"
+    m.settle.control = "stop"
+end sub
+
+function focusKey() as Dynamic
+    return { zone: m.zone, q: m.query.text, scope: m.query.scope, grid: m.grid.callFunc("focusKey") }
+end function
+
+function onMemoryLevel(event as Object) as Boolean
+    m.grid.pages = event.gridPages
+    return true
+end function
+
+sub start()
+    memoryState = platform.current().memory
+    m.lowTier = memoryState.tier = memory.tier.LOW
+    m.grid.owner = m.top.owner
+    m.grid.pages = memoryState.gridPages
+    platform.subscribe(m.top.owner, [platform.topic.MEMORY_LEVEL], "onMemoryLevel")
+    m.capabilities = api.newHandle(m.top.owner)
+    m.capabilities.observeField("status", "onCapabilities")
+    api.send(catalog.request.searchCapabilities(), m.capabilities)
+end sub
+
+' A rebuilt screen's saved query and segment, run without waiting.
+sub resume(restore as Object)
+    q = util.text(restore.q)
+    if q = "" then return
+    m.restoreGrid = restore.grid
+    apply(search.typed(m.query, q, clockMs()))
+    m.keyboard.text = q
+    m.keyboard.textEditBox.cursorPosition = Len(q)
+    scope = util.text(restore.scope)
+    if scope <> "" then apply(search.choose(m.query, scope))
+    apply(search.submit(m.query))
+end sub
+
+function clockMs() as Integer
+    return m.clock.TotalMilliseconds()
+end function
+
+sub onTyped()
+    apply(search.typed(m.query, m.keyboard.text, clockMs()))
+end sub
+
+sub onDebounce()
+    apply(search.tick(m.query, clockMs()))
+end sub
+
+sub onFilterChosen()
+    apply(search.choose(m.query, m.filter.chosen))
+end sub
+
+sub onRetry()
+    apply(search.retry(m.query))
+    ' The error state and its button go while the query runs again.
+    focusZone(search.zone.FILTER)
+end sub
+
+sub onCapabilities()
+    result = api.resultOf(m.capabilities)
+    body = result.body
+    videoWithEpisodes = result.ok and util.isObject(body) and util.isTrue(body.available) and util.isTrue(body.videoWithEpisodes)
+    apply(search.capabilities(m.query, videoWithEpisodes))
+end sub
+
+' Carries out a search.step decision.
+sub apply(decision as Object)
+    action = decision.action
+    if action = search.step.WAIT
+        m.debounce.control = "stop"
+        m.debounce.duration = decision.delayMs / 1000
+        m.debounce.control = "start"
+    else if action = search.step.RUN
+        m.debounce.control = "stop"
+        request = catalog.request.search(decision.q, decision.scope, decision.videoWithEpisodes, "", catalog.grid.PAGE_SIZE, m.lowTier)
+        m.grid.callFunc("load", { request: request, lowTier: m.lowTier })
+        if m.restoreGrid <> invalid
+            m.grid.callFunc("restoreFocus", m.restoreGrid)
+            m.restoreGrid = invalid
+        end if
+    else if action = search.step.CLEAR
+        m.debounce.control = "stop"
+        m.grid.callFunc("clear")
+    end if
+    m.filter.selected = m.query.scope
+    arrange()
+    showState()
+end sub
+
+' The keyboard while focus is in it; otherwise the query field in its
+' place. Then the filter once a query exists, the count, and the grid, with
+' the empty and error states centred in the space below.
+sub arrange()
+    expanded = m.zone = search.zone.KEYBOARD
+    m.keyboard.visible = expanded
+    m.field.visible = not expanded
+    m.field.text = m.query.text
+    side = (1920 - COLUMN_WIDTH) \ 2
+    if expanded
+        area = m.keyboard.boundingRect()
+        height = area.height
+        if height <= 0 then height = KEYBOARD_HEIGHT
+        m.keyboard.translation = [(1920 - Int(area.width)) \ 2, TOP]
+        y = TOP + height + GAP
+    else
+        m.field.translation = [side, TOP]
+        y = TOP + theme.firstRun.FIELD_HEIGHT + GAP
+    end if
+    m.filter.visible = m.query.text <> ""
+    if m.filter.visible
+        m.filter.translation = [(1920 - FILTER_WIDTH) \ 2, y]
+        y = y + FILTER_HEIGHT + GAP
+    end if
+    m.count.translation = [side, y]
+    y = y + COUNT_HEIGHT + GAP
+    m.grid.translation = [side, y]
+    centre = [960, (y + 1080) \ 2]
+    m.status.centre = centre
+    m.spinner.centre = centre
+end sub
+
+' The count, the spinner, and the initial, empty, and error states for the
+' grid's state.
+sub showState()
+    gridState = m.grid.state
+    total = m.grid.total
+    key = search.countKey(gridState, total)
+    if key = ""
+        m.count.text = ""
+    else
+        m.count.text = i18n.text(key, { count: total })
+    end if
+    hasQuery = m.query.text <> ""
+    m.spinner.running = hasQuery and gridState = "loading"
+    m.grid.visible = hasQuery
+    message = ""
+    detail = ""
+    action = ""
+    kind = "empty"
+    if not hasQuery
+        message = i18n.text("search.initial")
+        detail = i18n.text("search.initialBody")
+    else if gridState = "empty"
+        message = i18n.text("search.empty")
+        detail = i18n.text("search.emptyBody")
+    else if gridState = "error"
+        message = i18n.text("search.error")
+        detail = i18n.text("search.errorBody")
+        action = i18n.text("states.retry")
+        kind = "error"
+    end if
+    m.status.setFields({ kind: kind, message: message, detail: detail, action: action })
+    m.status.visible = message <> ""
+end sub
+
+' Results settled: the audio guide reads the count or the state after what
+' the keyboard is saying (plan section 4.9).
+sub onGridState()
+    showState()
+    gridState = m.grid.state
+    spoken = m.count.text
+    if gridState = "empty" or gridState = "error" then spoken = m.status.message + ". " + m.status.detail
+    if gridState <> "loading" and spoken <> "" then say(spoken)
+end sub
+
+sub onSelected()
+    card = m.grid.selectedItem
+    if card <> invalid then nav.push(nav.route.DETAIL, search.detailParams(card))
+end sub
+
+' Moves focus to a zone (search.zone), folding the keyboard away below it.
+sub focusZone(zone as String)
+    target = zoneTarget(zone)
+    if target = invalid
+        zone = search.zone.KEYBOARD
+        target = m.keyboard
+    end if
+    m.zone = zone
+    arrange()
+    focusNode(target)
+end sub
+
+' The node that takes focus for a zone, or invalid when the zone has none:
+' the filter needs a query, and results need a grid that is loading or
+' holds items (or a query waiting for the search capability), or the error
+' state's button.
+function zoneTarget(zone as String) as Dynamic
+    if zone = search.zone.KEYBOARD then return m.keyboard
+    if m.query.text = "" then return invalid
+    if zone = search.zone.FILTER then return m.filter
+    gridState = m.grid.state
+    if gridState = "ready" or gridState = "loading" or m.query.held then return m.gridList
+    if gridState = "error" then return m.status
+    return invalid
+end function
+
+' Focus goes to a concrete control, never to an ancestor of the focused node:
+' hardware run 4 found that setFocus(true) on such a node does nothing.
+' TODO(M2): the shared focus helper from the run 4 fixes replaces this.
+sub focusNode(target as Object)
+    if not target.isInFocusChain() then target.setFocus(true)
+end sub
+
+' Keys the keyboard, filter, grid, and states leave unhandled. Back from
+' the keyboard reaches AppScene, which pops Search (backContext).
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if key = "back"
+        if search.back(m.zone) = "" then return false
+        focusZone(search.zone.KEYBOARD)
+        return true
+    end if
+    zone = m.zone
+    target = ""
+    if zone = search.zone.KEYBOARD and (key = "down" or key = "play")
+        ' Play runs the query at once, as Android TV's Search key does.
+        if key = "play" then apply(search.submit(m.query))
+        target = search.zone.FILTER
+    else if zone = search.zone.FILTER and key = "up"
+        target = search.zone.KEYBOARD
+    else if zone = search.zone.FILTER and key = "down"
+        target = search.zone.RESULTS
+    else if zone = search.zone.RESULTS and key = "up"
+        target = search.zone.FILTER
+    end if
+    if target = "" or zoneTarget(target) = invalid then return false
+    focusZone(target)
+    return true
+end function
+
+sub say(text as String)
+    if m.audioGuide = invalid then m.audioGuide = CreateObject("roAudioGuide")
+    if m.audioGuide <> invalid then m.audioGuide.Say(text, false, true)
+end sub

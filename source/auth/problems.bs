@@ -1,0 +1,115 @@
+import "pkg:/source/util/values.bs"
+
+' The client action for each v2 Problem type (implementation plan section 5,
+' spec section 6.4). Pure: action(type, status, context) reads only the type's
+' last path segment (api.problem.typeName) and the HTTP status, never `detail`.
+' context says what kind of request was answered, since some types mean
+' different things there:
+'   ""             an authenticated request (the default)
+'   "public"       an unauthenticated request: a 401 is never refreshed
+'   "login"        POST /auth/login: a 401 is a wrong username or password
+'   "refresh"      POST /auth/refresh: a 401 is a refused refresh
+'   "pin"          POST /profiles/{id}/verify-pin: a 429 is the PIN lockout
+'   "replan", "progress", "route_event"   playback jobs, which retry
+'                  internal_error and rate_limited with a bounded backoff
+namespace api.auth.problems
+    ' Refresh the access token once and retry the request once.
+    const REFRESH = "refresh"
+    ' The refresh was refused: sign out.
+    const SIGN_OUT = "sign_out"
+    ' Ask for the profile's PIN again.
+    const VERIFY_PIN = "verify_pin"
+    ' A normal not-found state, or, for the current playback session, the
+    ' session-ended rules of plan section 5.
+    const NOT_FOUND = "not_found"
+    const EXIT_PLAYER = "exit_player"
+    ' Re-read playback capabilities, then start a new attempt.
+    const REREAD_CAPABILITIES = "reread_capabilities"
+    ' Retry the stored replan body once after 2 s; if it is still a conflict,
+    ' start a new attempt.
+    const REPLAN_CONFLICT = "replan_conflict"
+    ' A client bug (a progress sequence reused): log it and continue.
+    const LOG_AND_CONTINUE = "log_and_continue"
+    ' Start a new playback attempt.
+    const NEW_ATTEMPT = "new_attempt"
+    ' A generic error.
+    const GENERIC = "generic"
+    ' A generic error, recorded in diagnostics without request bodies.
+    const DIAGNOSTIC = "diagnostic"
+    ' Keep the tokens and retry with a bounded backoff (playback jobs).
+    const BACKOFF = "backoff"
+    ' Keep the tokens; wait for Retry-After when present, otherwise a bounded
+    ' backoff, and retry. A server outage never signs the viewer out.
+    const WAIT_RETRY = "wait_retry"
+    ' Login only: the username or password is wrong (401 invalid_token).
+    const INVALID_CREDENTIALS = "invalid_credentials"
+    ' PIN check only: too many wrong PINs; show the Retry-After time and never
+    ' retry on its own.
+    const PIN_LOCKED = "pin_locked"
+
+    ' The action for an error answer. problemType is the type's last segment
+    ' (or invalid when the body was not a Problem); status is the HTTP status.
+    function action(problemType as Dynamic, status as Integer, context = "" as String) as String
+        name = ""
+        if util.isString(problemType) then name = problemType
+        if context = "login" and status = 401 then return INVALID_CREDENTIALS
+        if context = "refresh" then return refreshAction(name, status)
+        if context = "pin" and status = 429 then return PIN_LOCKED
+        if name = "" then return byStatus(status, context)
+
+        if name = "invalid_token" or name = "token_refresh_required" or name = "authentication_required" or name = "session_expired"
+            ' A session_expired request refreshes too: only the refused refresh
+            ' signs out.
+            if context = "public" or context = "login" then return GENERIC
+            return REFRESH
+        end if
+        if name = "profile_verification_required" then return VERIFY_PIN
+        if name = "not_found" then return NOT_FOUND
+        if name = "playback_session_ended" then return EXIT_PLAYER
+        if name = "installation_changed" then return REREAD_CAPABILITIES
+        if name = "conflict"
+            if context = "replan" then return REPLAN_CONFLICT
+            return GENERIC
+        end if
+        if name = "progress_conflict" then return LOG_AND_CONTINUE
+        if name = "idempotency_conflict" then return NEW_ATTEMPT
+        if name = "validation_failed" or name = "permission_denied" or name = "capability_not_configured" then return DIAGNOSTIC
+        if name = "internal_error" or name = "rate_limited" then return transientAction(context)
+        if name = "dependency_unavailable" or name = "provider_unavailable" then return WAIT_RETRY
+        return byStatus(status, context)
+    end function
+
+    ' The action for a result envelope (source/api/response.bs), or invalid
+    ' when it succeeded or never got an HTTP answer.
+    function forResult(result as Object, context = "" as String) as Dynamic
+        if result.ok = true or result.error = invalid or result.error.kind <> "http" then return invalid
+        return action(result.error.problemType, result.status, context)
+    end function
+
+    ' POST /auth/refresh: only a 401 the server explains as an invalid or
+    ' ended session refuses it. Anything else, a 401 from a proxy included,
+    ' keeps the tokens for a later retry.
+    function refreshAction(name as String, status as Integer) as String
+        if status = 401 and (name = "session_expired" or name = "invalid_token" or name = "authentication_required") then return SIGN_OUT
+        if status = 400 or status = 422 then return DIAGNOSTIC
+        return WAIT_RETRY
+    end function
+
+    ' Types the table does not name, and bodies that are not Problems (a
+    ' proxy's error page), by status.
+    function byStatus(status as Integer, context as String) as String
+        if status = 401
+            if context = "public" or context = "login" then return GENERIC
+            return REFRESH
+        end if
+        if status = 404 then return NOT_FOUND
+        if status = 503 then return WAIT_RETRY
+        if status = 429 or status >= 500 then return transientAction(context)
+        return GENERIC
+    end function
+
+    function transientAction(context as String) as String
+        if context = "replan" or context = "progress" or context = "route_event" then return BACKOFF
+        return GENERIC
+    end function
+end namespace

@@ -1,0 +1,258 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/values.bs"
+
+' Recovery bookkeeping for one attempt (plan section 6.7, protocol v3 sections
+' 6 and 9): the failure chain, how a player failure is recovered, the stall
+' clock, the reconnect schedule, and the interim AAC rule (plan section 6.1).
+' Plan attempt keys are opaque: they are stored, echoed, and compared whole,
+' never parsed or built here.
+namespace playback.recovery
+    ' attempt_count runs 1 to 8; the server rejects more than 16 attempted keys.
+    const MAX_ATTEMPTS = 8
+    const MAX_KEYS = 16
+    ' No position progress for this long is a stall, at startup or mid-stream.
+    const STALL_MS = 20000
+    ' Position movement that restarts the stall clock (Android TV uses 1.5 s).
+    const PROGRESS_SECONDS = 1.5
+    ' A buffer reading at this fill (Video.bufferingStatus.percentage) is
+    ' everything the node waits for before it plays.
+    const FULL_PERCENT = 100
+    ' The local mutation a later replan reports after a local reopen.
+    const REOPEN_MUTATION = "transport_reopen"
+    ' Android TV's classifications for a seek_reanchor the server refused or
+    ' answered with a terminal; both continue as seek_failure_recovery.
+    const REANCHOR_FAILED = "seek_reanchor_failed"
+    const REANCHOR_TERMINAL = "seek_reanchor_terminal"
+    ' Reconnect after a network drop (protocol section 6.2): about two minutes,
+    ' 1 s doubling to a 15 s cap.
+    const RECONNECT_BUDGET_MS = 120000
+    const RECONNECT_CAP_MS = 15000
+
+    ' --- Failure chain --------------------------------------------------------
+
+    ' planKeys are the attempted_plan_keys so far; attemptCount is the
+    ' attempt_count the next failure replan sends. (An AA member named count or
+    ' keys would hide the AA's Count() and Keys().)
+    function newChain() as Object
+        return { planKeys: [], attemptCount: 1 }
+    end function
+
+    sub resetChain(chain as Object)
+        chain.planKeys = []
+        chain.attemptCount = 1
+    end sub
+
+    ' The replan members that name the plan being replaced. plan is the session
+    ' reducer's record of the adopted plan: the server's plan_id and
+    ' plan_attempt_key, and the plan_attempt_id the client minted on adoption.
+    function planIdentity(plan as Object) as Object
+        return { failed_plan_id: plan.id, plan_attempt_id: plan.attemptId, plan_attempt_key: plan.key }
+    end function
+
+    ' A failure_recovery or seek_failure_recovery: the failed plan's key joins
+    ' the chain's keys, attempt_count is the chain's count, and failure carries
+    ' the classification. Invalid once eight attempts have been sent, when the
+    ' player shows the terminal error instead.
+    function failureFields(chain as Object, plan as Object, operation as String, failure as Object) as Dynamic
+        if chain.attemptCount > MAX_ATTEMPTS then return invalid
+        fields = planIdentity(plan)
+        fields.operation = operation
+        fields.attempted_plan_keys = withKey(chain.planKeys, plan.key)
+        fields.attempt_count = chain.attemptCount
+        fields.failure = failure
+        if plan.mutations.Count() > 0 then fields.local_mutations = plan.mutations
+        return fields
+    end function
+
+    ' After a failure replan is sent, its keys become the chain's and the next
+    ' failure counts one higher.
+    sub recordFailure(chain as Object, fields as Object)
+        chain.planKeys = fields.attempted_plan_keys
+        chain.attemptCount = fields.attempt_count + 1
+    end sub
+
+    ' track_change, quality_change, output_change, and the reconnect: nothing
+    ' failed, so the keys are empty and the count is 1. Any returned key is
+    ' accepted, including one seen before.
+    function intentFields(plan as Object, operation as String) as Object
+        fields = planIdentity(plan)
+        fields.operation = operation
+        fields.attempted_plan_keys = []
+        fields.attempt_count = 1
+        return fields
+    end function
+
+    ' A seek_reanchor carries the chain unchanged and no failure; the server
+    ' ignores both for loop prevention (playback_v3.go, "!seekReanchor").
+    function seekFields(chain as Object, plan as Object) as Object
+        fields = planIdentity(plan)
+        fields.operation = "seek_reanchor"
+        fields.attempted_plan_keys = withKey(chain.planKeys, invalid)
+        fields.attempt_count = chain.attemptCount
+        if fields.attempt_count > MAX_ATTEMPTS then fields.attempt_count = MAX_ATTEMPTS
+        return fields
+    end function
+
+    ' A copy of keys with key appended unless it is already there (the server
+    ' reuses a failed key after node failover or a proxy sourceRefused), keeping
+    ' the newest MAX_KEYS.
+    function withKey(keys as Object, key as Dynamic) as Object
+        out = []
+        for each existing in keys
+            out.Push(existing)
+        end for
+        if playback.values.isText(key) and not util.contains(out, key) then out.Push(key)
+        while out.Count() > MAX_KEYS
+            out.Shift()
+        end while
+        return out
+    end function
+
+    ' --- Player failures ----------------------------------------------------
+
+    ' What to do about a failure on the current plan. kind is what the player
+    ' reported: "network" (the media connection failed: playback.video
+    ' reads it from Roku's error), "stall" (the stall clock ran out with no
+    ' input), "no_output" (it ran out after the decoder had input:
+    ' noteMedia), "server" (the media origin answered 5xx), "http" (it
+    ' refused), "decode", "audio_unsupported" (audioFormat = "mat"),
+    ' "subtitle_rendition" (the HLS subtitle rendition never became
+    ' selectable), or anything else. ("auth", "ended", and "media" never
+    ' get here.)
+    ' outage says the attempt is reconnecting from an outage whose
+    ' reconnect brought this plan. Returns {action, classification}, where
+    ' action is:
+    '   "reconnect": recovered without excluding the route (spec section
+    '     9.6, protocol section 6.2): a network failure, whenever it comes;
+    '     a 5xx from the media after the plan showed frames; a stall
+    '     during an outage; or a stall while the API is unreachable too;
+    '   "reopen": the one reopen this plan gets, at the current position,
+    '     for a stall;
+    '   "recover": a failure_recovery (or seek_failure_recovery) replan.
+    ' Every failure_recovery excludes the failed plan's route on the server,
+    ' so a failed connection never sends one: hardware run 14 lost every
+    ' route in 2 to 4 s that way while the lab refused media for 30 s.
+    function decide(kind as String, plan as Object, reachable as Boolean, outage = false as Boolean) as Object
+        reconnect = { action: "reconnect", classification: "transport_stall" }
+        if kind = "network" then return reconnect
+        transport = kind = "stall" or kind = "no_output"
+        if (plan.firstFrame or outage) and (kind = "server" or (transport and not reachable)) then return reconnect
+        if kind = "stall"
+            if outage then return reconnect
+            if not plan.reopened then return { action: "reopen", classification: "transport_stall" }
+            return { action: "recover", classification: "transport_stall" }
+        end if
+        return { action: "recover", classification: classification(kind, plan) }
+    end function
+
+    ' Failure classifications follow the values Android TV sends (spec section
+    ' 9.6). The server branches on sourceRefused for a proxy-origin stream, so
+    ' a refusal there is retried through the API origin first.
+    function classification(kind as String, plan as Object) as String
+        if kind = "no_output" then return "decoder_no_output"
+        if kind = "decode" then return "decoder_failure"
+        if kind = "audio_unsupported" then return "audio_codec_unsupported"
+        if kind = "subtitle_rendition" then return "subtitle_hls_rendition_failed"
+        if kind = "http" or kind = "server"
+            if isProxyStream(plan.data) then return "sourceRefused"
+            return "http_failure"
+        end if
+        return "player_failure"
+    end function
+
+    ' API-origin media URLs are server-relative; a proxy node's are absolute.
+    function isProxyStream(plan as Object) as Boolean
+        stream = plan.stream
+        return util.isObject(stream) and util.isString(stream.url) and LCase(Left(stream.url, 4)) = "http"
+    end function
+
+    ' --- Stall clock ----------------------------------------------------------
+
+    ' markAt is when the position last moved by PROGRESS_SECONDS, media last
+    ' reached a node waiting for it, or the clock was restarted; input is
+    ' whether the decoder has had media since then, in the current wait;
+    ' level is the buffer's last reading, in percent.
+    function newStall(now as Dynamic) as Object
+        return { markAt: now, markPosition: invalid, input: false, level: 0 }
+    end function
+
+    sub restartStall(stall as Object, now as Dynamic, position as Dynamic)
+        stall.markAt = now
+        stall.markPosition = position
+        stall.input = false
+        stall.level = 0
+    end sub
+
+    ' The node rebuffers after it has played: a wait of its own. Media the
+    ' decoder had while it played says nothing about this wait, whose empty
+    ' buffer is starved rather than stuck, so the wait starts with no input
+    ' and no reading; the clock runs on from the last progress.
+    sub rebufferStarted(stall as Object)
+        stall.input = false
+        stall.level = 0
+    end sub
+
+    sub notePosition(stall as Object, position as Dynamic, now as Dynamic)
+        if not util.isNumber(stall.markPosition) or Abs(position - stall.markPosition) >= PROGRESS_SECONDS then restartStall(stall, now, position)
+    end sub
+
+    ' Media arrived: a buffer reading of percent, or a downloaded segment
+    ' (percent invalid). waiting says the node has not played the load yet
+    ' or is rebuffering. Media that fills a waiting node's buffer is a slow
+    ' network, not a decoder failure, so it restarts the clock, as Android
+    ' TV's buffer growth does before its decoder has input: hardware run 11
+    ' sent decoder_no_output, which excludes the route, for a copy remux
+    ' whose buffer was at 74% and filling, and for a Dolby Vision original
+    ' 0.6 s before its first frame. A full buffer, or media while the node
+    ' plays, is input the decoder had.
+    sub noteMedia(stall as Object, percent as Dynamic, waiting as Boolean, now as Dynamic)
+        if util.isNumber(percent)
+            filling = percent > stall.level
+            stall.level = percent
+        else
+            filling = stall.level < FULL_PERCENT
+        end if
+        if waiting and filling
+            stall.markAt = now
+            stall.input = false
+        end if
+        if stall.level >= FULL_PERCENT or not waiting then stall.input = true
+    end sub
+
+    function stallDeadline(stall as Object) as Dynamic
+        return stall.markAt + STALL_MS
+    end function
+
+    ' The failure kind once the clock has run out, else invalid.
+    function stallKind(stall as Object, now as Dynamic) as Dynamic
+        if now < stallDeadline(stall) then return invalid
+        if stall.input then return "no_output"
+        return "stall"
+    end function
+
+    ' --- Reconnect ------------------------------------------------------------
+
+    ' Delay before reconnect try n (1-based): 1, 2, 4, 8 s, then 15 s.
+    function reconnectDelayMs(tries as Integer) as Integer
+        delay = 1000
+        for i = 2 to tries
+            delay = delay * 2
+            if delay >= RECONNECT_CAP_MS then return RECONNECT_CAP_MS
+        end for
+        return delay
+    end function
+
+    ' --- Interim AAC rule -----------------------------------------------------
+
+    ' True when a returned plan delivers AAC with more than two channels to a
+    ' device that cannot decode multichannel AAC. The client does not open it:
+    ' it stops the session and starts a new attempt whose deliveries carry
+    ' max_channels: 2. failure_recovery cannot do this, because attempt keys
+    ' ignore the channel count.
+    function needsStereoRestart(plan as Object, multichannelAac as Boolean) as Boolean
+        if multichannelAac then return false
+        recipe = plan.effective_recipe
+        if not util.isObject(recipe) then return false
+        return util.isString(recipe.audio_codec) and LCase(recipe.audio_codec) = "aac" and playback.values.number(recipe.audio_channels, 0) > 2
+    end function
+end namespace

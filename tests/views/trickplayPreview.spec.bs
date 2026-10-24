@@ -1,0 +1,264 @@
+import "pkg:/components/theme/helpers.bs"
+
+namespace tests
+
+    ' TrickplayPreview built headless (components/player/trickplay/): layout,
+    ' which sheets its Posters hold, tile offsets, status, and refresh. brs-node
+    ' loads packaged images and fails remote ones at once, so sheets here are
+    ' packaged images; decoding real sheets is hardware test H20.
+    @suite("trickplay preview")
+    class TrickplayPreviewTests extends rooibos.BaseTestSuite
+
+        function preview(tier as String) as Object
+            theme.install()
+            node = CreateObject("roSGNode", "TrickplayPreview")
+            node.tier = tier
+            return node
+        end function
+
+        ' The fixture's manifest with a packaged image for each of its 11
+        ' sheets, or a remote URL brs-node fails for the sheets in failing,
+        ' expiring an hour from now unless told.
+        function manifest(expiresIn = 3600 as Integer, failing = [] as Object) as Object
+            out = playback.trickplay.parseManifest(tests.catalogData.fixture("get_watch_trickplay_ok"), "42", "https://media.example")
+            images = ["brand/wordmark", "firstrun/spinner", "firstrun/lock_badge", "firstrun/mesh_profiles", "firstrun/mesh_setup", "firstrun/pin_dot", "firstrun/pin_dot_ring", "firstrun/avatar_disc", "firstrun/avatar_ring", "firstrun/avatar_shade", "ui/card_placeholder"]
+            for i = 0 to 10
+                out.sheets[i] = "pkg:/images/" + images[i] + ".png"
+            end for
+            for each i in failing
+                out.sheets[i] = "https://media.example/api/v2/artwork/trickplay/42/9913/" + i.ToStr() + ".9913.jpg?sig=x"
+            end for
+            clock = CreateObject("roDateTime")
+            out.expiresAt = clock.AsSeconds() + expiresIn
+            return out
+        end function
+
+        function sheet(node as Object, id as String) as Object
+            return node.findNode(id)
+        end function
+
+        ' Field values as Integers: brs-node keeps the type each was set with.
+        function whole(values as Object) as Object
+            out = []
+            for each value in values
+                out.Push(Int(value))
+            end for
+            return out
+        end function
+
+        function uris(node as Object) as Object
+            return [m.sheet(node, "sheetA").uri, m.sheet(node, "sheetB").uri]
+        end function
+
+        ' Active at position with the manifest (the default one when invalid).
+        function shown(tier as String, position as Float, manifest = invalid as Dynamic) as Object
+            node = m.preview(tier)
+            if manifest = invalid then manifest = m.manifest()
+            node.manifest = manifest
+            node.position = position
+            node.active = true
+            return node
+        end function
+
+        @describe("sheets")
+
+        @it("sizes the tile on tvOS's 340 px card and decodes sheets within 1600 px before any uri is set")
+        sub _()
+            node = m.preview(memory.tier.STANDARD)
+            node.manifest = m.manifest()
+            m.assertEqual(node.frameWidth, 320)
+            m.assertEqual(node.frameHeight, 134)
+            a = m.sheet(node, "sheetA")
+            m.assertEqual(a.loadDisplayMode, "limitSize")
+            m.assertEqual([a.loadWidth, a.loadHeight], [1600.0, 672.0], "the same decode as a 240 px draw")
+            m.assertEqual([a.width, a.height], [3200.0, 1340.0])
+            frame = node.findNode("frame")
+            m.assertEqual(m.uris(node), ["", ""])
+            m.assertEqual(node.status, "loading")
+            m.assertFalse(frame.visible)
+        end sub
+
+        @it("loads the current and next sheets and moves only the Poster within a sheet")
+        sub _()
+            manifest = m.manifest()
+            node = m.shown(memory.tier.STANDARD, 1005, manifest)
+            m.assertEqual(m.uris(node), [manifest.sheets[1], manifest.sheets[2]])
+            a = m.sheet(node, "sheetA")
+            m.assertEqual(m.whole(a.translation), [0, 0])
+            m.assertTrue(a.visible)
+            m.assertFalse(m.sheet(node, "sheetB").visible)
+            m.assertTrue(node.findNode("frame").visible)
+            m.assertEqual(node.findNode("time").text, "16:45")
+            frame = node.findNode("frame")
+            m.assertEqual(m.whole([frame.clippingRect.width, frame.clippingRect.height]), [320, 134])
+            m.assertEqual(m.whole(frame.translation), [10, 10])
+            m.assertEqual(node.cardWidth, 340)
+            m.assertEqual(m.whole(node.findNode("card").translation), [-170, -191], "the card's bottom centre on the origin")
+            m.assertEqual(m.whole(node.findNode("time").translation), [0, 152])
+            node.position = 1015
+            m.assertEqual(m.whole(a.translation), [-320, 0])
+            node.position = 1985
+            m.assertEqual(m.whole(a.translation), [-2560, -1206])
+            m.assertEqual(m.uris(node), [manifest.sheets[1], manifest.sheets[2]])
+        end sub
+
+        @it("swaps one sheet at a boundary forward, and keeps the previous one moving back")
+        sub _()
+            manifest = m.manifest()
+            node = m.shown(memory.tier.STANDARD, 1005, manifest)
+            node.position = 2005
+            m.assertEqual(m.uris(node), [manifest.sheets[3], manifest.sheets[2]])
+            m.assertTrue(m.sheet(node, "sheetB").visible)
+            m.assertFalse(m.sheet(node, "sheetA").visible)
+            m.assertEqual(m.whole(m.sheet(node, "sheetB").translation), [0, 0])
+            node.position = 1995
+            m.assertEqual(m.uris(node), [manifest.sheets[1], manifest.sheets[0]])
+            node.position = 995
+            m.assertEqual(m.uris(node), [manifest.sheets[1], manifest.sheets[0]])
+            m.assertTrue(m.sheet(node, "sheetB").visible)
+        end sub
+
+        @it("keeps one sheet on the low tier, and drops the neighbour when the tier falls")
+        sub _()
+            manifest = m.manifest()
+            node = m.shown(memory.tier.LOW, 1005, manifest)
+            m.assertEqual(m.uris(node), [manifest.sheets[1], ""])
+            node.position = 2005
+            m.assertEqual(m.uris(node), [manifest.sheets[2], ""])
+            standard = m.shown(memory.tier.STANDARD, 1005, manifest)
+            standard.tier = memory.tier.LOW
+            m.assertEqual(m.uris(standard), [manifest.sheets[1], ""])
+        end sub
+
+        @it("drops every sheet and hides when the scrub ends")
+        sub _()
+            node = m.shown(memory.tier.STANDARD, 1005)
+            node.active = false
+            m.assertEqual(m.uris(node), ["", ""])
+            m.assertFalse(node.findNode("card").visible)
+            m.assertEqual(node.status, "loading")
+        end sub
+
+        @describe("status and refresh")
+
+        @it("is ready once the current sheet loads")
+        sub _()
+            node = m.shown(memory.tier.STANDARD, 1005)
+            m.assertEqual(node.status, "ready")
+            m.assertTrue(m.sheet(node, "sheetA").visible)
+            node.position = 2005
+            m.assertEqual(node.status, "ready")
+            m.assertTrue(m.sheet(node, "sheetB").visible)
+        end sub
+
+        @it("shows the time and says previews are not available without a manifest")
+        sub _()
+            node = m.shown(memory.tier.STANDARD, 3725, {})
+            m.assertEqual(node.status, "unavailable")
+            m.assertTrue(node.findNode("message").visible)
+            m.assertEqual(node.findNode("message").text, "Previews aren't available for this title")
+            m.assertEqual(node.findNode("time").text, "1:02:05")
+            m.assertFalse(node.findNode("frame").visible)
+            m.assertEqual(node.frameWidth, 0)
+        end sub
+
+        @it("keeps the message's card within span, centred where it fits (run 7)")
+        sub _()
+            node = m.shown(memory.tier.STANDARD, 19, {})
+            node.span = [160, 1760]
+            message = node.findNode("message")
+            width = Int(message.width)
+            m.assertTrue(width > 240 and width <= 640, "as wide as its words")
+            card = node.findNode("card")
+            cardWidth = node.cardWidth
+            m.assertEqual(cardWidth, width + 40)
+            node.translation = [960, 720]
+            m.assertEqual(Int(card.translation[0]), - (cardWidth \ 2), "centred mid-scrubber")
+            node.translation = [208, 720]
+            m.assertEqual(Int(208 + card.translation[0]), 160, "its left edge on the scrubber's start")
+            node.translation = [1712, 720]
+            m.assertEqual(Int(1712 + card.translation[0]) + cardWidth, 1760, "its right edge on the scrubber's end")
+            m.assertEqual(Int(node.findNode("time").translation[1]), 52, "the time under the message")
+        end sub
+
+        @it("shows the tile alone, 480 px wide from its top centre, for the hold indicator")
+        sub _()
+            node = m.shown(memory.tier.STANDARD, 1005)
+            node.mode = "hold"
+            m.assertEqual([node.frameWidth, node.frameHeight, node.heldHeight], [480, 202, 202])
+            m.assertEqual(m.whole(node.findNode("card").translation), [-240, 0])
+            m.assertFalse(node.findNode("cardFill").visible)
+            m.assertFalse(node.findNode("time").visible)
+            m.assertEqual(m.whole(m.sheet(node, "sheetA").translation), [0, 0])
+            node.position = 1015
+            m.assertEqual(m.whole(m.sheet(node, "sheetA").translation), [-480, 0])
+            node.manifest = {}
+            m.assertEqual(node.heldHeight, 0, "no previews: the indicator moves up")
+            m.assertFalse(node.findNode("card").visible)
+        end sub
+
+        @it("waits without the message while the manifest is read")
+        sub _()
+            node = m.shown(memory.tier.STANDARD, 10, playback.trickplay.pending())
+            m.assertEqual(node.status, "loading")
+            m.assertFalse(node.findNode("message").visible)
+            m.assertTrue(node.findNode("time").visible)
+            manifest = m.manifest()
+            node.manifest = manifest
+            m.assertEqual(m.uris(node), [manifest.sheets[0], manifest.sheets[1]])
+            m.assertEqual(node.status, "ready")
+        end sub
+
+        @it("asks for the manifest again instead of using URLs about to expire")
+        sub _()
+            node = m.shown(memory.tier.STANDARD, 1005, m.manifest(20))
+            m.assertTrue(node.refresh)
+            m.assertEqual(m.uris(node), ["", ""])
+            m.assertEqual(node.status, "loading")
+            fresh = m.manifest()
+            node.manifest = fresh
+            m.assertFalse(node.refresh)
+            m.assertEqual(m.uris(node), [fresh.sheets[1], fresh.sheets[2]])
+            m.assertEqual(node.status, "ready")
+        end sub
+
+        @it("reads the manifest again after a failed sheet, keeping the decoded one")
+        sub _()
+            node = m.shown(memory.tier.STANDARD, 1005, m.manifest(3600, [2]))
+            m.assertTrue(node.refresh)
+            fresh = m.manifest()
+            m.assertEqual(m.uris(node), [fresh.sheets[1], ""])
+            m.assertEqual(node.status, "ready")
+            node.manifest = fresh
+            m.assertFalse(node.refresh)
+            m.assertEqual(m.uris(node), [fresh.sheets[1], fresh.sheets[2]])
+        end sub
+
+        @it("loads nothing new while the refresh is pending")
+        sub _()
+            node = m.shown(memory.tier.STANDARD, 1005, m.manifest(3600, [2]))
+            node.position = 3005
+            m.assertEqual(m.uris(node), ["", ""])
+            m.assertEqual(node.status, "loading")
+        end sub
+
+        @it("gives up on previews when a sheet fails again after a refresh, until another manifest")
+        sub _()
+            node = m.shown(memory.tier.STANDARD, 1005, m.manifest(3600, [1]))
+            m.assertTrue(node.refresh)
+            m.assertEqual(node.status, "loading")
+            node.manifest = m.manifest(3600, [1])
+            m.assertEqual(node.status, "unavailable")
+            m.assertTrue(node.findNode("message").visible)
+            m.assertEqual(m.uris(node), ["", ""])
+            node.position = 2005
+            m.assertEqual(m.uris(node), ["", ""])
+            fresh = m.manifest()
+            node.manifest = fresh
+            m.assertEqual(node.status, "ready")
+            m.assertEqual(m.uris(node), [fresh.sheets[2], fresh.sheets[3]])
+        end sub
+
+    end class
+
+end namespace

@@ -1,0 +1,2733 @@
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/theme/upNext.bs"
+import "pkg:/components/views/controls.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/api/playback.bs"
+import "pkg:/source/api/request.bs"
+import "pkg:/source/api/session.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/player.bs"
+import "pkg:/source/memory/policy.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/playback/controls.bs"
+import "pkg:/source/playback/intent.bs"
+import "pkg:/source/playback/markers.bs"
+import "pkg:/source/playback/media.bs"
+import "pkg:/source/playback/nextEpisode.bs"
+import "pkg:/source/playback/options.bs"
+import "pkg:/source/playback/player.bs"
+import "pkg:/source/playback/preferences.bs"
+import "pkg:/source/playback/session.bs"
+import "pkg:/source/playback/sidecarCache.bs"
+import "pkg:/source/playback/sidecars.bs"
+import "pkg:/source/playback/skipIntro.bs"
+import "pkg:/source/playback/slot.bs"
+import "pkg:/source/playback/trickplay.bs"
+import "pkg:/source/playback/trickplayFetch.bs"
+import "pkg:/source/playback/upNext.bs"
+import "pkg:/source/playback/video.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/redact.bs"
+import "pkg:/source/util/values.bs"
+
+' The player. The session reducer decides; this file feeds it the Video
+' node's state, position, and errors (playback.video), ApiTask's answers
+' (playback.player.answerEvent), and the viewer's seeks and track choices,
+' and carries out its commands: requests through api.playback, content
+' loads through one Video node (playback.slot), sidecar subtitles through
+' ApiTask and MediaTask, and the overlay. Every Video callback is tagged
+' with the load whose content the node has, so the reducer ignores what an
+' earlier load reports.
+'
+' Keys go through the controls reducer (playback.controls, spec section 5.7's
+' key table), driven by the controlsTimer for holds, the rate ladder, merged
+' skips, and hiding. Its seeks are committed through the session reducer
+' (seekTo: a local seek or a seek_reanchor), never by setting Video.seek
+' here. While the controls hide, the Video node keeps focus, so * reaches
+' Roku's caption and audio overlay; while they show, the overlay's empty
+' keyFocus child has it and * opens Silo's Options (plan sections 6.4 and
+' 6.10). Development builds log where focus is when the controls show or
+' hide and when * arrives (logFocus). The profile's playback preferences
+' (playback.preferences) are read beside the watch projection; the start
+' waits for them up to PREFERENCES_WAIT_MS, because its audio, quality,
+' and bitrate cap follow them, and the defaults apply when they fail or
+' come later.
+'
+' Tracks (spec sections 8.5 and 9.7). A first start plays the version
+' Detail's Versions menu pinned (nav.player.pinnedFile), else the start
+' path's, and names Detail's picks for the version it plays
+' (nav.player.tracksFor through
+' playback.options.initialTracks); Detail's Auto, and a start without picks,
+' name the version's effective audio track, else the audio the worker
+' chooses for the profile's language and the device
+' (playback.options.initialAudio), and no subtitle; the session's
+' first plan then gets the subtitle the preferences choose from its
+' inventory (playback.options.afterStart), with at most one track_change. Nothing at load changes Roku's caption mode (assumption
+' AG-75): a subtitle the preferences choose shows while captions are on.
+' A burned-in subtitle cannot follow the mode, so the plan follows it
+' instead (followCaptions): captions Off asks for a plan without it and sets
+' it aside, and any other mode asks for it again. The Video node draws only
+' the plan's subtitle (Video.suppressCaptions, playback.sidecars.suppressed),
+' never a track Roku picks itself, such as one in an original's container.
+' A sidecar is selected by the TrackName Roku lists for it
+' (Video.availableSubtitleTracks, playback.sidecars.listedName), and an
+' in-place switch Roku does not follow reloads (checkSubtitle). Roku
+' reports a selected sidecar by any name that contains its path
+' (playback.sidecars.isTrack). The player selects nothing on its own while
+' content starts (onVideoSubtitles): Roku stopped content it was opening
+' when the player did (hardware run 20). Once the content settles, it
+' selects the sidecar once if Roku plays another track (confirmSubtitle):
+' Roku drew English while the sidecar of another language was selected
+' (hardware run 21).
+'
+' Content on the Video node is never changed: Roku closed the player when
+' playing content was given another subtitle track (hardware run 19), so a
+' sidecar that comes late reloads (lateSubtitle). Content waiting for the
+' node's stop may still change (its playStart and SubtitleTracks). The node
+' itself takes only seeks, track selections (subtitleTrack, audioTrack),
+' suppressCaptions, the caption mode, pause and resume, and its box;
+' anything else is new content for a load the session reducer started, so
+' nothing the replaced content reports reaches the stall clock. A
+' "finished" right after one of those changes, before the content's end,
+' is the change's doing, and the session reloads at the position
+' (noteWrite).
+'
+' Options (playback.options, components/player/options/OptionsPanel): the
+' Options button opens it on the tab it showed last in this player (Info
+' the first time), and Down with the controls hidden on Video (spec
+' section 5.7). * with the controls shown opens it on Video only on a Roku
+' player that passes the key on: a Roku TV takes * during full-screen
+' playback whatever has focus (assumption AG-117). It attaches under
+' optionsLayer, takes focus on its tabs, and handles Back itself: the first
+' Back closes its Quality picker, else the panel, and a pick leaves it
+' open, whether the plan switches in place or reloads (hardware run 22).
+' setOverlayFlags tells the controls reducer while it is open (options) and
+' while focus is in its columns (picker), so the reducer leaves the keys to
+' it; the controls step aside meanwhile, as tvOS's do, and come back when
+' it closes. Quality and
+' track choices go through the session reducer; a caption mode, and On
+' when a subtitle track is chosen with captions off, are written to
+' Video.globalCaptionMode, and a mode alone may need a plan that follows it
+' (followCaptions); Auto-play next is Up Next's toggle too
+' (m.autoplayNext). The model is set again whenever what it shows changes.
+'
+' Roku's * overlay: a track changed there is observed on the Video node and
+' becomes a track_change or is written back (playback.options.watchOverlay);
+' a caption mode set there arrives as a platform event, which the plan may
+' follow (followCaptions).
+'
+' Seek previews (playback.trickplay, components/player/trickplay/
+' TrickplayPreview): the manifest of the file the plan plays is read when the
+' watch projection marks the file and capabilities list trickplay_v1, after
+' the first plan, again when a replan changes the file, and when the preview
+' asks (its URLs expire, or a sheet failed). The preview shows above the
+' scrubber while the controls show a scrub, for Left and Right and every
+' ladder speed, and the memory level sets the sheets it keeps.
+'
+' Platform events (source/platform/client.bs): the caption mode, the memory
+' level, and a codec capability or HDMI change, which re-probes the output
+' in ApiTask; the reducer replans only when the normalized output context
+' changed.
+'
+' Markers (playback.markers, spec section 9.8): the version the plan plays
+' gives the scrubber its bands, Skip Intro its intro ranges, and Up Next its
+' credits start, read when the intent arrives and again when a replan
+' changes the file.
+'
+' Skip intro (playback.skipIntro, components/player/skip/SkipIntroButton):
+' positions and the Video state drive it, and the panelTimer its fill. The
+' button places itself at the bottom right, raised while the controls show.
+' While it shows (the controls reducer's skipButton flag), OK with the
+' controls hidden, or on the pill when it has the controls' focus, arrives
+' as activateSkip() and Back as dismissSkip(). Skip Recap
+' (playback.skipRecap, SkipRecapButton) takes the same positions, Video
+' state, and markers, shows while playback is inside a recap, and skips it
+' itself under the profile's playback.auto_skip_recap; its OK arrives as
+' activateRecap. Their seeks, Watch Intro's back to the intro's start too,
+' go through the session reducer as every seek does (commitSeek: local or
+' seek_reanchor).
+'
+' Up Next (playback.upNext, components/player/upnext/UpNextPanel), for
+' episodes: the next episode is resolved after the first plan
+' (playback.nextEpisode, through ApiTask's catalog reads), and the controls'
+' Up Next button shows once there is one. The panel opens at the credits,
+' at the video's end, or from the button; it attaches under upNextLayer,
+' takes focus, and shrinks the video into theme.upNext's box (setVideoBox).
+' An end that comes before the resolution waits for it, for up to
+' playback.upNext.END_WAIT_MS, then the player leaves as after a movie.
+' Auto-play next is one toggle for Options and the panel (m.autoplayNext):
+' the profile's playback.auto_play_next until the viewer changes it, and the
+' countdown also needs roDeviceInfo.IsAutoplayEnabled().
+'
+' The next episode starts in this player (assumption AG-100). Play Now or
+' the countdown stops the session as Back does, with its final position and
+' durable stop job (plan section 6.6); once the reducer is done, the player
+' clears what was the episode's (clearSession) and starts
+' nav.player.nextEpisode's intent: from 0, as an autoplay start, with the
+' carry (automatic advances in a row and the toggle). The same Video node
+' plays it once it has stopped (playback.slot), and load numbers keep
+' counting, so a late callback of the episode before never matches a load
+' of the next. The stack entry stays the first episode's: Back returns to
+' the page it came from, and the pages beneath refresh once, when the
+' player closes. Each next episode is noted on the entry (nav.notePlayed), so
+' that page selects the episode the chain played last, and as the player
+' leaves, so is its last item and whether this playback finished it
+' (playback.upNext.leftFinished), which decides whether that page moves on
+' (spec section 5.6).
+
+const LOG_TAG = "player"
+' The sidecar download's deadline. First extractions of embedded text take
+' about 65 s on the reference file, so the plan's 10 s would always miss them
+' (assumption A-15); "Loading subtitles…" shows meanwhile. New content waits
+' for its selected sidecar up to a cap, and a little for the others
+' (playback.sidecars.waitUntil); a selected one that arrives later reloads
+' the plan to carry it (lateSubtitle).
+const SUBTITLE_TIMEOUT_MS = 120000
+const NOTICE_MS = 4000
+' The keys the controls reducer takes; the others pass on.
+const CONTROL_KEYS = "|back|OK|play|left|right|up|down|rewind|fastforward|replay|options|"
+' Roku's caption mode that shows captions after a replay (plan section 6.10).
+const INSTANT_REPLAY = "Instant replay"
+' The failure screen (tvOS's PlayerView error): the 40 px triangle, 16 px
+' over the title and message, which stand 16 px over the 62 px buttons, 16
+' px apart, the stack centred on the screen.
+const ERROR_WIDTH = 1200
+const ERROR_GAP = 16
+const ERROR_LINE_GAP = 8
+const ERROR_ICON = 40
+const ERROR_BUTTON_HEIGHT = 62
+' How long the start waits for the profile's preferences once the watch
+' projection has answered; both are read at once.
+const PREFERENCES_WAIT_MS = 2000
+' How long after an in-place subtitle switch, or the player's selection
+' once content settles, Roku may still report the track before it as the
+' one it plays (checkSubtitle, confirmSubtitle).
+const SUBTITLE_CHECK_MS = 3000
+' How long after its first frame content takes no subtitle selection the
+' player makes on its own (holdsSubtitle).
+const SUBTITLE_SETTLE_MS = 3000
+' How soon after the player changes started content a "finished" is the
+' change's doing (hardware run 20: 0.17 s after a subtitle selection).
+const WRITE_STOP_MS = 2000
+' How many such stops with one subtitle selected end the player's own
+' selections of it until the viewer chooses a track (confirmSubtitle).
+const WRITE_STOPS_QUIET = 2
+' How long after Silo writes a caption mode Roku's first event may still
+' repeat the mode before it (hardware runs 7 and 17).
+const STALE_CAPTION_MS = 3000
+' The hold indicator's chip stands this far under the preview's tile.
+const HOLD_GAP = 16
+
+sub init()
+    m.video = m.top.findNode("video")
+    ' The node's own agent, set before any content, keeps HttpHeaders off the
+    ' global agent that Posters share (plan section 6.4).
+    agent = CreateObject("roHttpAgent")
+    agent.SetCertificatesFile("common:/certs/ca-bundle.crt")
+    m.video.setHttpAgent(agent)
+    m.video.asyncStopSemantics = true
+    m.video.observeField("state", "onVideoState")
+    m.video.observeField("position", "onVideoPosition")
+    m.video.observeField("audioFormat", "onVideoAudio")
+    m.video.observeField("videoFormat", "onVideoFormat")
+    m.video.observeField("downloadedSegment", "onVideoSegment")
+    m.video.observeField("bufferingStatus", "onVideoBuffer")
+    m.video.observeField("audioTrack", "onVideoTracks")
+    m.video.observeField("subtitleTrack", "onVideoTracks")
+    m.video.observeField("availableSubtitleTracks", "onVideoSubtitles")
+
+    m.overlay = m.top.findNode("overlay")
+    m.overlayFocus = m.overlay.findNode("keyFocus")
+    m.skipButton = m.top.findNode("skipButton")
+    m.recapButton = m.top.findNode("recapButton")
+    m.optionsLayer = m.top.findNode("optionsLayer")
+    m.upNextLayer = m.top.findNode("upNextLayer")
+    m.preview = m.top.findNode("preview")
+    m.preview.span = [theme.player.LEFT, theme.player.RIGHT]
+    m.holdIndicator = m.top.findNode("holdIndicator")
+    m.status = m.top.findNode("status")
+    m.preview.observeField("refresh", "onPreviewRefresh")
+    m.errorPanel = m.top.findNode("errorPanel")
+    m.errorIcon = m.top.findNode("errorIcon")
+    m.errorIcon.setFields({ uri: "pkg:/images/player/warning.png", blendColor: theme.color.ERROR_ICON })
+    m.errorTitle = styled("errorTitle", theme.textStyle.NOTICE_TITLE, theme.color.WHITE)
+    m.errorMessage = styled("errorMessage", theme.textStyle.ERROR_MESSAGE, theme.color.WHITE)
+    for each label in [m.errorTitle, m.errorMessage]
+        label.width = ERROR_WIDTH
+        label.translation = [(1920 - ERROR_WIDTH) \ 2, 0]
+    end for
+    m.retryButton = m.top.findNode("retryButton")
+    m.tryAnywayButton = m.top.findNode("tryAnywayButton")
+    m.tryAnywayButton.text = i18n.text("player.tryAnyway")
+    m.backButton = m.top.findNode("backButton")
+    m.backButton.text = i18n.text("player.goBack")
+    for each button in [m.retryButton, m.tryAnywayButton, m.backButton]
+        button.setFields({ variant: "solid", height: ERROR_BUTTON_HEIGHT, padding: 18, minWidth: 140, textStyle: theme.textStyle.ERROR_BUTTON })
+    end for
+    m.progressTimer = m.top.findNode("progressTimer")
+    m.progressTimer.observeField("fire", "onProgressTimer")
+    m.wakeTimer = m.top.findNode("wakeTimer")
+    m.wakeTimer.observeField("fire", "onWakeTimer")
+    m.controlsTimer = m.top.findNode("controlsTimer")
+    m.controlsTimer.observeField("fire", "onControlsTimer")
+    m.preferencesTimer = m.top.findNode("preferencesTimer")
+    m.preferencesTimer.duration = PREFERENCES_WAIT_MS / 1000
+    m.preferencesTimer.observeField("fire", "onPreferencesTimer")
+    m.panelTimer = m.top.findNode("panelTimer")
+    m.panelTimer.observeField("fire", "onPanelTimer")
+
+    m.clock = CreateObject("roTimespan")
+    ' The reducer's clocks and identity source (playback.session).
+    m.env = {
+        clock: m.clock,
+        wallClock: CreateObject("roDateTime"),
+        now: function() as Dynamic
+            return m.clock.TotalMilliseconds()
+        end function,
+        epoch: function() as Dynamic
+            m.wallClock.Mark()
+            return m.wallClock.AsSeconds()
+        end function,
+        uuid: function() as String
+            return CreateObject("roDeviceInfo").GetRandomUUID()
+        end function
+    }
+    m.slot = playback.slot.create()
+    ' Started with the first sidecar.
+    m.mediaTask = invalid
+    m.mediaQueue = []
+    m.awaitedMediaTask = invalid
+
+    ' What each pending request's answer is for, by request ID.
+    m.requests = {}
+    m.events = []
+    m.dispatching = false
+    m.state = invalid
+    m.intent = invalid
+    ' The content ID playing (onShow, then each next episode), and a next
+    ' episode's season as Up Next found it, until its watch projection
+    ' arrives (playingSeason).
+    m.itemId = ""
+    m.itemSeason = -1
+    ' The watch projection, and the version of the file the plan plays
+    ' (playback.intent.versionOf).
+    m.watch = invalid
+    m.version = invalid
+    ' The entry's nav.player intent, when it has one, and Detail's track
+    ' picks for the version the start plays (nav.player.tracksFor).
+    m.wanted = invalid
+    m.picks = invalid
+    ' The intent whose start waits for the preferences, and whether the
+    ' session's first plan is still to come (playback.options.afterStart).
+    m.waiting = invalid
+    m.firstPlan = true
+    m.identity = invalid
+    ' The last load number of the sessions before, for the next one's
+    ' (playback.session.create).
+    m.loads = 0
+    ' The newest load: { load, plan, playStart, autoplay, reopen, fields,
+    ' proxy, headersReady, assigned, sidecars, sidecarsAt }, and once
+    ' assigned its content, the ready sidecars it carries (tracks), and the
+    ' selected one's path (track), as the slot plays it.
+    m.current = invalid
+    ' The load whose content the Video node has, and whether it is a proxy's.
+    m.activeLoad = invalid
+    m.activeProxy = false
+    ' Whether the active load's content has reached "playing"
+    ' (playback.video.stateEvent), and its sidecar track's path.
+    m.activePlayed = false
+    m.activeTrack = ""
+    ' Whether the plan's subtitle is one Roku must not draw
+    ' (playback.sidecars.suppressed); the shown controls hide captions too
+    ' (drawCaptions).
+    m.subtitleSuppressed = false
+    ' An in-place subtitle switch to check: { load, path, at } (checkSubtitle).
+    m.subtitleCheck = invalid
+    ' Whether the active content has started (the node left its stopped
+    ' state for it), until when after its first frame the player makes no
+    ' subtitle selection on its own (holdsSubtitle), whether the check after
+    ' that has run, when to look again after its selection (confirmSubtitle),
+    ' and when the player last changed the started content (noteWrite).
+    m.activeStarted = false
+    m.settleUntil = invalid
+    m.subtitleConfirmed = false
+    m.recheckAt = invalid
+    m.wroteAt = invalid
+    ' The subtitle selected (its track ID, "" for none) when content last
+    ' finished right after the player changed it, and how many times in a
+    ' row that happened with it selected; a viewer's track choice clears it.
+    m.writeStops = { trackId: "", count: 0 }
+    m.captionMode = ""
+    m.videoMode = ""
+    m.pauseLoad = invalid
+    m.subtitleHandle = invalid
+    m.headerGeneration = invalid
+    m.flags = newFlags()
+    ' The notice's time on the status line (playback.player.noticeShows).
+    m.noticeClock = playback.player.newNoticeClock(0)
+    ' The controls reducer, the events raised while its commands run, and
+    ' whether focus waits for them (setOverlayFlags).
+    m.controls = playback.controls.create()
+    m.controlEvents = []
+    m.controlsBusy = false
+    m.refocus = false
+    ' Read once per session, beside the watch projection.
+    m.preferences = playback.preferences.defaults()
+    m.preferencesRequested = false
+    m.preferencesRead = false
+    ' Auto-play next for Up Next: the profile's until the viewer changes it
+    ' in Options, for this session only.
+    m.autoplayNext = m.preferences.autoPlayNext
+    m.autoplayChosen = false
+    ' The Options panel while it is open, its copy, and the model it was
+    ' last given, as JSON.
+    m.optionsPanel = invalid
+    m.optionsCopy = invalid
+    m.optionsModel = ""
+    ' The tab Options showed last, which it opens on next.
+    m.optionsTab = playback.options.TAB_INFO
+    m.modelType = CreateObject("roDeviceInfo").GetModelType()
+    ' Roku's * overlay as the player watches it (playback.options.watchOverlay).
+    m.overlayWatch = { played: false, audio: "", subtitle: "" }
+    ' The seek previews' latest manifest read, and the file they are for.
+    m.previewFetch = invalid
+    m.previewFileId = ""
+    ' Replay forced captions on over "Instant replay" (replayCaptions).
+    m.replayForced = false
+    ' The mode before Silo's last caption-mode write and until when Roku's
+    ' first event may still repeat it (onPlatform).
+    m.staleCaption = invalid
+    ' The burned-in subtitle captions Off set aside, for On to ask for again,
+    ' and the caption mode a plan's arrival last sent a track_change for
+    ' (followCaptions).
+    m.burnWanted = invalid
+    m.followedMode = invalid
+    ' The playing file's markers (playback.markers) and the file they are
+    ' for; Skip Intro's and Up Next's reducers, Up Next's panel while it
+    ' shows, and the next episode's resolution until it settles, then what it
+    ' found.
+    m.markers = []
+    m.markersFileId = ""
+    m.skip = invalid
+    m.recap = invalid
+    m.upNext = invalid
+    m.upNextPanel = invalid
+    m.resolution = invalid
+    m.nextUp = invalid
+    ' The item's video played to its end (endOfVideo).
+    m.videoEnded = false
+    ' Up Next's { itemId, carry } until the session it ends is done.
+    m.advance = invalid
+    m.errorVisible = false
+    m.retryable = false
+    ' The error says the server could not be reached: Try Anyway shows, and
+    ' Retry checks the server first.
+    m.unreachable = false
+    m.checkingServer = false
+    m.leaving = false
+    m.done = false
+    m.closed = false
+    m.released = false
+    m.slowStops = 0
+    m.lastStopMs = invalid
+end sub
+
+function newFlags() as Object
+    return { starting: false, stopping: false, reconnecting: false, progressPending: false, subtitlesLoading: false, notice: "" }
+end function
+
+function styled(id as String, style as String, color as String) as Object
+    label = m.top.findNode(id)
+    label.font = theme.font(style)
+    label.color = color
+    return label
+end function
+
+' --- Screen hooks -------------------------------------------------------------
+
+sub onShow(event as Object)
+    applyFocus()
+    if not event.first then return
+    params = m.top.entry.params
+    m.itemId = ""
+    m.startOver = false
+    ' A deep link's or detail page's entry carries an intent
+    ' (source/nav/player.bs); the test player entry passes the item ID and
+    ' Start over directly.
+    m.wanted = nav.player.intentOf(params)
+    if m.wanted <> invalid
+        m.itemId = m.wanted.contentId
+        m.startOver = m.wanted.startPositionRule = nav.player.START_OVER
+    else if util.isObject(params)
+        m.itemId = util.text(params.itemId)
+        m.startOver = util.isTrue(params.startOver)
+    end if
+    if m.itemId = ""
+        showLocalError({ title: "Nothing to play", message: "No title was chosen." }, false)
+        return
+    end if
+    loadWatch()
+end sub
+
+' AppScene is destroying the screen: after this player finished, or for a new
+' account, profile, or server. The reducer hands its stop to ApiTask first; a
+' start still unanswered is ApiTask's to stop once AppScene releases this
+' screen's owner (playback.worker.cancel).
+sub onRelease()
+    m.released = true
+    if m.state <> invalid and not m.done
+        if identityChanged()
+            dispatch({ type: "identityChange" })
+        else
+            dispatch({ type: "back" })
+        end if
+    end if
+    m.closed = true
+    m.progressTimer.control = "stop"
+    m.wakeTimer.control = "stop"
+    m.controlsTimer.control = "stop"
+    m.preferencesTimer.control = "stop"
+    m.panelTimer.control = "stop"
+    replayCaptions(false)
+    m.video.control = "stop"
+    ' MediaTask deletes the cache's files before it ends.
+    trimCache(sidecarCache(), playback.sidecarCache.MAX_BYTES)
+    stopMediaTask()
+    ' AppScene releases the owner, and with it the manifest read.
+    playback.trickplay.cancel(m.previewFetch)
+    m.preview.active = false
+    m.preview.manifest = {}
+end sub
+
+function identityChanged() as Boolean
+    view = api.session.current()
+    if view = invalid or not util.isObject(view.profile) then return true
+    return view.origin <> m.identity.server or view.accountId <> m.identity.account or view.profile.id <> m.identity.profile
+end function
+
+' --- Starting -------------------------------------------------------------------
+
+' GET /api/v2/watch/{id}: the file, its audio tracks, and the saved position.
+sub loadWatch()
+    hideError()
+    view = api.session.current()
+    if view = invalid or view.status <> "signed_in" or not util.isObject(view.profile)
+        showLocalError({ title: "Sign in first", message: "Sign in and choose a profile, then play again." }, false)
+        return
+    end if
+    m.flags.starting = true
+    handle = handleFor("onWatch")
+    m.requests[api.send({ path: "/api/v2/watch/" + api.request.escape(m.itemId), auth: "profile" }, handle)] = "watch"
+    loadPreferences()
+    refreshChrome()
+end sub
+
+' The profile's playback preferences, once per session and in parallel with
+' the watch projection: the start never waits for them, and the defaults
+' apply until they answer or when the read fails.
+sub loadPreferences()
+    if m.preferencesRequested then return
+    m.preferencesRequested = true
+    m.requests[api.send(playback.preferences.request(), handleFor("onPreferences"))] = "preferences"
+end sub
+
+sub onPreferences(event as Object)
+    handle = event.getRoSGNode()
+    takeRequest(handle)
+    result = api.resultOf(handle)
+    body = invalid
+    if result <> invalid and result.ok = true
+        body = result.body
+    else
+        status = 0
+        if result <> invalid then status = result.status
+        log.warn(LOG_TAG, "the playback preferences could not be read; using the defaults", { status: status })
+    end if
+    m.preferences = playback.preferences.parse(body)
+    m.preferencesRead = true
+    if not m.autoplayChosen then setAutoplay(m.preferences.autoPlayNext)
+    if m.skip <> invalid and playback.skipIntro.modeOf(m.preferences.introSkipMode) <> m.skip.mode then runSkip({ type: "mode", mode: m.preferences.introSkipMode })
+    runRecap({ type: "autoSkip", value: m.preferences.autoSkipRecap })
+    m.overlay.skipBackSeconds = m.preferences.skipBackSeconds
+    m.overlay.skipForwardSeconds = m.preferences.skipForwardSeconds
+    dispatchControls({ type: "preferences", skipBackSeconds: m.preferences.skipBackSeconds, skipForwardSeconds: m.preferences.skipForwardSeconds })
+    if m.waiting <> invalid then beginWaiting()
+end sub
+
+' The preferences are late: the start goes ahead with the defaults.
+sub onPreferencesTimer()
+    if m.waiting = invalid or m.closed then return
+    log.warn(LOG_TAG, "the playback preferences are late; starting with the defaults", { ms: PREFERENCES_WAIT_MS })
+    beginWaiting()
+end sub
+
+sub beginWaiting()
+    intent = m.waiting
+    m.waiting = invalid
+    m.preferencesTimer.control = "stop"
+    begin(intent)
+end sub
+
+sub onWatch(event as Object)
+    handle = event.getRoSGNode()
+    takeRequest(handle)
+    ' Back while the next episode's projection was read.
+    if m.leaving then return
+    result = api.resultOf(handle)
+    if result = invalid or result.ok <> true
+        status = 0
+        if result <> invalid then status = result.status
+        log.warn(LOG_TAG, "the item could not be read", { status: status })
+        m.flags.starting = false
+        if status = 404
+            showLocalError({ title: "Not available", message: "This title is no longer available on the server." }, false)
+        else
+            showLocalError({ title: "Can't load this title", message: "Check the connection to the server, then try again." }, true)
+        end if
+        return
+    end if
+    ' The version Detail's Version button chose, else the start path's.
+    intent = playback.intent.fromWatch(result.body, m.itemId, nav.player.pinnedFile(m.wanted))
+    if intent = invalid
+        m.flags.starting = false
+        showLocalError({ title: "Can't play this title", message: "The server lists no file for it." }, false)
+        return
+    end if
+    m.watch = result.body
+    if m.preferencesRead
+        begin(intent)
+    else
+        m.waiting = intent
+        m.preferencesTimer.control = "start"
+    end if
+end sub
+
+' Resume starts 7 s before the saved position, Start Over at 0, and a title
+' never started where the server says. Up Next's next episode starts at 0
+' as an autoplay start, with the carry of the episode before.
+sub begin(intent as Object)
+    m.intent = intent
+    m.version = playback.intent.versionOf(m.watch, intent.fileId)
+    title = intent.name
+    if title = "" then title = intent.title
+    m.overlay.setFields({ series: playback.controls.seriesLine(intent), title: title, tag: playback.controls.episodeTag(intent) })
+    carry = nav.player.carryOf(m.wanted)
+    chained = carry <> invalid
+    if chained
+        ' The page the first episode was played from selects this one when
+        ' the player leaves.
+        nav.notePlayed(m.itemId, playingSeason())
+        if util.isBoolean(carry.autoPlay)
+            m.autoplayChosen = true
+            setAutoplay(carry.autoPlay)
+        end if
+    end if
+    readMarkers(intent.fileId)
+    m.skip = playback.skipIntro.create(m.preferences.introSkipMode, m.markers)
+    m.recap = playback.skipRecap.create(m.preferences.autoSkipRecap, m.markers)
+    m.upNext = invalid
+    if intent.kind = "episode"
+        if not chained then carry = playback.upNext.newCarry()
+        m.upNext = playback.upNext.create({ creditsStart: playback.markers.creditsStart(m.markers), runtime: intent.runtime, autoPlayNext: m.autoplayNext, deviceAutoplay: CreateObject("roDeviceInfo").IsAutoplayEnabled(), carry: carry })
+    end if
+    ' The Up Next button waits for a next episode (resolveNext).
+    showUpNextButton(false)
+    view = api.session.current()
+    m.identity = { server: view.origin, account: view.accountId, profile: view.profile.id }
+    m.state = playback.session.create({ identity: m.identity, loads: m.loads })
+    current = platform.current()
+    m.captionMode = util.text(current.captionMode)
+    m.preview.tier = playback.trickplay.previewTier(current.memory)
+    ' A scrub before the first plan shows the time alone.
+    m.preview.manifest = playback.trickplay.pending()
+    platform.subscribe(m.top.owner, [platform.topic.CAPTION_MODE, platform.topic.MEMORY_LEVEL, platform.topic.CODEC_CAPABILITY, platform.topic.HDMI], "onPlatform")
+    ' Hidden screens release their browse textures before any stream loads.
+    platform.beforePlayback()
+    startPosition = playback.intent.resumeAt(intent.resumeSeconds)
+    if m.startOver then startPosition = 0
+    m.progressTimer.control = "start"
+    dispatchControls({ type: "show" })
+    ' Detail's Audio and Subtitles choices for the version it read, else the
+    ' worker's audio (the version's effective track) and no subtitle.
+    m.picks = nav.player.tracksFor(m.wanted, intent.fileId)
+    initial = playback.options.initialTracks(m.watch, m.preferences, m.picks)
+    playIntent = { contentId: m.itemId, fileId: intent.fileId, pinsVersion: intent.pinned, audioTracks: intent.audioTracks, effectiveAudioIndex: intent.effectiveAudioIndex, audioIndex: initial.audioIndex, subtitleIndex: initial.subtitleIndex, audioLanguage: util.text(m.preferences.audioLanguage) }
+    ' The profile's quality and bitrate cap, as read before the start or the
+    ' defaults (Auto, no cap); an Options choice replaces the quality for
+    ' this title's session.
+    dispatch({ type: "play", intent: playIntent, quality: m.preferences.preferredQuality, bandwidthCapKbps: m.preferences.maxBitrateKbps, autoplay: chained, catalogRuntime: intent.runtime, startPosition: startPosition })
+end sub
+
+' --- The reducer ----------------------------------------------------------------
+
+' Reduces event, and any event raised while its commands run, in order.
+sub dispatch(event as Object)
+    if m.state = invalid then return
+    m.events.Push(event)
+    if m.dispatching then return
+    m.dispatching = true
+    while m.events.Count() > 0 and not m.closed
+        for each command in playback.session.reduce(m.state, m.events.Shift(), m.env)
+            execute(command)
+        end for
+    end while
+    m.events = []
+    m.dispatching = false
+    if m.closed then return
+    scheduleWake()
+    refreshChrome()
+    advanceWhenDone()
+end sub
+
+sub execute(command as Object)
+    t = command.type
+    if t = "start"
+        m.flags.starting = true
+        m.requests[api.playback.start(command, handleFor("onCommandAnswer"))] = command
+    else if t = "replan"
+        m.requests[api.playback.replan(command, m.intent.audioTracks, handleFor("onCommandAnswer"))] = command
+    else if t = "progress"
+        m.requests[api.playback.progress(command, handleFor("onCommandAnswer"))] = command
+    else if t = "routeEvent"
+        api.playback.routeEvent(command, api.newHandle(m.top.owner))
+    else if t = "job"
+        api.playback.job(command, api.newHandle(m.top.owner))
+    else if t = "load"
+        m.flags.starting = false
+        prepare({ load: command.load, plan: command.plan, playStart: command.playerStart, autoplay: command.autoplay, reopen: false, refresh: util.isTrue(command.refresh) })
+        planLoaded(command.plan)
+    else if t = "reopen"
+        if m.current <> invalid then prepare({ load: command.load, plan: m.current.plan, playStart: command.playerPosition, autoplay: command.autoplay, reopen: true, refresh: util.isTrue(command.refresh), sidecars: m.current.sidecars, sidecarsAt: m.current.sidecarsAt })
+    else if t = "retrack"
+        retrack(command)
+    else if t = "seek"
+        seekLoad(command.load, command.playerPosition)
+    else if t = "refuseAudioCodec"
+        api.playback.refuseAudioCodec(command.codec, api.newHandle(m.top.owner))
+    else if t = "reconnecting"
+        m.flags.reconnecting = command.active
+    else if t = "progressPending"
+        m.flags.progressPending = command.pending
+    else if t = "error"
+        showReducerError(command, util.isTrue(command.retryable))
+    else if t = "finished"
+        endOfVideo()
+    else if t = "exit"
+        ' Up Next's next episode follows the session it ends.
+        if m.advance = invalid then leavePlayer()
+    else if t = "done"
+        m.done = true
+        closeWhenStopped()
+    else if t = "log"
+        if command.level = "debug"
+            log.debug(LOG_TAG, command.message, command.fields)
+        else if command.level = "info"
+            log.info(LOG_TAG, command.message, command.fields)
+        else
+            log.warn(LOG_TAG, command.message, command.fields)
+        end if
+    else if t = "refused"
+        refused(command.operation)
+    end if
+    ' "subtitleShift" needs nothing more: every plan's sidecar is fetched and
+    ' shifted for its own timeline offset when the plan loads.
+end sub
+
+' The server refused a replan the session asked for, and the plan playing
+' stays: a notice says a track or quality change did not happen. An
+' output change follows the device, never the viewer, so it says nothing.
+sub refused(operation as String)
+    if operation = "track_change"
+        notice(i18n.text("player.trackRefused"))
+    else if operation = "quality_change"
+        notice(i18n.text("player.qualityRefused"))
+    end if
+end sub
+
+' ApiTask's answer to a start, replan, or progress command.
+sub onCommandAnswer(event as Object)
+    handle = event.getRoSGNode()
+    command = takeRequest(handle)
+    if command = invalid then return
+    result = api.resultOf(handle)
+    body = invalid
+    if result <> invalid and result.ok = true then body = result.body
+    if command.type = "start" and util.isObject(body) and util.text(body.reason) <> "" then log.warn(LOG_TAG, "start refused", { reason: body.reason })
+    reducerEvent = playback.player.answerEvent(command, body)
+    if reducerEvent <> invalid then dispatch(reducerEvent)
+end sub
+
+sub onProgressTimer()
+    dispatch({ type: "tick" })
+end sub
+
+sub onWakeTimer()
+    runSlot(playback.slot.tick(m.slot, m.env.now()))
+    if m.current <> invalid then tryAssign(m.current)
+    dispatch({ type: "wake" })
+end sub
+
+' The reducer's next wake, the slot's deadlines, or the end of the wait for
+' sidecars, whichever comes first.
+sub scheduleWake()
+    now = m.env.now()
+    wake = playback.session.nextWake(m.state, now, m.env.epoch())
+    wake = sooner(wake, playback.slot.wakeAt(m.slot))
+    item = m.current
+    if item <> invalid and not item.assigned then wake = sooner(wake, playback.sidecars.waitUntil(item.sidecars, item.sidecarsAt))
+    m.wakeTimer.control = "stop"
+    if wake = invalid then return
+    delay = (wake - now) / 1000
+    if delay < 0.01 then delay = 0.01
+    m.wakeTimer.duration = delay
+    m.wakeTimer.control = "start"
+end sub
+
+function sooner(current as Dynamic, candidate as Dynamic) as Dynamic
+    if candidate = invalid then return current
+    if current = invalid or candidate < current then return candidate
+    return current
+end function
+
+' --- Loads ------------------------------------------------------------------------
+
+' A new plan's content: Options describes the file it plays, the previews
+' and markers follow that file, and the session's first plan takes the
+' subtitle the start's rule asks for (playback.options.afterStart), the
+' preferences read as they are now; that is at most one track_change, and it
+' leaves Roku's caption mode alone (assumption AG-75). With captions off, a
+' subtitle only a burn-in would show is set aside for On instead. Any other
+' plan may need to follow the caption mode (followCaptions). The first plan
+' also starts the next episode's resolution.
+sub planLoaded(plan as Object)
+    fileId = playback.intent.playingFile(plan, m.intent.fileId)
+    m.version = playback.intent.versionOf(m.watch, fileId)
+    followPreviews(fileId)
+    followMarkers(fileId)
+    change = invalid
+    if m.firstPlan
+        m.firstPlan = false
+        resolveNext()
+        change = playback.options.afterStart(plan, m.version, playback.options.initialTracks(m.watch, m.preferences, m.picks))
+        if change <> invalid and m.captionMode = playback.options.CAPTION_OFF and playback.options.burnsIn(plan, change.tracks)
+            m.burnWanted = change.tracks.subtitle
+            change = invalid
+        end if
+    end if
+    if change <> invalid
+        dispatch(change)
+    else
+        followCaptions(true)
+    end if
+end sub
+
+' A plan to play, or the current plan to reopen at a position: its content
+' needs media headers for its URL (none for a proxy node), from refreshed
+' tokens when the load renews the content's credential (refresh), and waits
+' briefly for its subtitle sidecars, which a reopen keeps.
+sub prepare(item as Object)
+    if not item.reopen
+        cancelSubtitle()
+        item.sidecars = []
+    end if
+    m.current = item
+    item.assigned = false
+    item.headersReady = false
+    base = serverBase()
+    item.fields = playback.media.contentFields(item.plan, base, item.playStart, m.intent.title)
+    if item.fields = invalid
+        stream = item.plan.stream
+        message = "unsupported stream"
+        if util.isObject(stream) then message = message + " " + util.text(stream.protocol) + "/" + util.text(stream.container)
+        dispatch({ type: "failure", load: item.load, kind: "player", message: message })
+        return
+    end if
+    item.proxy = playback.media.isProxy(item.fields.url, base)
+    if not item.reopen then log.info(LOG_TAG, "plan", playback.player.planFacts(item.plan, item.proxy))
+    if not item.autoplay then m.pauseLoad = item.load
+    if not item.reopen then startSidecars(item)
+    ' A renewal refreshes the tokens first, unless they already were.
+    m.requests[api.session.mediaHeaders(item.fields.url, m.headerGeneration, util.isTrue(item.refresh), handleFor("onHeaders"))] = item
+end sub
+
+sub onHeaders(event as Object)
+    handle = event.getRoSGNode()
+    item = takeRequest(handle)
+    if item = invalid or not isCurrent(item.load) then return
+    result = api.resultOf(handle)
+    if result = invalid or result.ok <> true
+        reason = "media_headers"
+        if result <> invalid and util.isObject(result.error) then reason = util.text(result.error.kind)
+        log.warn(LOG_TAG, "no media headers", { kind: reason })
+        dispatch({ type: "unplayable", reason: reason })
+        return
+    end if
+    item.headers = result.body.httpHeaders
+    item.headersReady = true
+    if util.isTrue(result.body.credentialed)
+        m.headerGeneration = result.body.generation
+        ' When the content's credential expires, and when to renew it.
+        dispatch({ type: "credentials", load: item.load, expiresAt: result.body.expiresAt, renewFrom: result.body.refreshAt })
+    end if
+    tryAssign(item)
+end sub
+
+' Builds the item's content once its headers are in and its sidecars are
+' ready, failed, or past their wait, and hands it to the slot. The content
+' carries every ready sidecar, so the viewer can switch between them in
+' place (playback.sidecars), but none for a plan without a subtitle once
+' captions have come on (playback.sidecars.mayCarry).
+sub tryAssign(item as Object)
+    if item.assigned or not item.headersReady then return
+    waitEnds = playback.sidecars.waitUntil(item.sidecars, item.sidecarsAt)
+    if waitEnds <> invalid and m.env.now() < waitEnds
+        if playback.sidecars.selectedPending(item.sidecars) then stopForSubtitle()
+        return
+    end if
+    fields = item.fields
+    content = CreateObject("roSGNode", "ContentNode")
+    content.url = fields.url
+    content.streamFormat = fields.streamFormat
+    content.playStart = fields.playStart
+    content.title = fields.title
+    ' The lines exist only on this content node from here on.
+    if item.headers.Count() > 0 then content.httpHeaders = item.headers
+    item.headers = invalid
+    item.content = content
+    item.tracks = []
+    item.track = ""
+    if playback.sidecars.mayCarry(item.plan, m.captionMode)
+        for each track in item.sidecars
+            if track.state = "ready"
+                item.tracks.Push(track)
+                if track.selected then item.track = track.path
+            end if
+        end for
+    end if
+    if item.tracks.Count() > 0 then content.subtitleTracks = subtitleTracks(item.tracks)
+    item.assigned = true
+    runSlot(playback.slot.assign(m.slot, m.video.state, item, m.env.now()))
+end sub
+
+' While new content waits for its selected sidecar, the Video node plays
+' nothing: the content before it, played on, would be played again from
+' where the new plan starts, and stopped seconds later it may be stopping
+' as Roku opens it (hardware run 24: 3.3-3.6 s, all after Roku listed the
+' file's own tracks and before its first frame). The status line says
+' "Loading subtitles…" meanwhile.
+sub stopForSubtitle()
+    if playback.slot.isStopping(m.slot) or playback.slot.isIdle(m.video.state) then return
+    log.info(LOG_TAG, "the content waits for its subtitle; the Video node stops", invalid)
+    runSlot(playback.slot.halt(m.slot, m.video.state, m.env.now()))
+end sub
+
+' --- Platform events --------------------------------------------------------
+
+' The interface callback for platform.subscribe.
+sub onPlatform(event as Object)
+    if m.closed or m.state = invalid then return
+    if event.type = platform.topic.CAPTION_MODE
+        ' Roku's overlay changed it; Silo's UI writes it only on the
+        ' viewer's choice (plan section 6.10), and Replay over "Instant
+        ' replay" for its span, whose own write is not the viewer's.
+        mode = util.text(event.mode)
+        if m.replayForced and mode = "On" then return
+        m.replayForced = false
+        ' Roku's first event after Silo writes a mode sometimes repeats the
+        ' mode before it (run 7: Instant replay before On mute; run 17: On or
+        ' Instant replay before Off), so that one repeat is not the viewer's.
+        stale = m.staleCaption
+        m.staleCaption = invalid
+        if stale <> invalid and mode = stale.mode and m.env.now() < stale.until then return
+        ' The mode is Roku's setting, not what a Roku TV shows under On mute
+        ' (platform.captionModeEvent), so muting and unmuting change nothing
+        ' (hardware run 17). The echo of Silo's own write changes nothing.
+        changed = mode <> m.captionMode
+        m.captionMode = mode
+        log.info(LOG_TAG, "caption mode", { mode: mode })
+        refreshOptions()
+        if changed then followCaptions(false)
+        return
+    end if
+    if event.type = platform.topic.MEMORY_LEVEL
+        m.preview.tier = playback.trickplay.previewTier(event)
+        ' Under pressure the cache keeps only what plays.
+        level = util.text(event.level)
+        if level = memory.level.PRESSURE or level = memory.level.CRITICAL then trimCache(sidecarCache(), 0)
+        return
+    end if
+    m.requests[api.playback.outputContext(handleFor("onOutputProbed"))] = "outputContext"
+end sub
+
+sub onOutputProbed(event as Object)
+    handle = event.getRoSGNode()
+    takeRequest(handle)
+    result = api.resultOf(handle)
+    if result = invalid or result.ok <> true or not util.isObject(result.body) or not util.isString(result.body.outputContextId) then return
+    dispatch({ type: "outputContext", outputContextId: result.body.outputContextId })
+end sub
+
+sub runSlot(actions as Object)
+    for each action in actions
+        if action.action = "stop"
+            m.video.control = "stop"
+        else if action.action = "play"
+            playItem(action.item, action.waitedMs)
+        else if action.action = "slow"
+            m.slowStops = m.slowStops + 1
+            log.warn(LOG_TAG, "the Video node is still stopping", { ms: playback.slot.FIRST_WAIT_MS })
+        else if action.action = "stuck"
+            log.warn(LOG_TAG, "the Video node did not stop", { ms: playback.slot.SECOND_WAIT_MS })
+            if m.leaving
+                closeWhenStopped()
+            else
+                dispatch({ type: "unplayable", reason: "video_stuck" })
+            end if
+        end if
+    end for
+end sub
+
+' The caption mode is left as it is: only the viewer's choices in Silo's UI
+' write it (plan section 6.10). Captions that came on while the content
+' waited for the stop leave a plan without a subtitle no sidecars, and the
+' node draws no subtitle but the plan's (playback.sidecars.suppressed).
+sub playItem(item as Object, waitedMs as Dynamic)
+    if waitedMs <> invalid
+        m.lastStopMs = waitedMs
+        log.info(LOG_TAG, "content assigned after the stop", { ms: waitedMs })
+    end if
+    ' An item that waited for the stop may have been replaced by a newer
+    ' load, or the player may have left or shown an error meanwhile.
+    if m.leaving or m.errorVisible or not isCurrent(item.load) then return
+    if item.tracks.Count() > 0 and not playback.sidecars.mayCarry(item.plan, m.captionMode)
+        item.tracks = []
+        item.content.subtitleTracks = []
+    end if
+    m.activeLoad = item.load
+    m.activeProxy = item.proxy
+    m.activePlayed = false
+    m.activeTrack = item.track
+    m.subtitleCheck = invalid
+    m.activeStarted = false
+    m.settleUntil = invalid
+    m.subtitleConfirmed = false
+    m.recheckAt = invalid
+    m.wroteAt = invalid
+    m.subtitleSuppressed = playback.sidecars.suppressed(item.plan, item.track)
+    drawCaptions()
+    m.video.content = item.content
+    if item.track <> "" then setSubtitleTrack(item.track)
+    m.video.control = "play"
+    ' The load's startup stall clock starts now (playback.session).
+    dispatch({ type: "assigned", load: item.load })
+end sub
+
+' A local seek on the current plan, or, before its content plays, a later
+' start position: on the fields while headers or the sidecar are awaited,
+' on the content while it waits for the previous one to stop.
+sub seekLoad(load as Integer, playerPosition as Dynamic)
+    item = m.current
+    if item = invalid or item.load <> load or item.fields = invalid then return
+    if not item.assigned
+        item.fields.playStart = playerPosition
+    else if m.activeLoad <> invalid and m.activeLoad = load
+        m.video.seek = playerPosition
+    else
+        item.content.playStart = playerPosition
+    end if
+end sub
+
+function isCurrent(load as Integer) as Boolean
+    return m.current <> invalid and m.current.load = load
+end function
+
+function serverBase() as String
+    view = api.session.current()
+    if view = invalid then return ""
+    return util.text(view.origin)
+end function
+
+' --- Video callbacks ------------------------------------------------------------
+
+sub onVideoState()
+    videoState = m.video.state
+    ' The state belongs to the content the node had; an idle state may let
+    ' the slot assign newer content, which has reported nothing yet.
+    load = m.activeLoad
+    runSlot(playback.slot.stateChanged(m.slot, videoState, m.env.now()))
+    if m.leaving
+        closeWhenStopped()
+        return
+    end if
+    if load = invalid or m.activeLoad <> load then return
+    if videoState = "error"
+        reportError(load)
+        return
+    end if
+    if videoState = "buffering" or videoState = "playing" or videoState = "paused" then m.activeStarted = true
+    firstFrame = false
+    if videoState = "playing" and not m.activePlayed
+        ' From here on, the node's tracks as they are now are the player's,
+        ' and a change is the viewer's in Roku's overlay. Roku may still
+        ' report a track it picked as the content opened; the player checks
+        ' what Roku plays once the settle time is over (confirmSubtitle).
+        m.overlayWatch.audio = util.text(m.video.audioTrack)
+        m.overlayWatch.subtitle = util.text(m.video.subtitleTrack)
+        m.activePlayed = true
+        m.settleUntil = m.env.now() + SUBTITLE_SETTLE_MS
+        logRokuSubtitle("first frame")
+        firstFrame = true
+        logFormats("first frame")
+        ' Playback accepts remote keys: a deep-link launch fires AppLaunchComplete.
+        m.top.ready = true
+    end if
+    if videoState = "playing" and m.pauseLoad <> invalid and m.pauseLoad = load
+        ' A plan adopted while the viewer had paused opens paused.
+        m.pauseLoad = invalid
+        m.video.control = "pause"
+    else if firstFrame
+        ' The controls the start showed make way for the picture.
+        dispatchControls({ type: "firstFrame" })
+    end if
+    afterWrite = false
+    if videoState = "finished" and m.wroteAt <> invalid and m.state.plan <> invalid then afterWrite = m.env.now() - m.wroteAt <= WRITE_STOP_MS
+    if afterWrite
+        ' Roku stopped content right after the player changed it; the
+        ' session reloads it unless it ended, and the reload's content
+        ' carries the plan's selection (confirmSubtitle counts the stops).
+        log.warn(LOG_TAG, "the Video node finished right after the player changed it", { played: m.activePlayed, ms: m.env.now() - m.wroteAt })
+        trackId = playback.media.selectedSubtitle(m.state.plan.data)
+        if trackId <> m.writeStops.trackId then m.writeStops = { trackId: trackId, count: 0 }
+        m.writeStops.count = m.writeStops.count + 1
+    end if
+    reducerEvent = playback.video.stateEvent(videoState, load, m.activePlayed, afterWrite)
+    if reducerEvent <> invalid
+        dispatch(reducerEvent)
+        runSkip({ type: "player", state: reducerEvent.state })
+    end if
+    ' The plan follows a caption mode that changed while its content loaded.
+    if firstFrame then followCaptions(true)
+    refreshChrome()
+end sub
+
+' What the device decodes, for Dolby Vision and audio checks on device runs
+' (plan section 6.11): videoFormat has no Dolby Vision value, so the output
+' mode is logged too.
+sub logFormats(reason as String)
+    m.videoMode = CreateObject("roDeviceInfo").GetVideoMode()
+    log.info(LOG_TAG, "video formats", { reason: reason, videoFormat: util.text(m.video.videoFormat), audioFormat: util.text(m.video.audioFormat), videoMode: m.videoMode })
+end sub
+
+' errorStr can quote the media URL, and with it a signed token: it is
+' redacted before it is logged or sent as the failure message.
+sub reportError(load as Integer)
+    detail = util.text(m.video.errorStr)
+    message = "Video error " + util.text(m.video.errorCode) + ": " + redact.text(detail)
+    failure = playback.video.failure(load, m.video.errorCode, m.video.errorInfo, detail, m.activeProxy, message)
+    category = ""
+    if util.isObject(m.video.errorInfo) then category = util.text(m.video.errorInfo.category)
+    log.warn(LOG_TAG, "Video error", { error: m.video.errorCode, status: failure.status, category: category, kind: failure.event.kind, message: message })
+    dispatch(failure.event)
+end sub
+
+' Skip Intro and Up Next follow the session's source position once the load
+' plays.
+sub onVideoPosition()
+    if m.leaving or m.activeLoad = invalid then return
+    dispatch({ type: "position", load: m.activeLoad, position: m.video.position })
+    if m.state = invalid or m.state.plan = invalid or not m.state.plan.loadPlayed then return
+    confirmSubtitle()
+    checkSubtitle()
+    position = m.state.player.position
+    runSkip({ type: "position", seconds: position })
+    runUpNext({ type: "position", seconds: position })
+end sub
+
+sub onVideoAudio()
+    if m.leaving or m.activeLoad = invalid then return
+    if m.activePlayed then logFormats("audio")
+    reducerEvent = playback.video.audioEvent(m.video.audioFormat, m.activeLoad)
+    if reducerEvent <> invalid then dispatch(reducerEvent)
+end sub
+
+sub onVideoFormat()
+    if m.leaving or m.activeLoad = invalid or not m.activePlayed then return
+    logFormats("video")
+end sub
+
+' Media data arrived. The stall clock tells a buffer that still fills (the
+' network) from a decoder that has its media and shows nothing
+' (playback.recovery.noteMedia). A segment whose download failed is not
+' media.
+sub onVideoSegment()
+    if m.leaving or m.activeLoad = invalid then return
+    reducerEvent = playback.video.segmentEvent(m.video.downloadedSegment, m.activeLoad)
+    if reducerEvent <> invalid then dispatch(reducerEvent)
+end sub
+
+sub onVideoBuffer()
+    if m.leaving or m.activeLoad = invalid then return
+    reducerEvent = playback.video.bufferEvent(m.video.bufferingStatus, m.activeLoad)
+    if reducerEvent <> invalid then dispatch(reducerEvent)
+end sub
+
+' Video.audioTrack or subtitleTrack changed. A track the viewer chose in
+' Roku's * overlay becomes a track_change, or is written back when it is not
+' one of the plan's (playback.options.watchOverlay, plan section 6.10). The
+' node's values are read as they are now, so a queued callback sees the
+' player's latest write; what Roku picks while content opens, and the echo
+' of the player's own writes, are not choices.
+sub onVideoTracks()
+    if m.leaving or m.closed or m.state = invalid or m.state.plan = invalid or m.activeLoad = invalid then return
+    logRokuSubtitle("track changed")
+    watch = m.overlayWatch
+    watch.played = m.activePlayed and isCurrent(m.activeLoad) and m.state.plan.load = m.activeLoad
+    watch.version = m.version
+    watch.rokuAudio = m.video.availableAudioTracks
+    watch.contentTracks = invalid
+    if watch.played then watch.contentTracks = m.current.tracks
+    ' The audio is read first (playback.options.fromRokuOverlay).
+    subtitle = util.text(m.video.audioTrack) = util.text(watch.audio)
+    outcome = playback.options.watchOverlay(m.state.plan.data, watch, util.text(m.video.audioTrack), util.text(m.video.subtitleTrack))
+    if outcome.kind = playback.options.OUTCOME_TRACKS
+        log.info(LOG_TAG, "a track chosen in Roku's overlay", { inPlace: outcome.event.inPlace })
+        trackChosen(subtitle)
+        dispatch(outcome.event)
+    else if outcome.kind = playback.options.OUTCOME_REVERT
+        log.info(LOG_TAG, "a track chosen in Roku's overlay is not the plan's; it is put back", invalid)
+        if outcome.DoesExist("audioTrack")
+            noteWrite()
+            m.video.audioTrack = outcome.audioTrack
+        end if
+        ' So soon after the first frame the change is Roku's, not the
+        ' viewer's: the sidecar is selected once the content settles, if
+        ' Roku still reports another track then (confirmSubtitle).
+        if outcome.DoesExist("subtitleTrack") and not holdsSubtitle()
+            noteWrite()
+            setSubtitleTrack(outcome.subtitleTrack)
+        end if
+    end if
+end sub
+
+' --- Subtitles (plan section 6.8, transport 2) ------------------------------
+
+' Downloads the sidecars the content carries (playback.sidecars.offered), one
+' at a time and the plan's selected one first, each with the profile's
+' credentials (all are on the configured origin); MediaTask then shifts and
+' converts each to SRT. One the session's cache keeps is ready at once
+' (playback.sidecarCache).
+sub startSidecars(item as Object)
+    offerSidecars(item, serverBase())
+    fetchSidecar(item)
+end sub
+
+' The item's sidecars, against the server's base URL, those the cache keeps
+' ready and the others queued.
+sub offerSidecars(item as Object, base as String)
+    item.sidecarsAt = m.env.now()
+    cache = sidecarCache()
+    selected = false
+    for each track in playback.sidecars.offered(item.plan, base, m.captionMode)
+        track.load = item.load
+        track.state = "queued"
+        track.path = playback.sidecarCache.take(cache, track.cacheKey)
+        track.output = ""
+        if track.path <> ""
+            track.state = "ready"
+            log.debug(LOG_TAG, "subtitle reused from this session", { format: track.format, selected: track.selected })
+        else if track.selected
+            m.flags.subtitlesLoading = true
+        end if
+        if track.selected then selected = true
+        item.sidecars.Push(track)
+    end for
+    keepCache(cache)
+    ' MediaTask looks for each kept file; one gone downloads again (keptGone).
+    for each track in item.sidecars
+        if track.state = "ready" then sendMedia({ id: item.load, track: track.trackId, kept: track.path })
+    end for
+    if playback.media.subtitleArtifact(item.plan) <> invalid and not selected then log.warn(LOG_TAG, "the subtitle sidecar is not on the configured origin", invalid)
+end sub
+
+' Starts the next queued sidecar's download while none is running.
+sub fetchSidecar(item as Object)
+    if m.subtitleHandle <> invalid then return
+    for each track in item.sidecars
+        if track.state = "queued"
+            track.state = "loading"
+            m.subtitleHandle = handleFor("onSubtitleDownloaded")
+            m.requests[api.playback.subtitle(track.url, track.format, SUBTITLE_TIMEOUT_MS, m.subtitleHandle)] = track
+            return
+        end if
+    end for
+end sub
+
+' A new plan replaces the sidecars still to come.
+sub cancelSubtitle()
+    m.flags.subtitlesLoading = false
+    if m.subtitleHandle = invalid then return
+    m.requests.Delete(m.subtitleHandle.requestId)
+    api.cancel(m.subtitleHandle)
+    m.subtitleHandle = invalid
+end sub
+
+sub onSubtitleDownloaded(event as Object)
+    handle = event.getRoSGNode()
+    track = takeRequest(handle)
+    if m.subtitleHandle <> invalid and m.subtitleHandle.isSameNode(handle) then m.subtitleHandle = invalid
+    result = api.resultOf(handle)
+    if track = invalid or sidecarOf(track.load, track.trackId) = invalid
+        if result <> invalid and result.ok = true then DeleteFile(result.body.path)
+        return
+    end if
+    if result = invalid or result.ok <> true
+        kind = "network"
+        if result <> invalid and util.isObject(result.error) then kind = util.text(result.error.kind)
+        sidecarFailed(track, kind)
+    else
+        if track.cacheKey <> ""
+            cache = sidecarCache()
+            track.output = playback.sidecarCache.newPath(cache)
+            keepCache(cache)
+        end if
+        sendMedia({ id: track.load, track: track.trackId, input: result.body.path, format: track.format, shiftSeconds: track.shiftSeconds, output: track.output, cacheKey: track.cacheKey })
+    end if
+    fetchSidecar(m.current)
+end sub
+
+' MediaTask takes requests once it observes its field, and starts once
+' the one stopMediaTask retired has ended (mediaTaskRetiring).
+sub sendMedia(request as Object)
+    if m.mediaTask = invalid and not mediaTaskRetiring() then startMediaTask()
+    if m.mediaTask <> invalid and m.mediaTask.ready
+        m.mediaTask.request = request
+    else
+        m.mediaQueue.Push(request)
+    end if
+end sub
+
+sub startMediaTask()
+    m.mediaTask = CreateObject("roSGNode", "MediaTask")
+    m.mediaTask.observeField("ready", "onMediaReady")
+    m.mediaTask.observeField("result", "onMediaResult")
+    m.mediaTask.control = "run"
+end sub
+
+' Whether the MediaTask stopMediaTask retired, this player's or an earlier
+' one's, still runs. Its last requests delete files (clearOutputs, the
+' cache's sweep) in the directories every MediaTask writes, so a
+' replacement waits for it (onMediaTaskEnded).
+function mediaTaskRetiring() as Boolean
+    if not m.global.hasField("retiringMediaTask") then return false
+    retiring = m.global.retiringMediaTask
+    if retiring = invalid or retiring.state <> "run" then return false
+    if m.awaitedMediaTask = invalid or not m.awaitedMediaTask.isSameNode(retiring)
+        m.awaitedMediaTask = retiring
+        retiring.observeField("state", "onMediaTaskEnded")
+    end if
+    return true
+end function
+
+' A closed player starts no MediaTask, which nothing would end.
+sub onMediaTaskEnded()
+    if m.closed or m.mediaTask <> invalid or m.mediaQueue.Count() = 0 or mediaTaskRetiring() then return
+    m.awaitedMediaTask = invalid
+    startMediaTask()
+end sub
+
+' MediaTask's callbacks may still arrive after stopMediaTask().
+sub onMediaReady()
+    if m.mediaTask = invalid or not m.mediaTask.ready then return
+    for each request in m.mediaQueue
+        m.mediaTask.request = request
+    end for
+    m.mediaQueue = []
+end sub
+
+sub onMediaResult(event as Object)
+    result = event.getData()
+    if not util.isObject(result) then return
+    if cacheResult(result) then return
+    if m.closed then return
+    track = sidecarOf(result.id, result.track)
+    if track = invalid then return
+    if not util.isTrue(result.ok)
+        sidecarFailed(track, util.text(result.error))
+        return
+    end if
+    track.state = "ready"
+    track.path = result.path
+    if track.selected then m.flags.subtitlesLoading = false
+    item = m.current
+    if not item.assigned
+        tryAssign(item)
+    else if track.selected
+        lateSubtitle(item, track)
+    end if
+    refreshChrome()
+end sub
+
+' --- The session's converted sidecars (playback.sidecarCache) ---------------------
+
+' The index, in m.global, as it is now; keepCache puts back a changed one.
+function sidecarCache() as Object
+    if not m.global.hasField("sidecarCache") then m.global.addFields({ sidecarCache: playback.sidecarCache.create() })
+    return m.global.sidecarCache
+end function
+
+sub keepCache(cache as Object)
+    m.global.sidecarCache = cache
+end sub
+
+' Keeps a conversion MediaTask wrote for the cache, within its bound,
+' whichever plan it was for. True for MediaTask's answer about a kept file
+' (playback.sidecarFiles.check), which is the cache's alone.
+function cacheResult(result as Object) as Boolean
+    if result.DoesExist("kept")
+        if util.isTrue(result.gone) then keptGone(result)
+        return true
+    end if
+    if util.isTrue(result.ok) and util.text(result.cacheKey) <> ""
+        cache = sidecarCache()
+        playback.sidecarCache.put(cache, result.cacheKey, result.path, result.bytes)
+        trimCache(cache, playback.sidecarCache.MAX_BYTES)
+    end if
+    return false
+end function
+
+' A kept file MediaTask found gone leaves the index, and a sidecar the
+' current load offered from it downloads and converts again: content not
+' built yet waits for it as for any other, and built content takes a
+' selected one by the late path's reload (lateSubtitle).
+sub keptGone(result as Object)
+    cache = sidecarCache()
+    playback.sidecarCache.forget(cache, result.kept)
+    keepCache(cache)
+    if m.closed then return
+    track = sidecarOf(result.id, result.track)
+    if track = invalid or track.path <> result.kept then return
+    log.info(LOG_TAG, "the subtitle kept from this session is gone; it downloads again", { format: track.format, selected: track.selected })
+    track.state = "queued"
+    track.path = ""
+    if track.selected then m.flags.subtitlesLoading = true
+    fetchSidecar(m.current)
+    refreshChrome()
+end sub
+
+' Brings the cache within limit bytes, keeping the files that content
+' carries or that conversions still have to write; MediaTask deletes the
+' others (playback.sidecarFiles.sweep). A closed player starts no
+' MediaTask, which nothing would end; the next trim deletes them.
+sub trimCache(cache as Object, limit as Integer)
+    pinned = []
+    content = m.video.content
+    if content <> invalid and type(content.subtitleTracks) = "roArray"
+        for each track in content.subtitleTracks
+            pinned.Push(util.text(track.TrackName))
+        end for
+    end if
+    if m.current <> invalid and type(m.current.sidecars) = "roArray"
+        for each track in m.current.sidecars
+            pinned.Push(util.text(track.path))
+            pinned.Push(util.text(track.output))
+        end for
+    end if
+    request = playback.sidecarCache.trim(cache, pinned, limit)
+    keepCache(cache)
+    if not m.closed or m.mediaTask <> invalid then sendMedia(request)
+end sub
+
+' A selected sidecar that arrives after its content was built. Content
+' still waiting for the previous one to stop is not on the Video node yet
+' and takes it. Content the node has never takes another track: Roku then
+' listed only the added one and closed the player (hardware run 19). That
+' content plays on without its subtitle, and the session reloads the plan
+' at the position once nothing on its way replaces it; the new content
+' carries the sidecar (playback.session's subtitleReady). A track change
+' that comes first supersedes it.
+sub lateSubtitle(item as Object, track as Object)
+    if m.activeLoad = invalid or m.activeLoad <> item.load
+        item.tracks.Push(track)
+        item.track = track.path
+        item.content.subtitleTracks = subtitleTracks(item.tracks)
+        return
+    end if
+    tracks = invalid
+    reload = playback.options.reloadSelection(item.plan)
+    if reload <> invalid then tracks = reload.tracks
+    dispatch({ type: "subtitleReady", load: item.load, tracks: tracks })
+end sub
+
+' Selects a sidecar on the playing content, or none, and lets Roku draw
+' that and nothing else (playback.sidecars.suppressed). A sidecar is
+' selected by the TrackName Roku lists for its path, or by the path until
+' Roku lists the content's tracks (onVideoSubtitles), since Roku ignored a
+' path it lists under another name (hardware run 17). Roku's overlay watch
+' takes the name first, so the write's echo is no viewer's choice, then
+' whatever the node holds after it.
+sub selectSubtitle(path as String)
+    noteWrite()
+    m.subtitleSuppressed = playback.sidecars.suppressed(m.current.plan, path)
+    drawCaptions()
+    name = playback.sidecars.listedName(m.video.availableSubtitleTracks, path)
+    if name = "" then name = path
+    m.overlayWatch.subtitle = name
+    setSubtitleTrack(name)
+    m.overlayWatch.subtitle = util.text(m.video.subtitleTrack)
+end sub
+
+' Every write of Video.subtitleTrack, logged at debug level with its value:
+' a TrackName Roku listed, the tmp:/ path the player gave it, or ""
+' (hardware run 21's build could not show what the player had written).
+sub setSubtitleTrack(name as String)
+    log.debug(LOG_TAG, "subtitleTrack written", { value: trackLabel(name) })
+    m.video.subtitleTrack = name
+end sub
+
+' What Roku reports about the active content's subtitle at debug level: the
+' track selected (Video.subtitleTrack) and the one it plays
+' (Video.currentSubtitleTrack).
+sub logRokuSubtitle(reason as String)
+    log.debug(LOG_TAG, "Roku's subtitle tracks", { reason: reason, selected: trackLabel(util.text(m.video.subtitleTrack)), playing: trackLabel(util.text(m.video.currentSubtitleTrack)) })
+end sub
+
+' A track name as it is logged: a listed TrackName, a tmp:/ path, or a
+' track Roku found in the stream; a name with a URL in it is masked.
+function trackLabel(name as String) as String
+    if Instr(1, name, "://") > 0 then return redact.MASK
+    return name
+end function
+
+' Once the active content has settled (SUBTITLE_SETTLE_MS after its first
+' frame, holdsSubtitle), the player checks at the next position report
+' whether Roku draws the plan's sidecar (playback.sidecars.drawn) and,
+' when Roku reports another track, selects the sidecar by its listed
+' name, once per load. Hardware run 21: after a reload with Arabic or
+' Italian selected, Roku reported the sidecar selected but played the
+' file's English track (mkv/3) or the English sidecar, and drew English
+' while Options showed the choice. A stream track in the sidecar's
+' language gets the selection too: in hardware run 22 Roku reported the
+' file's only English track (mkv/4) playing for the English sidecar and
+' drew nothing. A "finished" right after the write reloads the plan
+' (noteWrite), and the reload's content is checked once again; after
+' WRITE_STOPS_QUIET such stops in a row with the subtitle selected, the
+' player selects it on its own no more until the viewer chooses a track. A
+' track Roku still plays instead SUBTITLE_CHECK_MS after the write is
+' logged and left. A viewer's switch before the check replaces it
+' (retrack).
+sub confirmSubtitle()
+    if m.recheckAt <> invalid
+        if m.env.now() < m.recheckAt then return
+        m.recheckAt = invalid
+        if not isCurrent(m.activeLoad) then return
+        logRokuSubtitle("after the selection")
+        if not subtitleDrawn() then log.info(LOG_TAG, "Roku still plays another subtitle track after the player selected the sidecar; left as it is", { playing: trackLabel(util.text(m.video.currentSubtitleTrack)) })
+        return
+    end if
+    if m.subtitleConfirmed or m.settleUntil = invalid or holdsSubtitle() then return
+    m.subtitleConfirmed = true
+    path = m.activeTrack
+    if path = "" or not isCurrent(m.activeLoad) then return
+    logRokuSubtitle("settled")
+    if subtitleDrawn() then return
+    playing = trackLabel(util.text(m.video.currentSubtitleTrack))
+    if m.writeStops.count >= WRITE_STOPS_QUIET and m.writeStops.trackId = playback.media.selectedSubtitle(m.state.plan.data)
+        log.warn(LOG_TAG, "the sidecar is not selected again after Roku stopped its content twice", { playing: playing })
+        return
+    end if
+    log.info(LOG_TAG, "Roku plays another subtitle track once the content settled; the sidecar is selected", { playing: playing })
+    selectSubtitle(path)
+    m.recheckAt = m.env.now() + SUBTITLE_CHECK_MS
+end sub
+
+function subtitleDrawn() as Boolean
+    return playback.sidecars.drawn(m.activeTrack, util.text(m.video.subtitleTrack), util.text(m.video.currentSubtitleTrack))
+end function
+
+' Whether the active content takes no subtitle selection the player makes
+' on its own: from its start until SUBTITLE_SETTLE_MS after its first frame
+' (hardware run 20). Before it starts, the content is still being set up.
+function holdsSubtitle() as Boolean
+    if not m.activeStarted then return false
+    return not m.activePlayed or m.env.now() < m.settleUntil
+end function
+
+' The player changes content the Video node has started (its subtitle,
+' audio, caption drawing, or caption mode). A "finished" from it within
+' WRITE_STOP_MS is the change's doing (onVideoState). Seeks are not
+' counted: one may reach the content's end.
+sub noteWrite()
+    if m.activeStarted then m.wroteAt = m.env.now()
+end sub
+
+' Video.suppressCaptions: set for a subtitle Roku must not draw, and while
+' the controls show. Roku draws captions above the UI at a place of its
+' own, so a cue covered the scrubber and the time row (hardware run 26);
+' tvOS draws its controls over its subtitles, and Roku hides them instead
+' until the controls hide (assumption AG-293). The field is the node's
+' own, which Roku documents for UI drawn where captions are; the caption
+' mode is left alone. Content still settling (SUBTITLE_SETTLE_MS after its
+' first frame) is not changed for it, as the player selects no subtitle on
+' its own then (hardware run 20).
+sub drawCaptions()
+    covered = m.overlay.shown and not m.controls.upNext and m.settleUntil <> invalid and m.env.now() >= m.settleUntil
+    suppressed = m.subtitleSuppressed or covered
+    if suppressed = m.video.suppressCaptions then return
+    noteWrite()
+    m.video.suppressCaptions = suppressed
+end sub
+
+' Roku lists the tracks of the content it opens (Video.availableSubtitleTracks):
+' the sidecars it carries, by TrackNames of Roku's own, and those Roku finds in
+' the stream. While the content is set up, before it starts, the selected
+' sidecar is selected by its listed name unless Roku reports it selected.
+' From its start the player selects nothing on its own until it settles
+' (holdsSubtitle, confirmSubtitle). Hardware run 20: on MKV originals, Roku
+' reported subtitleTrack as the bare path after the player wrote the listed
+' name; a second listing about 1 s in reported the file's own track (mkv/3)
+' as currentSubtitleTrack; the player selected the sidecar again, and Roku
+' stopped the content 0.17 s later, before any frame (4 of 5 loads), while
+' a build that did not select again played 2 of 2 with cues.
+sub onVideoSubtitles()
+    if m.leaving or m.activeLoad = invalid or not isCurrent(m.activeLoad) then return
+    listed = m.video.availableSubtitleTracks
+    log.info(LOG_TAG, "Roku lists subtitle tracks", { tracks: listed })
+    logRokuSubtitle("listed")
+    path = m.activeTrack
+    if m.activeStarted or playback.sidecars.listedName(listed, path) = "" or playback.sidecars.isTrack(util.text(m.video.subtitleTrack), path) then return
+    selectSubtitle(path)
+end sub
+
+' Roku reports the track it plays (Video.currentSubtitleTrack, "the
+' identifier of the subtitle track that is playing"). Once SUBTITLE_CHECK_MS
+' have passed since an in-place switch, another sidecar of the content
+' reported there, by any name that contains its path, means Roku kept the
+' track it drew before (hardware run 17), so the plan's selection reloads,
+' which draws it. Only once per switch, and never while content starts: a
+' switch in place needs content that has played (playback.session's
+' retrackRefusals), so its check comes after the settle time (holdsSubtitle). A
+' track Roku found in the stream (hardware run 20's mkv/3) is not another
+' sidecar and is only logged. While another track change is on its way the
+' check waits for it (W11-3): its plan checks its own selection (retrack)
+' or loads new content, which ends the check, and a refusal leaves this one
+' to the next report.
+sub checkSubtitle()
+    check = m.subtitleCheck
+    if check = invalid or m.env.now() < check.at or playback.session.changingTracks(m.state) then return
+    m.subtitleCheck = invalid
+    if m.activeLoad <> check.load or not isCurrent(check.load) then return
+    playing = util.text(m.video.currentSubtitleTrack)
+    other = playback.sidecars.trackPath(m.current.tracks, playing)
+    if other = check.path then return
+    if other = ""
+        if playing <> "" then log.info(LOG_TAG, "Roku reports a track of its own as playing after the switch; left as it is", { playing: playing })
+        return
+    end if
+    reload = playback.options.reloadSelection(m.state.plan.data)
+    if reload = invalid then return
+    log.info(LOG_TAG, "Roku did not switch the subtitle in place; the plan reloads", invalid)
+    dispatch(reload)
+end sub
+
+sub sidecarFailed(track as Object, kind as String)
+    track.state = "failed"
+    log.warn(LOG_TAG, "subtitles failed", { kind: kind, format: track.format, selected: track.selected })
+    if track.selected
+        m.flags.subtitlesLoading = false
+        if kind = "too_large" or kind = "too_many_cues"
+            notice("Subtitles are too large to show.")
+        else
+            notice("Subtitles are not available.")
+        end if
+    end if
+    tryAssign(m.current)
+    refreshChrome()
+end sub
+
+' A track_change answered with a plan for the same media
+' (playback.session): the content plays on, from the URL it loaded with
+' until the reducer reloads it into the plan's, and shows the plan's subtitle
+' from the sidecars it carries, or none, with Roku's caption mode as the
+' viewer's choice set it. Off clears Roku's selection too; if captions are
+' on by then, the plan reloads without the carried tracks (followCaptions).
+sub retrack(command as Object)
+    item = m.current
+    if item = invalid or item.load <> command.load or not item.assigned then return
+    item.plan = command.plan
+    selectedId = ""
+    artifact = playback.media.subtitleArtifact(item.plan)
+    if artifact <> invalid then selectedId = artifact.trackId
+    for each track in item.sidecars
+        track.selected = track.trackId = selectedId
+    end for
+    m.flags.subtitlesLoading = false
+    path = playback.sidecars.pathOf(item.tracks, selectedId)
+    if selectedId <> "" and path = ""
+        ' The server chose a track the content does not carry.
+        log.warn(LOG_TAG, "the plan's subtitle is not on the playing content", invalid)
+        notice("Subtitles are not available.")
+    end if
+    item.track = path
+    m.activeTrack = path
+    ' The viewer's choice, made whenever it comes; its own check replaces
+    ' the one after the content settles.
+    selectSubtitle(path)
+    m.subtitleConfirmed = true
+    m.recheckAt = invalid
+    m.subtitleCheck = invalid
+    if path <> "" then m.subtitleCheck = { load: item.load, path: path, at: m.env.now() + SUBTITLE_CHECK_MS }
+    followCaptions(true)
+end sub
+
+' Its tracks are deleted when the player stops (plan section 4.8); a Task
+' that has not started yet clears what is left when the next one starts.
+sub stopMediaTask()
+    if m.mediaTask = invalid then return
+    if m.mediaTask.ready
+        m.mediaTask.request = { finish: true }
+        if not m.global.hasField("retiringMediaTask") then m.global.addField("retiringMediaTask", "node", false)
+        m.global.retiringMediaTask = m.mediaTask
+    else
+        m.mediaTask.control = "stop"
+    end if
+    m.mediaTask = invalid
+end sub
+
+' The current item's sidecar for this load and track, or invalid when the
+' answer is about a plan since replaced.
+function sidecarOf(load as Dynamic, trackId as Dynamic) as Dynamic
+    if m.current = invalid then return invalid
+    for each track in m.current.sidecars
+        if track.load = load and track.trackId = trackId then return track
+    end for
+    return invalid
+end function
+
+' The content's SubtitleTracks, the selected sidecar first: Roku draws a
+' track it picks by the caption language until it lists the content's tracks
+' and the selected one is selected by its listed name (onVideoSubtitles).
+function subtitleTracks(tracks as Object) as Object
+    out = []
+    for each track in tracks
+        entry = { Language: track.language, TrackName: track.path, Description: track.label }
+        if track.selected
+            out.Unshift(entry)
+        else
+            out.Push(entry)
+        end if
+    end for
+    return out
+end function
+
+' --- Leaving and errors -------------------------------------------------------------
+
+' The reducer ended the session: stop the node, then close once the reducer
+' is done and the node has stopped.
+sub leavePlayer()
+    if m.leaving then return
+    notePlayedLast()
+    closeOptionsPanel()
+    m.leaving = true
+    m.flags.stopping = true
+    m.progressTimer.control = "stop"
+    m.controlsTimer.control = "stop"
+    m.panelTimer.control = "stop"
+    cancelSubtitle()
+    runSlot(playback.slot.halt(m.slot, m.video.state, m.env.now()))
+    closeWhenStopped()
+end sub
+
+' Hands the page the player was opened from its last item and whether
+' this playback finished it, before the player leaves.
+sub notePlayedLast()
+    if m.itemId = "" then return
+    nav.notePlayed(m.itemId, playingSeason(), playback.upNext.leftFinished(m.upNext, m.videoEnded))
+end sub
+
+' The playing item's season number: its watch projection's, else, for a
+' next episode left before that arrived, the season Up Next found it in;
+' -1 when neither is known.
+function playingSeason() as Integer
+    if util.isObject(m.watch) and util.isNumber(m.watch.season_number) then return Int(m.watch.season_number)
+    return m.itemSeason
+end function
+
+sub closeWhenStopped()
+    if not m.leaving or not m.done or m.closed or m.released or playback.slot.isStopping(m.slot) then return
+    m.closed = true
+    ' AppScene releases this screen before pop returns.
+    nav.pop()
+end sub
+
+' The reducer's error, with Retry when it allows one, and Try Anyway when
+' the server could not be reached.
+sub showReducerError(command as Object, retryable as Boolean)
+    m.flags.starting = false
+    runSlot(playback.slot.halt(m.slot, m.video.state, m.env.now()))
+    m.activeLoad = invalid
+    showLocalError(playback.player.errorCopy(command), retryable, util.isTrue(command.serverUnreachable))
+end sub
+
+' The full-screen error (spec section 5.7), centred as tvOS's: the warning
+' triangle, the title and message, then Retry ("Try again" when the server
+' could not be reached), Try Anyway for an unreachable server once a
+' session exists, and Go Back; Go Back alone when nothing can be retried.
+' The player keeps focus and highlights the buttons.
+sub showLocalError(copy as Object, retryable as Boolean, unreachable = false as Boolean)
+    closeOptionsPanel()
+    ' Up Next closes as Keep Watching closes it; the end opens it again.
+    if m.upNextPanel <> invalid then runUpNext({ type: "keepWatching" })
+    m.errorTitle.text = copy.title
+    m.errorMessage.text = copy.message
+    m.retryable = retryable
+    m.unreachable = retryable and unreachable and m.state <> invalid
+    m.checkingServer = false
+    buttons = []
+    if retryable
+        m.retryButton.text = i18n.text("states.retry")
+        if unreachable then m.retryButton.text = i18n.text("common.tryAgain")
+        buttons.Push(m.retryButton)
+        if m.unreachable then buttons.Push(m.tryAnywayButton)
+    end if
+    buttons.Push(m.backButton)
+    m.retryButton.visible = retryable
+    m.tryAnywayButton.visible = m.unreachable
+    layoutError(buttons)
+    setControlRows([buttons], true, [copy.title, copy.message])
+    m.errorPanel.visible = true
+    m.errorVisible = true
+    dispatchControls({ type: "hide" })
+    applyFocus()
+    refreshChrome()
+    ' The error screen is operable, so a deep-link launch still completes.
+    m.top.ready = true
+end sub
+
+' Stacks the failure screen and centres it on the screen, the buttons in a
+' centred row.
+sub layoutError(buttons as Object)
+    titleHeight = Int(m.errorTitle.boundingRect().height)
+    messageHeight = Int(m.errorMessage.boundingRect().height)
+    height = ERROR_ICON + ERROR_GAP + titleHeight + ERROR_LINE_GAP + messageHeight + ERROR_GAP + ERROR_BUTTON_HEIGHT
+    y = (1080 - height) \ 2
+    m.errorIcon.translation = [(1920 - ERROR_ICON) \ 2, y]
+    y = y + ERROR_ICON + ERROR_GAP
+    m.errorTitle.translation = [m.errorTitle.translation[0], y]
+    y = y + titleHeight + ERROR_LINE_GAP
+    m.errorMessage.translation = [m.errorMessage.translation[0], y]
+    y = y + messageHeight + ERROR_GAP
+    total = (buttons.Count() - 1) * ERROR_GAP
+    for each button in buttons
+        total = total + button.drawnWidth
+    end for
+    x = (1920 - total) \ 2
+    for each button in buttons
+        button.translation = [x, y]
+        x = x + button.drawnWidth + ERROR_GAP
+    end for
+end sub
+
+sub hideError()
+    m.errorPanel.visible = false
+    m.errorVisible = false
+    m.unreachable = false
+    m.checkingServer = false
+    applyFocus()
+end sub
+
+sub errorAction(button as Dynamic)
+    if button = invalid or m.checkingServer then return
+    if not m.retryable or button.isSameNode(m.backButton)
+        exitPlayer()
+    else if button.isSameNode(m.tryAnywayButton)
+        ' A new attempt at once, without the check (Android TV's force).
+        hideError()
+        dispatch({ type: "retry" })
+    else if m.state = invalid
+        hideError()
+        loadWatch()
+    else if m.unreachable
+        ' Retry checks the server first, as Android TV does.
+        m.checkingServer = true
+        m.requests[api.send({ path: "/api/v2/system/info" }, handleFor("onServerChecked"))] = "serverCheck"
+    else
+        hideError()
+        dispatch({ type: "retry" })
+    end if
+end sub
+
+sub onServerChecked(event as Object)
+    handle = event.getRoSGNode()
+    takeRequest(handle)
+    if not m.checkingServer then return
+    m.checkingServer = false
+    result = api.resultOf(handle)
+    if result = invalid or result.ok <> true
+        log.warn(LOG_TAG, "the server is still unreachable", invalid)
+        return
+    end if
+    hideError()
+    dispatch({ type: "retry" })
+end sub
+
+' Back on the error screen or with nothing playing, the Close button, and
+' the controls' exit: the reducer stops the session, then the player leaves.
+' After the video's end the session has already stopped, and Up Next's
+' advance has already asked it to stop: the player leaves instead of
+' starting the next episode.
+sub exitPlayer()
+    if m.state = invalid
+        if not m.leaving then notePlayedLast()
+        m.leaving = true
+        m.done = true
+        closeWhenStopped()
+    else if m.done or m.advance <> invalid
+        m.advance = invalid
+        leavePlayer()
+    else
+        dispatch({ type: "back" })
+    end if
+end sub
+
+' --- Keys and the overlay ---------------------------------------------------------
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if m.leaving then return true
+    if m.errorVisible
+        if not press then return true
+        if key = "back"
+            exitPlayer()
+        else if key = "OK"
+            errorAction(highlightedControl())
+        else
+            moveHighlight(key)
+        end if
+        return true
+    end if
+    if Instr(1, CONTROL_KEYS, "|" + key + "|") = 0 then return false
+    if key = "options" and press then logFocus("options key")
+    if m.state = invalid
+        ' Nothing plays yet: only Back does anything.
+        if press and key = "back" then exitPlayer()
+        return true
+    end if
+    dispatchControls({ type: "key", key: key, press: press })
+    return true
+end function
+
+' The Video node while the controls hide, so * reaches Roku's overlay; the
+' overlay's keyFocus while they show; the screen's anchor under the error. A
+' panel that reported itself with setOverlayFlags keeps the focus it took.
+sub applyFocus()
+    c = m.controls
+    if c.options or c.picker or c.upNext then return
+    if m.errorVisible
+        focusScreen()
+    else if c.shown
+        m.overlayFocus.setFocus(true)
+    else
+        m.video.setFocus(true)
+    end if
+end sub
+
+' Which of the player's nodes has focus, logged in development builds
+' only, for device runs: the coordinator's check at a417adb saw * with the
+' controls shown open the Roku TV's Settings menu, which Roku shows only
+' for a focused Video node. Cheap enough to work out in release builds,
+' where log.debug prints nothing, on the rare calls it has.
+sub logFocus(reason as String)
+    log.debug(LOG_TAG, "focus", { reason: reason, focused: focusedName(), controls: m.controls.shown })
+end sub
+
+function focusedName() as String
+    named = { video: m.video, keyFocus: m.overlayFocus, overlay: m.overlay, focusAnchor: m.top.findNode("focusAnchor"), player: m.top }
+    for each name in named
+        if named[name].hasFocus() then return name
+    end for
+    if m.optionsPanel <> invalid and m.optionsPanel.isInFocusChain() then return "optionsPanel"
+    if m.upNextPanel <> invalid and m.upNextPanel.isInFocusChain() then return "upNextPanel"
+    if m.top.isInFocusChain() then return "inside the player"
+    return "outside the player"
+end function
+
+' Reduces event, and any event raised while its commands run, in order.
+sub dispatchControls(event as Object)
+    m.controlEvents.Push(event)
+    if m.controlsBusy then return
+    m.controlsBusy = true
+    while m.controlEvents.Count() > 0 and not m.closed
+        for each command in playback.controls.reduce(m.controls, m.controlEvents.Shift(), m.env.now())
+            executeControl(command)
+        end for
+    end while
+    m.controlEvents = []
+    m.controlsBusy = false
+    if m.closed then return
+    if m.refocus
+        m.refocus = false
+        applyFocus()
+    end if
+    c = m.controls
+    ' Options draws over the video alone: the controls step aside while it
+    ' is open (tvOS), and come back with it closed.
+    m.overlay.shown = c.shown and not c.options
+    m.overlay.focusTarget = c.focus
+    drawCaptions()
+    restyleSkipPills()
+    scrubbing = playback.controls.isScrubbing(c)
+    ' Observers of scrubbing read scrubPosition, so it is set first.
+    if scrubbing then m.overlay.scrubPosition = c.pending
+    m.overlay.scrubbing = scrubbing
+    m.overlay.rate = c.rate
+    updatePreview()
+    wake = playback.controls.nextWake(c)
+    m.controlsTimer.control = "stop"
+    if wake = invalid then return
+    delay = (wake - m.env.now()) / 1000
+    if delay < 0.01 then delay = 0.01
+    m.controlsTimer.duration = delay
+    m.controlsTimer.control = "start"
+end sub
+
+sub executeControl(command as Object)
+    t = command.type
+    if t = "visibility"
+        applyFocus()
+        if command.shown then logFocus("controls shown") else logFocus("controls hidden")
+    else if t = "seek"
+        commitSeek(command.position, util.isTrue(command.resume))
+    else if t = "togglePause"
+        togglePause()
+    else if t = "openOptions"
+        openOptions(command.tab)
+    else if t = "openUpNext"
+        openUpNext()
+    else if t = "activateSkip"
+        activateSkip()
+    else if t = "activateRecap"
+        runRecap({ type: "press" })
+    else if t = "dismissSkip"
+        dismissSkip()
+    else if t = "closeOptions"
+        closeOptionsPanel()
+    else if t = "exit"
+        exitPlayer()
+    else if t = "replayCaptions"
+        replayCaptions(command.active)
+    end if
+end sub
+
+sub onControlsTimer()
+    dispatchControls({ type: "wake" })
+end sub
+
+' The content a newer load is about to replace (a renewal's reload waiting
+' for its headers) is left as it is: the new load opens as the session
+' decided, and resuming the old content would play its old position until
+' then (hardware run 9, T1e).
+sub togglePause()
+    if m.current <> invalid and m.activeLoad <> invalid and m.current.load <> m.activeLoad then return
+    if m.video.state = "playing"
+        m.video.control = "pause"
+    else if m.video.state = "paused"
+        m.video.control = "resume"
+    end if
+end sub
+
+' In Roku's "Instant replay" caption mode, captions show from a Replay to
+' where it was pressed, then the mode returns (plan section 6.10). The
+' mode Silo writes comes back as a platform event, which onPlatform ignores
+' while forced.
+sub replayCaptions(active as Boolean)
+    if active
+        if m.replayForced or m.captionMode <> INSTANT_REPLAY then return
+        m.replayForced = true
+        noteWrite()
+        m.video.globalCaptionMode = "On"
+    else if m.replayForced
+        m.replayForced = false
+        noteWrite()
+        m.video.globalCaptionMode = INSTANT_REPLAY
+    end if
+end sub
+
+' --- Options --------------------------------------------------------------------
+
+' Opens the Options panel on a tab (playback.options.TAB_*), or on the one
+' it showed last in this player (playback.controls.LAST_TAB; Info the first
+' time). It takes focus when its tab is set, after the controls reducer
+' knows it is open.
+sub openOptions(page as String)
+    if m.optionsPanel <> invalid or m.state = invalid then return
+    if page = playback.controls.LAST_TAB then page = m.optionsTab
+    m.optionsPanel = m.optionsLayer.createChild("OptionsPanel")
+    m.status.below = m.optionsPanel.bottom
+    refreshOptions()
+    m.optionsPanel.observeField("choice", "onOptionsChoice")
+    m.optionsPanel.observeField("picker", "onOptionsPicker")
+    m.optionsPanel.observeField("closed", "closeOptionsPanel")
+    setOverlayFlags({ options: true })
+    m.optionsPanel.tab = page
+end sub
+
+' What playback.options decides from, as its namespace comment lists it.
+function optionsState() as Object
+    plan = invalid
+    if m.state.plan <> invalid then plan = m.state.plan.data
+    item = m.current
+    contentTracks = invalid
+    if item <> invalid and item.assigned and m.activeLoad <> invalid and m.activeLoad = item.load then contentTracks = item.tracks
+    overview = ""
+    if util.isObject(m.watch) then overview = util.text(m.watch.overview)
+    return {
+        plan: plan,
+        version: m.version,
+        quality: m.state.quality,
+        switching: switchingQuality(),
+        captionMode: m.captionMode,
+        modelType: m.modelType,
+        autoplay: m.autoplayNext,
+        episode: m.intent.kind = "episode",
+        info: { series: m.overlay.series, title: m.overlay.title, tag: m.overlay.tag, year: m.intent.year, runtime: playback.options.runtimeText(m.intent.runtime, optionsWords().strings), overview: overview },
+        stats: playback.player.statsColumns(plan, m.activeProxy, { videoFormat: m.video.videoFormat, audioFormat: m.video.audioFormat, videoMode: m.videoMode, captionMode: m.captionMode, slowStops: m.slowStops, lastStopMs: m.lastStopMs }),
+        contentTracks: contentTracks,
+        rokuSubtitles: m.video.availableSubtitleTracks,
+        subtitleLanguage: playback.options.subtitleOrderLanguage(m.watch),
+        burnWanted: m.burnWanted
+    }
+end function
+
+' Whether a quality change is on its way: Options' Quality row reads
+' "Switching…" and opens nothing meanwhile (tvOS ccf39a8b).
+function switchingQuality() as Boolean
+    if m.state.mutation <> invalid and m.state.mutation.request.op = "quality_change" then return true
+    return m.state.queued <> invalid and m.state.queued.op = "quality_change"
+end function
+
+' Gives the open panel its model again when what it shows changed: a new
+' plan or retrack, a choice, the caption mode, the content's sidecars, or
+' the Stats text. An unchanged model is not set again, so the panel keeps
+' its list as it is.
+sub refreshOptions()
+    if m.optionsPanel = invalid then return
+    model = playback.options.model(optionsState(), optionsWords())
+    text = FormatJson(model)
+    if text = m.optionsModel then return
+    m.optionsModel = text
+    m.optionsPanel.model = model
+end sub
+
+' Options' copy (playback.options.words), read once.
+function optionsWords() as Object
+    if m.optionsCopy = invalid
+        i18n.install()
+        m.optionsCopy = playback.options.words(m.global.strings)
+    end if
+    return m.optionsCopy
+end function
+
+' A row the viewer chose (playback.options.choose): quality and track
+' changes go through the session reducer; a caption mode, and On when a
+' subtitle track is chosen with captions off, are written to Roku's caption
+' mode, which a viewer's choice may change (assumption AG-75), and a mode
+' alone may need a plan to follow it (followCaptions); Auto-play next is
+' kept for this session.
+sub onOptionsChoice()
+    if m.optionsPanel = invalid or m.state = invalid then return
+    choice = m.optionsPanel.choice
+    outcome = playback.options.choose(optionsState(), choice)
+    kind = outcome.kind
+    ' A subtitle row is a choice even when it holds already (Off again).
+    subtitle = util.text(choice.kind) = playback.options.KIND_SUBTITLE
+    if subtitle or kind = playback.options.OUTCOME_TRACKS then trackChosen(subtitle)
+    if kind = playback.options.OUTCOME_CAPTION
+        setCaptionMode(outcome.captionMode)
+        followCaptions(false)
+    else if kind = playback.options.OUTCOME_TRACKS
+        if outcome.captionMode <> invalid then setCaptionMode(outcome.captionMode)
+        dispatch(outcome.event)
+    else if kind = playback.options.OUTCOME_QUALITY
+        dispatch(outcome.event)
+    else if kind = playback.options.OUTCOME_AUTOPLAY
+        m.autoplayChosen = true
+        setAutoplay(outcome.autoplay)
+    end if
+    refreshOptions()
+end sub
+
+' Focus entered or left the panel's list, its open picker.
+sub onOptionsPicker()
+    if m.optionsPanel <> invalid then setOverlayFlags({ picker: m.optionsPanel.picker })
+end sub
+
+' The panel closed, or Back reached the controls reducer while it was open,
+' or an error or the player's exit covers it: it goes, and focus returns to
+' the controls, or to the Video node while they hide.
+sub closeOptionsPanel()
+    panel = m.optionsPanel
+    if panel = invalid then return
+    if panel.current <> "" then m.optionsTab = panel.current
+    m.optionsPanel = invalid
+    m.optionsModel = ""
+    m.optionsLayer.removeChild(panel)
+    m.status.below = 0
+    setOverlayFlags({ options: false, picker: false })
+end sub
+
+' The viewer's caption mode from Silo's UI, written to Roku's (plan section
+' 6.10). It ends Replay's forced captions, so their end does not write
+' "Instant replay" back over the choice.
+sub setCaptionMode(mode as String)
+    m.replayForced = false
+    m.staleCaption = invalid
+    if mode <> m.captionMode then m.staleCaption = { mode: m.captionMode, until: m.env.now() + STALE_CAPTION_MS }
+    m.captionMode = mode
+    noteWrite()
+    m.video.globalCaptionMode = mode
+    log.info(LOG_TAG, "caption mode chosen", { mode: mode })
+end sub
+
+' The viewer chose a track; a subtitle replaces one captions Off set aside,
+' and the player selects its sidecar on its own again (confirmSubtitle).
+sub trackChosen(subtitle as Boolean)
+    if subtitle then m.burnWanted = invalid
+    m.followedMode = invalid
+    m.writeStops = { trackId: "", count: 0 }
+end sub
+
+' Roku's caption mode changed without a track choice, or a plan arrived
+' (fromPlan): the plan may need a track_change to follow the mode
+' (playback.options.captionTracks). Not while a track change is on its
+' way: its plan comes back here. A plan's arrival asks once per mode, so a
+' server that burns in a subtitle it was asked to leave out is not asked
+' again until the mode or a track changes.
+sub followCaptions(fromPlan as Boolean)
+    if not fromPlan then m.followedMode = invalid
+    if m.state = invalid or m.state.plan = invalid or playback.session.changingTracks(m.state) then return
+    if fromPlan and m.followedMode <> invalid and m.followedMode = m.captionMode then return
+    follow = playback.options.captionTracks(m.state.plan.data, m.captionMode, carriesSubtitles(), m.burnWanted)
+    m.burnWanted = follow.wanted
+    if follow.event = invalid then return
+    if fromPlan then m.followedMode = m.captionMode
+    log.info(LOG_TAG, "the plan follows the caption mode", { mode: m.captionMode, subtitle: follow.event.tracks.DoesExist("subtitle") })
+    dispatch(follow.event)
+end sub
+
+' Whether the playing content of the current plan carries subtitle tracks.
+function carriesSubtitles() as Boolean
+    item = m.current
+    if item = invalid or not item.assigned or m.activeLoad = invalid or m.activeLoad <> item.load then return false
+    tracks = item.content.subtitleTracks
+    return type(tracks) = "roArray" and tracks.Count() > 0
+end function
+
+' --- Seek previews --------------------------------------------------------------
+
+' The previews follow the file the plan plays (plan section 6.9): a file
+' the watch projection marks, on a server that lists trickplay_v1, has its
+' manifest read; another shows the time alone. A replan that keeps the
+' file keeps its manifest.
+sub followPreviews(fileId as String)
+    if fileId = m.previewFileId then return
+    m.previewFileId = fileId
+    if playback.trickplay.isEligible(m.watch, fileId, m.state.features)
+        readPreviews()
+        m.preview.manifest = playback.trickplay.pending()
+    else
+        playback.trickplay.cancel(m.previewFetch)
+        m.previewFetch = invalid
+        m.preview.manifest = {}
+    end if
+end sub
+
+sub readPreviews()
+    m.previewFetch = playback.trickplay.fetch(m.previewFetch, m.top.owner, m.itemId, m.previewFileId, serverBase(), "onPreviewManifest")
+end sub
+
+' The answer counts only on the latest read, for the file still playing
+' (playback.trickplay.settle).
+sub onPreviewManifest(event as Object)
+    if m.closed then return
+    manifest = playback.trickplay.settle(m.previewFetch, event.getRoSGNode(), m.previewFileId)
+    if manifest <> invalid then m.preview.manifest = manifest
+end sub
+
+' The manifest's URLs expire, or a sheet failed: it is read again for the
+' same file, and the preview keeps what it decoded meanwhile.
+sub onPreviewRefresh()
+    if m.closed or not m.preview.refresh or m.previewFetch = invalid then return
+    readPreviews()
+end sub
+
+' The preview shows while the viewer scrubs, at its position: with the
+' controls, a card centred over the scrub point and kept within the
+' scrubber; with the ladder running from hidden controls, the tile at the
+' top centre over the hold indicator (spec section 5.7).
+sub updatePreview()
+    c = m.controls
+    scrubbing = playback.controls.isScrubbing(c)
+    held = scrubbing and c.hiddenLadder
+    active = scrubbing and (c.shown or held)
+    if active
+        m.preview.position = c.pending
+        if held
+            if m.preview.mode <> "hold" then m.preview.mode = "hold"
+            m.preview.translation = [960, theme.player.HOLD_TOP]
+            top = theme.player.HOLD_TOP
+            if m.preview.heldHeight > 0 then top = top + m.preview.heldHeight + HOLD_GAP
+            m.holdIndicator.translation = [960, top]
+            m.holdIndicator.setFields({ rate: c.rate, position: c.pending, runtime: m.overlay.runtime })
+        else
+            if m.preview.mode <> "card" then m.preview.mode = "card"
+            x = playback.trickplay.centerX(playback.trickplay.scrubPointX(c.pending, m.overlay.runtime, theme.player.LEFT, theme.player.RIGHT), m.preview.cardWidth, theme.player.LEFT, theme.player.RIGHT)
+            m.preview.translation = [x, theme.player.PREVIEW_BOTTOM]
+        end if
+    end if
+    if m.holdIndicator.visible <> held then m.holdIndicator.visible = held
+    if m.preview.active <> active then m.preview.active = active
+end sub
+
+' --- Markers and Skip Intro ------------------------------------------------------
+
+' The skip pills rise over the controls while they show, Options aside. A
+' pill is lit while OK is its own: with the controls hidden (Skip Intro
+' first), or while it has the controls' focus (spec section 5.7).
+sub restyleSkipPills()
+    c = m.controls
+    shown = c.shown and not c.options
+    idle = not c.shown and not c.options and not c.upNext
+    m.skipButton.raised = shown
+    m.skipButton.highlighted = idle or (shown and c.focus = playback.controls.SKIP_INTRO)
+    m.recapButton.raised = shown
+    m.recapButton.stacked = m.skipButton.visible
+    m.recapButton.highlighted = (idle and not c.skipButton) or (shown and c.focus = playback.controls.SKIP_RECAP)
+end sub
+
+' The markers of the version a file belongs to, and the scrubber's bands.
+sub readMarkers(fileId as String)
+    m.markersFileId = fileId
+    m.markers = []
+    if util.isObject(m.version) then m.markers = playback.markers.fromVersion(m.version)
+    m.overlay.markers = playback.markers.bands(m.markers)
+end sub
+
+' A plan's file: a replan that changes it reads its version's markers for
+' the bands and Skip Intro, and Up Next takes the credits start and the
+' plan's runtime.
+sub followMarkers(fileId as String)
+    if fileId <> m.markersFileId
+        readMarkers(fileId)
+        runSkip({ type: "markers", markers: m.markers })
+    end if
+    runUpNext({ type: "timeline", creditsStart: playback.markers.creditsStart(m.markers), runtime: m.state.plan.runtime })
+end sub
+
+' Reduces a Skip Intro event at the clock's now and carries out what it
+' returns; Skip Recap takes the positions, the Video state, and the markers
+' too.
+sub runSkip(event as Object)
+    if m.skip = invalid or m.leaving then return
+    t = event.type
+    if t = "position" or t = "player" or t = "markers" then runRecap(event)
+    event.now = m.env.now()
+    for each command in playback.skipIntro.reduce(m.skip, event)
+        if command.type = "seek"
+            commitSeek(command.seconds)
+        else if command.type = "show"
+            m.skipButton.mode = command.mode
+            m.skipButton.progress = command.progress
+            if not m.skipButton.visible
+                m.skipButton.visible = true
+                setOverlayFlags({ skipButton: true })
+            end if
+        else if command.type = "hide"
+            hideSkip()
+        end if
+    end for
+    schedulePanels()
+end sub
+
+sub hideSkip()
+    if not m.skipButton.visible then return
+    m.skipButton.visible = false
+    setOverlayFlags({ skipButton: false })
+end sub
+
+' Reduces a Skip Recap event (playback.skipRecap): its seeks, a skip or the
+' profile's auto-skip, go through the session reducer as every seek does.
+sub runRecap(event as Object)
+    if m.recap = invalid or m.leaving then return
+    for each command in playback.skipRecap.reduce(m.recap, event)
+        if command.type = "seek"
+            commitSeek(command.seconds)
+        else
+            showRecap(command.type = "show")
+        end if
+    end for
+end sub
+
+sub showRecap(shown as Boolean)
+    if m.recapButton.visible = shown then return
+    m.recapButton.visible = shown
+    setOverlayFlags({ recapButton: shown })
+end sub
+
+' OK with the skip button showing and the controls hidden.
+sub activateSkip()
+    runSkip({ type: "press" })
+end sub
+
+' Back with the skip button showing.
+sub dismissSkip()
+    runSkip({ type: "back" })
+end sub
+
+' A seek from the controls or Skip Intro, through the session reducer (a
+' local seek or a seek_reanchor). Up Next does not take the jump for
+' playback crossing the credits.
+' resume: Play committed the seek while paused, so a load the seek opens
+' plays (playback.session.onSeekTo).
+sub commitSeek(position as Dynamic, resume = false as Boolean)
+    runUpNext({ type: "seek" })
+    dispatch({ type: "seekTo", position: position, resume: resume })
+end sub
+
+' Skip Intro's fill and Up Next's end countdown and wait.
+sub schedulePanels()
+    now = m.env.now()
+    wake = invalid
+    if m.skip <> invalid then wake = playback.skipIntro.nextWake(m.skip, now)
+    if m.upNext <> invalid then wake = sooner(wake, playback.upNext.nextWake(m.upNext, now))
+    m.panelTimer.control = "stop"
+    if wake = invalid or m.leaving then return
+    delay = (wake - now) / 1000
+    if delay < 0.01 then delay = 0.01
+    m.panelTimer.duration = delay
+    m.panelTimer.control = "start"
+end sub
+
+sub onPanelTimer()
+    runSkip({ type: "tick" })
+    runUpNext({ type: "tick" })
+end sub
+
+' --- Next episode and Up Next -------------------------------------------------------
+
+' The episode after this one (playback.nextEpisode), read through ApiTask
+' once the first plan is in; an episode the projection does not place in a
+' series settles at once with none.
+sub resolveNext()
+    if m.upNext = invalid then return
+    m.resolution = playback.nextEpisode.create(playback.nextEpisode.currentFromWatch(m.watch))
+    sendNext(playback.nextEpisode.start(m.resolution))
+    settleNext()
+end sub
+
+sub sendNext(plans as Object)
+    for each item in plans
+        m.requests[api.send(item.request, handleFor("onNextEpisode"))] = { nextStage: item.stage }
+    end for
+end sub
+
+' An answer for the resolution of the episode still playing; one for an
+' episode before, or after the player closed, was dropped with its request.
+sub onNextEpisode(event as Object)
+    handle = event.getRoSGNode()
+    context = takeRequest(handle)
+    if context = invalid or m.resolution = invalid or m.closed then return
+    result = api.resultOf(handle)
+    sendNext(playback.nextEpisode.answer(m.resolution, context.nextStage, result <> invalid and result.ok = true, handle.content))
+    settleNext()
+end sub
+
+' Once settled, the Up Next button shows if there is a next episode, and Up
+' Next learns which.
+sub settleNext()
+    if not playback.nextEpisode.settled(m.resolution) then return
+    m.nextUp = playback.nextEpisode.episode(m.resolution)
+    m.resolution = invalid
+    log.info(LOG_TAG, "next episode", { found: m.nextUp <> invalid })
+    showUpNextButton(m.nextUp <> invalid)
+    runUpNext({ type: "next", next: m.nextUp })
+end sub
+
+sub showUpNextButton(shown as Boolean)
+    m.overlay.episode = shown
+    dispatchControls({ type: "content", episode: shown })
+end sub
+
+' The Up Next button.
+sub openUpNext()
+    runUpNext({ type: "open" })
+end sub
+
+' Reduces an Up Next event at the clock's now and carries out what it
+' returns.
+sub runUpNext(event as Object)
+    if m.upNext = invalid or m.leaving then return
+    event.now = m.env.now()
+    for each command in playback.upNext.reduce(m.upNext, event)
+        t = command.type
+        if t = "show"
+            showUpNext(command)
+        else if t = "close"
+            closeUpNext()
+        else if t = "playNext"
+            advanceTo(command)
+        else if t = "exit"
+            exitPlayer()
+        end if
+    end for
+    schedulePanels()
+end sub
+
+' The video ended. The session has stopped; Up Next holds the player while
+' it has the next episode or is still resolving it, else the player leaves.
+sub endOfVideo()
+    m.videoEnded = true
+    if m.upNext = invalid or not playback.upNext.holdsEnd(m.upNext)
+        leavePlayer()
+        return
+    end if
+    runUpNext({ type: "ended" })
+end sub
+
+' Opens the panel over the shrunken video, or gives it the command's
+' heading, countdown, and toggle. It closes Options and the controls and
+' takes focus.
+sub showUpNext(command as Object)
+    panel = m.upNextPanel
+    opening = panel = invalid
+    if opening
+        closeOptionsPanel()
+        panel = m.upNextLayer.createChild("UpNextPanel")
+        m.upNextPanel = panel
+        if m.nextUp <> invalid then panel.content = m.nextUp.card
+        panel.seriesTitle = util.text(m.watch.series_title)
+    end if
+    panel.setFields(playback.upNext.panelFields(command))
+    if not opening then return
+    panel.observeField("action", "onUpNextAction")
+    panel.observeField("autoPlay", "onUpNextAutoPlay")
+    panel.observeField("videoBox", "onUpNextBox")
+    setVideoBox(panel.videoBox)
+    panel.visible = true
+    setOverlayFlags({ upNext: true })
+    dispatchControls({ type: "hide" })
+    panel.setFocus(true)
+end sub
+
+' The panel's text moved its video box.
+sub onUpNextBox()
+    if m.upNextPanel <> invalid then setVideoBox(m.upNextPanel.videoBox)
+end sub
+
+' The panel goes, and the video takes the screen and focus back.
+sub closeUpNext()
+    panel = m.upNextPanel
+    if panel = invalid then return
+    m.upNextPanel = invalid
+    m.upNextLayer.removeChild(panel)
+    setVideoBox(invalid)
+    setOverlayFlags({ upNext: false })
+end sub
+
+' Play Now, Keep Watching, or Back on the panel.
+sub onUpNextAction()
+    if m.upNextPanel <> invalid then runUpNext({ type: m.upNextPanel.action })
+end sub
+
+' The panel's toggle is Options' Auto-play next too.
+sub onUpNextAutoPlay()
+    panel = m.upNextPanel
+    if panel = invalid or m.upNext = invalid or panel.autoPlay = m.upNext.autoPlay then return
+    m.autoplayChosen = true
+    setAutoplay(panel.autoPlay)
+end sub
+
+' Auto-play next, for Options and Up Next alike.
+sub setAutoplay(value as Boolean)
+    m.autoplayNext = value
+    runUpNext({ type: "autoPlay", value: value })
+    refreshOptions()
+end sub
+
+' Play Now or the countdown: the session stops with its final position, as
+' Back stops it (plan section 6.6), then the next episode starts here.
+sub advanceTo(command as Object)
+    log.info(LOG_TAG, "playing the next episode", { auto: command.auto, streak: command.carry.streak })
+    closeUpNext()
+    season = -1
+    if m.nextUp <> invalid and util.isNumber(m.nextUp.seasonNumber) then season = Int(m.nextUp.seasonNumber)
+    m.advance = { itemId: command.itemId, carry: command.carry, seasonNumber: season }
+    if not m.done then dispatch({ type: "back" })
+    advanceWhenDone()
+end sub
+
+' Once the session the advance ends is done, and no reduction is under way.
+sub advanceWhenDone()
+    if m.advance = invalid or not m.done or m.dispatching or m.leaving or m.closed then return
+    chosen = m.advance
+    m.advance = invalid
+    clearSession()
+    m.itemId = chosen.itemId
+    m.itemSeason = chosen.seasonNumber
+    m.startOver = true
+    m.wanted = nav.player.nextEpisode(chosen.itemId, chosen.carry)
+    loadWatch()
+end sub
+
+' What belonged to the episode that ended goes before the next one starts
+' in this player. Its session is done; the Video node stops, and the next
+' content waits for that (playback.slot). The profile's preferences stay.
+sub clearSession()
+    closeOptionsPanel()
+    closeUpNext()
+    hideSkip()
+    showRecap(false)
+    m.progressTimer.control = "stop"
+    m.panelTimer.control = "stop"
+    replayCaptions(false)
+    cancelSubtitle()
+    stopMediaTask()
+    m.mediaQueue = []
+    runSlot(playback.slot.halt(m.slot, m.video.state, m.env.now()))
+    playback.trickplay.cancel(m.previewFetch)
+    m.previewFetch = invalid
+    m.previewFileId = ""
+    m.preview.active = false
+    dropRequests()
+    m.loads = m.state.loads
+    m.state = invalid
+    m.intent = invalid
+    m.watch = invalid
+    m.version = invalid
+    m.picks = invalid
+    m.firstPlan = true
+    m.current = invalid
+    m.activeLoad = invalid
+    m.activeProxy = false
+    m.activePlayed = false
+    m.activeTrack = ""
+    m.activeStarted = false
+    m.subtitleConfirmed = false
+    m.recheckAt = invalid
+    m.wroteAt = invalid
+    m.writeStops = { trackId: "", count: 0 }
+    m.pauseLoad = invalid
+    m.flags = newFlags()
+    m.noticeClock = playback.player.newNoticeClock(0)
+    m.overlayWatch = { played: false, audio: "", subtitle: "" }
+    m.burnWanted = invalid
+    m.followedMode = invalid
+    m.markers = []
+    m.markersFileId = ""
+    m.skip = invalid
+    m.recap = invalid
+    m.upNext = invalid
+    m.resolution = invalid
+    m.nextUp = invalid
+    m.videoEnded = false
+    m.done = false
+    dispatchControls({ type: "hide" })
+    ' Replay's caption span was the episode's; replayCaptions ended it.
+    m.controls.replay = invalid
+end sub
+
+' Drops the answers the episode before still waits for, but the profile's
+' preferences and an output probe, which hold for the next one too.
+sub dropRequests()
+    kept = {}
+    for each id in m.requests
+        context = m.requests[id]
+        if util.isString(context) and (context = "preferences" or context = "outputContext") then kept[id] = context
+    end for
+    m.requests = kept
+end sub
+
+' The overlays above report themselves: flags has any of skipButton,
+' picker, upNext, and options.
+sub setOverlayFlags(flags as Object)
+    event = { type: "flags" }
+    event.Append(flags)
+    dispatchControls(event)
+    ' Raised while a command runs (a key opening Options, whose list then
+    ' takes focus), the event waits behind it, and focus waits for the
+    ' event: deciding it now, from flags not yet reduced, took focus from
+    ' the panel's list (run 6).
+    if m.controlsBusy
+        m.refocus = true
+    else
+        applyFocus()
+    end if
+end sub
+
+' Up Next's 16:9 frame on the left, { x, y, width, height } in FHD px, or
+' invalid for the full screen.
+sub setVideoBox(frame as Dynamic)
+    if frame = invalid then frame = { x: 0, y: 0, width: 1920, height: 1080 }
+    m.video.translation = [frame.x, frame.y]
+    m.video.width = frame.width
+    m.video.height = frame.height
+end sub
+
+' A notice shows for NOTICE_MS once nothing outranks it on the status
+' line, whatever showed when it came (playback.player.noticeShows).
+sub notice(text as String)
+    m.flags.notice = text
+    m.noticeClock = playback.player.newNoticeClock(NOTICE_MS)
+end sub
+
+' The overlay's position, runtime, and play state, the status, the
+' controls reducer's view of playback, and the Options panel.
+sub refreshChrome()
+    if m.closed then return
+    now = m.env.now()
+    position = 0#
+    runtime = invalid
+    seeking = false
+    if m.state <> invalid
+        position = m.state.player.position
+        ' A seek in flight shows, and counts skips from, its target.
+        if util.isNumber(m.state.seekTarget) then position = m.state.seekTarget
+        seeking = util.isNumber(m.state.seekTarget) or m.state.player.seeking
+        if m.state.plan <> invalid then runtime = m.state.plan.runtime
+    end if
+    if runtime = invalid and m.intent <> invalid then runtime = m.intent.runtime
+    buffering = m.video.state = "buffering"
+    paused = m.video.state = "paused"
+    flags = { buffering: buffering }
+    flags.Append(m.flags)
+    if flags.notice <> "" and not playback.player.noticeShows(m.noticeClock, flags, now)
+        m.flags.notice = ""
+        flags.notice = ""
+    end if
+    ' Under the error the status is out of sight, and says nothing.
+    status = { busy: "", notice: invalid }
+    if not m.errorVisible then status = playback.player.statusOf(flags)
+    m.status.busy = status.busy
+    if status.notice = invalid then m.status.notice = {} else m.status.notice = status.notice
+    m.overlay.paused = paused
+    m.overlay.position = position
+    if runtime = invalid then m.overlay.runtime = 0 else m.overlay.runtime = runtime
+    busy = seeking or buffering or m.flags.starting or m.flags.reconnecting
+    dispatchControls({ type: "playback", position: position, runtime: runtime, paused: paused, busy: busy })
+    refreshOptions()
+end sub
+
+' --- Requests ---------------------------------------------------------------------
+
+function handleFor(callback as String) as Object
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", callback)
+    return handle
+end function
+
+' What the answered request was for, or invalid when it was dropped.
+function takeRequest(handle as Object) as Dynamic
+    id = handle.requestId
+    context = m.requests[id]
+    m.requests.Delete(id)
+    return context
+end function

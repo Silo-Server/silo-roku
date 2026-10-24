@@ -1,0 +1,179 @@
+namespace tests
+
+    ' Android TV's next-episode resolution (spec section 9.8) over answers
+    ' mapped as ApiTask maps them (catalog.map, kinds episodes and seasons).
+    @suite("playback next episode")
+    class PlaybackNextEpisodeTests extends rooibos.BaseTestSuite
+
+        ' A RowContent of episode cards for (season, episode) pairs.
+        function episodes(pairs as Object) as Object
+            items = []
+            for each pair in pairs
+                items.Push({ content_id: "episode:s" + pair[0].ToStr() + "e" + pair[1].ToStr(), season_number: pair[0], episode_number: pair[1], title: "Episode " + pair[1].ToStr(), runtime: 50, still_url: "https://img.example/still.jpg?sig=x" })
+            end for
+            return m.mapped(catalog.kind.EPISODES, { items: items })
+        end function
+
+        function seasons(numbers as Object) as Object
+            items = []
+            for each number in numbers
+                items.Push({ content_id: "series:sev-S" + number.ToStr(), season_number: number, title: "Season " + number.ToStr(), episode_count: 3 })
+            end for
+            return m.mapped(catalog.kind.SEASONS, { items: items })
+        end function
+
+        function mapped(kind as String, body as Object) as Object
+            result = catalog.map.apply({ requestId: "r1", map: { kind: kind } }, tests.catalogData.ok(body), tests.catalogData.words())
+            return result.content
+        end function
+
+        function resolution(season as Integer, episode as Integer) as Object
+            return playback.nextEpisode.create({ itemId: "episode:s" + season.ToStr() + "e" + episode.ToStr(), seriesId: "series:sev", seasonNumber: season, episodeNumber: episode, libraryId: "" })
+        end function
+
+        function foundId(state as Object) as Dynamic
+            found = playback.nextEpisode.episode(state)
+            if found = invalid then return invalid
+            return found.itemId
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("the playing episode")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("reads an episode's series and numbers from its watch projection")
+        sub _()
+            detail = { content_id: "episode:sev-s01e02", type: "episode", series_id: "series:sev", season_number: 1, episode_number: 2 }
+            m.assertEqual(playback.nextEpisode.currentFromWatch(detail, "lib-1"), { itemId: "episode:sev-s01e02", seriesId: "series:sev", seasonNumber: 1, episodeNumber: 2, libraryId: "lib-1" })
+            m.assertEqual(playback.nextEpisode.currentFromWatch(detail).libraryId, "")
+        end sub
+
+        @it("has nothing to resolve for a movie or an episode without its series or numbers")
+        sub _()
+            m.assertInvalid(playback.nextEpisode.currentFromWatch(tests.catalogData.fixture("get_watch_state_ok")))
+            m.assertInvalid(playback.nextEpisode.currentFromWatch({ content_id: "episode:x", type: "episode", season_number: 1, episode_number: 2 }))
+            m.assertInvalid(playback.nextEpisode.currentFromWatch({ content_id: "episode:x", type: "episode", series_id: "series:sev", season_number: 1 }))
+            m.assertInvalid(playback.nextEpisode.currentFromWatch(invalid))
+            state = playback.nextEpisode.create(invalid)
+            m.assertTrue(playback.nextEpisode.settled(state))
+            m.assertEqual(playback.nextEpisode.start(state), [])
+            m.assertInvalid(playback.nextEpisode.episode(state))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("the current season")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("first reads the current season's episodes with stills")
+        sub _()
+            state = playback.nextEpisode.create({ itemId: "episode:a", seriesId: "series:sev", seasonNumber: 2, episodeNumber: 4, libraryId: "lib-1" })
+            requests = playback.nextEpisode.start(state)
+            m.assertEqual(requests.Count(), 1)
+            m.assertEqual(requests[0].stage, playback.nextEpisode.SEASON)
+            m.assertEqual(requests[0].request, catalog.request.episodes("series:sev", 2, "lib-1"))
+            m.assertEqual(requests[0].request.path, "/api/v2/catalog/series/series:sev/seasons/2/episodes")
+            m.assertFalse(playback.nextEpisode.settled(state))
+        end sub
+
+        @it("takes the next episode of the current season and its card")
+        sub _()
+            state = m.resolution(1, 2)
+            follow = playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, true, m.episodes([[1, 1], [1, 2], [1, 3], [1, 4]]))
+            m.assertEqual(follow, [])
+            m.assertTrue(playback.nextEpisode.settled(state))
+            found = playback.nextEpisode.episode(state)
+            m.assertEqual(found.itemId, "episode:s1e3")
+            m.assertEqual(found.seasonNumber, 1)
+            m.assertEqual(found.episodeNumber, 3)
+            m.assertEqual(found.card.subtype(), "CardContent")
+            m.assertEqual(found.card.caption, "S01E03 · Episode 3")
+            m.assertEqual(found.card.infoLine, "S1 · E3 · 50 min")
+        end sub
+
+        @it("skips gaps, ignores list order, and needs no listing of the current episode")
+        sub _()
+            state = m.resolution(1, 2)
+            playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, true, m.episodes([[1, 7], [1, 1], [1, 5]]))
+            m.assertEqual(m.foundId(state), "episode:s1e5")
+        end sub
+
+        @it("has no next episode when the current season cannot be read")
+        sub _()
+            state = m.resolution(1, 2)
+            m.assertEqual(playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, false, invalid), [])
+            m.assertTrue(playback.nextEpisode.settled(state))
+            m.assertEqual(state.phase, "none")
+            m.assertInvalid(playback.nextEpisode.episode(state))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("rolling over")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("after a season's last episode, reads the seasons, then the next regular season")
+        sub _()
+            state = m.resolution(1, 3)
+            follow = playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, true, m.episodes([[1, 1], [1, 2], [1, 3]]))
+            m.assertEqual(follow, [{ stage: playback.nextEpisode.SEASONS, request: catalog.request.seasons("series:sev", "") }])
+            follow = playback.nextEpisode.answer(state, playback.nextEpisode.SEASONS, true, m.seasons([0, 1, 3, 2]))
+            m.assertEqual(follow, [{ stage: playback.nextEpisode.NEXT_SEASON, request: catalog.request.episodes("series:sev", 2, "") }])
+            m.assertFalse(playback.nextEpisode.settled(state))
+            m.assertEqual(playback.nextEpisode.answer(state, playback.nextEpisode.NEXT_SEASON, true, m.episodes([[2, 2], [2, 1]])), [])
+            m.assertEqual(m.foundId(state), "episode:s2e1")
+        end sub
+
+        @it("moves from the specials through them, then into season 1")
+        sub _()
+            state = m.resolution(0, 1)
+            playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, true, m.episodes([[0, 1], [0, 2]]))
+            m.assertEqual(m.foundId(state), "episode:s0e2")
+            state = m.resolution(0, 2)
+            playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, true, m.episodes([[0, 1], [0, 2]]))
+            follow = playback.nextEpisode.answer(state, playback.nextEpisode.SEASONS, true, m.seasons([0, 1, 2]))
+            m.assertEqual(follow[0].request.path, "/api/v2/catalog/series/series:sev/seasons/1/episodes")
+        end sub
+
+        @it("does not roll over when the season list fails or has no later regular season")
+        sub _()
+            state = m.resolution(2, 3)
+            playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, true, m.episodes([[2, 3]]))
+            m.assertEqual(playback.nextEpisode.answer(state, playback.nextEpisode.SEASONS, false, invalid), [])
+            m.assertEqual(state.phase, "none")
+            state = m.resolution(2, 3)
+            playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, true, m.episodes([[2, 3]]))
+            m.assertEqual(playback.nextEpisode.answer(state, playback.nextEpisode.SEASONS, true, m.seasons([0, 1, 2])), [])
+            m.assertEqual(state.phase, "none")
+        end sub
+
+        @it("does not roll over when the next season fails or is empty, and tries no later season")
+        sub _()
+            for each answer in [{ ok: false, content: invalid }, { ok: true, content: m.episodes([]) }]
+                state = m.resolution(1, 3)
+                playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, true, m.episodes([[1, 3]]))
+                playback.nextEpisode.answer(state, playback.nextEpisode.SEASONS, true, m.seasons([1, 2, 3]))
+                m.assertEqual(playback.nextEpisode.answer(state, playback.nextEpisode.NEXT_SEASON, answer.ok, answer.content), [])
+                m.assertEqual(state.phase, "none")
+            end for
+        end sub
+
+        @it("ignores answers once settled, and unknown stages")
+        sub _()
+            state = m.resolution(1, 1)
+            m.assertEqual(playback.nextEpisode.answer(state, "other", true, invalid), [])
+            m.assertFalse(playback.nextEpisode.settled(state))
+            playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, true, m.episodes([[1, 2]]))
+            m.assertEqual(playback.nextEpisode.answer(state, playback.nextEpisode.SEASON, true, m.episodes([[1, 3]])), [])
+            m.assertEqual(m.foundId(state), "episode:s1e2")
+            m.assertEqual(playback.nextEpisode.start(state), [])
+        end sub
+
+        @it("picks the smallest later (season, episode), the first listed on a tie")
+        sub _()
+            candidates = [{ itemId: "a", seasonNumber: 2, episodeNumber: 1 }, { itemId: "b", seasonNumber: 1, episodeNumber: 9 }, { itemId: "c", seasonNumber: 1, episodeNumber: 9 }, { itemId: "d", seasonNumber: 1, episodeNumber: 4 }]
+            m.assertEqual(playback.nextEpisode.after(candidates, 1, 4).itemId, "b")
+            m.assertEqual(playback.nextEpisode.after(candidates, 1, 9).itemId, "a")
+            m.assertInvalid(playback.nextEpisode.after(candidates, 2, 1))
+            m.assertInvalid(playback.nextEpisode.after([{ itemId: "x", seasonNumber: -1, episodeNumber: -1 }], 0, 0))
+        end sub
+    end class
+end namespace

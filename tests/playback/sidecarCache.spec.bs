@@ -1,0 +1,265 @@
+namespace tests
+
+    ' The session's converted sidecars: the index the player keeps on the
+    ' render thread (playback.sidecarCache), MediaTask's work on the real
+    ' files in its tmp:/ directory (playback.sidecarFiles), and the key a
+    ' plan's track gets (playback.sidecars.cacheKey).
+    @suite("playback sidecar cache")
+    class PlaybackSidecarCacheTests extends rooibos.BaseTestSuite
+
+        ' An empty index over an empty directory.
+        function fresh() as Object
+            for each name in ListDir(playback.sidecarCache.DIR)
+                DeleteFile(playback.sidecarCache.DIR + "/" + name)
+            end for
+            CreateDirectory(playback.sidecarCache.DIR)
+            return playback.sidecarCache.create()
+        end function
+
+        ' A conversion of bytes bytes kept for key, at the path the cache
+        ' names; written there too when write is true, as MediaTask does.
+        function kept(index as Object, key as String, bytes as Integer, write = false as Boolean) as String
+            path = playback.sidecarCache.newPath(index)
+            if write then WriteAsciiFile(path, string(bytes, "x"))
+            playback.sidecarCache.put(index, key, path, bytes)
+            return path
+        end function
+
+        function files() as Integer
+            return ListDir(playback.sidecarCache.DIR).Count()
+        end function
+
+        ' A plan of file fileId with an embedded English ASS track and an
+        ' external SRT, whose timeline starts offset seconds in.
+        function plan(fileId as String, offset as Double) as Object
+            return {
+                effective_media_file_id: fileId,
+                source: { media_file_id: fileId },
+                timeline: { timeline_offset_seconds: offset },
+                subtitle: {
+                    mode: "render",
+                    track_id: "file:" + fileId + ":subtitle:1",
+                    artifact: { url: "/api/v2/stream/s-1/subtitles/1.ass?file_id=" + fileId, format: "ass" },
+                    inventory: [
+                        { track_id: "file:" + fileId + ":subtitle:0", source: "external", codec: "srt", language: "eng", label: "English", delivery: "sidecar", sync_key: "external-ab12", url: "/api/v2/stream/s-1/subtitles/0.srt?file_id=" + fileId },
+                        { track_id: "file:" + fileId + ":subtitle:1", source: "embedded", codec: "ass", language: "eng", label: "Full Subtitles", forced: false, default: true, delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/1.ass?file_id=" + fileId + "&embedded_stream_index=3" }
+                    ]
+                }
+            }
+        end function
+
+        function keys(plan as Object, origin = "https://silo.example" as String) as Object
+            out = []
+            for each track in playback.sidecars.offered(plan, origin, "Off")
+                out.Push(track.cacheKey)
+            end for
+            return out
+        end function
+
+        ' An untitled English ASS track of file 42 at inventory position
+        ' ordinal, in stream stream of the file, as the reviewers' rescan
+        ' gives two of them.
+        function untitled(ordinal as Integer, stream as Integer) as Object
+            return { track_id: "file:42:subtitle:" + ordinal.ToStr(), source: "embedded", codec: "ass", language: "eng", label: "eng", forced: false, default: false, hearing_impaired: false, delivery: "sidecar", url: "/api/v2/stream/s-2/subtitles/" + ordinal.ToStr() + ".ass?file_id=42&embedded_stream_index=" + stream.ToStr() }
+        end function
+
+        ' File 42's plan rendering inventory[selected].
+        function untitledPlan(inventory as Object, selected as Integer) as Object
+            return { effective_media_file_id: "42", source: { media_file_id: "42" }, timeline: { timeline_offset_seconds: 0 }, subtitle: { mode: "render", track_id: inventory[selected].track_id, artifact: { url: inventory[selected].url, format: "ass" }, inventory: inventory } }
+        end function
+
+        @describe("keys")
+
+        @it("keys an embedded text track by the server, its file, stream, description, format, and offset, never its URL")
+        sub _()
+            first = m.keys(m.plan("42", 0))
+            m.assertEqual(first.Count(), 2)
+            m.assertNotEqual(first[0], "", "the selected embedded ASS")
+            m.assertEqual(first[1], "", "an external SRT, which the server may retime")
+            m.assertTrue(Instr(1, first[0], "https://silo.example") > 0, "the configured origin, whose IDs the file and stream are")
+            for each secret in ["api/v2", "s-1", "subtitles/1.ass", "file_id", "embedded_stream_index", "?"]
+                m.assertEqual(Instr(1, first[0], secret), 0, secret)
+            end for
+            m.assertEqual(m.keys(m.plan("42", 0))[0], first[0], "the same track of the same file in another plan")
+            m.assertNotEqual(m.keys(m.plan("43", 0))[0], first[0], "another file")
+            m.assertNotEqual(m.keys(m.plan("42", 12.5))[0], first[0], "another offset")
+            plan = m.plan("42", 0)
+            plan.subtitle.mode = "convert"
+            plan.subtitle.artifact.format = "vtt"
+            m.assertNotEqual(m.keys(plan)[0], first[0], "another format")
+            plan = m.plan("42", 0)
+            plan.subtitle.inventory[1].label = "Signs"
+            m.assertNotEqual(m.keys(plan)[0], first[0], "another description")
+        end sub
+
+        @it("keys nothing without the server, the file named in both places, or the stream, or for a track with a sync_key")
+        sub _()
+            plan = m.plan("42", 0)
+            m.assertEqual(playback.sidecars.cacheKey(plan, plan.subtitle.inventory[1], "ass", 0, ""), "", "no configured server")
+            plan.source.media_file_id = "41"
+            m.assertEqual(m.keys(plan)[0], "")
+            plan = m.plan("42", 0)
+            plan.subtitle.inventory[1].sync_key = "stored-7"
+            m.assertEqual(m.keys(plan)[0], "")
+            plan = m.plan("42", 0)
+            plan.subtitle.inventory[1].source = "downloaded"
+            m.assertEqual(m.keys(plan)[0], "")
+            for each url in ["/api/v2/stream/s-1/subtitles/1.ass?file_id=42", "/api/v2/stream/s-1/subtitles/1.ass?file_id=41&embedded_stream_index=3", "/api/v2/stream/s-1/subtitles/1.ass?file_id=42&embedded_stream_index=", "/api/v2/stream/s-1/subtitles/1.ass?file_id=42&embedded_stream_index=x3"]
+                plan = m.plan("42", 0)
+                plan.subtitle.inventory[1].url = url
+                m.assertEqual(m.keys(plan)[0], "", url)
+            end for
+        end sub
+
+        @it("keeps another server's file with the same IDs apart (W12 review)")
+        sub _()
+            plan = m.untitledPlan([m.untitled(0, 3), m.untitled(1, 4)], 1)
+            a = playback.sidecars.offered(plan, "https://server-a.example", "Off")[0].cacheKey
+            b = playback.sidecars.offered(plan, "https://server-b.example", "Off")[0].cacheKey
+            m.assertNotEqual(a, b)
+            index = playback.sidecarCache.create()
+            playback.sidecarCache.put(index, a, "tmp:/sidecar-cache/server-A-film.srt", 20)
+            m.assertEqual(playback.sidecarCache.take(index, b), "", "file IDs are each server's own")
+            m.assertEqual(playback.sidecarCache.take(index, a), "tmp:/sidecar-cache/server-A-film.srt")
+        end sub
+
+        @it("follows an embedded track's stream when a rescan moves it to another position beside a track that says the same (W12 review)")
+        sub _()
+            before = m.untitledPlan([m.untitled(0, 3), m.untitled(1, 4)], 1)
+            external = { track_id: "file:42:subtitle:0", source: "external", codec: "srt", language: "eng", label: "eng", delivery: "sidecar", sync_key: "external-new", url: "/api/v2/stream/s-2/subtitles/0.srt?file_id=42" }
+            after = [external, m.untitled(1, 3), m.untitled(2, 4)]
+            cachedB = playback.sidecars.offered(before, "https://silo.example", "Off")[0].cacheKey
+            index = playback.sidecarCache.create()
+            playback.sidecarCache.put(index, cachedB, "tmp:/sidecar-cache/embedded-B.srt", 20)
+            nowA = playback.sidecars.offered(m.untitledPlan(after, 1), "https://silo.example", "Off")[0].cacheKey
+            m.assertEqual(playback.sidecarCache.take(index, nowA), "", "A, at B's old position, is stream 3; B is stream 4")
+            nowB = playback.sidecars.offered(m.untitledPlan(after, 2), "https://silo.example", "Off")[0].cacheKey
+            m.assertEqual(playback.sidecarCache.take(index, nowB), "tmp:/sidecar-cache/embedded-B.srt", "B, moved on, is still B's")
+        end sub
+
+        @describe("index, on the render thread")
+
+        @it("gives back a kept file without looking for it, and nothing for another key")
+        sub _()
+            index = playback.sidecarCache.create()
+            path = m.kept(index, "a", 100)
+            m.assertEqual(playback.sidecarCache.take(index, "a"), path, "no file was written: whether it is there is MediaTask's to say")
+            m.assertEqual(playback.sidecarCache.take(index, "b"), "")
+            m.assertEqual(playback.sidecarCache.take(index, ""), "")
+        end sub
+
+        @it("forgets the entry for a file MediaTask found gone")
+        sub _()
+            index = playback.sidecarCache.create()
+            gone = m.kept(index, "a", 100)
+            other = m.kept(index, "b", 50)
+            playback.sidecarCache.forget(index, gone)
+            m.assertEqual([index.entries.Count(), index.bytes], [1, 50])
+            m.assertEqual(playback.sidecarCache.take(index, "a"), "")
+            m.assertEqual(playback.sidecarCache.take(index, "b"), other)
+            playback.sidecarCache.forget(index, "tmp:/sidecar-cache/none.srt")
+            m.assertEqual(index.entries.Count(), 1, "a path no entry names changes nothing")
+        end sub
+
+        @it("drops the least recently used beyond its bytes, but none that is pinned, and keeps the others' files and the pinned")
+        sub _()
+            index = playback.sidecarCache.create()
+            first = m.kept(index, "a", 400)
+            second = m.kept(index, "b", 400)
+            third = m.kept(index, "c", 400)
+            playback.sidecarCache.take(index, "a")
+            request = playback.sidecarCache.trim(index, [], 800)
+            m.assertEqual(request, { keep: [first, third] }, "b was used least recently; MediaTask deletes its file")
+            m.assertEqual(playback.sidecarCache.take(index, "b"), "")
+            m.assertEqual(index.bytes, 800)
+            request = playback.sidecarCache.trim(index, [first, third, ""], 0)
+            m.assertEqual(index.entries.Count(), 2, "both pinned")
+            m.assertEqual(request.keep, [first, third, first, third])
+            request = playback.sidecarCache.trim(index, [third], 0)
+            m.assertEqual([playback.sidecarCache.take(index, "a"), playback.sidecarCache.take(index, "c")], ["", third])
+            m.assertEqual(request.keep, [third, third])
+            m.assertNotEqual(second, third)
+        end sub
+
+        @it("holds at most MAX_BYTES and MAX_ENTRIES, keeping the newest")
+        sub _()
+            index = playback.sidecarCache.create()
+            size = playback.sidecarCache.MAX_BYTES \ 4
+            for i = 1 to 5
+                m.kept(index, "k" + i.ToStr(), size)
+            end for
+            playback.sidecarCache.trim(index, [], playback.sidecarCache.MAX_BYTES)
+            m.assertEqual(index.bytes, playback.sidecarCache.MAX_BYTES)
+            m.assertEqual(playback.sidecarCache.take(index, "k1"), "")
+            m.assertNotEqual(playback.sidecarCache.take(index, "k5"), "")
+            index = playback.sidecarCache.create()
+            for i = 1 to playback.sidecarCache.MAX_ENTRIES + 3
+                m.kept(index, "n" + i.ToStr(), 10)
+            end for
+            playback.sidecarCache.trim(index, [], playback.sidecarCache.MAX_BYTES)
+            m.assertEqual(index.entries.Count(), playback.sidecarCache.MAX_ENTRIES)
+            m.assertEqual(playback.sidecarCache.take(index, "n3"), "")
+            m.assertNotEqual(playback.sidecarCache.take(index, "n4"), "")
+        end sub
+
+        @it("replaces a key's file, which it keeps while pinned and leaves out once nothing pins it")
+        sub _()
+            index = playback.sidecarCache.create()
+            old = m.kept(index, "a", 100)
+            newer = m.kept(index, "a", 120)
+            m.assertEqual([index.entries.Count(), index.bytes], [1, 120])
+            m.assertEqual(playback.sidecarCache.trim(index, [old], playback.sidecarCache.MAX_BYTES), { keep: [newer, old] }, "the replaced file still plays")
+            m.assertEqual(playback.sidecarCache.trim(index, [], playback.sidecarCache.MAX_BYTES), { keep: [newer] })
+            m.assertEqual(playback.sidecarCache.take(index, "a"), newer)
+        end sub
+
+        @describe("files, in MediaTask (playback.sidecarFiles)")
+
+        @it("answers a kept file that is there as kept, and one that is gone as gone")
+        sub _()
+            index = m.fresh()
+            path = m.kept(index, "a", 100, true)
+            m.assertEqual(playback.sidecarFiles.check({ id: 3, track: "file:42:subtitle:1", kept: path }), { id: 3, track: "file:42:subtitle:1", kept: path, gone: false })
+            DeleteFile(path)
+            m.assertEqual(playback.sidecarFiles.check({ id: 3, track: "file:42:subtitle:1", kept: path }), { id: 3, track: "file:42:subtitle:1", kept: path, gone: true })
+            m.assertTrue(playback.sidecarFiles.check({ id: 3, track: "t" }).gone, "no path")
+        end sub
+
+        @it("deletes the files the index's trim leaves out: the least recently used, a replaced one, and a stray")
+        sub _()
+            index = m.fresh()
+            old = m.kept(index, "a", 400, true)
+            newer = m.kept(index, "a", 400, true)
+            used = m.kept(index, "b", 400, true)
+            newest = m.kept(index, "c", 400, true)
+            stray = playback.sidecarCache.newPath(index)
+            WriteAsciiFile(stray, "x")
+            playback.sidecarCache.take(index, "b")
+            m.assertEqual(m.files(), 5)
+            playback.sidecarFiles.sweep(playback.sidecarCache.trim(index, [old], 800).keep)
+            m.assertEqual(m.files(), 3, "a (least recently used) and the stray go; the replaced file still plays")
+            for each path in [old, used, newest]
+                m.assertTrue(CreateObject("roFileSystem").Exists(path), path)
+            end for
+            m.assertFalse(CreateObject("roFileSystem").Exists(newer))
+            playback.sidecarFiles.sweep(playback.sidecarCache.trim(index, [], 800).keep)
+            m.assertEqual(m.files(), 2, "once nothing pins it")
+            playback.sidecarFiles.sweep(invalid)
+            m.assertEqual(m.files(), 0, "keep nothing, delete everything")
+        end sub
+
+        @it("names files that never contain one another")
+        sub _()
+            index = m.fresh()
+            paths = []
+            for i = 1 to 12
+                paths.Push(playback.sidecarCache.newPath(index))
+            end for
+            for each a in paths
+                for each b in paths
+                    if a <> b then m.assertFalse(playback.sidecars.isTrack(b, a), a + " in " + b)
+                end for
+            end for
+        end sub
+    end class
+end namespace

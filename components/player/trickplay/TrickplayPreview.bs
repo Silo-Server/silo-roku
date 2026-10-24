@@ -1,0 +1,429 @@
+' TrickplayPreview: the seek-bar preview (plan section 6.9, spec section 5.7).
+'
+' Interface (TrickplayPreview.xml):
+'   manifest     in   a parsed manifest (playback.trickplay.settle),
+'                     playback.trickplay.pending() while one is read, or {}
+'                     when the title has no previews
+'   position     in   the scrub position in source seconds, the scrubber's
+'                     timeline
+'   active       in   true while the scrubber shows a scrub; false hides the
+'                     preview and clears its Posters' uri, dropping the sheets'
+'                     textures
+'   mode         in   "card": tvOS's preview card, its origin the card's
+'                     bottom centre, the 320 px tile and the time under it
+'                     (or the message and the time); "hold": the 480 px
+'                     tile alone, its origin the tile's top centre, for
+'                     the hold indicator (HoldSeekIndicator), which shows
+'                     the time itself
+'   span         in   the scrubber's ends, [left, right], in the coordinates
+'                     the preview is placed in: a card wider than the tile
+'                     card (the message's) moves in to stay between them
+'   tier         in   memory.tier: "standard" keeps the current sheet and its
+'                     neighbour, anything else the current sheet only
+'   status       out  "loading" (the tile is not on screen yet: the manifest
+'                     or sheet is loading, or the preview is inactive),
+'                     "ready" (the tile shows), or "unavailable" (no previews:
+'                     the time shows with "Previews aren't available for this
+'                     title")
+'   refresh      out  set true when the manifest must be read again (its URLs
+'                     expire, or a sheet failed); false once a manifest arrives
+'   frameWidth, frameHeight   out  the tile's size on screen (320 px wide
+'                     on a card, 480 px held, at the tile's aspect), 0
+'                     without a manifest
+'   cardWidth    out  the card's width, 340 px for a 16:9 tile
+'
+' A card has 10 px of padding and radius 20, filled theme.color
+' .PLAYER_GLASS; the tile has radius 14, the corners outside it painted the
+' card's colour, and the time sits 8 px under it. While a manifest is read
+' the tile's place shows its dark backing. A sheet decodes once at its load size (playback.trickplay
+' .decodeSize); moving the position re-translates its Poster and changes a
+' uri only when the position crosses into another sheet.
+'
+' components/player/Player.bs owns the fetch (this component never sends a
+' request): it reads the manifest of the file the plan plays when
+' playback.trickplay.isEligible, sets manifest to pending() meanwhile and to
+' playback.trickplay.settle's answer, or {} for a file without previews,
+' reads it again for the same file when refresh turns true, forwards the
+' controls' scrub as active and position for Left/Right and every ladder
+' speed, places the origin over the scrub point (playback.trickplay
+' .centerX), sets span to the scrubber's ends and tier from the memory
+' policy (playback.trickplay.previewTier), and clears active and manifest
+' when it closes.
+
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/theme/upNext.bs"
+import "pkg:/source/playback/media.bs"
+import "pkg:/source/playback/trickplay.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/log.bs"
+
+const LOG_TAG = "trickplay"
+const CARD_FILL = "pkg:/images/player/rounded_20_fill_$$RES$$.9.png"
+const CORNERS = "pkg:/images/player/frame_14_$$RES$$.9.png"
+const MODE_HOLD = "hold"
+const PADDING = 10
+const GAP = 8
+const TIME_HEIGHT = 29
+const MESSAGE_WIDTH = 640
+const MESSAGE_HEIGHT = 34
+const CARD_TILE_WIDTH = 320
+const CARD_TILE_HEIGHT = 180
+const HOLD_TILE_WIDTH = 480
+const HOLD_TILE_HEIGHT = 270
+
+sub init()
+    m.card = m.top.findNode("card")
+    m.cardFill = m.top.findNode("cardFill")
+    m.cardFill.setFields({ uri: CARD_FILL, blendColor: theme.player.GLASS, opacity: theme.player.GLASS_OPACITY })
+    m.corners = m.top.findNode("corners")
+    m.corners.setFields({ uri: CORNERS, blendColor: theme.player.GLASS, opacity: theme.player.GLASS_OPACITY })
+    m.frame = m.top.findNode("frame")
+    m.backing = m.top.findNode("backing")
+    m.backing.color = theme.color.RAISED_SURFACE
+    ' Each slot holds one retained sheet, by index, or -1. Slots are walked
+    ' by index: a Poster can report its load status while a loop over them
+    ' runs, and the callback walks them too, which would end a for each early.
+    m.slots = []
+    for each id in ["sheetA", "sheetB"]
+        poster = m.top.findNode(id)
+        poster.observeField("loadStatus", "onSheetStatus")
+        m.slots.Push({ poster: poster, sheet: -1 })
+    end for
+    m.time = m.top.findNode("time")
+    m.time.font = theme.font(theme.textStyle.PREVIEW_TIME)
+    m.time.color = theme.color.WHITE
+    m.time.height = TIME_HEIGHT
+    m.message = m.top.findNode("message")
+    m.message.font = theme.font(theme.textStyle.INFO_LINE)
+    m.message.color = theme.color.TEXT_TERTIARY
+    m.message.height = MESSAGE_HEIGHT
+    m.message.text = i18n.text("player.previewsUnavailable")
+    ' As wide as its words, so near the scrubber's ends its card moves in
+    ' no further than they need.
+    m.messageWidth = Int(m.message.boundingRect().width)
+    if m.messageWidth <= 0 or m.messageWidth > MESSAGE_WIDTH then m.messageWidth = MESSAGE_WIDTH
+    m.message.width = m.messageWidth
+    ' The card's shape (arrange), and its size.
+    m.shape = ""
+    m.cardSize = [0, 0]
+    m.top.observeField("translation", "placeCard")
+    m.clock = CreateObject("roDateTime")
+    ' Reused on every move, so a position change allocates nothing.
+    m.tile = {}
+    m.offset = [0, 0]
+    m.manifest = invalid
+    m.pending = false
+    m.display = invalid
+    ' The sheet the position is in, -1 before one is chosen; whether the last
+    ' change of sheet went back; whether the retained sheets must be chosen
+    ' again even within the same sheet.
+    m.current = -1
+    m.backward = false
+    m.retainAgain = true
+    ' A refresh was asked for and no manifest has come since; it was asked
+    ' for a failed sheet; the manifest came from such a refresh and no sheet
+    ' has loaded since; a sheet failed even so, and the title shows no
+    ' previews.
+    m.refreshing = false
+    m.failedRefresh = false
+    m.retried = false
+    m.gaveUp = false
+end sub
+
+sub onManifest()
+    value = m.top.manifest
+    if playback.trickplay.isParsed(value)
+        sameTiles = playback.trickplay.hasSameLayout(m.manifest, value)
+        if sameTiles
+            ' New URLs for the same tiles: sheets already decoded stay; the
+            ' others load again from the new URLs.
+            for i = 0 to m.slots.Count() - 1
+                if m.slots[i].poster.loadStatus <> "ready" then clearSlot(m.slots[i])
+            end for
+        else
+            clearSlots()
+        end if
+        m.manifest = value
+        if not sameTiles then layout()
+        m.pending = false
+        m.retried = m.failedRefresh
+    else
+        clearSlots()
+        m.manifest = invalid
+        m.pending = util.isObject(value) and util.isTrue(value.pending)
+        m.retried = false
+        layout()
+    end if
+    m.gaveUp = false
+    m.refreshing = false
+    m.failedRefresh = false
+    m.top.refresh = false
+    m.retainAgain = true
+    update()
+end sub
+
+sub onPosition()
+    if m.top.active then update()
+end sub
+
+sub onActive()
+    if not m.top.active
+        clearSlots()
+    else
+        m.retainAgain = true
+        if expired() then askRefresh("expired")
+    end if
+    update()
+end sub
+
+sub onTier()
+    m.retainAgain = true
+    if m.top.active then update()
+end sub
+
+sub onMode()
+    layout()
+    update()
+end sub
+
+' Centres the card over the origin, moved in to stay within span. Run 7
+' saw the time 300 px from the scrub point while the player kept the time
+' and a 640 px message bounds centred together.
+sub placeCard()
+    if m.top.mode = MODE_HOLD
+        m.card.translation = [-m.cardSize[0] / 2, 0]
+        return
+    end if
+    origin = m.top.translation[0]
+    centre = origin
+    span = m.top.span
+    if type(span) = "roArray" and span.Count() = 2 then centre = playback.trickplay.centerX(origin, m.cardSize[0], span[0], span[1])
+    m.card.translation = [centre - origin - m.cardSize[0] / 2, -m.cardSize[1]]
+end sub
+
+' The tile's bounds in the mode: 320 by 180 on a card, 480 by 270 held.
+function tileBox() as Object
+    if m.top.mode = MODE_HOLD then return [HOLD_TILE_WIDTH, HOLD_TILE_HEIGHT]
+    return [CARD_TILE_WIDTH, CARD_TILE_HEIGHT]
+end function
+
+' Sizes for the manifest and mode, before any uri is set; none without one.
+sub layout()
+    m.shape = ""
+    bounds = tileBox()
+    if m.manifest = invalid
+        m.display = invalid
+        m.top.frameWidth = 0
+        m.top.frameHeight = 0
+        return
+    end if
+    m.display = playback.trickplay.displaySize(m.manifest, bounds[0], bounds[1])
+    decode = playback.trickplay.decodeSize(m.manifest)
+    width = m.display.width
+    height = m.display.height
+    m.top.frameWidth = width
+    m.top.frameHeight = height
+    for i = 0 to m.slots.Count() - 1
+        poster = m.slots[i].poster
+        poster.loadWidth = decode.loadWidth
+        poster.loadHeight = decode.loadHeight
+        poster.width = m.manifest.columns * width
+        poster.height = m.manifest.rows * height
+    end for
+end sub
+
+' Shows the preview for the position, or the time with the message when
+' the title has no previews.
+sub update()
+    active = m.top.active
+    shown = false
+    if active and m.manifest <> invalid and not m.gaveUp then shown = place()
+    ' Checked after place(): a sheet can fail as its uri is set, and give up.
+    hasTiles = active and m.manifest <> invalid and not m.gaveUp
+    arrange(active, hasTiles)
+    if active then m.time.text = playback.media.clock(m.top.position)
+    if shown and hasTiles
+        setStatus("ready")
+    else if m.pending or (m.manifest <> invalid and not m.gaveUp)
+        setStatus("loading")
+    else
+        setStatus("unavailable")
+    end if
+end sub
+
+' Lays the card out for what it shows: the tile (or its backing while the
+' manifest is read) over the time, or the message over the time; held, the
+' tile alone. Only a change of shape moves anything.
+sub arrange(active as Boolean, hasTiles as Boolean)
+    hold = m.top.mode = MODE_HOLD
+    tiled = hasTiles or m.pending
+    m.card.visible = active and (tiled or not hold)
+    heldHeight = 0
+    if hold and tiled
+        heldHeight = tileBox()[1]
+        if m.display <> invalid then heldHeight = m.display.height
+    end if
+    if m.top.heldHeight <> heldHeight then m.top.heldHeight = heldHeight
+    shape = m.top.mode + "|" + tiled.ToStr()
+    if tiled and m.display <> invalid then shape = shape + "|" + m.display.width.ToStr() + "x" + m.display.height.ToStr()
+    if shape = m.shape then return
+    m.shape = shape
+    bounds = tileBox()
+    size = bounds
+    if m.display <> invalid then size = [m.display.width, m.display.height]
+    m.frame.visible = tiled
+    m.message.visible = not tiled and not hold
+    m.time.visible = not hold
+    m.cardFill.visible = not hold
+    m.corners.visible = tiled and not hold
+    m.frame.clippingRect = [0, 0, size[0], size[1]]
+    m.backing.width = size[0]
+    m.backing.height = size[1]
+    if hold
+        m.frame.translation = [0, 0]
+        m.cardSize = size
+    else if tiled
+        m.frame.translation = [PADDING, PADDING]
+        m.corners.setFields({ translation: [PADDING, PADDING], width: size[0], height: size[1] })
+        m.cardSize = [size[0] + 2 * PADDING, PADDING + size[1] + GAP + TIME_HEIGHT + PADDING]
+        m.time.translation = [0, PADDING + size[1] + GAP]
+    else
+        m.cardSize = [m.messageWidth + 4 * PADDING, PADDING + MESSAGE_HEIGHT + GAP + TIME_HEIGHT + PADDING]
+        m.message.translation = [2 * PADDING, PADDING]
+        m.time.translation = [0, PADDING + MESSAGE_HEIGHT + GAP]
+    end if
+    m.time.width = m.cardSize[0]
+    m.cardFill.width = m.cardSize[0]
+    m.cardFill.height = m.cardSize[1]
+    if not hold then m.top.cardWidth = m.cardSize[0]
+    placeCard()
+end sub
+
+' Moves the current sheet's Poster to the position's tile. The retained
+' sheets change only when the position enters another sheet, or when the
+' tier, the manifest, or activation asks. Gives whether the tile shows.
+function place() as Boolean
+    tile = playback.trickplay.tileAt(m.manifest, m.top.position, m.tile)
+    if tile.sheet <> m.current
+        if m.current >= 0 then m.backward = tile.sheet < m.current
+        m.current = tile.sheet
+        m.retainAgain = true
+    end if
+    if m.retainAgain then retain()
+    m.offset[0] = -tile.column * m.display.width
+    m.offset[1] = -tile.row * m.display.height
+    shown = false
+    for i = 0 to m.slots.Count() - 1
+        slot = m.slots[i]
+        isCurrent = slot.sheet >= 0 and slot.sheet = m.current
+        if isCurrent
+            slot.poster.translation = m.offset
+            shown = slot.poster.loadStatus = "ready"
+        end if
+        slot.poster.visible = isCurrent
+    end for
+    return shown
+end function
+
+' Keeps the sheets playback.trickplay.retainedSheets names and clears the
+' others' uri. Nothing new loads while a refresh is pending, or from a URL
+' about to expire, which asks for one.
+sub retain()
+    m.retainAgain = false
+    wanted = playback.trickplay.retainedSheets(m.top.tier, m.current, m.manifest.sheets.Count(), m.backward)
+    spare = []
+    for i = 0 to m.slots.Count() - 1
+        slot = m.slots[i]
+        if slot.sheet < 0 or not util.contains(wanted, slot.sheet)
+            clearSlot(slot)
+            spare.Push(slot)
+        end if
+    end for
+    if m.refreshing then return
+    if expired()
+        askRefresh("expired")
+        return
+    end if
+    for each sheet in wanted
+        if m.refreshing or m.gaveUp then exit for
+        if not holds(sheet) and spare.Count() > 0
+            slot = spare.Shift()
+            slot.sheet = sheet
+            slot.poster.uri = m.manifest.sheets[sheet]
+        end if
+    end for
+end sub
+
+function holds(sheet as Integer) as Boolean
+    for i = 0 to m.slots.Count() - 1
+        if m.slots[i].sheet = sheet then return true
+    end for
+    return false
+end function
+
+sub onSheetStatus(event as Object)
+    poster = event.getRoSGNode()
+    slot = invalid
+    for i = 0 to m.slots.Count() - 1
+        if m.slots[i].poster.isSameNode(poster) then slot = m.slots[i]
+    end for
+    if slot = invalid or slot.sheet < 0 then return
+    status = event.getData()
+    if status = "ready"
+        m.retried = false
+        if slot.sheet = m.current and m.top.active then update()
+    else if status = "failed"
+        sheetFailed(slot)
+    end if
+end sub
+
+' A sheet that fails asks for the manifest again. One that fails from the
+' manifest that refresh brought, before any sheet has loaded, means the
+' device or the server cannot give this title's previews: they show as
+' unavailable until another manifest arrives.
+sub sheetFailed(slot as Object)
+    sheet = slot.sheet
+    clearSlot(slot)
+    if m.retried
+        log.warn(LOG_TAG, "a preview sheet failed again after a refresh; previews are off for this title", { fileId: m.manifest.fileId, sheet: sheet })
+        m.gaveUp = true
+        clearSlots()
+    else
+        askRefresh("failed")
+        m.failedRefresh = true
+    end if
+    if m.top.active or m.gaveUp then update()
+end sub
+
+function expired() as Boolean
+    if m.manifest = invalid then return false
+    m.clock.Mark()
+    return playback.trickplay.refreshReason(m.manifest, { now: m.clock.AsSeconds() }) = "expired"
+end function
+
+sub askRefresh(reason as String)
+    if m.refreshing then return
+    m.refreshing = true
+    log.info(LOG_TAG, "reading the preview manifest again", { fileId: m.manifest.fileId, reason: reason })
+    m.top.refresh = true
+end sub
+
+' The slot is emptied before its uri is cleared, so the load status that
+' clearing may report is not taken for its sheet's.
+sub clearSlot(slot as Object)
+    slot.sheet = -1
+    slot.poster.uri = ""
+    slot.poster.visible = false
+end sub
+
+sub clearSlots()
+    for i = 0 to m.slots.Count() - 1
+        clearSlot(m.slots[i])
+    end for
+    m.current = -1
+    m.backward = false
+end sub
+
+sub setStatus(value as String)
+    if m.top.status <> value then m.top.status = value
+end sub

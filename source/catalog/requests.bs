@@ -1,0 +1,263 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/catalog/art.bs"
+
+' What ApiTask's map step builds from a catalog response before posting it
+' (source/catalog/map.bs). A request names one in map: { kind, ... }.
+namespace catalog.kind
+    ' user/libraries: { libraries: [{ id, name, type, movies, series }], movies, series }.
+    const LIBRARIES = "libraries"
+    ' home/sections or library/{id}/sections: a RowList tree of RowContent rows.
+    const ROWS = "rows"
+    ' One section's items, or a /catalog page of a section: one RowContent row.
+    const ROW = "row"
+    ' A /catalog page for a grid: a ContentNode of CardContent items.
+    const PAGE = "page"
+    ' A /catalog page read only for the cursor after it: no nodes.
+    const SKIP = "skip"
+    const SEASONS = "seasons"
+    const EPISODES = "episodes"
+    ' catalog/items/{id}: the detail page's fields (catalog.detail.fromItem).
+    const DETAIL = "detail"
+    ' watch/{id}: the resume point only (catalog.detail.resume).
+    const RESUME = "resume"
+    ' watch/{id}: the resume point and the Version, Audio, and Subtitles
+    ' choices (catalog.map.watchState).
+    const WATCH = "watch"
+    ' audio-prefs/{key}: the audio track the profile chose for a series or
+    ' movie (catalog.selection.audioPreferenceOf).
+    const AUDIO_PREFERENCE = "audioPreference"
+    const SEARCH_CAPABILITIES = "searchCapabilities"
+    const BRANDING = "branding"
+end namespace
+
+' Request builders for the browse screens (spec section 8.1). Each returns a
+' request for api.send (source/api/request.bs) with its map step; none sends
+' anything. Profile-scoped reads use auth "profile" (spec section 7.4).
+namespace catalog.request
+    ' Spec section 5.6: a search query is at most this long.
+    const MAX_QUERY = 200
+    ' The most items one /catalog request may ask for (listCatalogItems
+    ' limit maximum).
+    const MAX_LIMIT = 200
+
+    function libraries() as Object
+        return read("/api/v2/user/libraries", {}, { kind: catalog.kind.LIBRARIES })
+    end function
+
+    ' Home's rows with their first items. Sections the server sends without
+    ' items are loaded later with homeSectionItems, as Android TV does.
+    function homeSections(lowTier as Boolean) as Object
+        return read("/api/v2/home/sections", catalog.art.query(lowTier), { kind: catalog.kind.ROWS })
+    end function
+
+    function homeSectionItems(sectionId as String, lowTier as Boolean) as Object
+        return read("/api/v2/home/sections/" + segment(sectionId) + "/items", catalog.art.query(lowTier), { kind: catalog.kind.ROW })
+    end function
+
+    ' A library's Recommended rows (spec section 5.5), without its featured
+    ' sections, as tvOS and Android TV leave them out of library pages.
+    function librarySections(libraryId as String, lowTier as Boolean) as Object
+        return read("/api/v2/library/" + segment(libraryId) + "/sections", catalog.art.query(lowTier), { kind: catalog.kind.ROWS, skipFeatured: true })
+    end function
+
+    function librarySectionItems(libraryId as String, sectionId as String, lowTier as Boolean) as Object
+        return read("/api/v2/library/" + segment(libraryId) + "/sections/" + segment(sectionId) + "/items", catalog.art.query(lowTier), { kind: catalog.kind.ROW })
+    end function
+
+    ' One page of a section past its bounded first answer (plan section 5):
+    ' scope is "home" or "library"; libraryId is required for a library.
+    ' cursor "" is the first page.
+    function sectionPage(scope as String, sectionId as String, libraryId as String, cursor as String, limit as Integer, lowTier as Boolean) as Object
+        query = catalog.art.query(lowTier)
+        query.Append({ source: "section", scope: scope, section_id: sectionId, limit: limit })
+        if libraryId <> "" then query.library_id = libraryId
+        if cursor <> "" then query.cursor = cursor
+        return read("/api/v2/catalog", query, { kind: catalog.kind.ROW })
+    end function
+
+    ' A Browse grid page: options { libraryId, type, sort, namePrefix }, each
+    ' optional; sort as catalog.sort.param gives it.
+    function browse(options as Object, cursor as String, limit as Integer, lowTier as Boolean) as Object
+        query = catalog.art.query(lowTier)
+        names = { libraryId: "library_id", type: "type", sort: "sort", namePrefix: "name_prefix" }
+        for each name in names
+            value = options[name]
+            if api.request.isString(value) and value <> "" then query[names[name]] = value
+        end for
+        return page(query, cursor, limit, catalog.kind.PAGE)
+    end function
+
+    ' A search grid page. scope is catalog.searchScope; videoWithEpisodes is
+    ' the search capability (searchType). q is trimmed and cut to MAX_QUERY.
+    ' Episodes are captioned with their tag (map option episodeTags).
+    function search(q as String, scope as String, videoWithEpisodes as Boolean, cursor as String, limit as Integer, lowTier as Boolean) as Object
+        query = catalog.art.query(lowTier)
+        query.Append({ source: "query", q: Left(q.Trim(), MAX_QUERY), type: searchType(scope, videoWithEpisodes) })
+        out = page(query, cursor, limit, catalog.kind.PAGE)
+        out.map.episodeTags = true
+        return out
+    end function
+
+    ' Spec section 8.1: All searches episodes too when the server can.
+    function searchType(scope as String, videoWithEpisodes as Boolean) as String
+        if scope = catalog.searchScope.MOVIES then return "movie"
+        if scope = catalog.searchScope.SERIES then return "series"
+        if videoWithEpisodes then return "video_with_episodes"
+        return "video"
+    end function
+
+    function searchCapabilities() as Object
+        return read("/api/v2/catalog/search/capabilities", {}, { kind: catalog.kind.SEARCH_CAPABILITIES })
+    end function
+
+    ' The same /catalog request as request, from cursor with limit, mapped as
+    ' kind with request's other map options: how a grid reads past pages it
+    ' no longer holds (catalog.grid).
+    function continued(request as Object, cursor as String, limit as Integer, kind as String) as Object
+        query = {}
+        query.Append(request.query)
+        query.Delete("cursor")
+        out = page(query, cursor, limit, kind)
+        mapping = {}
+        mapping.Append(request.map)
+        mapping.kind = kind
+        out.map = mapping
+        return out
+    end function
+
+    ' A detail page. libraryId may be "".
+    function item(id as String, libraryId as String, lowTier as Boolean) as Object
+        query = { poster_width: catalog.art.POSTER_WIDTH, backdrop_width: catalog.art.heroSize(lowTier)[0], logo_width: catalog.art.DETAIL_LOGO_WIDTH }
+        if libraryId <> "" then query.library_id = libraryId
+        return read("/api/v2/catalog/items/" + segment(id), query, { kind: catalog.kind.DETAIL })
+    end function
+
+    ' A series' seasons, for the season capsules: text only.
+    function seasons(seriesId as String, libraryId as String) as Object
+        query = { include_artwork: false }
+        if libraryId <> "" then query.library_id = libraryId
+        return read("/api/v2/catalog/series/" + segment(seriesId) + "/seasons", query, { kind: catalog.kind.SEASONS })
+    end function
+
+    function episodes(seriesId as String, seasonNumber as Integer, libraryId as String) as Object
+        query = { still_width: catalog.art.STILL_WIDTH }
+        if libraryId <> "" then query.library_id = libraryId
+        return read("/api/v2/catalog/series/" + segment(seriesId) + "/seasons/" + seasonNumber.ToStr() + "/episodes", query, { kind: catalog.kind.EPISODES })
+    end function
+
+    ' An item's resume point after the player closes (plan section 4.5).
+    ' The player reads watch/{id} for playback itself.
+    function resume(id as String) as Object
+        return read("/api/v2/watch/" + segment(id), {}, { kind: catalog.kind.RESUME })
+    end function
+
+    ' The resume point and tracks of the item a detail page's action row
+    ' plays, for its Version, Audio, and Subtitles buttons (spec section 5.6).
+    function watch(id as String) as Object
+        return read("/api/v2/watch/" + segment(id), {}, { kind: catalog.kind.WATCH })
+    end function
+
+    ' The audio track the profile chose for key, a series or a movie
+    ' (catalog.selection's key); 404 when it chose none. It waits in the
+    ' key's line behind the writes sent before it (savePreference), so it
+    ' reads what they leave.
+    function audioPreference(key as String) as Object
+        out = read(preferencePath("audio", key), {}, { kind: catalog.kind.AUDIO_PREFERENCE })
+        out.orderKey = out.path
+        return out
+    end function
+
+    ' Remembers a detail page's audio or subtitle choice for key as tvOS
+    ' does (spec section 8.5): kind "audio" or "subtitle", body a
+    ' catalog.selection preference; invalid body forgets it (Auto). The
+    ' writes of a kind and key go one at a time, in the order sent, from
+    ' any page (api.router.order), so the latest choice is the one the
+    ' server keeps, as with tvOS's TrackSelectionPersistence.
+    function savePreference(kind as String, key as String, body as Dynamic) as Object
+        path = preferencePath(kind, key)
+        out = { method: "DELETE", path: path, auth: "profile", lane: "interactive", orderKey: path }
+        if body <> invalid
+            out.method = "PUT"
+            out.body = body
+        end if
+        return out
+    end function
+
+    function preferencePath(kind as String, key as String) as String
+        return "/api/v2/" + kind + "-prefs/" + segment(key)
+    end function
+
+    ' The server's public branding; sent without credentials.
+    function branding() as Object
+        out = read("/api/v2/theme/branding", {}, { kind: catalog.kind.BRANDING })
+        out.auth = "none"
+        return out
+    end function
+
+    function page(query as Object, cursor as String, limit as Integer, kind as String) as Object
+        query.limit = limit
+        if cursor <> "" then query.cursor = cursor
+        return read("/api/v2/catalog", query, { kind: kind })
+    end function
+
+    function read(path as String, query as Object, mapping as Object) as Object
+        return { path: path, query: query, auth: "profile", map: mapping }
+    end function
+
+    ' A path segment: content IDs keep their colons ("movie:heat-1995");
+    ' everything outside RFC 3986's unreserved set is escaped.
+    function segment(value as String) as String
+        return api.request.escape(value).Replace("%3A", ":")
+    end function
+end namespace
+
+' Search chips (spec section 5.6).
+namespace catalog.searchScope
+    const ALL = "all"
+    const MOVIES = "movies"
+    const SERIES = "series"
+end namespace
+
+' Browse sorts (spec section 5.5), with Android TV's field names and default
+' directions. Choosing the active sort again reverses it.
+namespace catalog.sort
+    ' [key, field, descending by default], in menu order. key names the label
+    ' (catalog.sort.<key> in locale/).
+    function options() as Object
+        return [
+            ["title", "title", false]
+            ["added", "added_at", true]
+            ["released", "release_date", true]
+            ["year", "year", true]
+            ["rating", "rating_imdb", true]
+            ["runtime", "runtime", true]
+            ["resolution", "resolution", true]
+        ]
+    end function
+
+    ' The sort query value: "title", or "-added_at" descending.
+    function param(field as String, descending as Boolean) as String
+        if descending then return "-" + field
+        return field
+    end function
+
+    ' { field, descending } after choosing field: the reverse when it is the
+    ' active sort, else its default direction. An unknown field keeps current.
+    function choose(current as Object, field as String) as Object
+        if current.field = field then return { field: field, descending: not current.descending }
+        for each option in options()
+            if option[1] = field then return { field: field, descending: option[2] }
+        end for
+        return current
+    end function
+
+    ' The alphabet rail, under every sort: "" is All (no name_prefix), then
+    ' "#" and A to Z, each sent as name_prefix.
+    function letters() as Object
+        out = ["", "#"]
+        for code = Asc("A") to Asc("Z")
+            out.Push(Chr(code))
+        end for
+        return out
+    end function
+end namespace

@@ -1,0 +1,193 @@
+namespace tests
+
+    ' The server rejects unknown members with 422, so each body is round-tripped
+    ' through JSON and checked against the v2 OpenAPI request schema.
+    @suite("dev harness: bodies against the v2 OpenAPI schemas")
+    class HarnessContractTests extends rooibos.BaseTestSuite
+
+        @describe("PlaybackStartBody")
+
+        @it("matches for the 4K TV with every toggle on")
+        sub _()
+            m.assertSchema(m.startBody(harness.defaultToggles(), m.facts()), "PlaybackStartBody")
+        end sub
+
+        @it("matches with each toggle off, a start position, and an audio ordinal")
+        sub _()
+            for each name in ["originalHttp", "hevcEac3", "sidecarSubtitles"]
+                toggles = harness.defaultToggles()
+                toggles[name] = false
+                body = m.startBody(toggles, m.facts())
+                body.start_position = 0
+                body.audio_track_index = 1
+                m.assertSchema(body, "PlaybackStartBody")
+            end for
+        end sub
+
+        @it("matches with both prototype toggles on and both track ordinals")
+        sub _()
+            toggles = harness.defaultToggles()
+            toggles.tsCopyRemux = true
+            toggles.noPlaylistVariables = true
+            body = m.startBody(toggles, m.facts())
+            body.audio_track_index = 0
+            body.subtitle_track_index = 2
+            m.assertSchema(body, "PlaybackStartBody")
+        end sub
+
+        ' The prototype tokens are not in the vendored contract. It types
+        ' feature lists as open strings, so the check above covers their shape
+        ' only, and whether a server accepts them is seen at run time. If the
+        ' contract ever enumerates tokens, this fails first: scope the
+        ' prototype tokens out of assertSchema then.
+        @it("leaves feature tokens open, so prototype tokens are checked for shape only")
+        sub _()
+            shapes = tests.contract.shapes()
+            for each property in [shapes.PlaybackStartBody.properties.client_features, shapes.PlaybackReplanBody.properties.client_features, shapes.DeliveryCapabilityV3.properties.features]
+                m.assertEqual(property.items, { "type": "string" })
+            end for
+        end sub
+
+        @it("matches when the display cannot be read")
+        sub _()
+            facts = m.facts()
+            facts.display.known = false
+            m.assertSchema(m.startBody(harness.defaultToggles(), facts), "PlaybackStartBody")
+        end sub
+
+        @describe("PlaybackReplanBody")
+
+        @it("matches for failure_recovery and seek_reanchor, with and without the prototype toggles")
+        sub _()
+            plan = tests.contract.fixture("playback_start_opaque_ids").playback_plan
+            prototypes = harness.defaultToggles()
+            prototypes.tsCopyRemux = true
+            prototypes.noPlaylistVariables = true
+            for each toggles in [harness.defaultToggles(), prototypes]
+                caps = harness.capabilities(m.facts(), toggles)
+                for each operation in ["failure_recovery", "seek_reanchor"]
+                    request = { installationId: "11111111-1111-4111-8111-111111111111", attemptId: harness.newUuid(), planAttemptId: harness.newUuid(), replanRequestId: harness.newUuid(), operation: operation, position: 0, attemptedPlanKeys: [], attemptCount: 1 }
+                    if operation = "failure_recovery"
+                        request.attemptedPlanKeys = [plan.plan_attempt_key]
+                        request.failure = { classification: harness.failureClassification(-5), message: "Roku Video errorCode -5" }
+                    end if
+                    m.assertSchema(harness.replanBody(request, plan, caps), "PlaybackReplanBody")
+                end for
+            end for
+        end sub
+
+        @describe("progress and stop")
+
+        @it("match PlaybackProgressBody and PlaybackStopBody")
+        sub _()
+            m.assertSchema(harness.progressBody("11111111-1111-4111-8111-111111111111", 1, 10.5, false), "PlaybackProgressBody")
+            m.assertSchema(harness.stopBody("11111111-1111-4111-8111-111111111111", harness.newUuid(), 2, 20, true), "PlaybackStopBody")
+        end sub
+
+        @describe("the checker itself")
+
+        @it("reports unknown, missing, mistyped, and out-of-range members")
+        sub _()
+            body = harness.progressBody("i", 1, 1, false)
+            body.metered = false
+            body.Delete("is_paused")
+            body.sequence = 0
+            body.position = "1"
+            errors = m.schemaErrors(body, "PlaybackProgressBody")
+            m.assertArrayContains(errors, "$.metered: not in the schema")
+            m.assertArrayContains(errors, "$.is_paused: required")
+            m.assertArrayContains(errors, "$.sequence: below the minimum")
+            m.assertArrayContains(errors, "$.position: expected number")
+        end sub
+
+        ' --- Helpers ---
+
+        ' A 4K TV that answers yes to every probe, including HDR10+ and Dolby Vision.
+        function facts() as Object
+            return tests.fakeTvFacts({ Hdr10: true, HLG: true, Hdr10Plus: true, DolbyVision: true })
+        end function
+
+        function startBody(toggles as Object, facts as Object) as Object
+            request = { installationId: "11111111-1111-4111-8111-111111111111", profileId: "p-owner", fileId: "42", attemptId: harness.newUuid() }
+            return harness.startBody(request, harness.capabilities(facts, toggles))
+        end function
+
+        sub assertSchema(body as Object, schema as String)
+            errors = m.schemaErrors(body, schema)
+            m.assertEmpty(errors, schema + ": " + errors.Join("; "))
+        end sub
+
+        ' Serialises and re-parses the body, as the server will see it, then
+        ' collects every schema violation as "path: problem".
+        function schemaErrors(body as Object, schema as String) as Object
+            errors = []
+            shapes = tests.contract.shapes()
+            m.checkObject(ParseJson(FormatJson(body)), shapes[schema], shapes, "$", errors)
+            return errors
+        end function
+
+        sub checkObject(value as Dynamic, shape as Object, shapes as Object, path as String, errors as Object)
+            if type(value) <> "roAssociativeArray"
+                errors.Push(path + ": expected object")
+                return
+            end if
+            for each key in shape.required
+                if not value.DoesExist(key) then errors.Push(path + "." + key + ": required")
+            end for
+            for each key in value
+                property = shape.properties[key]
+                if property = invalid
+                    errors.Push(path + "." + key + ": not in the schema")
+                else
+                    m.checkValue(value[key], property, shapes, path + "." + key, errors)
+                end if
+            end for
+        end sub
+
+        sub checkValue(value as Dynamic, property as Object, shapes as Object, path as String, errors as Object)
+            kind = property["type"]
+            if kind = "ref"
+                m.checkObject(value, shapes[property["ref"]], shapes, path, errors)
+            else if kind = "map"
+                if type(value) <> "roAssociativeArray"
+                    errors.Push(path + ": expected object")
+                    return
+                end if
+                for each key in value
+                    m.checkValue(value[key], property["values"], shapes, path + "." + key, errors)
+                end for
+            else if kind = "array"
+                if type(value) <> "roArray"
+                    errors.Push(path + ": expected array")
+                    return
+                end if
+                if property.DoesExist("maxItems") and value.Count() > property["maxItems"] then errors.Push(path + ": too many items")
+                for i = 0 to value.Count() - 1
+                    m.checkValue(value[i], property["items"], shapes, path + "[" + i.ToStr() + "]", errors)
+                end for
+            else if kind = "string"
+                if type(value) <> "String" and type(value) <> "roString"
+                    errors.Push(path + ": expected string")
+                    return
+                end if
+                if property.DoesExist("minLength") and Len(value) < property["minLength"] then errors.Push(path + ": too short")
+                if property.DoesExist("maxLength") and Len(value) > property["maxLength"] then errors.Push(path + ": too long")
+                if property.DoesExist("enum") and not tests.listHas(property["enum"], value) then errors.Push(path + ": not an allowed value")
+            else if kind = "integer" or kind = "number"
+                integerTypes = ["Integer", "roInteger", "LongInteger", "roLongInteger"]
+                numberTypes = ["Float", "roFloat", "Double", "roDouble"]
+                isInteger = tests.listHas(integerTypes, type(value))
+                if not isInteger and (kind = "integer" or not tests.listHas(numberTypes, type(value)))
+                    errors.Push(path + ": expected " + kind)
+                    return
+                end if
+                if property.DoesExist("minimum") and value < property["minimum"] then errors.Push(path + ": below the minimum")
+                if property.DoesExist("maximum") and value > property["maximum"] then errors.Push(path + ": above the maximum")
+            else if kind = "boolean"
+                if type(value) <> "Boolean" and type(value) <> "roBoolean" then errors.Push(path + ": expected boolean")
+            end if
+        end sub
+
+    end class
+
+end namespace

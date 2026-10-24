@@ -1,0 +1,272 @@
+import "pkg:/components/theme/browse.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/views/pending.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/grid.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/nav/focus.bs"
+import "pkg:/source/util/values.bs"
+
+' The key every grid focus key carries as its row.
+const GRID_KEY = "grid"
+
+sub init()
+    m.grid = m.top.findNode("grid")
+    m.lowTier = false
+    arrange()
+    m.grid.observeField("itemFocused", "onItemFocused")
+    m.grid.observeField("itemSelected", "onItemSelected")
+    m.top.observeField("focusedChild", "onFocusedChild")
+    m.top.observeField("cardSize", "onCardSize")
+    m.restoreTimer = m.top.findNode("restoreTimer")
+    m.restoreTimer.duration = nav.focus.WAIT_MS / 1000
+    m.restoreTimer.observeField("fire", "onRestoreTimeout")
+    m.paging = catalog.grid.create(m.top.pages)
+    m.root = invalid
+    ' Cards of a read before the held items that has not reached them yet
+    ' (catalog.grid gather), or invalid.
+    m.gathered = invalid
+    m.template = invalid
+    m.dev = invalid
+    ' Whether the grid shows m.root: detach() takes it away under memory
+    ' pressure, and pages arriving meanwhile change only m.root.
+    m.attached = true
+    ' Requests sent: { handle, kind: "page" | "refresh", decision }.
+    m.pending = []
+    m.focus = 0
+    m.restoreKey = invalid
+end sub
+
+' Focus given to the component goes to its grid.
+sub onFocusedChild()
+    if m.top.hasFocus() then m.grid.setFocus(true)
+end sub
+
+function load(options as Object) as Boolean
+    cancelPending()
+    m.template = options.request
+    m.dev = options.dev
+    m.lowTier = util.isTrue(options.lowTier)
+    m.grid.drawFocusFeedback = m.lowTier
+    if m.lowTier then m.grid.focusBitmapUri = theme.art.FOCUS_RING
+    room = arrange()
+    m.paging = catalog.grid.create(m.top.pages)
+    m.gathered = invalid
+    m.root = CreateObject("roSGNode", "RowContent")
+    m.root.lowTier = m.lowTier
+    m.root.cardRoom = room
+    ' Captions centred 16 px under the posters (B-11).
+    m.root.captionStyle = "grid"
+    m.root.observeField("artFailed", "onArtFailed")
+    if m.attached then m.grid.content = m.root
+    m.focus = 0
+    m.top.total = -1
+    m.top.state = "loading"
+    readToward(0)
+    return true
+end function
+
+' Sizes the grid's items for its cards and the tier, with room around each
+' card for the focus scale, and returns the room (theme.browse.gridLayout).
+' The grid sits offset by it, so cards rest at this component's origin.
+function arrange() as Object
+    geometry = theme.browse.gridLayout(m.lowTier, m.top.cardSize)
+    m.grid.itemSize = geometry.itemSize
+    m.grid.itemSpacing = geometry.itemSpacing
+    m.grid.translation = geometry.translation
+    return geometry.room
+end function
+
+sub onCardSize()
+    room = arrange()
+    if m.root <> invalid then m.root.cardRoom = room
+end sub
+
+function clear() as Boolean
+    cancelPending()
+    m.restoreKey = invalid
+    m.restoreTimer.control = "stop"
+    m.root = invalid
+    m.gathered = invalid
+    m.grid.content = invalid
+    m.focus = 0
+    m.top.total = -1
+    m.top.state = ""
+    return true
+end function
+
+' Asks for the next read with focus at absolute index target, if any.
+sub readToward(target as Integer)
+    decision = catalog.grid.want(m.paging, target)
+    if decision = invalid then return
+    kind = catalog.kind.PAGE
+    if decision.skip then kind = catalog.kind.SKIP
+    catalog.grid.started(m.paging, decision)
+    send(catalog.request.continued(m.template, decision.cursor, decision.limit, kind), { kind: "page", decision: decision })
+end sub
+
+sub send(request as Object, entry as Object)
+    if m.dev <> invalid then request.dev = m.dev
+    sendPending(request, entry)
+end sub
+
+sub onResult(event as Object)
+    handle = event.getRoSGNode()
+    entry = takePending(handle)
+    if entry = invalid then return
+    result = api.resultOf(handle)
+    if entry.kind = "refresh"
+        if result.ok and handle.content <> invalid then onRefresh(entry.decision, handle.content)
+        return
+    end if
+    if not result.ok
+        catalog.grid.failed(m.paging)
+        if m.paging.hi = 0
+            m.top.errorKind = result.error.kind
+            m.top.state = "error"
+        end if
+        return
+    end if
+    applyChange(catalog.grid.received(m.paging, entry.decision, result.body), handle.content)
+    m.top.total = m.paging.total
+    if m.paging.hi = 0 and m.paging.complete
+        m.top.state = "empty"
+    else
+        m.top.state = "ready"
+    end if
+    if m.restoreKey <> invalid
+        tryRestore(false)
+    else
+        readToward(m.paging.lo + m.focus)
+    end if
+end sub
+
+' Carries out catalog.grid's change on the grid's content, keeping focus on
+' the same item.
+sub applyChange(change as Object, content as Dynamic)
+    focus = m.focus
+    if change.insert = "end"
+        m.root.appendChildren(content.getChildren(change.size, change.from))
+    else if change.insert = "gather" or change.insert = "start"
+        if m.gathered = invalid then m.gathered = CreateObject("roSGNode", "ContentNode")
+        if change.size > 0 then m.gathered.appendChildren(content.getChildren(change.size, change.from))
+        if change.insert = "start"
+            cards = m.gathered.getChildren(-1, 0)
+            m.gathered = invalid
+            m.root.insertChildren(cards, 0)
+            focus = focus + cards.Count()
+        end if
+    end if
+    if m.paging.gather = invalid then m.gathered = invalid
+    if change.dropEnd > 0 then m.root.removeChildrenIndex(change.dropEnd, m.root.getChildCount() - change.dropEnd)
+    if change.dropStart > 0
+        m.root.removeChildrenIndex(change.dropStart, 0)
+        focus = focus - change.dropStart
+    end if
+    last = m.root.getChildCount() - 1
+    if focus > last then focus = last
+    if focus < 0 then focus = 0
+    if focus <> m.focus
+        m.focus = focus
+        if last >= 0 and m.attached then m.grid.jumpToItem = focus
+    end if
+end sub
+
+sub onItemFocused()
+    if m.root = invalid or m.grid.itemFocused < 0 then return
+    m.focus = m.grid.itemFocused
+    m.top.focusedItem = m.root.getChild(m.focus)
+    if m.restoreKey = invalid then readToward(m.paging.lo + m.focus)
+end sub
+
+sub onItemSelected()
+    if m.root = invalid then return
+    card = m.root.getChild(m.grid.itemSelected)
+    if card <> invalid and card.id <> "" then m.top.selectedItem = card
+end sub
+
+' The memory policy changed how many pages the grid may hold.
+sub onPages()
+    if m.root = invalid then return
+    applyChange(catalog.grid.trim(m.paging, m.top.pages, m.paging.lo + m.focus), invalid)
+end sub
+
+' A card's image failed: read its page again for fresh signed URLs, once.
+sub onArtFailed(event as Object)
+    if m.root = invalid or not m.root.isSameNode(event.getRoSGNode()) then return
+    id = m.root.artFailed
+    for i = 0 to m.root.getChildCount() - 1
+        if m.root.getChild(i).id = id
+            decision = catalog.grid.refreshFor(m.paging, m.paging.lo + i)
+            if decision <> invalid then send(catalog.request.continued(m.template, decision.cursor, decision.limit, catalog.kind.PAGE), { kind: "refresh", decision: decision })
+            return
+        end if
+    end for
+end sub
+
+sub onRefresh(decision as Object, content as Object)
+    span = catalog.grid.refreshRange(m.paging, decision, content.getChildCount())
+    fresh = content.getChildren(span.size, span.from)
+    for i = 0 to fresh.Count() - 1
+        m.root.replaceChild(fresh[i], span.start + i)
+    end for
+end sub
+
+' Memory pressure on a hidden screen (nav.textures): the grid lets go of
+' its content, destroying its cards' components and textures. False when
+' already detached.
+function detach() as Boolean
+    if not m.attached then return false
+    m.attached = false
+    m.grid.content = invalid
+    return true
+end function
+
+' The screen is shown again: the grid shows the items it holds now, with
+' focus where it was. True when it was detached with items to show.
+function attach() as Boolean
+    if m.attached then return false
+    m.attached = true
+    if m.root = invalid then return false
+    m.grid.content = m.root
+    if m.root.getChildCount() > 0 then m.grid.jumpToItem = m.focus
+    return true
+end function
+
+function focusKey() as Dynamic
+    if m.root = invalid then return invalid
+    card = m.root.getChild(m.focus)
+    if card = invalid then return invalid
+    return nav.focus.newKey(GRID_KEY, card.id, 0, m.paging.lo + m.focus)
+end function
+
+function restoreFocus(key as Dynamic) as Boolean
+    m.restoreKey = key
+    if key = invalid then return false
+    m.restoreTimer.control = "start"
+    if m.root <> invalid and m.root.getChildCount() > 0 then tryRestore(false)
+    return true
+end function
+
+sub onRestoreTimeout()
+    if m.restoreKey <> invalid then tryRestore(true)
+end sub
+
+' Focuses the restoration target, or keeps reading toward it.
+sub tryRestore(final as Boolean)
+    ids = []
+    for each card in m.root.getChildren(-1, 0)
+        ids.Push(card.id)
+    end for
+    target = catalog.grid.restore(m.paging, m.restoreKey, ids, final)
+    if target.kind = nav.restore.WAIT
+        readToward(target.index)
+        return
+    end if
+    m.restoreKey = invalid
+    m.restoreTimer.control = "stop"
+    if ids.Count() = 0 then return
+    m.focus = target.index - m.paging.lo
+    if m.attached then m.grid.jumpToItem = m.focus
+    readToward(target.index)
+end sub

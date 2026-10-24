@@ -1,0 +1,218 @@
+import "pkg:/source/api/problem.bs"
+import "pkg:/source/util/values.bs"
+
+' The result envelope ApiTask sends for each request (spec section 6.3):
+'   { requestId, ok, status, headers, body, error }
+' status is the HTTP status, or 0 when there was no response; ok is true for 2xx
+' and for 304 (a conditional request's cached copy is current); headers holds only
+' the request's responseHeaders, by lowercase name; body is the parsed JSON, or
+' invalid. error is invalid when ok, otherwise
+'   { kind, status, problemType, instance, retryAfterSeconds, reason }
+' with kind one of network, timeout, http, parse, too_large, cancelled, or
+' invalid_request, or, from the account session
+' (source/auth/coordinator.bs):
+'   signed_out        no account session
+'   profile_required  a profile request before a profile was chosen
+'   pin_required      the profile's PIN must be entered (again)
+'   auth_unavailable  the token needs a refresh the server could not give;
+'                     the session is kept; retryAfterSeconds says when to retry
+'   no_server         sign-in before a server was set up
+'   identity_changed  a request fenced to an account, profile, or server
+'                     other than the current one (a playback request, or one
+'                     that waited in an orderKey line); never sent
+'   origin_unverified a request carrying a credential while the configured
+'                     origin's check got no answer; never sent
+' and from a server check (source/auth/server.bs): invalid_address,
+' unsupported_scheme, credentials_in_address, needs_http_confirmation,
+' unreachable, server_update_required, origin_unconfirmed, or
+' origin_mismatch. A request carrying a credential to a server whose check
+' refused it fails with that check's error and is never sent.
+' reason is set only for cancelled: owner, request, shed, or server, or,
+' from AppScene, superseded (a waiting write a newer one replaced,
+' api.router.order).
+' A download request (api.request download) that succeeds has body
+' { path, size }: the file it saved, which the requester deletes. A
+' download's file has its own budget (limit).
+namespace api.response
+    ' The roRenderThreadQueue message ID ApiTask posts envelopes under.
+    const MESSAGE_ID = "silo.api.result"
+    ' Plan section 4.8: larger bodies fail as a client error before they are
+    ' read into memory. ApiTask receives bodies into files and counts their
+    ' decoded bytes (exceedsBudget); a body received as a string counts its
+    ' characters after download.
+    const MAX_BODY_BYTES = 2097152
+    ' A download (the only ones are subtitle sidecars) is saved to tmp:/ and
+    ' never parsed: MediaTask reads it in pieces of
+    ' playback.subtitles.CHUNK_BYTES, keeping at most MAX_CUES cues, so its
+    ' size costs tmp:/ space, which Roku counts as the app's memory, rather
+    ' than the conversion's. Its budget (sidecarBudget) is the smaller of
+    ' MAX_SIDECAR_BYTES and a FREE_SHARE-th of the memory the app has free
+    ' when it starts, never under MAX_BODY_BYTES. The server serves an
+    ' embedded ASS track as extracted, at any size: 10.24 MiB on hardware
+    ' run 23, mostly typesetting the conversion drops. 16 MiB holds that
+    ' file half again; more would buy minutes of "Loading subtitles…" (the
+    ' conversion's time grows with the file) for text that is mostly signs
+    ' (assumption AG-214).
+    const MAX_SIDECAR_BYTES = 16777216
+    ' Up to ApiTask's four kept downloads, each started at this share of
+    ' the free memory it saw, hold at most half of it; the conversion
+    ' (about 15 MiB at the cue limit) and the player keep the rest.
+    const FREE_SHARE = 8
+    ' The budget when the free memory cannot be read: AG-210's 8 MiB, which
+    ' a 4K Roku TV held without trouble (hardware runs 22 and 23).
+    const UNKNOWN_ROOM_SIDECAR_BYTES = 8388608
+    ' CURLE_OPERATION_TIMEDOUT, also reported when SetMinimumTransferRate trips.
+    const CURL_TIMEOUT = -28
+
+    ' The envelope for a completed transfer. transfer is
+    ' { code: GetResponseCode(), body, headers: GetResponseHeadersArray(), size }:
+    ' size is the bytes of the body's file, which is read only within the
+    ' budget, or invalid for a body received as a string, whose characters
+    ' count instead.
+    function fromTransfer(request as Object, transfer as Object) as Object
+        code = transfer.code
+        if code <= 0
+            kind = "network"
+            if code = CURL_TIMEOUT then kind = "timeout"
+            return failure(request, kind)
+        end if
+        result = envelope(request, code)
+        result.headers = pickHeaders(transfer.headers, request.responseHeaders)
+        text = transfer.body
+        if not api.problem.isString(text) then text = ""
+        size = transfer.size
+        if size = invalid then size = Len(text)
+        if exceedsBudget(size, MAX_BODY_BYTES)
+            result.error = error("too_large", code)
+            return result
+        end if
+        parsed = parse(text)
+        ok = (code >= 200 and code < 300) or code = 304
+        if ok and parsed = invalid and text.Trim() <> ""
+            result.error = error("parse", code)
+            return result
+        end if
+        result.body = parsed
+        if ok
+            result.ok = true
+            return result
+        end if
+        result.error = error("http", code)
+        problem = api.problem.parse(parsed, transfer.headers)
+        if problem <> invalid
+            result.error.problemType = problem.type
+            result.error.instance = problem.instance
+        end if
+        result.error.retryAfterSeconds = api.problem.retryAfter(transfer.headers)
+        return result
+    end function
+
+    ' The envelope for a download that completed with a 2xx status: body
+    ' { path, size }, the file ApiTask kept. transfer is { code, headers,
+    ' path, size, budget }: budget is the download's (limit), and a file
+    ' over it fails too_large.
+    function saved(request as Object, transfer as Object) as Object
+        result = envelope(request, transfer.code)
+        result.headers = pickHeaders(transfer.headers, request.responseHeaders)
+        if exceedsBudget(transfer.size, transfer.budget)
+            result.error = error("too_large", transfer.code)
+            return result
+        end if
+        result.ok = true
+        result.body = { path: transfer.path, size: transfer.size }
+        return result
+    end function
+
+    ' The envelope for a request that ended without a response, or one the
+    ' client refused: network, timeout, cancelled (with reason), or another
+    ' kind listed above.
+    function failure(request as Object, kind as String, reason = "" as String) as Object
+        result = envelope(request, 0)
+        result.error = error(kind, 0)
+        if reason <> "" then result.error.reason = reason
+        return result
+    end function
+
+    ' The too_large envelope; status is 0 when the transfer was stopped before
+    ' it completed.
+    function tooLarge(request as Object, status as Integer) as Object
+        result = envelope(request, status)
+        result.error = error("too_large", status)
+        return result
+    end function
+
+    ' The most a request's response may hold, decided when it starts:
+    ' sidecarBudget(roomKb) for a download, MAX_BODY_BYTES for the rest. A
+    ' download's error body is still read only within MAX_BODY_BYTES
+    ' (fromTransfer).
+    function limit(request as Object, roomKb = invalid as Dynamic) as Integer
+        if api.problem.isString(request.download) then return sidecarBudget(roomKb)
+        return MAX_BODY_BYTES
+    end function
+
+    ' A download's budget while the app has roomKb kilobytes of memory free
+    ' (roAppMemoryMonitor.GetChannelAvailableMemory, or invalid or 0 when
+    ' unknown): a FREE_SHARE-th of it, at most MAX_SIDECAR_BYTES and at
+    ' least MAX_BODY_BYTES, which every response gets;
+    ' UNKNOWN_ROOM_SIDECAR_BYTES without a reading.
+    function sidecarBudget(roomKb as Dynamic) as Integer
+        if not util.isNumber(roomKb) or roomKb <= 0 then return UNKNOWN_ROOM_SIDECAR_BYTES
+        ' Kilobytes to bytes in a Double: Integer bytes overflow past 2 GiB.
+        share = roomKb * 1024# / FREE_SHARE
+        if share >= MAX_SIDECAR_BYTES then return MAX_SIDECAR_BYTES
+        if share <= MAX_BODY_BYTES then return MAX_BODY_BYTES
+        return Int(share)
+    end function
+
+    ' Whether a body of size bytes (or characters) is over budget bytes.
+    function exceedsBudget(size as Dynamic, budget as Integer) as Boolean
+        return size > budget
+    end function
+
+    ' Whether response headers (GetResponseHeadersArray()) declare a body over
+    ' budget bytes. A compressed body's Content-Length is not its decoded
+    ' size, so only an uncompressed one is judged here; the received file's
+    ' size judges the rest, including bodies that declare no length.
+    function declaresTooLarge(headers as Dynamic, budget as Integer) as Boolean
+        encoding = api.problem.header(headers, "content-encoding")
+        if api.problem.isString(encoding)
+            encoding = LCase(encoding.Trim())
+            if encoding <> "" and encoding <> "identity" then return false
+        end if
+        length = api.problem.header(headers, "content-length")
+        if not api.problem.isString(length) then return false
+        length = length.Trim()
+        if not api.problem.isDigits(length) then return false
+        ' Ten digits or more is past any budget and past ToInt's range.
+        if Len(length) > 9 then return true
+        return exceedsBudget(length.ToInt(), budget)
+    end function
+
+    ' Parses a JSON object or array. Other text, such as a proxy's HTML error
+    ' page, is not parsed and gives invalid.
+    function parse(text as String) as Dynamic
+        first = Left(text.Trim(), 1)
+        if first <> "{" and first <> "[" then return invalid
+        return ParseJson(text)
+    end function
+
+    ' The wanted headers from a GetResponseHeadersArray() list, by lowercase name.
+    function pickHeaders(list as Dynamic, names as Object) as Object
+        out = {}
+        for each name in names
+            value = api.problem.header(list, name)
+            if value <> invalid then out[name] = value
+        end for
+        return out
+    end function
+
+    function envelope(request as Object, status as Integer) as Object
+        id = ""
+        if api.problem.isString(request.requestId) then id = request.requestId
+        return { requestId: id, ok: false, status: status, headers: {}, body: invalid, error: invalid }
+    end function
+
+    function error(kind as String, status as Integer) as Object
+        return { kind: kind, status: status, problemType: invalid, instance: invalid, retryAfterSeconds: invalid }
+    end function
+end namespace

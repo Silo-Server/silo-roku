@@ -1,0 +1,502 @@
+namespace tests
+
+    ' The player's subtitles off in place, its sidecars, the tracks Roku
+    ' would pick itself, and switches between sidecars in place, through a
+    ' PlayerProbe (tests/components/PlayerProbe.bs): the track_change the
+    ' player asks for is read where the reducer queues it. Split from
+    ' captions.spec.bs so each headless shard stays small (README,
+    ' Development).
+    @suite("player caption sidecars")
+    class PlayerCaptionSidecarsTests extends tests.PlayerCaptionsSuite
+
+        @describe("subtitles off in place (W7-5)")
+
+        @it("clears Roku's selection when a plan turns subtitles off in place")
+        sub _()
+            node = m.showingEnglish()
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            m.assertEqual([view.captionMode, view.globalCaptionMode], ["Off", "Off"])
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: true })
+            view = node.callFunc("probeRetrack", { mode: "off" })
+            m.assertEqual([view.subtitleTrack, view.activeTrack], ["", ""])
+            m.assertInvalid(view.queued, "captions are off: nothing to reload")
+        end sub
+
+        @it("reloads without the carried sidecars when Options turns captions on after Off")
+        sub _()
+            node = m.showingEnglish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            node.callFunc("probeRetrack", { mode: "off" })
+            view = node.callFunc("probeChoose", { kind: "caption", value: "On" })
+            m.assertEqual(view.globalCaptionMode, "On")
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: false }, "the same selection, reloaded")
+            m.assertEqual(view.subtitleTrack, "")
+        end sub
+
+        @it("reloads without the carried sidecars when Roku's overlay turns captions on after Off")
+        sub _()
+            node = m.showingEnglish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            node.callFunc("probeRetrack", { mode: "off" })
+            m.assertInvalid(node.callFunc("probeCaption", "Off").queued, "the echo of Silo's own write")
+            view = node.callFunc("probeCaption", "When mute")
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: false })
+        end sub
+
+        @it("waits for a track change on its way, then follows the mode its plan finds")
+        sub _()
+            node = m.showingEnglish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            node.callFunc("probeCaption", "Off")
+            view = node.callFunc("probeCaption", "On")
+            m.assertEqual(view.captionMode, "On", "after Roku's echo of the write, the viewer's On")
+            m.assertEqual(view.queued.inPlace, true, "only the viewer's Off waits")
+            view = node.callFunc("probeRetrack", { mode: "off" })
+            m.assertEqual(view.subtitleTrack, "")
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: false })
+        end sub
+
+        @it("leaves a selected sidecar, or content without sidecars, to Roku's caption mode")
+        sub _()
+            node = m.showingEnglish()
+            m.assertInvalid(node.callFunc("probeCaption", "Off").queued)
+            m.assertInvalid(node.callFunc("probeCaption", "Instant replay").queued)
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "Off", carried: [] })
+            m.assertInvalid(node.callFunc("probeCaption", "On").queued)
+        end sub
+
+        @describe("captions under the controls (hardware run 26; assumption AG-293)")
+
+        @it("hides captions while the controls show over settled content, and draws them again as the controls hide")
+        sub _()
+            node = m.showingEnglish()
+            node.callFunc("probeFirstFrame")
+            m.assertTrue(node.callFunc("probeShowControls").shown)
+            view = node.callFunc("probePosition")
+            m.assertFalse(view.suppressed, "content that has not settled is left as it is (run 20)")
+            node.callFunc("probeElapse", 3000)
+            view = node.callFunc("probePosition")
+            m.assertEqual([view.suppressed, view.subtitleTrack, view.globalCaptionMode], [true, "tmp:/probe/file-42-subtitle-0.srt", "On"], "the selection and Roku's caption mode stay")
+            m.assertFalse(node.callFunc("probeKey", "back", true).shown)
+            view = node.callFunc("probeView")
+            m.assertEqual([view.suppressed, view.subtitleTrack, view.globalCaptionMode], [false, "tmp:/probe/file-42-subtitle-0.srt", "On"])
+            m.assertInvalid(view.queued, "no track change")
+        end sub
+
+        @it("keeps a subtitle Roku must not draw hidden as the controls hide")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            node.callFunc("probeFirstFrame")
+            node.callFunc("probeElapse", 3000)
+            node.callFunc("probeShowControls")
+            m.assertTrue(node.callFunc("probePosition").suppressed)
+            node.callFunc("probeKey", "back", true)
+            m.assertTrue(node.callFunc("probeView").suppressed)
+        end sub
+
+        @describe("tracks Roku would pick itself (hardware run 16, T2l; assumption AG-190)")
+
+        @it("draws no subtitle with subtitles Off under every caption mode, and never writes the mode")
+        sub _()
+            node = m.player()
+            view = node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            m.assertEqual([view.suppressed, view.subtitleTrack, view.globalCaptionMode], [true, "", "On"])
+            for each mode in ["When mute", "Instant replay", "Off", "On"]
+                view = node.callFunc("probeCaption", mode)
+                m.assertEqual([view.suppressed, view.globalCaptionMode], [true, "On"], mode)
+            end for
+        end sub
+
+        @it("draws the selected sidecar, by its own track, under every caption mode")
+        sub _()
+            node = m.showingEnglish()
+            for each mode in ["On", "When mute", "Instant replay", "Off"]
+                view = node.callFunc("probeCaption", mode)
+                m.assertEqual([view.suppressed, view.subtitleTrack], [false, "tmp:/probe/file-42-subtitle-0.srt"], mode)
+            end for
+        end sub
+
+        @it("stops drawing when Off switches in place, and draws a sidecar chosen again")
+        sub _()
+            node = m.showingEnglish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            view = node.callFunc("probeRetrack", { mode: "off" })
+            m.assertEqual([view.suppressed, view.subtitleTrack], [true, ""])
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            view = node.callFunc("probeRetrack", { mode: "render", track_id: "file:42:subtitle:1", artifact: { url: "/api/v2/stream/s-1/subtitles/1.srt?file_id=42", format: "srt" } })
+            m.assertEqual([view.suppressed, view.subtitleTrack], [false, "tmp:/probe/file-42-subtitle-1.srt"])
+        end sub
+
+        @it("draws nothing beside a burned-in subtitle")
+        sub _()
+            m.assertTrue(m.burning("On").callFunc("probeView").suppressed)
+        end sub
+
+        @it("draws nothing while a selected sidecar downloads after its content started, then reloads to draw it (hardware run 19)")
+        sub _()
+            node = m.lateEnglish()
+            view = node.callFunc("probeSidecarsReady")
+            m.assertEqual([view.carried, view.subtitleTrack, view.suppressed], [0, "", true], "the playing content is left as it is")
+            m.assertTrue(view.subtitleReload, "the session holds a reload while the quality replan is in flight")
+            view = node.callFunc("probeIdle")
+            m.assertEqual(view.commands, ["log", "refused", "log", "reopen"], "a local reload, not a replan")
+            m.assertEqual(view.activeLoad, 2, "the earlier content plays until the Video node stops")
+            m.assertEqual(view.carried, 0)
+            view = node.callFunc("probeVideoState", "stopped")
+            m.assertEqual([view.activeLoad, view.carried], [3, 2], "the reload carries both sidecars")
+            m.assertEqual([view.subtitleTrack, view.suppressed], ["tmp:/probe/file-42-subtitle-0.srt", false])
+            m.assertFalse(view.subtitleReload)
+        end sub
+
+        @describe("a selected sidecar that comes after its content started (hardware run 19)")
+
+        ' Content of a plan that selects English plays without it: the
+        ' sidecar was still downloading when the content's wait ended.
+        function lateEnglish() as Object
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            view = node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "On", sidecarState: "loading", headers: true, videoState: "stopped", waited: true })
+            m.assertEqual([view.activeLoad, view.carried, view.subtitleTrack, view.suppressed], [2, 0, "", true], "it plays without the sidecar")
+            return node
+        end function
+
+        @it("gives the sidecar to content still waiting for the Video node's stop, which reloads nothing")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            view = node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "On", sidecarState: "loading", headers: true, videoState: "playing", waited: true })
+            m.assertEqual(view.activeLoad, 1, "the earlier content stops first")
+            view = node.callFunc("probeSidecarReady", { load: 2, trackId: "file:42:subtitle:0" })
+            m.assertFalse(view.subtitleReload)
+            view = node.callFunc("probeVideoState", "stopped")
+            m.assertEqual([view.activeLoad, view.carried, view.subtitleTrack, view.suppressed], [2, 1, "tmp:/probe/file-42-subtitle-0.srt", false])
+        end sub
+
+        @it("drops the sidecar when the viewer turns subtitles off in place before it comes")
+        sub _()
+            node = m.lateEnglish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            node.callFunc("probeRetrack", { mode: "off" })
+            view = node.callFunc("probeSidecarsReady")
+            m.assertEqual([view.carried, view.subtitleTrack, view.suppressed], [0, "", true])
+            m.assertFalse(view.subtitleReload, "Off superseded it")
+        end sub
+
+        @it("ignores the sidecar when the viewer's change has loaded a new plan before it comes")
+        sub _()
+            node = m.lateEnglish()
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            m.assertEqual(view.queued.inPlace, false, "the content carries no Spanish")
+            node.callFunc("probeNewLoad", { subtitle: { mode: "render", track_id: "file:42:subtitle:1", artifact: { url: "/api/v2/stream/s-1/subtitles/1.srt?file_id=42", format: "srt" } }, captionMode: "On", sidecarState: "loading", headers: false, videoState: "playing" })
+            view = node.callFunc("probeSidecarReady", { load: 2, trackId: "file:42:subtitle:0" })
+            m.assertEqual([view.activeLoad, view.carried, view.subtitleTrack], [2, 0, ""], "English never reaches the playing content")
+            m.assertFalse(view.subtitleReload)
+        end sub
+
+        @it("sets new content's drawing before it plays: none for Off, the sidecar it carries for a track")
+        sub _()
+            node = m.playingOff()
+            view = node.callFunc("probeNewLoad", { subtitle: { mode: "off" }, captionMode: "Off", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.activeLoad, view.carried, view.suppressed], [2, 2, true], "carried sidecars are not drawn")
+            view = node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.activeLoad, view.subtitleTrack, view.suppressed], [3, "tmp:/probe/file-42-subtitle-0.srt", false])
+        end sub
+
+        @describe("new content waits for its selected sidecar (hardware run 24)")
+
+        @it("carries a selected sidecar that comes within the cap in its one load, with the earlier content stopped meanwhile")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            view = node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "On", sidecarState: "loading", headers: true, videoState: "playing" })
+            m.assertEqual([view.activeLoad, view.stopping], [1, true], "the earlier content stops at once")
+            m.assertEqual(node.callFunc("probeStatus"), "Loading subtitles…")
+            view = node.callFunc("probeVideoState", "stopped")
+            m.assertFalse(view.stopping)
+            ' File A's sidecar came about 8 s after its plan.
+            node.callFunc("probeElapse", 8000)
+            node.callFunc("probeWake")
+            m.assertEqual(node.callFunc("probeView").activeLoad, 1, "still waiting")
+            m.assertEqual(node.callFunc("probeStatus"), "Loading subtitles…")
+            view = node.callFunc("probeSidecarReady", { load: 2, trackId: "file:42:subtitle:0" })
+            m.assertEqual([view.activeLoad, view.carried, view.subtitleTrack, view.suppressed], [2, 1, "tmp:/probe/file-42-subtitle-0.srt", false], "one load with the sidecar")
+            m.assertFalse(view.subtitleReload, "no late reload")
+            m.assertFalse(view.stopping, "nothing left to stop")
+        end sub
+
+        @it("starts without a selected sidecar past the cap and reloads once when it comes, as before")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "On", sidecarState: "loading", headers: true, videoState: "playing" })
+            node.callFunc("probeVideoState", "stopped")
+            ' The probe's clock also runs on its own between calls.
+            node.callFunc("probeElapse", playback.sidecars.SELECTED_WAIT_MS - 300)
+            node.callFunc("probeWake")
+            m.assertEqual(node.callFunc("probeView").activeLoad, 1, "just before the cap")
+            node.callFunc("probeElapse", 300)
+            node.callFunc("probeWake")
+            view = node.callFunc("probeView")
+            m.assertEqual([view.activeLoad, view.carried, view.subtitleTrack, view.suppressed], [2, 0, "", true], "it plays without the sidecar")
+            view = node.callFunc("probeSidecarReady", { load: 2, trackId: "file:42:subtitle:0" })
+            m.assertEqual([view.carried, view.subtitleTrack], [0, ""], "the playing content is left as it is")
+            m.assertTrue(view.subtitleReload, "the late path's one reload")
+        end sub
+
+        @it("waits 1 s for sidecars that were not selected and leaves the earlier content playing meanwhile")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "Off", carried: [] })
+            view = node.callFunc("probeNewLoad", { subtitle: { mode: "off" }, captionMode: "Off", sidecarState: "loading", headers: true, videoState: "playing" })
+            m.assertEqual([view.activeLoad, view.stopping], [1, false])
+            node.callFunc("probeElapse", playback.sidecars.OTHERS_GRACE_MS - 300)
+            node.callFunc("probeWake")
+            m.assertFalse(node.callFunc("probeView").stopping, "still within 1 s")
+            node.callFunc("probeElapse", 300)
+            node.callFunc("probeWake")
+            m.assertTrue(node.callFunc("probeView").stopping, "the content's turn: the earlier one stops for it")
+            view = node.callFunc("probeVideoState", "stopped")
+            m.assertEqual([view.activeLoad, view.carried], [2, 0], "without the sidecars still downloading")
+        end sub
+
+        @describe("the session's converted sidecars (hardware run 24)")
+
+        ' File A's subtitles as a plan gives them: its built-in English ASS
+        ' (selected by Auto, stream 2) and a built-in Spanish SRT (stream
+        ' 3), and an external English SRT the server may retime.
+        function fileInventory(fileId as String) as Object
+            return [
+                { track_id: "file:" + fileId + ":subtitle:0", source: "external", codec: "srt", language: "eng", label: "English", delivery: "sidecar", sync_key: "external-ab12", url: "/api/v2/stream/s-1/subtitles/0.srt?file_id=" + fileId },
+                { track_id: "file:" + fileId + ":subtitle:1", source: "embedded", codec: "ass", language: "eng", label: "Full Subtitles", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/1.ass?file_id=" + fileId + "&embedded_stream_index=2" },
+                { track_id: "file:" + fileId + ":subtitle:2", source: "embedded", codec: "srt", language: "spa", label: "Spanish", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/2.srt?file_id=" + fileId + "&embedded_stream_index=3" }
+            ]
+        end function
+
+        function fileAss(fileId as String) as Object
+            return { mode: "render", track_id: "file:" + fileId + ":subtitle:1", artifact: { url: "/api/v2/stream/s-1/subtitles/1.ass?file_id=" + fileId + "&embedded_stream_index=2", format: "ass" } }
+        end function
+
+        function states(offer as Object) as Object
+            out = []
+            for each track in offer.tracks
+                out.Push(track.state)
+            end for
+            return out
+        end function
+
+        @it("reuses a file's converted tracks on its next start, with no download or conversion, and converts another file's, or another server's with the same IDs")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "Off", carried: [] })
+            node.callFunc("probeClearCache")
+            offer = node.callFunc("probeOfferSidecars", { fileId: "42", subtitle: m.fileAss("42"), inventory: m.fileInventory("42") })
+            m.assertEqual(m.states(offer), ["queued", "queued", "queued"], "the first start downloads them all")
+            m.assertTrue(offer.loading)
+            node.callFunc("probeConverted", { trackId: "file:42:subtitle:1", bytes: 24000 })
+            node.callFunc("probeConverted", { trackId: "file:42:subtitle:2", bytes: 650000 })
+            node.callFunc("probeConverted", { trackId: "file:42:subtitle:0", bytes: 26000 })
+            m.assertEqual(node.callFunc("probeCache"), { entries: 2, bytes: 674000, files: 2 }, "the embedded tracks only")
+            offer = node.callFunc("probeOfferSidecars", { fileId: "42", subtitle: m.fileAss("42"), inventory: m.fileInventory("42") })
+            m.assertEqual(m.states(offer), ["ready", "queued", "ready"], "the next start: the ASS and the Spanish SRT come from the cache")
+            m.assertFalse(offer.loading, "no Loading subtitles…")
+            m.assertEqual(Left(offer.tracks[0].path, Len(playback.sidecarCache.DIR)), playback.sidecarCache.DIR)
+            spanish = { mode: "render", track_id: "file:42:subtitle:2", artifact: { url: "/api/v2/stream/s-1/subtitles/2.srt?file_id=42", format: "srt" } }
+            offer = node.callFunc("probeOfferSidecars", { fileId: "42", subtitle: spanish, inventory: m.fileInventory("42") })
+            m.assertEqual(m.states(offer), ["ready", "queued", "ready"], "a pick of the other track reuses it too")
+            offer = node.callFunc("probeOfferSidecars", { fileId: "43", subtitle: m.fileAss("43"), inventory: m.fileInventory("43") })
+            m.assertEqual(m.states(offer), ["queued", "queued", "queued"], "another file converts")
+            m.assertTrue(offer.loading)
+            offer = node.callFunc("probeOfferSidecars", { fileId: "42", subtitle: m.fileAss("42"), inventory: m.fileInventory("42"), origin: "https://server-b.example" })
+            m.assertEqual(m.states(offer), ["queued", "queued", "queued"], "Profiles, Change server: server B's file 42 is another film (W12 review)")
+            m.assertEqual(m.states(node.callFunc("probeOfferSidecars", { fileId: "42", subtitle: m.fileAss("42"), inventory: m.fileInventory("42") })), ["ready", "queued", "ready"], "the first server's are still its own")
+        end sub
+
+        @it("converts again a track whose kept file MediaTask finds gone, and keeps the cache within its bound")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "Off", carried: [] })
+            node.callFunc("probeClearCache")
+            node.callFunc("probeOfferSidecars", { fileId: "42", subtitle: m.fileAss("42"), inventory: m.fileInventory("42") })
+            node.callFunc("probeConverted", { trackId: "file:42:subtitle:1", bytes: 1000 })
+            for each name in ListDir(playback.sidecarCache.DIR)
+                DeleteFile(playback.sidecarCache.DIR + "/" + name)
+            end for
+            offer = node.callFunc("probeOfferSidecars", { fileId: "42", subtitle: m.fileAss("42"), inventory: m.fileInventory("42") })
+            m.assertEqual([offer.tracks[0].state, offer.tracks[0].path], ["queued", ""], "MediaTask found it gone: it downloads again")
+            m.assertTrue(offer.loading, "Loading subtitles…, as for any download of the selected track")
+            m.assertEqual(node.callFunc("probeCache").entries, 0, "the entry went with its file")
+            ' Three files' tracks at the cue limit's size: the first file's
+            ' goes once the third's is kept.
+            big = playback.sidecarCache.MAX_BYTES \ 2
+            for each fileId in ["50", "51", "52"]
+                node.callFunc("probeOfferSidecars", { fileId: fileId, subtitle: m.fileAss(fileId), inventory: m.fileInventory(fileId) })
+                node.callFunc("probeConverted", { trackId: "file:" + fileId + ":subtitle:1", bytes: big })
+            end for
+            m.assertEqual(node.callFunc("probeCache"), { entries: 2, bytes: playback.sidecarCache.MAX_BYTES, files: 2 })
+            m.assertEqual(node.callFunc("probeOfferSidecars", { fileId: "50", subtitle: m.fileAss("50"), inventory: m.fileInventory("50") }).tracks[0].state, "queued", "evicted, least recently used")
+            m.assertEqual(node.callFunc("probeOfferSidecars", { fileId: "52", subtitle: m.fileAss("52"), inventory: m.fileInventory("52") }).tracks[0].state, "ready")
+            node.callFunc("probeClearCache")
+        end sub
+
+        @it("starts no MediaTask while the one before still deletes its files (PR 4 review)")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "Off", carried: [] })
+            retired = node.callFunc("probeRetireMediaTask")
+            m.assertEqual(retired.waiting, { started: false, queued: 1 }, "its finish would clear tmp:/subtitles and its sweep the new cache files")
+            m.assertEqual(retired.ended, { started: true, queued: 1 }, "the next starts once it has ended, and takes the request when ready")
+        end sub
+
+        @describe("switching between sidecars in place (hardware run 17, T2f)")
+
+        ' English selected, Spanish carried beside it, and Roku listing both
+        ' under names of its own that contain the paths the player gave.
+        function listingEnglish() as Object
+            node = m.player()
+            view = node.callFunc("probeStart", { subtitle: m.english(), captionMode: "On", carried: ["file:42:subtitle:0", "file:42:subtitle:1"], listed: "srt/" })
+            m.assertEqual(view.subtitleTrack, "srt/tmp:/probe/file-42-subtitle-0.srt", "selected by the name Roku lists")
+            return node
+        end function
+
+        @it("selects each new sidecar in place by the TrackName Roku lists for it, back and forth")
+        sub _()
+            node = m.listingEnglish()
+            for each change in [{ index: 1, plan: m.spanish() }, { index: 0, plan: m.english() }, { index: 1, plan: m.spanish() }]
+                view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:" + change.index.ToStr() })
+                m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(change.index), inPlace: true })
+                view = node.callFunc("probeRetrack", change.plan)
+                path = "tmp:/probe/file-42-subtitle-" + change.index.ToStr() + ".srt"
+                m.assertEqual([view.subtitleTrack, view.activeTrack, view.suppressed, view.globalCaptionMode], ["srt/" + path, path, false, "On"])
+                m.assertInvalid(view.queued)
+            end for
+        end sub
+
+        @it("reloads a switch between sidecars Roku does not list")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: m.english(), captionMode: "On", carried: ["file:42:subtitle:0", "file:42:subtitle:1"] })
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(1), inPlace: false })
+        end sub
+
+        @it("selects the sidecar by its listed name when Roku lists the content's tracks and reports no selection, and never when it reports the path")
+        sub _()
+            node = m.player()
+            view = node.callFunc("probeStart", { subtitle: m.english(), captionMode: "On", carried: ["file:42:subtitle:0", "file:42:subtitle:1"] })
+            m.assertEqual(view.subtitleTrack, "tmp:/probe/file-42-subtitle-0.srt", "by its path until Roku lists it")
+            view = node.callFunc("probeRokuLists", "srt/")
+            m.assertEqual(view.subtitleTrack, "tmp:/probe/file-42-subtitle-0.srt", "Roku reports the path: it is selected (hardware run 20)")
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "", listed: "srt/" })
+            m.assertEqual([view.subtitleTrack, view.suppressed], ["srt/tmp:/probe/file-42-subtitle-0.srt", false])
+        end sub
+
+        @it("reloads the new sidecar when Roku still plays the one before after the switch")
+        sub _()
+            for each before in ["srt/tmp:/probe/file-42-subtitle-0.srt", "tmp:/probe/file-42-subtitle-0.srt"]
+                node = m.listingEnglish()
+                node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+                node.callFunc("probeRetrack", m.spanish())
+                view = node.callFunc("probeRokuPlays", { name: before, elapsedMs: 1000 })
+                m.assertInvalid(view.queued, "Roku may still be switching")
+                view = node.callFunc("probeRokuPlays", { name: before, elapsedMs: 2000 })
+                m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(1), inPlace: false }, "by its listed name or its bare path: " + before)
+            end for
+        end sub
+
+        @it("keeps a switch Roku follows, reports nothing about, or reports with a track it found itself")
+        sub _()
+            for each playing in ["srt/tmp:/probe/file-42-subtitle-1.srt", "tmp:/probe/file-42-subtitle-1.srt", "", "mkv/3"]
+                node = m.listingEnglish()
+                node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+                node.callFunc("probeRetrack", m.spanish())
+                m.assertInvalid(node.callFunc("probeRokuPlays", { name: playing, elapsedMs: 3000 }).queued, playing)
+            end for
+        end sub
+
+        @it("waits for another track change before checking a switch, and reloads the switch Roku did not follow once that change is refused (W11-3)")
+        sub _()
+            english = "srt/tmp:/probe/file-42-subtitle-0.srt"
+            node = m.listingEnglish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            node.callFunc("probeRetrack", m.spanish())
+            ' Roku still draws English when the viewer chooses again.
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(0), inPlace: true })
+            view = node.callFunc("probeRokuPlays", { name: english, elapsedMs: 3000 })
+            m.assertEqual(view.queued.tracks, m.trackTo(0), "no reload while the change is on its way")
+            view = node.callFunc("probeRefuse")
+            m.assertInvalid(view.queued)
+            m.assertEqual(view.activeTrack, "tmp:/probe/file-42-subtitle-1.srt", "Spanish stays the plan's")
+            view = node.callFunc("probeRokuPlays", { name: english, elapsedMs: 0 })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(1), inPlace: false }, "the next report reloads Spanish")
+            ' The reload's content plays; reports after it reload nothing.
+            view = node.callFunc("probeNewLoad", { subtitle: m.spanish(), captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.activeLoad, view.subtitleTrack], [2, "tmp:/probe/file-42-subtitle-1.srt"])
+            for each elapsed in [3000, 30000]
+                m.assertInvalid(node.callFunc("probeRokuPlays", { name: english, elapsedMs: elapsed }).queued, "once per switch")
+            end for
+        end sub
+
+        @it("checks the selection another track change brings instead, on either side of the first check's time")
+        sub _()
+            english = "srt/tmp:/probe/file-42-subtitle-0.srt"
+            ' Back to English before the check is due, in place: Roku drawing
+            ' English is what the viewer chose.
+            node = m.listingEnglish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            node.callFunc("probeRetrack", m.spanish())
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            m.assertEqual(node.callFunc("probeRokuPlays", { name: english, elapsedMs: 2000 }).queued.tracks, m.trackTo(0))
+            node.callFunc("probeRetrack", m.english())
+            m.assertInvalid(node.callFunc("probeRokuPlays", { name: english, elapsedMs: 3000 }).queued)
+            ' Off after the check was due, in place: nothing to check.
+            node = m.listingEnglish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            node.callFunc("probeRetrack", m.spanish())
+            node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            m.assertEqual(node.callFunc("probeRokuPlays", { name: english, elapsedMs: 4000 }).queued.inPlace, true)
+            node.callFunc("probeRetrack", { mode: "off" })
+            m.assertInvalid(node.callFunc("probeRokuPlays", { name: english, elapsedMs: 3000 }).queued)
+            ' Spanish again after the check was due, in place: its own check,
+            ' which reloads it once Roku still draws English.
+            node = m.listingEnglish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            node.callFunc("probeRetrack", m.spanish())
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            node.callFunc("probeRokuPlays", { name: english, elapsedMs: 4000 })
+            node.callFunc("probeRetrack", m.spanish())
+            m.assertInvalid(node.callFunc("probeRokuPlays", { name: english, elapsedMs: 1000 }).queued, "its own three seconds")
+            m.assertEqual(node.callFunc("probeRokuPlays", { name: english, elapsedMs: 2000 }).queued, { op: "track_change", tracks: m.trackTo(1), inPlace: false })
+            ' A change whose plan loads new content ends the check.
+            node = m.listingEnglish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            node.callFunc("probeRetrack", m.spanish())
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertInvalid(node.callFunc("probeRokuPlays", { name: english, elapsedMs: 3000 }).queued)
+        end sub
+
+        @it("switches Off and a sidecar in place, the sidecar by its listed name (runs 7 and 17)")
+        sub _()
+            node = m.listingEnglish()
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            m.assertEqual(view.queued.inPlace, true)
+            view = node.callFunc("probeRetrack", { mode: "off" })
+            m.assertEqual([view.subtitleTrack, view.suppressed, view.globalCaptionMode], ["", true, "Off"])
+            m.assertInvalid(node.callFunc("probeRokuPlays", { name: "srt/tmp:/probe/file-42-subtitle-0.srt", elapsedMs: 3000 }).queued, "Off is not checked")
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            m.assertEqual([view.queued.inPlace, view.globalCaptionMode], [true, "On"])
+            view = node.callFunc("probeRetrack", m.spanish())
+            m.assertEqual([view.subtitleTrack, view.suppressed], ["srt/tmp:/probe/file-42-subtitle-1.srt", false])
+        end sub
+
+        @it("gives content its selected sidecar first")
+        sub _()
+            node = m.player()
+            tracks = [{ language: "eng", path: "tmp:/a.srt", label: "English", selected: false }, { language: "eng", path: "tmp:/b.srt", label: "Forced", selected: true }]
+            m.assertEqual(node.callFunc("probeSubtitleTracks", tracks), [{ Language: "eng", TrackName: "tmp:/b.srt", Description: "Forced" }, { Language: "eng", TrackName: "tmp:/a.srt", Description: "English" }])
+        end sub
+    end class
+end namespace

@@ -1,0 +1,181 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/playback/media.bs"
+
+' Decisions the player component (components/player/Player.bs) makes while
+' it carries out the session reducer's commands, kept pure so they are
+' specified headless: ApiTask's answers as reducer events, the status line,
+' the error copy, and the plan facts and stats text.
+namespace playback.player
+    ' Notice tones: the card's symbol and its colour.
+    const NOTICE_INFO = "info"
+    const NOTICE_WARNING = "warning"
+
+    ' The reducer event for ApiTask's answer to a start, replan, or progress
+    ' command (body from playback.worker), or invalid for other commands.
+    ' An answer that never arrived is "offline", so the reducer replays it. A
+    ' start ApiTask refused to send carries its reason (playback_closed,
+    ' playback_unavailable). status is the HTTP status, 0 without one.
+    function answerEvent(command as Object, body as Dynamic) as Dynamic
+        answer = body
+        if not util.isObject(answer) then answer = { kind: "offline" }
+        kind = util.text(answer.kind)
+        if kind = "" then kind = "offline"
+        status = 0
+        if util.isNumber(answer.status) then status = answer.status
+        if command.type = "start" then return { type: "startResult", playback_attempt_id: command.playback_attempt_id, kind: kind, status: status, decision: answer.decision, bodyText: answer.bodyText, context: answer.context, reason: answer.reason }
+        if command.type = "replan" then return { type: "replanResult", replan_request_id: command.replan_request_id, kind: kind, status: status, decision: answer.decision, bodyText: answer.bodyText }
+        if command.type = "progress" then return { type: "progressResult", session_id: command.session_id, sequence: command.sequence, kind: kind, status: status }
+        return invalid
+    end function
+
+    ' What the status surfaces show (spec section 5.7), as { busy, notice }:
+    ' busy is the busy capsule's text, most important first, or ""; notice
+    ' is the notice card, { title, message, tone } (tone NOTICE_INFO or
+    ' NOTICE_WARNING), or invalid. Reconnecting is a card that lasts while
+    ' it runs; a notice (flags.notice, its title) shows when nothing
+    ' outranks it (noticeShows). flags: { stopping, reconnecting,
+    ' progressPending, subtitlesLoading, buffering, starting, notice }.
+    function statusOf(flags as Object) as Object
+        out = { busy: busyText(flags), notice: invalid }
+        if util.isTrue(flags.reconnecting)
+            out.notice = { title: "Reconnecting…", message: "The connection to the server was lost. Playback will continue where you left off.", tone: NOTICE_INFO }
+        else if util.text(flags.notice) <> "" and out.busy = ""
+            out.notice = { title: flags.notice, message: "", tone: NOTICE_WARNING }
+        end if
+        return out
+    end function
+
+    ' The busy capsule's text, most important first, or "": tvOS's
+    ' "Loading…" for a start, a stall, or a reconnection's reload, and
+    ' Roku's own states by name.
+    function busyText(flags as Object) as String
+        if util.isTrue(flags.stopping) then return "Stopping…"
+        if util.isTrue(flags.progressPending) then return "Playback progress is pending…"
+        if util.isTrue(flags.starting) or util.isTrue(flags.buffering) then return "Loading…"
+        if util.isTrue(flags.subtitlesLoading) then return "Loading subtitles…"
+        return ""
+    end function
+
+    ' Whether something outranks a notice: a busy state, or Reconnecting.
+    function outranked(flags as Object) as Boolean
+        return busyText(flags) <> "" or util.isTrue(flags.reconnecting)
+    end function
+
+    ' A notice's time on the status line: durationMs, counted only while
+    ' nothing outranks it (noticeShows).
+    function newNoticeClock(durationMs as Integer) as Object
+        return { leftMs: durationMs, shownAt: invalid }
+    end function
+
+    ' Whether a notice still shows at now, counting its time on the status
+    ' line (clock, from newNoticeClock, updated in place): only the time
+    ' since the last call during which it showed, so one that comes while
+    ' a status outranks it (outranked) waits behind it and then shows for
+    ' its whole time. Hardware run 23: "Subtitles are too large to show."
+    ' came while the content buffered and expired behind "Buffering".
+    ' flags as status takes them.
+    function noticeShows(clock as Object, flags as Object, now as Dynamic) as Boolean
+        if clock.shownAt <> invalid
+            clock.leftMs = clock.leftMs - (now - clock.shownAt)
+            clock.shownAt = invalid
+        end if
+        if clock.leftMs <= 0 then return false
+        if not outranked(flags) then clock.shownAt = now
+        return true
+    end function
+
+    ' The full-screen error for a reducer "error" command (or one the player
+    ' raises itself), as { title, message }. A server's terminal message is
+    ' shown as the server wrote it.
+    function errorCopy(command as Object) as Object
+        reason = util.text(command.reason)
+        if playback.values.isText(command.message) then return { title: "Can't play this title", message: command.message }
+        if util.isTrue(command.serverUnreachable) or reason = "connection_lost" or reason = "server_unreachable" then return { title: "Can't reach the server", message: "Check the network connection and that the server is running, then try again." }
+        if reason = "not_found" then return { title: "Not available", message: "This title is no longer available on the server." }
+        if reason = "audio_unsupported" then return { title: "Can't play this audio", message: "This device can't play the audio of this title." }
+        if reason = "video_stuck" then return { title: "Playback stopped", message: "The player did not respond. Try again." }
+        if reason = "media_unauthorized" then return { title: "Playback stopped", message: "The server refused access to the video. Try again." }
+        if reason = "signed_out" or reason = "profile_required" or reason = "pin_required" then return { title: "Sign in again", message: "This profile needs to sign in again before it can play." }
+        if reason = "playback_unavailable" or reason = "playback_closed" then return { title: "Playback is not available", message: "This server or build does not allow playback on this device." }
+        return { title: "Playback failed", message: "Something went wrong while playing this title." }
+    end function
+
+    ' The non-secret plan facts device runs check (plan section 6.11, and
+    ' hardware run 2's missing dynamic range): never URLs, tokens, headers,
+    ' or plan identities. Logged with each load and shown in the stats line.
+    function planFacts(plan as Dynamic, proxy as Boolean) as Object
+        if not util.isObject(plan) then return {}
+        recipe = objectOr(plan.effective_recipe)
+        stream = objectOr(plan.stream)
+        timeline = objectOr(plan.timeline)
+        claims = objectOr(objectOr(plan.claims).video)
+        origin = "api"
+        if proxy then origin = "proxy"
+        return {
+            delivery: util.text(plan.delivery),
+            decision_reason: util.text(plan.decision_reason),
+            protocol: util.text(stream.protocol),
+            container: util.text(stream.container),
+            origin: origin,
+            video_codec: util.text(recipe.video_codec),
+            audio_codec: util.text(recipe.audio_codec),
+            audio_channels: recipe.audio_channels,
+            dynamic_range: util.text(recipe.dynamic_range),
+            dolby_vision: util.isTrue(claims.dolby_vision),
+            timeline_offset_seconds: playback.values.toDouble(timeline.timeline_offset_seconds),
+            player_start_seconds: playback.values.toDouble(timeline.player_start_seconds),
+            can_seek_anywhere: util.isTrue(timeline.can_seek_anywhere)
+        }
+    end function
+
+    ' The Options panel's Stats (spec section 5.7) as two columns, { title,
+    ' rows: [[label, value]] } each: the plan's facts (planFacts), and what
+    ' the Video node reports, { videoFormat, audioFormat, videoMode,
+    ' captionMode, slowStops, lastStopMs }.
+    function statsColumns(plan as Dynamic, proxy as Boolean, video as Object) as Object
+        if not util.isObject(plan) then return [{ title: "Source", rows: [["Plan", "None yet"]] }]
+        facts = planFacts(plan, proxy)
+        source = [
+            ["Delivery", facts.delivery],
+            ["Decision", facts.decision_reason],
+            ["Stream", facts.protocol + "/" + facts.container],
+            ["Origin", facts.origin],
+            ["Recipe", recipeText(facts)],
+            ["Range", facts.dynamic_range],
+            ["DV claimed", yesNo(facts.dolby_vision)]
+        ]
+        engine = [
+            ["Offset", playback.media.decimal(facts.timeline_offset_seconds) + " s"],
+            ["Seek anywhere", yesNo(facts.can_seek_anywhere)],
+            ["Video format", util.text(video.videoFormat)],
+            ["Audio format", util.text(video.audioFormat)],
+            ["Video mode", util.text(video.videoMode)],
+            ["Captions", util.text(video.captionMode)],
+            ["Slow stops", util.text(video.slowStops)]
+        ]
+        ' Before the first stop there is no time to show (run 6 read "last
+        ' stop:  ms").
+        if util.isNumber(video.lastStopMs) then engine.Push(["Last stop", util.text(video.lastStopMs) + " ms"])
+        return [{ title: "Source", rows: source }, { title: "Playback", rows: engine }]
+    end function
+
+    ' "h264/aac 6 ch", or the video codec alone for a title without audio
+    ' (run 11 read "h264/ ch").
+    function recipeText(facts as Object) as String
+        if facts.audio_codec = "" then return facts.video_codec + ", no audio"
+        audio = facts.audio_codec
+        if util.isNumber(facts.audio_channels) then audio = audio + " " + util.text(facts.audio_channels) + " ch"
+        return facts.video_codec + "/" + audio
+    end function
+
+    function objectOr(value as Dynamic) as Object
+        if util.isObject(value) then return value
+        return {}
+    end function
+
+    function yesNo(value as Boolean) as String
+        if value then return "yes"
+        return "no"
+    end function
+end namespace

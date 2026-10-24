@@ -1,0 +1,288 @@
+namespace tests
+
+    @suite("playback recovery")
+    class PlaybackRecoveryTests extends rooibos.BaseTestSuite
+
+        ' The session reducer's record of an adopted plan.
+        function adopted(id as String, key as String) as Object
+            return { id: id, key: key, attemptId: "pa-" + id, mutations: [], firstFrame: false, reopened: false, data: tests.directPlan(id, key) }
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("failure chain")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("adds the failed key after it fails and counts from 1")
+        sub _()
+            chain = playback.recovery.newChain()
+            fields = playback.recovery.failureFields(chain, m.adopted("plan-a", "v3:ka"), "failure_recovery", { classification: "decoder_failure" })
+            m.assertEqual(fields, {
+                failed_plan_id: "plan-a",
+                plan_attempt_id: "pa-plan-a",
+                plan_attempt_key: "v3:ka",
+                operation: "failure_recovery",
+                attempted_plan_keys: ["v3:ka"],
+                attempt_count: 1,
+                failure: { classification: "decoder_failure" }
+            })
+            m.assertEqual(chain.planKeys, [], "the chain changes only once the replan is sent")
+            playback.recovery.recordFailure(chain, fields)
+            m.assertEqual(chain, { planKeys: ["v3:ka"], attemptCount: 2 })
+        end sub
+
+        @it("accumulates keys across a chain")
+        sub _()
+            chain = playback.recovery.newChain()
+            fields = invalid
+            for each key in ["v3:ka", "v3:kb", "v3:kc"]
+                fields = playback.recovery.failureFields(chain, m.adopted("plan-" + key, key), "failure_recovery", { classification: "decoder_failure" })
+                playback.recovery.recordFailure(chain, fields)
+            end for
+            m.assertEqual(fields.attempted_plan_keys, ["v3:ka", "v3:kb", "v3:kc"])
+            m.assertEqual(fields.attempt_count, 3)
+        end sub
+
+        @it("accepts a repeated key after node failover without counting it twice")
+        sub _()
+            chain = playback.recovery.newChain()
+            first = playback.recovery.failureFields(chain, m.adopted("plan-a", "v3:ka"), "failure_recovery", { classification: "transport_stall" })
+            playback.recovery.recordFailure(chain, first)
+            ' The server ran the same recipe on another node and returned the same key.
+            again = playback.recovery.failureFields(chain, m.adopted("plan-a", "v3:ka"), "failure_recovery", { classification: "transport_stall" })
+            m.assertEqual(again.attempted_plan_keys, ["v3:ka"])
+            m.assertEqual(again.attempt_count, 2)
+        end sub
+
+        @it("sends attempt_count 1 through 8, then refuses a ninth")
+        sub _()
+            chain = playback.recovery.newChain()
+            counts = []
+            for i = 1 to 8
+                fields = playback.recovery.failureFields(chain, m.adopted("plan-" + i.ToStr(), "v3:k" + i.ToStr()), "failure_recovery", { classification: "decoder_failure" })
+                counts.Push(fields.attempt_count)
+                playback.recovery.recordFailure(chain, fields)
+            end for
+            m.assertEqual(counts, [1, 2, 3, 4, 5, 6, 7, 8])
+            m.assertInvalid(playback.recovery.failureFields(chain, m.adopted("plan-9", "v3:k9"), "failure_recovery", { classification: "decoder_failure" }))
+        end sub
+
+        @it("keeps at most the newest 16 keys")
+        sub _()
+            keys = []
+            for i = 1 to 16
+                keys.Push("v3:k" + i.ToStr())
+            end for
+            out = playback.recovery.withKey(keys, "v3:k17")
+            m.assertEqual(out.Count(), 16)
+            m.assertEqual(out[0], "v3:k2")
+            m.assertEqual(out[15], "v3:k17")
+            m.assertEqual(keys.Count(), 16, "the input is not changed")
+        end sub
+
+        @it("carries local mutations from a reopen")
+        sub _()
+            plan = m.adopted("plan-a", "v3:ka")
+            plan.mutations = ["transport_reopen"]
+            fields = playback.recovery.failureFields(playback.recovery.newChain(), plan, "failure_recovery", { classification: "transport_stall" })
+            m.assertEqual(fields.local_mutations, ["transport_reopen"])
+        end sub
+
+        @it("sends intent replans with empty keys, count 1, and no failure")
+        sub _()
+            fields = playback.recovery.intentFields(m.adopted("plan-a", "v3:ka"), "quality_change")
+            m.assertEqual(fields, { failed_plan_id: "plan-a", plan_attempt_id: "pa-plan-a", plan_attempt_key: "v3:ka", operation: "quality_change", attempted_plan_keys: [], attempt_count: 1 })
+        end sub
+
+        @it("sends a seek_reanchor with the chain unchanged and no failure")
+        sub _()
+            chain = { planKeys: ["v3:ka"], attemptCount: 9 }
+            fields = playback.recovery.seekFields(chain, m.adopted("plan-b", "v3:kb"))
+            m.assertEqual(fields.attempted_plan_keys, ["v3:ka"])
+            m.assertEqual(fields.attempt_count, 8)
+            m.assertFalse(fields.DoesExist("failure"))
+            fields.attempted_plan_keys.Push("x")
+            m.assertEqual(chain.planKeys, ["v3:ka"], "the chain's list is copied")
+        end sub
+
+        @it("resets to an empty chain")
+        sub _()
+            chain = { planKeys: ["v3:ka"], attemptCount: 4 }
+            playback.recovery.resetChain(chain)
+            m.assertEqual(chain, { planKeys: [], attemptCount: 1 })
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("decide")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("reopens once on a stall, then recovers")
+        sub _()
+            plan = m.adopted("plan-a", "v3:ka")
+            m.assertEqual(playback.recovery.decide("stall", plan, true), { action: "reopen", classification: "transport_stall" })
+            plan.reopened = true
+            m.assertEqual(playback.recovery.decide("stall", plan, true), { action: "recover", classification: "transport_stall" })
+        end sub
+
+        @it("reconnects on a network failure whenever it comes, never excluding the route (run 14)")
+        sub _()
+            plan = m.adopted("plan-a", "v3:ka")
+            m.assertEqual(playback.recovery.decide("network", plan, true), { action: "reconnect", classification: "transport_stall" }, "before the first frame, the API answering")
+            plan.reopened = true
+            m.assertEqual(playback.recovery.decide("network", plan, false).action, "reconnect", "after the reopen, offline")
+            plan.firstFrame = true
+            m.assertEqual(playback.recovery.decide("network", plan, true).action, "reconnect", "after the first frame")
+            plan.data.stream.url = "https://proxy-1.example/stream/token/master.m3u8"
+            m.assertEqual(playback.recovery.decide("network", plan, true).action, "reconnect", "from a proxy node")
+        end sub
+
+        @it("keeps reconnecting through a stall or a media 5xx while an outage lasts")
+        sub _()
+            plan = m.adopted("plan-a", "v3:ka")
+            m.assertEqual(playback.recovery.decide("stall", plan, true, true).action, "reconnect", "a reconnect's plan, before its first frame")
+            m.assertEqual(playback.recovery.decide("server", plan, true, true).action, "reconnect")
+            m.assertEqual(playback.recovery.decide("no_output", plan, true, true), { action: "recover", classification: "decoder_no_output" }, "a decoder with its media")
+            m.assertEqual(playback.recovery.decide("decode", plan, true, true), { action: "recover", classification: "decoder_failure" })
+        end sub
+
+        @it("reconnects after the plan showed frames while the server is unreachable")
+        sub _()
+            plan = m.adopted("plan-a", "v3:ka")
+            plan.firstFrame = true
+            m.assertEqual(playback.recovery.decide("stall", plan, false).action, "reconnect")
+        end sub
+
+        @it("reconnects at once on a media 5xx after the first frame, and on a stall with input while offline")
+        sub _()
+            plan = m.adopted("plan-a", "v3:ka")
+            m.assertEqual(playback.recovery.decide("server", plan, true), { action: "recover", classification: "http_failure" }, "before the first frame")
+            plan.firstFrame = true
+            m.assertEqual(playback.recovery.decide("server", plan, true).action, "reconnect", "the server answered, but failed")
+            m.assertEqual(playback.recovery.decide("no_output", plan, false).action, "reconnect")
+            m.assertEqual(playback.recovery.decide("no_output", plan, true).action, "recover")
+            m.assertEqual(playback.recovery.decide("decode", plan, false).action, "recover")
+        end sub
+
+        @it("takes the normal failure path for a stall before the first frame, even offline")
+        sub _()
+            plan = m.adopted("plan-a", "v3:ka")
+            plan.reopened = true
+            m.assertEqual(playback.recovery.decide("stall", plan, false).action, "recover")
+        end sub
+
+        @it("recovers decoder, audio, and subtitle failures without a reopen")
+        sub _()
+            plan = m.adopted("plan-a", "v3:ka")
+            m.assertEqual(playback.recovery.decide("no_output", plan, true), { action: "recover", classification: "decoder_no_output" })
+            m.assertEqual(playback.recovery.decide("decode", plan, true), { action: "recover", classification: "decoder_failure" })
+            m.assertEqual(playback.recovery.decide("audio_unsupported", plan, true), { action: "recover", classification: "audio_codec_unsupported" })
+            m.assertEqual(playback.recovery.decide("subtitle_rendition", plan, true), { action: "recover", classification: "subtitle_hls_rendition_failed" })
+            m.assertEqual(playback.recovery.decide("other", plan, true), { action: "recover", classification: "player_failure" })
+        end sub
+
+        @it("reports a refusal on a proxy-origin stream as sourceRefused")
+        sub _()
+            plan = m.adopted("plan-a", "v3:ka")
+            m.assertEqual(playback.recovery.decide("http", plan, true).classification, "http_failure")
+            plan.data.stream.url = "https://proxy-1.example/stream/token/master.m3u8"
+            m.assertEqual(playback.recovery.decide("http", plan, true).classification, "sourceRefused")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("stall clock")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("classifies 20 s without progress as transport_stall")
+        sub _()
+            stall = playback.recovery.newStall(0)
+            m.assertInvalid(playback.recovery.stallKind(stall, 19999))
+            m.assertEqual(playback.recovery.stallKind(stall, 20000), "stall")
+        end sub
+
+        @it("waits while media fills a waiting node's buffer, and calls it a transport stall once it stops")
+        sub _()
+            stall = playback.recovery.newStall(0)
+            playback.recovery.noteMedia(stall, 62, true, 1000)
+            playback.recovery.noteMedia(stall, 62, true, 4000)
+            m.assertEqual(stall.markAt, 1000, "a reading that does not rise is not progress")
+            playback.recovery.noteMedia(stall, invalid, true, 9000)
+            m.assertEqual(stall.markAt, 9000, "a downloaded segment is")
+            playback.recovery.noteMedia(stall, 74, true, 15000)
+            m.assertInvalid(playback.recovery.stallKind(stall, 34999))
+            m.assertEqual(playback.recovery.stallKind(stall, 35000), "stall")
+            m.assertEqual(stall.level, 74)
+        end sub
+
+        @it("classifies a full buffer that never plays as decoder_no_output")
+        sub _()
+            stall = playback.recovery.newStall(0)
+            playback.recovery.noteMedia(stall, 87, true, 10000)
+            playback.recovery.noteMedia(stall, 100, true, 12000)
+            playback.recovery.noteMedia(stall, 100, true, 13000)
+            playback.recovery.noteMedia(stall, invalid, true, 15000)
+            m.assertEqual(stall.markAt, 12000, "from a full buffer the wait is the decoder's, not the network's")
+            m.assertInvalid(playback.recovery.stallKind(stall, 31999))
+            m.assertEqual(playback.recovery.stallKind(stall, 32000), "no_output")
+        end sub
+
+        @it("counts media while the node plays as input the decoder had")
+        sub _()
+            stall = playback.recovery.newStall(0)
+            playback.recovery.noteMedia(stall, invalid, false, 5000)
+            m.assertEqual(stall.markAt, 0)
+            m.assertEqual(playback.recovery.stallKind(stall, 20000), "no_output")
+            playback.recovery.restartStall(stall, 21000, 40#)
+            m.assertEqual([stall.input, stall.level], [false, 0])
+        end sub
+
+        @it("starts a rebuffer with no decoder input, keeping the clock, and takes a full buffer in it as fresh input")
+        sub _()
+            stall = playback.recovery.newStall(0)
+            playback.recovery.noteMedia(stall, invalid, false, 5000)
+            playback.recovery.rebufferStarted(stall)
+            playback.recovery.noteMedia(stall, 0, true, 6000)
+            m.assertEqual(stall.markAt, 0, "the clock runs on from the last progress")
+            m.assertEqual(playback.recovery.stallKind(stall, 20000), "stall", "an empty rebuffer is starved, not stuck")
+            playback.recovery.noteMedia(stall, 40, true, 8000)
+            playback.recovery.noteMedia(stall, 100, true, 9000)
+            m.assertEqual(playback.recovery.stallKind(stall, 29000), "no_output")
+        end sub
+
+        @it("restarts on 1.5 s of movement, not on jitter")
+        sub _()
+            stall = playback.recovery.newStall(0)
+            playback.recovery.notePosition(stall, 100#, 1000)
+            playback.recovery.notePosition(stall, 101#, 15000)
+            m.assertEqual(stall.markAt, 1000)
+            playback.recovery.notePosition(stall, 101.6#, 16000)
+            m.assertEqual(stall.markAt, 16000)
+            m.assertInvalid(playback.recovery.stallKind(stall, 35999))
+            m.assertEqual(playback.recovery.stallKind(stall, 36000), "stall")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("reconnect and AAC")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("backs off 1 s doubling to a 15 s cap")
+        sub _()
+            delays = []
+            for i = 1 to 7
+                delays.Push(playback.recovery.reconnectDelayMs(i))
+            end for
+            m.assertEqual(delays, [1000, 2000, 4000, 8000, 15000, 15000, 15000])
+        end sub
+
+        @it("restarts multichannel AAC on a device without it")
+        sub _()
+            plan = tests.transcodePlan("plan-a", "v3:ka", 3000)
+            plan.effective_recipe.audio_channels = 6
+            m.assertTrue(playback.recovery.needsStereoRestart(plan, false))
+            m.assertFalse(playback.recovery.needsStereoRestart(plan, true))
+            plan.effective_recipe.audio_channels = 2
+            m.assertFalse(playback.recovery.needsStereoRestart(plan, false))
+            m.assertFalse(playback.recovery.needsStereoRestart(tests.directPlan("plan-b", "v3:kb"), false), "copied E-AC-3 5.1 is fine")
+        end sub
+
+    end class
+
+end namespace

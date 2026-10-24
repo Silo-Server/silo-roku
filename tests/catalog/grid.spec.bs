@@ -1,0 +1,534 @@
+namespace tests
+
+    @suite("catalog grid")
+    class CatalogGridTests extends rooibos.BaseTestSuite
+
+        ' The answer to request: limit items, with the cursor after them
+        ' until total.
+        function answer(request as Object, total as Integer) as Object
+            size = request.limit
+            if request.offset + size > total then size = total - request.offset
+            after = request.offset + size
+            cursor = ""
+            if after < total then cursor = "c" + after.ToStr()
+            return { size: size, total: total, hasMore: after < total, nextCursor: cursor }
+        end function
+
+        ' Reads forward with focus on the last held item until pages have loaded.
+        function forward(state as Object, pages as Integer, total as Integer) as Object
+            changes = []
+            for i = 1 to pages
+                request = catalog.grid.want(state, state.hi - 1)
+                catalog.grid.started(state, request)
+                changes.Push(catalog.grid.received(state, request, m.answer(request, total)))
+            end for
+            return changes
+        end function
+
+        function before(state as Object) as Integer
+            count = 0
+            for each mark in state.marks
+                if mark.offset < state.lo then count = count + 1
+            end for
+            return count
+        end function
+
+        ' A /catalog server over total items numbered from 0 ("movie:m<n>"),
+        ' answering decision through the production request builder and map
+        ' step. It reads from the cursor the request carries ("c<n>"), answers
+        ' at most short items when short is positive, and lists only shrunk
+        ' items when shrunk is positive (the results changed).
+        function served(decision as Object, total as Integer, short = 0 as Integer, shrunk = 0 as Integer) as Object
+            template = catalog.request.browse({}, "", catalog.grid.PAGE_SIZE, false)
+            kind = catalog.kind.PAGE
+            if decision.skip then kind = catalog.kind.SKIP
+            request = catalog.request.continued(template, decision.cursor, decision.limit, kind)
+            m.assertTrue(request.query.limit <= catalog.request.MAX_LIMIT, "limit " + request.query.limit.ToStr())
+            position = 0
+            cursor = util.text(request.query.cursor)
+            if cursor <> "" then position = Val(Mid(cursor, 2))
+            if shrunk > 0 then total = shrunk
+            size = request.query.limit
+            if short > 0 and size > short then size = short
+            if position + size > total then size = total - position
+            if size < 0 then size = 0
+            items = []
+            for n = position to position + size - 1
+                items.Push(tests.catalogData.item(n))
+            end for
+            after = position + size
+            paging = { has_more: after < total }
+            if after < total then paging.next_cursor = "c" + after.ToStr()
+            return catalog.map.apply(request, tests.catalogData.ok({ items: items, total: total, page: paging }), tests.catalogData.words())
+        end function
+
+        ' BrowseGrid's content as card IDs: held from lo, and gathered.
+        function newModel() as Object
+            return { held: [], gathered: [] }
+        end function
+
+        ' Carries out change on model as BrowseGrid.applyChange does.
+        sub applyTo(model as Object, state as Object, change as Object, content as Dynamic)
+            ids = []
+            if content <> invalid and change.size > 0
+                for each card in content.getChildren(change.size, change.from)
+                    ids.Push(card.id)
+                end for
+            end if
+            if change.insert = "end"
+                model.held.Append(ids)
+            else if change.insert = "gather" or change.insert = "start"
+                model.gathered.Append(ids)
+                if change.insert = "start"
+                    model.gathered.Append(model.held)
+                    model.held = model.gathered
+                    model.gathered = []
+                end if
+            end if
+            if state.gather = invalid then model.gathered = []
+            kept = []
+            for i = change.dropStart to model.held.Count() - change.dropEnd - 1
+                kept.Push(model.held[i])
+            end for
+            model.held = kept
+        end sub
+
+        ' Asks, sends, and applies reads with focus at focus until the grid
+        ' wants none, at most limit times; gives the decisions made.
+        function settle(state as Object, model as Object, focus as Integer, total as Integer, short = 0 as Integer, shrunk = 0 as Integer, limit = 40 as Integer) as Object
+            decisions = []
+            while decisions.Count() < limit
+                decision = catalog.grid.want(state, focus)
+                if decision = invalid then exit while
+                decisions.Push(decision)
+                catalog.grid.started(state, decision)
+                result = m.served(decision, total, short, shrunk)
+                m.assertTrue(result.ok, "answer mapped")
+                m.applyTo(model, state, catalog.grid.received(state, decision, result.body), result.content)
+            end while
+            return decisions
+        end function
+
+        ' Every held card is the item at its absolute offset, and lo starts a row.
+        sub assertAligned(state as Object, model as Object)
+            m.assertEqual(state.lo mod catalog.grid.COLUMNS, 0, "lo starts a row")
+            m.assertEqual(model.held.Count(), state.hi - state.lo, "held count")
+            for i = 0 to model.held.Count() - 1
+                if model.held[i] <> "movie:m" + (state.lo + i).ToStr()
+                    m.fail("item " + (state.lo + i).ToStr() + " holds " + model.held[i])
+                    return
+                end if
+            end for
+        end sub
+
+        @describe("reading forward (spec section 5.5)")
+
+        @it("reads the first page, then the next while focus is within eight rows of the end")
+        sub _()
+            state = catalog.grid.create(10)
+            first = catalog.grid.want(state, 0)
+            m.assertEqual(first, { offset: 0, cursor: "", limit: 40, direction: "next", skip: false })
+            catalog.grid.started(state, first)
+            m.assertInvalid(catalog.grid.want(state, 0))
+            change = catalog.grid.received(state, first, m.answer(first, 1000))
+            m.assertEqual(change, { insert: "end", from: 0, size: 40, dropStart: 0, dropEnd: 0 })
+            m.assertEqual(state.total, 1000)
+            ' Items 0-39 are rows 0-6: row 6 is within eight of row 0.
+            m.assertEqual(catalog.grid.want(state, 0).cursor, "c40")
+            m.forward(state, 2, 1000)
+            m.assertEqual(state.hi, 120)
+            ' Row 19 is the last; focus on row 10 is nine rows away.
+            m.assertInvalid(catalog.grid.want(state, 60))
+            m.assertEqual(catalog.grid.want(state, 66).offset, 120)
+        end sub
+
+        @it("stops at the last page and on an empty result")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 2, 50)
+            m.assertEqual(state.hi, 50)
+            m.assertTrue(state.complete)
+            m.assertInvalid(catalog.grid.want(state, 49))
+            empty = catalog.grid.create(10)
+            m.forward(empty, 1, 0)
+            m.assertTrue(empty.complete)
+            m.assertEqual(empty.hi, 0)
+        end sub
+
+        @it("can ask again after a failure")
+        sub _()
+            state = catalog.grid.create(10)
+            request = catalog.grid.want(state, 0)
+            catalog.grid.started(state, request)
+            catalog.grid.failed(state)
+            m.assertEqual(catalog.grid.want(state, 0), request)
+        end sub
+
+        @describe("retention (plan section 4.8)")
+
+        @it("holds at most ten pages, dropping whole rows from the front")
+        sub _()
+            state = catalog.grid.create(10)
+            changes = m.forward(state, 11, 5000)
+            m.assertEqual(changes[9].dropStart, 0)
+            ' 440 items over a 400 budget: the front drops to the next row
+            ' boundary, item 42, so no item changes column.
+            m.assertEqual(changes[10], { insert: "end", from: 0, size: 40, dropStart: 42, dropEnd: 0 })
+            m.assertEqual(state.lo, 42)
+            m.assertEqual(state.hi, 440)
+            m.assertEqual(state.lo mod catalog.grid.COLUMNS, 0)
+        end sub
+
+        @it("keeps at most ten cursor checkpoints before the held items")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 30, 5000)
+            m.assertEqual(m.before(state), 10)
+            m.assertEqual(state.lo, 804)
+        end sub
+
+        @it("trims to fewer pages under memory pressure, from the end away from focus")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 10, 5000)
+            change = catalog.grid.trim(state, 3, 30)
+            m.assertEqual(change.dropStart, 0)
+            m.assertEqual(change.dropEnd, 280)
+            m.assertEqual(state.hi, 120)
+            m.assertEqual(state.next, "c120")
+            m.assertFalse(state.complete)
+            nearEnd = catalog.grid.create(10)
+            m.forward(nearEnd, 10, 5000)
+            change = catalog.grid.trim(nearEnd, 3, 390)
+            m.assertEqual(change.dropEnd, 0)
+            m.assertEqual(nearEnd.lo, 282)
+            m.assertEqual(change.dropStart, 282)
+            m.assertEqual(catalog.grid.trim(nearEnd, 10, 390), catalog.grid.unchanged())
+        end sub
+
+        @describe("reading back over dropped pages")
+
+        @it("fills in before the held items from the nearest checkpoint, then drops the far end")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 11, 5000)
+            request = catalog.grid.want(state, 42)
+            ' The checkpoint at 40 would fill no whole row, so it reads from 0.
+            m.assertEqual(request, { offset: 0, cursor: "", limit: 42, direction: "previous", skip: false })
+            catalog.grid.started(state, request)
+            change = catalog.grid.received(state, request, m.answer(request, 5000))
+            m.assertEqual(change, { insert: "start", from: 0, size: 42, dropStart: 0, dropEnd: 40 })
+            m.assertEqual(state.lo, 0)
+            m.assertEqual(state.hi, 400)
+            m.assertEqual(state.next, "c400")
+            m.assertInvalid(catalog.grid.want(state, 0))
+        end sub
+
+        @it("reads from a checkpoint in the middle, skipping the part of a row it cannot hold")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 30, 5000)
+            request = catalog.grid.want(state, state.lo)
+            m.assertEqual(request, { offset: 760, cursor: "c760", limit: 44, direction: "previous", skip: false })
+            change = catalog.grid.received(state, request, m.answer(request, 5000))
+            m.assertEqual(change.insert, "start")
+            m.assertEqual(change.from, 2)
+            m.assertEqual(change.size, 42)
+            m.assertEqual(state.lo, 762)
+            m.assertEqual(state.hi, 1162)
+        end sub
+
+        @it("walks back for cursors when the nearest checkpoint is too far to read at once")
+        sub _()
+            state = catalog.grid.create(10)
+            state.lo = 600
+            state.hi = 1000
+            state.next = "c1000"
+            walk = catalog.grid.want(state, 600)
+            m.assertEqual(walk, { offset: 0, cursor: "", limit: 200, direction: "previous", skip: true })
+            change = catalog.grid.received(state, walk, m.answer(walk, 5000))
+            m.assertEqual(change.insert, "")
+            m.assertEqual(state.lo, 600)
+            m.assertEqual(catalog.grid.want(state, 600), { offset: 200, cursor: "c200", limit: 200, direction: "previous", skip: true })
+            catalog.grid.received(state, catalog.grid.want(state, 600), m.answer(catalog.grid.want(state, 600), 5000))
+            last = catalog.grid.want(state, 600)
+            m.assertEqual(last, { offset: 400, cursor: "c400", limit: 200, direction: "previous", skip: false })
+            change = catalog.grid.received(state, last, m.answer(last, 5000))
+            m.assertEqual(change.from, 2)
+            m.assertEqual(change.size, 198)
+            m.assertEqual(state.lo, 402)
+            ' 202 items back from the checkpoint at 200 is more than one read
+            ' may ask for: a short walk lands a read of 198.
+            walk = catalog.grid.want(state, 402)
+            m.assertEqual(walk, { offset: 200, cursor: "c200", limit: 4, direction: "previous", skip: true })
+            catalog.grid.received(state, walk, m.answer(walk, 5000))
+            m.assertEqual(catalog.grid.want(state, 402), { offset: 204, cursor: "c204", limit: 198, direction: "previous", skip: false })
+        end sub
+
+        @describe("reading back through the map step (W6-1)")
+
+        @it("maps a 42-item read back whole and puts every card at its offset")
+        sub _()
+            state = catalog.grid.create(10)
+            model = m.newModel()
+            for i = 1 to 11
+                m.settle(state, model, state.hi - 1, 5000, 0, 0, 1)
+            end for
+            m.assertEqual(state.lo, 42)
+            decision = catalog.grid.want(state, 42)
+            m.assertEqual(decision.limit, 42)
+            result = m.served(decision, 5000)
+            m.assertEqual(result.content.getChildCount(), 42)
+            m.assertEqual(result.body.size, 42)
+            catalog.grid.started(state, decision)
+            m.applyTo(model, state, catalog.grid.received(state, decision, result.body), result.content)
+            m.assertEqual(state.lo, 0)
+            m.assertEqual(model.held[0], "movie:m0")
+            m.assertAligned(state, model)
+        end sub
+
+        @it("reads back 44, nearly 200, and other sizes over thirty pages to the first item")
+        sub _()
+            state = catalog.grid.create(10)
+            model = m.newModel()
+            for i = 1 to 30
+                m.settle(state, model, state.hi - 1, 5000, 0, 0, 1)
+            end for
+            m.assertEqual(state.lo, 804)
+            m.assertAligned(state, model)
+            limits = {}
+            largest = 0
+            for i = 1 to 60
+                if state.lo = 0 then exit for
+                for each decision in m.settle(state, model, state.lo, 5000, 0, 0, 1)
+                    if not decision.skip
+                        limits[decision.limit.ToStr()] = true
+                        if decision.limit > largest then largest = decision.limit
+                    end if
+                end for
+                m.assertAligned(state, model)
+            end for
+            m.assertEqual(state.lo, 0)
+            m.assertTrue(limits.DoesExist("44"))
+            m.assertTrue(largest > 190, "a read of " + largest.ToStr())
+            m.assertEqual(model.held[0], "movie:m0")
+        end sub
+
+        @it("gathers short answers until they reach the held items")
+        sub _()
+            for each short in [40, 7, 1]
+                state = catalog.grid.create(10)
+                model = m.newModel()
+                for i = 1 to 11
+                    m.settle(state, model, state.hi - 1, 5000, 0, 0, 1)
+                end for
+                decisions = m.settle(state, model, 42, 5000, short, 0, 100)
+                m.assertEqual(state.lo, 0, "short " + short.ToStr())
+                m.assertTrue(decisions.Count() > 1)
+                m.assertInvalid(state.gather)
+                m.assertAligned(state, model)
+            end for
+        end sub
+
+        @it("stops reading back, without inserting, when the results end before the held items")
+        sub _()
+            state = catalog.grid.create(10)
+            model = m.newModel()
+            for i = 1 to 11
+                m.settle(state, model, state.hi - 1, 5000, 0, 0, 1)
+            end for
+            decisions = m.settle(state, model, 42, 5000, 0, 30)
+            m.assertEqual(decisions.Count(), 1)
+            m.assertTrue(state.stalled)
+            m.assertEqual(state.lo, 42)
+            m.assertAligned(state, model)
+            m.assertInvalid(catalog.grid.want(state, 42))
+            m.assertEqual(catalog.grid.restore(state, nav.focus.newKey("grid", "x", 0, 5), ["a"], false).kind, nav.restore.POSITION)
+        end sub
+
+        @it("drops gathered cards when a read at the end moves the front first")
+        sub _()
+            state = catalog.grid.create(10)
+            model = m.newModel()
+            for i = 1 to 11
+                m.settle(state, model, state.hi - 1, 5000, 0, 0, 1)
+            end for
+            m.settle(state, model, 42, 5000, 20, 0, 1)
+            m.assertNotInvalid(state.gather)
+            m.assertEqual(model.gathered.Count(), 20)
+            m.settle(state, model, state.hi - 1, 5000, 0, 0, 1)
+            m.assertInvalid(state.gather)
+            m.assertEqual(model.gathered.Count(), 0)
+            m.assertAligned(state, model)
+        end sub
+
+        @describe("memory budget (W6-2)")
+
+        @it("reads less far ahead when fewer pages are held")
+        sub _()
+            m.assertEqual(catalog.grid.reach(catalog.grid.create(10)), 8)
+            m.assertEqual(catalog.grid.reach(catalog.grid.create(5)), 8)
+            m.assertEqual(catalog.grid.reach(catalog.grid.create(3)), 5)
+            m.assertEqual(catalog.grid.reach(catalog.grid.create(1)), 1)
+        end sub
+
+        @it("goes idle at an unchanged focus on three pages (the reported cycle)")
+        sub _()
+            state = catalog.grid.create(3)
+            m.forward(state, 4, 5000)
+            m.assertEqual([state.lo, state.hi], [42, 160])
+            reads = 0
+            for i = 1 to 10
+                request = catalog.grid.want(state, 66)
+                if request = invalid then exit for
+                reads = reads + 1
+                catalog.grid.started(state, request)
+                catalog.grid.received(state, request, m.answer(request, 5000))
+            end for
+            m.assertTrue(reads <= 2, reads.ToStr() + " reads")
+            m.assertInvalid(catalog.grid.want(state, 66))
+            mapped = catalog.grid.create(3)
+            model = m.newModel()
+            for i = 1 to 4
+                m.settle(mapped, model, mapped.hi - 1, 5000, 0, 0, 1)
+            end for
+            m.assertTrue(m.settle(mapped, model, 66, 5000).Count() <= 2)
+            m.assertEqual(m.settle(mapped, model, 66, 5000).Count(), 0)
+            m.assertTrue(66 >= mapped.lo and 66 < mapped.hi)
+            m.assertAligned(mapped, model)
+        end sub
+
+        @it("moves through the results both ways on three pages, reading each page once a way")
+        sub _()
+            state = catalog.grid.create(3)
+            model = m.newModel()
+            reads = { next: 0, previous: 0 }
+            for each stepSize in [catalog.grid.COLUMNS, -catalog.grid.COLUMNS]
+                focus = 0
+                if stepSize < 0 then focus = 1200
+                while focus >= 0 and focus <= 1200
+                    pageReads = 0
+                    ' Rows between focus and the end read past: none would mean
+                    ' the read waited for focus to reach the last held row.
+                    ahead = { next: catalog.grid.rowOf(state.hi - 1) - focus \ catalog.grid.COLUMNS, previous: focus \ catalog.grid.COLUMNS - catalog.grid.rowOf(state.lo) }
+                    for each decision in m.settle(state, model, focus, 5000)
+                        if not decision.skip
+                            pageReads = pageReads + 1
+                            reads[decision.direction] = reads[decision.direction] + 1
+                            if state.hi > catalog.grid.PAGE_SIZE then m.assertTrue(ahead[decision.direction] > 0, decision.direction + " read late at " + focus.ToStr())
+                        end if
+                    end for
+                    m.assertTrue(pageReads <= 1, pageReads.ToStr() + " reads at " + focus.ToStr())
+                    m.assertInvalid(catalog.grid.want(state, focus))
+                    m.assertTrue(focus >= state.lo and focus < state.hi, "holds " + focus.ToStr())
+                    focus = focus + stepSize
+                end while
+                m.assertAligned(state, model)
+            end for
+            m.assertEqual(state.lo, 0)
+            ' 1,200 items are 30 pages forward, and reads of 40 to 48 back.
+            m.assertTrue(reads.next <= 31, reads.next.ToStr() + " forward")
+            m.assertTrue(reads.previous <= 30, reads.previous.ToStr() + " back")
+        end sub
+
+        @it("keeps focus held and goes idle after the budget drops")
+        sub _()
+            for each pages in [5, 3]
+                for each focus in [30, 200, 390]
+                    state = catalog.grid.create(10)
+                    model = m.newModel()
+                    for i = 1 to 10
+                        m.settle(state, model, state.hi - 1, 5000, 0, 0, 1)
+                    end for
+                    m.applyTo(model, state, catalog.grid.trim(state, pages, focus), invalid)
+                    label = pages.ToStr() + " pages, focus " + focus.ToStr()
+                    m.assertTrue(focus >= state.lo and focus < state.hi, label)
+                    m.assertTrue(state.hi - state.lo <= state.maxItems, label)
+                    m.assertAligned(state, model)
+                    m.assertTrue(m.settle(state, model, focus, 5000).Count() <= 2, label)
+                    m.assertInvalid(catalog.grid.want(state, focus), label)
+                    m.assertAligned(state, model)
+                end for
+            end for
+        end sub
+
+        @it("ignores a next page whose end a trim moved while it loaded")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 10, 5000)
+            request = catalog.grid.want(state, 399)
+            catalog.grid.started(state, request)
+            catalog.grid.trim(state, 3, 30)
+            m.assertEqual(state.hi, 120)
+            change = catalog.grid.received(state, request, m.answer(request, 5000))
+            m.assertEqual(change, catalog.grid.unchanged())
+            m.assertEqual(state.hi, 120)
+            m.assertEqual(state.next, "c120")
+        end sub
+
+        @it("reads on from the checkpoint before an end trimmed between checkpoints")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 10, 5000)
+            catalog.grid.trim(state, 3, 200)
+            m.assertEqual([state.lo, state.hi], [138, 258])
+            request = catalog.grid.want(state, 257)
+            m.assertEqual(request, { offset: 240, cursor: "c240", limit: 58, direction: "next", skip: false })
+            change = catalog.grid.received(state, request, m.answer(request, 5000))
+            m.assertEqual(change, { insert: "end", from: 18, size: 40, dropStart: 42, dropEnd: 0 })
+            m.assertEqual([state.lo, state.hi, state.nextAt], [180, 298, 298])
+            m.assertEqual(state.next, "c298")
+        end sub
+
+        @describe("artwork refresh (plan section 4.6)")
+
+        @it("re-reads the items around a failed image once per checkpoint")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 3, 5000)
+            m.assertEqual(catalog.grid.refreshFor(state, 50), { offset: 40, cursor: "c40", limit: 40, direction: "refresh", skip: false })
+            m.assertInvalid(catalog.grid.refreshFor(state, 60))
+            m.assertEqual(catalog.grid.refreshFor(state, 10), { offset: 0, cursor: "", limit: 40, direction: "refresh", skip: false })
+        end sub
+
+        @it("maps a refresh onto the held items")
+        sub _()
+            state = catalog.grid.create(10)
+            state.hi = 120
+            m.assertEqual(catalog.grid.refreshRange(state, { offset: 40 }, 40), { start: 40, from: 0, size: 40 })
+            state.lo = 42
+            m.assertEqual(catalog.grid.refreshRange(state, { offset: 40 }, 40), { start: 0, from: 2, size: 38 })
+            m.assertEqual(catalog.grid.refreshRange(state, { offset: 0 }, 40), { start: 0, from: 42, size: 0 })
+        end sub
+
+        @describe("focus restoration targets (spec section 5.3)")
+
+        @it("finds the item where it was, or anywhere it is held")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 1, 1000)
+            keys = ["a", "b", "c"]
+            m.assertEqual(catalog.grid.restore(state, nav.focus.newKey("grid", "b", 0, 1), keys, false), { kind: nav.restore.ITEM, index: 1 })
+            m.assertEqual(catalog.grid.restore(state, nav.focus.newKey("grid", "c", 0, 30), keys, false), { kind: nav.restore.ITEM, index: 2 })
+        end sub
+
+        @it("waits while the grid reads toward an item it does not hold, then takes the nearest position")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 1, 1000)
+            key = nav.focus.newKey("grid", "far", 0, 300)
+            m.assertEqual(catalog.grid.restore(state, key, ["a"], false), { kind: nav.restore.WAIT, index: 300 })
+            m.assertEqual(catalog.grid.want(state, 300).offset, 40)
+            m.assertEqual(catalog.grid.restore(state, key, ["a"], true), { kind: nav.restore.POSITION, index: 39 })
+        end sub
+
+        @it("does not wait past the end of a complete grid")
+        sub _()
+            state = catalog.grid.create(10)
+            m.forward(state, 1, 30)
+            m.assertEqual(catalog.grid.restore(state, nav.focus.newKey("grid", "x", 0, 35), ["a"], false), { kind: nav.restore.POSITION, index: 29 })
+            m.assertEqual(catalog.grid.restore(state, invalid, ["a"], false), { kind: nav.restore.DEFAULT, index: 0 })
+            m.assertEqual(catalog.grid.restore(state, nav.focus.newKey("grid", "x", 0, 5), [], false), { kind: nav.restore.DEFAULT, index: 0 })
+        end sub
+    end class
+end namespace

@@ -1,0 +1,313 @@
+namespace tests
+
+    @suite("playback subtitles")
+    class PlaybackSubtitlesTests extends rooibos.BaseTestSuite
+
+        function text(rows as Object) as String
+            return rows.Join(Chr(10))
+        end function
+
+        @describe("SRT")
+
+        @it("moves cues onto the player clock, dropping and clipping at the new origin")
+        sub _()
+            srt = m.text(["1", "00:00:01,000 --> 00:00:04,000", "Before the origin", "", "2", "00:09:59,000 --> 00:10:01,000", "Across it", "", "3", "00:10:00,500 --> 00:10:02,000", "After it", "with two lines", ""])
+            result = playback.subtitles.convert(srt, "srt", 600)
+            m.assertInvalid(result.error)
+            m.assertEqual(result.cues, 2)
+            m.assertEqual(result.srt, m.text(["1", "00:00:00,000 --> 00:00:01,000", "Across it", "", "2", "00:00:00,500 --> 00:00:02,000", "After it", "with two lines", ""]))
+        end sub
+
+        @it("reads a byte order mark and CRLF line ends")
+        sub _()
+            srt = Chr(&hFEFF) + "1" + Chr(13) + Chr(10) + "00:00:01,000 --> 00:00:02,000" + Chr(13) + Chr(10) + "Hi" + Chr(13) + Chr(10)
+            m.assertEqual(playback.subtitles.convert(srt, "srt", 0).srt, m.text(["1", "00:00:01,000 --> 00:00:02,000", "Hi", ""]))
+        end sub
+
+        @it("drops the ASS override blocks Roku would print, as the server's WebVTT conversion does (hardware run 16)")
+        sub _()
+            srt = m.text(["1", "00:00:01,000 --> 00:00:02,000", "{\an8}UNPARALLELED PERIL", "", "2", "00:00:03,000 --> 00:00:04,000", "{\an8}", "{\i1}One punch!{\i0} It's done!", "", "3", "00:00:05,000 --> 00:00:06,000", "Price {\an8 is high", "", "4", "00:00:07,000 --> 00:00:08,000", "{\an8}", ""])
+            result = playback.subtitles.convert(srt, "srt", 0)
+            m.assertEqual(result.cues, 3, "a cue of override blocks alone has nothing to show")
+            m.assertEqual(result.srt, m.text(["1", "00:00:01,000 --> 00:00:02,000", "UNPARALLELED PERIL", "", "2", "00:00:03,000 --> 00:00:04,000", "One punch! It's done!", "", "3", "00:00:05,000 --> 00:00:06,000", "Price {\an8 is high", ""]))
+        end sub
+
+        @it("reports a file with nothing left to show, and formats it cannot read")
+        sub _()
+            srt = m.text(["1", "00:00:01,000 --> 00:00:04,000", "Gone", ""])
+            m.assertEqual(playback.subtitles.convert(srt, "srt", 10).error, "no_cues")
+            m.assertEqual(playback.subtitles.convert("", "srt", 0).error, "no_cues")
+            m.assertEqual(playback.subtitles.convert(srt, "sup", 0).error, "unsupported_format")
+        end sub
+
+        @describe("WebVTT")
+
+        @it("skips the header, notes, and styles, and drops settings and most tags")
+        sub _()
+            vtt = m.text(["WEBVTT", "", "NOTE a comment", "over two lines", "", "STYLE", "::cue { color: red }", "", "00:01.000 --> 00:04.000 align:start line:0", "<v Roger>Hello &amp; <b>bold</b></v>", "", "cue-id", "00:00:05.250 --> 00:00:06.000", "<c.yellow>Second</c> &lt;3", ""])
+            result = playback.subtitles.convert(vtt, "vtt", 0)
+            m.assertEqual(result.srt, m.text(["1", "00:00:01,000 --> 00:00:04,000", "Hello & <b>bold</b>", "", "2", "00:00:05,250 --> 00:00:06,000", "Second <3", ""]))
+        end sub
+
+        @describe("ASS")
+
+        @it("reads Dialogue lines through the Format line, in time order")
+        sub _()
+            ass = m.text([
+                "[Script Info]"
+                "Title: x"
+                ""
+                "[V4+ Styles]"
+                "Format: Name, Fontname"
+                "Style: Default,Arial"
+                ""
+                "[Events]"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+                "Dialogue: 0,0:00:05.00,0:00:07.50,Default,,0,0,0,,{\i1}Later{\i0}, with a comma"
+                "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,First\Nline two"
+                "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\p1}m 0 0 l 100 0{\p0}"
+                "Comment: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,not shown"
+            ])
+            result = playback.subtitles.convert(ass, "ass", 0.5)
+            m.assertEqual(result.cues, 2)
+            m.assertEqual(result.srt, m.text(["1", "00:00:00,500 --> 00:00:01,500", "First", "line two", "", "2", "00:00:04,500 --> 00:00:07,000", "Later, with a comma", ""]))
+        end sub
+
+        @describe("ASS typesetting (hardware run 23: a 10.24 MiB typeset track)")
+
+        function events(rows as Object) as String
+            head = ["[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
+            head.Append(rows)
+            return m.text(head)
+        end function
+
+        @it("keeps an event's text outside its drawing, and drops events that draw or show nothing")
+        sub _()
+            ass = m.events([
+                "Dialogue: 0,0:00:01.00,0:00:02.00,Logo,,0,0,0,,{\p1}m 0 0 l 100 0 100 100{\p0}"
+                "Dialogue: 0,0:00:02.00,0:00:03.00,Sign,,0,0,0,,{\an7\pos(10,20)\p1}m 0 0 l 10 0{\p0}Shop sign"
+                "Dialogue: 0,0:00:03.00,0:00:04.00,Logo,,0,0,0,,{\pos(10,20)\p2}m 0 0 l 1 1 {\c&HFFFFFF&}l 2 2"
+                "Dialogue: 0,0:00:04.00,0:00:05.00,Kara,,0,0,0,,{\k20}Ka{\k30}ra{\kf25}o{\ko40}ke"
+                "Dialogue: 0,0:00:05.00,0:00:06.00,Sign,,0,0,0,,{\an8\pos(960,40)\fad(200,200)}NEXT EPISODE"
+                "Dialogue: 0,0:00:06.00,0:00:07.00,Sign,,0,0,0,,{\fad(200,200)\blur3}"
+                "Dialogue: 0,0:00:07.00,0:00:08.00,Default,,0,0,0,,{\p1}m 0 0{\p0}{\i1}Price{\i0} {is high"
+                "Dialogue: 0,0:00:08.00,0:00:09.00,Default,,0,0,0,,{\pbo5}Not a drawing"
+                "Dialogue: 0,0:00:09.00,0:00:10.00,Default,,0,0,0,,{\p1}m 0 0{\p0}\h\N\h"
+            ])
+            result = playback.subtitles.convert(ass, "ass", 0)
+            m.assertEqual([result.cues, result.dropped, result.merged], [5, 4, 0])
+            m.assertEqual(result.srt, m.text(["1", "00:00:02,000 --> 00:00:03,000", "Shop sign", "", "2", "00:00:04,000 --> 00:00:05,000", "Karaoke", "", "3", "00:00:05,000 --> 00:00:06,000", "NEXT EPISODE", "", "4", "00:00:07,000 --> 00:00:08,000", "Price {is high", "", "5", "00:00:08,000 --> 00:00:09,000", "Not a drawing", ""]))
+        end sub
+
+        @it("keeps one cue for a sign repeated frame by frame or in layers, and two for text said twice")
+        sub _()
+            ass = m.events([
+                "Dialogue: 0,0:00:10.00,0:00:10.04,Sign,,0,0,0,,{\pos(100,200)}STATION"
+                "Dialogue: 0,0:00:10.04,0:00:10.08,Sign,,0,0,0,,{\pos(101,200)}STATION"
+                "Dialogue: 0,0:00:10.08,0:00:10.12,Sign,,0,0,0,,{\pos(102,200)}STATION"
+                "Dialogue: 0,0:00:20.00,0:00:22.00,Sign,,0,0,0,,{\bord6\3c&H000000&}EXIT"
+                "Dialogue: 1,0:00:20.00,0:00:22.00,Sign,,0,0,0,,{\bord0}EXIT"
+                "Dialogue: 0,0:00:30.00,0:00:30.04,Sign,,0,0,0,,{\pos(1,1)}LEFT"
+                "Dialogue: 0,0:00:30.02,0:00:30.06,Sign,,0,0,0,,{\pos(9,9)}RIGHT"
+                "Dialogue: 0,0:00:30.04,0:00:30.08,Sign,,0,0,0,,{\pos(2,1)}LEFT"
+                "Dialogue: 0,0:00:30.06,0:00:30.10,Sign,,0,0,0,,{\pos(8,9)}RIGHT"
+                "Dialogue: 0,0:00:40.00,0:00:41.00,Default,,0,0,0,,Hey!"
+                "Dialogue: 0,0:00:45.00,0:00:46.00,Default,,0,0,0,,Hey!"
+            ])
+            result = playback.subtitles.convert(ass, "ass", 0)
+            m.assertEqual([result.cues, result.dropped, result.merged], [6, 0, 5])
+            m.assertEqual(result.srt, m.text(["1", "00:00:10,000 --> 00:00:10,120", "STATION", "", "2", "00:00:20,000 --> 00:00:22,000", "EXIT", "", "3", "00:00:30,000 --> 00:00:30,080", "LEFT", "", "4", "00:00:30,020 --> 00:00:30,100", "RIGHT", "", "5", "00:00:40,000 --> 00:00:41,000", "Hey!", "", "6", "00:00:45,000 --> 00:00:46,000", "Hey!", ""]))
+        end sub
+
+        ' An ASS time from centiseconds.
+        function assTime(cs as Integer) as String
+            return (cs \ 360000).ToStr() + ":" + Right("0" + ((cs \ 6000) mod 60).ToStr(), 2) + ":" + Right("0" + ((cs \ 100) mod 60).ToStr(), 2) + "." + Right("0" + (cs mod 100).ToStr(), 2)
+        end function
+
+        ' One block of a typeset episode, b * 10 s in: a drawn logo (about
+        ' 4 KB of vector commands), a tags-only fade, a sign tracked over ten
+        ' frames, a sign in two layers, a karaoke line, and two lines of
+        ' dialogue.
+        function typesetBlock(b as Integer, drawing as String) as Object
+            t = b * 1000
+            id = b.ToStr()
+            rows = ["Dialogue: 0," + m.assTime(t) + "," + m.assTime(t + 500) + ",Logo,,0,0,0,,{\an7\pos(0,0)\p1}" + drawing + "{\p0}"]
+            rows.Push("Dialogue: 0," + m.assTime(t) + "," + m.assTime(t + 500) + ",Logo,,0,0,0,,{\fad(100,100)}")
+            for f = 0 to 9
+                rows.Push("Dialogue: 0," + m.assTime(t + f * 4) + "," + m.assTime(t + f * 4 + 4) + ",Sign,,0,0,0,,{\pos(" + (100 + f).ToStr() + ",200)\frz2\blur0.6}STATION " + id)
+            end for
+            rows.Push("Dialogue: 0," + m.assTime(t + 100) + "," + m.assTime(t + 300) + ",Sign,,0,0,0,,{\bord6\3c&H000000&}EXIT " + id)
+            rows.Push("Dialogue: 1," + m.assTime(t + 100) + "," + m.assTime(t + 300) + ",Sign,,0,0,0,,{\bord0}EXIT " + id)
+            rows.Push("Dialogue: 0," + m.assTime(t + 300) + "," + m.assTime(t + 600) + ",Kara,,0,0,0,karaoke,{\k25}so{\k30}ra{\k40} " + id)
+            rows.Push("Dialogue: 0," + m.assTime(t + 600) + "," + m.assTime(t + 800) + ",Default,,0,0,0,,Line " + id + ", the first")
+            rows.Push("Dialogue: 0," + m.assTime(t + 800) + "," + m.assTime(t + 950) + ",Default,,0,0,0,,{\i1}Line " + id + "{\i0},\Nthe second")
+            return rows
+        end function
+
+        @it("converts a large typeset file in chunks, its typesetting costing no cues (run 23)")
+        sub _()
+            shape = "m 0 0 l 100 0 100 100 0 100 b 10 10 20 20 30 30 "
+            drawing = ""
+            while Len(drawing) < 4096
+                drawing = drawing + shape
+            end while
+            rows = ["[Script Info]", "ScriptType: v4.00+", "", "[V4+ Styles]", "Format: Name, Fontname", "Style: Default,Arial", "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
+            blocks = 450
+            for b = 1 to blocks
+                rows.Append(m.typesetBlock(b, drawing))
+            end for
+            path = "tmp:/subtitles-spec-typeset.ass"
+            m.assertTrue(WriteAsciiFile(path, m.text(rows)))
+            size = CreateObject("roFileSystem").Stat(path).size
+            m.assertTrue(size > api.response.MAX_BODY_BYTES, "past the JSON budget, in several chunks: " + size.ToStr())
+            result = playback.subtitles.convertFile(path, "ass", 0)
+            DeleteFile(path)
+            m.assertInvalid(result.error)
+            m.assertEqual([result.cues, result.dropped, result.merged], [5 * blocks, 2 * blocks, 10 * blocks])
+            m.assertTrue(Len(result.srt) < size / 10, "the cues are a tenth of the file")
+            m.assertEqual(Instr(1, result.srt, "m 0 0 l"), 0, "no vector commands")
+            first = m.text(["1", "00:00:10,000 --> 00:00:10,400", "STATION 1", "", "2", "00:00:11,000 --> 00:00:13,000", "EXIT 1", "", "3", "00:00:13,000 --> 00:00:16,000", "sora 1", "", "4", "00:00:16,000 --> 00:00:18,000", "Line 1, the first", "", "5", "00:00:18,000 --> 00:00:19,500", "Line 1,", "the second", ""])
+            m.assertEqual(Left(result.srt, Len(first)), first)
+        end sub
+
+        @it("skips an ASS line longer than a chunk, as only a drawing runs that long, and fails one in SRT")
+        sub _()
+            long = ""
+            while Len(long) < 300
+                long = long + "l 100 0 100 100 "
+            end while
+            ass = m.events(["Dialogue: 0,0:00:01.00,0:00:02.00,Logo,,0,0,0,,{\p1}m 0 0 " + long + "{\p0}", "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,After the logo"])
+            path = "tmp:/subtitles-spec-long.ass"
+            m.assertTrue(WriteAsciiFile(path, ass))
+            result = playback.subtitles.convertFile(path, "ass", 0, 128)
+            m.assertInvalid(result.error)
+            m.assertEqual([result.cues, result.dropped], [1, 1])
+            m.assertEqual(result.srt, m.text(["1", "00:00:03,000 --> 00:00:04,000", "After the logo", ""]))
+            m.assertEqual(playback.subtitles.convertFile(path, "srt", 0, 128).error, "too_large")
+            DeleteFile(path)
+        end sub
+
+        @describe("in pieces (hardware run 22: a typeset ASS track over 2 MiB)")
+
+        ' Every feed of text in pieces of whole lines, as convertFile gives it,
+        ' converts as the whole text does.
+        function inPieces(text as String, format as String, shiftSeconds as Dynamic, cuts as Object) as Object
+            reader = playback.subtitles.newReader(format)
+            at = 1
+            for each cut in cuts
+                playback.subtitles.feed(reader, Mid(text, at, cut - at + 1))
+                at = cut + 1
+            end for
+            playback.subtitles.feed(reader, Mid(text, at))
+            return playback.subtitles.finish(reader, shiftSeconds)
+        end function
+
+        ' The character positions of text's line ends.
+        function lineEnds(text as String) as Object
+            out = []
+            at = Instr(1, text, Chr(10))
+            while at > 0
+                out.Push(at)
+                at = Instr(at + 1, text, Chr(10))
+            end while
+            return out
+        end function
+
+        function sample() as String
+            return Chr(&hFEFF) + m.text(["1", "00:00:01,000 --> 00:00:04,000", "Première ligne", "{\an8}en haut", "", "2", "00:00:05,000 --> 00:00:06,000", "Fin", "", ""]).Replace(Chr(10), Chr(13) + Chr(10))
+        end function
+
+        @it("converts text fed a line at a time, or in larger pieces, as the whole text")
+        sub _()
+            whole = playback.subtitles.convert(m.sample(), "srt", 0.5)
+            m.assertEqual(whole.cues, 2)
+            ends = m.lineEnds(m.sample())
+            m.assertEqual(m.inPieces(m.sample(), "srt", 0.5, ends), whole, "a line at a time")
+            m.assertEqual(m.inPieces(m.sample(), "srt", 0.5, [ends[1], ends[4]]), whole, "a block cut after its timing line and its text")
+            vtt = m.text(["WEBVTT", "", "NOTE a comment", "over two lines", "", "00:01.000 --> 00:04.000 align:start", "<b>Hello</b>", ""])
+            m.assertEqual(m.inPieces(vtt, "vtt", 0, m.lineEnds(vtt)), playback.subtitles.convert(vtt, "vtt", 0))
+            ass = m.text(["[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text", "Dialogue: 0,0:00:05.00,0:00:07.50,Default,,0,0,0,,{\pos(10,20)}Later", "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,First"])
+            m.assertEqual(m.inPieces(ass, "ass", 0, m.lineEnds(ass)), playback.subtitles.convert(ass, "ass", 0))
+        end sub
+
+        @it("reads a sidecar file in chunks cut at character ends, multibyte text and a byte order mark included")
+        sub _()
+            path = "tmp:/subtitles-spec.srt"
+            m.assertTrue(WriteAsciiFile(path, m.sample()))
+            whole = playback.subtitles.convert(m.sample(), "srt", 0.5)
+            for each chunk in [32, 33, 34, 35, 36, 37, 38, 40, 4096, playback.subtitles.CHUNK_BYTES]
+                m.assertEqual(playback.subtitles.convertFile(path, "srt", 0.5, chunk), whole, chunk.ToStr())
+            end for
+            m.assertEqual(playback.subtitles.convertFile(path, "srt", 0.5, 16).error, "too_large", "a line longer than a chunk")
+            DeleteFile(path)
+            m.assertEqual(playback.subtitles.convertFile(path, "srt", 0).error, "no_cues", "no file")
+            m.assertEqual(playback.subtitles.convertFile(path, "sup", 0).error, "unsupported_format")
+        end sub
+
+        @it("cuts a chunk before a character it would split, and reads bytes that are not UTF-8 as a whole read does")
+        sub _()
+            bytes = CreateObject("roByteArray")
+            bytes.FromAsciiString("ab" + Chr(&hE9))
+            m.assertEqual(bytes.Count(), 4, "é is two bytes")
+            m.assertEqual(playback.subtitles.wholeCharacters(bytes), 4)
+            bytes.Pop()
+            m.assertEqual(playback.subtitles.wholeCharacters(bytes), 2, "its lead byte waits")
+            bytes.FromHexString("6162E282")
+            m.assertEqual(playback.subtitles.wholeCharacters(bytes), 2, "two bytes of a three-byte character")
+            bytes.FromHexString("6162E282AC")
+            m.assertEqual(playback.subtitles.wholeCharacters(bytes), 5)
+            bytes.FromHexString("80808080")
+            m.assertEqual(playback.subtitles.wholeCharacters(bytes), 4, "no lead byte")
+            ' A Latin-1 file: é is the single byte E9.
+            path = "tmp:/subtitles-spec-latin1.srt"
+            bytes.FromHexString("310A30303A30303A30312C303030202D2D3E2030303A30303A30322C3030300A636166E90A0A")
+            m.assertTrue(bytes.WriteFile(path))
+            whole = playback.subtitles.convert(bytes.ToAsciiString(), "srt", 0)
+            m.assertEqual(whole.cues, 1)
+            for each chunk in [33, 34, 35, 36, 37, 38, 39, 40]
+                m.assertEqual(playback.subtitles.convertFile(path, "srt", 0, chunk), whole, chunk.ToStr())
+            end for
+            DeleteFile(path)
+        end sub
+
+        @describe("times")
+
+        @it("reads SRT, WebVTT, and ASS times, and refuses others")
+        sub _()
+            m.assertEqual(playback.subtitles.parseTime("01:02:03,456"), 3723456)
+            m.assertEqual(playback.subtitles.parseTime("02:03.456"), 123456)
+            m.assertEqual(playback.subtitles.parseTime("1:02:03.4"), 3723400)
+            m.assertEqual(playback.subtitles.parseTime("0:00:07.50"), 7500)
+            m.assertEqual(playback.subtitles.parseTime("00:00:01"), 1000)
+            m.assertEqual(playback.subtitles.parseTime("12.5"), -1)
+            m.assertEqual(playback.subtitles.parseTime("aa:bb,000"), -1)
+            m.assertEqual(playback.subtitles.parseTime("00:01,x"), -1)
+            m.assertEqual(playback.subtitles.srtTime(3723456), "01:02:03,456")
+        end sub
+
+        @it("reads times with one pattern as it read them digit by digit (run 24)")
+        sub _()
+            pattern = playback.subtitles.timePattern()
+            cases = [["100:00:00,5", 360000500], ["1:2", 62000], ["0:00:01.123456", 1123], ["0:00:01.05", 1050], ["1:02:03:04", -1], ["1:02.5,3", -1], ["1:02,5.3", -1], ["1,000:00", -1], ["1:00:00.", -1], [":01:02", -1], ["1:02:03 ", -1], ["-1:02", -1], ["", -1]]
+            for each pair in cases
+                m.assertEqual(playback.subtitles.parseTime(pair[0], pattern), pair[1], pair[0])
+                m.assertEqual(playback.subtitles.parseTime(pair[0]), pair[1], pair[0] + " without a pattern")
+            end for
+            m.assertEqual(playback.subtitles.srtTime(360000500), "100:00:00,500", "hours past 99 keep their digits")
+        end sub
+
+        @it("keeps an ASS event's commas, reads the times wherever Format puts them, and drops events when Text is not last")
+        sub _()
+            moved = m.text(["[Events]", "Format: Start, Layer, End, Text", "Dialogue: 0:00:01.00,0,0:00:02.00,Hello, there, friend"])
+            result = playback.subtitles.convert(moved, "ass", 0)
+            m.assertEqual(result.srt, m.text(["1", "00:00:01,000 --> 00:00:02,000", "Hello, there, friend", ""]))
+            odd = m.text(["[Events]", "Format: Layer, Start, End, Text, Style", "Dialogue: 0,0:00:01.00,0:00:02.00,Hello,Default"])
+            result = playback.subtitles.convert(odd, "ass", 0)
+            m.assertEqual([result.cues, result.dropped, result.error], [0, 1, "no_cues"])
+            leading = m.text(["  [Events]  ", "  Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Indented"])
+            m.assertEqual(playback.subtitles.convert(leading, "ass", 0).srt, m.text(["1", "00:00:01,000 --> 00:00:02,000", "Indented", ""]))
+        end sub
+
+    end class
+
+end namespace

@@ -1,0 +1,291 @@
+import "pkg:/source/api/scheduler.bs"
+
+' API requests as plain AAs, shared by the render-side helper and ApiTask. A
+' request is:
+'   method       "GET" (default), "POST", "PUT", "PATCH", or "DELETE"
+'   path         "/api/v2/...", resolved against the configured base URL, or
+'   url          an absolute http(s) URL, such as a link a response returned
+'   query        { name: value }; arrays repeat the name, invalid is skipped
+'   body         any JSON value, sent as JSON; invalid sends none
+'   bodyText     JSON text sent byte for byte instead of body: a stored
+'                playback body is replayed, never re-serialized (plan section 5)
+'   headers      extra request headers { name: value }; never credential or
+'                client identity headers, which only the account session sets
+'                (isReservedHeader)
+'   lane         "playback", "interactive" (default), or "prefetch"
+'   owner        who to cancel with (api.release); playback ignores it
+'   timeoutMs    deadline from submission (default 15000, 1000 to 120000)
+'   auth         "none" (default), "account", or "profile"
+'   responseHeaders  lowercase header names to return, such as ["etag"]
+'   download     a GET whose body is saved, not parsed: a file extension of
+'                one to five lowercase letters or digits ("srt"); the result's
+'                body is { path, size } (plan section 6.8)
+'   fence        { server, account, profile }: the identity a playback request,
+'                or one with an orderKey, belongs to; it is never sent with
+'                another's credentials
+'   orderKey     requests with the same one go one at a time, in the order
+'                sent, a waiting write giving way to a newer one
+'                (api.router.order); AppScene sets their fence
+'   rotatesCredentials  set by the account session alone on sign-in and
+'                refresh (api.scheduler.ROTATING_CAP_MS)
+'   requestId    assigned by the router
+namespace api.request
+    const DEFAULT_TIMEOUT_MS = 15000
+    const MIN_TIMEOUT_MS = 1000
+    const MAX_TIMEOUT_MS = 120000
+    ' A transfer moving less than a byte a second for this long has stalled
+    ' (stallSeconds).
+    const STALL_SECONDS = 30
+    const METHODS = "|GET|POST|PUT|PATCH|DELETE|"
+    const AUTHS = "|none|account|profile|"
+    ' Headers only the account session (source/auth/coordinator.bs) sets, and
+    ' only on requests to the configured origin (AGENTS.md); X-Silo-* names
+    ' are reserved as a prefix.
+    const RESERVED_HEADERS = "|authorization|proxy-authorization|cookie|x-profile-id|x-profile-token|"
+    ' RFC 3986 unreserved characters, kept as they are by escape().
+    const UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+
+    ' The request with defaults filled in, or invalid when it cannot be sent.
+    ' The input is not changed.
+    function normalize(input as Dynamic) as Dynamic
+        if type(input) <> "roAssociativeArray" or not isString(input.requestId) or input.requestId = "" then return invalid
+        out = {}
+        out.Append(input)
+        out.method = UCase(stringOr(input.method, "GET"))
+        out.lane = stringOr(input.lane, "interactive")
+        out.owner = stringOr(input.owner, "")
+        out.auth = stringOr(input.auth, "none")
+        if Instr(1, METHODS, "|" + out.method + "|") = 0 or not api.scheduler.isLane(out.lane) or Instr(1, AUTHS, "|" + out.auth + "|") = 0 then return invalid
+        if not isInvalid(input.bodyText) and not isString(input.bodyText) then return invalid
+        if not isInvalid(input.download) and (out.method <> "GET" or not isExtension(input.download)) then return invalid
+        if isString(input.url)
+            if not isHttpUrl(input.url) then return invalid
+            out.Delete("path")
+        else if not isString(input.path) or Left(input.path, 1) <> "/" or Left(input.path, 2) = "//"
+            return invalid
+        end if
+        timeout = input.timeoutMs
+        if not isInteger(timeout) then timeout = DEFAULT_TIMEOUT_MS
+        if timeout < MIN_TIMEOUT_MS then timeout = MIN_TIMEOUT_MS
+        if timeout > MAX_TIMEOUT_MS then timeout = MAX_TIMEOUT_MS
+        out.timeoutMs = timeout
+        if type(input.query) <> "roAssociativeArray" then out.query = {}
+        if type(input.headers) = "roAssociativeArray"
+            for each name in input.headers
+                if isReservedHeader(name) then return invalid
+            end for
+        else
+            out.headers = {}
+        end if
+        names = []
+        if type(input.responseHeaders) = "roArray"
+            for each name in input.responseHeaders
+                if isString(name) and name <> "" then names.Push(LCase(name))
+            end for
+        end if
+        out.responseHeaders = names
+        return out
+    end function
+
+    ' The full URL for a normalized request: base + path, or the request's own
+    ' url, then the query. Gives invalid for a path request without a base.
+    function url(base as String, request as Object) as Dynamic
+        if isString(request.url)
+            target = request.url
+        else if base = ""
+            return invalid
+        else
+            target = base + request.path
+        end if
+        query = queryString(request.query)
+        if query = "" then return target
+        if Instr(1, target, "?") > 0 then return target + "&" + query
+        return target + "?" + query
+    end function
+
+    ' "a=1&b=x%20y" from { a: 1, b: "x y" }, names in the AA's order.
+    function queryString(query as Object) as String
+        parts = []
+        for each name in query
+            value = query[name]
+            if type(value) = "roArray"
+                for each item in value
+                    pushParam(parts, name, item)
+                end for
+            else
+                pushParam(parts, name, value)
+            end if
+        end for
+        return parts.Join("&")
+    end function
+
+    ' Percent-encodes a string's UTF-8 bytes, keeping only unreserved characters.
+    function escape(text as String) as String
+        bytes = CreateObject("roByteArray")
+        bytes.FromAsciiString(text)
+        hex = bytes.ToHexString()
+        out = ""
+        for i = 0 to bytes.Count() - 1
+            c = bytes[i]
+            if c < 128 and Instr(1, UNRESERVED, Chr(c)) > 0
+                out = out + Chr(c)
+            else
+                out = out + "%" + Mid(hex, i * 2 + 1, 2)
+            end if
+        end for
+        return out
+    end function
+
+    ' Whether header name, in any letter case, is one only the account session
+    ' sets: a credential header, or a client identity header (X-Silo-*), which
+    ' carries the device ID.
+    function isReservedHeader(name as String) as Boolean
+        lower = LCase(name.Trim())
+        return Instr(1, RESERVED_HEADERS, "|" + lower + "|") > 0 or Left(lower, 7) = "x-silo-"
+    end function
+
+    ' How ApiTask moves a request's body and response (plan section 4.8):
+    '   "download" a GET whose response is saved to a file that is kept
+    '   "file"    a GET whose response goes to a file, checked before it is read
+    '   "upload"  another method: the body, possibly empty, goes from a file and
+    '             the response to a file
+    '   "memory"  a body holding the password, a PIN, or a refresh token, which
+    '             never goes to a file; the response arrives as a string and is
+    '             checked after download
+    function transport(request as Object, secretBody as Boolean) as String
+        if request.method = "GET" and isString(request.download) then return "download"
+        if request.method = "GET" then return "file"
+        if secretBody then return "memory"
+        return "upload"
+    end function
+
+    ' How long a transfer may move less than a byte a second before it fails
+    ' as a timeout: STALL_SECONDS, or the request's whole allowance when that
+    ' is longer, so a sidecar the server is still extracting (assumption A-15)
+    ' or a late credential-rotating answer is not cut off before its deadline.
+    function stallSeconds(request as Object) as Integer
+        allowance = request.timeoutMs
+        rotates = request.rotatesCredentials
+        if (type(rotates) = "Boolean" or type(rotates) = "roBoolean") and rotates then allowance = api.scheduler.ROTATING_CAP_MS
+        if allowance \ 1000 > STALL_SECONDS then return allowance \ 1000
+        return STALL_SECONDS
+    end function
+
+    ' The headers sent for a request: Accept, Content-Type when it has a body, the
+    ' request's own headers, then the credential headers, which win.
+    function headers(request as Object, credentials as Object) as Object
+        out = { "Accept": "application/json" }
+        if hasBody(request) then out["Content-Type"] = "application/json"
+        out.Append(request.headers)
+        out.Append(credentials)
+        return out
+    end function
+
+    function hasBody(request as Object) as Boolean
+        return isString(request.bodyText) or (request.DoesExist("body") and not isInvalid(request.body))
+    end function
+
+    ' The JSON text sent as the body: bodyText as it is, else body serialized;
+    ' "" for none (DELETE and bodiless POSTs).
+    function bodyText(request as Object) as String
+        if isString(request.bodyText) then return request.bodyText
+        if not hasBody(request) then return ""
+        return FormatJson(request.body)
+    end function
+
+    ' A typed server address as a base URL: an http or https URL without
+    ' credentials, query, or fragment; the scheme and host lowercased, a default
+    ' port and trailing slashes removed. Gives invalid for anything else (spec
+    ' section 7.1).
+    function baseUrl(text as Dynamic) as Dynamic
+        if not isString(text) then return invalid
+        s = text.Trim()
+        if not isHttpUrl(s) or Instr(1, s, "?") > 0 or Instr(1, s, "#") > 0 then return invalid
+        origin = originOf(s)
+        if origin = invalid then return invalid
+        path = Mid(s, Instr(1, s, "://") + 3)
+        slash = Instr(1, path, "/")
+        if slash = 0 then return origin
+        path = Mid(path, slash)
+        while Right(path, 1) = "/"
+            path = Left(path, Len(path) - 1)
+        end while
+        return origin + path
+    end function
+
+    ' "scheme://host[:port]" of an http(s) URL, lowercased, without a default
+    ' port. Gives invalid for other URLs and for URLs carrying credentials.
+    function originOf(target as Dynamic) as Dynamic
+        if not isHttpUrl(target) then return invalid
+        sep = Instr(1, target, "://")
+        scheme = LCase(Left(target, sep - 1))
+        authority = Mid(target, sep + 3)
+        for each mark in ["/", "?", "#"]
+            cut = Instr(1, authority, mark)
+            if cut > 0 then authority = Left(authority, cut - 1)
+        end for
+        authority = LCase(authority)
+        if authority = "" or Instr(1, authority, "@") > 0 then return invalid
+        if scheme = "http" and Right(authority, 3) = ":80" then authority = Left(authority, Len(authority) - 3)
+        if scheme = "https" and Right(authority, 4) = ":443" then authority = Left(authority, Len(authority) - 4)
+        return scheme + "://" + authority
+    end function
+
+    ' Credentials go only to the configured server's origin (AGENTS.md).
+    function isSameOrigin(target as String, base as String) as Boolean
+        origin = originOf(target)
+        return origin <> invalid and origin = originOf(base)
+    end function
+
+    ' A download's file extension: one to five lowercase letters or digits.
+    function isExtension(value as Dynamic) as Boolean
+        if not isString(value) or Len(value) < 1 or Len(value) > 5 then return false
+        for i = 1 to Len(value)
+            if Instr(1, "abcdefghijklmnopqrstuvwxyz0123456789", Mid(value, i, 1)) = 0 then return false
+        end for
+        return true
+    end function
+
+    function isHttpUrl(value as Dynamic) as Boolean
+        if not isString(value) then return false
+        lower = LCase(value)
+        return (Left(lower, 7) = "http://" and Len(lower) > 7) or (Left(lower, 8) = "https://" and Len(lower) > 8)
+    end function
+
+    sub pushParam(parts as Object, name as String, value as Dynamic)
+        if isInvalid(value) then return
+        t = type(value)
+        if t = "Boolean" or t = "roBoolean"
+            text = "false"
+            if value then text = "true"
+        else if isString(value)
+            text = value
+        else if isInteger(value) or t = "Float" or t = "roFloat" or t = "Double" or t = "roDouble"
+            text = value.ToStr()
+        else
+            return
+        end if
+        parts.Push(escape(name) + "=" + escape(text))
+    end sub
+
+    function stringOr(value as Dynamic, fallback as String) as String
+        if isString(value) and value <> "" then return value
+        return fallback
+    end function
+
+    function isString(value as Dynamic) as Boolean
+        t = type(value)
+        return t = "String" or t = "roString"
+    end function
+
+    function isInteger(value as Dynamic) as Boolean
+        t = type(value)
+        return t = "Integer" or t = "roInt" or t = "roInteger" or t = "LongInteger" or t = "roLongInteger"
+    end function
+
+    ' brs-node reports "roInvalid" for invalid passed as an argument.
+    function isInvalid(value as Dynamic) as Boolean
+        t = type(value)
+        return t = "Invalid" or t = "roInvalid"
+    end function
+end namespace

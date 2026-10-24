@@ -1,0 +1,478 @@
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' Sidecar subtitles for the Video node (plan section 6.8): MediaTask reads a
+' downloaded SRT, WebVTT, or ASS file, moves its cues onto the player clock,
+' and writes SRT, which Roku plays from tmp:/. Sidecars carry absolute
+' source times, so a plan that starts at timeline offset t needs every cue
+' moved t seconds earlier: cues that end before the new origin are dropped
+' and one that spans it is clipped at zero. WebVTT is shifted by the server
+' (timestamp_offset), so it is converted with no shift. Styling is dropped:
+' Roku applies the viewer's caption style. Text in and out, read whole
+' (convert) or fed in pieces (newReader, feed, finish); convertFile reads
+' a file CHUNK_BYTES at a time, so a sidecar up to
+' api.response.MAX_SIDECAR_BYTES never sits whole in memory: only the cues
+' it keeps, at most MAX_CUES. An ASS file's drawings and other events
+' without text are dropped as they are read, and the events a typeset sign
+' repeats per frame or layer keep one cue, so its typesetting costs no
+' cues (assumption AG-214).
+namespace playback.subtitles
+    ' Plan section 4.8: a track holds at most this many cues.
+    const MAX_CUES = 20000
+    ' How much of a sidecar file convertFile holds at once, as bytes and as
+    ' text; a line longer than this fails the file as too_large, but for an
+    ' ASS line, which is skipped (feed).
+    const CHUNK_BYTES = 262144
+    ' An ASS event joins one of the last MERGE_WINDOW cues kept with its
+    ' text, starting within MERGE_GAP_MS of that cue's end (addAssCue).
+    const MERGE_WINDOW = 8
+    const MERGE_GAP_MS = 50
+    ' ASS Dialogue fields when the file gives no Format line.
+    const ASS_FIELDS = "layer,start,end,style,name,marginl,marginr,marginv,effect,text"
+
+    ' The SRT text for a sidecar, as { srt, cues, dropped, merged, error }:
+    ' cues the cues it holds; dropped the ASS Dialogue events with nothing
+    ' to show as text and merged those that joined a cue of the same text
+    ' (0 for SRT and WebVTT); error is invalid, "unsupported_format",
+    ' "no_cues", "too_many_cues", or, from convertFile only, "too_large".
+    ' format is the artifact's: "srt", "vtt", or "ass" ("ssa" too);
+    ' shiftSeconds moves every cue that much earlier.
+    function convert(text as String, format as String, shiftSeconds as Dynamic) as Object
+        reader = newReader(format)
+        feed(reader, text)
+        return finish(reader, shiftSeconds)
+    end function
+
+    ' The sidecar file at path, converted as convert does, read chunkBytes
+    ' at a time (roByteArray.ReadFile with an offset), each piece cut back
+    ' to the end of its last whole character so none is split. A line
+    ' longer than a chunk fails the file as too_large, but in ASS, where
+    ' only a drawing's vector commands run that long, it is skipped and
+    ' counted dropped (feed). A missing file has no cues. Development
+    ' builds log the file's size and what the conversion kept.
+    function convertFile(path as String, format as String, shiftSeconds as Dynamic, chunkBytes = CHUNK_BYTES as Integer) as Object
+        reader = newReader(format)
+        reader.lineLimit = chunkBytes
+        info = CreateObject("roFileSystem").Stat(path)
+        size = 0
+        if type(info) = "roAssociativeArray" and util.isNumber(info.size) then size = info.size
+        bytes = CreateObject("roByteArray")
+        at = 0
+        while at < size and reader.error = invalid
+            if not bytes.ReadFile(path, at, chunkBytes) or bytes.Count() = 0 then exit while
+            whole = bytes.Count()
+            if at + whole < size then whole = wholeCharacters(bytes)
+            if whole < bytes.Count() and not bytes.ReadFile(path, at, whole) then exit while
+            at = at + whole
+            feed(reader, bytes.ToAsciiString())
+        end while
+        result = finish(reader, shiftSeconds)
+        log.debug("media", "subtitle converted", { format: reader.kind, size: size, cues: result.cues, dropped: result.dropped, merged: result.merged, error: result.error })
+        return result
+    end function
+
+    ' How many of bytes' bytes end on a whole UTF-8 character: all of them
+    ' unless they end inside a sequence, whose lead byte and continuation
+    ' bytes then wait for the next piece. Reads at most the last four
+    ' bytes. Bytes that are not UTF-8 (a Latin-1 file's) read as they would
+    ' whole, one replacement character each.
+    function wholeCharacters(bytes as Object) as Integer
+        count = bytes.Count()
+        lead = count - 1
+        while lead >= 0 and lead >= count - 4 and bytes[lead] >= &h80 and bytes[lead] < &hC0
+            lead = lead - 1
+        end while
+        if lead < 0 or lead < count - 4 then return count
+        first = bytes[lead]
+        length = 1
+        if first >= &hF0 and first < &hF8
+            length = 4
+        else if first >= &hE0
+            length = 3
+        else if first >= &hC0
+            length = 2
+        end if
+        if lead > 0 and count - lead < length then return lead
+        return count
+    end function
+
+    ' A conversion fed nothing yet. SRT and WebVTT are read in blocks: a
+    ' timing line ("00:00:01,000 --> 00:00:04,000") and the text lines
+    ' after it up to a blank line; numbers and blank lines between blocks
+    ' are skipped, and so are WebVTT's NOTE, STYLE, and REGION blocks. ASS
+    ' is read from the Dialogue lines of its [Events] section, through its
+    ' Format line.
+    function newReader(format as String) as Object
+        kind = LCase(format)
+        if kind = "ssa" then kind = "ass"
+        ' pending: the text after the last line feed fed; lineLimit: the
+        ' longest line kept (0 for any), and overlong whether the rest of a
+        ' longer one is being skipped (feed). The patterns are made once a
+        ' file: a sidecar can hold thousands of cues.
+        reader = { kind: kind, error: invalid, cues: [], dropped: 0, merged: 0, started: false, pending: "", lineLimit: 0, overlong: false, block: invalid, skipping: false, inEvents: false, fields: [], startField: -1, endField: -1, time: timePattern(), tags: invalid, drawing: invalid, scale: invalid, overrides: invalid, breaks: invalid }
+        setFields(reader, ASS_FIELDS.Split(","))
+        if kind = "srt"
+            reader.tags = CreateObject("roRegex", "\{\\[^}]*\}", "")
+        else if kind = "vtt"
+            reader.tags = CreateObject("roRegex", "<(?!/?[biu]>)[^>]*>", "i")
+        else if kind = "ass"
+            reader.drawing = CreateObject("roRegex", "\{[^}]*\\p[1-9]", "")
+            reader.scale = CreateObject("roRegex", "\\p([0-9]+)", "")
+            reader.overrides = CreateObject("roRegex", "\{[^}]*\}", "")
+            reader.breaks = CreateObject("roRegex", "\\[Nn]", "")
+        else
+            reader.error = "unsupported_format"
+        end if
+        return reader
+    end function
+
+    ' The next piece of the text, cut anywhere but inside a character: each
+    ' line is read once its line feed comes, and the text after the
+    ' piece's last one waits for the next piece or finish (pending). The
+    ' first piece may open with a byte order mark; carriage returns are
+    ' dropped. With a lineLimit, a line longer than that is not kept: in
+    ' ASS it is skipped to its end and counted dropped, and anything else
+    ' fails too_large.
+    sub feed(reader as Object, text as String)
+        if reader.error <> invalid or text = "" then return
+        body = text
+        if not reader.started
+            reader.started = true
+            if Left(body, 1) = Chr(&hFEFF) then body = Mid(body, 2)
+        end if
+        if Instr(1, body, Chr(13)) > 0 then body = body.Replace(Chr(13), "")
+        rows = body.Split(Chr(10))
+        if rows.Count() = 0 then return
+        tail = rows.Pop()
+        if rows.Count() > 0
+            head = reader.pending + rows.Shift()
+            reader.pending = tail
+            if reader.overlong
+                reader.overlong = false
+            else
+                readLine(reader, head)
+            end if
+            for each row in rows
+                if reader.error <> invalid then return
+                readLine(reader, row)
+            end for
+        else if not reader.overlong
+            reader.pending = reader.pending + tail
+        end if
+        if reader.lineLimit > 0 and Len(reader.pending) > reader.lineLimit
+            reader.pending = ""
+            if reader.kind = "ass"
+                reader.overlong = true
+                reader.dropped = reader.dropped + 1
+            else
+                reader.error = "too_large"
+            end if
+        end if
+    end sub
+
+    sub readLine(reader as Object, row as String)
+        if reader.kind = "ass"
+            assRow(reader, row)
+        else
+            blockRow(reader, row)
+        end if
+    end sub
+
+    ' The conversion's result (convert's), once the text has all been fed.
+    ' ASS cues come out in time order.
+    function finish(reader as Object, shiftSeconds as Dynamic) as Object
+        if reader.error = invalid and reader.pending <> "" then readLine(reader, reader.pending)
+        reader.pending = ""
+        if reader.error = invalid and reader.block <> invalid then endBlock(reader)
+        result = { srt: "", cues: 0, dropped: reader.dropped, merged: reader.merged, error: reader.error }
+        if reader.error <> invalid then return result
+        cues = reader.cues
+        if reader.kind = "ass" then cues.SortBy("start")
+        shifted = shift(cues, shiftSeconds)
+        if shifted.Count() = 0
+            result.error = "no_cues"
+        else
+            result.srt = toSrt(shifted)
+            result.cues = shifted.Count()
+        end if
+        return result
+    end function
+
+    ' One SRT or WebVTT line. WebVTT cue settings after the end time are
+    ' dropped, and tags other than <b>, <i>, and <u> are removed (vttText);
+    ' SRT cue text loses its ASS override blocks (srtText).
+    sub blockRow(reader as Object, row as String)
+        if reader.block <> invalid
+            if row.Trim() = ""
+                endBlock(reader)
+            else
+                reader.block.body.Push(row)
+            end if
+        else if reader.skipping
+            reader.skipping = row.Trim() <> ""
+        else if Instr(1, row, "-->") > 0
+            reader.block = { timing: parseTiming(row, reader.time), body: [] }
+        else if reader.kind = "vtt" and (Left(row, 4) = "NOTE" or Left(row, 5) = "STYLE" or Left(row, 6) = "REGION")
+            reader.skipping = true
+        end if
+    end sub
+
+    sub endBlock(reader as Object)
+        block = reader.block
+        reader.block = invalid
+        if block.timing = invalid or block.body.Count() = 0 then return
+        cueText = block.body.Join(Chr(10))
+        if reader.kind = "vtt"
+            cueText = vttText(cueText, reader.tags)
+        else
+            cueText = srtText(cueText, reader.tags)
+        end if
+        if cueText.Trim() <> "" then addCue(reader, { start: block.timing.start, finish: block.timing.finish, text: cueText })
+    end sub
+
+    ' Keeps a cue, or fails the conversion past MAX_CUES and lets its cues go.
+    sub addCue(reader as Object, cue as Object)
+        if reader.cues.Count() >= MAX_CUES
+            reader.error = "too_many_cues"
+            reader.cues = []
+            return
+        end if
+        reader.cues.Push(cue)
+    end sub
+
+    ' { start, finish } from "start --> end [settings]", or invalid. pattern
+    ' is timePattern's.
+    function parseTiming(row as String, pattern as Object) as Dynamic
+        arrow = Instr(1, row, "-->")
+        first = parseTime(Left(row, arrow - 1).Trim(), pattern)
+        rest = Mid(row, arrow + 3).Trim()
+        space = Instr(1, rest, " ")
+        if space > 0 then rest = Left(rest, space - 1)
+        last = parseTime(rest, pattern)
+        if first < 0 or last < 0 or last < first then return invalid
+        return { start: first, finish: last }
+    end function
+
+    ' The times parseTime reads: two or three groups of digits split by
+    ' colons, then a fraction after a comma or a full stop. A reader makes
+    ' it once: matching it costs a tenth of checking each digit, and a
+    ' sidecar has two times per cue (8,723 cues in each of file A's SRTs).
+    function timePattern() as Object
+        return CreateObject("roRegex", "^([0-9]+):([0-9]+)(?::([0-9]+))?(?:[,.]([0-9]+))?$", "")
+    end function
+
+    ' Milliseconds from "h:mm:ss,mmm", "h:mm:ss.mmm", "mm:ss.mmm" (WebVTT), or
+    ' "h:mm:ss.cc" (ASS centiseconds); -1 when it is not a time. Of a
+    ' fraction, the first three digits count. pattern is timePattern's.
+    function parseTime(value as String, pattern = invalid as Dynamic) as Integer
+        if pattern = invalid then pattern = timePattern()
+        parts = pattern.Match(value)
+        if parts.Count() < 3 then return -1
+        seconds = parts[1].ToInt() * 60 + parts[2].ToInt()
+        third = util.text(parts[3])
+        if third <> "" then seconds = seconds * 60 + third.ToInt()
+        fraction = 0
+        digits = Left(util.text(parts[4]), 3)
+        if digits <> ""
+            fraction = digits.ToInt()
+            for i = Len(digits) to 2
+                fraction = fraction * 10
+            end for
+        end if
+        return seconds * 1000 + fraction
+    end function
+
+    ' One ASS or SSA line: section headers, the [Events] section's Format
+    ' line, and its Dialogue lines, each a cue of its text (assText) or,
+    ' with none, dropped. A typeset track is mostly long Dialogue lines
+    ' (file A's: 9,047 events in 10.24 MiB), so a line is copied only when
+    ' it starts with a space.
+    sub assRow(reader as Object, row as String)
+        lead = Left(row, 1)
+        if lead = " " or lead = Chr(9)
+            row = row.Trim()
+            lead = Left(row, 1)
+        end if
+        if lead = "["
+            reader.inEvents = LCase(row.Trim()) = "[events]"
+            return
+        end if
+        if not reader.inEvents then return
+        head = LCase(Left(row, 9))
+        if head = "dialogue:"
+            cue = assCue(row, 10, reader)
+            if cue = invalid
+                reader.dropped = reader.dropped + 1
+            else
+                addAssCue(reader, cue)
+            end if
+        else if Left(head, 7) = "format:"
+            fields = []
+            for each name in Mid(row, 8).Split(",")
+                fields.Push(LCase(name.Trim()))
+            end for
+            setFields(reader, fields)
+        end if
+    end sub
+
+    ' The Dialogue fields, in order, and where the times are among them.
+    sub setFields(reader as Object, fields as Object)
+        reader.fields = fields
+        reader.startField = -1
+        reader.endField = -1
+        for i = 0 to fields.Count() - 1
+            if fields[i] = "start" then reader.startField = i
+            if fields[i] = "end" then reader.endField = i
+        end for
+    end sub
+
+    ' Keeps an ASS cue, or lengthens one of the last MERGE_WINDOW kept that
+    ' has its text and whose time it overlaps or follows within
+    ' MERGE_GAP_MS. A sign tracked frame by frame, or drawn in layers (an
+    ' outline under its fill), is an event per frame or layer with the
+    ' same text once its tags are gone: as text it is one cue, and stacked
+    ' copies would show it twice.
+    sub addAssCue(reader as Object, cue as Object)
+        cues = reader.cues
+        last = cues.Count() - 1
+        first = last - MERGE_WINDOW + 1
+        if first < 0 then first = 0
+        for i = last to first step -1
+            kept = cues[i]
+            if kept.text = cue.text and cue.start <= kept.finish + MERGE_GAP_MS and cue.finish + MERGE_GAP_MS >= kept.start
+                if cue.start < kept.start then kept.start = cue.start
+                if cue.finish > kept.finish then kept.finish = cue.finish
+                reader.merged = reader.merged + 1
+                return
+            end if
+        end for
+        addCue(reader, cue)
+    end sub
+
+    ' The cue of the Dialogue line whose fields start at from, or invalid.
+    ' The text field, the last, takes the rest of the line, commas
+    ' included; of the others only the times are read, once the event has
+    ' text, so neither the line is copied field by field nor the times of
+    ' the drawings and tags-only events most of a typeset track is are
+    ' parsed.
+    function assCue(line as String, from as Integer, reader as Object) as Dynamic
+        last = reader.fields.Count() - 1
+        if reader.startField < 0 or reader.endField < 0 or reader.fields[last] <> "text" then return invalid
+        startText = ""
+        endText = ""
+        at = from
+        for i = 0 to last - 1
+            comma = Instr(at, line, ",")
+            if comma = 0 then return invalid
+            if i = reader.startField then startText = Mid(line, at, comma - at)
+            if i = reader.endField then endText = Mid(line, at, comma - at)
+            at = comma + 1
+        end for
+        cueText = assText(Mid(line, at), reader)
+        if cueText = "" then return invalid
+        first = parseTime(startText.Trim(), reader.time)
+        ending = parseTime(endText.Trim(), reader.time)
+        if first < 0 or ending < first then return invalid
+        return { start: first, finish: ending, text: cueText }
+    end function
+
+    ' An event's text as plain text: override blocks ({\...}) go, and so
+    ' does what a drawing draws (from \p1 or higher to \p0), which is
+    ' vector commands, not text; \N and \n break lines and \h is a space.
+    ' An unclosed block is text.
+    function assText(raw as String, reader as Object) as String
+        if Instr(1, raw, "{") = 0
+            text = raw
+        else if Instr(1, raw, "\p") = 0 or not reader.drawing.IsMatch(raw)
+            text = reader.overrides.ReplaceAll(raw, "")
+        else
+            text = ""
+            drawing = false
+            at = 1
+            while at <= Len(raw)
+                open = Instr(at, raw, "{")
+                close = 0
+                if open > 0 then close = Instr(open, raw, "}")
+                if close = 0
+                    if not drawing then text = text + Mid(raw, at)
+                    exit while
+                end if
+                if not drawing then text = text + Mid(raw, at, open - at)
+                for each scale in reader.scale.MatchAll(Mid(raw, open, close - open + 1))
+                    drawing = scale[1].ToInt() > 0
+                end for
+                at = close + 1
+            end while
+        end if
+        if Instr(1, text, "\") > 0 then text = reader.breaks.ReplaceAll(text, Chr(10)).Replace("\h", " ")
+        return text.Trim()
+    end function
+
+    ' SRT cue text without the ASS override blocks ({\an8}, {\i1}) many SRT
+    ' files carry, which Roku prints as text (hardware run 16) and whose
+    ' placement its SRT cannot follow; FFmpeg and the server's WebVTT
+    ' conversion drop them too, but the original SRT the server serves under
+    ' subrip_sidecar_v1 keeps them. A line left empty goes, and an unclosed
+    ' block is text. pattern is the SRT reader's (newReader).
+    function srtText(value as String, pattern as Object) as String
+        if Instr(1, value, "{\") = 0 then return value
+        rows = []
+        for each row in value.Split(Chr(10))
+            cleaned = pattern.ReplaceAll(row, "")
+            if cleaned.Trim() <> "" then rows.Push(cleaned)
+        end for
+        return rows.Join(Chr(10))
+    end function
+
+    ' WebVTT cue text as SRT text: <b>, <i>, and <u> stay; other tags (voice,
+    ' class, ruby, timestamps) go; the common entities are decoded. pattern
+    ' is the WebVTT reader's (newReader).
+    function vttText(value as String, pattern as Object) as String
+        out = value
+        if Instr(1, value, "<") > 0 then out = pattern.ReplaceAll(value, "")
+        out = out.Replace("&lt;", "<").Replace("&gt;", ">").Replace("&nbsp;", " ").Replace("&lrm;", "").Replace("&rlm;", "")
+        return out.Replace("&amp;", "&")
+    end function
+
+    ' Cues moved shiftSeconds earlier, in place, so a large track is not
+    ' copied: those ending at or before zero go and one that starts before
+    ' zero starts at zero.
+    function shift(cues as Object, shiftSeconds as Dynamic) as Object
+        delta = 0
+        if util.isNumber(shiftSeconds) then delta = Int(shiftSeconds * 1000 + 0.5)
+        out = []
+        for each cue in cues
+            cue.start = cue.start - delta
+            cue.finish = cue.finish - delta
+            if cue.finish > 0
+                if cue.start < 0 then cue.start = 0
+                out.Push(cue)
+            end if
+        end for
+        return out
+    end function
+
+    function toSrt(cues as Object) as String
+        blocks = []
+        for i = 0 to cues.Count() - 1
+            cue = cues[i]
+            blocks.Push((i + 1).ToStr() + Chr(10) + srtTime(cue.start) + " --> " + srtTime(cue.finish) + Chr(10) + cue.text + Chr(10))
+        end for
+        return blocks.Join(Chr(10))
+    end function
+
+    ' "hh:mm:ss,mmm".
+    function srtTime(ms as Integer) as String
+        hours = ms \ 3600000
+        minutes = (ms mod 3600000) \ 60000
+        seconds = (ms mod 60000) \ 1000
+        millis = ms mod 1000
+        return pad(hours, 2) + ":" + pad(minutes, 2) + ":" + pad(seconds, 2) + "," + pad(millis, 3)
+    end function
+
+    function pad(value as Integer, width as Integer) as String
+        text = value.ToStr()
+        if Len(text) >= width then return text
+        return Right("000" + text, width)
+    end function
+end namespace

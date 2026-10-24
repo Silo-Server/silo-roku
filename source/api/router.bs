@@ -1,0 +1,167 @@
+import "pkg:/source/util/values.bs"
+
+' The render-thread end of the request path (plan section 4.2). AppScene owns one
+' router: it maps request IDs to the RequestHandle nodes waiting for them, by
+' owner, and hands each result ApiTask sends to its handle. A result whose handle
+' was released finds nothing and is dropped. Until ApiTask is ready, the router
+' also keeps AppScene's sets of ApiTask fields, in order.
+'
+' Requests with one orderKey (source/api/request.bs) stand in a line: ApiTask
+' gets them one at a time, in the order they were sent, each once the one
+' before it has its result, so the server applies them in that order
+' whichever screen sent them and whether or not it is still there
+' (assumption AG-286). A write (any method but GET) waiting last in its
+' line gives way to a newer write, which leaves the server as the two would.
+namespace api.router
+    function create() as Object
+        return { entries: {}, owners: {}, nextId: 0, ready: false, backlog: [], lines: {}, lineOf: {} }
+    end function
+
+    ' Whether AppScene may set ApiTask's field now. A field set before ApiTask
+    ' observes its fields would be lost, so until taskReady() the set is kept.
+    function admit(router as Object, field as String, value as Object) as Boolean
+        if router.ready then return true
+        router.backlog.Push({ field: field, value: value })
+        return false
+    end function
+
+    ' ApiTask has published its first session, which it does once its fields
+    ' are observed. Gives the kept field sets, in the order they were made, to
+    ' set now; later calls give none.
+    function taskReady(router as Object) as Object
+        router.ready = true
+        kept = router.backlog
+        router.backlog = []
+        return kept
+    end function
+
+    ' Registers handle under a new request ID, which it returns, and its owner.
+    function register(router as Object, owner as String, handle as Object) as String
+        router.nextId = router.nextId + 1
+        id = "r" + router.nextId.ToStr()
+        router.entries[id] = { owner: owner, handle: handle }
+        ids = router.owners[owner]
+        if ids = invalid
+            ids = {}
+            router.owners[owner] = ids
+        end if
+        ids[id] = true
+        return id
+    end function
+
+    ' Unregisters and returns the handle waiting for requestId, or invalid when
+    ' there is none.
+    function take(router as Object, requestId as String) as Dynamic
+        entry = router.entries[requestId]
+        if entry = invalid then return invalid
+        router.entries.Delete(requestId)
+        ids = router.owners[entry.owner]
+        ids.Delete(requestId)
+        if ids.IsEmpty() then router.owners.Delete(entry.owner)
+        return entry.handle
+    end function
+
+    ' Unregisters every handle of owner, giving how many there were. Its
+    ' requests still waiting in a line leave it unsent.
+    function release(router as Object, owner as String) as Integer
+        ids = router.owners[owner]
+        if ids = invalid then return 0
+        router.owners.Delete(owner)
+        for each id in ids
+            router.entries.Delete(id)
+            withdraw(router, id)
+        end for
+        return ids.Count()
+    end function
+
+    ' --- Lines (orderKey) ------------------------------------------------------
+
+    function isOrdered(request as Object) as Boolean
+        return util.isString(request.orderKey) and request.orderKey <> ""
+    end function
+
+    ' Puts request, with its request ID, in its line, as { send, superseded }:
+    ' send is true when it goes to ApiTask now, and false while the one before
+    ' it has no result; superseded is the waiting write it replaced, which
+    ' never goes, or invalid. A request without an orderKey always goes now.
+    function order(router as Object, request as Object) as Object
+        out = { send: true, superseded: invalid }
+        if not isOrdered(request) then return out
+        key = request.orderKey
+        router.lineOf[request.requestId] = key
+        line = router.lines[key]
+        if line = invalid
+            router.lines[key] = { running: request.requestId, waiting: [] }
+            return out
+        end if
+        out.send = false
+        last = line.waiting.Peek()
+        if last <> invalid and isWrite(last) and isWrite(request)
+            line.waiting.Pop()
+            router.lineOf.Delete(last.requestId)
+            out.superseded = last
+        end if
+        line.waiting.Push(request)
+        return out
+    end function
+
+    ' requestId has its result: the next request in its line, to send now, or
+    ' invalid.
+    function advance(router as Object, requestId as String) as Dynamic
+        key = router.lineOf[requestId]
+        if key = invalid then return invalid
+        line = router.lines[key]
+        if line.running <> requestId then return invalid
+        router.lineOf.Delete(requestId)
+        following = line.waiting.Shift()
+        if following = invalid
+            router.lines.Delete(key)
+            return invalid
+        end if
+        line.running = following.requestId
+        return following
+    end function
+
+    ' Takes requestId out of its line while it waits there: true then, as
+    ' ApiTask never had it. One already sent ends with its result (advance).
+    function withdraw(router as Object, requestId as String) as Boolean
+        key = router.lineOf[requestId]
+        if key = invalid then return false
+        waiting = router.lines[key].waiting
+        for at = 0 to waiting.Count() - 1
+            if waiting[at].requestId = requestId
+                waiting.Delete(at)
+                router.lineOf.Delete(requestId)
+                return true
+            end if
+        end for
+        return false
+    end function
+
+    function isWrite(request as Object) as Boolean
+        return util.isString(request.method) and UCase(request.method) <> "GET"
+    end function
+
+    function pending(router as Object) as Integer
+        return router.entries.Count()
+    end function
+
+    ' Moves result onto handle (render thread): a node tree in result.content
+    ' goes to handle.content, the envelope is stored by setRef without a copy or
+    ' a notification, and then setting status ("ok" or "error") notifies the
+    ' handle's observer.
+    sub deliver(handle as Object, result as Object)
+        content = result.content
+        if content <> invalid
+            result.Delete("content")
+            handle.content = content
+        end if
+        ' setRef works only on the render thread (Roku OS 15.0+).
+        if not handle.setRef("result", result) then handle.result = result
+        if result.ok = true
+            handle.status = "ok"
+        else
+            handle.status = "error"
+        end if
+    end sub
+end namespace
