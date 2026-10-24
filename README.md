@@ -54,6 +54,27 @@ and are stored only in a temporary, private curl configuration during upload.
 
 Sideloaded builds are for development only; they are not release evidence.
 
+### Remote control
+
+`npm run roku -- <command>` drives the device over ECP, using the same `.env` and
+`ROKU_DEPLOY_VIA` relay as sideloading. ECP network access must be set to
+Permissive (Settings > System > Advanced system settings > Control by mobile
+apps) for keypresses and launches.
+
+```sh
+npm run roku -- key Home            # press keys in order: Up Down Left Right Select Back
+                                    # Home Play Rev Fwd Info InstantReplay ...
+npm run roku -- text "the matrix"   # type into the focused text field
+npm run roku -- launch              # relaunch the dev app (optional: app id, key=value params)
+npm run roku -- active              # print the foreground app
+npm run roku -- query device-info   # any /query/<path> ECP endpoint
+npm run roku -- screenshot shot.jpg # capture the screen (dev app only)
+```
+
+If an install keeps reporting "Install timeout" and the dev app never appears in
+`query apps`, the device's installer can get stuck; a software restart may not
+clear it. Unplug the device for 60 seconds, then sideload again.
+
 ## License and trademarks
 
 The implementation is intended to use `AGPL-3.0-or-later`, matching the other

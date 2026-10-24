@@ -46,6 +46,15 @@ wire behavior, platform floor, or certification plan.
 - Never log access tokens, refresh tokens, profile tokens, device-login codes,
   signed stream URLs, credentials, or server responses that contain them.
 
+## Development workflow
+
+- The README's Development section is the procedure for building, sideloading,
+  the debug console, and remote control (`npm run roku`). Device address,
+  password, and relay come from the gitignored `.env`; see `.env.example`.
+- Run `npm run lint` before committing. After `npm run sideload`, confirm the
+  change on the device with `npm run roku -- screenshot` or the console; the
+  sideload script's success means installed and active, not visually correct.
+
 ## Repository hygiene
 
 - Do not commit packaged channels, signing keys, developer-device credentials,
