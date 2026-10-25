@@ -1,0 +1,135 @@
+namespace tests
+
+    @suite("silocontrol policy")
+    class SiloControlPolicyTests extends rooibos.BaseTestSuite
+
+        function controller(id as String, seq as Integer, fields = {} as Object) as Object
+            out = { id: id, seq: seq, didHello: true, authorized: true, handingOff: false, passive: false, deviceId: id }
+            out.Append(fields)
+            return out
+        end function
+
+        @describe("peers")
+
+        @it("accepts private, link-local, and loopback IPv4 peers only")
+        sub _()
+            for each address in ["10.20.30.50:-5000", "192.168.1.20", "172.16.0.1:52817", "172.31.255.255", "169.254.3.4", "127.0.0.1"]
+                m.assertTrue(silocontrol.policy.isLocalPeer(address), address)
+            end for
+            for each address in ["8.8.8.8", "172.32.0.1", "192.169.0.1", "fe80::1", "10.0.0", "10.0.0.256", "", "a.b.c.d"]
+                m.assertFalse(silocontrol.policy.isLocalPeer(address), address)
+            end for
+            m.assertFalse(silocontrol.policy.isLocalPeer(invalid))
+        end sub
+
+        @describe("admission")
+
+        @it("admits below the limit")
+        sub _()
+            m.assertEqual(silocontrol.policy.admission([m.controller("a", 1), m.controller("b", 2)]), "admit")
+        end sub
+
+        @it("evicts a silent one first, then an unauthorized one, then the oldest passive one")
+        sub _()
+            full = [m.controller("a", 1), m.controller("b", 2, { passive: true }), m.controller("c", 3, { authorized: false }), m.controller("d", 4, { didHello: false })]
+            m.assertEqual(silocontrol.policy.admission(full), "d")
+            full.Pop()
+            full.Push(m.controller("e", 5))
+            m.assertEqual(silocontrol.policy.admission(full), "c")
+            full[2].handingOff = true
+            m.assertEqual(silocontrol.policy.admission(full), "b")
+        end sub
+
+        @it("refuses a newcomer when every controller is active or handing off")
+        sub _()
+            full = [m.controller("a", 1), m.controller("b", 2), m.controller("c", 3, { passive: true, handingOff: true }), m.controller("d", 4)]
+            m.assertEqual(silocontrol.policy.admission(full), "refuse")
+        end sub
+
+        @it("names the same device's other connections as replaced")
+        sub _()
+            existing = [m.controller("a", 1, { deviceId: "phone" }), m.controller("b", 2, { deviceId: "other" }), m.controller("c", 3, { deviceId: "phone" })]
+            m.assertEqual(silocontrol.policy.replaced("phone", "c", existing), ["a"])
+            m.assertEqual(silocontrol.policy.replaced("", "c", existing), [])
+        end sub
+
+        @describe("command budget")
+
+        @it("allows a burst of 40, then 20 a second")
+        sub _()
+            budget = silocontrol.policy.budget()
+            allowed = 0
+            for i = 1 to 50
+                if silocontrol.policy.allow(budget, 1000) then allowed = allowed + 1
+            end for
+            m.assertEqual(allowed, 40)
+            m.assertFalse(silocontrol.policy.allow(budget, 1010))
+            m.assertTrue(silocontrol.policy.allow(budget, 1060))
+        end sub
+
+        @describe("identity reuse")
+
+        @it("reuses from the issuing connection or with the issued token")
+        sub _()
+            m.assertTrue(silocontrol.policy.mayReuse(true, "c1", "c1", "", invalid))
+            m.assertTrue(silocontrol.policy.mayReuse(true, "", "c2", "abc", "abc"))
+            m.assertFalse(silocontrol.policy.mayReuse(true, "c1", "c2", "abc", "abd"))
+            m.assertFalse(silocontrol.policy.mayReuse(false, "c1", "c1", "abc", "abc"))
+            m.assertFalse(silocontrol.policy.mayReuse(true, "", "c2", "", ""))
+        end sub
+
+        @it("asks before replacing another profile's title, once per title")
+        sub _()
+            m.assertTrue(silocontrol.policy.needsReplaceConfirmation(true, false, false, true))
+            m.assertFalse(silocontrol.policy.needsReplaceConfirmation(true, true, false, true))
+            m.assertFalse(silocontrol.policy.needsReplaceConfirmation(true, false, false, false))
+            m.assertFalse(silocontrol.policy.needsReplaceConfirmation(false, false, false, true))
+            m.assertTrue(silocontrol.policy.confirmationCovers("c1", true, "c1"))
+            m.assertFalse(silocontrol.policy.confirmationCovers("c2", true, "c1"))
+            m.assertFalse(silocontrol.policy.confirmationCovers("c1", invalid, "c1"))
+        end sub
+
+        @it("makes a 64-digit resume token")
+        sub _()
+            token = silocontrol.policy.resumeToken(["0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0", "00112233-4455-6677-8899-aabbccddeeff"])
+            m.assertEqual(Len(token), 64)
+            m.assertEqual(Left(token, 8), "0f1e2d3c")
+        end sub
+
+        @describe("launch intent")
+
+        @it("starts where the server's resume rule says without a file")
+        sub _()
+            wanted = silocontrol.policy.launchIntent({ contentId: "c1", startFromBeginning: false })
+            m.assertEqual(wanted.contentId, "c1")
+            m.assertEqual(wanted.startPositionRule, nav.player.RESUME)
+            m.assertInvalid(wanted.tracks)
+            m.assertInvalid(nav.player.startSecondsOf(wanted))
+        end sub
+
+        @it("names the version and tracks as server ordinals")
+        sub _()
+            wanted = silocontrol.policy.launchIntent({ contentId: "c1", fileId: 42, audioTrackIndex: 1, subtitleTrackIndex: -1, startFromBeginning: true, pinsVersion: true })
+            m.assertEqual(wanted.startPositionRule, nav.player.START_OVER)
+            m.assertEqual(wanted.tracks, { fileId: "42", pinsVersion: true, audioIndex: 1, subtitleIndex: playback.tracks.OFF })
+            auto = silocontrol.policy.launchIntent({ contentId: "c1", fileId: 42, startFromBeginning: false })
+            m.assertEqual(auto.tracks.audioIndex, playback.tracks.AUTO)
+            m.assertEqual(auto.tracks.subtitleIndex, playback.tracks.AUTO)
+        end sub
+
+        @it("applies tracks named without a version to the player's version")
+        sub _()
+            wanted = silocontrol.policy.launchIntent({ contentId: "c1", audioTrackIndex: 2, subtitleTrackIndex: -1, startFromBeginning: false })
+            m.assertEqual(nav.player.pinnedFile(wanted), "")
+            m.assertEqual(nav.player.tracksFor(wanted, "77"), { audioIndex: 2, subtitleIndex: playback.tracks.OFF })
+        end sub
+
+        @it("starts at the phone's resume position unless it starts over")
+        sub _()
+            m.assertEqual(nav.player.startSecondsOf(silocontrol.policy.launchIntent({ contentId: "c1", startFromBeginning: false, resumePosition: 312.5 })), 312.5)
+            m.assertInvalid(nav.player.startSecondsOf(silocontrol.policy.launchIntent({ contentId: "c1", startFromBeginning: true, resumePosition: 312.5 })))
+        end sub
+
+    end class
+
+end namespace

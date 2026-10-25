@@ -1,0 +1,238 @@
+namespace tests
+
+    @suite("silocontrol receiver")
+    class SiloControlReceiverTests extends rooibos.BaseTestSuite
+
+        function config() as Object
+            return { deviceName: "Living Room", deviceId: "roku-1", origin: "https://silo.example.com", serverId: silocontrol.protocol.serverId("https://silo.example.com"), serverName: "silo.example.com", serverIdentity: "dep-1" }
+        end function
+
+        function hello(fields = {} as Object) as String
+            body = { "role": "phone", "deviceName": "Pixel", "deviceId": "phone-1", "serverId": silocontrol.protocol.serverId("https://silo.example.com"), "supportedVersions": [2], "features": ["close_reason", "resume_token"] }
+            body.Append(fields)
+            return FormatJson({ "type": "hello", "v": 2, "hello": body })
+        end function
+
+        ' The actions of one kind, and for send and close their message types.
+        function kinds(actions as Object) as Object
+            out = []
+            for each action in actions
+                if action.kind = "send" or action.kind = "close"
+                    sent = "-"
+                    if action.text <> "" then sent = ParseJson(action.text).type
+                    out.Push(action.kind + ":" + action.id + ":" + sent)
+                else if action.kind = "emit"
+                    out.Push("emit:" + action.event.type)
+                else
+                    out.Push(action.kind + ":" + action.id)
+                end if
+            end for
+            return out
+        end function
+
+        ' A receiver with one connection, c1, that said hello.
+        function connected(fields = {} as Object) as Object
+            state = silocontrol.receiver.create(m.config())
+            state.stateText = silocontrol.protocol.state(silocontrol.state.idle())
+            silocontrol.receiver.accepted(state, "c1", "10.20.30.50:-1", 0)
+            silocontrol.receiver.frame(state, "c1", m.hello(fields), 10)
+            return state
+        end function
+
+        @describe("connecting")
+
+        @it("drops a peer outside the local network")
+        sub _()
+            state = silocontrol.receiver.create(m.config())
+            m.assertEqual(m.kinds(silocontrol.receiver.accepted(state, "c1", "8.8.8.8:1", 0)), ["drop:c1"])
+            m.assertTrue(state.controllers.IsEmpty())
+        end sub
+
+        @it("sends its hello at once, then state and connected after a matching hello")
+        sub _()
+            state = silocontrol.receiver.create(m.config())
+            state.stateText = silocontrol.protocol.state(silocontrol.state.idle())
+            m.assertEqual(m.kinds(silocontrol.receiver.accepted(state, "c1", "10.20.30.50", 0)), ["send:c1:hello", "emit:controllers"])
+            m.assertEqual(m.kinds(silocontrol.receiver.frame(state, "c1", m.hello(), 10)), ["send:c1:state", "emit:connected", "emit:controllers"])
+            m.assertTrue(state.controllers.c1.authorized)
+        end sub
+
+        @it("keeps another server's phone connected but unauthorized")
+        sub _()
+            state = m.connected({ "serverId": silocontrol.protocol.serverId("https://other.example"), "serverIdentity": "dep-2" })
+            m.assertFalse(state.controllers.c1.authorized)
+            m.assertEqual(m.kinds(silocontrol.receiver.frame(state, "c1", "{""type"":""control"",""v"":2,""control"":{""name"":""play""}}", 20)), ["send:c1:error"])
+        end sub
+
+        @it("authorizes a phone on another address of the same deployment, and names that deployment with its launches")
+        sub _()
+            state = m.connected({ "serverId": silocontrol.protocol.serverId("http://192.168.1.5:8096"), "serverIdentity": "dep-1" })
+            m.assertTrue(state.controllers.c1.authorized)
+            actions = silocontrol.receiver.frame(state, "c1", "{""type"":""launch"",""v"":2,""launch"":{""serverId"":""x"",""playback"":{""contentId"":""m1"",""fileId"":42,""startFromBeginning"":false}}}", 20)
+            m.assertEqual(m.kinds(actions), ["emit:launch"])
+            m.assertEqual(actions[0].event.controller.serverIdentity, "dep-1")
+        end sub
+
+        @it("authorizes a phone on another address once the deployment identity is learned")
+        sub _()
+            config = m.config()
+            config.serverIdentity = ""
+            state = silocontrol.receiver.create(config)
+            state.stateText = silocontrol.protocol.state(silocontrol.state.idle())
+            silocontrol.receiver.accepted(state, "c1", "10.20.30.50:-1", 0)
+            silocontrol.receiver.frame(state, "c1", m.hello({ "serverId": silocontrol.protocol.serverId("http://192.168.1.5:8096"), "serverIdentity": "dep-1" }), 10)
+            m.assertFalse(state.controllers.c1.authorized)
+            config.serverIdentity = "dep-1"
+            m.assertEqual(m.kinds(silocontrol.receiver.configure(state, config)), ["send:c1:state", "emit:connected", "emit:controllers"])
+            m.assertTrue(state.controllers.c1.authorized)
+            m.assertEqual(silocontrol.receiver.configure(state, config), [])
+        end sub
+
+        @it("refuses a hello without v2 or a server, with its close reason")
+        sub _()
+            state = silocontrol.receiver.create(m.config())
+            silocontrol.receiver.accepted(state, "c1", "10.20.30.50", 0)
+            actions = silocontrol.receiver.frame(state, "c1", m.hello({ "supportedVersions": [1] }), 10)
+            m.assertEqual(m.kinds(actions), ["send:c1:error", "close:c1:close", "emit:gone", "emit:controllers"])
+            m.assertEqual(ParseJson(actions[1].text).close.reason, "unauthorized")
+        end sub
+
+        @it("closes the same device's older connection as replaced")
+        sub _()
+            state = m.connected()
+            silocontrol.receiver.accepted(state, "c2", "10.20.30.50", 100)
+            actions = silocontrol.receiver.frame(state, "c2", m.hello(), 110)
+            m.assertEqual(m.kinds(actions).Slice(0, 3), ["close:c1:close", "emit:gone", "emit:controllers"])
+            m.assertEqual(ParseJson(actions[0].text).close.reason, "replaced")
+            m.assertFalse(state.controllers.DoesExist("c1"))
+        end sub
+
+        @it("refuses a fifth active controller with its reasons")
+        sub _()
+            state = silocontrol.receiver.create(m.config())
+            for i = 1 to 4
+                id = "c" + i.ToStr()
+                silocontrol.receiver.accepted(state, id, "10.20.30.50", 0)
+                silocontrol.receiver.frame(state, id, m.hello({ "deviceId": id }), 1)
+            end for
+            actions = silocontrol.receiver.accepted(state, "c5", "10.0.0.161", 2)
+            m.assertEqual(m.kinds(actions), ["send:c5:hello", "send:c5:error", "close:c5:close"])
+            m.assertEqual(ParseJson(actions[1].text).error.code, "too_many_controllers")
+        end sub
+
+        @it("evicts a connection that never said hello for a newcomer")
+        sub _()
+            state = silocontrol.receiver.create(m.config())
+            for i = 1 to 4
+                silocontrol.receiver.accepted(state, "c" + i.ToStr(), "10.20.30.50", 0)
+            end for
+            actions = silocontrol.receiver.accepted(state, "c5", "10.0.0.161", 2)
+            m.assertEqual(m.kinds(actions).Slice(0, 1), ["close:c1:close"])
+            m.assertTrue(state.controllers.DoesExist("c5"))
+        end sub
+
+        @describe("heartbeat")
+
+        @it("closes a connection without hello after five seconds")
+        sub _()
+            state = silocontrol.receiver.create(m.config())
+            silocontrol.receiver.accepted(state, "c1", "10.20.30.50", 0)
+            m.assertEqual(silocontrol.receiver.nextWake(state), 3000)
+            m.assertEqual(m.kinds(silocontrol.receiver.tick(state, 3000)), ["send:c1:ping"])
+            m.assertEqual(silocontrol.receiver.nextWake(state), 5000)
+            m.assertEqual(m.kinds(silocontrol.receiver.tick(state, 5000)), ["close:c1:close", "emit:gone", "emit:controllers"])
+        end sub
+
+        @it("pings every three seconds and drops after more than three missed pongs")
+        sub _()
+            state = m.connected()
+            for t = 3000 to 9000 step 3000
+                m.assertEqual(m.kinds(silocontrol.receiver.tick(state, t)), ["send:c1:ping"])
+            end for
+            silocontrol.receiver.frame(state, "c1", "{""type"":""pong"",""v"":2}", 9500)
+            m.assertEqual(state.controllers.c1.missed, 0)
+            for t = 12000 to 18000 step 3000
+                silocontrol.receiver.tick(state, t)
+            end for
+            m.assertEqual(m.kinds(silocontrol.receiver.tick(state, 21000)), ["drop:c1", "emit:gone", "emit:controllers"])
+        end sub
+
+        @it("answers ping with pong, and a phone's own ping does not count as a pong")
+        sub _()
+            state = m.connected()
+            silocontrol.receiver.tick(state, 3000)
+            m.assertEqual(m.kinds(silocontrol.receiver.frame(state, "c1", "{""type"":""ping"",""v"":2}", 3100)), ["send:c1:pong"])
+            m.assertEqual(state.controllers.c1.missed, 1)
+        end sub
+
+        @describe("messages")
+
+        @it("forwards control, launch, and offers to AppScene")
+        sub _()
+            state = m.connected()
+            actions = silocontrol.receiver.frame(state, "c1", "{""type"":""control"",""v"":2,""control"":{""name"":""seek"",""seconds"":12}}", 20)
+            m.assertEqual(m.kinds(actions), ["emit:control"])
+            m.assertEqual(actions[0].event.payload.seconds, 12)
+            m.assertEqual(actions[0].event.controller.deviceName, "Pixel")
+            offer = silocontrol.receiver.frame(state, "c1", FormatJson({ "type": "handoff_offer", "v": 2, "handoffOffer": { "requestId": "r1", "serverId": "s", "serverURL": "u", "profileId": "p" } }), 30)
+            m.assertEqual(m.kinds(offer), ["emit:offer"])
+            m.assertTrue(state.controllers.c1.handingOff)
+            silocontrol.receiver.sendTo(state, "c1", silocontrol.protocol.handoffCancel("r1", "handoff_failed", "no"), true)
+            m.assertFalse(state.controllers.c1.handingOff)
+        end sub
+
+        @it("answers an offer before hello with version_unsupported")
+        sub _()
+            state = silocontrol.receiver.create(m.config())
+            silocontrol.receiver.accepted(state, "c1", "10.20.30.50", 0)
+            actions = silocontrol.receiver.frame(state, "c1", FormatJson({ "type": "handoff_offer", "v": 2, "handoffOffer": { "requestId": "r1", "serverId": "s", "serverURL": "u", "profileId": "p" } }), 10)
+            m.assertEqual(ParseJson(actions[0].text).handoffCancel.reason, "version_unsupported")
+        end sub
+
+        @it("rate-limits commands with one notice a second")
+        sub _()
+            state = m.connected()
+            command = "{""type"":""control"",""v"":2,""control"":{""name"":""play""}}"
+            for i = 1 to 40
+                silocontrol.receiver.frame(state, "c1", command, 100)
+            end for
+            m.assertEqual(m.kinds(silocontrol.receiver.frame(state, "c1", command, 100)), ["send:c1:error"])
+            m.assertEqual(silocontrol.receiver.frame(state, "c1", command, 100), [])
+        end sub
+
+        @it("closes on a malformed known type and ignores an unknown one")
+        sub _()
+            state = m.connected()
+            m.assertEqual(silocontrol.receiver.frame(state, "c1", "{""type"":""controllers"",""v"":2}", 20), [])
+            m.assertEqual(m.kinds(silocontrol.receiver.frame(state, "c1", "{""type"":""launch"",""v"":2,""launch"":{}}", 30)), ["close:c1:close", "emit:gone", "emit:controllers"])
+        end sub
+
+        @it("sends state to authorized controllers only, and closes everyone with a reason")
+        sub _()
+            state = m.connected()
+            silocontrol.receiver.accepted(state, "c2", "10.0.0.161", 0)
+            silocontrol.receiver.frame(state, "c2", m.hello({ "deviceId": "phone-2", "serverId": "x", "features": [] }), 10)
+            m.assertEqual(m.kinds(silocontrol.receiver.setState(state, silocontrol.protocol.state(silocontrol.state.idle()))), ["send:c1:state"])
+            actions = silocontrol.receiver.closeAll(state, "tv_disconnected")
+            closes = []
+            for each action in actions
+                if action.kind = "close" then closes.Push(ParseJson(action.text))
+            end for
+            m.assertEqual(closes.Count(), 2)
+            reasons = []
+            for each sent in closes
+                if sent.DoesExist("close") then reasons.Push(sent.close.reason) else reasons.Push("")
+            end for
+            reasons.Sort()
+            m.assertEqual(reasons, ["", "tv_disconnected"])
+        end sub
+
+        @it("drops a controller that sends close, without answering")
+        sub _()
+            state = m.connected()
+            m.assertEqual(m.kinds(silocontrol.receiver.frame(state, "c1", "{""type"":""close"",""v"":2}", 20)), ["drop:c1", "emit:gone", "emit:controllers"])
+        end sub
+
+    end class
+
+end namespace

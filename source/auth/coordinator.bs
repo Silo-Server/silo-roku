@@ -1,6 +1,8 @@
 import "pkg:/source/api/request.bs"
 import "pkg:/source/api/response.bs"
 import "pkg:/source/api/scheduler.bs"
+import "pkg:/source/auth/companion.bs"
+import "pkg:/source/auth/handoff.bs"
 import "pkg:/source/auth/headers.bs"
 import "pkg:/source/auth/problems.bs"
 import "pkg:/source/auth/profiles.bs"
@@ -36,6 +38,8 @@ import "pkg:/source/util/values.bs"
 '   { session: "verifyPin", profile, pin }
 '   { session: "checkOrigin" }      check the configured origin again
 '   { session: "mediaHeaders", url, generation, refresh }  (mediaHeaders)
+'   { session: "companionServer" | "companionStart" | "companionPoll" |
+'     "companionCancel" }  companion sign-in (source/auth/companion.bs)
 ' profile is an item of api.auth.profiles.list. Their envelopes carry no
 ' tokens, but for mediaHeaders, whose lines the player sets on its Video
 ' node's content. Tokens, the password, and PINs leave this state only as
@@ -96,7 +100,7 @@ namespace api.auth.coordinator
     ' "checking" | "verified" | "refused", problem, url, requestId } for the
     ' base URL url.
     function create(saved as Object, facts as Object, allowUnconfirmedOrigin = false as Boolean) as Object
-        return { saved: saved, facts: facts, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
+        return { saved: saved, facts: facts, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, companion: invalid, companionAttempt: 0, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
     end function
 
     ' The decisions to carry out once, at launch, before the first publish:
@@ -113,8 +117,11 @@ namespace api.auth.coordinator
     '     originStatus: "unverified" | "checking" | "verified" | "refused",
     '     originProblem: "" | "origin_unconfirmed" | "origin_mismatch" |
     '       "server_update_required",
-    '     reason: "" | "expired" | "signed_out" | "server_changed" }
-    ' reason says why the last session ended. verification names the open
+    '     reason: "" | "expired" | "signed_out" | "server_changed",
+    '     deviceId, borrowed: invalid | { profileId, accountId,
+    '     sessionExpiresAt }, borrowedReason: "" | "expired" }
+    ' reason says why the last session ended. deviceId is the installation ID
+    ' (X-Silo-Device-Id), which the SiloControl receiver advertises. verification names the open
     ' profile whose token the server refused: it needs its PIN again, and
     ' until then no profile shows as open, so the app returns to the profile
     ' step (spec section 7.3). originStatus is the configured origin's check;
@@ -129,7 +136,7 @@ namespace api.auth.coordinator
         active = invalid
         if state.profile <> invalid and state.verification = invalid then active = profileView(state.profile)
         check = currentOriginCheck(state)
-        return { status: status, origin: state.saved.origin, accountId: state.saved.accountId, rememberedProfileId: state.saved.profileId, profile: active, verification: state.verification, originStatus: check.status, originProblem: check.problem, reason: state.reason }
+        return { status: status, origin: state.saved.origin, accountId: state.saved.accountId, rememberedProfileId: state.saved.profileId, profile: active, verification: state.verification, originStatus: check.status, originProblem: check.problem, reason: state.reason, deviceId: state.saved.deviceId, borrowed: borrowedView(state), borrowedReason: state.borrowedReason }
     end function
 
     ' The record to persist.
@@ -158,7 +165,7 @@ namespace api.auth.coordinator
     function sendsSecret(state as Object, requestId as String) as Boolean
         op = state.ops[requestId]
         if op = invalid then return false
-        return op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "pin"
+        return op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "pin" or op.kind = "borrowRefresh" or op.kind = "handoffPoll" or op.kind = "handoffCancel" or op.kind = "companionPoll" or op.kind = "companionCancel"
     end function
 
     ' A session operation from the render thread.
@@ -171,6 +178,16 @@ namespace api.auth.coordinator
         if op = "verifyPin" then return verifyPin(state, input)
         if op = "checkOrigin" then return checkOrigin(state, input)
         if op = "mediaHeaders" then return mediaHeaders(state, input, now)
+        if op = "handoffStart" then return handoffStart(state, input)
+        if op = "handoffPoll" then return handoffPoll(state, input)
+        if op = "handoffCancel" then return handoffCancel(state, input)
+        if op = "borrow" then return borrow(state, input, now)
+        if op = "borrowedEnd" then return borrowedEnd(state, input)
+        if op = "pairing" then return pairing(state, input)
+        if op = "companionServer" then return companionServer(state, input)
+        if op = "companionStart" then return companionStart(state, input)
+        if op = "companionPoll" then return companionPoll(state, input)
+        if op = "companionCancel" then return companionCancel(state, input)
         return [reply(api.response.failure(input, "invalid_request"))]
     end function
 
@@ -179,10 +196,11 @@ namespace api.auth.coordinator
     ' waits for it when the token has expired. Markers this module sets on
     ' requests are removed first.
     function submitted(state as Object, request as Object, now as Integer) as Object
-        for each marker in ["authGeneration", "authRetried", "authProfileId", "authProof", "rotatesCredentials", "confidential"]
+        for each marker in ["authGeneration", "authRetried", "authProfileId", "authProof", "authBorrowed", "rotatesCredentials", "confidential"]
             request.Delete(marker)
         end for
         if request.auth = "none" or state.saved.refreshToken = "" then return []
+        if isBorrowed(state, request.fence) then return borrowedSubmitted(state, now)
         decisions = confirmOrigin(state)
         if currentOriginCheck(state).status = "refused" then return decisions
         isExpired = expired(state, now)
@@ -210,8 +228,13 @@ namespace api.auth.coordinator
     function credentials(state as Object, request as Object, url as String) as Object
         ' A playback request fenced to an earlier identity never takes this
         ' one's credentials (plan section 6.6).
-        if util.isObject(request.fence) and not sameIdentity(request.fence, identity(state)) then return { headers: {}, error: "identity_changed" }
+        if util.isObject(request.fence) and not sameIdentity(request.fence, identity(state))
+            ' A phone's borrowed identity (docs/silocontrol.md section 8.3).
+            if isBorrowed(state, request.fence) and state.saved.accessToken <> "" then return borrowedCredentials(state, request, url)
+            return { headers: {}, error: "identity_changed" }
+        end if
         op = state.ops[request.requestId]
+        if isCompanionOp(op) then return companionCredentials(state, op, url)
         expected = state.saved.origin
         if op <> invalid and util.isString(op.origin) then expected = op.origin
         sameOrigin = api.request.isSameOrigin(url, expected)
@@ -244,6 +267,10 @@ namespace api.auth.coordinator
     function answered(state as Object, request as Object, result as Object, now as Integer) as Object
         noteAnswer(state, request, result)
         if request.auth = "none" then return [finish(result)]
+        if util.isTrue(request.authBorrowed)
+            if result.status = 401 then return borrowedUnauthorized(state, request, result, now)
+            return [finish(result)]
+        end if
         if result.status = 401 then return unauthorized(state, request, result, now)
         if result.status = 403 and problemType(result) = "profile_verification_required" and util.isString(request.authProfileId)
             decisions = refuseProof(state, request.authProfileId, request.authProof)
@@ -264,6 +291,14 @@ namespace api.auth.coordinator
         if op.kind = "server" then return serverChecked(state, request, op, result)
         if op.kind = "origin" then return originChecked(state, request, op, result)
         if op.kind = "pin" then return pinChecked(state, request, op, result)
+        if op.kind = "handoffCapability" then return handoffCapable(state, op, result)
+        if op.kind = "handoffStart" then return handoffStarted(state, op, result)
+        if op.kind = "handoffPoll" then return handoffPolled(state, op, result)
+        if op.kind = "borrowRefresh" then return borrowedRefreshed(state, request, op, result, now)
+        if op.kind = "companionInfo" then return companionInfo(state, op, result)
+        if op.kind = "companionIdentity" then return companionIdentity(state, op, result)
+        if op.kind = "companionStart" then return companionStarted(state, op, result)
+        if op.kind = "companionPoll" then return companionPolled(state, op, result, now)
         if op.kind = "logoutRefresh"
             tokens = parseTokens(result)
             if tokens = invalid then return []
@@ -360,6 +395,18 @@ namespace api.auth.coordinator
     function mediaHeaders(state as Object, input as Object, now as Integer) as Object
         if not api.request.isSameOrigin(util.text(input.url), state.saved.origin) then return [reply(succeeded(input, { httpHeaders: [], generation: state.generation, credentialed: false }))]
         if state.saved.accessToken = "" then return [reply(api.response.failure(input, "signed_out"))]
+        if util.isObject(input.fence) and not sameIdentity(input.fence, identity(state))
+            if not isBorrowed(state, input.fence) then return [reply(api.response.failure(input, "identity_changed"))]
+            borrowed = state.borrowed
+            decisions = []
+            if borrowed.refreshing = "" and borrowedMediaRefreshDue(state, input, now) then decisions = startBorrowedRefresh(state, false)
+            if borrowed.refreshing = ""
+                decisions.Push(borrowedMediaReply(state, input))
+            else
+                state.mediaWaiters.Push(input)
+            end if
+            return decisions
+        end if
         if not originConfirmed(state, state.saved.origin)
             decisions = confirmOrigin(state)
             decisions.Push(reply(api.response.failure(input, originError(state))))
@@ -388,6 +435,7 @@ namespace api.auth.coordinator
 
     function mediaReply(state as Object, input as Object) as Object
         if state.saved.accessToken = "" then return reply(api.response.failure(input, "signed_out"))
+        if util.isObject(input.fence) and not sameIdentity(input.fence, identity(state)) then return borrowedMediaReply(state, input)
         if not originConfirmed(state, state.saved.origin) then return reply(api.response.failure(input, originError(state)))
         if state.profile = invalid then return reply(api.response.failure(input, "profile_required"))
         pair = api.auth.headers.profile(state.profile, profileToken(state, state.profile.id))
@@ -406,10 +454,17 @@ namespace api.auth.coordinator
     ' Answers every mediaHeaders request waiting for the refresh that ended.
     function answerMedia(state as Object) as Object
         decisions = []
+        waiting = []
         for each input in state.mediaWaiters
-            decisions.Push(mediaReply(state, input))
+            borrowedWait = isBorrowed(state, input.fence) and state.borrowed.refreshing <> ""
+            ownWait = not util.isObject(input.fence) and state.refreshing <> invalid
+            if borrowedWait or ownWait
+                waiting.Push(input)
+            else
+                decisions.Push(mediaReply(state, input))
+            end if
         end for
-        state.mediaWaiters = []
+        state.mediaWaiters = waiting
         return decisions
     end function
 
@@ -419,6 +474,18 @@ namespace api.auth.coordinator
         decisions = confirmOrigin(state)
         decisions.Push(reply(succeeded(input, { originStatus: currentOriginCheck(state).status })))
         return decisions
+    end function
+
+    ' The SiloControl receiver's pairing key (docs/silocontrol.md section
+    ' 9.4), { session: "pairing" } to read it and with key (32 hex digits,
+    ' or "" for Require Pairing off) to store it; answers { key }. It stays
+    ' on the device across sign-outs and is shown only on Connect a Phone.
+    function pairing(state as Object, input as Object) as Object
+        if not input.DoesExist("key") then return [reply(succeeded(input, { key: state.saved.pairingKey }))]
+        key = LCase(util.text(input.key))
+        if key <> "" and not storage.isPairingKey(key) then return [reply(api.response.failure(input, "invalid_request"))]
+        state.saved.pairingKey = key
+        return [persist(), reply(succeeded(input, { key: key }))]
     end function
 
     ' ---- The configured origin
@@ -684,7 +751,16 @@ namespace api.auth.coordinator
         return decisions
     end function
 
+    ' The Roku's own refresh holds credentialed requests, or stops holding
+    ' them; a borrowed refresh may still hold them (applyHold).
     function setHold(state as Object, held as Boolean) as Object
+        state.ownHold = held
+        return applyHold(state)
+    end function
+
+    ' Holds credentialed requests while either refresh asks to.
+    function applyHold(state as Object) as Object
+        held = state.ownHold or (state.borrowed <> invalid and state.borrowed.holding)
         if state.held = held then return []
         state.held = held
         return [{ kind: "hold", held: held }]
@@ -718,7 +794,12 @@ namespace api.auth.coordinator
         state.notBefore = 0
         state.unanswered = false
         state.reason = reason
-        decisions = setHold(state, false)
+        ' A phone's borrowed identity and its handoffs end with the
+        ' session they were approved under.
+        state.handoffs = {}
+        state.handoffStarts = {}
+        decisions = endBorrowed(state, "", true)
+        decisions.Append(setHold(state, false))
         ' Media headers waiting for a refresh are answered signed_out.
         decisions.Append(answerMedia(state))
         return decisions
@@ -823,7 +904,7 @@ namespace api.auth.coordinator
         ' The scheduler lets these run past their deadline once started
         ' (api.scheduler.ROTATING_CAP_MS): the server may have rotated the
         ' refresh token, and a late answer is still applied.
-        if op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" then spec.rotatesCredentials = true
+        if op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "borrowRefresh" then spec.rotatesCredentials = true
         ' These carry a credential without auth, and wait for the origin check.
         if op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "logout" then spec.confidential = true
         state.ops[id] = op

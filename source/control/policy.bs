@@ -1,0 +1,172 @@
+import "pkg:/source/nav/player.bs"
+import "pkg:/source/playback/tracks.bs"
+import "pkg:/source/util/values.bs"
+
+' The receiver's rules as pure functions (docs/silocontrol.md sections 5.5,
+' 6.2, 6.3, 7, and 8), the Roku's copy of silo-apple's
+' SiloControlReceiverPolicy with Roku's limits.
+namespace silocontrol.policy
+    ' Section 5.5: four controllers, not the other TVs' eight.
+    const MAX_CONTROLLERS = 4
+    ' Section 6.3: tvOS's command budget, a token bucket.
+    const COMMANDS_PER_SECOND = 20
+    const COMMAND_BURST = 40
+    const RATE_NOTICE_MS = 1000
+
+    ' Whether a peer may connect at all: a private (RFC 1918), link-local,
+    ' or loopback IPv4 address. address is "a.b.c.d" with or without
+    ' ":port", as roSocketAddress.getAddress() gives it.
+    function isLocalPeer(address as Dynamic) as Boolean
+        if not util.isString(address) then return false
+        host = address
+        colon = Instr(1, host, ":")
+        if colon > 0 then host = Left(host, colon - 1)
+        parts = host.Split(".")
+        if parts.Count() <> 4 then return false
+        octets = []
+        for each part in parts
+            if part = "" or Len(part) > 3 then return false
+            for i = 1 to Len(part)
+                c = Asc(Mid(part, i, 1))
+                if c < 48 or c > 57 then return false
+            end for
+            value = part.ToInt()
+            if value > 255 then return false
+            octets.Push(value)
+        end for
+        a = octets[0]
+        b = octets[1]
+        if a = 10 or a = 127 then return true
+        if a = 172 and b >= 16 and b <= 31 then return true
+        if a = 192 and b = 168 then return true
+        return a = 169 and b = 254
+    end function
+
+    ' What to do with a new connection, given the connected controllers as
+    ' { id, seq, didHello, authorized, handingOff, passive }: "admit", "refuse",
+    ' or the id of the controller to close first. At the limit, one that
+    ' never said hello goes first, then an unauthorized one not handing off,
+    ' then the oldest passive one not handing off; otherwise the newcomer is
+    ' refused (section 5.5).
+    function admission(existing as Object) as String
+        if existing.Count() < MAX_CONTROLLERS then return "admit"
+        byAge = []
+        byAge.Append(existing)
+        byAge.SortBy("seq")
+        for each candidate in byAge
+            if not candidate.didHello then return candidate.id
+        end for
+        for each candidate in byAge
+            if not candidate.authorized and not candidate.handingOff then return candidate.id
+        end for
+        for each candidate in byAge
+            if candidate.passive and not candidate.handingOff then return candidate.id
+        end for
+        return "refuse"
+    end function
+
+    ' The other connections of the device that said hello on connection id:
+    ' sockets it has abandoned, which the newest replaces.
+    function replaced(deviceId as String, id as String, existing as Object) as Object
+        out = []
+        if deviceId = "" then return out
+        for each other in existing
+            if other.id <> id and other.deviceId = deviceId then out.Push(other.id)
+        end for
+        return out
+    end function
+
+    ' A fresh command budget.
+    function budget() as Object
+        return { tokens: COMMAND_BURST, at: invalid }
+    end function
+
+    ' Whether a command at now (milliseconds) fits the budget, which it
+    ' spends.
+    function allow(state as Object, now as Integer) as Boolean
+        if util.isNumber(state.at)
+            elapsed = now - state.at
+            if elapsed < 0 then elapsed = 0
+            state.tokens = state.tokens + elapsed * COMMANDS_PER_SECOND / 1000
+            if state.tokens > COMMAND_BURST then state.tokens = COMMAND_BURST
+        end if
+        state.at = now
+        if state.tokens < 1 then return false
+        state.tokens = state.tokens - 1
+        return true
+    end function
+
+    ' Whether an offer that names the identity a launch would use may reuse
+    ' it without a new approval: from the connection that completed the
+    ' handoff, or with the resume token issued to it.
+    function mayReuse(matches as Boolean, identityConnection as String, connection as String, issuedToken as String, offeredToken as Dynamic) as Boolean
+        if not matches then return false
+        if identityConnection <> "" and identityConnection = connection then return true
+        if issuedToken = "" or not util.isString(offeredToken) then return false
+        return sameText(issuedToken, offeredToken)
+    end function
+
+    ' Whether a handoff must ask before it replaces what plays: only a title
+    ' under another profile, and only a controller that can ask.
+    function needsReplaceConfirmation(titleOnScreen as Boolean, playingUnderOfferedProfile as Boolean, confirmed as Boolean, canConfirm as Boolean) as Boolean
+        return titleOnScreen and not playingUnderOfferedProfile and not confirmed and canConfirm
+    end function
+
+    ' A confirmation covers only the title the viewer agreed to replace.
+    function confirmationCovers(onScreenContentId as String, replaceConfirmed as Dynamic, replacingContentId as Dynamic) as Boolean
+        return util.isTrue(replaceConfirmed) and util.text(replacingContentId) = onScreenContentId
+    end function
+
+    ' The player's intent (source/nav/player.bs) for a launch's playback
+    ' request (section 7.2): the version and tracks as server ordinals when
+    ' the request names a file, tracks alone for the version the player
+    ' chooses, else the player's own choice; a start from
+    ' the beginning, at resumePosition, or where the server's resume rule
+    ' says. A negative subtitle index is no subtitle. libraryId is ignored.
+    function launchIntent(request as Object) as Object
+        rule = nav.player.RESUME
+        fromStart = util.isTrue(request.startFromBeginning)
+        if fromStart then rule = nav.player.START_OVER
+        wanted = nav.player.intent(request.contentId, rule)
+        hasTracks = util.isNumber(request.audioTrackIndex) or util.isNumber(request.subtitleTrackIndex)
+        if util.isNumber(request.fileId) or hasTracks
+            audio = playback.tracks.AUTO
+            if util.isNumber(request.audioTrackIndex) and request.audioTrackIndex >= 0 then audio = Int(request.audioTrackIndex)
+            subtitle = playback.tracks.AUTO
+            if util.isNumber(request.subtitleTrackIndex)
+                subtitle = Int(request.subtitleTrackIndex)
+                if subtitle < 0 then subtitle = playback.tracks.OFF
+            end if
+            if util.isNumber(request.fileId)
+                nav.player.withTracks(wanted, Int(request.fileId).ToStr(), audio, subtitle, util.isTrue(request.pinsVersion))
+            else
+                ' Tracks without a version (Android phones may send them):
+                ' they apply to the version the player chooses.
+                nav.player.withTracks(wanted, "", audio, subtitle)
+                wanted.tracks.anyVersion = true
+            end if
+        end if
+        if not fromStart and util.isNumber(request.resumePosition) and request.resumePosition > 0 then nav.player.startAt(wanted, request.resumePosition)
+        return wanted
+    end function
+
+    ' A resume token: 64 hex digits from four UUIDs (section 9.3: it only
+    ' needs to be unguessable to the other phones on the network).
+    function resumeToken(uuids as Object) as String
+        out = ""
+        for each uuid in uuids
+            out = out + LCase(uuid.Replace("-", ""))
+        end for
+        return Left(out, 64)
+    end function
+
+    ' Compares two strings in time that does not depend on where they differ.
+    function sameText(a as String, b as String) as Boolean
+        if Len(a) <> Len(b) then return false
+        diff = 0
+        for i = 1 to Len(a)
+            if Asc(Mid(a, i, 1)) <> Asc(Mid(b, i, 1)) then diff = diff + 1
+        end for
+        return diff = 0
+    end function
+end namespace

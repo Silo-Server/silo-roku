@@ -1,0 +1,382 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/api/response.bs"
+import "pkg:/source/api/scheduler.bs"
+import "pkg:/source/auth/headers.bs"
+import "pkg:/source/auth/problems.bs"
+import "pkg:/source/util/instant.bs"
+import "pkg:/source/util/values.bs"
+
+' Profile handoff in the account session (docs/silocontrol.md section 8):
+' the remote_playback device login a phone approves, and the borrowed
+' identity it gives, beside the Roku's own. Part of api.auth.coordinator,
+' whose decisions it returns.
+'
+' Session operations:
+'   { session: "handoffStart", deviceName, startKey }  checks the server
+'       offers remote_playback handoff, then starts a temporary device login;
+'       answers { handoffId, userCode, matchCode, expiresAt (ISO), interval }.
+'       startKey, the caller's, names the start until it answers.
+'   { session: "handoffPoll", handoffId }  polls once; answers { status,
+'       pollAfter, profileId, sessionExpiresAt }. An approval's tokens stay
+'       here until "borrow".
+'   { session: "handoffCancel", handoffId }  withdraws the request
+'   { session: "handoffCancel", startKey }  withdraws a start still in
+'       flight: it starts no login, or withdraws the one it started
+'   { session: "borrow", handoffId }  installs an approved handoff's identity,
+'       ending any other borrowed one; answers { identity, profileId,
+'       sessionExpiresAt }
+'   { session: "borrowedEnd" }  logs the borrowed identity out, once, and
+'       forgets it
+' The device code and the tokens never leave this state but as request
+' bodies and headers to the configured origin; user and match codes go to
+' the render thread, which sends them to the phone that approves.
+'
+' The borrowed identity { server, account, profile } is held in memory only:
+' nothing reaches the registry. A request fenced to it (request.fence) is
+' sent with its tokens and profile headers; it refreshes in its own lane,
+' and requests wait for that refresh as they wait for the Roku's own. A
+' refused refresh, or reaching the session's end, forgets it, and the view
+' says so (borrowedReason "expired").
+namespace api.auth.coordinator
+    const CAPABILITY_PATH = "/api/v2/auth/device/capability"
+    const DEVICE_START_PATH = "/api/v2/auth/device/start"
+    const DEVICE_POLL_PATH = "/api/v2/auth/device/poll"
+    const DEVICE_CANCEL_PATH = "/api/v2/auth/device/cancel"
+    const HANDOFF_TIMEOUT_MS = 15000
+
+    ' { profileId, accountId, sessionExpiresAt } of the borrowed identity, or
+    ' invalid.
+    function borrowedView(state as Object) as Dynamic
+        borrowed = state.borrowed
+        if borrowed = invalid then return invalid
+        return { profileId: borrowed.identity.profile, accountId: borrowed.identity.account, sessionExpiresAt: borrowed.sessionEndsAt }
+    end function
+
+    ' The borrowed identity, for the playback worker (env.borrowed), or
+    ' invalid.
+    function borrowedIdentity(state as Object) as Dynamic
+        if state.borrowed = invalid then return invalid
+        return state.borrowed.identity
+    end function
+
+    ' Whether fence names the borrowed identity.
+    function isBorrowed(state as Object, fence as Dynamic) as Boolean
+        return state.borrowed <> invalid and util.isObject(fence) and sameIdentity(fence, state.borrowed.identity)
+    end function
+
+    ' ---- Operations
+
+    function handoffStart(state as Object, input as Object) as Object
+        if state.saved.accessToken = "" or state.saved.origin = "" then return [reply(api.response.failure(input, "signed_out"))]
+        key = util.text(input.startKey)
+        if key <> "" then state.handoffStarts[key] = true
+        request = build(state, { owner: util.text(input.owner) }, { method: "GET", path: CAPABILITY_PATH, timeoutMs: HANDOFF_TIMEOUT_MS }, { kind: "handoffCapability", origin: state.saved.origin, startKey: key, input: input })
+        return submitConfidential(state, request)
+    end function
+
+    ' The capability answered: start the device login, or refuse.
+    function handoffCapable(state as Object, op as Object, result as Object) as Object
+        input = op.input
+        if handoffWithdrawn(state, op) then return [reply(api.response.failure(input, "handoff_gone"))]
+        body = result.body
+        offered = result.ok = true and util.isObject(body) and util.text(body.state) = "available" and util.isTrue(body.remote_playback_handoff) and util.contains(body.protocol_versions, 2)
+        if offered and util.isBoolean(body.allowed) and not body.allowed then offered = false
+        if not offered
+            state.handoffStarts.Delete(op.startKey)
+            if result.ok <> true then return [reply(answerFor(input, result))]
+            return [reply(api.response.failure(input, "handoff_unsupported"))]
+        end if
+        name = api.auth.headers.clampName(input.deviceName)
+        request = build(state, { owner: util.text(input.owner) }, { method: "POST", path: DEVICE_START_PATH, body: { device_name: name, device_platform: api.auth.headers.DEVICE_PLATFORM, client_purpose: "remote_playback", temporary: true }, timeoutMs: HANDOFF_TIMEOUT_MS }, { kind: "handoffStart", origin: op.origin, startKey: op.startKey, input: input })
+        return submitConfidential(state, request)
+    end function
+
+    ' The device login started. The server must echo the purpose and
+    ' temporary; the device code stays here, by handoffId. A login a
+    ' withdrawn start opened is withdrawn.
+    function handoffStarted(state as Object, op as Object, result as Object) as Object
+        body = result.body
+        if handoffWithdrawn(state, op)
+            decisions = [reply(api.response.failure(op.input, "handoff_gone"))]
+            if result.ok = true and util.isObject(body) and nonEmpty(body.device_code) then decisions.Append(submitConfidential(state, deviceCancelRequest(state, op.origin, body.device_code)))
+            return decisions
+        end if
+        state.handoffStarts.Delete(op.startKey)
+        if result.ok <> true then return [reply(answerFor(op.input, result))]
+        valid = util.isObject(body) and nonEmpty(body.device_code) and nonEmpty(body.user_code) and util.isString(body.match_code) and util.text(body.client_purpose) = "remote_playback" and util.isTrue(body.temporary)
+        if not valid then return [reply(api.response.failure(op.input, "handoff_unsupported"))]
+        state.nextHandoff = state.nextHandoff + 1
+        id = "h" + state.nextHandoff.ToStr()
+        interval = 3
+        if util.isNumber(body.interval) and body.interval > 0 then interval = Int(body.interval)
+        state.handoffs[id] = { deviceCode: body.device_code, origin: op.origin, approved: invalid }
+        return [reply(succeeded(op.input, { handoffId: id, userCode: body.user_code, matchCode: body.match_code, expiresAt: util.text(body.expires_at), interval: interval }, result.status))]
+    end function
+
+    function handoffPoll(state as Object, input as Object) as Object
+        handoff = state.handoffs[util.text(input.handoffId)]
+        if handoff = invalid or handoff.origin <> state.saved.origin then return [reply(api.response.failure(input, "handoff_gone"))]
+        request = build(state, { owner: util.text(input.owner) }, { method: "POST", path: DEVICE_POLL_PATH, body: { device_code: handoff.deviceCode }, timeoutMs: HANDOFF_TIMEOUT_MS }, { kind: "handoffPoll", origin: handoff.origin, handoffId: input.handoffId, input: input })
+        return submitConfidential(state, request)
+    end function
+
+    ' A poll answered. An approval must be temporary, carry tokens and the
+    ' account, and name a profile; its tokens wait for "borrow". Any end
+    ' (denied, expired, canceled, consumed) forgets the handoff. A failed
+    ' poll is answered as it is, and the caller polls again.
+    function handoffPolled(state as Object, op as Object, result as Object) as Object
+        input = op.input
+        handoff = state.handoffs[util.text(op.handoffId)]
+        if handoff = invalid then return [reply(api.response.failure(input, "handoff_gone"))]
+        body = result.body
+        if result.ok <> true or not util.isObject(body) then return [reply(answerFor(input, result))]
+        status = util.text(body.status)
+        pollAfter = 0
+        if util.isNumber(body.poll_after) then pollAfter = Int(body.poll_after)
+        answer = { status: status, pollAfter: pollAfter, profileId: "", sessionExpiresAt: "" }
+        if status = "approved"
+            tokens = invalid
+            user = invalid
+            if util.isObject(body.tokens)
+                tokens = parseTokens({ ok: true, body: body.tokens })
+                if util.isObject(body.tokens.user) then user = body.tokens.user
+            end if
+            ends = util.isoSeconds(body.session_expires_at)
+            if tokens = invalid or user = invalid or not nonEmpty(user.id) or not nonEmpty(body.profile_id) or not util.isTrue(body.temporary) or ends = invalid
+                state.handoffs.Delete(op.handoffId)
+                answer.status = "invalid"
+                return [reply(succeeded(input, answer, result.status))]
+            end if
+            handoff.approved = { tokens: tokens, accountId: user.id, profileId: body.profile_id, profileToken: util.text(body.profile_token), sessionEndsAt: ends }
+            answer.profileId = body.profile_id
+            answer.sessionExpiresAt = util.text(body.session_expires_at)
+        else if status <> "pending"
+            state.handoffs.Delete(op.handoffId)
+        end if
+        return [reply(succeeded(input, answer, result.status))]
+    end function
+
+    ' Withdraws a handoff; the server's answer is not awaited. One already
+    ' approved has a session nobody will use, which is logged out.
+    function handoffCancel(state as Object, input as Object) as Object
+        id = util.text(input.handoffId)
+        handoff = state.handoffs[id]
+        decisions = [reply(succeeded(input, {}))]
+        state.handoffStarts.Delete(util.text(input.startKey))
+        if handoff = invalid then return decisions
+        state.handoffs.Delete(id)
+        if handoff.origin <> state.saved.origin then return decisions
+        if handoff.approved <> invalid
+            decisions.Append(submitConfidential(state, logoutRequest(state, handoff.origin, handoff.approved.tokens.accessToken)))
+            return decisions
+        end if
+        decisions.Append(submitConfidential(state, deviceCancelRequest(state, handoff.origin, handoff.deviceCode)))
+        return decisions
+    end function
+
+    function deviceCancelRequest(state as Object, origin as String, deviceCode as String) as Object
+        return build(state, { owner: "" }, { method: "POST", path: DEVICE_CANCEL_PATH, body: { device_code: deviceCode }, timeoutMs: HANDOFF_TIMEOUT_MS }, { kind: "handoffCancel", origin: origin })
+    end function
+
+    ' Whether op's start was withdrawn (a handoffCancel with its startKey)
+    ' or ended with the session.
+    function handoffWithdrawn(state as Object, op as Object) as Boolean
+        return op.startKey <> "" and not state.handoffStarts.DoesExist(op.startKey)
+    end function
+
+    ' Installs an approved handoff as the borrowed identity, after logging
+    ' out any other one.
+    function borrow(state as Object, input as Object, now as Integer) as Object
+        id = util.text(input.handoffId)
+        handoff = state.handoffs[id]
+        if handoff = invalid or handoff.approved = invalid or handoff.origin <> state.saved.origin or state.saved.accessToken = "" then return [reply(api.response.failure(input, "handoff_gone"))]
+        state.handoffs.Delete(id)
+        approved = handoff.approved
+        decisions = endBorrowed(state, "", true)
+        borrowed = { identity: { server: state.saved.origin, account: approved.accountId, profile: approved.profileId }, accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, sessionEndsAt: approved.sessionEndsAt, profileToken: approved.profileToken, generation: 0, refreshing: "", holding: false, notBefore: 0 }
+        setBorrowedTokens(borrowed, approved.tokens, now)
+        state.borrowed = borrowed
+        state.borrowedReason = ""
+        decisions.Push(publish())
+        decisions.Push(reply(succeeded(input, { identity: borrowed.identity, profileId: approved.profileId, sessionExpiresAt: approved.sessionEndsAt })))
+        return decisions
+    end function
+
+    function borrowedEnd(state as Object, input as Object) as Object
+        decisions = endBorrowed(state, "", true)
+        decisions.Push(publish())
+        decisions.Push(reply(succeeded(input, {})))
+        return decisions
+    end function
+
+    ' Forgets the borrowed identity: with logout, POST /auth/logout once with
+    ' its token, unanswered; reason is what the view says ("expired", or ""
+    ' for an end the receiver asked for). Requests waiting for its refresh
+    ' are released.
+    function endBorrowed(state as Object, reason as String, logout as Boolean) as Object
+        borrowed = state.borrowed
+        if borrowed = invalid then return []
+        state.borrowed = invalid
+        state.borrowedReason = reason
+        decisions = applyHold(state)
+        decisions.Append(answerMedia(state))
+        if logout and borrowed.accessToken <> "" and state.saved.origin = borrowed.identity.server then decisions.Append(submitConfidential(state, logoutRequest(state, borrowed.identity.server, borrowed.accessToken)))
+        return decisions
+    end function
+
+    ' The envelope for input of a request built for it, without the body,
+    ' which may hold a device code or tokens.
+    function answerFor(input as Object, result as Object) as Object
+        out = withoutBody(result)
+        out.requestId = util.text(input.requestId)
+        return out
+    end function
+
+    ' ---- Requests under the borrowed identity
+
+    ' A request fenced to the borrowed identity, before it is queued: past
+    ' the session's end the identity goes; an expired token starts a
+    ' refresh the request waits for, and a token past refreshAt one it does
+    ' not.
+    function borrowedSubmitted(state as Object, now as Integer) as Object
+        borrowed = state.borrowed
+        if now >= borrowed.sessionEndsAt
+            decisions = endBorrowed(state, "expired", false)
+            decisions.Push(publish())
+            return decisions
+        end if
+        decisions = confirmOrigin(state)
+        if borrowed.refreshing <> "" or now < borrowed.notBefore then return decisions
+        if borrowedExpired(borrowed, now)
+            decisions.Append(startBorrowedRefresh(state, true))
+        else if borrowed.refreshAt > 0 and now >= borrowed.refreshAt
+            decisions.Append(startBorrowedRefresh(state, false))
+        end if
+        return decisions
+    end function
+
+    ' Headers for a request fenced to the borrowed identity (credentials()).
+    function borrowedCredentials(state as Object, request as Object, url as String) as Object
+        borrowed = state.borrowed
+        if not api.request.isSameOrigin(url, borrowed.identity.server) then return { headers: {}, error: "invalid_request" }
+        if not originConfirmed(state, borrowed.identity.server) then return { headers: {}, error: originError(state) }
+        out = api.auth.headers.identity(state.facts, true)
+        if request.auth = "none" then return { headers: out, error: invalid }
+        out.Append(api.auth.headers.account(borrowed.accessToken))
+        request.authGeneration = borrowed.generation
+        request.authBorrowed = true
+        if request.auth = "profile" then out.Append(borrowedProfileHeaders(borrowed))
+        return { headers: out, error: invalid }
+    end function
+
+    function borrowedProfileHeaders(borrowed as Object) as Object
+        out = { "X-Profile-Id": borrowed.identity.profile }
+        if borrowed.profileToken <> "" then out["X-Profile-Token"] = borrowed.profileToken
+        return out
+    end function
+
+    ' A 401 on a request sent with the borrowed tokens: retried once after a
+    ' refresh, as the Roku's own are.
+    function borrowedUnauthorized(state as Object, request as Object, result as Object, now as Integer) as Object
+        borrowed = state.borrowed
+        if borrowed = invalid or not isBorrowed(state, request.fence) then return [finish(result)]
+        replays = not util.isTrue(request.authRetried)
+        if not util.isNumber(request.authGeneration) or request.authGeneration <> borrowed.generation
+            if not replays then return [finish(result)]
+            request.authRetried = true
+            return [{ kind: "requeue", requestId: request.requestId }]
+        end if
+        decisions = []
+        if borrowed.refreshing = ""
+            if now < borrowed.notBefore then return [finish(result)]
+            decisions.Append(startBorrowedRefresh(state, true))
+        else
+            borrowed.holding = true
+            decisions.Append(applyHold(state))
+        end if
+        if not replays
+            decisions.Push(finish(result))
+            return decisions
+        end if
+        request.authRetried = true
+        decisions.Push({ kind: "requeue", requestId: request.requestId })
+        return decisions
+    end function
+
+    function startBorrowedRefresh(state as Object, hold as Boolean) as Object
+        borrowed = state.borrowed
+        request = build(state, { owner: "" }, { method: "POST", path: REFRESH_PATH, body: { refresh_token: borrowed.refreshToken }, lane: api.scheduler.LANE_PLAYBACK, timeoutMs: REFRESH_TIMEOUT_MS }, { kind: "borrowRefresh", origin: borrowed.identity.server, generation: borrowed.generation, identity: borrowed.identity })
+        borrowed.refreshing = request.requestId
+        decisions = []
+        if hold
+            borrowed.holding = true
+            decisions.Append(applyHold(state))
+        end if
+        decisions.Append(submitConfidential(state, request))
+        return decisions
+    end function
+
+    ' The borrowed refresh settled: new tokens, an end (a refusal), or a
+    ' backoff, as the Roku's own refresh does.
+    function borrowedRefreshed(state as Object, request as Object, op as Object, result as Object, now as Integer) as Object
+        borrowed = state.borrowed
+        if borrowed = invalid or borrowed.refreshing <> request.requestId or not sameIdentity(op.identity, borrowed.identity) then return []
+        borrowed.refreshing = ""
+        borrowed.holding = false
+        tokens = parseTokens(result)
+        if tokens <> invalid
+            setBorrowedTokens(borrowed, tokens, now)
+            borrowed.generation = borrowed.generation + 1
+            decisions = applyHold(state)
+            decisions.Append(answerMedia(state))
+            return decisions
+        end if
+        if result.ok <> true and result.status <> 0 and not isOriginError(result.error) and api.auth.problems.action(result.error.problemType, result.status, "refresh") = api.auth.problems.SIGN_OUT
+            decisions = endBorrowed(state, "expired", false)
+            decisions.Push(publish())
+            return decisions
+        end if
+        borrowed.notBefore = now + BACKOFF_SECONDS
+        decisions = applyHold(state)
+        decisions.Append(answerMedia(state))
+        return decisions
+    end function
+
+    ' The Video node's headers under the borrowed identity (mediaHeaders).
+    function borrowedMediaReply(state as Object, input as Object) as Object
+        borrowed = state.borrowed
+        if borrowed = invalid or not isBorrowed(state, input.fence) then return reply(api.response.failure(input, "identity_changed"))
+        if not originConfirmed(state, borrowed.identity.server) then return reply(api.response.failure(input, originError(state)))
+        headers = api.auth.headers.account(borrowed.accessToken)
+        headers.Append(borrowedProfileHeaders(borrowed))
+        lines = []
+        for each name in headers
+            lines.Push(name + ": " + headers[name])
+        end for
+        return reply(succeeded(input, { httpHeaders: lines, generation: borrowed.generation, credentialed: true, expiresAt: borrowed.expiresAt, refreshAt: borrowed.refreshAt }))
+    end function
+
+    ' Whether a borrowed mediaHeaders request should wait for a refresh.
+    function borrowedMediaRefreshDue(state as Object, input as Object, now as Integer) as Boolean
+        borrowed = state.borrowed
+        if borrowed.refreshToken = "" or now < borrowed.notBefore then return false
+        if util.isTrue(input.refresh) and util.isNumber(input.generation) and input.generation = borrowed.generation then return true
+        return borrowedExpired(borrowed, now) or (borrowed.refreshAt > 0 and now >= borrowed.refreshAt)
+    end function
+
+    function borrowedExpired(borrowed as Object, now as Integer) as Boolean
+        return borrowed.expiresAt > 0 and now >= borrowed.expiresAt - EXPIRY_MARGIN_SECONDS
+    end function
+
+    ' As setTokens, for the borrowed identity: never past the session's end.
+    sub setBorrowedTokens(borrowed as Object, tokens as Object, now as Integer)
+        borrowed.accessToken = tokens.accessToken
+        borrowed.refreshToken = tokens.refreshToken
+        lifetime = tokens.expiresIn
+        early = lifetime - PROACTIVE_SECONDS
+        if early < lifetime \ 2 then early = lifetime \ 2
+        borrowed.expiresAt = now + lifetime
+        borrowed.refreshAt = now + early
+        borrowed.notBefore = 0
+    end sub
+end namespace

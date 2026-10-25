@@ -1,0 +1,677 @@
+' QR codes for screens that hand a link to a phone, and a 1-bit PNG of one
+' that a Poster can show from tmp:/. Text is encoded as UTF-8 in byte mode at
+' error correction level M, in the smallest of versions 1 to 10 that holds it,
+' following ISO/IEC 18004. The mask penalty is scored as Project Nayuki's
+' reference generator scores it, so codes match that generator module for
+' module. Pure.
+'
+' BrightScript has no XOR operator, so xorInt() derives it from "or" and
+' "and"; integers are 32-bit signed, so CRC-32 values are masked after every
+' right shift whether or not the shift extends the sign.
+namespace util.qr
+    const MAX_VERSION = 10
+    ' Penalty weights of ISO/IEC 18004 section 7.8.3.
+    const PENALTY_N1 = 3
+    const PENALTY_N2 = 3
+    const PENALTY_N3 = 40
+    const PENALTY_N4 = 10
+    ' The largest stored deflate block.
+    const STORED_MAX = 65535
+    ' 0xEDB88320, the reflected CRC-32 polynomial, as a signed 32-bit integer.
+    const CRC_POLY = -306674912
+
+    ' { size, rows } for the text, rows being size arrays of size 0 (light)
+    ' or 1 (dark) modules, without the quiet zone; invalid when the text's
+    ' UTF-8 bytes do not fit in version 10.
+    function matrix(input as String) as Dynamic
+        bytes = CreateObject("roByteArray")
+        bytes.FromAsciiString(input)
+        version = versionFor(bytes.Count())
+        if version = 0 then return invalid
+        codewords = interleave(dataCodewords(bytes, version), version)
+        size = version * 4 + 17
+        grid = emptyGrid(size)
+        reserved = emptyGrid(size)
+        drawFunctionPatterns(grid, reserved, version)
+        drawCodewords(grid, reserved, codewords)
+        best = invalid
+        bestScore = 0
+        for mask = 0 to 7
+            candidate = masked(grid, reserved, mask)
+            drawFormat(candidate, invalid, mask)
+            score = penalty(candidate)
+            if best = invalid or score < bestScore
+                best = candidate
+                bestScore = score
+            end if
+        end for
+        return { size: size, rows: best }
+    end function
+
+    ' A PNG of the code: 1-bit grayscale, scale pixels per module, quiet light
+    ' modules on every side. grid is what matrix() returns or its rows. The
+    ' image is assembled in an roArray, read only through for each and Append,
+    ' and copied into the roByteArray once: in brs-node, the headless test
+    ' runner, indexing a large array takes time in proportion to its length.
+    function png(grid as Object, scale as Integer, quiet as Integer) as Object
+        rows = grid
+        if type(grid) = "roAssociativeArray" then rows = grid.rows
+        width = (rows.Count() + 2 * quiet) * scale
+        header = []
+        pushUint32(header, width)
+        pushUint32(header, width)
+        ' Bit depth 1, colour type 0 (grayscale), deflate, filter 0, no interlace.
+        header.Append([1, 0, 0, 0, 0])
+        image = [137, 80, 78, 71, 13, 10, 26, 10]
+        appendChunk(image, "IHDR", header)
+        appendChunk(image, "IDAT", zlibStored(scanlines(rows, scale, quiet)))
+        appendChunk(image, "IEND", [])
+        out = CreateObject("roByteArray")
+        for each value in image
+            out.Push(value)
+        end for
+        return out
+    end function
+
+    ' Writes png(grid, scale, quiet) to path, such as one under tmp:/.
+    function writePng(grid as Object, scale as Integer, quiet as Integer, path as String) as Boolean
+        return png(grid, scale, quiet).WriteFile(path)
+    end function
+
+    ' CRC-32 (ISO 3309, as PNG uses) of an roArray of byte values, as a
+    ' signed integer. XOR is inlined: this runs per byte. The bytes are read
+    ' with for each (see png()); brs-node's for each over an roByteArray
+    ' misreads it, so an roByteArray is not accepted.
+    function crc32(bytes as Object) as Integer
+        table = crcTable()
+        crc = -1
+        for each value in bytes
+            entry = table[((crc or value) - (crc and value)) and 255]
+            shifted = (crc >> 8) and &hFFFFFF
+            crc = (entry or shifted) - (entry and shifted)
+        end for
+        return xorInt(crc, -1)
+    end function
+
+    ' Adler-32 (RFC 1950) of an roArray of byte values, as a signed
+    ' integer.
+    function adler32(bytes as Object) as Integer
+        low = 1
+        high = 0
+        for each value in bytes
+            low = (low + value) mod 65521
+            high = (high + low) mod 65521
+        end for
+        return (high << 16) or low
+    end function
+
+    ' a XOR b for any two integers: the bits set in either but not both.
+    function xorInt(a as Integer, b as Integer) as Integer
+        return (a or b) - (a and b)
+    end function
+
+    '-------------------------------------------------------------------------
+    ' Data codewords and error correction
+    '-------------------------------------------------------------------------
+
+    ' Error correction codewords per block at level M, by version.
+    function eccPerBlock(version as Integer) as Integer
+        return [0, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26][version]
+    end function
+
+    ' Error correction blocks at level M, by version.
+    function blockCount(version as Integer) as Integer
+        return [0, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5][version]
+    end function
+
+    ' Modules left for codewords and remainder bits once the function
+    ' patterns and format and version information are placed.
+    function rawModules(version as Integer) as Integer
+        modules = (16 * version + 128) * version + 64
+        if version >= 2
+            alignments = version \ 7 + 2
+            modules = modules - ((25 * alignments - 10) * alignments - 55)
+            if version >= 7 then modules = modules - 36
+        end if
+        return modules
+    end function
+
+    function dataCapacity(version as Integer) as Integer
+        return rawModules(version) \ 8 - eccPerBlock(version) * blockCount(version)
+    end function
+
+    ' The smallest version whose data codewords hold count bytes, or 0.
+    function versionFor(count as Integer) as Integer
+        for version = 1 to MAX_VERSION
+            ' The mode indicator and the character count, which is 16 bits
+            ' from version 10.
+            headerBits = 12
+            if version >= 10 then headerBits = 20
+            if headerBits + count * 8 <= dataCapacity(version) * 8 then return version
+        end for
+        return 0
+    end function
+
+    ' The data codewords: byte mode indicator, character count, the bytes, a
+    ' terminator of up to 4 zero bits, zero bits to a byte boundary, then the
+    ' pad bytes 0xEC and 0x11 by turns.
+    function dataCodewords(bytes as Object, version as Integer) as Object
+        capacity = dataCapacity(version)
+        writer = { codewords: [], pending: 0, filled: 0 }
+        appendBits(writer, 4, 4)
+        if version >= 10 then appendBits(writer, bytes.Count(), 16) else appendBits(writer, bytes.Count(), 8)
+        for i = 0 to bytes.Count() - 1
+            appendBits(writer, bytes[i], 8)
+        end for
+        terminator = capacity * 8 - writer.codewords.Count() * 8 - writer.filled
+        if terminator > 4 then terminator = 4
+        appendBits(writer, 0, terminator)
+        if writer.filled > 0 then appendBits(writer, 0, 8 - writer.filled)
+        out = writer.codewords
+        padByte = &hEC
+        while out.Count() < capacity
+            out.Push(padByte)
+            padByte = xorInt(padByte, xorInt(&hEC, &h11))
+        end while
+        return out
+    end function
+
+    ' Appends the low count bits of value, most significant first, to the
+    ' writer's codewords, holding a partial byte in pending.
+    sub appendBits(writer as Object, value as Integer, count as Integer)
+        for i = count - 1 to 0 step -1
+            writer.pending = writer.pending * 2 + ((value >> i) and 1)
+            writer.filled = writer.filled + 1
+            if writer.filled = 8
+                writer.codewords.Push(writer.pending)
+                writer.pending = 0
+                writer.filled = 0
+            end if
+        end for
+    end sub
+
+    ' The final codeword sequence: data split into blocks, the shorter blocks
+    ' first, each given its Reed-Solomon codewords, then the data codewords
+    ' and the error correction codewords each interleaved across the blocks.
+    function interleave(data as Object, version as Integer) as Object
+        blocks = blockCount(version)
+        eccLength = eccPerBlock(version)
+        total = rawModules(version) \ 8
+        shortBlocks = blocks - total mod blocks
+        shortLength = total \ blocks - eccLength
+        field = gfTables()
+        divisor = rsDivisor(eccLength, field)
+        dataBlocks = []
+        eccBlocks = []
+        k = 0
+        for i = 0 to blocks - 1
+            dataLength = shortLength
+            if i >= shortBlocks then dataLength = shortLength + 1
+            block = []
+            for j = 0 to dataLength - 1
+                block.Push(data[k + j])
+            end for
+            k = k + dataLength
+            dataBlocks.Push(block)
+            eccBlocks.Push(rsRemainder(block, divisor, field))
+        end for
+        out = []
+        for i = 0 to shortLength
+            for each block in dataBlocks
+                if i < block.Count() then out.Push(block[i])
+            end for
+        end for
+        for i = 0 to eccLength - 1
+            for each block in eccBlocks
+                out.Push(block[i])
+            end for
+        end for
+        return out
+    end function
+
+    ' Exponent and logarithm tables of GF(256) with the polynomial 0x11D.
+    function gfTables() as Object
+        exponents = []
+        logs = []
+        for i = 0 to 255
+            logs.Push(0)
+        end for
+        value = 1
+        for i = 0 to 254
+            exponents.Push(value)
+            logs[value] = i
+            value = value * 2
+            if value > 255 then value = xorInt(value, &h11D)
+        end for
+        return { exponents: exponents, logs: logs }
+    end function
+
+    function gfMultiply(a as Integer, b as Integer, field as Object) as Integer
+        if a = 0 or b = 0 then return 0
+        return field.exponents[(field.logs[a] + field.logs[b]) mod 255]
+    end function
+
+    ' The generator polynomial of the given degree without its leading 1,
+    ' highest power first: the product of (x - 2^i) for i below degree.
+    function rsDivisor(degree as Integer, field as Object) as Object
+        coefficients = []
+        for i = 1 to degree - 1
+            coefficients.Push(0)
+        end for
+        coefficients.Push(1)
+        root = 1
+        for i = 0 to degree - 1
+            for j = 0 to degree - 1
+                coefficients[j] = gfMultiply(coefficients[j], root, field)
+                if j + 1 < degree then coefficients[j] = xorInt(coefficients[j], coefficients[j + 1])
+            end for
+            root = gfMultiply(root, 2, field)
+        end for
+        return coefficients
+    end function
+
+    ' The remainder of the block, as a polynomial, divided by the generator.
+    function rsRemainder(block as Object, divisor as Object, field as Object) as Object
+        remainder = []
+        for each coefficient in divisor
+            remainder.Push(0)
+        end for
+        for each value in block
+            factor = xorInt(value, remainder.Shift())
+            remainder.Push(0)
+            for i = 0 to divisor.Count() - 1
+                remainder[i] = xorInt(remainder[i], gfMultiply(divisor[i], factor, field))
+            end for
+        end for
+        return remainder
+    end function
+
+    '-------------------------------------------------------------------------
+    ' Module placement
+    '-------------------------------------------------------------------------
+
+    function emptyGrid(size as Integer) as Object
+        rows = []
+        for y = 0 to size - 1
+            row = []
+            for x = 0 to size - 1
+                row.Push(0)
+            end for
+            rows.Push(row)
+        end for
+        return rows
+    end function
+
+    ' Sets a function module and marks it reserved; reserved may be invalid.
+    sub setModule(grid as Object, reserved as Dynamic, x as Integer, y as Integer, dark as Boolean)
+        if dark then grid[y][x] = 1 else grid[y][x] = 0
+        if reserved <> invalid then reserved[y][x] = 1
+    end sub
+
+    ' Timing, finder, separator, and alignment patterns, format information
+    ' (for mask 0, so its modules are reserved), the dark module, and version
+    ' information from version 7.
+    sub drawFunctionPatterns(grid as Object, reserved as Object, version as Integer)
+        size = grid.Count()
+        for i = 0 to size - 1
+            setModule(grid, reserved, 6, i, i mod 2 = 0)
+            setModule(grid, reserved, i, 6, i mod 2 = 0)
+        end for
+        drawFinder(grid, reserved, 3, 3)
+        drawFinder(grid, reserved, size - 4, 3)
+        drawFinder(grid, reserved, 3, size - 4)
+        positions = alignmentPositions(version)
+        last = positions.Count() - 1
+        for i = 0 to last
+            for j = 0 to last
+                ' The three corners with finder patterns have none.
+                corner = (i = 0 and j = 0) or (i = 0 and j = last) or (i = last and j = 0)
+                if not corner then drawAlignment(grid, reserved, positions[i], positions[j])
+            end for
+        end for
+        drawFormat(grid, reserved, 0)
+        drawVersion(grid, reserved, version)
+    end sub
+
+    ' A finder pattern centred on (cx, cy) with its separator, clipped to the
+    ' symbol.
+    sub drawFinder(grid as Object, reserved as Object, cx as Integer, cy as Integer)
+        size = grid.Count()
+        for dy = -4 to 4
+            for dx = -4 to 4
+                x = cx + dx
+                y = cy + dy
+                if x >= 0 and x < size and y >= 0 and y < size
+                    ring = chebyshev(dx, dy)
+                    setModule(grid, reserved, x, y, ring <> 2 and ring <> 4)
+                end if
+            end for
+        end for
+    end sub
+
+    sub drawAlignment(grid as Object, reserved as Object, cx as Integer, cy as Integer)
+        for dy = -2 to 2
+            for dx = -2 to 2
+                setModule(grid, reserved, cx + dx, cy + dy, chebyshev(dx, dy) <> 1)
+            end for
+        end for
+    end sub
+
+    ' Distance from the centre in rings: max(|dx|, |dy|).
+    function chebyshev(dx as Integer, dy as Integer) as Integer
+        if dx < 0 then dx = -dx
+        if dy < 0 then dy = -dy
+        if dx > dy then return dx
+        return dy
+    end function
+
+    ' Centre coordinates of alignment patterns (ISO/IEC 18004 Annex E).
+    function alignmentPositions(version as Integer) as Object
+        return [[], [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50]][version]
+    end function
+
+    ' Both copies of the 15 format bits for level M and the mask, and the dark
+    ' module beside the lower-left finder.
+    sub drawFormat(grid as Object, reserved as Dynamic, mask as Integer)
+        size = grid.Count()
+        ' Level M's indicator is 00, so the data is the mask alone.
+        remainder = mask
+        for i = 1 to 10
+            remainder = xorInt(remainder << 1, (remainder >> 9) * &h537)
+        end for
+        bits = xorInt((mask << 10) or remainder, &h5412)
+        for i = 0 to 5
+            setModule(grid, reserved, 8, i, bitAt(bits, i))
+        end for
+        setModule(grid, reserved, 8, 7, bitAt(bits, 6))
+        setModule(grid, reserved, 8, 8, bitAt(bits, 7))
+        setModule(grid, reserved, 7, 8, bitAt(bits, 8))
+        for i = 9 to 14
+            setModule(grid, reserved, 14 - i, 8, bitAt(bits, i))
+        end for
+        for i = 0 to 7
+            setModule(grid, reserved, size - 1 - i, 8, bitAt(bits, i))
+        end for
+        for i = 8 to 14
+            setModule(grid, reserved, 8, size - 15 + i, bitAt(bits, i))
+        end for
+        setModule(grid, reserved, 8, size - 8, true)
+    end sub
+
+    ' Both copies of the 18 version bits, from version 7.
+    sub drawVersion(grid as Object, reserved as Object, version as Integer)
+        if version < 7 then return
+        size = grid.Count()
+        remainder = version
+        for i = 1 to 12
+            remainder = xorInt(remainder << 1, (remainder >> 11) * &h1F25)
+        end for
+        bits = (version << 12) or remainder
+        for i = 0 to 17
+            a = size - 11 + i mod 3
+            b = i \ 3
+            setModule(grid, reserved, a, b, bitAt(bits, i))
+            setModule(grid, reserved, b, a, bitAt(bits, i))
+        end for
+    end sub
+
+    function bitAt(value as Integer, index as Integer) as Boolean
+        return ((value >> index) and 1) = 1
+    end function
+
+    ' Places the codewords' bits, most significant first, in two-module
+    ' columns from the right, upwards and downwards by turns, skipping the
+    ' vertical timing pattern and reserved modules. Remainder bits stay light.
+    sub drawCodewords(grid as Object, reserved as Object, codewords as Object)
+        size = grid.Count()
+        totalBits = codewords.Count() * 8
+        index = 0
+        right = size - 1
+        while right >= 1
+            if right = 6 then right = 5
+            upward = ((right + 1) and 2) = 0
+            for vertical = 0 to size - 1
+                y = vertical
+                if upward then y = size - 1 - vertical
+                for j = 0 to 1
+                    x = right - j
+                    if reserved[y][x] = 0 and index < totalBits
+                        grid[y][x] = (codewords[index >> 3] >> (7 - (index and 7))) and 1
+                        index = index + 1
+                    end if
+                end for
+            end for
+            right = right - 2
+        end while
+    end sub
+
+    '-------------------------------------------------------------------------
+    ' Masking
+    '-------------------------------------------------------------------------
+
+    ' A copy of the grid with the mask applied to every unreserved module.
+    function masked(grid as Object, reserved as Object, mask as Integer) as Object
+        size = grid.Count()
+        rows = []
+        for y = 0 to size - 1
+            source = grid[y]
+            fixed = reserved[y]
+            row = []
+            for x = 0 to size - 1
+                value = source[x]
+                if fixed[x] = 0 and maskHit(mask, x, y) then value = 1 - value
+                row.Push(value)
+            end for
+            rows.Push(row)
+        end for
+        return rows
+    end function
+
+    ' Whether the mask pattern inverts the module in column x, row y.
+    function maskHit(mask as Integer, x as Integer, y as Integer) as Boolean
+        if mask = 0 then return (x + y) mod 2 = 0
+        if mask = 1 then return y mod 2 = 0
+        if mask = 2 then return x mod 3 = 0
+        if mask = 3 then return (x + y) mod 3 = 0
+        if mask = 4 then return (x \ 3 + y \ 2) mod 2 = 0
+        product = x * y
+        if mask = 5 then return product mod 2 + product mod 3 = 0
+        if mask = 6 then return (product mod 2 + product mod 3) mod 2 = 0
+        return ((x + y) mod 2 + product mod 3) mod 2 = 0
+    end function
+
+    ' The mask penalty: runs of five or more (N1) and finder-like patterns
+    ' (N3) in rows and columns, 2x2 blocks (N2), and dark/light imbalance
+    ' (N4). Linear in the module count.
+    function penalty(grid as Object) as Integer
+        size = grid.Count()
+        score = linePenalty(grid, size, false) + linePenalty(grid, size, true)
+        dark = 0
+        for y = 0 to size - 1
+            row = grid[y]
+            for x = 0 to size - 1
+                dark = dark + row[x]
+            end for
+            if y < size - 1
+                below = grid[y + 1]
+                for x = 0 to size - 2
+                    cell = row[x]
+                    if cell = row[x + 1] and cell = below[x] and cell = below[x + 1] then score = score + PENALTY_N2
+                end for
+            end if
+        end for
+        ' N4 per 5% step the dark share strays from 50%, rounded as the
+        ' reference generator rounds it.
+        total = size * size
+        imbalance = dark * 20 - total * 10
+        if imbalance < 0 then imbalance = -imbalance
+        steps = (imbalance + total - 1) \ total - 1
+        return score + steps * PENALTY_N4
+    end function
+
+    ' N1 and N3 over every row, or every column. The run history holds the
+    ' last seven run lengths, newest first; the symbol's edges count as
+    ' light runs as wide as the symbol, as the quiet zone would be.
+    function linePenalty(grid as Object, size as Integer, columns as Boolean) as Integer
+        score = 0
+        for a = 0 to size - 1
+            color = 0
+            runLength = 0
+            history = [0, 0, 0, 0, 0, 0, 0]
+            for b = 0 to size - 1
+                if columns then cell = grid[b][a] else cell = grid[a][b]
+                if cell = color
+                    runLength = runLength + 1
+                    if runLength = 5
+                        score = score + PENALTY_N1
+                    else if runLength > 5
+                        score = score + 1
+                    end if
+                else
+                    pushRun(history, runLength, size)
+                    if color = 0 then score = score + finderLike(history) * PENALTY_N3
+                    color = cell
+                    runLength = 1
+                end if
+            end for
+            if color = 1
+                pushRun(history, runLength, size)
+                runLength = 0
+            end if
+            pushRun(history, runLength + size, size)
+            score = score + finderLike(history) * PENALTY_N3
+        end for
+        return score
+    end function
+
+    sub pushRun(history as Object, runLength as Integer, size as Integer)
+        ' The first run of a line borders the light edge.
+        if history[0] = 0 then runLength = runLength + size
+        for i = 6 to 1 step -1
+            history[i] = history[i - 1]
+        end for
+        history[0] = runLength
+    end sub
+
+    ' How many 1:1:3:1:1 dark-light-dark-light-dark patterns, ending at the
+    ' latest light run, have light runs of four on one side (0, 1, or 2).
+    function finderLike(history as Object) as Integer
+        n = history[1]
+        if n = 0 or history[2] <> n or history[3] <> n * 3 or history[4] <> n or history[5] <> n then return 0
+        found = 0
+        if history[0] >= n * 4 and history[6] >= n then found = found + 1
+        if history[6] >= n * 4 and history[0] >= n then found = found + 1
+        return found
+    end function
+
+    '-------------------------------------------------------------------------
+    ' PNG
+    '-------------------------------------------------------------------------
+
+    ' The image's filtered scanlines: per pixel row a filter byte of 0, then
+    ' one bit per pixel, most significant first, 1 for light. Pixel rows of
+    ' one module row are identical, so each is built once.
+    function scanlines(rows as Object, scale as Integer, quiet as Integer) as Object
+        size = rows.Count()
+        out = []
+        for my = -quiet to size + quiet - 1
+            moduleRow = invalid
+            if my >= 0 and my < size then moduleRow = rows[my]
+            single = scanline(moduleRow, size, scale, quiet)
+            for i = 1 to scale
+                out.Append(single)
+            end for
+        end for
+        return out
+    end function
+
+    ' One pixel row: moduleRow is invalid for a row of the quiet zone. Bits
+    ' past the image's width in the last byte are 0.
+    function scanline(moduleRow as Dynamic, size as Integer, scale as Integer, quiet as Integer) as Object
+        width = (size + 2 * quiet) * scale
+        out = [0]
+        value = 0
+        filled = 0
+        for px = 0 to width - 1
+            mx = px \ scale - quiet
+            light = 1
+            if moduleRow <> invalid and mx >= 0 and mx < size then light = 1 - moduleRow[mx]
+            value = value * 2 + light
+            filled = filled + 1
+            if filled = 8
+                out.Push(value)
+                value = 0
+                filled = 0
+            end if
+        end for
+        if filled > 0 then out.Push(value << (8 - filled))
+        return out
+    end function
+
+    ' A zlib stream (RFC 1950) of stored deflate blocks (RFC 1951) holding the
+    ' bytes: no compression, which a QR code's few kilobytes do not need.
+    ' Longer data is copied in one pass of for each (see png()).
+    function zlibStored(raw as Object) as Object
+        ' CMF 0x78 (deflate, 32K window) and FLG 0x01 (fastest; header check).
+        out = [&h78, &h01]
+        remaining = raw.Count()
+        if remaining <= STORED_MAX
+            appendStoredHeader(out, remaining, true)
+            out.Append(raw)
+        else
+            blockLeft = 0
+            for each value in raw
+                if blockLeft = 0
+                    blockLeft = remaining
+                    if blockLeft > STORED_MAX then blockLeft = STORED_MAX
+                    remaining = remaining - blockLeft
+                    appendStoredHeader(out, blockLeft, remaining = 0)
+                end if
+                out.Push(value)
+                blockLeft = blockLeft - 1
+            end for
+        end if
+        pushUint32(out, adler32(raw))
+        return out
+    end function
+
+    ' BFINAL, BTYPE 00, then LEN and its ones' complement, little-endian.
+    sub appendStoredHeader(out as Object, blockLength as Integer, isFinal as Boolean)
+        if isFinal then out.Push(1) else out.Push(0)
+        out.Append([blockLength and 255, blockLength >> 8, 255 - (blockLength and 255), 255 - (blockLength >> 8)])
+    end sub
+
+    ' A chunk: big-endian length, type, data, then the CRC-32 of type and data.
+    sub appendChunk(out as Object, chunkType as String, payload as Object)
+        typed = []
+        for i = 1 to Len(chunkType)
+            typed.Push(Asc(Mid(chunkType, i, 1)))
+        end for
+        typed.Append(payload)
+        pushUint32(out, payload.Count())
+        out.Append(typed)
+        pushUint32(out, crc32(typed))
+    end sub
+
+    ' Appends the integer's 32 bits, most significant byte first, to an roArray.
+    sub pushUint32(out as Object, value as Integer)
+        out.Push((value >> 24) and 255)
+        out.Push((value >> 16) and 255)
+        out.Push((value >> 8) and 255)
+        out.Push(value and 255)
+    end sub
+
+    ' The CRC-32 lookup table for each byte value.
+    function crcTable() as Object
+        table = []
+        for n = 0 to 255
+            crc = n
+            for k = 1 to 8
+                shifted = (crc >> 1) and &h7FFFFFFF
+                if (crc and 1) = 1 then crc = xorInt(CRC_POLY, shifted) else crc = shifted
+            end for
+            table.Push(crc)
+        end for
+        return table
+    end function
+end namespace

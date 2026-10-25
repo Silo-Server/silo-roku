@@ -1,0 +1,138 @@
+import "pkg:/source/control/state.bs"
+import "pkg:/source/playback/options.bs"
+import "pkg:/source/util/values.bs"
+
+' The player as a SiloControl receiver sees it (docs/silocontrol.md sections
+' 6.4 and 6.5). AppScene calls remoteState() for each state frame and
+' remoteCommand() for each phone command. A command takes the path the
+' viewer's own key or Options choice takes, so the session reducer decides
+' as it does for the Roku remote; the player never hands the Video node to
+' the receiver.
+
+' What a phone sees, as silocontrol.state.build's snapshot.
+function remoteState() as Object
+    snapshot = { contentId: m.itemId, title: "Loading", isLoading: true, isMuted: m.video.mute }
+    if m.intent = invalid or m.state = invalid
+        if m.errorVisible
+            snapshot.isLoading = false
+            snapshot.error = m.errorTitle.text
+        end if
+        return snapshot
+    end if
+    title = m.intent.name
+    if title = "" then title = m.intent.title
+    snapshot.title = title
+    if m.intent.kind = "episode"
+        line = []
+        for each part in [m.overlay.series, m.overlay.tag]
+            if util.text(part) <> "" then line.Push(part)
+        end for
+        snapshot.subtitle = line.Join(" · ")
+    end if
+    if m.state.attempt <> invalid then snapshot.sessionId = m.state.attempt.sessionId
+    position = m.state.player.position
+    if util.isNumber(m.state.seekTarget) then position = m.state.seekTarget
+    snapshot.currentTime = position
+    runtime = invalid
+    if m.state.plan <> invalid then runtime = m.state.plan.runtime
+    if runtime = invalid then runtime = m.intent.runtime
+    snapshot.duration = runtime
+    videoState = m.video.state
+    snapshot.isPlaying = videoState = "playing"
+    snapshot.isBuffering = videoState = "buffering"
+    snapshot.isLoading = m.flags.starting or m.state.plan = invalid
+    if m.errorVisible then snapshot.error = m.errorTitle.text
+    snapshot.hasNextEpisode = m.nextUp <> invalid
+    ' The card is a ContentNode (playback.nextEpisode.entries).
+    if m.nextUp <> invalid and m.nextUp.card <> invalid then snapshot.nextEpisodeTitle = util.text(m.nextUp.card.title)
+    plan = invalid
+    if m.state.plan <> invalid then plan = m.state.plan.data
+    snapshot.Append(silocontrol.state.fromOptions(playback.options.model(optionsState(), optionsWords()), subtitleIndexes(plan)))
+    snapshot.isQualitySwitching = switchingQuality()
+    return snapshot
+end function
+
+' track_id to combined_index for the plan's subtitle inventory, the
+' ordinal phones name a subtitle by.
+function subtitleIndexes(plan as Dynamic) as Object
+    out = {}
+    for each entry in playback.options.subtitleEntries(plan)
+        if util.isNumber(entry.combined_index) then out[util.text(entry.track_id)] = Int(entry.combined_index)
+    end for
+    return out
+end function
+
+' One phone command (silocontrol.protocol's control payload), as { ok, code,
+' message }; code is the SiloControl error code when ok is false.
+function remoteCommand(command as Object) as Object
+    name = util.text(command.name)
+    if name = "stop"
+        exitPlayer()
+        return remoteDone()
+    end if
+    if name = "set_muted"
+        m.video.mute = util.isTrue(command.enabled)
+        return remoteDone()
+    end if
+    if name = "set_volume"
+        ' Roku apps cannot set a level: 0 mutes, anything above unmutes.
+        if util.isNumber(command.volume) then m.video.mute = command.volume <= 0
+        return remoteDone()
+    end if
+    if name = "set_playback_speed" or name = "set_video_gravity" or name = "set_subtitle_sync_ms" or name = "set_subtitle_position"
+        return remoteFailed("command_failed", "Not available on Roku.")
+    end if
+    if m.state = invalid or m.leaving or m.errorVisible then return remoteFailed("player_not_ready", "The Roku player is not ready yet.")
+    if name = "play"
+        if m.video.state = "paused" then togglePause()
+    else if name = "pause"
+        if m.video.state = "playing" then togglePause()
+    else if name = "play_pause"
+        togglePause()
+    else if name = "seek"
+        if not util.isNumber(command.seconds) then return remoteFailed("command_failed", "No position to seek to.")
+        seconds = command.seconds
+        if seconds < 0 then seconds = 0
+        commitSeek(seconds)
+    else if name = "play_next"
+        if m.nextUp = invalid or m.upNext = invalid then return remoteFailed("command_failed", "There is no next episode.")
+        runUpNext({ type: "open" })
+        runUpNext({ type: "playNow" })
+    else if name = "select_audio_track"
+        if not util.isNumber(command.trackId) then return remoteFailed("command_failed", "No audio track chosen.")
+        applyChoice({ kind: playback.options.KIND_AUDIO, value: Int(command.trackId) })
+    else if name = "select_subtitle_track"
+        value = ""
+        if util.isNumber(command.trackId)
+            value = remoteSubtitle(Int(command.trackId))
+            if value = "" then return remoteFailed("command_failed", "That subtitle track is not available.")
+        end if
+        applyChoice({ kind: playback.options.KIND_SUBTITLE, value: value })
+    else if name = "set_quality"
+        value = util.text(command.value)
+        if value = "" then return remoteFailed("command_failed", "No quality chosen.")
+        applyChoice({ kind: playback.options.KIND_QUALITY, value: value })
+    else
+        return remoteFailed("command_failed", "Not available on Roku.")
+    end if
+    return remoteDone()
+end function
+
+' The track_id of the subtitle a phone names by its ordinal, or "".
+function remoteSubtitle(index as Integer) as String
+    plan = invalid
+    if m.state.plan <> invalid then plan = m.state.plan.data
+    indexes = subtitleIndexes(plan)
+    for each trackId in indexes
+        if indexes[trackId] = index then return trackId
+    end for
+    return ""
+end function
+
+function remoteDone() as Object
+    return { ok: true, code: "", message: "" }
+end function
+
+function remoteFailed(code as String, message as String) as Object
+    return { ok: false, code: code, message: message }
+end function

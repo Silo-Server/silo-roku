@@ -1,0 +1,146 @@
+import "pkg:/source/control/policy.bs"
+import "pkg:/source/util/values.bs"
+
+' Companion sign-in's receiver (docs/companion-pairing.md sections 3 and 4):
+' the pairing protocol's frames, and the one phone a Roku on its server or
+' sign-in screen talks to. ControlTask runs it in place of
+' silocontrol.receiver when started with service "pairing", and carries out
+' the same actions:
+'   { kind: "send", id, text }   { kind: "close", id, text }
+'   { kind: "drop", id }         { kind: "emit", event }
+' Events: { type: "phone", id } when a phone connects; { type: "push", id,
+' server: { url, name, identity, endpoints } }; { type: "done", id };
+' { type: "cancel", id, reason }; { type: "gone", id } when it leaves. The
+' flow, the idle timeout, and every answer are AppScene's
+' (components/AppSceneCompanion.bs).
+'
+' config: { deviceName, deviceId, state } with state "setup" or "login".
+namespace silocontrol.pairing
+    const VERSION = 1
+    const SERVICE = "_silopair-roku._tcp.local"
+    const FIRST_PORT = 52827
+    const LAST_PORT = 52836
+    ' Longest pushed URL or name kept, in characters.
+    const MAX_TEXT = 2048
+    const MAX_ENDPOINTS = 16
+
+    function create(config as Object) as Object
+        return { config: config, phone: "" }
+    end function
+
+    sub configure(state as Object, config as Object)
+        state.config = config
+    end sub
+
+    ' One phone at a time; anyone else is closed at once.
+    function accepted(state as Object, id as String, peer as Dynamic) as Object
+        if not silocontrol.policy.isLocalPeer(peer) or state.phone <> "" then return [{ kind: "drop", id: id }]
+        state.phone = id
+        return [send(id, hello(state.config)), emit({ type: "phone", id: id })]
+    end function
+
+    function frame(state as Object, id as String, text as String) as Object
+        if id <> state.phone then return []
+        message = decode(text)
+        if message.kind = "invalid" then return closePhone(state, "")
+        if message.kind = "pushServer" then return [emit({ type: "push", id: id, server: message.server })]
+        if message.kind = "done" then return [emit({ type: "done", id: id })]
+        if message.kind = "cancel" then return [emit({ type: "cancel", id: id, reason: message.reason })]
+        return []
+    end function
+
+    function lost(state as Object, id as String) as Object
+        if id <> state.phone then return [{ kind: "drop", id: id }]
+        state.phone = ""
+        return [{ kind: "drop", id: id }, emit({ type: "gone", id: id })]
+    end function
+
+    function sendTo(state as Object, id as String, text as String) as Object
+        if id = "" or id <> state.phone then return []
+        return [send(id, text)]
+    end function
+
+    ' Closes the phone after text ("" for none).
+    function closePhone(state as Object, text as String) as Object
+        id = state.phone
+        if id = "" then return []
+        state.phone = ""
+        return [{ kind: "close", id: id, text: text }, emit({ type: "gone", id: id })]
+    end function
+
+    function closeAll(state as Object, reason as String) as Object
+        text = ""
+        if reason <> "" then text = cancel(reason)
+        return closePhone(state, text)
+    end function
+
+    ' ---- Messages
+
+    function hello(config as Object) as String
+        return FormatJson({ "type": "hello", "v": VERSION, "tvName": util.text(config.deviceName), "tvDeviceId": util.text(config.deviceId), "state": util.text(config.state), "supportedVersions": [VERSION] })
+    end function
+
+    function deviceStarted(serverUrl as String, userCode as String, matchCode as String) as String
+        return FormatJson({ "type": "deviceStarted", "v": VERSION, "serverURL": serverUrl, "userCode": userCode, "matchCode": matchCode })
+    end function
+
+    ' error "" for a sign-in.
+    function serverResult(serverUrl as String, failure as String) as String
+        out = { "type": "serverResult", "v": VERSION, "serverURL": serverUrl, "status": "signedIn" }
+        if failure <> ""
+            out.status = "failed"
+            out.error = failure
+        end if
+        return FormatJson(out)
+    end function
+
+    function cancel(reason as String) as String
+        return FormatJson({ "type": "cancel", "v": VERSION, "reason": reason })
+    end function
+
+    ' A phone's frame as { kind: "pushServer", server } | { kind: "done" } |
+    ' { kind: "cancel", reason } | { kind: "ignored" } (a type this side
+    ' does not take) | { kind: "invalid" } (not a JSON object, or a push
+    ' without a usable serverURL).
+    function decode(text as String) as Object
+        message = ParseJson(text)
+        if not util.isObject(message) or not util.isString(message.type) then return { kind: "invalid" }
+        kind = message.type
+        if kind = "done" then return { kind: "done" }
+        if kind = "cancel" then return { kind: "cancel", reason: util.text(message.reason) }
+        if kind <> "pushServer" then return { kind: "ignored" }
+        url = clip(message.serverURL)
+        if url = "" then return { kind: "invalid" }
+        endpoints = []
+        if type(message.endpoints) = "roArray"
+            for each entry in message.endpoints
+                if endpoints.Count() < MAX_ENDPOINTS and util.isObject(entry) and clip(entry.url) <> ""
+                    endpoints.Push({ url: clip(entry.url), kind: clip(entry.kind), provider: clip(entry.provider), displayName: clip(entry.displayName) })
+                end if
+            end for
+        end if
+        return { kind: "pushServer", server: { url: url, name: clip(message.serverName), identity: clip(message.serverIdentity), endpoints: endpoints } }
+    end function
+
+    function clip(value as Dynamic) as String
+        if not util.isString(value) then return ""
+        return Left(value.Trim(), MAX_TEXT)
+    end function
+
+    ' ---- DNS-SD
+
+    ' The TXT pairs (section 3): sid is new each time the receiver starts.
+    function txt(config as Object, sid as String, serverIdentity as String) as Object
+        pairs = [["v", VERSION.ToStr()], ["name", util.text(config.deviceName)], ["id", util.text(config.deviceId)], ["sid", sid], ["st", util.text(config.state)]]
+        if config.state = "login" and serverIdentity <> "" then pairs.Push(["srv", serverIdentity])
+        return pairs
+    end function
+
+    function send(id as String, text as String) as Object
+        return { kind: "send", id: id, text: text }
+    end function
+
+    function emit(event as Object) as Object
+        return { kind: "emit", event: event }
+    end function
+end namespace

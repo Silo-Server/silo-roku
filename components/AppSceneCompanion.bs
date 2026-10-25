@@ -1,0 +1,571 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/api/request.bs"
+import "pkg:/source/control/pairing.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/nav/stack.bs"
+import "pkg:/source/onboarding/address.bs"
+import "pkg:/source/platform/topics.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' AppScene as companion sign-in's receiver (docs/companion-pairing.md). While
+' the server or sign-in screen is on top, ControlTask serves
+' _silopair-roku._tcp (service "pairing"); a phone that connects pushes a
+' server, and this file runs the attempt: the Roku's consent, the server
+' and identity checks, the device login whose code the Companion screen
+' shows, and the polls, through the auth coordinator's companion
+' operations (source/auth/companion.bs). The session a sign-in installs
+' moves the app on to the profile picker. Built only with bs_const
+' companion.
+
+const COMPANION_OWNER = "companion"
+' Section 4: a phone that sends nothing this long, with no attempt in
+' flight, is closed.
+const COMPANION_IDLE_SECONDS = 180
+' Section 5 step 5: after a sign-in the receiver waits this long for the
+' phone's done before it stops.
+const COMPANION_FINISH_SECONDS = 3
+
+sub companionInit()
+    m.companion = { task: invalid, taskReady: false, queued: [], retiring: [], mode: "", serverIdentity: "", identityOrigin: "", identityHandle: invalid, sid: "", phone: "", consented: false, push: invalid, stage: "idle", alternate: invalid, probing: [], userCode: "", matchCode: "", failure: "", help: "", handle: invalid, requestOpen: false, clock: CreateObject("roTimespan"), deadline: 0, interval: 5, signedIn: false, finishing: false }
+    m.companionPollTimer = m.top.findNode("companionPollTimer")
+    m.companionIdleTimer = m.top.findNode("companionIdleTimer")
+    m.companionFinishTimer = m.top.findNode("companionFinishTimer")
+    #if companion
+        m.companionPollTimer.observeField("fire", "onCompanionPoll")
+        m.companionIdleTimer.observeField("fire", "onCompanionIdle")
+        m.companionFinishTimer.observeField("fire", "companionFinish")
+    #end if
+end sub
+
+' Called after each navigation and session change: the receiver runs while
+' the server screen, or the sign-in screen of a confirmed server, is on top
+' (section 3), and through its own Companion screen and a sign-in's finish.
+sub companionRefresh()
+    #if companion
+        wanted = companionWanted()
+        if wanted = m.companion.mode then return
+        if m.companion.mode <> "" then companionStop("receiver_cancelled")
+        if wanted <> "" then companionStart(wanted)
+    #end if
+end sub
+
+function companionWanted() as String
+    view = m.apiSession
+    if view = invalid or util.text(view.deviceId) = "" then return ""
+    if m.companion.finishing then return m.companion.mode
+    ' An approval publishes its session before the poll that collected it
+    ' answers: the attempt keeps the receiver until that answer arrives, so
+    ' the phone hears signedIn rather than a cancel.
+    if m.companion.stage = "code" and m.companion.requestOpen then return m.companion.mode
+    top = nav.stack.topEntry(m.navStack)
+    if top = invalid then return ""
+    if top.route = nav.route.COMPANION then return m.companion.mode
+    if top.route = nav.route.SETUP then return "setup"
+    if top.route = nav.route.SIGN_IN and view.status = "signed_out" and view.originStatus = "verified" then return "login"
+    return ""
+end function
+
+' A sign-in screen advertises its server's identity (srv), read first.
+sub companionStart(mode as String)
+    m.companion.mode = mode
+    m.companion.sid = CreateObject("roDeviceInfo").GetRandomUUID()
+    if mode = "login" and m.companion.identityOrigin <> m.apiSession.origin
+        handle = api.newHandle(COMPANION_OWNER)
+        handle.observeField("status", "onCompanionIdentity")
+        m.companion.identityHandle = handle
+        apiSend({ path: "/api/v2/system/identity" }, handle)
+        return
+    end if
+    companionRun()
+end sub
+
+sub onCompanionIdentity(event as Object)
+    handle = event.getRoSGNode()
+    if m.companion.identityHandle = invalid or not handle.isSameNode(m.companion.identityHandle) then return
+    m.companion.identityHandle = invalid
+    if m.companion.mode <> "login" then return
+    result = api.resultOf(handle)
+    identity = ""
+    if result <> invalid and result.ok = true and util.isObject(result.body) then identity = util.text(result.body.server_id).Trim()
+    ' Without an identity no phone could name this server: nothing
+    ' advertises, and the next refresh asks again.
+    if identity = ""
+        m.companion.mode = ""
+        return
+    end if
+    m.companion.serverIdentity = identity
+    m.companion.identityOrigin = m.apiSession.origin
+    companionRun()
+end sub
+
+sub companionRun()
+    task = CreateObject("roSGNode", "ControlTask")
+    task.observeField("ready", "onCompanionTaskReady")
+    task.observeField("event", "onCompanionEvent")
+    m.companion.task = task
+    m.companion.taskReady = false
+    m.companion.queued = []
+    config = companionConfig()
+    companionCommand({ kind: "start", service: "pairing", config: config, txt: silocontrol.pairing.txt(config, m.companion.sid, m.companion.serverIdentity) })
+    task.control = "run"
+    log.info("companion", "receiver starting", { state: m.companion.mode })
+end sub
+
+function companionConfig() as Object
+    return { deviceName: controlDeviceName(), deviceId: util.text(m.apiSession.deviceId), state: m.companion.mode }
+end function
+
+' Stops the receiver: a phone mid-attempt hears reason (cancel), an open
+' device request is withdrawn, and the Companion screen goes.
+sub companionStop(reason as String)
+    if m.companion.identityHandle <> invalid
+        m.companion.identityHandle.unobserveField("status")
+        m.companion.identityHandle = invalid
+    end if
+    if m.companion.signedIn then reason = ""
+    companionAbandon()
+    task = m.companion.task
+    if task <> invalid
+        if m.companion.taskReady
+            task.command = { kind: "stop", reason: reason }
+        else
+            m.companion.retiring.Push({ task: task, reason: reason })
+        end if
+    end if
+    m.companion.task = invalid
+    m.companion.mode = ""
+    m.companion.phone = ""
+    m.companion.consented = false
+    m.companion.push = invalid
+    m.companion.stage = "idle"
+    m.companion.signedIn = false
+    m.companion.finishing = false
+    m.companionIdleTimer.control = "stop"
+    m.companionFinishTimer.control = "stop"
+    companionLeaveScreen()
+    log.info("companion", "receiver stopped")
+end sub
+
+sub companionCommand(command as Object)
+    task = m.companion.task
+    if task = invalid then return
+    if m.companion.taskReady
+        task.command = command
+    else
+        m.companion.queued.Push(command)
+    end if
+end sub
+
+sub onCompanionTaskReady(event as Object)
+    task = event.getRoSGNode()
+    if not task.ready then return
+    kept = []
+    for each retired in m.companion.retiring
+        if retired.task.isSameNode(task)
+            task.command = { kind: "stop", reason: retired.reason }
+        else
+            kept.Push(retired)
+        end if
+    end for
+    m.companion.retiring = kept
+    if m.companion.task = invalid or not task.isSameNode(m.companion.task) then return
+    m.companion.taskReady = true
+    for each command in m.companion.queued
+        task.command = command
+    end for
+    m.companion.queued = []
+end sub
+
+' ---- The phone (section 4)
+
+sub onCompanionEvent(event as Object)
+    task = event.getRoSGNode()
+    if m.companion.task = invalid or not task.isSameNode(m.companion.task) then return
+    data = event.getData()
+    if not util.isObject(data) then return
+    kind = util.text(data.type)
+    if kind = "phone"
+        m.companion.phone = util.text(data.id)
+        m.companion.consented = false
+        companionArmIdle()
+        log.info("companion", "phone connected")
+    else if data.id <> invalid and util.text(data.id) <> m.companion.phone
+        return
+    else if kind = "push"
+        companionArmIdle()
+        companionPush(data.server)
+    else if kind = "done" or kind = "cancel" or kind = "gone"
+        companionPhoneLeft(kind = "gone")
+    else if kind = "failed"
+        log.warn("companion", "the receiver could not listen")
+    end if
+end sub
+
+sub companionSend(text as String)
+    if m.companion.phone = "" then return
+    companionCommand({ kind: "send", id: m.companion.phone, text: text })
+end sub
+
+' Closes the phone after text ("" for none).
+sub companionClosePhone(text as String)
+    if m.companion.phone = "" then return
+    companionCommand({ kind: "close", text: text })
+    m.companion.phone = ""
+    m.companionIdleTimer.control = "stop"
+end sub
+
+sub companionArmIdle()
+    companionRestartTimer(m.companionIdleTimer, COMPANION_IDLE_SECONDS)
+end sub
+
+sub companionRestartTimer(timer as Object, seconds as Integer)
+    timer.control = "stop"
+    timer.duration = seconds
+    timer.control = "start"
+end sub
+
+' Idle past the limit with nothing in flight: the phone goes. An attempt
+' checking, waiting on the viewer's choice of address, or showing its code
+' is in flight.
+sub onCompanionIdle()
+    stage = m.companion.stage
+    if stage = "reaching" or stage = "unreachable" or stage = "code"
+        companionArmIdle()
+        return
+    end if
+    companionClosePhone(silocontrol.pairing.cancel("idle_timeout"))
+    if stage = "consent"
+        m.companion.stage = "idle"
+        companionLeaveScreen()
+    end if
+end sub
+
+' The phone sent done or cancel, or left.
+sub companionPhoneLeft(gone as Boolean)
+    if m.companion.signedIn
+        companionFinish()
+        return
+    end if
+    companionAbandon()
+    if not gone then companionClosePhone("")
+    m.companion.phone = ""
+    m.companionIdleTimer.control = "stop"
+    if m.companion.stage = "failed"
+        companionPublish()
+        return
+    end if
+    m.companion.stage = "idle"
+    companionLeaveScreen()
+end sub
+
+' ---- An attempt (section 5)
+
+sub companionPush(server as Dynamic)
+    if not util.isObject(server) then return
+    ' A Roku keeps one server (section 4).
+    if m.companion.signedIn
+        companionSend(silocontrol.pairing.serverResult(util.text(server.url), "auth_failed"))
+        return
+    end if
+    ' A new push replaces the one in flight.
+    companionAbandon()
+    m.companion.push = server
+    m.companion.alternate = invalid
+    m.companion.failure = ""
+    m.companion.help = ""
+    if m.companion.consented
+        companionBegin()
+    else
+        m.companion.stage = "consent"
+        companionShowScreen()
+    end if
+end sub
+
+' Checks the pushed server (step 2): at the pushed address on the server
+' screen; on the sign-in screen, only the Roku's own server, by identity.
+sub companionBegin()
+    push = m.companion.push
+    if push = invalid then return
+    address = push.url
+    if m.companion.mode = "login"
+        if push.identity = ""
+            companionFail("update_required")
+            return
+        end if
+        if push.identity <> m.companion.serverIdentity
+            companionFail("identity_mismatch")
+            return
+        end if
+        address = m.apiSession.origin
+    end if
+    m.companion.stage = "reaching"
+    companionShowScreen()
+    companionRequest({ session: "companionServer", address: address, identity: push.identity }, "onCompanionServer")
+end sub
+
+' One coordinator operation at a time; a newer one, or abandoning the
+' attempt, drops the answer of the one before.
+sub companionRequest(input as Object, callback as String)
+    companionDropHandle()
+    handle = api.newHandle(COMPANION_OWNER)
+    handle.observeField("status", callback)
+    m.companion.handle = handle
+    apiSend(input, handle)
+end sub
+
+function companionTake(event as Object) as Dynamic
+    handle = event.getRoSGNode()
+    if m.companion.handle = invalid or not handle.isSameNode(m.companion.handle) then return invalid
+    m.companion.handle = invalid
+    return api.resultOf(handle)
+end function
+
+sub companionDropHandle()
+    if m.companion.handle = invalid then return
+    m.companion.handle.unobserveField("status")
+    m.companion.handle = invalid
+end sub
+
+sub onCompanionServer(event as Object)
+    result = companionTake(event)
+    if result = invalid then return
+    if result.ok = true
+        companionStartLogin()
+        return
+    end if
+    kind = companionErrorKind(result)
+    if kind = "unreachable"
+        companionProbeAlternates()
+    else if kind = "identity_mismatch"
+        companionFail("identity_mismatch")
+    else if kind = "server_update_required" or kind = "origin_unconfirmed"
+        companionFail("update_required")
+    else
+        companionFail("auth_failed")
+    end if
+end sub
+
+' The pushed address gave no answer: the server's other addresses are
+' checked for the same identity, and the first that answers is offered.
+sub companionProbeAlternates()
+    push = m.companion.push
+    m.companion.probing = []
+    if push.identity <> ""
+        for each endpoint in push.endpoints
+            if endpoint.url <> push.url then m.companion.probing.Push(endpoint)
+        end for
+    end if
+    companionProbeNext()
+end sub
+
+sub companionProbeNext()
+    if m.companion.probing.Count() = 0
+        m.companion.stage = "unreachable"
+        companionPublish()
+        return
+    end if
+    endpoint = m.companion.probing[0]
+    companionRequest({ session: "companionServer", address: endpoint.url, identity: m.companion.push.identity }, "onCompanionProbed")
+end sub
+
+sub onCompanionProbed(event as Object)
+    result = companionTake(event)
+    if result = invalid then return
+    endpoint = m.companion.probing.Shift()
+    if result.ok = true
+        m.companion.alternate = endpoint
+        m.companion.probing = []
+        m.companion.stage = "unreachable"
+        companionPublish()
+        return
+    end if
+    companionProbeNext()
+end sub
+
+' Step 3: the device login at the confirmed address.
+sub companionStartLogin()
+    companionRequest({ session: "companionStart", deviceName: controlDeviceName() }, "onCompanionStarted")
+end sub
+
+sub onCompanionStarted(event as Object)
+    result = companionTake(event)
+    if result = invalid then return
+    if result.ok <> true
+        if companionErrorKind(result) = "unreachable"
+            companionFail("unreachable")
+        else
+            companionFail("auth_failed")
+        end if
+        return
+    end if
+    body = result.body
+    m.companion.requestOpen = true
+    m.companion.userCode = util.text(body.userCode)
+    m.companion.matchCode = util.text(body.matchCode)
+    m.companion.interval = body.interval
+    m.companion.deadline = m.companion.clock.TotalMilliseconds() + body.expiresIn * 1000
+    m.companion.stage = "code"
+    companionSend(silocontrol.pairing.deviceStarted(m.companion.push.url, m.companion.userCode, m.companion.matchCode))
+    companionPublish()
+    companionSchedulePoll(m.companion.interval)
+end sub
+
+sub companionSchedulePoll(seconds as Integer)
+    if seconds < 1 then seconds = 1
+    companionRestartTimer(m.companionPollTimer, seconds)
+end sub
+
+' Step 4.
+sub onCompanionPoll()
+    if m.companion.stage <> "code" or not m.companion.requestOpen then return
+    if m.companion.clock.TotalMilliseconds() > m.companion.deadline
+        companionFail("expired")
+        return
+    end if
+    companionRequest({ session: "companionPoll" }, "onCompanionPolled")
+end sub
+
+sub onCompanionPolled(event as Object)
+    result = companionTake(event)
+    if result = invalid then return
+    if result.ok <> true
+        ' A network blip or a 5xx while the phone approves: poll again.
+        if companionErrorKind(result) = "handoff_gone"
+            m.companion.requestOpen = false
+            companionFail("expired")
+        else
+            companionSchedulePoll(m.companion.interval)
+        end if
+        return
+    end if
+    status = util.text(result.body.status)
+    if status = "pending"
+        wait = m.companion.interval
+        if util.isNumber(result.body.pollAfter) and result.body.pollAfter > wait then wait = result.body.pollAfter
+        companionSchedulePoll(wait)
+        return
+    end if
+    m.companion.requestOpen = false
+    if status = "approved"
+        companionSignedIn()
+    else if status = "denied"
+        companionFail("denied")
+    else if status = "invalid"
+        companionFail("auth_failed")
+    else
+        companionFail("expired")
+    end if
+end sub
+
+' Step 5: the session is installed; the phone hears so, and the receiver
+' stops after the phone's done or COMPANION_FINISH_SECONDS.
+sub companionSignedIn()
+    m.companion.signedIn = true
+    m.companion.finishing = true
+    m.companion.stage = "signedIn"
+    companionSend(silocontrol.pairing.serverResult(m.companion.push.url, ""))
+    companionPublish()
+    companionRestartTimer(m.companionFinishTimer, COMPANION_FINISH_SECONDS)
+    log.info("companion", "signed in")
+end sub
+
+sub companionFinish()
+    if not m.companion.finishing then return
+    m.companion.finishing = false
+    companionStop("")
+    companionRefresh()
+end sub
+
+' A failure stays on screen until the viewer acts; the phone hears why.
+sub companionFail(code as String)
+    companionAbandon()
+    m.companion.stage = "failed"
+    m.companion.failure = code
+    if m.companion.push <> invalid then companionSend(silocontrol.pairing.serverResult(m.companion.push.url, code))
+    companionShowScreen()
+    log.info("companion", "sign-in failed", { code: code })
+end sub
+
+' Stops the attempt in flight and withdraws a device request it opened
+' (step 6). An operation still in flight ends with the attempt too: the
+' coordinator withdraws a request a pending start opens.
+sub companionAbandon()
+    inFlight = m.companion.handle <> invalid
+    companionDropHandle()
+    m.companionPollTimer.control = "stop"
+    m.companion.probing = []
+    if m.companion.requestOpen or inFlight
+        m.companion.requestOpen = false
+        apiSend({ session: "companionCancel" }, api.newHandle(COMPANION_OWNER))
+    end if
+end sub
+
+function companionErrorKind(result as Object) as String
+    if not util.isObject(result.error) then return ""
+    return util.text(result.error.kind)
+end function
+
+' ---- The Companion screen
+
+' What the Companion screen shows (CompanionScreen), published as
+' platform.topic.COMPANION_STATUS.
+sub companionPublish()
+    push = m.companion.push
+    name = ""
+    address = ""
+    if push <> invalid
+        address = push.url
+        name = push.name
+        if name = "" then name = onboarding.address.hostOf(address)
+    end if
+    alternate = ""
+    if m.companion.alternate <> invalid then alternate = m.companion.alternate.url
+    status = { stage: m.companion.stage, serverName: name, address: address, http: LCase(Left(address, 7)) = "http://", userCode: m.companion.userCode, matchCode: m.companion.matchCode, failure: m.companion.failure, alternate: alternate, signIn: m.companion.mode = "login" }
+    m.top.companionStatus = status
+    platformPublish({ type: platform.topic.COMPANION_STATUS, status: status })
+end sub
+
+sub companionShowScreen()
+    companionPublish()
+    top = nav.stack.topEntry(m.navStack)
+    if top <> invalid and top.route <> nav.route.COMPANION then navPush(nav.route.COMPANION, {})
+end sub
+
+sub companionLeaveScreen()
+    companionPublish()
+    top = nav.stack.topEntry(m.navStack)
+    if top <> invalid and top.route = nav.route.COMPANION then navPop()
+end sub
+
+' The Companion screen's buttons: "allow", "deny", "cancel", "alternate",
+' "retry", and "dismiss" (a failure's Try again, or Back).
+sub companionAct(action as String)
+    stage = m.companion.stage
+    if action = "allow" and stage = "consent"
+        m.companion.consented = true
+        companionBegin()
+    else if action = "deny" and stage = "consent"
+        companionClosePhone(silocontrol.pairing.cancel("consent_denied"))
+        m.companion.stage = "idle"
+        companionLeaveScreen()
+    else if action = "alternate" and stage = "unreachable" and m.companion.alternate <> invalid
+        ' The alternate's check confirmed it for this attempt.
+        m.companion.stage = "reaching"
+        companionPublish()
+        companionStartLogin()
+    else if action = "retry" and stage = "unreachable"
+        companionBegin()
+    else if action = "cancel" and stage <> "signedIn"
+        companionAbandon()
+        if stage = "unreachable" and m.companion.push <> invalid then companionSend(silocontrol.pairing.serverResult(m.companion.push.url, "unreachable"))
+        companionClosePhone(silocontrol.pairing.cancel("receiver_cancelled"))
+        m.companion.stage = "idle"
+        companionLeaveScreen()
+    else if action = "dismiss" and stage = "failed"
+        m.companion.stage = "idle"
+        m.companion.failure = ""
+        companionLeaveScreen()
+    end if
+end sub

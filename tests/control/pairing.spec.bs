@@ -1,0 +1,91 @@
+namespace tests
+
+    ' Companion sign-in's receiver (source/control/pairing.bs): the pairing
+    ' protocol's frames as the Apple and Android TVs send them, and the one
+    ' phone a Roku talks to.
+    @suite("silocontrol pairing")
+    class SiloControlPairingTests extends rooibos.BaseTestSuite
+
+        function config() as Object
+            return { deviceName: "Living Room", deviceId: "dev-1", state: "setup" }
+        end function
+
+        @describe("frames")
+
+        @it("says hello as the other TVs do")
+        sub _()
+            m.assertEqual(ParseJson(silocontrol.pairing.hello(m.config())), { type: "hello", v: 1, tvName: "Living Room", tvDeviceId: "dev-1", state: "setup", supportedVersions: [1] })
+        end sub
+
+        @it("writes deviceStarted and serverResult")
+        sub _()
+            m.assertEqual(ParseJson(silocontrol.pairing.deviceStarted("https://a.example", "1234-5678", "warm pony")), { type: "deviceStarted", v: 1, serverURL: "https://a.example", userCode: "1234-5678", matchCode: "warm pony" })
+            m.assertEqual(ParseJson(silocontrol.pairing.serverResult("https://a.example", "")), { type: "serverResult", v: 1, serverURL: "https://a.example", status: "signedIn" })
+            m.assertEqual(ParseJson(silocontrol.pairing.serverResult("https://a.example", "denied")), { type: "serverResult", v: 1, serverURL: "https://a.example", status: "failed", error: "denied" })
+        end sub
+
+        @it("reads a push with its identity and endpoints")
+        sub _()
+            message = silocontrol.pairing.decode(FormatJson({ type: "pushServer", v: 1, serverURL: " https://a.example ", serverName: "Home", serverIdentity: "srv-1", endpoints: [{ url: "https://b.example", kind: "provider", provider: "tailscale", displayName: "Tailscale" }, { kind: "public" }] }))
+            m.assertEqual(message.kind, "pushServer")
+            m.assertEqual(message.server.url, "https://a.example")
+            m.assertEqual(message.server.identity, "srv-1")
+            m.assertEqual(message.server.endpoints, [{ url: "https://b.example", kind: "provider", provider: "tailscale", displayName: "Tailscale" }])
+        end sub
+
+        @it("reads done and cancel, ignores other types, and refuses the rest")
+        sub _()
+            m.assertEqual(silocontrol.pairing.decode("{""type"":""done"",""v"":1}"), { kind: "done" })
+            m.assertEqual(silocontrol.pairing.decode("{""type"":""cancel"",""v"":1,""reason"":""user""}"), { kind: "cancel", reason: "user" })
+            m.assertEqual(silocontrol.pairing.decode("{""type"":""future"",""v"":1}").kind, "ignored")
+            m.assertEqual(silocontrol.pairing.decode("{""type"":""pushServer"",""v"":1}").kind, "invalid")
+            m.assertEqual(silocontrol.pairing.decode("[1]").kind, "invalid")
+        end sub
+
+        @it("advertises its server's identity only on the sign-in screen")
+        sub _()
+            setup = silocontrol.pairing.txt(m.config(), "sid-1", "srv-1")
+            m.assertEqual(setup, [["v", "1"], ["name", "Living Room"], ["id", "dev-1"], ["sid", "sid-1"], ["st", "setup"]])
+            login = m.config()
+            login.state = "login"
+            m.assertEqual(silocontrol.pairing.txt(login, "sid-1", "srv-1")[5], ["srv", "srv-1"])
+        end sub
+
+        @describe("the phone")
+
+        @it("greets one local phone and drops anyone else")
+        sub _()
+            state = silocontrol.pairing.create(m.config())
+            actions = silocontrol.pairing.accepted(state, "c1", "10.0.0.20:5000")
+            m.assertEqual(actions[0].kind, "send")
+            m.assertEqual(actions[1].event, { type: "phone", id: "c1" })
+            m.assertEqual(silocontrol.pairing.accepted(state, "c2", "10.0.0.21:5000"), [{ kind: "drop", id: "c2" }])
+            other = silocontrol.pairing.create(m.config())
+            m.assertEqual(silocontrol.pairing.accepted(other, "c3", "8.8.8.8:5000"), [{ kind: "drop", id: "c3" }])
+        end sub
+
+        @it("hands a push to AppScene and closes on a bad frame")
+        sub _()
+            state = silocontrol.pairing.create(m.config())
+            silocontrol.pairing.accepted(state, "c1", "10.0.0.20:5000")
+            actions = silocontrol.pairing.frame(state, "c1", "{""type"":""pushServer"",""v"":1,""serverURL"":""https://a.example""}")
+            m.assertEqual(actions[0].event.type, "push")
+            m.assertEqual(actions[0].event.server.url, "https://a.example")
+            actions = silocontrol.pairing.frame(state, "c1", "nope")
+            m.assertEqual(actions[0], { kind: "close", id: "c1", text: "" })
+            m.assertEqual(actions[1].event, { type: "gone", id: "c1" })
+            m.assertEqual(state.phone, "")
+        end sub
+
+        @it("says why when it stops with a phone on the line")
+        sub _()
+            state = silocontrol.pairing.create(m.config())
+            silocontrol.pairing.accepted(state, "c1", "10.0.0.20:5000")
+            actions = silocontrol.pairing.closeAll(state, "receiver_cancelled")
+            m.assertEqual(ParseJson(actions[0].text), { type: "cancel", v: 1, reason: "receiver_cancelled" })
+            m.assertEqual(silocontrol.pairing.closeAll(state, "x"), [])
+        end sub
+
+    end class
+
+end namespace

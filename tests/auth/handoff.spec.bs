@@ -1,0 +1,295 @@
+namespace tests
+
+    ' Profile handoff in the account session (source/auth/handoff.bs), driven
+    ' through tests.sessions. Bodies follow the server contract's
+    ' DeviceLoginCapability, DeviceLoginStart, and DeviceLoginPoll.
+    @suite("auth handoff")
+    class AuthHandoffTests extends rooibos.BaseTestSuite
+
+        function capability() as Object
+            return { remote_playback_handoff: true, jellyfin_quick_connect: false, protocol_versions: [2], cancel: true, opened_signal: true, revision: "r1", state: "available", allowed: true }
+        end function
+
+        function started() as Object
+            return { device_code: "dev-secret", user_code: "48217730", match_code: "warm pony", verification_uri: "https://silo.example/activate", verification_uri_complete: "https://silo.example/activate?code=48217730", expires_at: "2026-10-25T18:15:00.123Z", expires_in: 900, interval: 3, device_name: "Living Room", device_platform: "roku", client_purpose: "remote_playback", temporary: true }
+        end function
+
+        function approved() as Object
+            return { status: "approved", poll_after: 3, opened: true, profile_id: "kid", profile_token: "ptok", temporary: true, session_expires_at: "2026-10-26T18:00:00Z", tokens: { access_token: "bacc", refresh_token: "bref", expires_in: 3600, user: { id: "7", username: "sam", role: "user" } } }
+        end function
+
+        ' A signed-in loop with the own profile "main" open.
+        function signedIn() as Object
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "sel", session: "selectProfile", profile: { id: "main", name: "Main" } })
+            return loop
+        end function
+
+        ' Runs a handoff to approval and installs it; gives the handoff's ID.
+        function borrowed(loop as Object) as String
+            tests.sessions.send(loop, { requestId: "h1", session: "handoffStart", deviceName: "Living Room" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/capability"), 200, m.capability())
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, m.started())
+            id = loop.delivered.h1.body.handoffId
+            tests.sessions.send(loop, { requestId: "p1", session: "handoffPoll", handoffId: id })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, m.approved())
+            tests.sessions.send(loop, { requestId: "b1", session: "borrow", handoffId: id })
+            return id
+        end function
+
+        function borrowedFence() as Object
+            return { server: "https://silo.example", account: "7", profile: "kid" }
+        end function
+
+        @describe("starting")
+
+        @it("checks the capability, starts a temporary login, and keeps the device code")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "h1", session: "handoffStart", deviceName: "Living Room" })
+            capability = tests.sessions.runningId(loop, "/api/v2/auth/device/capability")
+            m.assertNotInvalid(capability)
+            tests.sessions.respond(loop, capability, 200, m.capability())
+            m.assertEqual(loop.running[tests.sessions.runningId(loop, "/api/v2/auth/device/start")].request.body, { device_name: "Living Room", device_platform: "roku", client_purpose: "remote_playback", temporary: true })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, m.started())
+            body = loop.delivered.h1.body
+            m.assertEqual(body.userCode, "48217730")
+            m.assertEqual(body.matchCode, "warm pony")
+            m.assertEqual(body.interval, 3)
+            m.assertFalse(FormatJson(loop.delivered.h1).Instr("dev-secret") >= 0)
+        end sub
+
+        @it("refuses a server without remote playback handoff")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "h1", session: "handoffStart", deviceName: "Living Room" })
+            caps = m.capability()
+            caps.remote_playback_handoff = false
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/capability"), 200, caps)
+            m.assertEqual(loop.delivered.h1.error.kind, "handoff_unsupported")
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/auth/device/start"))
+        end sub
+
+        @it("refuses a start that does not echo the purpose")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "h1", session: "handoffStart", deviceName: "Living Room" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/capability"), 200, m.capability())
+            start = m.started()
+            start.temporary = false
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, start)
+            m.assertEqual(loop.delivered.h1.error.kind, "handoff_unsupported")
+        end sub
+
+        @describe("polling")
+
+        @it("polls with the device code, and forgets a denied handoff")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "h1", session: "handoffStart", deviceName: "Living Room" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/capability"), 200, m.capability())
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, m.started())
+            id = loop.delivered.h1.body.handoffId
+            tests.sessions.send(loop, { requestId: "p1", session: "handoffPoll", handoffId: id })
+            m.assertEqual(loop.running[tests.sessions.runningId(loop, "/api/v2/auth/device/poll")].request.body, { device_code: "dev-secret" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, { status: "pending", poll_after: 5, opened: false, profile_id: "", profile_token: "", temporary: true })
+            m.assertEqual(loop.delivered.p1.body.status, "pending")
+            m.assertEqual(loop.delivered.p1.body.pollAfter, 5)
+            tests.sessions.send(loop, { requestId: "p2", session: "handoffPoll", handoffId: id })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, { status: "denied", poll_after: 5, opened: true, profile_id: "", profile_token: "", temporary: true })
+            m.assertEqual(loop.delivered.p2.body.status, "denied")
+            tests.sessions.send(loop, { requestId: "p3", session: "handoffPoll", handoffId: id })
+            m.assertEqual(loop.delivered.p3.error.kind, "handoff_gone")
+        end sub
+
+        @it("refuses an approval without tokens or a temporary session")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "h1", session: "handoffStart", deviceName: "Living Room" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/capability"), 200, m.capability())
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, m.started())
+            approval = m.approved()
+            approval.temporary = false
+            tests.sessions.send(loop, { requestId: "p1", session: "handoffPoll", handoffId: loop.delivered.h1.body.handoffId })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, approval)
+            m.assertEqual(loop.delivered.p1.body.status, "invalid")
+            m.assertFalse(FormatJson(loop.delivered.p1).Instr("bacc") >= 0)
+        end sub
+
+        @it("withdraws a handoff with the device code")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "h1", session: "handoffStart", deviceName: "Living Room" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/capability"), 200, m.capability())
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, m.started())
+            tests.sessions.send(loop, { requestId: "c1", session: "handoffCancel", handoffId: loop.delivered.h1.body.handoffId })
+            cancel = tests.sessions.runningId(loop, "/api/v2/auth/device/cancel")
+            m.assertEqual(loop.running[cancel].request.body, { device_code: "dev-secret" })
+            m.assertTrue(loop.delivered.c1.ok)
+        end sub
+
+        @it("withdraws a login whose start answers after the handoff was withdrawn")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "h1", session: "handoffStart", deviceName: "Living Room", startKey: "s1" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/capability"), 200, m.capability())
+            start = tests.sessions.runningId(loop, "/api/v2/auth/device/start")
+            tests.sessions.send(loop, { requestId: "c1", session: "handoffCancel", startKey: "s1" })
+            m.assertTrue(loop.delivered.c1.ok)
+            tests.sessions.respond(loop, start, 201, m.started())
+            m.assertEqual(loop.delivered.h1.error.kind, "handoff_gone")
+            cancel = tests.sessions.runningId(loop, "/api/v2/auth/device/cancel")
+            m.assertEqual(loop.running[cancel].request.body, { device_code: "dev-secret" })
+            m.assertEqual(loop.session.handoffs, {})
+        end sub
+
+        @it("starts no login for a handoff withdrawn while the capability is checked")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "h1", session: "handoffStart", deviceName: "Living Room", startKey: "s1" })
+            tests.sessions.send(loop, { requestId: "c1", session: "handoffCancel", startKey: "s1" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/capability"), 200, m.capability())
+            m.assertEqual(loop.delivered.h1.error.kind, "handoff_gone")
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/auth/device/start"))
+        end sub
+
+        @it("logs out an approved handoff that is withdrawn before use")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "h1", session: "handoffStart", deviceName: "Living Room" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/capability"), 200, m.capability())
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, m.started())
+            id = loop.delivered.h1.body.handoffId
+            tests.sessions.send(loop, { requestId: "p1", session: "handoffPoll", handoffId: id })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, m.approved())
+            tests.sessions.send(loop, { requestId: "c1", session: "handoffCancel", handoffId: id })
+            logout = tests.sessions.runningId(loop, "/api/v2/auth/logout")
+            m.assertEqual(loop.running[logout].headers.Authorization, "Bearer bacc")
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/auth/device/cancel"))
+            m.assertInvalid(api.auth.coordinator.view(loop.session).borrowed)
+        end sub
+
+        @describe("the borrowed identity")
+
+        @it("sends requests fenced to it with its tokens and profile, and others with the Roku's own")
+        sub _()
+            loop = m.signedIn()
+            m.borrowed(loop)
+            m.assertEqual(loop.delivered.b1.body.identity, m.borrowedFence())
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual(view.borrowed.profileId, "kid")
+            m.assertEqual(view.profile.id, "main")
+            tests.sessions.send(loop, { requestId: "w1", path: "/api/v2/watch/c1", auth: "profile", fence: m.borrowedFence() })
+            m.assertEqual(loop.running.w1.headers.Authorization, "Bearer bacc")
+            m.assertEqual(loop.running.w1.headers["X-Profile-Id"], "kid")
+            m.assertEqual(loop.running.w1.headers["X-Profile-Token"], "ptok")
+            tests.sessions.send(loop, { requestId: "w2", path: "/api/v2/watch/c1", auth: "profile" })
+            m.assertEqual(loop.running.w2.headers.Authorization, "Bearer acc")
+            m.assertEqual(loop.running.w2.headers["X-Profile-Id"], "main")
+        end sub
+
+        @it("never writes the borrowed identity to the registry")
+        sub _()
+            loop = m.signedIn()
+            m.borrowed(loop)
+            record = api.auth.coordinator.record(loop.session)
+            text = FormatJson(storage.encode(record))
+            m.assertFalse(text.Instr("bacc") >= 0)
+            m.assertFalse(text.Instr("bref") >= 0)
+            m.assertFalse(text.Instr("ptok") >= 0)
+            m.assertEqual(record.profileId, "main")
+        end sub
+
+        @it("refuses a request fenced to an identity that has gone")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "w1", path: "/api/v2/watch/c1", auth: "profile", fence: m.borrowedFence() })
+            m.assertEqual(loop.delivered.w1.error.kind, "identity_changed")
+        end sub
+
+        @it("refreshes its own tokens after a 401 and retries the request once")
+        sub _()
+            loop = m.signedIn()
+            m.borrowed(loop)
+            tests.sessions.send(loop, { requestId: "w1", path: "/api/v2/watch/c1", auth: "profile", fence: m.borrowedFence() })
+            tests.sessions.respond(loop, "w1", 401, tests.sessions.fixture("token_refresh_required"))
+            refresh = tests.sessions.runningId(loop, "/api/v2/auth/refresh")
+            m.assertEqual(loop.running[refresh].request.body, { refresh_token: "bref" })
+            ' A late answer still applies: the server may have rotated the token.
+            m.assertTrue(loop.running[refresh].request.rotatesCredentials)
+            tests.sessions.respond(loop, refresh, 200, { access_token: "bacc2", refresh_token: "bref2", expires_in: 3600 })
+            m.assertEqual(loop.running.w1.headers.Authorization, "Bearer bacc2")
+            ' The Roku's own tokens are untouched.
+            tests.sessions.send(loop, { requestId: "w2", path: "/api/v2/watch/c1", auth: "profile" })
+            m.assertEqual(loop.running.w2.headers.Authorization, "Bearer acc")
+        end sub
+
+        @it("forgets it when its refresh is refused, and says it expired")
+        sub _()
+            loop = m.signedIn()
+            m.borrowed(loop)
+            tests.sessions.send(loop, { requestId: "w1", path: "/api/v2/watch/c1", auth: "profile", fence: m.borrowedFence() })
+            tests.sessions.respond(loop, "w1", 401, tests.sessions.fixture("token_refresh_required"))
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/refresh"), 401, tests.sessions.fixture("refresh_session_revoked"))
+            view = api.auth.coordinator.view(loop.session)
+            m.assertInvalid(view.borrowed)
+            m.assertEqual(view.borrowedReason, "expired")
+            m.assertEqual(view.status, "signed_in")
+        end sub
+
+        @it("logs out once with its token when it ends")
+        sub _()
+            loop = m.signedIn()
+            m.borrowed(loop)
+            tests.sessions.send(loop, { requestId: "e1", session: "borrowedEnd" })
+            logout = tests.sessions.runningId(loop, "/api/v2/auth/logout")
+            m.assertEqual(loop.running[logout].headers.Authorization, "Bearer bacc")
+            m.assertInvalid(api.auth.coordinator.view(loop.session).borrowed)
+            m.assertEqual(api.auth.coordinator.view(loop.session).borrowedReason, "")
+        end sub
+
+        @it("ends with the Roku's sign-out, logging out both")
+        sub _()
+            loop = m.signedIn()
+            m.borrowed(loop)
+            tests.sessions.send(loop, { requestId: "so", session: "signOut" })
+            tokens = []
+            for each id in loop.running
+                entry = loop.running[id]
+                if tests.sessions.pathOf(entry.request) = "/api/v2/auth/logout" then tokens.Push(entry.headers.Authorization)
+            end for
+            tokens.Sort()
+            m.assertEqual(tokens, ["Bearer acc", "Bearer bacc"])
+            m.assertInvalid(api.auth.coordinator.view(loop.session).borrowed)
+        end sub
+
+        @it("gives the player its media headers under the borrowed identity")
+        sub _()
+            loop = m.signedIn()
+            m.borrowed(loop)
+            tests.sessions.send(loop, { requestId: "mh", session: "mediaHeaders", url: "https://silo.example/media/1", generation: 0, refresh: false, fence: m.borrowedFence() })
+            lines = loop.delivered.mh.body.httpHeaders
+            m.assertTrue(util.contains(lines, "Authorization: Bearer bacc"))
+            m.assertTrue(util.contains(lines, "X-Profile-Id: kid"))
+        end sub
+
+        @it("waits for the borrowed player's stop before its logout")
+        sub _()
+            loop = m.signedIn()
+            m.borrowed(loop)
+            fence = m.borrowedFence()
+            fence.session = "s-1"
+            tests.sessions.send(loop, { requestId: "j1", playback: "job", job: { kind: "stop", id: "s-1:stop", fence: fence, sessionId: "s-1", sequence: invalid, uncertain: false, bodyText: "{}" } })
+            tests.sessions.send(loop, { requestId: "e1", session: "borrowedEnd" })
+            m.assertEqual(tests.sessions.count(loop, "defer borrowedEnd"), 1)
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/auth/logout"))
+            stopId = tests.sessions.runningId(loop, "/api/v2/playback/s-1")
+            m.assertEqual(loop.running[stopId].headers.Authorization, "Bearer bacc")
+            tests.sessions.respond(loop, stopId, 200, tests.sessions.fixture("playback_stop_completed"))
+            tests.sessions.tick(loop, 10)
+            m.assertNotInvalid(tests.sessions.runningId(loop, "/api/v2/auth/logout"))
+        end sub
+
+    end class
+
+end namespace

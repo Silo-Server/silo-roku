@@ -1,0 +1,152 @@
+namespace tests
+
+    @suite("silocontrol mdns")
+    class SiloControlMdnsTests extends rooibos.BaseTestSuite
+
+        function bytes(list as Object) as Object
+            out = CreateObject("roByteArray")
+            for each value in list
+                out.Push(value)
+            end for
+            return out
+        end function
+
+        sub label(out as Object, text as String)
+            out.Push(Len(text))
+            for i = 1 to Len(text)
+                out.Push(Asc(Mid(text, i, 1)))
+            end for
+        end sub
+
+        ' A query, as macOS sends one: the service's PTR question, then
+        ' _airplay._tcp.local's, whose "_tcp.local" is a pointer back into
+        ' the first (offset 12 + 15).
+        function query() as Object
+            out = m.bytes([0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0])
+            m.label(out, "_silocast-roku")
+            m.label(out, "_tcp")
+            m.label(out, "local")
+            out.Append(m.bytes([0, 0, 12, &h80, 1]))
+            m.label(out, "_airplay")
+            out.Append(m.bytes([&hC0, 27, 0, 12, 0, 1]))
+            return out
+        end function
+
+        ' The answer names and types of a response, in order.
+        function answersOf(packet as Object) as Object
+            count = (packet[6] << 8) + packet[7]
+            offset = 12
+            out = []
+            for i = 1 to count
+                name = silocontrol.mdns.readName(packet, packet.Count(), offset)
+                offset = name.next
+                rrtype = (packet[offset] << 8) + packet[offset + 1]
+                ttl = (packet[offset + 4] << 24) + (packet[offset + 5] << 16) + (packet[offset + 6] << 8) + packet[offset + 7]
+                length = (packet[offset + 8] << 8) + packet[offset + 9]
+                out.Push({ name: name.text, type: rrtype, ttl: ttl, rdataAt: offset + 10, length: length })
+                offset = offset + 10 + length
+            end for
+            return out
+        end function
+
+        function config() as Object
+            return { deviceId: "8F3A21C4-77AB-4c1d-9e2f-001122334455", port: 52817, address: "10.20.30.40", txt: [["v", "2"], ["name", "Living Room"], ["sec", "plain"]] }
+        end function
+
+        @describe("questions")
+
+        @it("reads questions and follows compression pointers")
+        sub _()
+            packet = m.query()
+            found = silocontrol.mdns.questions(packet, packet.Count())
+            m.assertEqual(found.Count(), 2)
+            m.assertEqual(found[0], { name: "_silocast-roku._tcp.local", type: 12 })
+            m.assertEqual(found[1].name, "_airplay._tcp.local")
+        end sub
+
+        @it("reads nothing from a response or a cut packet")
+        sub _()
+            packet = m.query()
+            packet[2] = &h84
+            m.assertEqual(silocontrol.mdns.questions(packet, packet.Count()), [])
+            m.assertEqual(silocontrol.mdns.questions(m.query(), 20), [])
+        end sub
+
+        @it("refuses a pointer loop")
+        sub _()
+            packet = m.bytes([0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, &hC0, 12, 0, 12, 0, 1])
+            m.assertEqual(silocontrol.mdns.questions(packet, packet.Count()), [])
+        end sub
+
+        @describe("answers")
+
+        @it("answers the service with every record and its own names with theirs")
+        sub _()
+            id = m.config().deviceId
+            m.assertEqual(silocontrol.mdns.answers([{ name: "_silocast-roku._tcp.local", type: 12 }], id), ["ptr", "srv", "txt", "a"])
+            m.assertEqual(silocontrol.mdns.answers([{ name: "silo-8f3a21c4._silocast-roku._tcp.local", type: 16 }], id), ["txt"])
+            m.assertEqual(silocontrol.mdns.answers([{ name: "silo-8f3a21c4._silocast-roku._tcp.local", type: 33 }], id), ["srv", "a"])
+            m.assertEqual(silocontrol.mdns.answers([{ name: "silo-8f3a21c4.local", type: 1 }], id), ["a"])
+            m.assertEqual(silocontrol.mdns.answers([{ name: "_services._dns-sd._udp.local", type: 12 }], id), ["services"])
+            m.assertEqual(silocontrol.mdns.answers([{ name: "_airplay._tcp.local", type: 12 }, { name: "silo-other.local", type: 1 }], id), [])
+        end sub
+
+        @it("answers companion sign-in's service when it is the one served")
+        sub _()
+            id = m.config().deviceId
+            pairing = silocontrol.pairing.SERVICE
+            m.assertEqual(silocontrol.mdns.answers([{ name: pairing, type: 12 }], id, pairing), ["ptr", "srv", "txt", "a"])
+            m.assertEqual(silocontrol.mdns.answers([{ name: "_silocast-roku._tcp.local", type: 12 }], id, pairing), [])
+        end sub
+
+        @describe("packet")
+
+        @it("writes PTR, SRV, TXT, and A with their TTLs")
+        sub _()
+            packet = silocontrol.mdns.packet(m.config(), silocontrol.mdns.allRecords())
+            records = m.answersOf(packet)
+            m.assertEqual(records.Count(), 4)
+            m.assertEqual(records[0].name, "_silocast-roku._tcp.local")
+            m.assertEqual(records[0].type, 12)
+            m.assertEqual(silocontrol.mdns.readName(packet, packet.Count(), records[0].rdataAt).text, "Silo-8f3a21c4._silocast-roku._tcp.local")
+            m.assertEqual(records[1].type, 33)
+            srv = records[1].rdataAt
+            m.assertEqual((packet[srv + 4] << 8) + packet[srv + 5], 52817)
+            m.assertEqual(silocontrol.mdns.readName(packet, packet.Count(), srv + 6).text, "silo-8f3a21c4.local")
+            m.assertEqual(records[2].type, 16)
+            m.assertEqual(records[2].ttl, 4500)
+            txt = records[2].rdataAt
+            m.assertEqual(packet[txt], 3)
+            m.assertEqual(records[3].type, 1)
+            a = records[3].rdataAt
+            m.assertEqual([packet[a], packet[a + 1], packet[a + 2], packet[a + 3]], [10, 20, 30, 40])
+            m.assertEqual(records[3].ttl, 120)
+        end sub
+
+        @it("names the service the config gives")
+        sub _()
+            config = m.config()
+            config.service = silocontrol.pairing.SERVICE
+            packet = silocontrol.mdns.packet(config, silocontrol.mdns.allRecords())
+            records = m.answersOf(packet)
+            m.assertEqual(records[0].name, "_silopair-roku._tcp.local")
+            m.assertEqual(silocontrol.mdns.readName(packet, packet.Count(), records[0].rdataAt).text, "Silo-8f3a21c4._silopair-roku._tcp.local")
+        end sub
+
+        @it("says goodbye with TTL 0")
+        sub _()
+            for each record in m.answersOf(silocontrol.mdns.packet(m.config(), silocontrol.mdns.allRecords(), true))
+                m.assertEqual(record.ttl, 0)
+            end for
+        end sub
+
+        @it("cuts a TXT string at 255 bytes")
+        sub _()
+            data = silocontrol.mdns.txtData([["name", string(300, "x")]])
+            m.assertEqual(data[0], 255)
+            m.assertEqual(data.Count(), 256)
+        end sub
+
+    end class
+
+end namespace

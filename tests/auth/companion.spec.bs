@@ -1,0 +1,198 @@
+namespace tests
+
+    ' Companion sign-in in the account session (source/auth/companion.bs),
+    ' driven through tests.sessions. Bodies follow the server contract's
+    ' SystemIdentity, DeviceLoginStart, and DeviceLoginPoll.
+    @suite("auth companion")
+    class AuthCompanionTests extends rooibos.BaseTestSuite
+
+        function started() as Object
+            return { device_code: "dev-secret", user_code: "48217730", match_code: "warm pony", verification_uri: "https://other.example/activate", expires_at: "2026-10-25T18:15:00Z", expires_in: 600, interval: 4, device_name: "Living Room", device_platform: "roku", client_purpose: "sign_in", temporary: false }
+        end function
+
+        function approved() as Object
+            return { status: "approved", poll_after: 4, opened: true, profile_id: "", profile_token: "", temporary: false, tokens: { access_token: "cacc", refresh_token: "cref", expires_in: 3600, user: { id: "7", username: "sam", role: "user" } } }
+        end function
+
+        ' A new Roku with no server.
+        function fresh() as Object
+            record = storage.empty()
+            record.deviceId = "device-1"
+            return tests.sessions.create(record)
+        end function
+
+        ' Checks https://other.example, whose identity is srv-1.
+        function checked(loop as Object, identity = "srv-1" as String) as Object
+            tests.sessions.send(loop, { requestId: "s1", session: "companionServer", address: "https://other.example", identity: "srv-1" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, tests.sessions.systemInfo("https://other.example"))
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/system/identity"), 200, { server_id: identity })
+            return loop.delivered.s1
+        end function
+
+        function begun(loop as Object) as Object
+            m.checked(loop)
+            tests.sessions.send(loop, { requestId: "d1", session: "companionStart", deviceName: "Living Room" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, m.started())
+            return loop.delivered.d1
+        end function
+
+        @describe("checking the pushed server")
+
+        @it("checks the origin and identity, and stores nothing")
+        sub _()
+            loop = m.fresh()
+            answer = m.checked(loop)
+            m.assertTrue(answer.ok)
+            m.assertEqual(answer.body, { origin: "https://other.example", serverIdentity: "srv-1" })
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "no_server")
+        end sub
+
+        @it("refuses another deployment")
+        sub _()
+            loop = m.fresh()
+            m.assertEqual(m.checked(loop, "srv-2").error.kind, "identity_mismatch")
+        end sub
+
+        @it("refuses a server that cannot confirm the origin")
+        sub _()
+            loop = m.fresh()
+            tests.sessions.send(loop, { requestId: "s1", session: "companionServer", address: "https://other.example", identity: "" })
+            info = tests.sessions.systemInfo("https://other.example")
+            info.Delete(api.auth.server.ORIGIN_MEMBER)
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, info)
+            m.assertEqual(loop.delivered.s1.error.kind, "origin_unconfirmed")
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/system/identity"))
+        end sub
+
+        @describe("the device login")
+
+        @it("starts only at a checked origin")
+        sub _()
+            loop = m.fresh()
+            tests.sessions.send(loop, { requestId: "d1", session: "companionStart", deviceName: "Living Room" })
+            m.assertEqual(loop.delivered.d1.error.kind, "origin_unverified")
+        end sub
+
+        @it("starts a sign-in login there and keeps the device code")
+        sub _()
+            loop = m.fresh()
+            m.checked(loop)
+            tests.sessions.send(loop, { requestId: "d1", session: "companionStart", deviceName: "Living Room" })
+            id = tests.sessions.runningId(loop, "/api/v2/auth/device/start")
+            m.assertEqual(loop.running[id].request.url, "https://other.example/api/v2/auth/device/start")
+            m.assertEqual(loop.running[id].request.body, { device_name: "Living Room", device_platform: "roku" })
+            tests.sessions.respond(loop, id, 201, m.started())
+            m.assertEqual(loop.delivered.d1.body, { userCode: "48217730", matchCode: "warm pony", interval: 4, expiresIn: 600 })
+            m.assertFalse(FormatJson(loop.delivered.d1).Instr("dev-secret") >= 0)
+        end sub
+
+        @it("signs in on approval, with the pushed server as the Roku's")
+        sub _()
+            loop = m.fresh()
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            id = tests.sessions.runningId(loop, "/api/v2/auth/device/poll")
+            m.assertEqual(loop.running[id].request.body, { device_code: "dev-secret" })
+            tests.sessions.respond(loop, id, 200, { status: "pending", poll_after: 6, opened: false, temporary: false })
+            m.assertEqual(loop.delivered.p1.body, { status: "pending", pollAfter: 6 })
+            tests.sessions.send(loop, { requestId: "p2", session: "companionPoll" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, m.approved())
+            m.assertEqual(loop.delivered.p2.body.status, "approved")
+            m.assertFalse(FormatJson(loop.delivered.p2).Instr("cacc") >= 0)
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual(view.status, "signed_in")
+            m.assertEqual(view.origin, "https://other.example")
+            m.assertEqual(view.accountId, "7")
+            m.assertEqual(view.originStatus, "verified")
+            m.assertEqual(loop.session.saved.accessToken, "cacc")
+        end sub
+
+        @it("refuses a temporary approval")
+        sub _()
+            loop = m.fresh()
+            m.begun(loop)
+            approval = m.approved()
+            approval.temporary = true
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, approval)
+            m.assertEqual(loop.delivered.p1.body.status, "invalid")
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "no_server")
+        end sub
+
+        @it("forgets a denied request")
+        sub _()
+            loop = m.fresh()
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, { status: "denied", poll_after: 4, opened: true, temporary: false })
+            m.assertEqual(loop.delivered.p1.body.status, "denied")
+            tests.sessions.send(loop, { requestId: "p2", session: "companionPoll" })
+            m.assertEqual(loop.delivered.p2.error.kind, "handoff_gone")
+        end sub
+
+        @it("withdraws an open request with its device code")
+        sub _()
+            loop = m.fresh()
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "c1", session: "companionCancel" })
+            m.assertTrue(loop.delivered.c1.ok)
+            id = tests.sessions.runningId(loop, "/api/v2/auth/device/cancel")
+            m.assertEqual(loop.running[id].request.url, "https://other.example/api/v2/auth/device/cancel")
+            m.assertEqual(loop.running[id].request.body, { device_code: "dev-secret" })
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            m.assertEqual(loop.delivered.p1.error.kind, "handoff_gone")
+        end sub
+
+        @it("withdraws a login whose start answers after the attempt ended")
+        sub _()
+            loop = m.fresh()
+            m.checked(loop)
+            tests.sessions.send(loop, { requestId: "d1", session: "companionStart", deviceName: "Living Room" })
+            start = tests.sessions.runningId(loop, "/api/v2/auth/device/start")
+            tests.sessions.send(loop, { requestId: "c1", session: "companionCancel" })
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/auth/device/cancel"))
+            tests.sessions.respond(loop, start, 201, m.started())
+            m.assertEqual(loop.delivered.d1.error.kind, "handoff_gone")
+            id = tests.sessions.runningId(loop, "/api/v2/auth/device/cancel")
+            m.assertEqual(loop.running[id].request.body, { device_code: "dev-secret" })
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            m.assertEqual(loop.delivered.p1.error.kind, "handoff_gone")
+        end sub
+
+        @it("keeps a newer attempt's login when an older start answers late")
+        sub _()
+            loop = m.fresh()
+            m.checked(loop)
+            tests.sessions.send(loop, { requestId: "d1", session: "companionStart", deviceName: "Living Room" })
+            old = tests.sessions.runningId(loop, "/api/v2/auth/device/start")
+            m.checked(loop)
+            tests.sessions.send(loop, { requestId: "d2", session: "companionStart", deviceName: "Living Room" })
+            newer = invalid
+            for each id in loop.running
+                if id <> old and tests.sessions.pathOf(loop.running[id].request) = "/api/v2/auth/device/start" then newer = id
+            end for
+            fresh = m.started()
+            fresh.device_code = "dev-new"
+            tests.sessions.respond(loop, newer, 201, fresh)
+            m.assertTrue(loop.delivered.d2.ok)
+            tests.sessions.respond(loop, old, 201, m.started())
+            m.assertEqual(loop.delivered.d1.error.kind, "handoff_gone")
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            m.assertEqual(loop.running[tests.sessions.runningId(loop, "/api/v2/auth/device/poll")].request.body, { device_code: "dev-new" })
+        end sub
+
+        @it("replaces a signed-in server's session on approval elsewhere")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, m.approved())
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual(view.origin, "https://other.example")
+            m.assertEqual(view.accountId, "7")
+            m.assertEqual(loop.session.saved.refreshToken, "cref")
+        end sub
+
+    end class
+
+end namespace

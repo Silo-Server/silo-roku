@@ -1,0 +1,576 @@
+import "pkg:/source/control/mdns.bs"
+import "pkg:/source/control/pairing.bs"
+import "pkg:/source/control/protocol.bs"
+import "pkg:/source/control/receiver.bs"
+import "pkg:/source/control/sealed.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' The receiver's sockets (docs/silocontrol.md sections 5, 6.1, and 10). One
+' loop waits on one port for AppScene's commands and every socket's events
+' until the nearest deadline: the listener, each controller's connection
+' (framing in silocontrol.protocol, rules in silocontrol.receiver), and the
+' multicast DNS socket (silocontrol.mdns). Nothing here logs a frame's text:
+' handoff frames carry the codes a phone approves. At level sealed
+' (section 9.2) a connection is keyed by the sealed_hello exchange before
+' the receiver hears of it, and every frame after is sealed and opened
+' here.
+'
+' Started with service "pairing", the same loop serves companion sign-in
+' (docs/companion-pairing.md) instead: silocontrol.pairing in place of the
+' receiver, its own ports and DNS-SD service type, and no sealed level.
+
+' Section 5.2: the first free port from FIRST_PORT to LAST_PORT, else any.
+const FIRST_PORT = 52817
+const LAST_PORT = 52826
+const BACKLOG = 4
+' Bytes read from a connection at a time; the buffer is filled to this
+' length first (section 5.1).
+const RECEIVE_BYTES = 8192
+' A close frame waits this long to leave before the socket closes.
+const CLOSE_GRACE_MS = 500
+' How often the address is checked for a change (section 10).
+const ADDRESS_CHECK_MS = 5000
+' Announcements go at once, then after these many more milliseconds.
+const ANNOUNCE_GAPS_MS = "1000,2000"
+
+sub init()
+    m.top.functionName = "serve"
+end sub
+
+sub serve()
+    m.port = CreateObject("roMessagePort")
+    m.top.observeFieldScopedEx("command", m.port)
+    m.clock = CreateObject("roTimespan")
+    ' Connection ID to { id, socket, reader, queue, sent, closeAt }.
+    m.connections = {}
+    ' roSocket GetID() as text to connection ID.
+    m.bySocket = {}
+    m.nextId = 0
+    m.buffer = filledBuffer(RECEIVE_BYTES)
+    m.packet = filledBuffer(silocontrol.mdns.MAX_PACKET)
+    m.receiver = invalid
+    m.pairing = false
+    m.listener = invalid
+    m.mdns = invalid
+    m.listenPort = 0
+    m.address = ""
+    m.txt = []
+    m.pairingKey = invalid
+    m.keyId = ""
+    m.announceAt = []
+    m.addressCheckAt = 0
+    m.top.ready = true
+    while true
+        msg = wait(waitMs(), m.port)
+        msgType = type(msg)
+        if msgType = "roSGNodeEvent" and msg.getField() = "command"
+            if not onCommand(msg.getData()) then exit while
+        else if msgType = "roSocketEvent"
+            onSocket(msg.getSocketID())
+        end if
+        housekeeping()
+    end while
+    m.top.event = { type: "stopped" }
+end sub
+
+function clockMs() as Integer
+    return m.clock.TotalMilliseconds()
+end function
+
+' ---- Commands from AppScene
+
+' Gives false once the Task should end.
+function onCommand(command as Dynamic) as Boolean
+    if not util.isObject(command) then return true
+    kind = util.text(command.kind)
+    if kind = "start"
+        start(command)
+    else if m.receiver = invalid
+        return kind <> "stop"
+    else if kind = "update"
+        if m.pairing
+            silocontrol.pairing.configure(m.receiver, command.config)
+        else
+            runActions(silocontrol.receiver.configure(m.receiver, command.config))
+        end if
+        if type(command.txt) = "roArray" then m.txt = command.txt
+        scheduleAnnouncements()
+    else if m.pairing
+        if kind = "send" then runActions(silocontrol.pairing.sendTo(m.receiver, util.text(command.id), util.text(command.text)))
+        if kind = "close" then runActions(silocontrol.pairing.closePhone(m.receiver, util.text(command.text)))
+        if kind = "stop"
+            stopAll(util.text(command.reason))
+            return false
+        end if
+    else if kind = "state"
+        if util.isObject(command.body) then runActions(silocontrol.receiver.setState(m.receiver, silocontrol.protocol.state(command.body)))
+    else if kind = "send"
+        runActions(silocontrol.receiver.sendTo(m.receiver, util.text(command.id), util.text(command.text), util.isTrue(command.endsHandoff)))
+    else if kind = "broadcast"
+        runActions(silocontrol.receiver.broadcast(m.receiver, util.text(command.text)))
+    else if kind = "close"
+        runActions(silocontrol.receiver.closeController(m.receiver, util.text(command.id), util.text(command.reason)))
+    else if kind = "stop"
+        stopAll(util.text(command.reason))
+        return false
+    end if
+    return true
+end function
+
+sub start(command as Object)
+    if m.receiver <> invalid then return
+    m.pairing = util.text(command.service) = "pairing"
+    if m.pairing
+        m.receiver = silocontrol.pairing.create(command.config)
+    else
+        m.receiver = silocontrol.receiver.create(command.config)
+        if util.isObject(command.stateBody) then m.receiver.stateText = silocontrol.protocol.state(command.stateBody)
+    end if
+    if type(command.txt) = "roArray" then m.txt = command.txt
+    ' Level sealed with the pairing key's 32 hex digits; plain without.
+    key = util.text(command.pairingKey)
+    if Len(key) = 32 and not m.pairing
+        m.pairingKey = CreateObject("roByteArray")
+        m.pairingKey.FromHexString(key)
+        m.keyId = silocontrol.sealed.keyId(m.pairingKey)
+    end if
+    if not openListener()
+        log.warn("control", "no port to listen on")
+        m.top.event = { type: "failed", reason: "listen" }
+        return
+    end if
+    openMdns()
+    m.address = localAddress()
+    m.addressCheckAt = clockMs() + ADDRESS_CHECK_MS
+    log.info("control", "listening", { address: m.address, port: m.listenPort, mdns: m.mdns <> invalid, pairing: m.pairing })
+    m.top.event = { type: "listening", address: m.address, port: m.listenPort }
+    scheduleAnnouncements()
+end sub
+
+' Closes every controller, waits up to CLOSE_GRACE_MS for their close frames
+' to leave, says goodbye on DNS-SD, and closes every socket.
+sub stopAll(reason as String)
+    if m.receiver <> invalid
+        if m.pairing
+            runActions(silocontrol.pairing.closeAll(m.receiver, reason))
+        else
+            runActions(silocontrol.receiver.closeAll(m.receiver, reason))
+        end if
+    end if
+    deadline = clockMs() + CLOSE_GRACE_MS
+    while not m.connections.IsEmpty() and clockMs() < deadline
+        msg = wait(50, m.port)
+        if type(msg) = "roSocketEvent" then onSocket(msg.getSocketID())
+    end while
+    for each id in idsOf(m.connections)
+        closeSocket(id)
+    end for
+    if m.mdns <> invalid and m.address <> ""
+        announce(true)
+        m.mdns.close()
+    end if
+    m.mdns = invalid
+    if m.listener <> invalid then m.listener.close()
+    m.listener = invalid
+end sub
+
+' ---- Listener
+
+function openListener() as Boolean
+    candidates = []
+    first = FIRST_PORT
+    last = LAST_PORT
+    if m.pairing
+        first = silocontrol.pairing.FIRST_PORT
+        last = silocontrol.pairing.LAST_PORT
+    end if
+    for p = first to last
+        candidates.Push(p)
+    end for
+    ' 0: any port the OS assigns.
+    candidates.Push(0)
+    for each candidate in candidates
+        socket = CreateObject("roStreamSocket")
+        address = CreateObject("roSocketAddress")
+        address.setPort(candidate)
+        socket.setAddress(address)
+        if socket.listen(BACKLOG)
+            socket.setMessagePort(m.port)
+            socket.notifyReadable(true)
+            m.listener = socket
+            m.listenPort = socket.getAddress().getPort()
+            if m.listenPort < 0 then m.listenPort = m.listenPort + 65536
+            return true
+        end if
+        socket.close()
+    end for
+    return false
+end function
+
+sub accept()
+    socket = m.listener.accept()
+    if socket = invalid then return
+    m.nextId = m.nextId + 1
+    id = "c" + m.nextId.ToStr()
+    peer = invalid
+    from = socket.getReceivedFromAddress()
+    if from <> invalid then peer = from.getAddress()
+    ' Section 9.2: before its sealed_hello a connection is no one's, so only
+    ' a local peer may start one, and only a few at once.
+    if not m.pairing and m.pairingKey <> invalid
+        if not silocontrol.policy.isLocalPeer(peer) or pendingSealed() >= silocontrol.policy.MAX_CONTROLLERS
+            socket.close()
+            return
+        end if
+    end if
+    socket.setMessagePort(m.port)
+    socket.notifyReadable(true)
+    m.connections[id] = { id: id, socket: socket, reader: silocontrol.protocol.reader(), queue: [], sent: 0, closeAt: invalid, sealed: invalid, peer: peer }
+    m.bySocket[socket.getID().ToStr()] = id
+    if m.pairing
+        runActions(silocontrol.pairing.accepted(m.receiver, id, peer))
+    else if m.pairingKey = invalid
+        runActions(silocontrol.receiver.accepted(m.receiver, id, peer, clockMs()))
+    else
+        ' The phone's sealed_hello comes first (section 9.2).
+        m.connections[id].sealed = { keys: invalid, sendSeq: 0, recvSeq: 0, deadline: clockMs() + silocontrol.receiver.HELLO_WAIT_MS }
+    end if
+end sub
+
+' Connections still waiting for their sealed_hello.
+function pendingSealed() as Integer
+    count = 0
+    for each id in m.connections
+        sealed = m.connections[id].sealed
+        if sealed <> invalid and sealed.keys = invalid then count = count + 1
+    end for
+    return count
+end function
+
+' The phone's sealed_hello on a connection at level sealed: a matching key
+' ID keys the session, answers with the Roku's, and hands the connection
+' to the receiver; anything else is closed with reason unauthorized, in
+' plain text.
+sub sealedHello(connection as Object, text as String)
+    hello = silocontrol.sealed.readHello(text)
+    if hello = invalid or hello.keyId <> m.keyId
+        enqueue(connection.id, silocontrol.protocol.frame(silocontrol.protocol.close("unauthorized")))
+        connection.closeAt = clockMs() + CLOSE_GRACE_MS
+        if connection.queue.Count() = 0 then closeSocket(connection.id)
+        return
+    end if
+    info = CreateObject("roDeviceInfo")
+    nonce = silocontrol.sealed.newNonce(info.GetRandomUUID() + clockMs().ToStr() + connection.id)
+    enqueue(connection.id, silocontrol.protocol.frame(silocontrol.sealed.hello(m.keyId, nonce)))
+    connection.sealed.keys = silocontrol.sealed.sessionKeys(m.pairingKey, hello.nonce, nonce)
+    runActions(silocontrol.receiver.accepted(m.receiver, connection.id, connection.peer, clockMs()))
+end sub
+
+' The bytes to send for text on a connection: framed, and sealed once the
+' connection is keyed.
+function frameFor(connection as Object, text as String) as Object
+    sealed = connection.sealed
+    if sealed = invalid or sealed.keys = invalid then return silocontrol.protocol.frame(text)
+    body = silocontrol.sealed.seal(sealed.keys, silocontrol.sealed.FROM_TV, sealed.sendSeq, text)
+    sealed.sendSeq = sealed.sendSeq + 1
+    return silocontrol.protocol.frameBytes(body)
+end function
+
+' ---- Sockets
+
+sub onSocket(socketId as Integer)
+    if m.listener <> invalid and socketId = m.listener.getID()
+        if m.listener.isReadable() then accept()
+        return
+    end if
+    if m.mdns <> invalid and socketId = m.mdns.getID()
+        if m.mdns.isReadable() then onQuery()
+        return
+    end if
+    id = m.bySocket[socketId.ToStr()]
+    if id = invalid then return
+    connection = m.connections[id]
+    if connection = invalid then return
+    socket = connection.socket
+    if socket.isWritable() then flush(connection)
+    if socket.isReadable() then receive(connection)
+end sub
+
+sub receive(connection as Object)
+    count = connection.socket.receive(m.buffer, 0, RECEIVE_BYTES)
+    if count = 0
+        lost(connection.id)
+        return
+    end if
+    if count < 0
+        if not connection.socket.eAgain() then lost(connection.id)
+        return
+    end if
+    ' A connection closing reads nothing more.
+    if util.isNumber(connection.closeAt) then return
+    result = silocontrol.protocol.feed(connection.reader, m.buffer, count)
+    for each body in result.frames
+        if m.receiver = invalid or not m.connections.DoesExist(connection.id) or util.isNumber(connection.closeAt) then return
+        sealed = connection.sealed
+        if m.pairing
+            runActions(silocontrol.pairing.frame(m.receiver, connection.id, body.ToAsciiString()))
+        else if sealed = invalid
+            runActions(silocontrol.receiver.frame(m.receiver, connection.id, body.ToAsciiString(), clockMs()))
+        else if sealed.keys = invalid
+            sealedHello(connection, body.ToAsciiString())
+        else
+            ' A frame that does not open closes the connection unanswered.
+            opened = silocontrol.sealed.open(sealed.keys, silocontrol.sealed.FROM_PHONE, sealed.recvSeq, body)
+            if not opened.ok
+                runActions(silocontrol.receiver.lost(m.receiver, connection.id))
+                closeSocket(connection.id)
+                return
+            end if
+            sealed.recvSeq = sealed.recvSeq + 1
+            runActions(silocontrol.receiver.frame(m.receiver, connection.id, opened.text, clockMs()))
+        end if
+    end for
+    if result.error = "" then return
+    if m.pairing
+        runActions(silocontrol.pairing.lost(m.receiver, connection.id))
+    else
+        runActions(silocontrol.receiver.closeController(m.receiver, connection.id, ""))
+    end if
+end sub
+
+' The peer closed, or the socket failed.
+sub lost(id as String)
+    connection = m.connections[id]
+    if connection = invalid then return
+    if util.isNumber(connection.closeAt)
+        closeSocket(id)
+    else if m.pairing
+        runActions(silocontrol.pairing.lost(m.receiver, id))
+    else
+        runActions(silocontrol.receiver.lost(m.receiver, id))
+    end if
+end sub
+
+sub enqueue(id as String, bytes as Object)
+    connection = m.connections[id]
+    if connection = invalid or util.isNumber(connection.closeAt) then return
+    connection.queue.Push(bytes)
+    flush(connection)
+end sub
+
+' Sends what the connection's queue holds, as far as the socket takes it,
+' and closes a closing connection once its queue is empty.
+sub flush(connection as Object)
+    socket = connection.socket
+    while connection.queue.Count() > 0
+        bytes = connection.queue[0]
+        remaining = bytes.Count() - connection.sent
+        written = socket.send(bytes, connection.sent, remaining)
+        if written < 0
+            if socket.eAgain()
+                socket.notifyWritable(true)
+                return
+            end if
+            ' A failed write is a lost peer: the receiver frees its slot and
+            ' AppScene hears it left.
+            lost(connection.id)
+            closeSocket(connection.id)
+            return
+        end if
+        connection.sent = connection.sent + written
+        if connection.sent < bytes.Count()
+            socket.notifyWritable(true)
+            return
+        end if
+        connection.queue.Shift()
+        connection.sent = 0
+    end while
+    socket.notifyWritable(false)
+    if util.isNumber(connection.closeAt) then closeSocket(connection.id)
+end sub
+
+sub closeSocket(id as String)
+    connection = m.connections[id]
+    if connection = invalid then return
+    m.connections.Delete(id)
+    m.bySocket.Delete(connection.socket.getID().ToStr())
+    connection.socket.close()
+end sub
+
+' Carries out silocontrol.receiver's actions in order.
+sub runActions(actions as Object)
+    for each action in actions
+        kind = action.kind
+        connection = invalid
+        if util.isString(action.id) then connection = m.connections[action.id]
+        if kind = "send"
+            if connection <> invalid then enqueue(action.id, frameFor(connection, action.text))
+        else if kind = "close"
+            if action.text <> "" and connection <> invalid then enqueue(action.id, frameFor(connection, action.text))
+            if connection <> invalid
+                connection.closeAt = clockMs() + CLOSE_GRACE_MS
+                if connection.queue.Count() = 0 then closeSocket(action.id)
+            end if
+        else if kind = "drop"
+            closeSocket(action.id)
+        else if kind = "emit"
+            m.top.event = action.event
+        end if
+    end for
+end sub
+
+' ---- Deadlines
+
+sub housekeeping()
+    if m.receiver = invalid then return
+    t = clockMs()
+    wake = receiverWake()
+    if util.isNumber(wake) and t >= wake then runActions(silocontrol.receiver.tick(m.receiver, t))
+    for each id in idsOf(m.connections)
+        connection = m.connections[id]
+        if connection <> invalid and util.isNumber(connection.closeAt) and t >= connection.closeAt then closeSocket(id)
+        ' A connection that never sent its sealed_hello.
+        if connection <> invalid and connection.sealed <> invalid and connection.sealed.keys = invalid and t >= connection.sealed.deadline then closeSocket(id)
+    end for
+    if m.announceAt.Count() > 0 and t >= m.announceAt[0]
+        m.announceAt.Shift()
+        announce(false)
+    end if
+    if t >= m.addressCheckAt
+        m.addressCheckAt = t + ADDRESS_CHECK_MS
+        checkAddress()
+    end if
+end sub
+
+' Milliseconds until the nearest deadline: a controller's tick, a closing
+' connection, an announcement, or the address check.
+function waitMs() as Integer
+    if m.receiver = invalid then return 0
+    t = clockMs()
+    due = m.addressCheckAt
+    wake = receiverWake()
+    if util.isNumber(wake) and wake < due then due = wake
+    if m.announceAt.Count() > 0 and m.announceAt[0] < due then due = m.announceAt[0]
+    for each id in m.connections
+        closeAt = m.connections[id].closeAt
+        if util.isNumber(closeAt) and closeAt < due then due = closeAt
+    end for
+    remaining = due - t
+    if remaining < 1 then remaining = 1
+    return remaining
+end function
+
+' The receiver's next tick; pairing has none.
+function receiverWake() as Dynamic
+    if m.pairing then return invalid
+    return silocontrol.receiver.nextWake(m.receiver)
+end function
+
+' ---- Multicast DNS (section 5.1)
+
+sub openMdns()
+    socket = CreateObject("roDataGramSocket")
+    socket.SetReuseAddr(true)
+    address = CreateObject("roSocketAddress")
+    address.setPort(silocontrol.mdns.PORT)
+    if not socket.setAddress(address)
+        log.warn("control", "mDNS port unavailable")
+        socket.close()
+        return
+    end if
+    group = CreateObject("roSocketAddress")
+    group.setAddress(silocontrol.mdns.GROUP)
+    if not socket.JoinGroup(group) then log.warn("control", "mDNS group join failed")
+    socket.SetMulticastTTL(255)
+    socket.SetMulticastLoop(false)
+    socket.setSendToAddress(group)
+    socket.setMessagePort(m.port)
+    socket.notifyReadable(true)
+    m.mdns = socket
+end sub
+
+sub onQuery()
+    count = m.mdns.receive(m.packet, 0, silocontrol.mdns.MAX_PACKET)
+    if count <= 0 or m.address = "" then return
+    records = silocontrol.mdns.answers(silocontrol.mdns.questions(m.packet, count), ownDeviceId(), mdnsService())
+    if records.Count() > 0 then sendRecords(records, false)
+end sub
+
+sub scheduleAnnouncements()
+    t = clockMs()
+    m.announceAt = [t]
+    for each gap in ANNOUNCE_GAPS_MS.Split(",")
+        t = t + gap.ToInt()
+        m.announceAt.Push(t)
+    end for
+end sub
+
+sub announce(goodbye as Boolean)
+    if m.address = "" then return
+    sendRecords(silocontrol.mdns.allRecords(), goodbye)
+end sub
+
+sub sendRecords(records as Object, goodbye as Boolean)
+    if m.mdns = invalid then return
+    bytes = silocontrol.mdns.packet(mdnsConfig(), records, goodbye)
+    m.mdns.send(bytes, 0, bytes.Count())
+end sub
+
+function mdnsConfig() as Object
+    return { deviceId: ownDeviceId(), port: m.listenPort, address: m.address, txt: m.txt, service: mdnsService() }
+end function
+
+function mdnsService() as String
+    if m.pairing then return silocontrol.pairing.SERVICE
+    return silocontrol.mdns.SERVICE
+end function
+
+function ownDeviceId() as String
+    return util.text(m.receiver.config.deviceId)
+end function
+
+' A new address: the old records go with TTL 0 and the new ones are
+' announced (section 10).
+sub checkAddress()
+    current = localAddress()
+    if current = m.address then return
+    if m.address <> "" then announce(true)
+    m.address = current
+    log.info("control", "address changed", { address: current })
+    m.top.event = { type: "listening", address: current, port: m.listenPort }
+    scheduleAnnouncements()
+end sub
+
+' The Roku's IPv4 address on the local network, or "".
+function localAddress() as String
+    addresses = CreateObject("roDeviceInfo").GetIPAddrs()
+    if type(addresses) <> "roAssociativeArray" then return ""
+    for each name in addresses
+        value = util.text(addresses[name])
+        if value <> "" and Instr(1, value, ":") = 0 then return value
+    end for
+    return ""
+end function
+
+' ---- Helpers
+
+' An roByteArray of size zeros: receive() writes only into existing bytes.
+function filledBuffer(size as Integer) as Object
+    out = CreateObject("roByteArray")
+    out[size - 1] = 0
+    if out.Count() < size
+        for i = out.Count() to size - 1
+            out.Push(0)
+        end for
+    end if
+    return out
+end function
+
+function idsOf(table as Object) as Object
+    out = []
+    for each key in table
+        out.Push(key)
+    end for
+    return out
+end function

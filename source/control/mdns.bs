@@ -1,0 +1,246 @@
+import "pkg:/source/util/values.bs"
+
+' The receiver's multicast DNS responder (docs/silocontrol.md section 5.1,
+' RFC 6762 and RFC 6763) as pure functions over roByteArrays. ControlTask
+' owns the socket: it passes each packet to questions(), asks answers()
+' which records to send, and sends packet()'s bytes to 224.0.0.251:5353.
+'
+' config: { deviceId, port, address ("a.b.c.d"), txt: [[key, value], ...],
+' service }, the service type being SERVICE (SiloControl) when absent, or companion
+' sign-in's (docs/companion-pairing.md section 3). The records: PTR
+' type -> Silo-<id8>.type, SRV and TXT on that instance, and A for
+' silo-<id8>.local. Names compare without case.
+namespace silocontrol.mdns
+    const SERVICE = "_silocast-roku._tcp.local"
+    const ENUMERATION = "_services._dns-sd._udp.local"
+    const GROUP = "224.0.0.251:5353"
+    const PORT = 5353
+    const TYPE_A = 1
+    const TYPE_PTR = 12
+    const TYPE_TXT = 16
+    const TYPE_SRV = 33
+    const TYPE_ANY = 255
+    const HOST_TTL = 120
+    const TXT_TTL = 4500
+    ' The largest packet read; a buffer of this many bytes, filled first,
+    ' receives each one (section 5.1).
+    const MAX_PACKET = 9000
+
+    ' The first eight letters and digits of the installation ID, lowercase.
+    function shortId(deviceId as String) as String
+        out = ""
+        for i = 1 to Len(deviceId)
+            c = LCase(Mid(deviceId, i, 1))
+            code = Asc(c)
+            if (code >= 48 and code <= 57) or (code >= 97 and code <= 122) then out = out + c
+            if Len(out) = 8 then exit for
+        end for
+        if out = "" then out = "roku"
+        return out
+    end function
+
+    function instanceName(deviceId as String, serviceType = SERVICE as String) as String
+        return "Silo-" + shortId(deviceId) + "." + serviceType
+    end function
+
+    function serviceOf(config as Object) as String
+        if util.isString(config.service) and config.service <> "" then return config.service
+        return SERVICE
+    end function
+
+    function hostName(deviceId as String) as String
+        return "silo-" + shortId(deviceId) + ".local"
+    end function
+
+    ' ---- Reading queries
+
+    ' The questions of a query, as [{ name (lowercase, dotted), type }], or
+    ' [] for a response or a malformed packet. bytes holds count valid bytes.
+    function questions(bytes as Object, count as Integer) as Object
+        out = []
+        if count < 12 then return out
+        if (bytes[2] and &h80) <> 0 then return out
+        total = (bytes[4] << 8) + bytes[5]
+        offset = 12
+        for q = 1 to total
+            name = readName(bytes, count, offset)
+            if name = invalid or name.next + 4 > count then return out
+            offset = name.next
+            qtype = (bytes[offset] << 8) + bytes[offset + 1]
+            out.Push({ name: LCase(name.text), type: qtype })
+            offset = offset + 4
+        end for
+        return out
+    end function
+
+    ' The name at offset, following compression pointers, as { text, next }
+    ' where next is the offset after it in the packet; invalid when it runs
+    ' past count or loops.
+    function readName(bytes as Object, count as Integer, offset as Integer) as Dynamic
+        labels = []
+        position = offset
+        after = -1
+        jumps = 0
+        while true
+            if position >= count then return invalid
+            size = bytes[position]
+            if size = 0
+                if after < 0 then after = position + 1
+                exit while
+            end if
+            if (size and &hC0) = &hC0
+                if position + 1 >= count then return invalid
+                jumps = jumps + 1
+                if jumps > 16 then return invalid
+                if after < 0 then after = position + 2
+                position = ((size and &h3F) << 8) + bytes[position + 1]
+            else if (size and &hC0) <> 0
+                return invalid
+            else
+                if position + size >= count then return invalid
+                label = CreateObject("roByteArray")
+                for i = position + 1 to position + size
+                    label.Push(bytes[i])
+                end for
+                labels.Push(label.ToAsciiString())
+                position = position + size + 1
+            end if
+        end while
+        return { text: labels.Join("."), next: after }
+    end function
+
+    ' Which records answer the questions, as a list of "ptr", "srv", "txt",
+    ' "a", and "services" (the enumeration PTR): a PTR (or ANY) question for
+    ' the service gets all four; one for the instance or host name gets its
+    ' own record; an enumeration question gets the service type.
+    function answers(found as Object, deviceId as String, serviceType = SERVICE as String) as Object
+        instance = LCase(instanceName(deviceId, serviceType))
+        host = LCase(hostName(deviceId))
+        wanted = {}
+        for each question in found
+            qtype = question.type
+            if question.name = serviceType and (qtype = TYPE_PTR or qtype = TYPE_ANY)
+                for each record in ["ptr", "srv", "txt", "a"]
+                    wanted[record] = true
+                end for
+            else if question.name = ENUMERATION and (qtype = TYPE_PTR or qtype = TYPE_ANY)
+                wanted.services = true
+            else if question.name = instance
+                if qtype = TYPE_SRV or qtype = TYPE_ANY
+                    wanted.srv = true
+                    wanted.a = true
+                end if
+                if qtype = TYPE_TXT or qtype = TYPE_ANY then wanted.txt = true
+            else if question.name = host and (qtype = TYPE_A or qtype = TYPE_ANY)
+                wanted.a = true
+            end if
+        end for
+        out = []
+        for each record in ["services", "ptr", "srv", "txt", "a"]
+            if wanted.DoesExist(record) then out.Push(record)
+        end for
+        return out
+    end function
+
+    ' ---- Writing responses
+
+    ' A response with the records named (answers()), all four for the
+    ' announcements. goodbye sends them with TTL 0 (section 5.1).
+    function packet(config as Object, records as Object, goodbye = false as Boolean) as Object
+        out = CreateObject("roByteArray")
+        for each value in [0, &h8400, 0, records.Count(), 0, 0]
+            push16(out, value)
+        end for
+        serviceType = serviceOf(config)
+        instance = instanceName(config.deviceId, serviceType)
+        host = hostName(config.deviceId)
+        for each record in records
+            if record = "services"
+                rdata = CreateObject("roByteArray")
+                pushName(rdata, serviceType)
+                write(out, ENUMERATION, TYPE_PTR, 1, ttl(HOST_TTL, goodbye), rdata)
+            else if record = "ptr"
+                rdata = CreateObject("roByteArray")
+                pushName(rdata, instance)
+                write(out, serviceType, TYPE_PTR, 1, ttl(HOST_TTL, goodbye), rdata)
+            else if record = "srv"
+                rdata = CreateObject("roByteArray")
+                push16(rdata, 0)
+                push16(rdata, 0)
+                push16(rdata, config.port)
+                pushName(rdata, host)
+                write(out, instance, TYPE_SRV, &h8001, ttl(HOST_TTL, goodbye), rdata)
+            else if record = "txt"
+                write(out, instance, TYPE_TXT, &h8001, ttl(TXT_TTL, goodbye), txtData(config.txt))
+            else if record = "a"
+                rdata = CreateObject("roByteArray")
+                for each octet in util.text(config.address).Split(".")
+                    rdata.Push(octet.ToInt())
+                end for
+                write(out, host, TYPE_A, &h8001, ttl(HOST_TTL, goodbye), rdata)
+            end if
+        end for
+        return out
+    end function
+
+    ' The four records every announcement carries.
+    function allRecords() as Object
+        return ["ptr", "srv", "txt", "a"]
+    end function
+
+    function ttl(seconds as Integer, goodbye as Boolean) as Integer
+        if goodbye then return 0
+        return seconds
+    end function
+
+    ' TXT rdata: each "key=value" as a length-prefixed string of at most 255
+    ' bytes; a longer one is cut.
+    function txtData(pairs as Object) as Object
+        out = CreateObject("roByteArray")
+        for each pair in pairs
+            entry = CreateObject("roByteArray")
+            entry.FromAsciiString(pair[0] + "=" + util.text(pair[1]))
+            size = entry.Count()
+            if size > 255 then size = 255
+            out.Push(size)
+            for i = 0 to size - 1
+                out.Push(entry[i])
+            end for
+        end for
+        if out.Count() = 0 then out.Push(0)
+        return out
+    end function
+
+    sub write(out as Object, name as String, rrtype as Integer, rrclass as Integer, seconds as Integer, rdata as Object)
+        pushName(out, name)
+        push16(out, rrtype)
+        push16(out, rrclass)
+        push16(out, (seconds >> 16) and &hFFFF)
+        push16(out, seconds and &hFFFF)
+        push16(out, rdata.Count())
+        out.Append(rdata)
+    end sub
+
+    ' A dotted name as DNS labels, without compression. Each label is cut to
+    ' 63 bytes.
+    sub pushName(out as Object, name as String)
+        for each label in name.Split(".")
+            if label <> ""
+                bytes = CreateObject("roByteArray")
+                bytes.FromAsciiString(label)
+                size = bytes.Count()
+                if size > 63 then size = 63
+                out.Push(size)
+                for i = 0 to size - 1
+                    out.Push(bytes[i])
+                end for
+            end if
+        end for
+        out.Push(0)
+    end sub
+
+    sub push16(out as Object, value as Integer)
+        out.Push((value >> 8) and &hFF)
+        out.Push(value and &hFF)
+    end sub
+end namespace

@@ -239,6 +239,41 @@ The console logs each link's validity and outcome, never its values;
 `AppLaunchComplete` fires once per launch: for a deep-link launch, when
 playback starts or the player shows an error.
 
+### Phone remote (SiloControl)
+
+Development builds (`npm run sideload:dev`) run the SiloControl receiver
+(`docs/silocontrol.md`): once signed in, the app listens on TCP 52817 and
+advertises `_silocast-roku._tcp` over multicast DNS, and the avatar menu has
+Connect a Phone. Release builds leave it out until the build switches
+`silocontrol` and `handoff` in `manifest` are turned on.
+
+`npm run silocontrol -- <options> <steps>` plays a phone's part against the
+Roku in `.env`, through `ROKU_DEPLOY_VIA` when set. It prints every frame the
+Roku sends, masking handoff codes and resume tokens; by default its hello
+names the Roku's own server.
+
+```sh
+npm run silocontrol -- wait 10                              # connect, hello, and watch state
+npm run silocontrol -- control seek '{"seconds":120}' wait 3 # a control command
+npm run silocontrol -- offer <profileId> wait 2 launch <contentId> wait 10
+npm run silocontrol -- --key <pairing code> wait 5          # level sealed, after Require Pairing
+dns-sd -B _silocast-roku._tcp                               # on a Mac: is the Roku advertised?
+```
+
+With the `companion` switch (on in every build), the server and sign-in
+screens also run companion sign-in (`docs/companion-pairing.md`):
+they advertise `_silopair-roku._tcp` on TCP 52827, and a Silo phone app on
+the network offers to sign the Roku in. `--pairing` plays the phone's part:
+
+```sh
+npm run silocontrol -- --pairing push https://silo.example '{"serverIdentity":"<server_id>"}' wait 30 cancel
+```
+
+On macOS, Homebrew's `node` started over SSH has no Local Network permission
+and gets `EHOSTUNREACH` for LAN addresses; run the script on the Mac's own
+terminal, or relay through a loopback port with the system `python3` or
+`nc`.
+
 ### Device check
 
 `scripts/device-check.sh` is the device lane of plan sections 1, 7, and 8: cold

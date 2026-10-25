@@ -26,7 +26,9 @@ import "pkg:/source/playback/options.bs"
 '                                 level "debug", "info", or "warn"
 ' env: { now (milliseconds on a clock that is never reset), device
 ' (roDeviceInfo, or a facade in specs), identity
-' (api.auth.coordinator.identity), app ({ version, build, channel }), gates
+' (api.auth.coordinator.identity), borrowed (a phone's identity the
+' coordinator also holds, api.auth.coordinator.borrowedIdentity, or
+' invalid), app ({ version, build, channel }), gates
 ' (a playback.gates.evaluate context, or invalid for this build's), uuid()
 ' (a canonical UUID, for the stops this file builds itself) }.
 '
@@ -106,7 +108,7 @@ namespace playback.worker
         end if
         command = input.command
         if not util.isObject(command) or not util.isObject(command.fence) then return [reply(answer(input, "rejected", 0))]
-        if not fencedTo(command.fence, env.identity) then return [reply(answer(input, "fenced", 0))]
+        if not isLive(command.fence, env) then return [reply(answer(input, "fenced", 0))]
         ' While an identity change waits, the identity that is leaving starts
         ' nothing new; replays of what is in flight still go.
         if (op = "start" or op = "replan") and departing(state, command.fence) and not playback.values.isText(command.bodyText) then return [reply(answer(input, "fenced", 0))]
@@ -134,7 +136,7 @@ namespace playback.worker
             ' leaves (hardware run 8, defect 3).
             if kind = "notFound" or kind = "ended" then forgetSession(state, util.text(command.session_id))
             ' A post of an identity that has gone retires nothing.
-            if op.kind = "progress" and kind = "ok" and fencedTo(command.fence, env.identity)
+            if op.kind = "progress" and kind = "ok" and isLive(command.fence, env)
                 for each record in playback.jobs.supersede(state.jobs, command.fence, util.text(command.session_id), op.since)
                     decisions.Push(jobLog(record))
                 end for
@@ -163,13 +165,15 @@ namespace playback.worker
         end for
         decisions.Append(settleDeparting(state, env))
         decisions.Append(releaseSession(state, env))
-        for each record in playback.jobs.releaseOthers(state.jobs, env.identity, "identity_changed")
+        for each record in playback.jobs.releaseOutside(state.jobs, liveIdentities(env), "identity_changed")
             decisions.Push(jobLog(record))
         end for
-        decisions.Append(releaseStarts(state, env.identity))
+        decisions.Append(releaseStarts(state, liveIdentities(env)))
         decisions.Append(replayOrphans(state, env))
-        for each job in playback.jobs.due(state.jobs, env.now, env.identity)
-            decisions.Push(submit(jobRequest(state, job)))
+        for each identity in liveIdentities(env)
+            for each job in playback.jobs.due(state.jobs, env.now, identity)
+                decisions.Push(submit(jobRequest(state, job)))
+            end for
         end for
         return decisions
     end function
@@ -237,7 +241,7 @@ namespace playback.worker
     function startPlayback(state as Object, input as Object, env as Object) as Object
         command = input.command
         if playback.values.isText(command.bodyText) then return [submit(startRequest(state, input, command.bodyText, state.contexts[util.text(command.playback_attempt_id)]))]
-        key = capabilitiesKey(env.identity)
+        key = capabilitiesKey(command.fence)
         caps = state.capabilities
         if util.isTrue(command.refreshCapabilities) or (caps <> invalid and caps.key <> key)
             state.capabilities = invalid
@@ -268,7 +272,7 @@ namespace playback.worker
         end if
         etag = ""
         if util.isObject(result.headers) then etag = util.text(result.headers.etag)
-        caps = { key: capabilitiesKey(env.identity), etag: etag, installationId: body.installation_id, features: body.features, readAt: env.now }
+        caps = { key: capabilitiesKey(op.input.command.fence), etag: etag, installationId: body.installation_id, features: body.features, readAt: env.now }
         state.capabilities = caps
         return buildStart(state, op.input, caps, env)
     end function
@@ -292,7 +296,7 @@ namespace playback.worker
         request = {
             installationId: caps.installationId,
             fileId: util.text(intent.fileId),
-            profileId: util.text(env.identity.profile),
+            profileId: util.text(command.fence.profile),
             playbackAttemptId: util.text(command.playback_attempt_id),
             qualityPreference: util.text(command.quality_preference),
             audioTrack: tracks.audio,
@@ -474,13 +478,13 @@ namespace playback.worker
         return decisions
     end function
 
-    ' Stops tracking starts of an identity other than identity that are not
+    ' Stops tracking starts of an identity not among identities that are not
     ' in flight: their sessions cannot be stopped with its credentials.
-    function releaseStarts(state as Object, identity as Object) as Object
+    function releaseStarts(state as Object, identities as Object) as Object
         decisions = []
         kept = []
         for each entry in state.starts
-            if entry.requestId = "" and not fencedTo(entry.fence, identity)
+            if entry.requestId = "" and not fencedToAny(entry.fence, identities)
                 if entry.sessionId <> invalid or entry.orphaned then decisions.Push(logged("warn", "a session of an identity that is gone is left to the server", invalid))
             else
                 kept.Push(entry)
@@ -563,7 +567,7 @@ namespace playback.worker
     function addJob(state as Object, input as Object, env as Object) as Object
         job = input.job
         if not util.isObject(job) or not util.isObject(job.fence) or not playback.values.isText(job.sessionId) or not playback.values.isText(job.bodyText) then return [reply(answer(input, "rejected", 0))]
-        if not fencedTo(job.fence, env.identity) then return [jobLog(playback.jobs.record(job, "identity_changed")), reply(answer(input, "fenced", 0))]
+        if not isLive(job.fence, env) then return [jobLog(playback.jobs.record(job, "identity_changed")), reply(answer(input, "fenced", 0))]
         if job.kind = "stop" then forgetSession(state, job.sessionId)
         decisions = queueJob(state, job, env)
         decisions.Push(reply(answer(input, "queued", 0)))
@@ -574,7 +578,7 @@ namespace playback.worker
     ' Queues a job fenced to the identity whose credentials ApiTask holds,
     ' and releases one fenced to any other.
     function queueJob(state as Object, job as Object, env as Object) as Object
-        if not fencedTo(job.fence, env.identity) then return [jobLog(playback.jobs.record(job, "identity_changed"))]
+        if not isLive(job.fence, env) then return [jobLog(playback.jobs.record(job, "identity_changed"))]
         decisions = []
         for each record in playback.jobs.add(state.jobs, job, env.now)
             decisions.Push(jobLog(record))
@@ -617,15 +621,26 @@ namespace playback.worker
     ' and the stops of its live sessions finish with that identity's
     ' credentials before the new identity is published; later operations
     ' queue behind it. cancel() drops waiting operations.
+    ' Ending or replacing a phone's borrowed identity ("borrowedEnd",
+    ' "borrow") waits the same way for the borrowed identity's playback, so
+    ' its stop goes out before its logout (docs/silocontrol.md section 8.3).
     function deferSession(state as Object, input as Object, env as Object) as Boolean
         op = util.text(input.session)
-        if op <> "server" and op <> "signIn" and op <> "signOut" and op <> "selectProfile" and op <> "verifyPin" then return false
+        borrowing = op = "borrowedEnd" or op = "borrow"
+        if op <> "server" and op <> "signIn" and op <> "signOut" and op <> "selectProfile" and op <> "verifyPin" and not borrowing then return false
         if state.deferred <> invalid
             state.deferred.inputs.Push(input)
             return true
         end if
-        if not changesIdentity(input, env.identity) or not busy(state, env.identity) then return false
-        state.deferred = { inputs: [input], identity: env.identity, until: env.now + playback.jobs.SETTLE_MS, settled: false }
+        leaving = env.identity
+        if borrowing
+            leaving = env.borrowed
+            if not util.isObject(leaving) then return false
+        else if not changesIdentity(input, env.identity)
+            return false
+        end if
+        if not busy(state, leaving) then return false
+        state.deferred = { inputs: [input], identity: leaving, until: env.now + playback.jobs.SETTLE_MS, settled: false }
         return true
     end function
 
@@ -736,6 +751,26 @@ namespace playback.worker
 
     function capabilitiesKey(identity as Object) as String
         return util.text(identity.server) + "|" + util.text(identity.account) + "|" + util.text(identity.profile)
+    end function
+
+    ' The identities whose credentials ApiTask holds: its own, and a phone's
+    ' it borrowed (docs/silocontrol.md section 8.3).
+    function liveIdentities(env as Object) as Object
+        out = [env.identity]
+        if util.isObject(env.borrowed) then out.Push(env.borrowed)
+        return out
+    end function
+
+    ' Whether fence belongs to an identity ApiTask holds credentials for.
+    function isLive(fence as Object, env as Object) as Boolean
+        return fencedToAny(fence, liveIdentities(env))
+    end function
+
+    function fencedToAny(fence as Object, identities as Object) as Boolean
+        for each identity in identities
+            if fencedTo(fence, identity) then return true
+        end for
+        return false
     end function
 
     function fencedTo(fence as Object, identity as Object) as Boolean

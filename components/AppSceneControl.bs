@@ -1,0 +1,887 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/control/policy.bs"
+import "pkg:/source/control/protocol.bs"
+import "pkg:/source/control/sealed.bs"
+import "pkg:/source/control/state.bs"
+import "pkg:/source/nav/phase.bs"
+import "pkg:/source/platform/topics.bs"
+import "pkg:/source/nav/player.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/nav/stack.bs"
+import "pkg:/source/api/request.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/instant.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' AppScene as the SiloControl receiver's hub (docs/silocontrol.md sections 6
+' to 10). ControlTask owns the sockets and the connection rules; this file
+' starts and stops it with the session, sends it the state frame while
+' authorized phones listen, and acts on what they ask: a control command
+' goes to the player (Player's remoteCommand), a launch opens the player on
+' top of the shell, and a handoff offer for the profile open on the Roku is
+' answered at once (section 8.1). Built only with bs_const silocontrol.
+
+' The owner of the receiver's requests.
+const CONTROL_OWNER = "silocontrol"
+' Section 8.1: an own-profile handoff_ready says its session lasts this long.
+const CONTROL_SESSION_SECONDS = 86400
+' A launch counts as pending until its player reports or this long passes.
+const CONTROL_LAUNCH_WAIT_MS = 30000
+
+sub controlInit()
+    m.remote = { task: invalid, taskReady: false, queued: [], origin: "", serverIdentity: "", listening: invalid, controllers: [], ready: {}, issued: invalid, launchAt: invalid, launchContentId: "", launchSeen: false, launchClock: CreateObject("roTimespan"), stateKey: "", starts: 0, playing: false, identityHandle: invalid, handoff: invalid, borrowed: invalid, pairingKey: "", pairingHandle: invalid, starting: false, retiring: [], memoryPaused: false }
+    m.controlTimer = m.top.findNode("controlTimer")
+    m.controlTimer.observeField("fire", "onControlTick")
+    m.controlPollTimer = m.top.findNode("controlPollTimer")
+    m.controlLaunchTimer = m.top.findNode("controlLaunchTimer")
+    m.remoteNotice = m.top.findNode("remoteNotice")
+    m.remoteNoticeTimer = m.top.findNode("remoteNoticeTimer")
+    m.remoteNoticeTimer.observeField("fire", "onRemoteNoticeTimer")
+    #if handoff
+        m.controlPollTimer.observeField("fire", "onControlPoll")
+        m.controlLaunchTimer.observeField("fire", "onControlLaunchTimeout")
+    #end if
+end sub
+
+' Called by onApiSession for each session ApiTask publishes: the receiver
+' runs while the app is signed in to a confirmed server (section 5.2) and
+' stops on sign-out and server change (section 10).
+sub controlSessionChanged()
+    #if silocontrol
+        view = m.apiSession
+        wanted = view <> invalid and view.status = "signed_in" and view.originStatus = "verified" and util.text(view.deviceId) <> "" and not m.remote.memoryPaused
+        active = m.remote.task <> invalid or m.remote.starting
+        if active and (not wanted or view.origin <> m.remote.origin) then controlStop("tv_disconnected")
+        active = m.remote.task <> invalid or m.remote.starting
+        if wanted and not active then controlStart(view)
+        if m.remote.task <> invalid then controlRefresh()
+    #end if
+end sub
+
+' Section 10: at Roku's critical memory level the receiver stops, closing
+' every phone, and starts again once memory recovers.
+sub controlMemoryLevel(critical as Boolean)
+    if critical = m.remote.memoryPaused then return
+    m.remote.memoryPaused = critical
+    log.info("silocontrol", "memory", { critical: critical })
+    controlSessionChanged()
+end sub
+
+' Reads the pairing key first: with one the receiver runs at level sealed
+' (section 9.4).
+sub controlStart(view as Object)
+    m.remote.origin = view.origin
+    m.remote.starting = true
+    handle = api.newHandle(CONTROL_OWNER)
+    handle.observeField("status", "onControlPairing")
+    m.remote.pairingHandle = handle
+    apiSend({ session: "pairing" }, handle)
+end sub
+
+sub onControlPairing(event as Object)
+    handle = event.getRoSGNode()
+    if m.remote.pairingHandle = invalid or not handle.isSameNode(m.remote.pairingHandle) then return
+    m.remote.pairingHandle = invalid
+    result = api.resultOf(handle)
+    m.remote.pairingKey = ""
+    if result <> invalid and result.ok = true and util.isObject(result.body) then m.remote.pairingKey = util.text(result.body.key)
+    view = m.apiSession
+    if not m.remote.starting or view = invalid or view.origin <> m.remote.origin then return
+    m.remote.starting = false
+    controlRun()
+end sub
+
+sub controlRun()
+    m.remote.serverIdentity = ""
+    m.remote.ready = {}
+    m.remote.issued = invalid
+    m.remote.controllers = []
+    m.remote.listening = invalid
+    m.remote.taskReady = false
+    m.remote.queued = []
+    task = CreateObject("roSGNode", "ControlTask")
+    task.observeField("ready", "onControlTaskReady")
+    task.observeField("event", "onControlEvent")
+    m.remote.task = task
+    m.remote.stateKey = "idle"
+    controlCommand({ kind: "start", config: controlConfig(), txt: controlTxt(), stateBody: silocontrol.state.idle(), pairingKey: m.remote.pairingKey })
+    task.control = "run"
+    ' The deployment identity lets a phone on another address of this
+    ' server recognise it (section 6.2).
+    m.remote.identityHandle = api.newHandle(CONTROL_OWNER)
+    m.remote.identityHandle.observeField("status", "onControlIdentity")
+    apiSend({ path: "/api/v2/system/identity" }, m.remote.identityHandle)
+    log.info("silocontrol", "receiver starting")
+end sub
+
+sub controlStop(reason as String)
+    m.remote.starting = false
+    if m.remote.pairingHandle <> invalid
+        m.remote.pairingHandle.unobserveField("status")
+        m.remote.pairingHandle = invalid
+    end if
+    if m.remote.task = invalid
+        controlPublish()
+        return
+    end if
+    controlDropHandoff()
+    if m.remote.taskReady
+        m.remote.task.command = { kind: "stop", reason: reason }
+    else
+        ' Stopped before it observes its commands: it stops once it does.
+        m.remote.retiring.Push({ task: m.remote.task, reason: reason })
+    end if
+    m.remote.task = invalid
+    m.remote.controllers = []
+    m.remote.ready = {}
+    m.remote.issued = invalid
+    m.remote.listening = invalid
+    m.controlTimer.control = "stop"
+    apiRelease(CONTROL_OWNER)
+    controlPublish()
+    log.info("silocontrol", "receiver stopped", { reason: reason })
+end sub
+
+' A set kept until the Task observes its command field.
+sub controlCommand(command as Object)
+    task = m.remote.task
+    if task = invalid then return
+    if m.remote.taskReady
+        task.command = command
+    else
+        m.remote.queued.Push(command)
+    end if
+end sub
+
+sub onControlTaskReady(event as Object)
+    task = event.getRoSGNode()
+    if not task.ready then return
+    kept = []
+    for each retired in m.remote.retiring
+        if retired.task.isSameNode(task)
+            task.command = { kind: "stop", reason: retired.reason }
+        else
+            kept.Push(retired)
+        end if
+    end for
+    m.remote.retiring = kept
+    if m.remote.task = invalid or not task.isSameNode(m.remote.task) then return
+    m.remote.taskReady = true
+    for each command in m.remote.queued
+        task.command = command
+    end for
+    m.remote.queued = []
+end sub
+
+' The hello's values (silocontrol.receiver's config).
+function controlConfig() as Object
+    view = m.apiSession
+    origin = m.remote.origin
+    return { deviceName: controlDeviceName(), deviceId: util.text(view.deviceId), origin: origin, serverId: silocontrol.protocol.serverId(origin), serverName: controlServerName(origin), serverIdentity: m.remote.serverIdentity }
+end function
+
+' The DNS-SD TXT pairs (section 5.1).
+function controlTxt() as Object
+    config = controlConfig()
+    playing = "0"
+    if m.remote.playing then playing = "1"
+    pairs = [["v", "2"], ["name", config.deviceName], ["id", config.deviceId], ["server", config.serverId], ["serverName", config.serverName], ["playing", playing]]
+    if config.serverIdentity <> "" then pairs.Push(["serverIdentity", config.serverIdentity])
+    if m.remote.pairingKey = ""
+        pairs.Push(["sec", "plain"])
+    else
+        pairs.Push(["sec", "sealed"])
+        pairs.Push(["kid", silocontrol.sealed.keyId(controlKeyBytes())])
+    end if
+    return pairs
+end function
+
+' The Roku's own name for itself, clamped as X-Silo-Device-Name is.
+function controlDeviceName() as String
+    info = CreateObject("roDeviceInfo")
+    name = util.text(info.GetFriendlyName()).Trim()
+    if name = "" then name = util.text(info.GetModelDisplayName())
+    if name = "" then name = "Roku"
+    return Left(name, 120)
+end function
+
+' The server's host, which phones show beside the Roku's name: the server
+' publishes no display name.
+function controlServerName(origin as String) as String
+    host = origin
+    cut = Instr(1, host, "://")
+    if cut > 0 then host = Mid(host, cut + 3)
+    return host
+end function
+
+sub onControlIdentity(event as Object)
+    handle = event.getRoSGNode()
+    if m.remote.identityHandle = invalid or not handle.isSameNode(m.remote.identityHandle) then return
+    m.remote.identityHandle = invalid
+    result = api.resultOf(handle)
+    if result = invalid or result.ok <> true or not util.isObject(result.body) then return
+    identity = util.text(result.body.server_id).Trim()
+    if identity = "" or identity = m.remote.serverIdentity then return
+    m.remote.serverIdentity = identity
+    controlCommand({ kind: "update", config: controlConfig(), txt: controlTxt() })
+end sub
+
+' ---- Events from ControlTask
+
+sub onControlEvent(event as Object)
+    task = event.getRoSGNode()
+    if m.remote.task = invalid or not task.isSameNode(m.remote.task) then return
+    data = event.getData()
+    if not util.isObject(data) then return
+    kind = util.text(data.type)
+    if kind = "listening"
+        m.remote.listening = { address: data.address, port: data.port }
+        controlPublish()
+    else if kind = "controllers"
+        m.remote.controllers = data.list
+        controlRefresh()
+        controlPublish()
+    else if kind = "connected"
+        log.info("silocontrol", "phone connected")
+        controlNotice(i18n.text("connect.connected", { name: util.text(data.deviceName) }))
+    else if kind = "gone"
+        m.remote.ready.Delete(data.id)
+        if m.remote.issued <> invalid and m.remote.issued.connection = data.id then m.remote.issued.connection = ""
+        if m.remote.handoff <> invalid and m.remote.handoff.controllerId = data.id then controlDropHandoff()
+    else if kind = "handoffCancel"
+        pending = m.remote.handoff
+        if pending <> invalid and pending.controllerId = data.id and pending.requestId = data.payload.requestId then controlDropHandoff()
+    else if kind = "control"
+        controlApply(data)
+    else if kind = "launch"
+        controlLaunch(data)
+    else if kind = "offer"
+        controlOffer(data)
+    else if kind = "failed"
+        log.warn("silocontrol", "receiver failed", { reason: data.reason })
+    end if
+end sub
+
+' ---- Connect a Phone (section 4.1)
+
+function controlKeyBytes() as Object
+    bytes = CreateObject("roByteArray")
+    bytes.FromHexString(m.remote.pairingKey)
+    return bytes
+end function
+
+' The pairing link (section 5.3), or "" until the receiver listens.
+function controlLink() as String
+    listening = m.remote.listening
+    if listening = invalid or m.remote.task = invalid or util.text(listening.address) = "" then return ""
+    config = controlConfig()
+    link = "silo://cast?v=2&host=" + listening.address + "&port=" + listening.port.ToStr() + "&id=" + api.request.escape(config.deviceId) + "&name=" + api.request.escape(config.deviceName) + "&server=" + api.request.escape(config.serverId)
+    if m.remote.pairingKey = "" then return link + "&security=plain"
+    return link + "&security=sealed&key=" + silocontrol.sealed.base32(controlKeyBytes())
+end function
+
+' The key in base32, in groups of four, as Connect a Phone shows it.
+function controlPairingCode() as String
+    if m.remote.pairingKey = "" then return ""
+    code = silocontrol.sealed.base32(controlKeyBytes())
+    groups = []
+    for i = 1 to Len(code) step 4
+        groups.Push(Mid(code, i, 4))
+    end for
+    return groups.Join(" ")
+end function
+
+sub controlPublish()
+    listening = m.remote.listening
+    address = ""
+    port = 0
+    if listening <> invalid and m.remote.task <> invalid
+        address = util.text(listening.address)
+        port = listening.port
+    end if
+    phones = []
+    for each controller in m.remote.controllers
+        if util.isTrue(controller.authorized) and not util.isTrue(controller.passive) then phones.Push(util.text(controller.deviceName))
+    end for
+    status = { running: m.remote.task <> invalid and address <> "", address: address, port: port, deviceName: controlDeviceName(), link: controlLink(), phones: phones, sealed: m.remote.pairingKey <> "", pairingCode: controlPairingCode() }
+    m.top.remoteStatus = status
+    platformPublish({ type: platform.topic.REMOTE_STATUS, status: status })
+end sub
+
+sub remoteRequirePairing(enabled as Boolean)
+    key = ""
+    if enabled then key = controlNewKey()
+    controlStorePairing(key)
+end sub
+
+sub remoteResetPairing()
+    if m.remote.pairingKey <> "" then controlStorePairing(controlNewKey())
+end sub
+
+' Section 9.3: SHA-256 of four UUIDs, the installation ID, and the uptime.
+function controlNewKey() as String
+    info = CreateObject("roDeviceInfo")
+    material = info.GetRandomUUID() + info.GetRandomUUID() + info.GetRandomUUID() + info.GetRandomUUID() + util.text(m.apiSession.deviceId) + UpTime(0).ToStr()
+    return LCase(silocontrol.sealed.newKey(material).ToHexString())
+end function
+
+' Stores the key, then starts the receiver again at its new level, which
+' disconnects every phone.
+sub controlStorePairing(key as String)
+    handle = api.newHandle(CONTROL_OWNER + ".pairing")
+    handle.observeField("status", "onControlPairingStored")
+    apiSend({ session: "pairing", key: key }, handle)
+end sub
+
+sub onControlPairingStored(event as Object)
+    result = api.resultOf(event.getRoSGNode())
+    if result = invalid or result.ok <> true then return
+    view = m.apiSession
+    if m.remote.task = invalid and not m.remote.starting then return
+    controlStop("tv_disconnected")
+    if view <> invalid then controlStart(view)
+end sub
+
+' A short line over every screen, top centre.
+sub controlNotice(line as String)
+    label = m.top.findNode("remoteNoticeLabel")
+    label.font = theme.font(theme.textStyle.NOTICE_MESSAGE)
+    label.color = theme.color.WHITE
+    label.text = line
+    width = Int(label.boundingRect().width) + 64
+    if width < 320 then width = 320
+    label.width = width
+    label.height = 64
+    fill = m.top.findNode("remoteNoticeFill")
+    fill.uri = theme.art.PANEL
+    fill.width = width
+    fill.height = 64
+    m.remoteNotice.translation = [(1920 - width) \ 2, 48]
+    m.remoteNotice.visible = true
+    m.remoteNoticeTimer.control = "stop"
+    m.remoteNoticeTimer.control = "start"
+end sub
+
+sub onRemoteNoticeTimer()
+    m.remoteNotice.visible = false
+end sub
+
+' ---- State (section 6.4)
+
+' The player screen, or invalid.
+function controlPlayer() as Dynamic
+    entries = m.navStack.entries
+    for i = entries.Count() - 1 to 0 step -1
+        entry = entries[i]
+        if entry.route = nav.route.PLAYER
+            screen = m.navScreens[entry.id]
+            if screen <> invalid then return screen
+        end if
+    end for
+    return invalid
+end function
+
+' Starts the state ticks while an authorized phone listens and a title is
+' up, sends the state now, and updates the TXT's playing flag.
+sub controlRefresh()
+    if m.remote.task = invalid then return
+    controlFollowBorrowed()
+    player = controlPlayer()
+    playing = player <> invalid
+    if playing <> m.remote.playing
+        m.remote.playing = playing
+        controlCommand({ kind: "update", config: controlConfig(), txt: controlTxt() })
+    end if
+    listening = false
+    for each controller in m.remote.controllers
+        if util.isTrue(controller.authorized) then listening = true
+    end for
+    if listening and playing
+        if m.controlTimer.control <> "start" then m.controlTimer.control = "start"
+    else
+        m.controlTimer.control = "stop"
+    end if
+    controlSendState()
+end sub
+
+sub onControlTick()
+    if m.remote.task = invalid
+        m.controlTimer.control = "stop"
+        return
+    end if
+    controlRefresh()
+end sub
+
+' Sends the state when it changed, or while a title plays. ControlTask
+' encodes it, keeping JSON off the render thread.
+sub controlSendState()
+    player = controlPlayer()
+    if player = invalid
+        ' The launched title's player closed before it finished loading.
+        if m.remote.launchSeen then m.remote.launchAt = invalid
+        m.remote.launchSeen = false
+        key = "idle"
+        body = silocontrol.state.idle()
+        if controlLaunchPending()
+            key = "loading:" + m.remote.launchContentId
+            body = silocontrol.state.loading(m.remote.launchContentId)
+        end if
+        if key = m.remote.stateKey then return
+        m.remote.stateKey = key
+    else
+        snapshot = player.callFunc("remoteState")
+        if util.isObject(snapshot)
+            if util.isNumber(m.remote.launchAt) and util.text(snapshot.contentId) = m.remote.launchContentId then m.remote.launchSeen = true
+            if not util.isTrue(snapshot.isLoading) then m.remote.launchAt = invalid
+        end if
+        body = silocontrol.state.build(snapshot)
+        m.remote.stateKey = ""
+    end if
+    controlCommand({ kind: "state", body: body })
+end sub
+
+' ---- Commands (section 6.5)
+
+sub controlApply(data as Object)
+    command = data.payload
+    player = controlPlayer()
+    if player = invalid
+        if util.text(command.name) <> "stop" then controlSend(data.id, silocontrol.protocol.error("player_not_ready", "The Roku player is not ready yet."))
+        return
+    end if
+    outcome = player.callFunc("remoteCommand", command)
+    if util.isObject(outcome) and not util.isTrue(outcome.ok) then controlSend(data.id, silocontrol.protocol.error(util.text(outcome.code), util.text(outcome.message)))
+    controlSendState()
+end sub
+
+sub controlSend(id as String, text as String, endsHandoff = false as Boolean)
+    controlCommand({ kind: "send", id: id, text: text, endsHandoff: endsHandoff })
+end sub
+
+' ---- Handoff (section 8)
+
+' The identity a controller made ready may launch under while it is still
+' the one the Roku holds: "own:<profile>" for the profile open on the Roku,
+' "borrowed:<profile>" for a phone's.
+function controlOwnKey() as String
+    view = m.apiSession
+    if view = invalid or not util.isObject(view.profile) then return ""
+    return "own:" + view.profile.id
+end function
+
+function controlBorrowedKey() as String
+    if m.remote.borrowed = invalid then return ""
+    return "borrowed:" + m.remote.borrowed.profileId
+end function
+
+sub controlOffer(data as Object)
+    offer = data.payload
+    id = data.id
+    requestId = offer.requestId
+    if not silocontrol.protocol.serverMatches(offer.serverId, offer.serverIdentity, m.remote.origin, m.remote.serverIdentity)
+        controlCancel(id, requestId, "handoff_failed", "This Roku plays from " + controlServerName(m.remote.origin) + ".")
+        return
+    end if
+    view = m.apiSession
+    if m.navShell.phase <> nav.phase.MAIN or not util.isObject(view.profile)
+        controlCancel(id, requestId, "handoff_failed", "Choose a profile on the Roku first.")
+        return
+    end if
+    ' A handoff stops what plays before its identity goes in, so consent is
+    ' asked here (section 7.2).
+    nowPlaying = controlConsentNeeded(data)
+    if nowPlaying <> invalid
+        name = util.text(nowPlaying.profileName)
+        if name = "" then name = "Someone"
+        controlSend(id, silocontrol.protocol.handoffCancel(requestId, "replace_confirmation_required", name + " is watching " + nowPlaying.title + " on this Roku.", nowPlaying), true)
+        return
+    end if
+    ' A newer offer supersedes a handoff awaiting approval, however it is
+    ' answered (section 8.2).
+    controlSupersedeHandoff(data)
+    if offer.profileId = view.profile.id
+        ' Section 8.1: the profile open on the Roku needs no handoff.
+        controlReady(data, controlOwnKey(), offer.profileId, controlIsoIn(CONTROL_SESSION_SECONDS))
+        return
+    end if
+    #if handoff
+        borrowed = m.remote.borrowed
+        if borrowed <> invalid and borrowed.profileId = offer.profileId and borrowed.deviceId = data.controller.deviceId
+            issued = m.remote.issued
+            issuedConnection = ""
+            issuedToken = ""
+            if issued <> invalid and issued.key = controlBorrowedKey()
+                issuedConnection = issued.connection
+                issuedToken = issued.token
+            end if
+            if silocontrol.policy.mayReuse(true, issuedConnection, id, issuedToken, offer.resumeToken)
+                controlReady(data, controlBorrowedKey(), offer.profileId, borrowed.sessionExpiresAt)
+                return
+            end if
+        end if
+        controlBeginHandoff(data)
+    #else
+        controlCancel(id, requestId, "handoff_failed", "This Roku can play only for the profile open on it, " + view.profile.name + ".")
+    #end if
+end sub
+
+' What an offer would replace without consent (section 7.2), as the
+' cancel's nowPlaying, or invalid. Only a title under another profile
+' needs it, and only a phone that can ask.
+function controlConsentNeeded(data as Object) as Dynamic
+    player = controlPlayer()
+    if player = invalid then return invalid
+    entry = player.entry
+    offer = data.payload
+    borrowed = nav.player.identityOf(entry.params)
+    profileName = ""
+    controllerName = ""
+    playingProfile = ""
+    if borrowed <> invalid
+        playingProfile = borrowed.profile
+        profileName = util.text(entry.params.profileName)
+        controllerName = util.text(entry.params.controller)
+    else if util.isObject(m.apiSession.profile)
+        playingProfile = m.apiSession.profile.id
+        profileName = m.apiSession.profile.name
+    end if
+    snapshot = player.callFunc("remoteState")
+    contentId = util.text(snapshot.contentId)
+    confirmed = silocontrol.policy.confirmationCovers(contentId, offer.replaceConfirmed, offer.replacingContentId)
+    if not silocontrol.policy.needsReplaceConfirmation(true, playingProfile = offer.profileId, confirmed, util.contains(data.controller.features, "replace_confirmation")) then return invalid
+    title = util.text(snapshot.title)
+    if title = "" then title = "a title"
+    return { "contentId": contentId, "title": title, "subtitle": silocontrol.state.optionalText(snapshot.subtitle), "profileName": silocontrol.state.optionalText(profileName), "controllerName": silocontrol.state.optionalText(controllerName) }
+end function
+
+' handoff_ready for the controller, which may then launch under key.
+sub controlReady(data as Object, key as String, profileId as String, sessionExpiresAt as String, reused = true as Boolean)
+    id = data.id
+    token = ""
+    if util.contains(data.controller.features, "resume_token")
+        issued = m.remote.issued
+        if issued <> invalid and issued.key = key and issued.token <> ""
+            token = issued.token
+        else
+            info = CreateObject("roDeviceInfo")
+            token = silocontrol.policy.resumeToken([info.GetRandomUUID(), info.GetRandomUUID()])
+        end if
+    end if
+    m.remote.issued = { key: key, connection: id, token: token }
+    ' Readiness is this controller's alone (tvOS completeHandoff).
+    m.remote.ready = {}
+    m.remote.ready[id] = key
+    controlSend(id, silocontrol.protocol.handoffReady(data.payload.requestId, data.payload.serverId, profileId, sessionExpiresAt, reused, token), true)
+end sub
+
+' Withdraws a handoff awaiting approval for a newer offer; another phone's
+' hears it was superseded.
+sub controlSupersedeHandoff(data as Object)
+    pending = m.remote.handoff
+    if pending = invalid then return
+    if pending.controllerId <> data.id then controlCancel(pending.controllerId, pending.requestId, "superseded", util.text(data.controller.deviceName) + " started playing on this Roku.")
+    controlDropHandoff()
+end sub
+
+sub controlCancel(id as String, requestId as String, reason as String, message as String)
+    controlSend(id, silocontrol.protocol.handoffCancel(requestId, reason, message), true)
+end sub
+
+' An RFC 3339 instant seconds from now.
+function controlIsoIn(seconds as Integer) as String
+    moment = CreateObject("roDateTime")
+    moment.FromSeconds(moment.AsSeconds() + seconds)
+    return moment.ToISOString()
+end function
+
+#if handoff
+    ' Section 8.2: a device login the phone approves under its own profile.
+    ' One runs at a time; controlOffer has superseded any before it.
+    sub controlBeginHandoff(data as Object)
+        handle = api.newHandle(CONTROL_OWNER)
+        handle.observeField("status", "onControlHandoffStarted")
+        m.remote.starts = m.remote.starts + 1
+        startKey = "s" + m.remote.starts.ToStr()
+        m.remote.handoff = { controllerId: data.id, requestId: data.payload.requestId, data: data, handoffId: "", startKey: startKey, handle: handle, interval: 3, deadline: invalid }
+        apiSend({ session: "handoffStart", deviceName: controlDeviceName(), startKey: startKey }, handle)
+        log.info("silocontrol", "handoff started")
+    end sub
+
+    sub onControlHandoffStarted(event as Object)
+        pending = m.remote.handoff
+        if pending = invalid or not pending.handle.isSameNode(event.getRoSGNode()) then return
+        result = api.resultOf(pending.handle)
+        if result = invalid or result.ok <> true
+            kind = ""
+            if result <> invalid and util.isObject(result.error) then kind = util.text(result.error.kind)
+            message = "This Roku couldn't start the profile handoff."
+            if kind = "handoff_unsupported" then message = "Update the Silo server to use profile handoff."
+            controlFailHandoff(message)
+            return
+        end if
+        body = result.body
+        pending.handoffId = body.handoffId
+        pending.interval = body.interval
+        pending.deadline = controlClockMs() + 900000
+        expires = util.isoSeconds(body.expiresAt)
+        if util.isNumber(expires) then pending.deadline = controlClockMs() + (expires - controlNowSeconds()) * 1000
+        controlSend(pending.controllerId, silocontrol.protocol.handoffChallenge(pending.requestId, body.userCode, body.matchCode, body.expiresAt))
+        controlSchedulePoll(pending.interval)
+    end sub
+
+    sub controlSchedulePoll(seconds as Integer)
+        if seconds < 1 then seconds = 1
+        m.controlPollTimer.duration = seconds
+        m.controlPollTimer.control = "start"
+    end sub
+
+    sub onControlPoll()
+        pending = m.remote.handoff
+        if pending = invalid or pending.handoffId = "" then return
+        if controlClockMs() > pending.deadline
+            controlFailHandoff("Profile handoff expired.")
+            return
+        end if
+        handle = api.newHandle(CONTROL_OWNER)
+        handle.observeField("status", "onControlPolled")
+        pending.handle = handle
+        apiSend({ session: "handoffPoll", handoffId: pending.handoffId }, handle)
+    end sub
+
+    sub onControlPolled(event as Object)
+        pending = m.remote.handoff
+        if pending = invalid or not pending.handle.isSameNode(event.getRoSGNode()) then return
+        result = api.resultOf(pending.handle)
+        if result = invalid or result.ok <> true
+            ' A network blip or a 5xx while the phone approves: poll again.
+            if result <> invalid and util.isObject(result.error) and result.error.kind = "handoff_gone"
+                controlFailHandoff("Profile handoff expired.")
+            else
+                controlSchedulePoll(pending.interval)
+            end if
+            return
+        end if
+        body = result.body
+        status = util.text(body.status)
+        if status = "pending"
+            wait = pending.interval
+            if util.isNumber(body.pollAfter) and body.pollAfter > wait then wait = body.pollAfter
+            controlSchedulePoll(wait)
+            return
+        end if
+        if status <> "approved"
+            message = "Profile handoff expired."
+            if status = "denied" then message = "Profile handoff was denied."
+            if status = "invalid" then message = "The server returned an invalid profile handoff."
+            pending.handoffId = ""
+            controlFailHandoff(message)
+            return
+        end if
+        if body.profileId <> pending.data.payload.profileId
+            controlFailHandoff("The server returned an invalid profile handoff.")
+            return
+        end if
+        ' Approved: what plays goes first, then the identity goes in.
+        nowPlaying = controlConsentNeeded(pending.data)
+        if nowPlaying <> invalid
+            controlSend(pending.controllerId, silocontrol.protocol.handoffCancel(pending.requestId, "replace_confirmation_required", "Someone started a title on this Roku.", nowPlaying), true)
+            controlDropHandoff()
+            return
+        end if
+        pending.sessionExpiresAt = util.text(body.sessionExpiresAt)
+        controlStopPlayer()
+        handle = api.newHandle(CONTROL_OWNER)
+        handle.observeField("status", "onControlBorrowed")
+        pending.handle = handle
+        apiSend({ session: "borrow", handoffId: pending.handoffId }, handle)
+    end sub
+
+    sub onControlBorrowed(event as Object)
+        pending = m.remote.handoff
+        if pending = invalid or not pending.handle.isSameNode(event.getRoSGNode()) then return
+        m.remote.handoff = invalid
+        result = api.resultOf(pending.handle)
+        if result = invalid or result.ok <> true
+            controlCancel(pending.controllerId, pending.requestId, "handoff_failed", "This Roku couldn't use the phone's profile.")
+            return
+        end if
+        data = pending.data
+        m.remote.borrowed = { identity: result.body.identity, profileId: data.payload.profileId, profileName: util.text(data.payload.profileName), controllerName: util.text(data.controller.deviceName), deviceId: util.text(data.controller.deviceId), sessionExpiresAt: pending.sessionExpiresAt, launched: false, seen: false }
+        log.info("silocontrol", "handoff ready")
+        controlReady(data, controlBorrowedKey(), data.payload.profileId, pending.sessionExpiresAt, false)
+        ' Section 8.3: a borrowed identity nobody launches under goes back.
+        m.controlLaunchTimer.control = "start"
+    end sub
+
+    sub controlFailHandoff(message as String)
+        pending = m.remote.handoff
+        if pending = invalid then return
+        controlCancel(pending.controllerId, pending.requestId, "handoff_failed", message)
+        controlDropHandoff()
+    end sub
+
+    ' Forgets the handoff in progress and withdraws its request.
+    sub controlDropHandoff()
+        pending = m.remote.handoff
+        if pending = invalid then return
+        m.remote.handoff = invalid
+        m.controlPollTimer.control = "stop"
+        if pending.handle <> invalid then pending.handle.unobserveField("status")
+        ' A start still in flight is withdrawn by its key.
+        if pending.handoffId <> ""
+            apiSend({ session: "handoffCancel", handoffId: pending.handoffId }, api.newHandle(CONTROL_OWNER))
+        else if pending.handle <> invalid
+            apiSend({ session: "handoffCancel", startKey: pending.startKey }, api.newHandle(CONTROL_OWNER))
+        end if
+    end sub
+
+    ' No launch came within a minute of handoff_ready (section 8.3).
+    sub onControlLaunchTimeout()
+        borrowed = m.remote.borrowed
+        if borrowed = invalid or borrowed.launched then return
+        ' Only a phone still ready under the borrowed identity hears it; a
+        ' newer offer's readiness stays.
+        key = controlBorrowedKey()
+        expiring = []
+        for each id in m.remote.ready
+            if m.remote.ready[id] = key then expiring.Push(id)
+        end for
+        controlEndBorrowed()
+        for each id in expiring
+            controlSend(id, silocontrol.protocol.error("launch_timeout", "No content was launched, so the phone's profile was handed back."))
+        end for
+    end sub
+
+    ' Ends the borrowed identity: the coordinator logs it out once its
+    ' player's stop has gone (playback.worker.deferSession).
+    sub controlEndBorrowed()
+        if m.remote.borrowed = invalid then return
+        key = controlBorrowedKey()
+        m.remote.borrowed = invalid
+        m.controlLaunchTimer.control = "stop"
+        for each id in m.remote.ready
+            if m.remote.ready[id] = key then m.remote.ready.Delete(id)
+        end for
+        apiSend({ session: "borrowedEnd" }, api.newHandle(CONTROL_OWNER))
+        log.info("silocontrol", "borrowed identity ended")
+    end sub
+
+    ' The borrowed identity's player closed for any reason, or the session
+    ' dropped the identity (temporary_session_expired).
+    sub controlFollowBorrowed()
+        borrowed = m.remote.borrowed
+        if borrowed = invalid then return
+        view = m.apiSession
+        present = view <> invalid and util.isObject(view.borrowed) and view.borrowed.profileId = borrowed.profileId
+        ' The session may publish the identity after "borrow" answers.
+        if present then borrowed.seen = true
+        if not present and borrowed.seen
+            if view <> invalid and view.borrowedReason = "expired" then controlBroadcast(silocontrol.protocol.error("temporary_session_expired", "The phone profile session expired."))
+            m.remote.borrowed = invalid
+            controlStopPlayer()
+            return
+        end if
+        if not borrowed.launched then return
+        if controlBorrowedPlayer() = invalid then controlEndBorrowed()
+    end sub
+
+    ' A player entry that plays as the borrowed identity, or invalid.
+    function controlBorrowedPlayer() as Dynamic
+        for each entry in m.navStack.entries
+            if entry.route = nav.route.PLAYER and nav.player.identityOf(entry.params) <> invalid then return entry
+        end for
+        return invalid
+    end function
+#else
+    sub controlFollowBorrowed()
+    end sub
+
+    sub controlDropHandoff()
+    end sub
+#end if
+
+sub controlBroadcast(text as String)
+    controlCommand({ kind: "broadcast", text: text })
+end sub
+
+' Closes the player on top as Back does, final progress included.
+sub controlStopPlayer()
+    player = controlPlayer()
+    if player <> invalid then player.callFunc("remoteCommand", { name: "stop" })
+end sub
+
+function controlClockMs() as Integer
+    return m.remote.launchClock.TotalMilliseconds()
+end function
+
+function controlNowSeconds() as Integer
+    moment = CreateObject("roDateTime")
+    return moment.AsSeconds()
+end function
+
+' ---- Launch (section 7)
+
+sub controlLaunch(data as Object)
+    id = data.id
+    launch = data.payload
+    controller = data.controller
+    key = m.remote.ready[id]
+    borrowedKey = controlBorrowedKey()
+    playsBorrowed = key <> invalid and key <> "" and key = borrowedKey
+    if key = invalid or (key <> controlOwnKey() and not playsBorrowed)
+        controlSend(id, silocontrol.protocol.error("handoff_required", "Prepare the phone profile before playing."))
+        return
+    end if
+    ' A phone on another address of the Roku's deployment names its own
+    ' server; its hello's identity matched (section 6.2).
+    peerIdentity = ""
+    if util.isString(launch.serverId) and launch.serverId <> "" then peerIdentity = util.text(controller.serverIdentity)
+    if not silocontrol.protocol.serverMatches(launch.serverId, peerIdentity, m.remote.origin, m.remote.serverIdentity)
+        controlSend(id, silocontrol.protocol.error("server_mismatch", "This Roku is connected to a different Silo server."))
+        return
+    end if
+    if m.navShell.phase <> nav.phase.MAIN
+        controlSend(id, silocontrol.protocol.error("player_not_ready", "The Roku player is not ready yet."))
+        return
+    end if
+    if controlLaunchPending()
+        controlSend(id, silocontrol.protocol.error("launch_pending", "A title is already starting on this Roku."))
+        return
+    end if
+    wanted = silocontrol.policy.launchIntent(launch.playback)
+    log.info("silocontrol", "launch", { startPositionRule: wanted.startPositionRule, tracks: wanted.tracks <> invalid, borrowed: playsBorrowed })
+    m.remote.launchAt = controlClockMs()
+    m.remote.launchContentId = wanted.contentId
+    m.remote.launchSeen = false
+    identity = invalid
+    profileName = ""
+    if playsBorrowed
+        borrowed = m.remote.borrowed
+        borrowed.launched = true
+        m.controlLaunchTimer.control = "stop"
+        identity = borrowed.identity
+        profileName = borrowed.profileName
+    end if
+    params = nav.player.launchParams(wanted, identity, profileName, util.text(controller.deviceName))
+    ' The overlays a deep link closes go too (AppSceneDeepLink.bs).
+    deepLinkClose()
+    top = nav.stack.topEntry(m.navStack)
+    if top <> invalid and top.route = nav.route.PLAYER
+        navReplace(nav.route.PLAYER, params)
+    else
+        navPush(nav.route.PLAYER, params)
+    end if
+    controlRefresh()
+end sub
+
+function controlLaunchPending() as Boolean
+    at = m.remote.launchAt
+    if not util.isNumber(at) then return false
+    if m.remote.launchClock.TotalMilliseconds() - at > CONTROL_LAUNCH_WAIT_MS
+        m.remote.launchAt = invalid
+        return false
+    end if
+    return true
+end function

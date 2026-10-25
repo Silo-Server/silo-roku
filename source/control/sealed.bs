@@ -1,0 +1,212 @@
+import "pkg:/source/util/values.bs"
+
+' Level sealed (docs/silocontrol.md section 9.2): a channel only a phone
+' holding the Roku's pairing key can open, with frames encrypted
+' (AES-128-CBC) and authenticated (HMAC-SHA256, encrypt-then-MAC) and
+' numbered per direction so none can be replayed or reordered. Pure but for
+' roHMAC, roEVPCipher, and roEVPDigest. Keys are roByteArrays.
+'
+' Each side opens with one plain sealed_hello carrying the key's ID and a
+' 16-byte nonce; the phone sends first. Session keys are HKDF-SHA256 of
+' the pairing key with salt phoneNonce || tvNonce, one output block each.
+' A frame body is seq (8 bytes, big-endian, from 0) || iv (16) ||
+' ciphertext || tag (32), the tag over LABEL || direction || seq || iv ||
+' ciphertext. The Roku's IV is AES-128-ECB(ivKey, direction || seq padded
+' with zeros to 16 bytes), so it needs no random numbers per frame.
+namespace silocontrol.sealed
+    const LABEL = "silo-cast-sealed-1"
+    const FROM_PHONE = 1
+    const FROM_TV = 2
+    const NONCE_BYTES = 16
+    const KEY_BYTES = 16
+
+    ' The key's ID: the first 8 hex digits of SHA-256 of the key.
+    function keyId(key as Object) as String
+        digest = CreateObject("roEVPDigest")
+        digest.Setup("sha256")
+        return LCase(Left(digest.Process(key), 8))
+    end function
+
+    ' The sealed_hello frame's text.
+    function hello(id as String, nonce as Object) as String
+        return FormatJson({ "type": "sealed_hello", "v": 1, "keyId": id, "nonce": base64url(nonce) })
+    end function
+
+    ' A peer's sealed_hello as { keyId, nonce }, or invalid.
+    function readHello(text as String) as Dynamic
+        if Left(text, 1) <> "{" then return invalid
+        frameObject = ParseJson(text)
+        if not util.isObject(frameObject) or frameObject.type <> "sealed_hello" or not util.isString(frameObject.keyId) or not util.isString(frameObject.nonce) then return invalid
+        nonce = fromBase64url(frameObject.nonce)
+        if nonce.Count() <> NONCE_BYTES then return invalid
+        return { keyId: LCase(frameObject.keyId), nonce: nonce }
+    end function
+
+    ' { encKey, macKey, ivKey } for a session.
+    function sessionKeys(key as Object, phoneNonce as Object, tvNonce as Object) as Object
+        salt = CreateObject("roByteArray")
+        salt.Append(phoneNonce)
+        salt.Append(tvNonce)
+        prk = hmac(salt, key)
+        return { encKey: slice(expand(prk, "enc"), 0, KEY_BYTES), macKey: expand(prk, "mac"), ivKey: slice(expand(prk, "iv"), 0, KEY_BYTES) }
+    end function
+
+    ' HKDF-Expand's first block: HMAC(prk, LABEL + " " + purpose || 0x01).
+    function expand(prk as Object, purpose as String) as Object
+        info = CreateObject("roByteArray")
+        info.FromAsciiString(LABEL + " " + purpose)
+        info.Push(1)
+        return hmac(prk, info)
+    end function
+
+    ' The IV the Roku uses for frame seq in direction.
+    function frameIv(keys as Object, direction as Integer, seq as Integer) as Object
+        block = CreateObject("roByteArray")
+        block.Push(direction)
+        block.Append(seqBytes(seq))
+        while block.Count() < 16
+            block.Push(0)
+        end while
+        ' One block of CBC with a zero IV is that block in ECB; it also runs
+        ' where an ECB cipher wants an IV. The first block alone: a cipher
+        ' that pads anyway adds a second.
+        zero = CreateObject("roByteArray")
+        for i = 1 to 16
+            zero.Push(0)
+        end for
+        return slice(cipher(true, "aes-128-cbc", keys.ivKey, zero, block, false), 0, 16)
+    end function
+
+    ' The sealed body of text as frame seq in direction; iv defaults to
+    ' frameIv's.
+    function seal(keys as Object, direction as Integer, seq as Integer, text as String, iv = invalid as Dynamic) as Object
+        if iv = invalid then iv = frameIv(keys, direction, seq)
+        plain = CreateObject("roByteArray")
+        plain.FromAsciiString(text)
+        encrypted = cipher(true, "aes-128-cbc", keys.encKey, iv, plain, true)
+        body = CreateObject("roByteArray")
+        body.Append(seqBytes(seq))
+        body.Append(iv)
+        body.Append(encrypted)
+        body.Append(tag(keys, direction, body))
+        return body
+    end function
+
+    ' Opens a body from direction that must be frame seq: { ok, text }. The
+    ' tag is checked before anything is decrypted; any failure is not ok.
+    function open(keys as Object, direction as Integer, seq as Integer, body as Object) as Object
+        failed = { ok: false, text: "" }
+        size = body.Count()
+        if size < 8 + 16 + 16 + 32 or (size - 8 - 16 - 32) mod 16 <> 0 then return failed
+        signed = slice(body, 0, size - 32)
+        if not sameBytes(tag(keys, direction, signed), slice(body, size - 32, 32)) then return failed
+        if not sameBytes(slice(body, 0, 8), seqBytes(seq)) then return failed
+        plain = cipher(false, "aes-128-cbc", keys.encKey, slice(body, 8, 16), slice(body, 24, size - 24 - 32), true)
+        if plain = invalid or plain.Count() = 0 then return failed
+        return { ok: true, text: plain.ToAsciiString() }
+    end function
+
+    ' HMAC(macKey, LABEL || direction || seq || iv || ciphertext), signed
+    ' being seq || iv || ciphertext.
+    function tag(keys as Object, direction as Integer, signed as Object) as Object
+        message = CreateObject("roByteArray")
+        message.FromAsciiString(LABEL)
+        message.Push(direction)
+        message.Append(signed)
+        return hmac(keys.macKey, message)
+    end function
+
+    ' A 16-byte pairing key from the material given (section 9.3): SHA-256
+    ' of it all, cut to 16 bytes.
+    function newKey(material as String) as Object
+        bytes = CreateObject("roByteArray")
+        bytes.FromAsciiString(material)
+        digest = CreateObject("roEVPDigest")
+        digest.Setup("sha256")
+        out = CreateObject("roByteArray")
+        out.FromHexString(Left(digest.Process(bytes), KEY_BYTES * 2))
+        return out
+    end function
+
+    ' A 16-byte nonce: unique, not secret (section 9.3).
+    function newNonce(material as String) as Object
+        return newKey("nonce " + material)
+    end function
+
+    ' ---- Bytes
+
+    function hmac(key as Object, message as Object) as Object
+        mac = CreateObject("roHMAC")
+        mac.Setup("sha256", key)
+        return mac.Process(message)
+    end function
+
+    ' AES with key and iv (roByteArrays), with or without PKCS#7 padding;
+    ' invalid when the cipher refuses.
+    function cipher(encrypt as Boolean, format as String, key as Object, iv as Object, input as Object, padded as Boolean) as Dynamic
+        engine = CreateObject("roEVPCipher")
+        padding = 0
+        if padded then padding = 1
+        if engine.Setup(encrypt, format, key.ToHexString(), iv.ToHexString(), padding) <> 0 then return invalid
+        return engine.Process(input)
+    end function
+
+    function seqBytes(seq as Integer) as Object
+        out = CreateObject("roByteArray")
+        for each value in [0, 0, 0, 0, (seq >> 24) and &hFF, (seq >> 16) and &hFF, (seq >> 8) and &hFF, seq and &hFF]
+            out.Push(value)
+        end for
+        return out
+    end function
+
+    function slice(bytes as Object, offset as Integer, count as Integer) as Object
+        out = CreateObject("roByteArray")
+        for i = offset to offset + count - 1
+            out.Push(bytes[i])
+        end for
+        return out
+    end function
+
+    ' Compares in time that does not depend on where they differ.
+    function sameBytes(a as Object, b as Object) as Boolean
+        if a.Count() <> b.Count() then return false
+        diff = 0
+        for i = 0 to a.Count() - 1
+            if a[i] <> b[i] then diff = diff + 1
+        end for
+        return diff = 0
+    end function
+
+    function base64url(bytes as Object) as String
+        return bytes.ToBase64String().Replace("+", "-").Replace("/", "_").Replace("=", "")
+    end function
+
+    function fromBase64url(encoded as String) as Object
+        padded = encoded.Replace("-", "+").Replace("_", "/")
+        while Len(padded) mod 4 <> 0
+            padded = padded + "="
+        end while
+        out = CreateObject("roByteArray")
+        out.FromBase64String(padded)
+        return out
+    end function
+
+    ' RFC 4648 base32 without padding, as the pairing link carries the key
+    ' (section 5.3).
+    function base32(bytes as Object) as String
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+        out = ""
+        buffer = 0
+        bits = 0
+        for i = 0 to bytes.Count() - 1
+            buffer = ((buffer << 8) or bytes[i]) and &hFFFF
+            bits = bits + 8
+            while bits >= 5
+                bits = bits - 5
+                out = out + Mid(alphabet, ((buffer >> bits) and 31) + 1, 1)
+            end while
+        end for
+        if bits > 0 then out = out + Mid(alphabet, ((buffer << (5 - bits)) and 31) + 1, 1)
+        return out
+    end function
+end namespace

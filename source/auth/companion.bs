@@ -1,0 +1,183 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/api/response.bs"
+import "pkg:/source/auth/headers.bs"
+import "pkg:/source/auth/server.bs"
+import "pkg:/source/util/values.bs"
+
+' Companion sign-in in the account session (docs/companion-pairing.md): a
+' phone on the server or sign-in screen pushes a server, and this Roku signs
+' in to it with a device login the phone approves. Part of
+' api.auth.coordinator, whose decisions it returns.
+'
+' Session operations:
+'   { session: "companionServer", address, identity }  checks a pushed
+'       server as setup checks a typed one (system/info with api_major 2 and
+'       request_origin), then reads its deployment identity, which must be
+'       identity when that is given; answers { origin, serverIdentity }. The
+'       origin is then confirmed for this attempt, and nothing is stored.
+'   { session: "companionStart", deviceName }  starts a device login at the
+'       confirmed origin; answers { userCode, matchCode, interval, expiresIn }
+'   { session: "companionPoll" }  polls once; answers { status, pollAfter }.
+'       An approval installs the session as a password sign-in does, with
+'       that origin as the Roku's server.
+'   { session: "companionCancel" }  ends the attempt and withdraws its open
+'       request, best effort; a start still in flight is withdrawn when it
+'       answers
+' Each companionServer and companionCancel begins a new attempt, and an
+' answer for an earlier one changes nothing. The device code and the
+' tokens never leave this state but as request bodies to the confirmed
+' origin; the user and match codes go to the render thread, which shows
+' them and sends them to the phone.
+namespace api.auth.coordinator
+    const IDENTITY_PATH = "/api/v2/system/identity"
+    const COMPANION_TIMEOUT_MS = 15000
+
+    function companionServer(state as Object, input as Object) as Object
+        address = api.auth.server.normalize(input.address, true)
+        if address.error <> invalid then return [reply(api.response.failure(input, address.error))]
+        state.companion = invalid
+        state.companionAttempt += 1
+        request = build(state, { owner: util.text(input.owner) }, { method: "GET", url: address.url + api.auth.server.INFO_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "companionInfo", origin: address.url, attempt: state.companionAttempt, input: input })
+        return [submit(request)]
+    end function
+
+    ' system/info answered: the identity next, or the refusal.
+    function companionInfo(state as Object, op as Object, result as Object) as Object
+        check = api.auth.server.checkInfo(result, op.origin, state.allowUnconfirmedOrigin)
+        if not check.ok
+            failed = api.response.failure(op.input, check.error)
+            failed.status = result.status
+            return [reply(failed)]
+        end if
+        request = build(state, { owner: util.text(op.input.owner) }, { method: "GET", url: op.origin + IDENTITY_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "companionIdentity", origin: op.origin, attempt: op.attempt, check: check, input: op.input })
+        return [submit(request)]
+    end function
+
+    function companionIdentity(state as Object, op as Object, result as Object) as Object
+        input = op.input
+        if op.attempt <> state.companionAttempt then return [reply(api.response.failure(input, "handoff_gone"))]
+        if result.ok <> true or not util.isObject(result.body) then return [reply(answerFor(input, result))]
+        found = util.text(result.body.server_id).Trim()
+        wanted = util.text(input.identity).Trim()
+        if found = "" or (wanted <> "" and found <> wanted) then return [reply(api.response.failure(input, "identity_mismatch"))]
+        state.companion = { origin: op.origin, check: op.check, deviceCode: "", attempt: op.attempt }
+        return [reply(succeeded(input, { origin: op.origin, serverIdentity: found }, result.status))]
+    end function
+
+    function companionStart(state as Object, input as Object) as Object
+        companion = state.companion
+        if companion = invalid then return [reply(api.response.failure(input, "origin_unverified"))]
+        name = api.auth.headers.clampName(input.deviceName)
+        request = build(state, { owner: util.text(input.owner) }, { method: "POST", url: companion.origin + DEVICE_START_PATH, body: { device_name: name, device_platform: api.auth.headers.DEVICE_PLATFORM }, timeoutMs: COMPANION_TIMEOUT_MS }, { kind: "companionStart", origin: companion.origin, attempt: companion.attempt, input: input })
+        return [submit(request)]
+    end function
+
+    ' The device login started; its device code stays here. A login an
+    ' ended attempt started is withdrawn.
+    function companionStarted(state as Object, op as Object, result as Object) as Object
+        input = op.input
+        companion = state.companion
+        body = result.body
+        if companion = invalid or companion.attempt <> op.attempt
+            decisions = [reply(api.response.failure(input, "handoff_gone"))]
+            if result.ok = true and util.isObject(body) and nonEmpty(body.device_code) then decisions.Push(companionWithdraw(state, op.origin, body.device_code))
+            return decisions
+        end if
+        if result.ok <> true then return [reply(answerFor(input, result))]
+        if not util.isObject(body) or not nonEmpty(body.device_code) or not nonEmpty(body.user_code) then return [reply(api.response.failure(input, "parse"))]
+        companion.deviceCode = body.device_code
+        interval = 5
+        if util.isNumber(body.interval) and body.interval > 0 then interval = Int(body.interval)
+        expiresIn = 600
+        if util.isNumber(body.expires_in) and body.expires_in > 0 then expiresIn = Int(body.expires_in)
+        return [reply(succeeded(input, { userCode: body.user_code, matchCode: util.text(body.match_code), interval: interval, expiresIn: expiresIn }, result.status))]
+    end function
+
+    function companionPoll(state as Object, input as Object) as Object
+        companion = state.companion
+        if companion = invalid or companion.deviceCode = "" then return [reply(api.response.failure(input, "handoff_gone"))]
+        request = build(state, { owner: util.text(input.owner) }, { method: "POST", url: companion.origin + DEVICE_POLL_PATH, body: { device_code: companion.deviceCode }, timeoutMs: COMPANION_TIMEOUT_MS }, { kind: "companionPoll", origin: companion.origin, deviceCode: companion.deviceCode, input: input })
+        return [submit(request)]
+    end function
+
+    ' A poll answered. An approval installs the session; any other end
+    ' (denied, expired, canceled, consumed) forgets the request. A failed
+    ' poll is answered as it is, and the caller polls again.
+    function companionPolled(state as Object, op as Object, result as Object, now as Integer) as Object
+        input = op.input
+        companion = state.companion
+        if companion = invalid or companion.deviceCode <> op.deviceCode then return [reply(api.response.failure(input, "handoff_gone"))]
+        body = result.body
+        if result.ok <> true or not util.isObject(body) then return [reply(answerFor(input, result))]
+        status = util.text(body.status)
+        pollAfter = 0
+        if util.isNumber(body.poll_after) then pollAfter = Int(body.poll_after)
+        answer = { status: status, pollAfter: pollAfter }
+        if status = "pending" then return [reply(succeeded(input, answer, result.status))]
+        companion.deviceCode = ""
+        if status <> "approved" then return [reply(succeeded(input, answer, result.status))]
+        tokens = invalid
+        user = invalid
+        if util.isObject(body.tokens)
+            tokens = parseTokens({ ok: true, body: body.tokens })
+            if util.isObject(body.tokens.user) then user = body.tokens.user
+        end if
+        if tokens = invalid or user = invalid or not nonEmpty(user.id) or util.isTrue(body.temporary)
+            answer.status = "invalid"
+            return [reply(succeeded(input, answer, result.status))]
+        end if
+        state.companion = invalid
+        return companionSignedIn(state, input, companion, tokens, user.id, answer, result.status, now)
+    end function
+
+    ' Installs an approved sign-in: a new server ends the session for the
+    ' old one, as setup does; the same server keeps the remembered profile
+    ' when the account is the same, as a password sign-in does.
+    function companionSignedIn(state as Object, input as Object, companion as Object, tokens as Object, accountId as String, answer as Object, status as Integer, now as Integer) as Object
+        changed = companion.origin <> state.saved.origin
+        decisions = []
+        if changed
+            decisions = endSession(state, "server_changed")
+            state.saved.origin = companion.origin
+            decisions.Push({ kind: "server", origin: companion.origin })
+        else
+            decisions = endSession(state, "")
+        end if
+        if accountId <> state.saved.accountId then state.saved.profileId = ""
+        state.saved.accountId = accountId
+        setTokens(state, tokens, now)
+        decisions.Append(originSettled(state, companion.origin, companion.check))
+        decisions.Append([persist(), publish(), reply(succeeded(input, answer, status))])
+        return decisions
+    end function
+
+    function companionCancel(state as Object, input as Object) as Object
+        decisions = [reply(succeeded(input, {}))]
+        companion = state.companion
+        state.companion = invalid
+        state.companionAttempt += 1
+        if companion = invalid or companion.deviceCode = "" then return decisions
+        decisions.Push(companionWithdraw(state, companion.origin, companion.deviceCode))
+        return decisions
+    end function
+
+    function companionWithdraw(state as Object, origin as String, deviceCode as String) as Object
+        return submit(build(state, { owner: "" }, { method: "POST", url: origin + DEVICE_CANCEL_PATH, body: { device_code: deviceCode }, timeoutMs: COMPANION_TIMEOUT_MS }, { kind: "companionCancel", origin: origin }))
+    end function
+
+    ' Headers for a request built here for companion sign-in: identity
+    ' headers to the pushed origin; the device requests only once this
+    ' attempt confirmed that origin.
+    function companionCredentials(state as Object, op as Object, url as String) as Object
+        if not api.request.isSameOrigin(url, op.origin) then return { headers: {}, error: "invalid_request" }
+        if op.kind = "companionInfo" or op.kind = "companionIdentity" then return { headers: api.auth.headers.identity(state.facts, false), error: invalid }
+        ' A withdrawal goes where its request was started, after the attempt ended.
+        if op.kind = "companionCancel" then return { headers: api.auth.headers.identity(state.facts, true), error: invalid }
+        if state.companion = invalid or state.companion.origin <> op.origin then return { headers: {}, error: "origin_unverified" }
+        return { headers: api.auth.headers.identity(state.facts, true), error: invalid }
+    end function
+
+    function isCompanionOp(op as Dynamic) as Boolean
+        return op <> invalid and Left(util.text(op.kind), 9) = "companion"
+    end function
+end namespace

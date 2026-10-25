@@ -1,0 +1,363 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/util/values.bs"
+
+' SiloControl v2 on the wire (docs/silocontrol.md section 6): the framing,
+' the envelope, decoding and validating what a phone sends, and building
+' what the Roku sends. Pure, so ControlTask only moves bytes. The message
+' types, fields, error codes, and close reasons are the Apple and Android
+' TVs' (silo-apple Control/SiloControlProtocol.swift, silo-android
+' cast/SiloCastMessage.kt); wire keys keep their camelCase, so every object
+' built here uses quoted literal keys.
+'
+' decode(text) gives one of:
+'   { kind: "message", type, payload }  a known type whose payload validated;
+'                                       payload is the payloadKey member, or
+'                                       {} for ping, pong, and close
+'   { kind: "ignored", type, name }     an unknown type, a control with an
+'                                       unknown name, or a type only a TV
+'                                       sends; the connection stays
+'   { kind: "invalid", reason }         not JSON, no type, or a known type
+'                                       with a malformed payload: close
+namespace silocontrol.protocol
+    const VERSION = 2
+    ' Roku takes frames up to this many bytes, not the other TVs' 1 MiB
+    ' (section 6.1).
+    const MAX_FRAME_BYTES = 65536
+
+    ' The hello's features (section 6.2). volume_mute_only and
+    ' no_playback_speed are Roku's: the TV can mute but not set a level, and
+    ' has no playback speed (section 6.5).
+    function features() as Object
+        return ["multi_controller", "close_reason", "resume_token", "replace_confirmation", "presence", "volume_mute_only", "no_playback_speed"]
+    end function
+
+    ' Every control.name the phones send; set_hdr_enabled is retired but old
+    ' phones still send it, and it is ignored like an unknown name.
+    function commandNames() as Object
+        return ["play", "pause", "play_pause", "seek", "stop", "select_audio_track", "select_subtitle_track", "set_playback_speed", "set_quality", "set_video_gravity", "set_subtitle_sync_ms", "set_subtitle_position", "set_volume", "set_muted", "play_next"]
+    end function
+
+    ' ---- Decoding
+
+    function decode(text as String) as Object
+        if Left(text, 1) <> "{" then return invalidMessage("not_object")
+        frameObject = ParseJson(text)
+        if not util.isObject(frameObject) then return invalidMessage("not_json")
+        kind = frameObject.type
+        if not util.isString(kind) then return invalidMessage("no_type")
+        if kind = "ping" or kind = "pong" then return accepted(kind, {})
+        if kind = "close"
+            ' The payload is optional and read leniently, as the phones do.
+            payload = {}
+            if util.isObject(frameObject.close) and util.isString(frameObject.close.reason) then payload = { reason: frameObject.close.reason }
+            return accepted(kind, payload)
+        end if
+        if kind = "hello" then return checked(kind, frameObject.hello, validHello(frameObject.hello))
+        if kind = "handoff_offer" then return checked(kind, frameObject.handoffOffer, validOffer(frameObject.handoffOffer))
+        if kind = "handoff_cancel" then return checked(kind, frameObject.handoffCancel, validCancel(frameObject.handoffCancel))
+        if kind = "launch" then return checked(kind, frameObject.launch, validLaunch(frameObject.launch))
+        if kind = "presence" then return checked(kind, frameObject.presence, util.isObject(frameObject.presence) and util.isBoolean(frameObject.presence.passive))
+        if kind = "control"
+            command = frameObject.control
+            if not util.isObject(command) or not util.isString(command.name) then return invalidMessage("malformed")
+            if not util.contains(commandNames(), command.name) then return { kind: "ignored", type: kind, name: command.name }
+            return checked(kind, command, validCommand(command))
+        end if
+        ' state, error, handoff_challenge, and handoff_ready come only from a
+        ' TV; anything else is a newer peer's.
+        return { kind: "ignored", type: kind, name: "" }
+    end function
+
+    function accepted(kind as String, payload as Object) as Object
+        return { kind: "message", type: kind, payload: payload }
+    end function
+
+    function checked(kind as String, payload as Dynamic, valid as Boolean) as Object
+        if not valid then return invalidMessage("malformed")
+        return accepted(kind, payload)
+    end function
+
+    function invalidMessage(reason as String) as Object
+        return { kind: "invalid", reason: reason }
+    end function
+
+    function validHello(greeting as Dynamic) as Boolean
+        if not util.isObject(greeting) then return false
+        if not util.isString(greeting.role) or (greeting.role <> "phone" and greeting.role <> "tv") then return false
+        if not util.isString(greeting.deviceName) or not util.isString(greeting.deviceId) then return false
+        if not isIntList(greeting.supportedVersions) then return false
+        if not optionalString(greeting.serverId) or not optionalString(greeting.serverName) or not optionalString(greeting.serverIdentity) or not optionalString(greeting.clientKind) then return false
+        if not optionalBoolean(greeting.passive) then return false
+        return isAbsent(greeting.features) or isStringList(greeting.features)
+    end function
+
+    function validOffer(offer as Dynamic) as Boolean
+        if not util.isObject(offer) then return false
+        for each key in ["requestId", "serverId", "serverURL", "profileId"]
+            if not util.isString(offer[key]) then return false
+        end for
+        for each key in ["serverName", "profileName", "title", "serverIdentity", "resumeToken", "replacingContentId"]
+            if not optionalString(offer[key]) then return false
+        end for
+        return optionalBoolean(offer.replaceConfirmed)
+    end function
+
+    function validCancel(cancel as Dynamic) as Boolean
+        return util.isObject(cancel) and util.isString(cancel.requestId) and util.isString(cancel.reason) and optionalString(cancel.message)
+    end function
+
+    function validLaunch(launch as Dynamic) as Boolean
+        if not util.isObject(launch) or not util.isString(launch.serverId) then return false
+        wanted = launch.playback
+        if not util.isObject(wanted) or not util.isString(wanted.contentId) or not util.isBoolean(wanted.startFromBeginning) then return false
+        for each key in ["fileId", "audioTrackIndex", "subtitleTrackIndex", "libraryId"]
+            if not optionalInteger(wanted[key]) then return false
+        end for
+        return optionalNumber(wanted.resumePosition) and optionalBoolean(wanted.pinsVersion)
+    end function
+
+    function validCommand(command as Object) as Boolean
+        return optionalNumber(command.seconds) and optionalInteger(command.trackId) and optionalNumber(command.speed) and optionalNumber(command.volume) and optionalString(command.value) and optionalBoolean(command.enabled) and optionalInteger(command.milliseconds)
+    end function
+
+    ' ---- Encoding
+
+    ' The envelope's JSON text: { type, v, payloadKey: payload }, payloadKey
+    ' omitted when it is "".
+    function envelope(kind as String, payloadKey as String, payload as Dynamic) as String
+        out = { "type": kind, "v": VERSION }
+        if payloadKey <> "" then out.AddReplace(payloadKey, payload)
+        return FormatJson(out)
+    end function
+
+    ' info: { deviceName, deviceId, serverId, serverName, serverIdentity }.
+    function hello(info as Object) as String
+        body = {
+            "role": "tv",
+            "deviceName": util.text(info.deviceName),
+            "deviceId": util.text(info.deviceId),
+            "serverId": util.text(info.serverId),
+            "serverName": util.text(info.serverName),
+            "supportedVersions": [VERSION],
+            "features": features()
+        }
+        if util.text(info.serverIdentity) <> "" then body.AddReplace("serverIdentity", info.serverIdentity)
+        return envelope("hello", "hello", body)
+    end function
+
+    function error(code as String, message as String) as String
+        return envelope("error", "error", { "code": code, "message": message })
+    end function
+
+    ' A close with reason, or a bare close for "" (sent to peers that do not
+    ' list close_reason).
+    function close(reason as String) as String
+        if reason = "" then return envelope("close", "", invalid)
+        return envelope("close", "close", { "reason": reason })
+    end function
+
+    function ping() as String
+        return envelope("ping", "", invalid)
+    end function
+
+    function pong() as String
+        return envelope("pong", "", invalid)
+    end function
+
+    function state(body as Object) as String
+        return envelope("state", "state", body)
+    end function
+
+    function handoffChallenge(requestId as String, userCode as String, matchCode as String, expiresAt as String) as String
+        return envelope("handoff_challenge", "handoffChallenge", { "requestId": requestId, "userCode": userCode, "matchCode": matchCode, "expiresAt": expiresAt })
+    end function
+
+    ' resumeToken "" is left out (a phone without resume_token).
+    function handoffReady(requestId as String, server as String, profileId as String, sessionExpiresAt as String, reused as Boolean, resumeToken as String) as String
+        body = { "requestId": requestId, "serverId": server, "profileId": profileId, "sessionExpiresAt": sessionExpiresAt, "reused": reused }
+        if resumeToken <> "" then body.AddReplace("resumeToken", resumeToken)
+        return envelope("handoff_ready", "handoffReady", body)
+    end function
+
+    ' nowPlaying: { contentId, title, subtitle, profileName, controllerName },
+    ' with replace_confirmation_required; invalid otherwise.
+    function handoffCancel(requestId as String, reason as String, message as String, nowPlaying = invalid as Dynamic) as String
+        body = { "requestId": requestId, "reason": reason, "message": message }
+        if util.isObject(nowPlaying) then body.AddReplace("nowPlaying", nowPlaying)
+        return envelope("handoff_cancel", "handoffCancel", body)
+    end function
+
+    ' ---- Framing (section 6.1)
+
+    ' The frame for text: a 4-byte big-endian length, then its UTF-8 bytes.
+    function frame(text as String) as Object
+        body = CreateObject("roByteArray")
+        body.FromAsciiString(text)
+        return frameBytes(body)
+    end function
+
+    function frameBytes(body as Object) as Object
+        size = body.Count()
+        out = CreateObject("roByteArray")
+        out.Push((size >> 24) and &hFF)
+        out.Push((size >> 16) and &hFF)
+        out.Push((size >> 8) and &hFF)
+        out.Push(size and &hFF)
+        out.Append(body)
+        return out
+    end function
+
+    ' A reader for one connection's incoming bytes.
+    function reader() as Object
+        return { pending: CreateObject("roByteArray") }
+    end function
+
+    ' Adds count bytes of chunk (an roByteArray at least that long) and gives
+    ' { frames: [roByteArray bodies], error: "" | "too_large" }. A frame
+    ' longer than MAX_FRAME_BYTES ends the connection.
+    function feed(input as Object, chunk as Object, count as Integer) as Object
+        pending = input.pending
+        for i = 0 to count - 1
+            pending.Push(chunk[i])
+        end for
+        frames = []
+        offset = 0
+        total = pending.Count()
+        while total - offset >= 4
+            size = (pending[offset] << 24) + (pending[offset + 1] << 16) + (pending[offset + 2] << 8) + pending[offset + 3]
+            if size < 0 or size > MAX_FRAME_BYTES
+                input.pending = CreateObject("roByteArray")
+                return { frames: frames, error: "too_large" }
+            end if
+            if total - offset - 4 < size then exit while
+            body = CreateObject("roByteArray")
+            for i = offset + 4 to offset + 3 + size
+                body.Push(pending[i])
+            end for
+            frames.Push(body)
+            offset = offset + 4 + size
+        end while
+        if offset > 0
+            rest = CreateObject("roByteArray")
+            for i = offset to total - 1
+                rest.Push(pending[i])
+            end for
+            input.pending = rest
+        end if
+        return { frames: frames, error: "" }
+    end function
+
+    ' ---- Servers (section 6.2)
+
+    ' The phones' registry key for a server: base64url without padding of its
+    ' URL, trimmed of whitespace and trailing slashes.
+    function serverId(url as String) as String
+        bytes = CreateObject("roByteArray")
+        bytes.FromAsciiString(trimUrl(url))
+        out = bytes.ToBase64String()
+        out = out.Replace("+", "-").Replace("/", "_").Replace("=", "")
+        return out
+    end function
+
+    ' The URL a registry key names, or "" when it is not one serverId()
+    ' would give for an http(s) URL.
+    function urlOf(id as String) as String
+        if id = "" then return ""
+        text = id.Replace("-", "+").Replace("_", "/")
+        while Len(text) mod 4 <> 0
+            text = text + "="
+        end while
+        bytes = CreateObject("roByteArray")
+        bytes.FromBase64String(text)
+        if bytes.Count() = 0 then return ""
+        url = trimUrl(bytes.ToAsciiString())
+        if not api.request.isHttpUrl(url) or serverId(url) <> id then return ""
+        return url
+    end function
+
+    ' Whether a phone's registry key names the server at origin: equal keys,
+    ' or URLs with the same scheme, host, port, and path, the scheme and host
+    ' compared without case and a default port dropped, as the phones
+    ' compare them (ServerRegistry.serverIdsMatch).
+    function serverIdMatches(id as Dynamic, origin as String) as Boolean
+        if not util.isString(id) or id = "" or origin = "" then return false
+        if id = serverId(origin) then return true
+        url = urlOf(id)
+        if url = "" then return false
+        return comparable(url) = comparable(origin)
+    end function
+
+    ' Whether a phone's server matches the Roku's by key or by deployment
+    ' identity (section 6.2).
+    function serverMatches(id as Dynamic, identity as Dynamic, origin as String, ownIdentity as String) as Boolean
+        if serverIdMatches(id, origin) then return true
+        theirs = trimText(identity)
+        return theirs <> "" and theirs = trimText(ownIdentity)
+    end function
+
+    ' scheme://host[:port] with the scheme and host lowercased and a default
+    ' port dropped, then the path as it is; "" for anything else.
+    function comparable(url as String) as String
+        base = api.request.baseUrl(url)
+        if base = invalid then return ""
+        return base
+    end function
+
+    function trimUrl(url as String) as String
+        out = url.Trim()
+        while Right(out, 1) = "/"
+            out = Left(out, Len(out) - 1)
+        end while
+        return out
+    end function
+
+    function trimText(value as Dynamic) as String
+        if not util.isString(value) then return ""
+        return value.Trim()
+    end function
+
+    ' ---- Types
+
+    ' A missing member, or JSON null.
+    function isAbsent(value as Dynamic) as Boolean
+        kind = type(value)
+        return kind = "Invalid" or kind = "roInvalid" or kind = "<uninitialized>"
+    end function
+
+    function optionalString(value as Dynamic) as Boolean
+        return isAbsent(value) or util.isString(value)
+    end function
+
+    function optionalBoolean(value as Dynamic) as Boolean
+        return isAbsent(value) or util.isBoolean(value)
+    end function
+
+    function optionalNumber(value as Dynamic) as Boolean
+        return isAbsent(value) or util.isNumber(value)
+    end function
+
+    function optionalInteger(value as Dynamic) as Boolean
+        return isAbsent(value) or isInteger(value)
+    end function
+
+    function isInteger(value as Dynamic) as Boolean
+        kind = type(value)
+        return kind = "Integer" or kind = "roInt" or kind = "roInteger" or kind = "LongInteger" or kind = "roLongInteger"
+    end function
+
+    function isIntList(value as Dynamic) as Boolean
+        if type(value) <> "roArray" then return false
+        for each item in value
+            if not isInteger(item) then return false
+        end for
+        return true
+    end function
+
+    function isStringList(value as Dynamic) as Boolean
+        if type(value) <> "roArray" then return false
+        for each item in value
+            if not util.isString(item) then return false
+        end for
+        return true
+    end function
+end namespace

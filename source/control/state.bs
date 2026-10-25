@@ -1,0 +1,154 @@
+import "pkg:/source/util/values.bs"
+
+' The state frame's body (docs/silocontrol.md section 6.4), from what the
+' player reports (Player's remoteState()) or, with no player, the idle state
+' tvOS sends. Every key the Android phone requires is present
+' (silo-apple SiloControlWireCompatibilityTests): a missing one fails its
+' decoder and drops the session. posterUrl and overview are never sent.
+'
+' snapshot: { contentId, sessionId, title, subtitle, currentTime, duration,
+' isPlaying, isLoading, isBuffering, error, audioTracks, subtitleTracks
+' ([{ trackId, title, detail }]), selectedAudioTrackId,
+' selectedSubtitleTrackId (invalid for none), qualityOptions ([{ id, label,
+' detail }]), activeQualityId, isQualitySwitching, hasNextEpisode,
+' nextEpisodeTitle, isMuted }.
+namespace silocontrol.state
+    const AUTO_QUALITY = "auto"
+
+    function idle() as Object
+        return build({ title: "Ready" })
+    end function
+
+    ' The state of a title a launch is opening, before its player reports.
+    function loading(contentId as String) as Object
+        return build({ contentId: contentId, title: "Loading", isLoading: true })
+    end function
+
+    function build(snapshot as Object) as Object
+        muted = util.isTrue(snapshot.isMuted)
+        volume = 1
+        if muted then volume = 0
+        quality = util.text(snapshot.activeQualityId)
+        if quality = "" then quality = AUTO_QUALITY
+        return {
+            "contentId": optionalText(snapshot.contentId),
+            "sessionId": optionalText(snapshot.sessionId),
+            "title": util.text(snapshot.title),
+            "subtitle": optionalText(snapshot.subtitle),
+            "isPlaying": util.isTrue(snapshot.isPlaying),
+            "isLoading": util.isTrue(snapshot.isLoading),
+            "isBuffering": util.isTrue(snapshot.isBuffering),
+            "currentTime": seconds(snapshot.currentTime),
+            "duration": seconds(snapshot.duration),
+            "audioTracks": tracks("audio", snapshot.audioTracks),
+            "subtitleTracks": tracks("subtitle", snapshot.subtitleTracks),
+            "selectedAudioTrackId": optionalNumber(snapshot.selectedAudioTrackId),
+            "selectedSubtitleTrackId": optionalNumber(snapshot.selectedSubtitleTrackId),
+            "qualityOptions": options(snapshot.qualityOptions),
+            "activeQualityId": quality,
+            "isQualitySwitching": util.isTrue(snapshot.isQualitySwitching),
+            "playbackSpeed": 1,
+            "videoGravity": "fit",
+            "hdrEnabled": false,
+            "supportsVideoGravity": false,
+            "supportsHDRToggle": false,
+            "supportsSubtitleDelay": false,
+            "supportsSubtitlePosition": false,
+            "volume": volume,
+            "isMuted": muted,
+            "hasNextEpisode": util.isTrue(snapshot.hasNextEpisode),
+            "nextEpisodeTitle": optionalText(snapshot.nextEpisodeTitle),
+            "error": optionalText(snapshot.error)
+        }
+    end function
+
+    ' The tracks and qualities the player's Options panel offers
+    ' (playback.options.model), as the phone names them:
+    ' { audioTracks, selectedAudioTrackId, subtitleTracks,
+    ' selectedSubtitleTrackId, qualityOptions, activeQualityId }. Audio is
+    ' named by its ordinal (the row's value); a subtitle by the ordinal
+    ' ordinals gives its track_id (the plan inventory's
+    ' combined_index), and Off is no track. The quality ID is the label the
+    ' plan publishes, or "auto".
+    function fromOptions(model as Dynamic, ordinals as Object) as Object
+        out = { audioTracks: [], selectedAudioTrackId: invalid, subtitleTracks: [], selectedSubtitleTrackId: invalid, qualityOptions: [], activeQualityId: AUTO_QUALITY }
+        if not util.isObject(model) or type(model.tabs) <> "roArray" then return out
+        for each page in model.tabs
+            rows = firstRows(page)
+            if page.key = "audio"
+                for each row in rows
+                    if util.isNumber(row.value)
+                        out.audioTracks.Push({ trackId: row.value, title: row.label, detail: row.detail })
+                        if util.isTrue(row.checked) then out.selectedAudioTrackId = row.value
+                    end if
+                end for
+            else if page.key = "subtitles"
+                for each row in rows
+                    index = ordinals[util.text(row.value)]
+                    if util.text(row.value) <> "" and util.isNumber(index)
+                        out.subtitleTracks.Push({ trackId: index, title: row.label, detail: row.detail })
+                        if util.isTrue(row.checked) then out.selectedSubtitleTrackId = index
+                    end if
+                end for
+            else if page.key = "video"
+                for each row in rows
+                    if row.kind = "quality" and util.isObject(row.picker)
+                        for each option in row.picker.rows
+                            out.qualityOptions.Push({ id: util.text(option.value), label: option.label })
+                            if util.isTrue(option.checked) then out.activeQualityId = util.text(option.value)
+                        end for
+                    end if
+                end for
+            end if
+        end for
+        return out
+    end function
+
+    ' The rows of a tab's first column.
+    function firstRows(page as Object) as Object
+        if type(page.columns) <> "roArray" or page.columns.Count() = 0 then return []
+        rows = page.columns[0].rows
+        if type(rows) <> "roArray" then return []
+        return rows
+    end function
+
+    function tracks(kind as String, list as Dynamic) as Object
+        out = []
+        if type(list) <> "roArray" then return out
+        for each track in list
+            if util.isObject(track) and util.isNumber(track.trackId)
+                out.Push({ "kind": kind, "trackId": Int(track.trackId), "title": util.text(track.title), "detail": optionalText(track.detail) })
+            end if
+        end for
+        return out
+    end function
+
+    function options(list as Dynamic) as Object
+        out = []
+        if type(list) <> "roArray" then return out
+        for each option in list
+            if util.isObject(option) and util.text(option.id) <> ""
+                out.Push({ "id": util.text(option.id), "label": util.text(option.label), "detail": optionalText(option.detail) })
+            end if
+        end for
+        return out
+    end function
+
+    ' Seconds as a non-negative number; anything else 0.
+    function seconds(value as Dynamic) as Dynamic
+        if not util.isNumber(value) or value < 0 then return 0
+        return value
+    end function
+
+    ' A non-empty string, else invalid (JSON null).
+    function optionalText(value as Dynamic) as Dynamic
+        text = util.text(value)
+        if text = "" then return invalid
+        return text
+    end function
+
+    function optionalNumber(value as Dynamic) as Dynamic
+        if util.isNumber(value) then return Int(value)
+        return invalid
+    end function
+end namespace

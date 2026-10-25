@@ -1,0 +1,228 @@
+namespace tests
+
+    ' Wire cases from silo-apple's SiloControlWireCompatibilityTests.swift
+    ' (tests/fixtures/SOURCE pins the revision).
+    @suite("silocontrol protocol")
+    class SiloControlProtocolTests extends rooibos.BaseTestSuite
+
+        function phoneHello(extra = {} as Object) as String
+            hello = { "role": "phone", "deviceName": "Pixel", "deviceId": "p1", "serverId": "s1", "supportedVersions": [2], "features": ["close_reason"] }
+            hello.Append(extra)
+            return FormatJson({ "type": "hello", "v": 2, "hello": hello })
+        end function
+
+        ' The frames a reader gives for chunks fed in order.
+        function framesOf(chunks as Object) as Object
+            reader = silocontrol.protocol.reader()
+            out = []
+            for each chunk in chunks
+                result = silocontrol.protocol.feed(reader, chunk, chunk.Count())
+                for each body in result.frames
+                    out.Push(body.ToAsciiString())
+                end for
+                if result.error <> "" then out.Push("error:" + result.error)
+            end for
+            return out
+        end function
+
+        function bytesOf(list as Object) as Object
+            out = CreateObject("roByteArray")
+            for each value in list
+                out.Push(value)
+            end for
+            return out
+        end function
+
+        @describe("decode")
+
+        @it("accepts a phone hello and keeps its fields")
+        sub _()
+            decoded = silocontrol.protocol.decode(m.phoneHello({ "passive": true }))
+            m.assertEqual(decoded.kind, "message")
+            m.assertEqual(decoded.type, "hello")
+            m.assertEqual(decoded.payload.deviceId, "p1")
+            m.assertTrue(decoded.payload.passive)
+        end sub
+
+        @it("refuses a hello without supportedVersions or with a wrong type")
+        sub _()
+            m.assertEqual(silocontrol.protocol.decode(FormatJson({ "type": "hello", "v": 2, "hello": { "role": "phone", "deviceName": "a", "deviceId": "b" } })).kind, "invalid")
+            m.assertEqual(silocontrol.protocol.decode(m.phoneHello({ "passive": "yes" })).kind, "invalid")
+            m.assertEqual(silocontrol.protocol.decode(m.phoneHello({ "role": 3 })).kind, "invalid")
+        end sub
+
+        @it("ignores the retired set_hdr_enabled and any unknown command name")
+        sub _()
+            retired = silocontrol.protocol.decode("{""type"":""control"",""v"":2,""control"":{""name"":""set_hdr_enabled"",""enabled"":true}}")
+            m.assertEqual(retired.kind, "ignored")
+            m.assertEqual(retired.name, "set_hdr_enabled")
+            m.assertEqual(silocontrol.protocol.decode("{""type"":""control"",""v"":2,""control"":{""name"":""set_something_new"",""value"":""x""}}").kind, "ignored")
+        end sub
+
+        @it("refuses a command without a name, and one with a wrong argument type")
+        sub _()
+            m.assertEqual(silocontrol.protocol.decode("{""type"":""control"",""v"":2,""control"":{""enabled"":true}}").kind, "invalid")
+            m.assertEqual(silocontrol.protocol.decode("{""type"":""control"",""v"":2,""control"":{""name"":""seek"",""seconds"":""ten""}}").kind, "invalid")
+        end sub
+
+        @it("decodes every known command with its arguments")
+        sub _()
+            cases = [
+                { "name": "seek", "seconds": 42.5 },
+                { "name": "select_audio_track", "trackId": 7 },
+                { "name": "select_subtitle_track" },
+                { "name": "set_quality", "value": "1080p" },
+                { "name": "set_volume", "volume": 0.6 },
+                { "name": "set_muted", "enabled": true },
+                { "name": "set_subtitle_sync_ms", "milliseconds": -250 },
+                { "name": "play_next" }
+            ]
+            for each command in cases
+                decoded = silocontrol.protocol.decode(FormatJson({ "type": "control", "v": 2, "control": command }))
+                m.assertEqual(decoded.kind, "message", command.name)
+                m.assertEqual(decoded.payload.name, command.name)
+            end for
+        end sub
+
+        @it("ignores an unknown message type and the types only a TV sends")
+        sub _()
+            m.assertEqual(silocontrol.protocol.decode("{""type"":""controllers"",""v"":2,""controllers"":{""list"":[]}}").kind, "ignored")
+            m.assertEqual(silocontrol.protocol.decode("{""type"":""error"",""v"":2,""error"":{""code"":42}}").kind, "ignored")
+            m.assertEqual(silocontrol.protocol.decode("{""type"":""state"",""v"":2}").kind, "ignored")
+        end sub
+
+        @it("refuses a frame without a type or that is not JSON")
+        sub _()
+            m.assertEqual(silocontrol.protocol.decode("{""v"":2}").kind, "invalid")
+            m.assertEqual(silocontrol.protocol.decode("not json").kind, "invalid")
+            m.assertEqual(silocontrol.protocol.decode("{""type"":").kind, "invalid")
+        end sub
+
+        @it("decodes a launch with and without the picked-version pin")
+        sub _()
+            plain = silocontrol.protocol.decode("{""type"":""launch"",""v"":2,""launch"":{""serverId"":""s1"",""playback"":{""contentId"":""c1"",""fileId"":42,""startFromBeginning"":false}}}")
+            m.assertEqual(plain.kind, "message")
+            m.assertEqual(plain.payload.playback.fileId, 42)
+            pinned = silocontrol.protocol.decode("{""type"":""launch"",""v"":2,""launch"":{""serverId"":""s1"",""playback"":{""contentId"":""c1"",""fileId"":42,""startFromBeginning"":false,""pinsVersion"":true}}}")
+            m.assertTrue(pinned.payload.playback.pinsVersion)
+            m.assertEqual(silocontrol.protocol.decode("{""type"":""launch"",""v"":2,""launch"":{""serverId"":""s1"",""playback"":{""contentId"":""c1""}}}").kind, "invalid")
+        end sub
+
+        @it("reads a close with or without its reason")
+        sub _()
+            m.assertEqual(silocontrol.protocol.decode("{""type"":""close"",""v"":2,""close"":{""reason"":""replaced""}}").payload.reason, "replaced")
+            bare = silocontrol.protocol.decode("{""type"":""close"",""v"":2}")
+            m.assertEqual(bare.kind, "message")
+            m.assertInvalid(bare.payload.reason)
+        end sub
+
+        @it("requires a handoff offer's identifiers")
+        sub _()
+            offer = { "requestId": "r1", "serverId": "s1", "serverURL": "https://silo.example", "profileId": "p1", "resumeToken": invalid }
+            m.assertEqual(silocontrol.protocol.decode(FormatJson({ "type": "handoff_offer", "v": 2, "handoffOffer": offer })).kind, "message")
+            offer.Delete("profileId")
+            m.assertEqual(silocontrol.protocol.decode(FormatJson({ "type": "handoff_offer", "v": 2, "handoffOffer": offer })).kind, "invalid")
+        end sub
+
+        @describe("encode")
+
+        @it("writes the envelope with the payload under its camelCase key")
+        sub _()
+            sent = ParseJson(silocontrol.protocol.handoffReady("r1", "s1", "p1", "2026-10-25T00:00:00Z", true, ""))
+            m.assertEqual(sent.type, "handoff_ready")
+            m.assertEqual(sent.v, 2)
+            m.assertEqual(sent.handoffReady.profileId, "p1")
+            m.assertFalse(sent.handoffReady.DoesExist("resumeToken"))
+            m.assertTrue(Instr(1, silocontrol.protocol.handoffReady("r1", "s1", "p1", "x", true, "t"), """handoffReady"":") > 0)
+        end sub
+
+        @it("writes the Roku hello with v2, the features, and volume_mute_only")
+        sub _()
+            text = silocontrol.protocol.hello({ deviceName: "Living Room", deviceId: "d1", serverId: "s1", serverName: "silo.example", serverIdentity: "" })
+            sent = ParseJson(text)
+            m.assertEqual(sent.hello.role, "tv")
+            m.assertEqual(sent.hello.supportedVersions, [2])
+            m.assertTrue(util.contains(sent.hello.features, "volume_mute_only"))
+            m.assertFalse(sent.hello.DoesExist("serverIdentity"))
+            m.assertTrue(Instr(1, text, """deviceName"":""Living Room""") > 0)
+        end sub
+
+        @it("writes a bare close without a reason")
+        sub _()
+            m.assertFalse(ParseJson(silocontrol.protocol.close("")).DoesExist("close"))
+            m.assertEqual(ParseJson(silocontrol.protocol.close("timeout")).close.reason, "timeout")
+        end sub
+
+        @it("writes every state key an older v2 peer requires")
+        sub _()
+            text = silocontrol.protocol.state(silocontrol.state.idle())
+            body = ParseJson(text).state
+            for each key in ["title", "isPlaying", "isLoading", "isBuffering", "currentTime", "duration", "audioTracks", "subtitleTracks", "qualityOptions", "activeQualityId", "isQualitySwitching", "playbackSpeed", "videoGravity", "hdrEnabled", "supportsVideoGravity", "supportsHDRToggle", "volume", "isMuted", "hasNextEpisode"]
+                m.assertTrue(body.DoesExist(key), key)
+                m.assertTrue(Instr(1, text, """" + key + """:") > 0, key + " keeps its case")
+            end for
+            m.assertFalse(body.supportsHDRToggle)
+            m.assertFalse(body.DoesExist("posterUrl"))
+        end sub
+
+        @describe("framing")
+
+        @it("frames text with a big-endian length")
+        sub _()
+            framed = silocontrol.protocol.frame("hi")
+            m.assertEqual(framed.Count(), 6)
+            m.assertEqual(framed[3], 2)
+            m.assertEqual(framed[4], Asc("h"))
+        end sub
+
+        @it("reads frames split across chunks and several in one chunk")
+        sub _()
+            one = silocontrol.protocol.frame("{""a"":1}")
+            two = silocontrol.protocol.frame("{""b"":2}")
+            both = CreateObject("roByteArray")
+            both.Append(one)
+            both.Append(two)
+            m.assertEqual(m.framesOf([both]), ["{""a"":1}", "{""b"":2}"])
+            first = CreateObject("roByteArray")
+            rest = CreateObject("roByteArray")
+            for i = 0 to one.Count() - 1
+                if i < 3 then first.Push(one[i]) else rest.Push(one[i])
+            end for
+            m.assertEqual(m.framesOf([first, rest]), ["{""a"":1}"])
+        end sub
+
+        @it("ends the connection on a frame over 64 KiB")
+        sub _()
+            m.assertEqual(m.framesOf([m.bytesOf([0, 1, 0, 1])]), ["error:too_large"])
+            m.assertEqual(m.framesOf([m.bytesOf([&hFF, 0, 0, 0])]), ["error:too_large"])
+        end sub
+
+        @describe("servers")
+
+        @it("names a server as the phones do")
+        sub _()
+            ' base64url of "https://silo.example.com", no padding.
+            m.assertEqual(silocontrol.protocol.serverId("https://silo.example.com/"), "aHR0cHM6Ly9zaWxvLmV4YW1wbGUuY29t")
+            m.assertEqual(silocontrol.protocol.urlOf("aHR0cHM6Ly9zaWxvLmV4YW1wbGUuY29t"), "https://silo.example.com")
+            m.assertEqual(silocontrol.protocol.urlOf("bm90IGEgdXJs"), "")
+        end sub
+
+        @it("matches a phone's server by origin, case, and default port")
+        sub _()
+            origin = "https://silo.example.com"
+            m.assertTrue(silocontrol.protocol.serverIdMatches(silocontrol.protocol.serverId("https://SILO.example.com:443/"), origin))
+            m.assertFalse(silocontrol.protocol.serverIdMatches(silocontrol.protocol.serverId("https://silo.example.com:8443"), origin))
+            m.assertFalse(silocontrol.protocol.serverIdMatches(silocontrol.protocol.serverId("https://silo.example.com/sub"), origin))
+            m.assertFalse(silocontrol.protocol.serverIdMatches("", origin))
+        end sub
+
+        @it("matches another address of the same deployment by identity")
+        sub _()
+            m.assertTrue(silocontrol.protocol.serverMatches("other", " dep-1 ", "https://silo.example.com", "dep-1"))
+            m.assertFalse(silocontrol.protocol.serverMatches("other", "dep-2", "https://silo.example.com", "dep-1"))
+            m.assertFalse(silocontrol.protocol.serverMatches("other", "", "https://silo.example.com", ""))
+        end sub
+
+    end class
+
+end namespace
