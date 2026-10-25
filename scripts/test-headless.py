@@ -48,7 +48,7 @@ SHARDS = [
     ("detail", ["views/detailScreen.spec.bs", "onboarding", "storage", "theme", "util", "smoke.spec.bs"]),
     ("detail-tracks", ["views/detailTracks.spec.bs", "auth", "control"]),
     ("views", ["views", "player"]),
-    ("screens", ["home", "library", "search"]),
+    ("screens", ["home", "library", "search", "settings"]),
 ]
 
 

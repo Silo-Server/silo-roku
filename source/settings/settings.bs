@@ -1,0 +1,184 @@
+import "pkg:/source/catalog/pickers.bs"
+import "pkg:/source/util/values.bs"
+
+' Only controls the Roku actually consumes. The server contract supplies
+' schemas and option sets; device playback overrides leave the profile intact.
+namespace settings
+    function supportedControls() as Object
+        return [
+            { key: "ui.title_art", category: "general", section: "appearance", label: "titleArt", device: false },
+            { key: "playback.preferred_quality", category: "playback", section: "quality", label: "resolution", device: true },
+            { key: "playback.max_bitrate_kbps", category: "playback", section: "quality", label: "bitrate", device: true },
+            { key: "playback.audio_language", category: "playback", section: "streaming", label: "audioLanguage", device: true },
+            { key: "playback.auto_play_next", category: "playback", section: "episodes", label: "autoplay", device: true },
+            { key: "playback.intro_skip_mode", category: "playback", section: "episodes", label: "intros", device: true },
+            { key: "playback.auto_skip_recap", category: "playback", section: "episodes", label: "recaps", device: true },
+            { key: "player.video_skip_back_seconds", category: "playback", section: "video", label: "skipBack", device: false },
+            { key: "player.video_skip_forward_seconds", category: "playback", section: "video", label: "skipForward", device: false },
+            { key: "playback.subtitle_language", category: "subtitles", section: "tracks", label: "language", device: true },
+            { key: "playback.subtitle_mode", category: "subtitles", section: "tracks", label: "behavior", device: true },
+            { key: "playback.show_forced_subtitles", category: "subtitles", section: "tracks", label: "forced", device: true }
+        ]
+    end function
+
+    function contractRequest() as Object
+        return { path: "/api/v2/settings/contract", auth: "profile", map: { kind: "settingsContract" } }
+    end function
+
+    ' Runs on ApiTask, retaining twelve small definitions rather than the
+    ' entire manifest. Unknown or incompatible definitions are not editable.
+    function contract(body as Object, copy as Object) as Dynamic
+        if type(body.definitions) <> "roArray" then return invalid
+        out = []
+        for each control in supportedControls()
+            for each definition in body.definitions
+                if util.isObject(definition) and util.text(definition.key) = control.key
+                    schema = definition.value_schema
+                    if util.text(definition.persistence) <> "remote" or not util.isObject(schema) then exit for
+                    scope = "profile"
+                    if control.device and util.contains(definition.allowed_scopes, "profile_device") then scope = "profile_device"
+                    if not util.contains(definition.allowed_scopes, scope) then exit for
+                    options = definitionOptions(definition, body.option_sets, copy)
+                    if options.Count() = 0 then exit for
+                    control.scope = scope
+                    control.options = options
+                    control.schema = schema
+                    out.Push(control)
+                    exit for
+                end if
+            end for
+        end for
+        return { controls: out }
+    end function
+
+    function definitionOptions(definition as Object, sets as Dynamic, copy as Object) as Object
+        schema = definition.value_schema
+        out = []
+        kind = util.text(schema.type)
+        if kind = "boolean"
+            out = [{ value: true, title: i18n.lookup(copy, "settings.on") }, { value: false, title: i18n.lookup(copy, "settings.off") }]
+        else if kind = "enum" and type(schema.values) = "roArray"
+            for each option in schema.values
+                if util.isObject(option) and not util.isTrue(option.deprecated)
+                    out.Push({ value: option.value, title: util.text(option.label) })
+                end if
+            end for
+        else if kind = "language_tag"
+            if util.isTrue(schema.nullable) then out.Push({ value: invalid, title: util.text(definition.unset_label) })
+            if definition.key = "playback.audio_language" then out.Push({ value: "x-silo-original", title: i18n.lookup(copy, "settings.originalLanguage") })
+            if util.isObject(sets)
+                group = sets[util.text(definition.suggested_options)]
+                if util.isObject(group) and type(group.options) = "roArray"
+                    for each option in group.options
+                        if util.isObject(option) and util.isString(option.value)
+                            out.Push({ value: option.value, title: languageName(option.value, copy) })
+                        end if
+                    end for
+                end if
+            end if
+        else if definition.key = "playback.max_bitrate_kbps" and kind = "integer" and util.isNumber(schema.minimum) and util.isNumber(schema.maximum)
+            if util.isTrue(schema.nullable) then out.Push({ value: invalid, title: i18n.lookup(copy, "settings.noLimit") })
+            for each cap in [1000, 2000, 4000, 6000, 8000, 10000, 15000, 20000, 30000, 40000, 60000, 80000, 100000, 150000, 200000]
+                if cap >= schema.minimum and cap <= schema.maximum then out.Push({ value: cap, title: bitrateLabel(cap) })
+            end for
+        end if
+        return out
+    end function
+
+    function languageName(code as String, copy as Object) as String
+        if code = "x-silo-original" then return i18n.lookup(copy, "settings.originalLanguage")
+        label = catalog.pickers.languageName(code, copy)
+        if Instr(1, code, "-") > 0 then label = label + " (" + code + ")"
+        return label
+    end function
+
+    function bitrateLabel(cap as Integer) as String
+        return (cap / 1000).ToStr() + " Mbps"
+    end function
+
+    function keys(controls as Object) as Object
+        out = []
+        for each control in controls
+            out.Push(control.key)
+        end for
+        return out
+    end function
+
+    function valuesRequest(controls as Object) as Object
+        return { path: "/api/v2/settings/values/effective", query: { keys: keys(controls) }, auth: "profile" }
+    end function
+
+    ' Require every requested row before enabling writes. A failed read must
+    ' never turn defaults into values a viewer can accidentally save.
+    function values(body as Dynamic, controls as Object) as Dynamic
+        if not util.isObject(body) or type(body.items) <> "roArray" then return invalid
+        out = {}
+        for each item in body.items
+            if util.isObject(item) and util.isString(item.key) then out[item.key] = item
+        end for
+        for each control in controls
+            item = out[control.key]
+            if not util.isObject(item) or not item.DoesExist("value") then return invalid
+        end for
+        return out
+    end function
+
+    function isOwn(control as Object, item as Object) as Boolean
+        return util.text(item.source) = control.scope or util.text(item.scope) = control.scope
+    end function
+
+    function authored(item as Object) as Dynamic
+        if util.isTrue(item.constrained) and item.DoesExist("stored_value") then return item.stored_value
+        return item.value
+    end function
+
+    function valueLabel(control as Object, value as Dynamic, copy as Object) as String
+        for each option in control.options
+            if same(option.value, value) then return option.title
+        end for
+        if value = invalid then return i18n.lookup(copy, "settings.noPreference")
+        if util.text(control.schema.type) = "language_tag" and util.isString(value) then return languageName(value, copy)
+        if control.key = "playback.max_bitrate_kbps" and util.isNumber(value) then return bitrateLabel(value)
+        return util.text(value)
+    end function
+
+    function same(a as Dynamic, b as Dynamic) as Boolean
+        return util.kind(a) = util.kind(b) and a = b
+    end function
+
+    ' Picker indices are separate from typed wire values (including null).
+    function picker(control as Object, item as Object, copy as Object) as Object
+        options = []
+        chosen = 0
+        if control.scope = "profile_device" then options.Push({ value: 0, title: i18n.lookup(copy, "settings.useProfile"), reset: true, detail: "" })
+        selected = authored(item)
+        for each option in control.options
+            row = { value: options.Count(), title: option.title, wire: option.value, reset: false, detail: "" }
+            if same(option.value, selected) then chosen = row.value
+            options.Push(row)
+        end for
+        ' Preserve a valid open value supplied by another client, even when it
+        ' is not one of this menu's suggestions (BCP-47 and arbitrary caps).
+        found = false
+        for each option in control.options
+            if same(option.value, selected) then found = true
+        end for
+        if not found
+            chosen = options.Count()
+            options.Push({ value: chosen, title: valueLabel(control, selected, copy), wire: selected, reset: false, detail: "" })
+        end if
+        if control.scope = "profile_device" and not isOwn(control, item) then chosen = 0
+        return { items: options, chosen: chosen }
+    end function
+
+    function writeRequest(control as Object, option as Object) as Object
+        request = { path: "/api/v2/settings/values/" + control.key, query: { scope: control.scope }, auth: "profile", orderKey: "settings." + control.key }
+        if util.isTrue(option.reset)
+            request.method = "DELETE"
+        else
+            request.method = "PUT"
+            request.body = { value: option.wire }
+        end if
+        return request
+    end function
+end namespace

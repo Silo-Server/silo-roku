@@ -2056,3 +2056,30 @@ exited, Roku Home played its own 15 s preview clip (ECP `native-ui`) and then st
 
 Harness slip (not the client): during the closing skip-back on file A, a Back sent after the −10 s skips only hid the
 controls the skips had shown, so file A played 16 s longer before the second Back stopped it.
+
+
+## Run 29 — supported Settings and TV layout
+
+2026-10-25, settings work based on `b5808bd`, development build. Physical
+Roku Ultra 4850X, Roku OS 16.0.4, 1080p UI. Controlled through the README's
+ECP helper; no emulator or simulator was used.
+
+- Installed and launched successfully. The avatar menu includes Settings.
+- General, Playback, and Subtitles render with the category rail, selected
+  category fill, focused setting row, scope footer, and centered option menu.
+- Changed Resolution from inherited Auto to a device-specific 720p. The server
+  returned success, the effective read showed 720p, and closing and reopening
+  Settings retained 720p. Selecting Use profile setting cleared the override;
+  the effective value returned to Auto and the picker checked inheritance.
+  Restored the original preference before ending the run.
+- Verified Back closes the picker, returns from the pane to the rail, then
+  restores the originating avatar. The language picker and subtitle footer
+  render; no subtitle or global Roku caption preference was changed.
+- Developer screenshots occasionally omit unchanged layers, including on the
+  existing Home screen. Recapturing after navigation produces complete frames.
+  Screenshots verify layout; no person independently watched the display or
+  listened to Audio Guide. This run does not establish low-memory support.
+
+Local checks: `npm run ci` passed, including 2,140 headless tests, the API
+contract checks, package budget, thread and shadowing checks, and Roku Static
+Analysis (zero errors and zero memory-monitoring warnings).

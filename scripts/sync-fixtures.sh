@@ -6,7 +6,9 @@
 # playback request bodies the client sends and every schema they reference;
 # and the method, path, and query parameters of each catalog operation the
 # browse screens and the player's previews call (source/catalog/requests.bs,
-# source/playback/trickplay.bs). The server checkout is only read with git; this
+# source/playback/trickplay.bs); and the settings manifest's definitions for
+# the keys Settings edits (source/settings/settings.bs) with the option sets
+# they suggest from. The server checkout is only read with git; this
 # never checks out, fetches, or edits anything there. Writes
 # tests/fixtures/SOURCE; running it again at the same commit changes nothing.
 #
@@ -45,6 +47,15 @@ CATALOG = {
     "getAudioPreference", "updateAudioPreference", "deleteAudioPreference", "updateSubtitlePreference", "deleteSubtitlePreference",
 }
 OPERATIONS |= CATALOG
+# The keys Settings edits (settings.supportedControls).
+SETTINGS = [
+    "ui.title_art", "playback.preferred_quality", "playback.max_bitrate_kbps", "playback.audio_language",
+    "playback.auto_play_next", "playback.intro_skip_mode", "playback.auto_skip_recap",
+    "player.video_skip_back_seconds", "player.video_skip_forward_seconds",
+    "playback.subtitle_language", "playback.subtitle_mode", "playback.show_forced_subtitles",
+]
+MANIFEST = "contracts/settings/v1/manifest.json"
+MANIFEST_OUT = "settings/manifest.json"
 OPENAPI = "contracts/api/v2/openapi.json"
 FIXTURES = "contracts/api/v2/fixtures"
 SCHEMA_OUT = "openapi/playback-v3.json"
@@ -125,6 +136,19 @@ for stale in (out / FIXTURE_OUT).iterdir():
     if stale.name not in expected:
         stale.unlink()
 
+manifest = json.loads(show(MANIFEST))
+definitions = {entry["key"]: entry for entry in manifest["definitions"]}
+missing = [key for key in SETTINGS if key not in definitions]
+if missing:
+    sys.exit(f"settings not in {MANIFEST}: {', '.join(missing)}")
+chosen = [definitions[key] for key in SETTINGS]
+sets = sorted({entry["suggested_options"] for entry in chosen if entry.get("suggested_options")})
+write(out / MANIFEST_OUT, dump({
+    "revision": manifest["revision"],
+    "definitions": chosen,
+    "option_sets": {name: manifest["option_sets"][name] for name in sets},
+}))
+
 date = subprocess.run(["git", "-C", server, "show", "-s", "--format=%cI", sha], check=True, capture_output=True, text=True).stdout.strip()
 lines = [
     f"repository: {REPOSITORY}",
@@ -137,6 +161,7 @@ lines = [
     f"  {FIXTURES}/index.json -> tests/fixtures/{FIXTURE_OUT}/index.json (entries for {', '.join(sorted(OPERATIONS))})",
 ]
 lines += [f"  {FIXTURES}/{body} -> tests/fixtures/{FIXTURE_OUT}/{body}" for body in bodies]
+lines.append(f"  {MANIFEST} -> tests/fixtures/{MANIFEST_OUT} (revision, option sets, and definitions of {', '.join(SETTINGS)})")
 write(out / "SOURCE", ("\n".join(lines) + "\n").encode())
 print(f"synced {len(kept)} schemas, {len(operations)} catalog operations, and {len(entries)} fixtures from {sha}")
 PY

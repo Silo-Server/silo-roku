@@ -1,0 +1,589 @@
+import "pkg:/components/theme/browse.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/views/controls.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/api/session.bs"
+import "pkg:/source/home/shell.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/onboarding/address.bs"
+import "pkg:/source/settings/settings.bs"
+import "pkg:/source/util/i18n.bs"
+
+const ROW_WIDTH = 1200
+const ROW_HEIGHT = 70
+const ROW_PITCH = 78
+const PANE_HEIGHT = 700
+const RAIL_X = 108
+const RAIL_WIDTH = 490
+' tvOS's rail rows: the profile, then each category under an icon with a
+' one-line description.
+const PROFILE_Y = 148
+const PROFILE_HEIGHT = 100
+const CATEGORY_Y = 278
+const CATEGORY_HEIGHT = 80
+const CATEGORY_PITCH = 86
+const SIGN_OUT_Y = 893
+' A rail category's description, and the same line on a focused row, at 62%.
+const DETAIL_COLOR = "0xEDEDED9E"
+const DETAIL_ON_FOCUS = "0x0000009E"
+' The pane header's icon tile (tvOS siloIconTile).
+const ICON_TILE = "0x3A3A3CFF"
+const GLYPHS = "pkg:/images/settings/"
+const CHEVRON_ART = "pkg:/images/player/chevron.png"
+const CHEVRON_SIZE = 15
+
+sub init()
+    m.category = "general"
+    m.railAt = 1
+    m.at = 0
+    m.first = 0
+    m.inPane = false
+    m.controls = []
+    m.values = invalid
+    m.busy = false
+    m.failed = false
+    m.released = false
+    m.picker = invalid
+    m.dialog = invalid
+    m.pending = invalid
+    m.readRequest = invalid
+    m.rows = []
+    m.rail = []
+    i18n.install()
+    m.copy = m.global.strings
+    styleLabel("heading", theme.textStyle.SETTINGS_TITLE, theme.color.TEXT).text = i18n.text("settings.title")
+    styleLabel("paneTitle", theme.textStyle.SETTINGS_PANE_TITLE, theme.color.TEXT)
+    styleLabel("description", theme.textStyle.SETTINGS_BODY, theme.color.TEXT_TERTIARY)
+    m.top.findNode("paneTile").setFields({ uri: theme.firstRunArt.FIELD_FILL, blendColor: ICON_TILE })
+    styleLabel("footer", theme.textStyle.SETTINGS_BODY, theme.color.TEXT_TERTIARY)
+    styleLabel("scrollHint", theme.textStyle.SETTINGS_BODY, theme.color.TEXT_TERTIARY)
+    styleLabel("version", theme.textStyle.SETTINGS_BODY, theme.color.TEXT_TERTIARY)
+    m.railKeys = ["profile", "general", "playback", "subtitles", "server", "signOut"]
+    for i = 0 to m.railKeys.Count() - 1
+        m.rail.Push(makeRailRow(m.top.findNode("rail"), m.railKeys[i], i))
+    end for
+    m.server = ""
+    showCategory()
+end sub
+
+sub readIdentity()
+    session = api.session.current()
+    if session <> invalid
+        m.server = util.text(session.origin)
+        if util.isObject(session.profile)
+            profile = mainShell.profileBadge(session.profile, m.server)
+            m.rail[0].title.text = profile.name
+            m.rail[0].detail.text = onboarding.address.hostOf(m.server)
+            m.top.findNode("avatar").setFields({ initials: profile.initials, tint: profile.tint, uri: profile.uri })
+        end if
+    end if
+    info = CreateObject("roAppInfo")
+    m.top.findNode("version").text = "Silo " + info.GetVersion()
+end sub
+
+function styleLabel(id as String, style as String, color as String) as Object
+    label = m.top.findNode(id)
+    label.font = theme.font(style)
+    label.color = color
+    return label
+end function
+
+' A pane row: a card at rest (tvOS TVSettingsPaneRowStyle), the focus fill,
+' its title, the value, and a chevron when OK opens something.
+function makeRow(parent as Object, id as String, hasChevron as Boolean) as Object
+    node = parent.createChild("Group")
+    node.id = id
+    fill = node.createChild("Poster")
+    fill.setFields({ id: "focus", uri: theme.browseArt.ROW_FILL, width: ROW_WIDTH, height: ROW_HEIGHT, visible: false })
+    rest = node.createChild("Poster")
+    rest.setFields({ uri: theme.browseArt.BUTTON, width: ROW_WIDTH, height: ROW_HEIGHT })
+    title = node.createChild("Label")
+    title.setFields({ font: theme.font(theme.textStyle.SETTINGS_ROW), width: 565, height: ROW_HEIGHT, translation: [24, 0], vertAlign: "center", color: theme.color.TEXT })
+    ' The value ends 16 px before the chevron, or at the row's inset.
+    right = ROW_WIDTH - 24
+    if hasChevron then right = right - CHEVRON_SIZE - 16
+    value = node.createChild("Label")
+    value.setFields({ id: "value", font: theme.font(theme.textStyle.SETTINGS_VALUE), width: 570, height: ROW_HEIGHT, translation: [right - 570, 0], horizAlign: "right", vertAlign: "center", color: theme.color.TEXT_TERTIARY })
+    section = node.createChild("Label")
+    section.setFields({ font: theme.font(theme.textStyle.SETTINGS_SECTION), width: ROW_WIDTH - 48, translation: [24, -35], color: theme.color.TEXT_TERTIARY, visible: false })
+    arrow = node.createChild("Poster")
+    arrow.setFields({ uri: CHEVRON_ART, width: CHEVRON_SIZE, height: CHEVRON_SIZE, translation: [ROW_WIDTH - 24 - CHEVRON_SIZE, (ROW_HEIGHT - CHEVRON_SIZE) / 2], visible: hasChevron })
+    return { node: node, rest: rest, fill: fill, title: title, value: value, section: section, chevron: arrow }
+end function
+
+' A rail row: the profile (avatar, name, server, chevron), a category (icon,
+' name, description), or Sign Out (icon and name).
+function makeRailRow(parent as Object, key as String, index as Integer) as Object
+    node = parent.createChild("Group")
+    node.id = "rail." + key
+    height = CATEGORY_HEIGHT
+    y = CATEGORY_Y + (index - 1) * CATEGORY_PITCH
+    if key = "profile"
+        height = PROFILE_HEIGHT
+        y = PROFILE_Y
+    else if key = "signOut"
+        height = ROW_HEIGHT
+        y = SIGN_OUT_Y
+    end if
+    node.translation = [RAIL_X, y]
+    fill = node.createChild("Poster")
+    fill.setFields({ uri: theme.browseArt.ROW_FILL, width: RAIL_WIDTH, height: height, visible: false })
+    icon = node.createChild("Poster")
+    title = node.createChild("Label")
+    title.text = i18n.text("settings." + key)
+    detail = node.createChild("Label")
+    detail.setFields({ font: theme.font(theme.textStyle.SETTINGS_CATEGORY_DETAIL), width: 360, translation: [70, 46], color: DETAIL_COLOR })
+    arrow = node.createChild("Poster")
+    arrow.visible = false
+    if key = "profile"
+        ' The avatar is the screen's own node, laid over this row.
+        title.setFields({ font: theme.font(theme.textStyle.SETTINGS_PROFILE), width: 320, translation: [106, 18] })
+        detail.setFields({ font: theme.font(theme.textStyle.SETTINGS_PROFILE_DETAIL), width: 320, translation: [106, 56] })
+        arrow.setFields({ uri: CHEVRON_ART, width: CHEVRON_SIZE, height: CHEVRON_SIZE, translation: [RAIL_WIDTH - 20 - CHEVRON_SIZE, (height - CHEVRON_SIZE) / 2], visible: true })
+        icon.visible = false
+    else
+        glyph = key
+        title.setFields({ font: theme.font(theme.textStyle.SETTINGS_CATEGORY), width: 380, translation: [70, 12] })
+        if key = "signOut"
+            glyph = "sign_out"
+            title.setFields({ height: height, translation: [70, 0], vertAlign: "center" })
+        else
+            detail.text = i18n.text("settings.railDescription." + key)
+        end if
+        icon.setFields({ uri: GLYPHS + glyph + ".png", width: 30, height: 30, translation: [22, (height - 30) / 2] })
+    end if
+    return { node: node, fill: fill, icon: icon, title: title, detail: detail, chevron: arrow }
+end function
+
+sub onShow(event as Object)
+    m.released = false
+    readIdentity()
+    ' A pending save that was never confirmed belongs to an earlier visit.
+    m.pending = invalid
+    if util.isObject(event.restore)
+        ' A rebuilt screen starts on General; the key carries the category.
+        if util.isString(event.restore.category) then m.category = event.restore.category
+        if util.isNumber(event.restore.railAt) then m.railAt = event.restore.railAt
+        showCategory()
+        m.inPane = util.isTrue(event.restore.pane)
+        m.at = event.restore.at
+        ' Before the contract arrives, onContract clamps instead.
+        if m.controls.Count() > 0 then clampFocus()
+    end if
+    focusScreen()
+    if m.controls.Count() = 0
+        loadContract()
+    else
+        loadValues()
+    end if
+    paint()
+    announce()
+end sub
+
+sub onHide()
+    if m.picker <> invalid then closePicker()
+end sub
+
+sub onRelease()
+    m.released = true
+end sub
+
+function focusKey() as Object
+    return { pane: m.inPane, at: m.at, category: m.category, railAt: m.railAt }
+end function
+
+sub loadContract()
+    m.busy = true
+    m.failed = false
+    notice("settings.loading", false)
+    send(settings.contractRequest(), "onContract")
+end sub
+
+sub send(request as Object, callback as String)
+    handle = api.newHandle(m.top.owner)
+    if callback = "onContract" or callback = "onValues"
+        previous = m.readRequest
+        m.readRequest = handle
+        if previous <> invalid then api.cancel(previous)
+    end if
+    handle.observeField("status", callback)
+    api.send(request, handle)
+end sub
+
+sub onContract(event as Object)
+    if m.released then return
+    if m.readRequest = invalid or not event.getRoSGNode().isSameNode(m.readRequest) then return
+    result = api.resultOf(event.getRoSGNode())
+    if not result.ok
+        readFailed()
+        return
+    end if
+    m.controls = result.body.controls
+    if m.controls.Count() = 0
+        m.busy = false
+        m.failed = true
+        notice("settings.unsupported", true)
+        return
+    end if
+    at = m.at
+    showCategory()
+    ' Keep a restored focus that arrived before the contract.
+    m.at = at
+    clampFocus()
+    loadValues()
+end sub
+
+sub loadValues()
+    m.busy = true
+    m.failed = false
+    send(settings.valuesRequest(m.controls), "onValues")
+end sub
+
+sub onValues(event as Object)
+    if m.released then return
+    if m.readRequest = invalid or not event.getRoSGNode().isSameNode(m.readRequest) then return
+    result = api.resultOf(event.getRoSGNode())
+    m.busy = false
+    values = invalid
+    if result.ok then values = settings.values(result.body, m.controls)
+    if values = invalid
+        readFailed()
+        return
+    end if
+    m.values = values
+    m.failed = false
+    ' Heroes already on the stack observe this field; reopening Home also
+    ' redraws its focused hero. No app restart is needed for title art.
+    titleArt = values[mainShell.TITLE_ART_KEY]
+    if titleArt <> invalid and m.global.hasField("titleArt")
+        current = m.global.titleArt
+        current.show = util.isTrue(titleArt.value)
+        ' Fences off a shell read that started before this one.
+        current.revision = mainShell.titleArtRevision(current) + 1
+        m.global.titleArt = current
+    end if
+    saved = m.pending <> invalid
+    m.pending = invalid
+    paint()
+    if saved
+        notice("settings.saved", false)
+    else
+        describeFocus()
+    end if
+end sub
+
+sub readFailed()
+    m.busy = false
+    m.failed = true
+    if m.pending <> invalid
+        notice("settings.refreshFailed", true)
+    else
+        notice("settings.loadFailed", true)
+    end if
+end sub
+
+sub notice(key as String, isError as Boolean)
+    footer = m.top.findNode("footer")
+    footer.text = i18n.text(key)
+    footer.color = theme.color.TEXT_TERTIARY
+    if isError then footer.color = theme.color.ERROR
+    speak(footer.text, false)
+end sub
+
+sub showCategory()
+    m.top.findNode("paneTitle").text = i18n.text("settings." + m.category)
+    m.top.findNode("paneGlyph").uri = GLYPHS + m.category + ".png"
+    m.top.findNode("description").text = i18n.text("settings.description." + m.category)
+    group = m.top.findNode("rows")
+    group.removeChildrenIndex(group.getChildCount(), 0)
+    m.rows = []
+    m.shown = []
+    for each control in m.controls
+        if control.category = m.category
+            row = makeRow(group, control.key, true)
+            row.title.text = i18n.text("settings.control." + control.label)
+            row.section.text = UCase(i18n.text("settings.section." + control.section))
+            m.rows.Push(row)
+            m.shown.Push(control)
+        end if
+    end for
+    if m.category = "server"
+        row = makeRow(group, "server.address", false)
+        row.title.text = i18n.text("settings.address")
+        row.value.text = m.server
+        m.rows.Push(row)
+        row = makeRow(group, "server.change", true)
+        row.title.text = i18n.text("settings.changeServer")
+        m.rows.Push(row)
+    end if
+    m.at = 0
+    m.first = 0
+    paint()
+end sub
+
+sub paint()
+    for i = 0 to m.rail.Count() - 1
+        row = m.rail[i]
+        focused = not m.inPane and i = m.railAt
+        selected = m.railKeys[i] = m.category
+        destructive = m.railKeys[i] = "signOut"
+        ' tvOS: the selected category keeps a dim fill; focus is the light
+        ' fill with dark content, or red with white for Sign Out.
+        row.fill.visible = focused or selected
+        row.fill.blendColor = theme.color.CHROME_SELECTED_FILL
+        ink = theme.color.TEXT
+        detail = DETAIL_COLOR
+        if destructive then ink = theme.color.DESTRUCTIVE
+        if focused and destructive
+            row.fill.blendColor = theme.color.DESTRUCTIVE
+            ink = theme.color.TEXT
+        else if focused
+            row.fill.blendColor = theme.color.FOCUS
+            ink = theme.color.ON_FOCUS
+            detail = DETAIL_ON_FOCUS
+        end if
+        row.title.color = ink
+        row.icon.blendColor = ink
+        row.chevron.blendColor = ink
+        row.detail.color = detail
+    end for
+    ' Only rows inside the viewport draw. Scrolling is bounded and keeps
+    ' the focused row plus its section heading together.
+    if m.at < m.first then m.first = m.at
+    while lastVisible(m.first) < m.at and m.first < m.at
+        m.first = m.first + 1
+    end while
+    y = 40
+    previous = ""
+    for i = 0 to m.rows.Count() - 1
+        row = m.rows[i]
+        section = ""
+        if i < m.shown.Count() then section = m.shown[i].section
+        heading = section <> "" and section <> previous
+        if i >= m.first
+            if i > m.first and heading then y = y + 40
+            row.node.translation = [0, y]
+            row.node.visible = y + ROW_HEIGHT <= PANE_HEIGHT
+            row.section.visible = heading
+            y = y + ROW_PITCH
+            previous = section
+        else
+            row.node.visible = false
+        end if
+        focused = m.inPane and i = m.at
+        row.fill.visible = focused
+        row.rest.visible = not focused
+        row.fill.blendColor = theme.color.FOCUS
+        row.title.color = theme.color.TEXT
+        row.value.color = theme.color.TEXT_TERTIARY
+        row.chevron.blendColor = theme.color.TEXT_TERTIARY
+        if focused
+            row.title.color = theme.color.ON_FOCUS
+            row.value.color = theme.color.ON_FOCUS
+            row.chevron.blendColor = theme.color.ON_FOCUS
+        end if
+        if i < m.shown.Count() and m.values <> invalid
+            control = m.shown[i]
+            item = m.values[control.key]
+            if item <> invalid then row.value.text = settings.valueLabel(control, item.value, m.copy)
+        end if
+    end for
+    hint = ""
+    if lastVisible(m.first) < m.rows.Count() - 1 then hint = "↓"
+    if m.first > 0 then hint = "↕"
+    m.top.findNode("scrollHint").text = hint
+end sub
+
+sub clampFocus()
+    if m.at >= m.rows.Count() then m.at = m.rows.Count() - 1
+    if m.at < 0 then m.at = 0
+    if m.rows.Count() = 0 then m.inPane = false
+end sub
+
+function lastVisible(first as Integer) as Integer
+    y = 40
+    previous = ""
+    last = first - 1
+    for i = first to m.rows.Count() - 1
+        section = ""
+        if i < m.shown.Count() then section = m.shown[i].section
+        if i > first and section <> "" and section <> previous then y = y + 40
+        if y + ROW_HEIGHT > PANE_HEIGHT then return last
+        last = i
+        y = y + ROW_PITCH
+        previous = section
+    end for
+    return last
+end function
+
+sub describeFocus()
+    if m.busy or m.failed then return
+    key = "settings.navigation"
+    message = ""
+    if m.inPane and m.at < m.shown.Count()
+        control = m.shown[m.at]
+        key = "settings.profileScope"
+        if control.scope = "profile_device" then key = "settings.deviceScope"
+        if m.values <> invalid
+            item = m.values[control.key]
+            if util.isTrue(item.constrained) then message = " " + i18n.text("settings.constrained", { value: settings.valueLabel(control, settings.authored(item), m.copy) })
+        end if
+    end if
+    if m.category = "subtitles" then message = message + " " + i18n.text("settings.captionSystem")
+    m.top.findNode("footer").setFields({ text: i18n.text(key) + message, color: theme.color.TEXT_TERTIARY })
+end sub
+
+sub announce()
+    if m.inPane and m.at < m.rows.Count()
+        row = m.rows[m.at]
+        speak(util.speech.sentences([row.title.text, row.value.text, m.top.findNode("footer").text]))
+    else
+        speak(m.rail[m.railAt].title.text)
+    end if
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if m.dialog <> invalid
+        if key = "back" then closeDialog()
+        return true
+    end if
+    if m.picker <> invalid then return true
+    ' Do not allow another write or navigation to cancel one mid-flight.
+    ' The API timeout bounds the wait. After a failed refresh, OK retries it.
+    if m.pending <> invalid and m.busy then return true
+    if key = "back"
+        if not m.inPane then return false
+        m.inPane = false
+    else if key = "left"
+        m.inPane = false
+    else if key = "right"
+        if m.rows.Count() > 0 then m.inPane = true
+    else if key = "up" or key = "down"
+        delta = 1
+        if key = "up" then delta = -1
+        if m.inPane
+            m.at = m.at + delta
+            if m.at < 0 then m.at = 0
+            if m.at >= m.rows.Count() then m.at = m.rows.Count() - 1
+        else
+            m.railAt = m.railAt + delta
+            if m.railAt < 0 then m.railAt = 0
+            if m.railAt >= m.rail.Count() then m.railAt = m.rail.Count() - 1
+            selected = m.railKeys[m.railAt]
+            if util.contains(["general", "playback", "subtitles", "server"], selected)
+                m.category = selected
+                showCategory()
+            end if
+        end if
+    else if key = "OK"
+        ' The picker, dialog, or pushed screen speaks for itself; announcing
+        ' this row would interrupt it.
+        if activate() then return true
+    else
+        return false
+    end if
+    paint()
+    describeFocus()
+    announce()
+    return true
+end function
+
+' True when focus moved to a picker, dialog, or another screen.
+function activate() as Boolean
+    if not m.inPane
+        selected = m.railKeys[m.railAt]
+        if selected = "profile"
+            nav.push(nav.route.PROFILE, { choose: true })
+            return true
+        else if selected = "signOut"
+            m.dialog = m.top.createChild("SignOutDialog")
+            m.dialog.observeField("choice", "onSignOut")
+            m.dialog.setFocus(true)
+            return true
+        else if m.failed
+            retry()
+        else if m.rows.Count() > 0
+            m.inPane = true
+        end if
+    else if m.category = "server" and m.at = 1
+        nav.push(nav.route.SETUP, { pushed: true })
+        return true
+    else if m.failed
+        retry()
+    else if not m.busy and m.values <> invalid and m.at < m.shown.Count()
+        control = m.shown[m.at]
+        m.options = settings.picker(control, m.values[control.key], m.copy)
+        modal = m.top.findNode("modal")
+        m.picker = modal.createChild("TrackPicker")
+        m.picker.title = i18n.text("settings.control." + control.label)
+        m.picker.centered = true
+        m.picker.options = m.options
+        m.picker.chosen = m.options.chosen
+        m.picker.observeField("picked", "onPicked")
+        m.picker.observeField("closed", "onPickerClosed")
+        modal.visible = true
+        m.picker.callFunc("open")
+        return true
+    end if
+    return false
+end function
+
+sub retry()
+    if m.controls.Count() > 0 then loadValues() else loadContract()
+end sub
+
+sub onPicked(event as Object)
+    index = event.getData()
+    if m.picker = invalid or index < 0 or index >= m.options.items.Count() then return
+    control = m.shown[m.at]
+    option = m.options.items[index]
+    item = m.values[control.key]
+    if option.reset and not settings.isOwn(control, item) then return
+    if not option.reset and settings.isOwn(control, item) and settings.same(settings.authored(item), option.wire) then return
+    m.pending = settings.writeRequest(control, option)
+    m.busy = true
+    notice("settings.saving", false)
+    send(m.pending, "onSaved")
+end sub
+
+sub onPickerClosed()
+    closePicker()
+end sub
+
+sub closePicker()
+    if m.picker = invalid then return
+    picker = m.picker
+    m.picker = invalid
+    m.top.findNode("modal").visible = false
+    focusScreen()
+    m.top.findNode("modal").removeChild(picker)
+    describeFocus()
+end sub
+
+sub onSaved(event as Object)
+    if m.released then return
+    result = api.resultOf(event.getRoSGNode())
+    ' DELETE of an already absent override has the desired result.
+    if not result.ok and not (m.pending.method = "DELETE" and result.status = 404)
+        m.pending = invalid
+        m.busy = false
+        notice("settings.saveFailed", true)
+        return
+    end if
+    loadValues()
+end sub
+
+sub onSignOut()
+    confirmed = m.dialog.choice = "confirm"
+    closeDialog()
+    if confirmed then api.session.signOut(api.newHandle(m.top.owner))
+end sub
+
+sub closeDialog()
+    dialog = m.dialog
+    m.dialog = invalid
+    focusScreen()
+    m.top.removeChild(dialog)
+end sub
