@@ -563,7 +563,8 @@ codec in `codecs_audio` is copied as the original bitstream.
 passthrough, client transformations.
 
 **Client features:** `seek_reanchor_v1`, `direct_stream_resume_v1`, and under
-gate G13 `subrip_sidecar_v1` and `hls_subtitle_renditions_v1`. Not
+gate G13 `subrip_sidecar_v1` and `hls_subtitle_renditions_v1`, plus
+`hls_remux_subtitle_renditions_v1` when the capabilities `features` list it. Not
 `header_authenticated_media_v1` or `authorized_media_origins_v1`: the client
 uses signed-URL media mode so plans can use proxy nodes (decision D-1, section
 6.4). Never `plan_invalidated_v1` (it needs the realtime socket; when the server's
@@ -641,9 +642,10 @@ gate. Only G1, G13, and G14 are required paths: when they fail, a fix must land.
   Subtitle artifacts stay on the API origin in both cases and need the headers,
   so for proxy-served plans they use the download transport in section 6.8.
   Signed HLS playlists put the `st` query on every segment URI, and long ones are
-  compacted with `#EXT-X-DEFINE` variable substitution (HLS version 8); whether
-  Roku parses that is test H2, a Milestone 0a gate, with server issue S-21 if it
-  fails.
+  compacted with `#EXT-X-DEFINE` variable substitution (HLS version 8) when the
+  client sends hls delivery feature `hls_variable_substitution_v1`, which it does
+  whenever the capabilities `features` list it (S-22); whether Roku parses that is
+  test H2, a Milestone 0a gate, with server issue S-21 if it fails.
 - **One `Video` node per player session**, with `enableUI=false`,
   `asyncStopSemantics=true`, and its own `roHttpAgent` (`setHttpAgent`) created
   before any content is set, so headers never reach the global agent that Posters
@@ -780,11 +782,13 @@ burn-in transcode, so subtitles are a Milestone 0a gate (G13).
 
 - **Request:** `subtitle_fidelity_preference: "compatible"`; `sidecar_text: true`
   on every enabled delivery; `ass_styling`, `font_attachments`, `embedded_bitmap`
-  false; `subrip_sidecar_v1` and `hls_subtitle_renditions_v1`.
+  false; `subrip_sidecar_v1` and `hls_subtitle_renditions_v1`, and
+  `hls_remux_subtitle_renditions_v1` when the server advertises it.
 - **What arrives:** original SRT for external and downloaded SRT tracks; a WebVTT
   rendition inside the HLS stream for embedded text on a transcode (already
-  `DEFAULT=YES`, no `LANGUAGE`); WebVTT sidecars for embedded text on originals
-  and remuxes; **raw `.ass`** for ASS/SSA tracks; burn-in for PGS and VobSub. All
+  `DEFAULT=YES`, no `LANGUAGE`), and on a copy remux from a server that
+  advertises `hls_remux_subtitle_renditions_v1`; WebVTT sidecars for embedded
+  text on originals and on remuxes from older servers; **raw `.ass`** for ASS/SSA tracks; burn-in for PGS and VobSub. All
   sidecars carry absolute source timestamps.
 - **Timing:** for `.vtt`, the client requests the protocol's
   `timestamp_offset=-{timeline_offset_seconds}` (the negative of the video timeline
