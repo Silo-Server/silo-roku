@@ -2083,3 +2083,51 @@ ECP helper; no emulator or simulator was used.
 Local checks: `npm run ci` passed, including 2,140 headless tests, the API
 contract checks, package budget, thread and shadowing checks, and Roku Static
 Analysis (zero errors and zero memory-monitoring warnings).
+
+## Run 30 — format claims without gates (decision D-7)
+
+2026-10-25, branch `feat/remove-playback-gates` at `811b26b` (rebased on
+`98e6911`), development build with a temporary, uncommitted debug log of the
+probe and the claims at each start and replan. Physical Roku Ultra 4850X,
+Roku OS 16.0.4, on HDMI to a TV whose display properties report Dolby Vision,
+HDR10, and HLG but not HDR10+; no external audio device. The shared Silo
+development server, already signed in on its admin profile, with plans routed
+through proxy nodes. Titles came from that server's library and are named
+here by format only. Deep links started most titles; two were started from
+their detail pages, one with a version chosen there.
+
+- **Probe:** `GetVideoMode()` read `2160p60dv` outside and during playback, so
+  the player's Dolby Vision output is in its mode string. Video ladder: H.264
+  4.2, HEVC Main and Main 10 at 5.1 (4K60), VP9 profiles 0 and 2, AV1.
+  Audio: AC-3 and E-AC-3 in both containers, E-AC-3 Atmos, FLAC, Opus, and
+  PCM yes; multichannel AAC no; DTS passthrough no (no DTS sink).
+- **Claims sent:** HDR10, HLG, and Dolby Vision P5 and P8 on the output and on
+  `original_http`; no HDR10+ (the display reports none); `original_http` video
+  H.264, HEVC, VP9, AV1 and audio AAC, MP3, AC-3, E-AC-3, FLAC, Opus,
+  `pcm_s16le`, `pcm_s24le`; `hls` H.264 and HEVC with AAC, AC-3, E-AC-3;
+  subtitle sidecars and renditions; `hls_copy_mpegts_v1`.
+- **Sources:** the dev console, ECP `query/media-player` every 2 s, and
+  screenshots.
+
+| Test | Date | Device / OS | Sink | File class | Harness settings | Result | Observed facts |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Dolby Vision P8.1, copy remux | 2026-10-25 | 4850X / 16.0.4 | TV | MKV HEVC Main 10 2160p DV P8.1, DTS-HD 7.1 | detail page, Resume | PASS | `server_remux_hls` (TS), `dynamic_range` dolby_vision; ECP `hevc_b`, playing. DTS converted to stereo AAC (`hls_audio_adaptation`; no DTS sink, no multichannel AAC, S-1) |
+| Dolby Vision P5, original | 2026-10-25 | 4850X / 16.0.4 | TV | MKV HEVC Main 10 2160p DV P5, E-AC-3 5.1 | detail page, 2160p DV version chosen, Play | PASS | `original_http`, `validated_original_playback`; ECP 3840×2160 23.976 `hevc`, `eac3`. A person at the TV confirmed Dolby Vision mode and correct colours |
+| HDR10, copy remux | 2026-10-25 | 4850X / 16.0.4 | TV | MKV HEVC Main 10 2160p HDR10, E-AC-3 5.1 (Auto of two versions) | deep link | PASS | `server_remux_hls` (`hls_packaging_required`), E-AC-3 6 channels copied; ECP `hevc_b`, `eac3`, captions `webvtt` |
+| HLG, original | 2026-10-25 | 4850X / 16.0.4 | TV | MKV HEVC Main 10 2160p25 HLG, AAC | deep link | PASS | `original_http`, `dynamic_range` hlg; ECP 3840×2160 25 fps |
+| AV1, original | 2026-10-25 | 4850X / 16.0.4 | TV | MKV AV1 Main 2160p50 SDR, Opus stereo | deep link | PASS | `original_http`; ECP `av1` 3840×2160 50 fps, `opus` |
+| VP9 profile 0, original | 2026-10-25 | 4850X / 16.0.4 | TV | MKV VP9 profile 0 2160p24 SDR, Opus stereo | deep link | PASS | `original_http`; ECP `vp9` 3840×2160, `opus`, captions `srt` |
+| VP9 profile 2 HDR10, original | 2026-10-25 | 4850X / 16.0.4 | TV | MKV VP9 profile 2 2160p HDR10, E-AC-3 5.1 | deep link (resumed at 593 s) | PASS | `original_http`, `dynamic_range` hdr10; ECP `vp9` 3840×2160 23.976, `eac3` |
+| FLAC, original | 2026-10-25 | 4850X / 16.0.4 | TV | MKV H.264 1080p, FLAC stereo | deep link | PASS | `original_http`; ECP `flac` |
+| PCM, original | 2026-10-25 | 4850X / 16.0.4 | TV | MKV H.264 1080p, `pcm_s16le` stereo | deep link | PASS | `original_http`; ECP `pcm` for 4 s, then the automatic subtitle pick replanned to a burn-in transcode (`subtitle_burn_in_required`), unrelated to the audio |
+| AV1 10-bit with Dolby Vision, original | 2026-10-25 | 4850X / 16.0.4 | TV | MKV AV1 Main 10 2160p25 DV with HDR10 base, PCM 24-bit | deep link | FAIL | The server refused the original and asked for a 4K transcode, which this server disables ("A lower-resolution source is required because 4K transcoding is disabled"). Dolby Vision on AV1 (profile 10) is not claimed; before D-7, AV1 was not claimed at all, so this title failed the same way |
+
+### Observations in run 30
+
+1. Not testable here: HDR10+ (the display reports none) and DTS passthrough
+   (no DTS sink); both stay unclaimed by the probe on this setup.
+2. Watch state changed on the admin profile: one DV P5 title advanced about
+   13 minutes while the picture was being checked, and eight other titles
+   advanced 14–32 s each.
+3. Another session installed a different build on the device twice during
+   the run; the matrix above was run after it finished, on this run's build.

@@ -8,8 +8,8 @@ import "pkg:/source/util/values.bs"
 ' roDeviceInfo and specs pass an AA whose functions answer from recorded
 ' probes. Results use the server's ffprobe vocabulary. Every probe answer is
 ' kept in `answers`, keyed by key(), which is also the format of the recorded
-' fixtures in tests/fixtures/probes/. Which results become claims is decided by
-' gates.bs and capabilities.bs; a probe never adds anything a gate controls.
+' fixtures in tests/fixtures/probes/. capabilities.bs turns the results into
+' claims.
 namespace playback.probe
 
     ' Platform floor attested when the ladder cannot run at all: Roku documents
@@ -19,27 +19,26 @@ namespace playback.probe
 
     ' The whole probe: the video ladder (pass a cached one to reuse it), the
     ' audio probe, the normalized display, and the output context they imply.
-    ' options comes from gates.probeOptions().
-    function collect(device as Object, options = invalid as Dynamic, cachedVideo = invalid as Dynamic) as Object
+    function collect(device as Object, cachedVideo = invalid as Dynamic) as Object
         facts = deviceFacts(device)
         display = normalizedDisplay(device, facts)
         audio = audioSupport(device)
         video = cachedVideo
-        if video = invalid then video = videoLadder(device, options)
+        if video = invalid then video = videoLadder(device)
         return { facts: facts, device: describeDevice(facts), display: display, audio: audio, video: video, outputContextId: outputContextId(display, audio) }
     end function
 
     ' collect() for a start or replan (plan section 6.3): the audio probe and
     ' the display run each time, and the video ladder is taken from ladders,
     ' an AA keyed by output_context_id, or probed once and kept there.
-    function collectCached(device as Object, options as Dynamic, ladders as Object) as Object
+    function collectCached(device as Object, ladders as Object) as Object
         facts = deviceFacts(device)
         display = normalizedDisplay(device, facts)
         audio = audioSupport(device)
         id = outputContextId(display, audio)
         video = ladders[id]
         if video = invalid
-            video = videoLadder(device, options)
+            video = videoLadder(device)
             ladders[id] = video
         end if
         return { facts: facts, device: describeDevice(facts), display: display, audio: audio, video: video, outputContextId: id }
@@ -50,15 +49,13 @@ namespace playback.probe
     ' H.264 at 4.2, then 4.1, then Main; HEVC Main 10 and Main from level 6.2
     ' down to the documented 4.1; VP9 profiles 0 and 2; bare AV1. Each shape
     ' reports only the levels that answered yes, keeping every measured bound.
-    ' Undocumented HEVC levels (above 5.1) count only with
-    ' options.countUndocumentedHevcLevels, after test H4.
-    function videoLadder(device as Object, options = invalid as Dynamic) as Object
-        countUndocumented = util.isObject(options) and util.isTrue(options.countUndocumentedHevcLevels)
+    ' Undocumented HEVC levels (above 5.1) are recorded but never counted.
+    function videoLadder(device as Object) as Object
         answers = {}
         decode = []
         h264 = h264Entry(device, answers)
         if h264 <> invalid then decode.Push(h264)
-        decode.Append(hevcEntries(device, answers, countUndocumented))
+        decode.Append(hevcEntries(device, answers))
 
         ran = false
         for each name in answers
@@ -71,9 +68,11 @@ namespace playback.probe
             decode = [{ codec: "h264", hardware: true, bit_depths: [8], max_width: 1920, max_height: 1080, max_frame_rate: FALLBACK_FRAME_RATE }]
         end if
 
-        ' Shapes only gates G10 and G11 may claim.
-        gated = { vp9: vp9Entry(device, answers), av1: av1Entry(device, answers, decodeCeiling(decode)) }
-        return { evidence: evidence, decode: decode, gated: gated, answers: answers }
+        ceiling = decodeCeiling(decode)
+        for each entry in [vp9Entry(device, answers, ceiling), av1Entry(device, answers, ceiling)]
+            if entry <> invalid then decode.Push(entry)
+        end for
+        return { evidence: evidence, decode: decode, answers: answers }
     end function
 
     ' Every shape is asked, so the recorded answers are complete; the first that
@@ -110,12 +109,12 @@ namespace playback.probe
     ' One entry for Main and Main 10 when both top out at the same level, as
     ' they do on every documented device; otherwise one entry each, so neither
     ' profile borrows the other's bound.
-    function hevcEntries(device as Object, answers as Object, countUndocumented as Boolean) as Object
+    function hevcEntries(device as Object, answers as Object) as Object
         top = {}
         for each profile in ["main 10", "main"]
             for each shape in hevcLevels()
                 passed = canDecode(device, answers, "video", { Codec: "hevc", Profile: profile, Level: shape.level })
-                if passed and (shape.documented or countUndocumented) and top[profile] = invalid then top[profile] = shape
+                if passed and shape.documented and top[profile] = invalid then top[profile] = shape
             end for
         end for
 
@@ -132,20 +131,21 @@ namespace playback.probe
         return { codec: "hevc", hardware: true, profiles: profiles, levels: [shape.id], bit_depths: bitDepths, max_width: shape.width, max_height: shape.height, max_frame_rate: shape.frameRate }
     end function
 
-    ' AV1 has no documented bounds of its own, so it takes the largest size
-    ' and frame rate the H.264 and HEVC ladders proved (gate G10 is off).
+    ' VP9 and AV1 answers carry no size or frame rate, so they take the
+    ' largest size the H.264 and HEVC ladders proved, at the highest frame
+    ' rate proved at that size.
     function decodeCeiling(decode as Object) as Object
         ceiling = { width: 1920, height: 1080, frameRate: FALLBACK_FRAME_RATE }
         for each entry in decode
-            if entry.max_height > ceiling.height then ceiling = { width: entry.max_width, height: entry.max_height, frameRate: entry.max_frame_rate }
+            taller = entry.max_height > ceiling.height
+            faster = entry.max_height = ceiling.height and entry.max_frame_rate > ceiling.frameRate
+            if taller or faster then ceiling = { width: entry.max_width, height: entry.max_height, frameRate: entry.max_frame_rate }
         end for
         return ceiling
     end function
 
-    ' bit_depths are listed in step with profiles (playback.gates.vp9Decoder).
-    ' The VP9 answers carry no size or frame rate, so the entry has none:
-    ' gate G11 bounds its claim, never with another codec's bounds.
-    function vp9Entry(device as Object, answers as Object) as Dynamic
+    ' bit_depths are listed in step with profiles.
+    function vp9Entry(device as Object, answers as Object, ceiling as Object) as Dynamic
         profiles = []
         bitDepths = []
         if canDecode(device, answers, "video", { Codec: "vp9", Profile: "profile 0" })
@@ -157,7 +157,7 @@ namespace playback.probe
             bitDepths.Push(10)
         end if
         if profiles.Count() = 0 then return invalid
-        return { codec: "vp9", hardware: true, profiles: profiles, bit_depths: bitDepths }
+        return { codec: "vp9", hardware: true, profiles: profiles, bit_depths: bitDepths, max_width: ceiling.width, max_height: ceiling.height, max_frame_rate: ceiling.frameRate }
     end function
 
     ' Probed bare: a probe with profile or container always fails (community).
@@ -171,8 +171,12 @@ namespace playback.probe
     ' Run before every playback (Roku's advice). aac and mp3 are always
     ' decodable; ac3 and eac3 count only when every container answers yes with
     ' PassThru unset (the Roku or the sink). PassThru 0 and 1 and Atmos are
-    ' recorded for diagnostics only. Gated codecs are probed so gates G9 and G12
-    ' can decide; truehd, mlp, and DTS-HD are never probed or claimed.
+    ' recorded for diagnostics only. flac and opus count when they decode,
+    ' and the "pcm" answer stands for pcm_s16le and pcm_s24le. DTS 5.1
+    ' passthrough is probed and names the output context, but dts is not
+    ' claimed until the server matches DTS variants (S-8): it would send a
+    ' DTS-HD MA or DTS:X source as dts. truehd, mlp, and DTS-HD are never
+    ' probed or claimed.
     function audioSupport(device as Object) as Object
         answers = {}
         codecs = ["aac", "mp3"]
@@ -184,15 +188,14 @@ namespace playback.probe
             canDecode(device, answers, "audio", { Codec: codec, PassThru: 1 })
         end for
         canDecode(device, answers, "audio", { Codec: "eac3", Atmos: 1 })
+        dtsPassthrough = canDecode(device, answers, "audio", { Codec: "dts", PassThru: 1, ChCnt: 6 })
+        if canDecode(device, answers, "audio", { Codec: "flac" }) then codecs.Push("flac")
+        if canDecode(device, answers, "audio", { Codec: "opus" }) then codecs.Push("opus")
+        if canDecode(device, answers, "audio", { Codec: "pcm" }) then codecs.Append(["pcm_s16le", "pcm_s24le"])
         return {
             codecs: codecs,
             multichannelAac: canDecode(device, answers, "audio", { Codec: "aac", ChCnt: 6 }),
-            gated: {
-                dts: canDecode(device, answers, "audio", { Codec: "dts", PassThru: 1, ChCnt: 6 }),
-                flac: canDecode(device, answers, "audio", { Codec: "flac" }),
-                opus: canDecode(device, answers, "audio", { Codec: "opus" }),
-                pcm: canDecode(device, answers, "audio", { Codec: "pcm" })
-            },
+            dtsPassthrough: dtsPassthrough,
             answers: answers
         }
     end function
@@ -277,7 +280,7 @@ namespace playback.probe
         for each codec in ["ac3", "eac3"]
             if util.contains(audio.codecs, codec) then sound.Push(codec)
         end for
-        if audio.gated.dts then sound.Push("dts")
+        if util.isTrue(audio.dtsPassthrough) then sound.Push("dts")
         if sound.Count() = 0 then sound.Push("stereo")
         return "roku:" + display.resolution.ToStr() + ":" + hdr.Join(".") + ":" + sound.Join(".")
     end function

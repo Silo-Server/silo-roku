@@ -1261,19 +1261,20 @@ requires `api_major` 2. Any other answer, including a v1-only server, shows the
 "server update required" screen.
 
 Roku follows HTTP redirects without telling the app and re-sends a login body
-on a `307`, so the same check also confirms where its request arrived. The
-answer must carry `request_origin` (`scheme://host[:port]`, the origin the
-server saw the request reach), equal to the configured origin once both are
-normalized (lowercase scheme and host, numeric port, default port removed).
-Until it does in the current app run, nothing that carries a credential is
-sent: sign-in, token refresh, PIN checks, sign-out, authenticated requests,
+on a `307`, so the same check also confirms where its request arrived. When
+the answer carries `request_origin` (`scheme://host[:port]`, the origin the
+server saw the request reach), it must equal the configured origin once both
+are normalized (lowercase scheme and host, numeric port, default port
+removed). An answer without it, from a server too old to report it, is
+accepted with a warning (the exception below). Until the check passes in the
+current app run, nothing that carries a credential is sent: sign-in, token refresh, PIN checks, sign-out, authenticated requests,
 and media headers wait for the check and then fail if it refuses.
 
 - The check runs at server setup and again at every launch for the stored
   server, a restored session included.
-- A server without `request_origin` is refused in release builds with the
-  "server update required" screen ("This server needs an update to sign in on
-  Roku"). Debug builds log a warning and proceed.
+- A server without `request_origin`, too old to report it, is accepted in
+  every build with a logged warning (decision of 2026-10-25; release builds
+  used to refuse it).
 - A different origin, or a value that is not an origin, is refused in every
   build: inline on the setup screen, and with the "server update required"
   screen for a stored server.
@@ -1323,7 +1324,8 @@ prohibits off-device sign-in or activation, and Roku's rendezvous-linking
 page says "Only TVE apps may use rendezvous linking". Silo's device-code login
 (`/api/v2/auth/device/*`) and browser-based OAuth sign-in are therefore
 excluded from public builds. Profile handoff reuses the device login for
-a temporary session and is gated separately
+a temporary session; it is on in every build by the project owner's
+decision of 2026-10-25, before Roku confirms it
 ([`silocontrol.md`](silocontrol.md) section 2.3). Device-code login may remain in development and
 beta builds. Companion sign-in, where a phone on the network signs a new
 Roku in with a device login it approves, is the exception: it ships in
@@ -1546,45 +1548,44 @@ or output change, the client builds a conservative device context from
 - unsupported subtitle features remain false rather than being inferred from a
   related Roku capability.
 
-Initial codec probes cover H.264, HEVC, VP9, AAC, AC-3, and E-AC-3. AV1, Dolby
-Vision, HDR10+, HLG, DTS variants, and lossless audio are later capability
-increments backed by fixtures and hardware evidence.
+Every build claims what the probe finds, on every device class; there are
+no per-build or per-cohort switches (decision D-7 of
+2026-10-25 in `implementation-assumptions.md`):
 
-Hardware run 11 opened two of them on `original_http` for Roku TVs
-(`GetModelType` "TV"); players keep both off:
+- video: H.264 and HEVC at the measured levels, and VP9 (profiles 0 and 2)
+  and AV1 where `CanDecodeVideo` passes them. `CanDecodeVideo` reports no
+  VP9 or AV1 size or frame rate, so both take the largest H.264 or HEVC
+  shape the ladder proved. HEVC levels above 5.1 are recorded but never
+  counted;
+- audio: AAC and MP3, AC-3 and E-AC-3 when every container passes, FLAC,
+  Opus, and `pcm_s16le` and `pcm_s24le` when their probes pass. DTS is not
+  claimed until the server matches DTS variants (implementation plan S-8),
+  because it would send a DTS-HD MA or DTS:X source as `dts`; DTS 5.1
+  passthrough is still probed and names the output context. TrueHD, MLP, and
+  DTS-HD are never claimed;
+- output: HDR10 and HLG where the display reports them, HDR10+ beside HDR10
+  where the display reports it, under the HDR output rule (an HEVC Main 10
+  decoder, a 2160-line output, and an exact display answer);
+- Dolby Vision P5 and P8 (levels 9, P8 base layer ID 1) on the output and on
+  `original_http` where the Roku is shown to output it. A Roku TV's panel does
+  the Dolby Vision processing, so `GetVideoMode()` never shows it (run 11 read
+  `2160p60` throughout) and the display's Dolby Vision flag is the evidence. A
+  player shows it in its mode string: the Ultra 4850X reads `2160p60dv`
+  outside playback too, and a player without Dolby Vision output never does;
+- on an HDR10 output without Dolby Vision, `original_http` sends
+  `client_dv8_base_layer_fallback_v1` with `dv8_base_layer_compatibility_ids:
+  [1]`, so a P8.1 original plays as its HDR10 base layer, and only when the
+  capabilities document's `features` lists
+  `dv8_base_layer_compatibility_ids_v1`: a server without it ignores the list
+  and would also admit ID 2 (SDR) and ID 4 (HLG) sources, neither tested.
 
-- VP9 profile 0, sent as a `video_decode` entry with `profiles: ["profile 0"]`
-  and `bit_depths: [8]`, so a profile 2 (10-bit) source is not planned as an
-  original even where the probe passes profile 2, and bounded by the shape
-  run 11 played, 1920×1080 at 30 fps (the fixture's frame rate was not
-  recorded). `CanDecodeVideo` reports no VP9 size or frame rate, and the
-  HEVC or H.264 bounds say nothing about VP9, so a larger VP9 source is
-  transcoded until H7 plays one;
-- FLAC, as `flac` in the audio codec lists. Opus and the PCM names stay
-  unclaimed until tested, although the run 11 TV's probe passed them. The
-  body has no per-codec channel limit, so the claim covers multichannel FLAC,
-  which run 11 did not test (its fixture is mono).
-
-Run 11's evidence also opens the Dolby Vision Profile 8 base-layer fallback
-for Roku TVs, for base-layer compatibility ID 1 (HDR10) only: a P8.1
-original played on `original_http` as its HDR10 base layer. Roku TVs send
-`client_dv8_base_layer_fallback_v1` on `original_http` with
-`dv8_base_layer_compatibility_ids: [1]`, and only when the capabilities
-document's `features` lists `dv8_base_layer_compatibility_ids_v1`. A server
-without that feature ignores the list and would also admit ID 2 (SDR) and,
-with HLG claimed, ID 4 sources, neither of which has been tested, so against
-it the client makes no claim and a P8.1 file keeps the server's HDR10 remux.
-Players make no claim. `GetModel()` returned `A000X` on that TV (ECP reports
-A109X), a value other Roku TVs may share, so no claim is keyed on it.
-
-Dolby Vision output (gate G5) stays off until a person confirms the TV's
-Dolby Vision badge and picture on run 11's P5 and P8.1 loads. Its predicate
-is ready for Roku TVs: the panel does the Dolby Vision processing, so
-`GetVideoMode()` never shows it (run 11 read `2160p60` throughout, Dolby
-Vision playback included), and the display's own Dolby Vision flag from
-`GetDisplayProperties()`, with the HDR output rule, is the evidence. A
-player still needs `Dv` in its mode string or a model with an H3 pass
-recorded.
+Hardware run 30 played one example of each claim the Ultra makes, not every
+format and bound: Dolby Vision P8.1 as a TS copy remux and P5 as an MKV
+original (Dolby Vision engaged with correct colours, confirmed on the TV),
+HDR10 and E-AC-3 5.1 as a copy remux, HLG, AV1 at 2160p50, and VP9 profile 0
+at 2160p24 and profile 2 HDR10 as originals, and Opus, FLAC, and 16-bit PCM
+decoded. 24-bit PCM, VP9 and AV1 at 60 fps, and HDR10+ were not exercised.
+Dolby Vision on AV1 (profile 10) is not claimed.
 
 ### 9.3 Start and plan execution
 
@@ -2318,13 +2319,11 @@ criterion. The tables describe what the client does today (sections 5.7 and
 records the Audio Guide gaps closed for Milestone 3 and proposes the ones
 accepted for the first release.
 
-Cohorts are the gate table's, classified from probes
-(`source/playback/gates.bs`): Roku TV (`GetModelType()` is `"TV"`), 4K
-player, and HD player, which includes the 512 MB devices. A row is supported
-once it passes on each cohort it names, on the section 12.4 devices and Roku
-OS versions, in a release build. Release builds send no subtitle claims until
-gate G13 opens (implementation plan section 6.2). Evidence names runs in
-`docs/hardware-evidence.md`; all of it so far comes from one Roku TV and dev
+Cohorts are classified from probes: Roku TV (`GetModelType()` is `"TV"`),
+4K player, and HD player, which includes the 512 MB devices. A row is
+supported once it passes on each cohort it names, on the section 12.4 devices
+and Roku OS versions, in a release build. Evidence names runs in
+`docs/hardware-evidence.md`; nearly all of it comes from one Roku TV and dev
 builds.
 
 Subtitle sources:
@@ -2515,9 +2514,9 @@ the server:
 | Side-loaded subtitles | Disabled until proven | Section 9.7 matrix |
 | PIN prompt on deep link | Prompt for the remembered profile's PIN | Roku answer |
 | AC-3/E-AC-3 passthrough | Disabled until proven | Codec/output-change hardware tests |
-| Dolby Vision and advanced HDR | Defer | Exact Roku probe-to-v3 mapping and fixtures |
+| Dolby Vision and advanced HDR | Claimed where the probe and display report them (section 9.2) | Dolby Vision on AV1 (profile 10); HDR10+ on a display that reports it |
 | Roku Search feed | Not planned | Roku guidance if usage grows |
-| SiloControl receiver | Built behind bs_const `silocontrol` and `handoff`, on in development builds; public builds turn them on after the first public release; see [`silocontrol.md`](silocontrol.md) section 13 | Spikes C0-1 to C0-7, hardware tests HC-1 to HC-6, and Roku's confirmation |
+| SiloControl receiver | Built behind bs_const `silocontrol` and `handoff`, on in every build since 2026-10-25; see [`silocontrol.md`](silocontrol.md) section 13 | Spikes C0-1 to C0-7, hardware tests HC-1 to HC-6, and Roku's confirmation |
 
 ## 16. Definition of done for this draft
 

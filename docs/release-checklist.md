@@ -2,7 +2,7 @@
 
 **Status:** Draft for Milestone 4 (beta and public readiness)
 
-**Last updated:** 2026-10-22, against integration commit `f1d9d9b`
+**Last updated:** 2026-10-25 (section 1 items 1 and 2, rows 2.2 and 4.15; other rows still as of 2026-10-22, against integration commit `f1d9d9b`)
 
 **Companion to:** [`spec.md`](spec.md) sections 10–13 and
 [`implementation-plan.md`](implementation-plan.md) sections 7, 9.1, and 9.2.
@@ -28,19 +28,19 @@ Anything Roku's pages did not settle is marked **unconfirmed**.
 
 These stop a beta with households, and therefore public submission:
 
-1. **Release builds play nothing.** `source/playback/gates.bs` keeps the
-   required gates G1, G13, and G14 at `development`, which opens them in debug
-   builds only. With G1 closed, `capabilities.startBody()` builds no start
-   body. Every hardware run so far used a dev build. G1 waits for H1 (Roku
-   forwards profile headers across redirects, so credential confinement rests
-   on server issue S-20) and H2 (S-22 playlist compaction); G14 waits for
-   S-15 (TS copy remux); G13 waits for H14.
-2. **Release builds cannot sign in to a stock Silo server.** They require
-   `request_origin` in `GET /api/v2/system/info` (spec section 7.1,
-   assumption A-20), which only an unadopted server prototype serves.
-3. **Milestone 3 has not exited.** Every hardware row comes from one Roku TV
-   (section 7), no one has looked at or listened to the output (HDR and Dolby
-   Vision badges, Atmos), and output changes (H13) are untested. Token refresh
+1. ~~**Release builds play nothing.**~~ Resolved 2026-10-25 (decision D-7):
+   the hardware gates are gone, so release builds play, copy-remux, and send
+   subtitle sidecars like development builds, and every format claim follows
+   the device's probe. Hardware run 30 checked the claims on the Ultra 4850X
+   in a dev build; no release build has run on hardware yet.
+2. ~~**Release builds cannot sign in to a stock Silo server.**~~ Resolved: the
+   server serves `request_origin` (S-20, silo-server #3023, merged
+   2026-10-25), and since D-7 every build also accepts an older server
+   without it, with a warning. A mismatch is still refused.
+3. **Milestone 3 has not exited.** Nearly every hardware row comes from one
+   Roku TV (section 7); runs 29 and 30 added the Ultra 4850X. Only run 30's
+   Dolby Vision picture has been seen (P5, on the Ultra); no one has listened
+   to the output (Atmos), and output changes (H13) are untested. Token refresh
    during playback, which failed in hardware run 8, passed in runs 9, 10, and
    19.
 4. **No official artwork.** The icons and splash screens are generated
@@ -70,7 +70,7 @@ Source for every row: Roku certification criteria,
 | --- | --- | --- | --- | --- |
 | 1.1 | Video ads follow Roku's ad requirements | No ads | — | N/A |
 | 2.1 | Transactional apps use Roku Pay | Free, nothing for sale | — | N/A |
-| 2.2 | On-device authentication only; no off-device sign-up, sign-in, or activation | Password sign-in with Roku's `DynamicKeyboard` (spec 7.2). No device-code or browser sign-in exists in any build. A server without password sign-in gets an explanation and stops | Hardware runs 4 and 5, onboarding rows | Met on the Roku TV; Partial across devices |
+| 2.2 | On-device authentication only; no off-device sign-up, sign-in, or activation | Password sign-in with Roku's `DynamicKeyboard` (spec 7.2). Companion sign-in (a phone approves a device login) and profile handoff ship in public builds by the owner's decision (spec 7.2, D-7) before Roku answers Q10. A server without password sign-in gets an explanation and stops | Hardware runs 4 and 5, onboarding rows | At risk, owner-accepted |
 | 2.3 | Instant Signup for SVOD above 10M hours a month | Not SVOD | — | N/A |
 | 2.4 | No nested apps, browsers, embedded screens, or cross-app features | None. The typed server address is a separate question (section 1, item 5) | Code | Met, pending Roku's answer on the typed address |
 | 2.5 | Disclose any payment SDK | None | — | N/A |
@@ -95,7 +95,7 @@ Source for every row: Roku certification criteria,
 | 4.12 | Roku voice keyboards for email, PIN, and password | `DynamicKeyboard` for address, username, password, search; `DynamicPinPad` for PINs (plan 7) | Runs 4–5 onboarding | Met on the Roku TV |
 | 4.13 | Continue Watching integration above the hours thresholds | Below the thresholds (spec 10.2) | — | N/A at launch |
 | 4.14 | Instant Resume for US apps above 5M hours | Below the threshold; no `sdk_instant_resume` (plan 3) | — | N/A at launch |
-| 4.15 | Never route traffic for third parties or act as a proxy, relay, or exit node | The app talks only to the configured server and the media and image hosts it names; the SiloControl receiver is deferred | Code | Met |
+| 4.15 | Never route traffic for third parties or act as a proxy, relay, or exit node | The app talks only to the configured server and the media and image hosts it names. The SiloControl receiver and companion listener accept local phones on TCP and answer mDNS on UDP 5353 in every build (D-7); they relay nothing | Code | Open, pending Roku's answer on the receiver |
 | 5.1 | Deep linking for all media types | `contentId` and `mediaType` at launch and through `roInput` (`source/deeplink/`); movie, episode, series, season play, a season like its series; invalid or inaccessible links fall back to Home (spec 10.1) | Runs 4–5 ECP matrix PASS (Roku TV), signed in and signed out | Partial (Deep Linking Tester not run, section 4) |
 | 5.2 | Direct to Play | The link plays directly, resuming without a prompt, using the profile rule in spec 10.1 | Runs 4–5 | Partial: Roku's Direct to Play page ties it to a Roku Search catalog ([Direct to Play](https://developer.roku.com/dev/docs/direct-to-play)), which Silo has no global form of (Q5) |
 | 5.3 | No deep links into other apps | None | Code | Met |
@@ -255,7 +255,7 @@ Spec 12.4 per-device list, on the Roku TV:
 | Long rows, large grids, fast navigation | PASS (run 5); texture at 90% of the maximum against a 70% target (run 5) |
 | Image failures | Not run |
 | H.264/AAC direct play | PASS (runs 4, 5) |
-| HEVC and VP9 eligibility | HEVC partial (HEVC Main 10 original never observed); VP9 off (G11) |
+| HEVC and VP9 eligibility | HEVC partial (HEVC Main 10 original never observed); VP9 claimed from the probe (run 30 on the Ultra: profiles 0 and 2 played as originals) |
 | HLS remux and transcode | PASS in dev builds (runs 3–5) |
 | AC-3/E-AC-3 fallback, output-route changes | Decode reported (runs 2, 4, 5); output changes never run (H13) |
 | Seek, pause/resume, Replay | PASS (runs 5, 6) |

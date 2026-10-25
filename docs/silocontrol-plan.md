@@ -191,7 +191,7 @@ start once the Roku phase it depends on works with the Node controller.
 
 | Risk | Effect | Mitigation |
 | --- | --- | --- |
-| Roku reads handoff as off-device authentication (criterion 2.2) | Rejection of an update | Ships after the first public release; `handoff` switch off in public builds until Q10 or the owner's decision; control and own-profile launch unaffected |
+| Roku reads handoff as off-device authentication (criterion 2.2) | Rejection of an update | The owner accepted the risk on 2026-10-25 (D-7): `handoff` is on in every build; turning the switch off removes it without touching control or own-profile launch |
 | A Roku reviewer reads the listener as against 4.15 | Rejection | Roku's confirmation; private-peer-only accept; nothing forwarded |
 | `plain` handoff on a hostile network | An attacker in the path could get a 24-hour session for the phone's profile | Same as the other TVs today; `sealed` closes it; recorded as accepted for beta |
 | `GetRandomUUID()` is not a secure generator | Guessable pairing keys | Roku's confirmation; the phone-proposed key in R9.3 |
@@ -205,8 +205,9 @@ start once the Roku phase it depends on works with the Node controller.
 
 - **Open with Roku:** handoff under 2.2, the listener under 4.15, and
   `GetRandomUUID()`.
-- **Handoff in public builds:** decided by the project owner after Q10, or
-  earlier by accepting the risk. Record it in spec section 15.
+- **Handoff in public builds:** decided 2026-10-25: the project owner
+  accepted the risk before Roku confirms these, and `handoff` is on in every build (D-7, spec
+  section 15).
 
 ## 7. Spec changes
 

@@ -344,9 +344,6 @@ def client_problems(body):
             errors.append(f"{DV8_CLAIM} is sent only with the base-layer IDs it covers")
         if "dv8_base_layer_compatibility_ids" in delivery and not claimed:
             errors.append(f"{where}.dv8_base_layer_compatibility_ids is sent only with {DV8_CLAIM}")
-    original = context["deliveries"]["original_http"]
-    if original.get("hdr_details", {}).get("dolby_vision_profiles"):
-        errors.append("original_http.hdr_details carries no Dolby Vision (gate G6 stays off)")
     for where, codecs in audio_lists:
         for codec in codecs:
             if NEVER_AUDIO.match(codec):

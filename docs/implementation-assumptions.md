@@ -15,6 +15,7 @@ Each entry says where it came from and when to revisit it. Entries marked
 | D-4 | Deep links use the most recent non-child profile and skip PIN-locked profiles until Roku rules on PIN prompts | Plan section 7 unchanged | Roku's answer |
 | D-5 | The server provides trickplay | The scrubber relies on server sheets; a file without sheets shows time only. Roku's answer on files without previews is still requested but is no longer a public-release prerequisite | Roku's answer, or certification feedback |
 | D-6 | Devices without multichannel AAC get stereo AAC, with a stop-and-restart when a plan returns multichannel AAC | Plan section 6.1 unchanged | S-13, or H9 showing a downmix |
+| D-7 | (2026-10-25) Release builds match development builds: the hardware gates (plan section 6.2, G1–G14) are removed, a server without `request_origin` is accepted with a warning in every build (a mismatch is still refused), and the `silocontrol` and `handoff` switches are on in every build | `source/playback/gates.bs` is gone; every format claim follows the device's probe (spec section 9.2), except DTS, which waits for S-8; one example of each claim was played on the Ultra 4850X in hardware run 30. Credential confinement on old servers now rests on the server not redirecting (A-14, A-20); handoff ships before Roku answers Q10 | Roku's answer on handoff and the receiver; a format that fails on a device whose probe passes it |
 
 ## Assumptions
 

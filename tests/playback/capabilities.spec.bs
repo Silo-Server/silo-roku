@@ -15,8 +15,12 @@ namespace tests
             return base
         end function
 
-        function body(probe as Object, context as Object, extra = {} as Object) as Dynamic
-            return playback.capabilities.startBody(probe, playback.gates.evaluate(probe, context), m.request(extra))
+        function body(probe as Object, extra = {} as Object) as Object
+            return playback.capabilities.startBody(probe, m.request(extra))
+        end function
+
+        function parts(probe as Object, extra = {} as Object) as Object
+            return playback.capabilities.replanParts(probe, m.request(extra))
         end function
 
         function sortedKeys(aa as Object) as Object
@@ -27,14 +31,9 @@ namespace tests
 
         @describe("startBody")
 
-        @it("builds no body while G1 keeps playback closed")
-        sub _()
-            m.assertInvalid(m.body(tests.devices.probeResult(), { debug: false }))
-        end sub
-
         @it("sends every required member and no optional one it was not given")
         sub _()
-            body = m.body(tests.devices.probeResult(), { debug: true })
+            body = m.body(tests.devices.probeResult())
             m.assertEqual(m.sortedKeys(body), ["client_capabilities", "client_features", "client_playback_context", "file_id", "installation_id", "playback_attempt_id", "profile_id", "protocol_version", "quality_preference", "subtitle_fidelity_preference"])
             m.assertEqual(body.quality_preference, "auto")
             m.assertEqual(body.subtitle_fidelity_preference, "compatible")
@@ -45,7 +44,7 @@ namespace tests
 
         @it("keeps Start Over's zero and the server's track identities")
         sub _()
-            body = m.body(tests.devices.probeResult(), { debug: true }, { fileId: 42, startPosition: 0, audioTrack: { id: "file:42:audio:1", index: 1, codec: "eac3", channels: 6 }, subtitleTrack: { id: "file:42:subtitle:3" } })
+            body = m.body(tests.devices.probeResult(), { fileId: 42, startPosition: 0, audioTrack: { id: "file:42:audio:1", index: 1, codec: "eac3", channels: 6 }, subtitleTrack: { id: "file:42:subtitle:3" } })
             m.assertEqual(body.file_id, "42")
             m.assertEqual(body.start_position, 0)
             m.assertEqual(body.audio_track_id, "file:42:audio:1")
@@ -56,185 +55,145 @@ namespace tests
 
         @it("pins a version a detail page chose, and otherwise leaves alternate versions to the server")
         sub _()
-            m.assertFalse(m.body(tests.devices.probeResult(), { debug: true }, { fileId: "102", pinsVersion: true }).allow_alternate_versions)
-            m.assertFalse(m.body(tests.devices.probeResult(), { debug: true }, { fileId: "102", pinsVersion: false }).DoesExist("allow_alternate_versions"))
+            m.assertFalse(m.body(tests.devices.probeResult(), { fileId: "102", pinsVersion: true }).allow_alternate_versions)
+            m.assertFalse(m.body(tests.devices.probeResult(), { fileId: "102", pinsVersion: false }).DoesExist("allow_alternate_versions"))
         end sub
 
         @it("never negotiates header-authenticated media, proxy origins, or plan invalidation")
         sub _()
-            for each context in [{ debug: true }, { debug: false }]
-                features = playback.capabilities.clientFeatures(playback.gates.evaluate(tests.devices.probeResult(), context))
-                for each banned in ["header_authenticated_media_v1", "authorized_media_origins_v1", "plan_invalidated_v1"]
-                    m.assertFalse(util.contains(features, banned), banned)
-                end for
+            features = playback.capabilities.clientFeatures()
+            for each banned in ["header_authenticated_media_v1", "authorized_media_origins_v1", "plan_invalidated_v1"]
+                m.assertFalse(util.contains(features, banned), banned)
             end for
         end sub
 
-        @it("asks for subtitle renditions in remuxes only when the server advertises them and G13 is open")
+        @it("asks for subtitle renditions in remuxes only when the server advertises them")
         sub _()
             probe = tests.devices.probeResult()
-            plain = m.body(probe, { debug: true }, { serverFeatures: ["sequenced_progress_v1"] })
+            plain = m.body(probe, { serverFeatures: ["sequenced_progress_v1"] })
             m.assertArrayNotContains(plain.client_features, "hls_remux_subtitle_renditions_v1")
             advertised = { serverFeatures: ["sequenced_progress_v1", "hls_remux_subtitle_renditions_v1"] }
-            m.assertEqual(m.body(probe, { debug: true }, advertised).client_features, ["seek_reanchor_v1", "direct_stream_resume_v1", "subrip_sidecar_v1", "hls_subtitle_renditions_v1", "hls_remux_subtitle_renditions_v1"])
-            m.assertArrayNotContains(m.body(probe, { debug: true, overrides: { G13: false } }, advertised).client_features, "hls_remux_subtitle_renditions_v1")
+            m.assertEqual(m.body(probe, advertised).client_features, ["seek_reanchor_v1", "direct_stream_resume_v1", "subrip_sidecar_v1", "hls_subtitle_renditions_v1", "hls_remux_subtitle_renditions_v1"])
         end sub
 
-        @describe("gates")
+        @describe("deliveries and codecs")
 
-        @it("closes the subtitle features and sidecar text with G13")
+        @it("offers sidecar text and copy remuxes of H.264 and HEVC with AAC, AC-3, and E-AC-3")
         sub _()
-            body = m.body(tests.devices.probeResult(), { debug: true, overrides: { G13: false } })
-            m.assertEqual(body.client_features, ["seek_reanchor_v1", "direct_stream_resume_v1"])
-            for each name in ["original_http", "hls", "progressive"]
-                m.assertFalse(body.client_playback_context.deliveries[name].subtitles.sidecar_text, name)
-            end for
+            body = m.body(tests.devices.probeResult())
+            deliveries = body.client_playback_context.deliveries
+            m.assertTrue(deliveries.original_http.subtitles.sidecar_text)
+            m.assertTrue(deliveries.hls.subtitles.sidecar_text)
+            m.assertFalse(deliveries.progressive.subtitles.sidecar_text)
+            m.assertEqual(deliveries.hls.video_codecs, ["h264", "hevc"])
+            m.assertEqual(deliveries.hls.audio_decode_codecs, ["aac", "ac3", "eac3"])
+            m.assertEqual(deliveries.original_http.video_codecs, ["h264", "hevc"])
         end sub
 
-        @it("lists only a transcode's output on hls while G14 is closed")
-        sub _()
-            hls = m.body(tests.devices.probeResult(), { debug: true, overrides: { G14: false } }).client_playback_context.deliveries.hls
-            m.assertEqual(hls.video_codecs, ["h264"])
-            m.assertEqual(hls.audio_decode_codecs, ["aac"])
-            m.assertEqual(hls.features, ["native_hls_playback_v1"])
-        end sub
-
-        @it("keeps HEVC a decoder fact when G2 is closed")
-        sub _()
-            body = m.body(tests.devices.probeResult(), { debug: true, overrides: { G2: false } })
-            m.assertEqual(body.client_capabilities.codecs_video, ["h264", "hevc"])
-            m.assertEqual(body.client_playback_context.deliveries.original_http.video_codecs, ["h264"])
-            m.assertEqual(body.client_playback_context.deliveries.hls.video_codecs, ["h264", "hevc"])
-        end sub
-
-        @it("claims gated codecs on original_http only")
+        @it("claims every probed codec on original_http, and only copyable ones on hls")
         sub _()
             probe = tests.devices.probeResult()
-            probe.audio.gated = { dts: true, flac: true, opus: true, pcm: true }
-            probe.video.gated = { vp9: { codec: "vp9", hardware: true, profiles: ["profile 0"], bit_depths: [8] }, av1: { codec: "av1", hardware: true, profiles: ["main"], bit_depths: [8, 10], max_width: 3840, max_height: 2160, max_frame_rate: 60 } }
-            body = m.body(probe, { debug: true, overrides: { G9: true, G10: true, G11: true, G12: true }, gatedAudio: ["flac", "opus", "pcm"] })
+            probe.audio.codecs.Append(["flac", "opus", "pcm_s16le", "pcm_s24le"])
+            probe.video.decode.Push({ codec: "vp9", hardware: true, profiles: ["profile 0"], bit_depths: [8], max_width: 3840, max_height: 2160, max_frame_rate: 60 })
+            probe.video.decode.Push({ codec: "av1", hardware: true, profiles: ["main"], bit_depths: [8, 10], max_width: 3840, max_height: 2160, max_frame_rate: 60 })
+            body = m.body(probe)
             deliveries = body.client_playback_context.deliveries
-            m.assertEqual(body.client_capabilities.codecs_audio, ["aac", "mp3", "ac3", "eac3", "dts", "flac", "opus", "pcm_s16le", "pcm_s24le"])
+            m.assertEqual(body.client_capabilities.codecs_audio, ["aac", "mp3", "ac3", "eac3", "flac", "opus", "pcm_s16le", "pcm_s24le"])
             m.assertEqual(body.client_capabilities.codecs_video, ["h264", "hevc", "vp9", "av1"])
             m.assertEqual(deliveries.original_http.video_codecs, ["h264", "hevc", "vp9", "av1"])
+            m.assertEqual(deliveries.original_http.audio_decode_codecs, ["aac", "mp3", "ac3", "eac3", "flac", "opus", "pcm_s16le", "pcm_s24le"])
             m.assertEqual(deliveries.hls.video_codecs, ["h264", "hevc"])
             m.assertEqual(deliveries.hls.audio_decode_codecs, ["aac", "ac3", "eac3"])
         end sub
 
-        @it("claims only VP9 profile 0 and FLAC on a Roku TV in a release build (run 11)")
+        @it("leaves a codec the probe did not find off every delivery")
         sub _()
             probe = tests.devices.probeResult()
-            probe.device.modelType = "TV"
-            probe.audio.gated = { dts: false, flac: true, opus: true, pcm: true }
-            probe.video.gated.vp9 = { codec: "vp9", hardware: true, profiles: ["profile 0", "profile 2"], bit_depths: [8, 10] }
-            gates = playback.gates.evaluate(probe, { debug: false })
-            parts = playback.capabilities.replanParts(probe, gates, m.request({}))
-            capabilities = parts.client_capabilities
-            m.assertEqual(capabilities.codecs_audio, ["aac", "mp3", "ac3", "eac3", "flac"])
-            m.assertEqual(capabilities.video_decode[2], { codec: "vp9", hardware: true, profiles: ["profile 0"], bit_depths: [8], max_width: 1920, max_height: 1080, max_frame_rate: 30 })
-            original = parts.client_playback_context.deliveries.original_http
-            m.assertEqual(original.video_codecs, ["h264", "hevc", "vp9"])
-            m.assertEqual(original.audio_decode_codecs, ["aac", "mp3", "ac3", "eac3", "flac"])
-            m.assertEqual(original.validated_claims, [], "no G7 claim to a server without the feature")
+            probe.audio.codecs = ["aac", "mp3"]
+            probe.video.decode.Delete(1)
+            deliveries = m.body(probe).client_playback_context.deliveries
+            m.assertEqual(deliveries.original_http.video_codecs, ["h264"])
+            m.assertEqual(deliveries.original_http.audio_decode_codecs, ["aac", "mp3"])
+            m.assertEqual(deliveries.hls.video_codecs, ["h264"])
+            m.assertEqual(deliveries.hls.audio_decode_codecs, ["aac"])
         end sub
 
-        ' The server's exact-evidence check of a source against video_decode
-        ' (silo-server internal/playback/capabilities_v3.go, videoEligibleV3,
-        ' read at 31fabc723): codec and hardware, profile, bit depth, then
-        ' size and frame rate.
-        function validates(decode as Object, source as Object) as Boolean
-            for each entry in decode
-                if entry.codec = source.codec and entry.hardware and util.contains(entry.profiles, source.profile) and util.contains(entry.bit_depths, source.bitDepth)
-                    if source.width <= entry.max_width and source.height <= entry.max_height and source.frameRate <= entry.max_frame_rate then return true
-                end if
-            end for
-            return false
-        end function
-
-        @it("bounds the Roku TV's VP9 claim by the shape run 11 played, though its HEVC decodes 4K60")
-        sub _()
-            probe = playback.probe.collect(tests.devices.fromFixture(tests.devices.fixture("dev-tv-tcl-55r625")), playback.gates.probeOptions())
-            decode = playback.capabilities.replanParts(probe, playback.gates.evaluate(probe, { debug: false }), m.request({})).client_capabilities.video_decode
-            m.assertEqual([decode[1].codec, decode[1].max_width, decode[1].max_height, decode[1].max_frame_rate], ["hevc", 3840, 2160, 60])
-            m.assertEqual(decode[2], { codec: "vp9", hardware: true, profiles: ["profile 0"], bit_depths: [8], max_width: 1920, max_height: 1080, max_frame_rate: 30 })
-            source = { codec: "vp9", profile: "profile 0", bitDepth: 8, width: 1920, height: 1080, frameRate: 23.976 }
-            m.assertTrue(m.validates(decode, source), "run 11's shape")
-            source.Append({ width: 3840, height: 2160 })
-            m.assertFalse(m.validates(decode, source), "4K VP9 is not validated as an original")
-            source.Append({ width: 1920, height: 1080, frameRate: 60 })
-            m.assertFalse(m.validates(decode, source), "nor 1080p60")
-            source.Append({ frameRate: 30, profile: "profile 2", bitDepth: 10 })
-            m.assertFalse(m.validates(decode, source), "nor profile 2")
-            source.Append({ codec: "hevc", profile: "main 10", width: 3840, height: 2160, frameRate: 60 })
-            m.assertTrue(m.validates(decode, source), "HEVC keeps its own bounds")
-        end sub
-
-        @it("keeps the base-layer original on HEVC's own bounds, which no other codec widens")
+        @it("claims the DV8 base layer for ID 1 on an HDR10 output, only when the server honours the list")
         sub _()
             probe = tests.devices.probeResult()
-            probe.device.modelType = "TV"
-            ' HEVC Main 10 tops out at level 5.0 (2160p30); H.264 4.2 decodes 60 fps.
-            probe.video.decode[1] = { codec: "hevc", hardware: true, profiles: ["main", "main 10"], levels: [150], bit_depths: [8, 10], max_width: 3840, max_height: 2160, max_frame_rate: 30 }
-            probe.video.gated.vp9 = { codec: "vp9", hardware: true, profiles: ["profile 0"], bit_depths: [8] }
-            parts = playback.capabilities.replanParts(probe, playback.gates.evaluate(probe, { debug: false }), m.request({ serverFeatures: [playback.capabilities.DV8_BASE_LAYER_IDS_FEATURE] }))
-            m.assertEqual(parts.client_playback_context.deliveries.original_http.validated_claims, [playback.capabilities.DV8_BASE_LAYER_CLAIM])
-            decode = parts.client_capabilities.video_decode
-            m.assertEqual(decode[1], probe.video.decode[1], "the ladder's HEVC entry as measured")
-            m.assertEqual([decode[2].max_height, decode[2].max_frame_rate], [1080, 30])
-            m.assertFalse(m.validates(decode, { codec: "hevc", profile: "main 10", bitDepth: 10, width: 3840, height: 2160, frameRate: 60 }), "a 2160p60 P8.1 base layer is above HEVC's level")
-        end sub
-
-        @it("claims the DV8 base layer for ID 1 only when the server honours the list")
-        sub _()
-            probe = tests.devices.probeResult()
-            probe.device.modelType = "TV"
-            stock = m.body(probe, { debug: true }, { serverFeatures: ["sequenced_progress_v1"] }).client_playback_context.deliveries.original_http
+            stock = m.body(probe, { serverFeatures: ["sequenced_progress_v1"] }).client_playback_context.deliveries.original_http
             m.assertEqual(stock.validated_claims, [])
             m.assertFalse(stock.DoesExist("dv8_base_layer_compatibility_ids"))
             features = ["sequenced_progress_v1", "dv8_base_layer_compatibility_ids_v1"]
-            deliveries = m.body(probe, { debug: true }, { serverFeatures: features }).client_playback_context.deliveries
+            deliveries = m.body(probe, { serverFeatures: features }).client_playback_context.deliveries
             m.assertEqual(deliveries.original_http.validated_claims, ["client_dv8_base_layer_fallback_v1"])
             m.assertEqual(deliveries.original_http.dv8_base_layer_compatibility_ids, [1])
             m.assertEqual(deliveries.hls.validated_claims, [])
             m.assertFalse(deliveries.hls.DoesExist("dv8_base_layer_compatibility_ids"))
-            ' A release build, and a replan, make the same claim; a player makes none.
-            release = playback.gates.evaluate(probe, { debug: false })
-            original = playback.capabilities.replanParts(probe, release, m.request({ serverFeatures: features })).client_playback_context.deliveries.original_http
-            m.assertEqual(original.validated_claims, ["client_dv8_base_layer_fallback_v1"])
+            ' A replan makes the same claim.
+            original = m.parts(probe, { serverFeatures: features }).client_playback_context.deliveries.original_http
             m.assertEqual(original.dv8_base_layer_compatibility_ids, [1])
-            probe.device.modelType = "STB"
-            player = playback.capabilities.replanParts(probe, playback.gates.evaluate(probe, { debug: false }), m.request({ serverFeatures: features })).client_playback_context.deliveries.original_http
-            m.assertEqual(player.validated_claims, [], "a 4K player")
-            m.assertFalse(player.DoesExist("dv8_base_layer_compatibility_ids"))
+            ' Not on an SDR output, nor where the output has Dolby Vision itself.
+            sdr = tests.devices.probeResult()
+            sdr.display.hdr10 = false
+            sdr.display.hlg = false
+            m.assertEqual(m.parts(sdr, { serverFeatures: features }).client_playback_context.deliveries.original_http.validated_claims, [])
+            dv = tests.devices.probeResult()
+            dv.display.dolbyVision = true
+            dv.display.modeDolbyVision = true
+            m.assertEqual(m.parts(dv, { serverFeatures: features }).client_playback_context.deliveries.original_http.validated_claims, [])
         end sub
 
         @describe("output")
 
-        @it("keeps HDR10+ behind the HDR10 claim")
+        @it("claims HDR10+ only beside HDR10")
         sub _()
             probe = tests.devices.probeResult()
             probe.display.hdr10Plus = true
-            m.assertFalse(m.body(probe, { debug: true, overrides: { G3: false, G4: true } }).client_capabilities.hdr_details.hdr10_plus)
-            m.assertTrue(m.body(probe, { debug: true, overrides: { G4: true } }).client_capabilities.hdr_details.hdr10_plus)
+            m.assertTrue(m.body(probe).client_capabilities.hdr_details.hdr10_plus)
+            probe.display.hdr10 = false
+            m.assertFalse(m.body(probe).client_capabilities.hdr_details.hdr10_plus)
         end sub
 
-        @it("reports Dolby Vision on the output and never on original_http")
+        @it("applies the section 6.1 output rule to every range")
+        sub _()
+            probe = tests.devices.probeResult()
+            probe.display.resolution = 1080
+            m.assertEqual(m.body(probe).client_capabilities.hdr_details, { hdr10: false, hdr10_plus: false, hlg: false, dolby_vision_profiles: [] })
+            probe = tests.devices.probeResult()
+            probe.video.decode[1].profiles = ["main"]
+            m.assertFalse(m.body(probe).client_capabilities.hdr)
+        end sub
+
+        @it("reports Dolby Vision on the output and on original_http where the Roku outputs it")
         sub _()
             probe = tests.devices.probeResult()
             probe.display.dolbyVision = true
             probe.display.modeDolbyVision = true
-            context = m.body(probe, { debug: true, overrides: { G5: true } }).client_playback_context
+            context = m.body(probe).client_playback_context
             m.assertEqual(context.output.hdr_details.dolby_vision_profiles, [5, 8])
+            m.assertEqual(context.output.hdr_details.dolby_vision_profile_levels, [{ profile: 5, max_level: 9 }, { profile: 8, max_level: 9, bl_compatibility_ids: [1] }])
             m.assertEqual(context.output.display.hdr_types, context.output.hdr_details)
-            m.assertEqual(context.deliveries.original_http.hdr_details, { hdr10: true, hdr10_plus: false, hlg: true, dolby_vision_profiles: [] })
+            m.assertEqual(context.deliveries.original_http.hdr_details, context.output.hdr_details)
             m.assertFalse(context.deliveries.hls.DoesExist("hdr_details"))
+        end sub
+
+        @it("takes a Roku TV's Dolby Vision from its display, and a player's from its mode string")
+        sub _()
+            probe = tests.devices.probeResult()
+            probe.display.dolbyVision = true
+            m.assertEqual(m.body(probe).client_capabilities.hdr_details.dolby_vision_profiles, [], "a player whose mode shows no DV")
+            probe.device.modelType = "TV"
+            m.assertEqual(m.body(probe).client_capabilities.hdr_details.dolby_vision_profiles, [5, 8], "a Roku TV")
+            probe.display.dolbyVision = false
+            m.assertEqual(m.body(probe).client_capabilities.hdr_details.dolby_vision_profiles, [], "a Roku TV whose panel has no DV")
         end sub
 
         @it("describes an unknown display without HDR types or claims")
         sub _()
             probe = tests.devices.probeResult()
             probe.display.evidence = "unknown"
-            body = m.body(probe, { debug: true })
+            body = m.body(probe)
             output = body.client_playback_context.output
             m.assertEqual(output.display, { hdr_evidence: "unknown", display_id: "hdmi" })
             m.assertEqual(output.hdr_details, { hdr10: false, hdr10_plus: false, hlg: false, dolby_vision_profiles: [] })
@@ -256,7 +215,7 @@ namespace tests
             probe.audio.multichannelAac = multichannelAac
             track = invalid
             if channels > 0 then track = { id: "file:42:audio:0", index: 0, codec: codec, channels: channels }
-            deliveries = m.body(probe, { debug: true }, { audioTrack: track, stereoAacRestart: restart }).client_playback_context.deliveries
+            deliveries = m.body(probe, { audioTrack: track, stereoAacRestart: restart }).client_playback_context.deliveries
             m.assertEqual(deliveries.original_http.DoesExist("max_channels"), original)
             m.assertEqual(deliveries.hls.DoesExist("max_channels"), hls)
             if hls then m.assertEqual(deliveries.hls.max_channels, 2)
@@ -266,11 +225,11 @@ namespace tests
 
         @it("names a track by its index alone when the watch projection has no id")
         sub _()
-            body = m.body(tests.devices.probeResult(), { debug: true }, { audioTrack: { index: 2, codec: "eac3", channels: 6 } })
+            body = m.body(tests.devices.probeResult(), { audioTrack: { index: 2, codec: "eac3", channels: 6 } })
             m.assertEqual(body.audio_track_index, 2)
             m.assertFalse(body.DoesExist("audio_track_id"))
             ' A track known only by codec and channels informs the AAC rule and is not named.
-            body = m.body(tests.devices.probeResult(), { debug: true }, { audioTrack: { codec: "aac", channels: 6 } })
+            body = m.body(tests.devices.probeResult(), { audioTrack: { codec: "aac", channels: 6 } })
             m.assertFalse(body.DoesExist("audio_track_index"))
             m.assertEqual(body.client_playback_context.deliveries.hls.max_channels, 2)
         end sub
@@ -278,21 +237,21 @@ namespace tests
         @it("asks for TS copy remuxes only when the server advertises the prototype")
         sub _()
             probe = tests.devices.probeResult()
-            plain = m.body(probe, { debug: true }, { serverFeatures: ["sequenced_progress_v1"] })
+            plain = m.body(probe, { serverFeatures: ["sequenced_progress_v1"] })
             m.assertEqual(plain.client_playback_context.deliveries.hls.features, ["native_hls_playback_v1"])
-            prototype = m.body(probe, { debug: true }, { serverFeatures: ["sequenced_progress_v1", "hls_copy_mpegts_v1"] })
+            prototype = m.body(probe, { serverFeatures: ["sequenced_progress_v1", "hls_copy_mpegts_v1"] })
             m.assertEqual(prototype.client_playback_context.deliveries.hls.features, ["native_hls_playback_v1", "hls_copy_mpegts_v1"])
             m.assertEqual(prototype.client_playback_context.deliveries.original_http.features, [])
-            parts = playback.capabilities.replanParts(probe, playback.gates.evaluate(probe, { debug: true }), m.request({ serverFeatures: ["hls_copy_mpegts_v1"] }))
+            parts = m.parts(probe, { serverFeatures: ["hls_copy_mpegts_v1"] })
             m.assertEqual(parts.client_playback_context.deliveries.hls.features, ["native_hls_playback_v1", "hls_copy_mpegts_v1"])
         end sub
 
         @it("asks for playlist variable substitution only when the server advertises it")
         sub _()
             probe = tests.devices.probeResult()
-            plain = m.body(probe, { debug: true }, { serverFeatures: ["sequenced_progress_v1", "hls_copy_mpegts_v1"] })
+            plain = m.body(probe, { serverFeatures: ["sequenced_progress_v1", "hls_copy_mpegts_v1"] })
             m.assertArrayNotContains(plain.client_playback_context.deliveries.hls.features, "hls_variable_substitution_v1")
-            both = m.body(probe, { debug: true }, { serverFeatures: ["sequenced_progress_v1", "hls_copy_mpegts_v1", "hls_variable_substitution_v1"] })
+            both = m.body(probe, { serverFeatures: ["sequenced_progress_v1", "hls_copy_mpegts_v1", "hls_variable_substitution_v1"] })
             m.assertEqual(both.client_playback_context.deliveries.hls.features, ["native_hls_playback_v1", "hls_copy_mpegts_v1", "hls_variable_substitution_v1"])
             m.assertEqual(both.client_playback_context.deliveries.original_http.features, [])
         end sub
@@ -302,9 +261,8 @@ namespace tests
         @it("rebuilds the ceiling from the track the replan selects")
         sub _()
             probe = tests.devices.probeResult()
-            gates = playback.gates.evaluate(probe, { debug: true })
-            stereo = playback.capabilities.replanParts(probe, gates, m.request({ audioTrack: { id: "file:42:audio:0", codec: "aac", channels: 2 } }))
-            surround = playback.capabilities.replanParts(probe, gates, m.request({ audioTrack: { id: "file:42:audio:1", codec: "aac", channels: 6 } }))
+            stereo = m.parts(probe, { audioTrack: { id: "file:42:audio:0", codec: "aac", channels: 2 } })
+            surround = m.parts(probe, { audioTrack: { id: "file:42:audio:1", codec: "aac", channels: 6 } })
             m.assertFalse(stereo.client_playback_context.deliveries.hls.DoesExist("max_channels"))
             m.assertEqual(surround.client_playback_context.deliveries.hls.max_channels, 2)
             m.assertEqual(m.sortedKeys(surround), ["client_capabilities", "client_features", "client_playback_context"])

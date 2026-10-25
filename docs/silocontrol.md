@@ -24,7 +24,7 @@ play them as the phone's own profile (profile handoff).
 | Handoff | Silo's existing `remote_playback` device login. No server change (section 8) |
 | Identity | The handoff identity lives only in memory, is used only by the handoff's player, and never replaces the Roku's saved sign-in (section 8.3) |
 | When it runs | Only while the Silo app is open on the Roku and signed in. The phone cannot open the app (section 2.1) |
-| Release | After the first public release (spec section 3.3). Handoff is in development and beta builds; public builds enable it only after Roku confirms it, or the project owner accepts the risk (section 2.3) |
+| Release | On in every build, handoff included, by the project owner's decision of 2026-10-25 (decision D-7 in [`implementation-assumptions.md`](implementation-assumptions.md)), which accepts the risk before Roku confirms it (section 2.3) |
 
 ## 2. Roku policy
 
@@ -77,10 +77,10 @@ How this design limits the exposure:
   remembered profile, and ends when its playback ends.
 - A phone on the profile the Roku already has open needs no handoff at all
   (section 8.1).
-- A build switch, `handoff`, is on in development and beta builds. Public
-  builds turn it on only after Q10 is answered or the project owner records
-  that they accept the risk. With it off, control still works, and so does
-  a launch on the profile open on the Roku.
+- A build switch, `handoff`, is on in every build: the project owner
+  accepted the risk before Roku confirms it (decision D-7, 2026-10-25). Turned
+  off, control still works, and so does a launch on the profile open on the
+  Roku.
 
 Discovery and the Connect a Phone pairing (section 5) carry no credential
 and sign nothing in, so neither is a sign-in mechanism.
@@ -613,8 +613,8 @@ itself, accepted while `plain` is the default.
 | Development controller | `scripts/silocontrol-phone.mjs` | A phone's part, plain or `sealed`, for device tests |
 
 The `silocontrol` build switch (bs_const) builds the receiver into the app;
-`handoff` adds section 8.2. Both are on in development builds and off in
-`manifest` for release builds.
+`handoff` adds section 8.2. Both are on in `manifest`, so every build has
+them (decision D-7).
 
 The player keeps sole ownership of the `Video` node (spec section 6.3); the
 receiver only asks it to act.
@@ -637,7 +637,7 @@ receiver only asks it to act.
 
 | Decision | Leaning | Needed evidence |
 | --- | --- | --- |
-| Handoff in public builds before Roku confirms it | No | Roku answer, or the project owner's acceptance |
+| Handoff in public builds before Roku confirms it | Yes: the project owner accepted the risk on 2026-10-25 (D-7) | Roku's answer; revert the switch if Roku reads it under 2.2 |
 | Require Pairing | Offered once both phone apps ship `sealed`; off by default | Phone release dates |
 | Discovery on other hardware | Works as on the TCL Roku TV | Spike C0-7: a Roku player, a 512 MB device, iPhone and Android browsing, a network change |
 | A fallback for networks that block multicast | Address and QR code on Connect a Phone; a server-kept TV list only if beta households need it | Beta reports |

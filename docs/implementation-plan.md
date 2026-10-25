@@ -106,11 +106,11 @@ it must be confirmed on our hardware.
 
 ### 2.2 Outcome by source format
 
-How each source reaches the viewer once the relevant gates (section 6.2) have
-passed. "Original" is the `original_http` delivery; "remux" is
+How each source reaches the viewer when the device's probe passes the format
+(section 6.2). "Original" is the `original_http` delivery; "remux" is
 `server_remux_hls` with the video stream copied. Every row was reproduced by
 running Roku payloads through the server planner (`origin/main`, 2026-10-21);
-what the viewer actually sees and hears is the hardware question each gate
+what the viewer actually sees and hears is the hardware question each H-test
 answers. Every row also assumes the selected audio track can be copied or
 converted to something the device decodes (section 6.3).
 
@@ -119,13 +119,13 @@ converted to something the device decodes (section 6.3).
 | H.264 High, Main, or Constrained Baseline up to level 4.2, with AAC, AC-3, or E-AC-3 | Original (MKV, MP4) | The original streams. Plain Baseline is transcoded |
 | HEVC Main/Main 10 up to 4K and the probed HEVC level, SDR/HDR10/HLG | Original | The original streams, in their range when the output is 4K HDR. Above the probed level: SDR H.264 at up to 1080p (S-5, S-10) |
 | HDR10+ | Original | HDR10+ on an HDR10+ panel, else HDR10 |
-| Dolby Vision P5, or P8.1 (compatibility ID 1), within the probed HEVC level and DV `max_level` | Remux (DV removed from the original delivery) | DV video bytes unchanged, if gates G5 and G14 pass |
+| Dolby Vision P5, or P8.1 (compatibility ID 1), within the probed HEVC level and DV `max_level` | Original or remux; both carry Dolby Vision since D-7 | DV video bytes unchanged where the Roku outputs DV (run 30: P5 original and P8.1 remux on the Ultra) |
 | Dolby Vision P8.4 (HLG base, as iPhones record) or P8.2 on a DV output | Tone-mapping transcode until H3 proves IDs 4 and 2 | SDR H.264 at up to 1080p; DV once H3 adds the IDs |
-| Dolby Vision P8.x on an output without DV | P8.1: remux with the server's RPU strip, or the original with the base-layer claim (G7). P8.4: the HLG base layer only with G7 and an HLG output. P8.2: the SDR base layer only with G7. Otherwise a tone-mapping transcode | HDR10, HLG, or SDR |
+| Dolby Vision P8.x on an output without DV | P8.1: remux with the server's RPU strip, or the original with the base-layer claim (ID 1, on an HDR10 output). P8.4 and P8.2: not claimed (IDs 4 and 2 untested). Otherwise a tone-mapping transcode | HDR10, HLG, or SDR |
 | Dolby Vision P5 on an output without DV | Tone-mapping transcode (P5 has no HDR10 base layer) | SDR H.264 at up to 1080p, or a terminal error when the server has no DV tone mapper |
 | Dolby Vision P7 (FEL/MEL) | Remux with the `server_dv7_to_hdr10` strip | HDR10; DV needs server issue S-2 |
 | E-AC-3 JOC, E-AC-3, AC-3 | Copied on the original and on HLS copy remuxes; a video transcode re-encodes them to AAC (5.1 at 384 kbps, or stereo under the interim rule in section 6.1) | When copied, the source bitstream: Atmos where the model and sink pass or decode it, else the 5.1 core |
-| DTS core | Original only, after gate G9 (which waits for server issue S-8) | DTS bitstream to a DTS sink |
+| DTS core | Not claimed until server issue S-8; converted like DTS-HD meanwhile | — |
 | TrueHD, DTS-HD MA, DTS:X | Remux, audio converted to AAC: 5.1 (384 kbps) on devices that decode multichannel AAC, stereo elsewhere (section 6.1) | Stereo on most devices; 5.1 only where a Dolby-decoding Ultra re-encodes to Dolby Digital for a Dolby AVR (H9). The client prefers a compatible E-AC-3/AC-3 track in the same language when the file has one; server issue S-1 converts to E-AC-3 5.1 instead |
 | Image subtitles (PGS, VobSub) selected | Burn-in transcode | SDR H.264 at up to 1080p; HDR and 4K lost (S-10, S-5) |
 | Any source on a 1080p or SDR output | As above within the decoder's limits | 4K SDR is downscaled by the Roku; HDR sources are tone-mapped to SDR H.264 by the server |
@@ -475,16 +475,16 @@ shapes that answered yes, in ffprobe vocabulary, keeping every measured bound.
 | Probe | Reported entry |
 | --- | --- |
 | `{codec: "mpeg4 avc", profile: "high", level: "4.2"}`, then 4.1, then `main` | `h264`, `profiles` up to the highest passing (`constrained baseline`, `main`, `high`), `levels: [42]` or `[41]`, `bit_depths: [8]`, 1920×1080, 60 fps at 4.2 or 30 at 4.1 |
-| `{codec: "hevc", profile: "main 10"}` at levels `6.2`, `6.1`, `6.0`, `5.2`, then the documented `5.1`, `5.0`, `4.1`; and `profile: "main"` | `hevc`, `profiles: ["main", "main 10"]`, `bit_depths: [8, 10]`, `levels` from the highest passing (×30: 6.2 → 186, 6.1 → 183, 6.0 → 180, 5.2 → 156, 5.1 → 153), size and frame rate from that level, capped at 3840×2160 |
-| `vp9` profiles 0 and 2 | Only under gate G11 |
-| `av1`, probed bare (*community*: a combined probe always fails) | Only under gate G10 |
+| `{codec: "hevc", profile: "main 10"}` at levels `6.2`, `6.1`, `6.0`, `5.2`, then the documented `5.1`, `5.0`, `4.1`; and `profile: "main"` | `hevc`, `profiles: ["main", "main 10"]`, `bit_depths: [8, 10]`, `levels` from the highest passing documented level (×30: 5.1 → 153, 5.0 → 150, 4.1 → 123), size and frame rate from that level, capped at 3840×2160. Answers for 6.2, 6.1, 6.0, and 5.2 are recorded, never reported |
+| `vp9` profiles 0 and 2 | `vp9` with the passing profiles and their bit depths, bounded by the largest H.264 or HEVC shape (the probe reports no VP9 size) |
+| `av1`, probed bare (*community*: a combined probe always fails) | `av1` Main, 8 and 10 bit, bounded like VP9 |
 
 - HEVC `levels` stay in the report, because removing the bound would also remove
   the server's level check on originals. The cost: a source above the reported
   level loses direct play and HDR (an SDR H.264 transcode at up to 1080p), and the
   server transcodes to H.264 rather than HEVC for this client until server issue
-  S-5 pins its HEVC output level. The undocumented level strings above 5.1 count
-  only after H4 shows a device that answers yes also plays such a source.
+  S-5 pins its HEVC output level. The undocumented level strings above 5.1 are
+  recorded but never counted.
 - Size is bounded by the decoder, not the output mode: on a 1080p output the Roku
   downscales a 4K SDR original, which beats a server transcode.
 - `max_bitrate_kbps` is omitted until hardware testing gives a number.
@@ -521,11 +521,11 @@ codec in `codecs_audio` is copied as the original bitstream.
 - `ac3`, `eac3` when `CanDecodeAudio` answers yes for the current output with
   `PassThru` unset, probed with `Container: "mkv"` and `"mp4"`. `PassThru: 0`,
   `PassThru: 1`, and `Atmos: 1` are recorded for local diagnostics only.
-- `dts` only under gate G9, which requires server issue S-8 (variant-aware DTS
-  matching with a channel ceiling): the server today calls DTS-HD MA and DTS:X
-  `dts` too.
-- `flac`, `opus`, and the tested ffprobe PCM names (for example `pcm_s16le`,
-  `pcm_s24le`; a bare `pcm` never matches a source) only under gate G12.
+- `dts` is not claimed until server issue S-8 (variant-aware DTS matching with
+  a channel ceiling): the server today calls DTS-HD MA and DTS:X `dts` too. DTS
+  5.1 passthrough is still probed and names the output context.
+- `flac`, `opus`, and the ffprobe PCM names `pcm_s16le` and `pcm_s24le` (a bare
+  `pcm` never matches a source) when their probes pass.
 - Never `truehd`, `mlp`, or any DTS-HD variant, whatever the probe says.
 - `audio_passthrough_codecs` stays empty on every delivery.
 
@@ -537,15 +537,15 @@ codec in `codecs_audio` is copied as the original bitstream.
   rate and the current `b10`/`Dv` suffix. `output_context_id` is derived from that
   normalized mode and the audio probe results, so playback's own mode switches
   never change it.
-- HDR10, HLG, and HDR10+ (gate G4) come from `GetDisplayProperties()` only when an
+- HDR10, HLG, and HDR10+ (beside HDR10) come from `GetDisplayProperties()` only when an
   HEVC Main 10 entry exists and the normalized resolution is ≥ 2160 lines. If H5
   shows a 4K SDR Display Type does not output HDR, the rule tightens to a mode with
   `b10`/`Dv` or an Auto Display Type.
-- Dolby Vision profiles only under gate G5, whose predicate also requires evidence
-  that the Roku itself outputs DV (section 6.2). P5 and P8 are reported with
-  `dolby_vision_profile_levels`: a `max_level` from H3 evidence for each, and
-  `bl_compatibility_ids: [1]` for P8. IDs 4 and 2 are added once H3 passes them,
-  using a `dev`-build override that sends `[1, 4]` and `[1, 2]`.
+- Dolby Vision profiles only with evidence that the Roku itself outputs DV: a
+  Roku TV's display flag, or `Dv` in a player's mode string (spec section 9.2).
+  P5 and P8 are reported with `dolby_vision_profile_levels` (`max_level` 9 until
+  H3 measures one) and `bl_compatibility_ids: [1]` for P8. IDs 4 and 2 are added
+  once H3 passes them.
 - `output.display.hdr_evidence` is `"exact"` when `GetDisplayProperties()`
   answers; the probe retries once before reporting `"unknown"`, because `unknown`
   turns every HDR and DV source into an SDR transcode.
@@ -554,7 +554,7 @@ codec in `codecs_audio` is copied as the original bitstream.
 
 | Class | Contents |
 | --- | --- |
-| `original_http` | `containers: ["mp4", "mkv"]`; the video and audio codecs above; `hdr_details` without Dolby Vision (gate G6 stays off); `validated_claims: ["client_dv8_base_layer_fallback_v1"]` only under gate G7 **and** only when the output reports no DV profile 8 (on a DV output the claim makes the server choose the base layer over the DV remux); `max_channels` only in the interim AAC case |
+| `original_http` | `containers: ["mp4", "mkv"]`; the video and audio codecs above; `hdr_details` as on the output, Dolby Vision included; `validated_claims: ["client_dv8_base_layer_fallback_v1"]` only on an HDR10 output **and** only when the output reports no DV profile 8 (on a DV output the claim makes the server choose the base layer over the DV remux); `max_channels` only in the interim AAC case |
 | `hls` | `containers: ["hls"]`; `h264`, `hevc`; `aac`, `ac3`, `eac3`; `features: ["native_hls_playback_v1"]` so DV copies are labelled `dvh1`; no `hdr_details` (Dolby Vision reaches `hls` through `output.hdr_details`); `max_channels` only in the interim AAC case |
 | `progressive` | disabled, `failure_reason: "disabled_pending_seekable_transport"` |
 
@@ -562,8 +562,8 @@ codec in `codecs_audio` is copied as the original bitstream.
 (until a hardware test shows Roku selects the same track the server named),
 passthrough, client transformations.
 
-**Client features:** `seek_reanchor_v1`, `direct_stream_resume_v1`, and under
-gate G13 `subrip_sidecar_v1` and `hls_subtitle_renditions_v1`, plus
+**Client features:** `seek_reanchor_v1`, `direct_stream_resume_v1`,
+`subrip_sidecar_v1`, and `hls_subtitle_renditions_v1`, plus
 `hls_remux_subtitle_renditions_v1` when the capabilities `features` list it. Not
 `header_authenticated_media_v1` or `authorized_media_origins_v1`: the client
 uses signed-URL media mode so plans can use proxy nodes (decision D-1, section
@@ -573,32 +573,21 @@ and the resulting media error or `404` starts a new attempt).
 
 Appendix A has a complete example payload.
 
-### 6.2 Hardware gates
+### 6.2 Format claims (formerly hardware gates)
 
-A gate turns a claim on once its tests pass on the device cohorts it lists.
-Gates live in one table in `source/playback/gates.bs`; each records its runtime
-predicate, the test IDs, the cohorts covered, and the evidence entry in
-`docs/hardware-evidence.md`. A device outside the tested cohorts keeps optional
-claims off. A gate that is on still sends a claim only when its predicate holds.
-A qualification run can end with a claim deliberately off; that completes the
-gate. Only G1, G13, and G14 are required paths: when they fail, a fix must land.
+The hardware gate table (G1–G14) was removed on 2026-10-25 (decision D-7 in
+[`implementation-assumptions.md`](implementation-assumptions.md)): release
+builds now match development builds. Every build plays, offers copy remuxes
+of H.264 and HEVC with AAC, AC-3, and E-AC-3, and sends subtitle sidecars,
+and each format claim follows the device's own probe on every device class
+(spec section 9.2): VP9, AV1, FLAC, Opus, PCM, HDR10+, and Dolby Vision
+where the Roku is shown to output it, on `original_http` too. DTS stays
+unclaimed until server issue S-8. Hardware run 30 played one example of each
+claim the Ultra 4850X makes.
 
-| Gate | Claim | Runtime predicate | Before evidence | Tests and preconditions |
-| --- | --- | --- | --- | --- |
-| G1 | Signed-URL media playback at all, on the API origin and on proxy origins | — | Development only | H1, including zero credential forwarding off-origin (section 4.2), and H2 (`#EXT-X-DEFINE` playlists) |
-| G2 | HEVC Main 10 4K on `original_http` (MKV, MP4) | HEVC ladder passes | On within tested cohorts (documented) | H4 before beta |
-| G3 | HDR10 and HLG | Section 6.1 output rule | On within tested cohorts (documented) | H5 before beta |
-| G4 | HDR10+ | Display reports HDR10+ | Off | H5 |
-| G5 | Dolby Vision P5 and P8 via `hls`, P8 with `bl_compatibility_ids: [1]` (4 and 2 after H3) | Display reports DV **and** the Roku is shown to output DV: `GetVideoMode()` carries `Dv` outside playback, or, if H3 shows the mode string carries it only during playback, this device's model has an H3 pass recorded (a model-keyed evidence entry combined with the live display flag, never the model name alone) | Off | H3, H19; S-4 or S-15 if H3 or H19 fail |
-| G6 | Dolby Vision on `original_http` | — | Off; expected to stay off | H3 |
-| G7 | `client_dv8_base_layer_fallback_v1` | Output reports no DV profile 8 | Off | H3 for base-layer IDs 1, 4, and 2 (HDR10, HLG, SDR), or a narrower server contract (S-19) |
-| G8 | E-AC-3 JOC copied | `eac3` probe passes | On within tested cohorts (documented on some models) | H9 |
-| G9 | `dts` on `original_http` | `CanDecodeAudio({codec: "dts", PassThru: 1, ChCnt: 6})` | Off | S-8, then H10 and H11 |
-| G10 | `av1` on `original_http` | Bare probe passes | Off | H6 |
-| G11 | `vp9` on `original_http` | Probe passes | Off | H7 |
-| G12 | `flac`, `opus`, tested `pcm_*` names | Probe passes | Off | H12 |
-| G13 | `sidecar_text: true` and the subtitle features | — | Development only | H14 thresholds (section 6.8) before Milestone 0a exits |
-| G14 | Copy remux to `hls` | — | Development only | H19 and the H8 envelope before Milestone 0a exits |
+G-numbers elsewhere in this plan, the spec's history, and
+[`hardware-evidence.md`](hardware-evidence.md) name the claims as they were
+then; the H-tests they cite remain the way to check a claim on new hardware.
 
 ### 6.3 Start path
 
@@ -1030,7 +1019,8 @@ infrastructure. Exit, per cohort:
   detectably (a `Video` error, not a hang or silence) so `failure_recovery` reaches
   a transcode; if failures are not detectable, S-11 is implemented and tested;
 - H14 meets the section 6.8 success criteria and the subtitle transport is chosen;
-- G1, G13, and G14 set;
+- the H1, H14, and H19 results recorded (before D-7 these set gates G1,
+  G13, and G14);
 - the threading spike's delivery decision, the start-path timing, and the
   `release`/`perf`/`requires_mkv` measurements recorded;
 - the section 4.8 workload holds the section 1 memory and texture limits on the
@@ -1040,8 +1030,10 @@ infrastructure. Exit, per cohort:
 
 **Milestone 0b — output claims (runs alongside Milestones 1–2).** H3, H4, H5, H9,
 H13, H16, and H20 on the DV, HDR10-only, and SDR TVs, the Atmos and DTS sinks, the
-no-DV 4K player, and the Roku TV. Exit: each of G2–G8 has a recorded result, on or
-deliberately off within its tested cohorts. Exits before Milestone 3 starts.
+no-DV 4K player, and the Roku TV. Exit: each probed claim (HEVC Main 10, HDR10,
+HLG, HDR10+, Dolby Vision, the DV8 base layer, E-AC-3) has a recorded result on
+each tested cohort; a claim that fails where the probe passes it gets a device
+rule in the serializer. Exits before Milestone 3 starts.
 
 **Milestone 1 — foundation.** PRs M1-1 to M1-8. Exit: spec section 13 Milestone 1
 criteria; a placeholder Home fires `AppLaunchComplete`; with a restored session
@@ -1063,9 +1055,8 @@ Behavior Analysis run.
 **Milestone 3 — playback.** Player controls and Options, track and quality
 replans, subtitles, trickplay, skip intro, Up Next, server preferences, recovery
 and Auto adaptation, output-change replans, deep-link playback. Exit: spec section
-13 Milestone 3 criteria; the 8 s playback-start target; G1–G8, G13, and G14
-recorded across the device matrix (G9–G12 stay off unless their preconditions and
-tests are met); the section 6.6 acceptance scenarios; the parity review for the
+13 Milestone 3 criteria; the 8 s playback-start target; each probed format claim
+played across the device matrix (DTS stays unclaimed until S-8); the section 6.6 acceptance scenarios; the parity review for the
 player.
 
 **Milestone 4 — beta and public readiness.** Deep Linking Tester, dashboard
@@ -1113,7 +1104,7 @@ scope that satisfies them.
 | Search across movies, series, episodes | 2 | `video_with_episodes` when advertised |
 | Movie and series detail, seasons, episodes | 2 | `play_season_number` from item detail |
 | Play, resume, start over | 3 | Section 6.3 `start_position` rules, tested separately at a non-zero position |
-| Direct play, HLS remux, HLS transcode | 0a, 3 | Gates G1, G13, G14; Milestone 3 matrix |
+| Direct play, HLS remux, HLS transcode | 0a, 3 | H1, H14, H19; Milestone 3 matrix |
 | Play/pause, skip, rate ladder, scrubbing, Replay, stop | 3 | Section 6.10; trickplay on every speed |
 | Audio, subtitle, quality via replan | 3 | Sections 6.7–6.8 |
 | Skip intro, Up Next with autoplay | 3 | `IsAutoplayEnabled()` honoured |
@@ -1229,7 +1220,7 @@ records the answers and the assumptions made since.
 | Risk | Effect | Mitigation |
 | --- | --- | --- |
 | `HttpHeaders` do not reach HLS child or subtitle requests | No authenticated HLS | H1 in M0-5; S-9 implemented before Milestone 1 if it fails |
-| Headers forwarded on a redirect to another origin | Credentials leak (AGENTS.md) | H1 redirect cases; G1 stays closed; S-20 |
+| Headers forwarded on a redirect to another origin | Credentials leak (AGENTS.md) | H1 redirect cases; S-20 (merged); the client's `request_origin` check |
 | Roku cannot parse `#EXT-X-DEFINE` | Long signed HLS titles fail on the API origin | H2 in M0-5; S-21 |
 | Muxed fMP4 remuxes play without audio | Every remux, H.264 and HEVC, is silent with no error to trigger a replan | H19 in M0-5; S-15 or S-4 |
 | Roku needs HLS master attributes for HDR/DV | DV remuxes play in the wrong range | H3; S-4; base-layer fallback on non-DV outputs |
