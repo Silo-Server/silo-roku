@@ -1,0 +1,172 @@
+namespace tests
+
+    ' ControlTask's queue behind a socket that takes few bytes or none
+    ' (tests/components/ControlTaskProbe).
+    @suite("silocontrol sockets")
+    class SiloControlSocketTests extends rooibos.BaseTestSuite
+
+        function task(args = {} as Object) as Object
+            node = CreateObject("roSGNode", "ControlTaskProbe")
+            node.callFunc("probeStart", args)
+            return node
+        end function
+
+        ' The message types of texts.
+        function types(texts as Object) as Object
+            out = []
+            for each text in texts
+                out.Push(ParseJson(text).type)
+            end for
+            return out
+        end function
+
+        function state(title as String) as Object
+            return { kind: "state", body: { "title": title } }
+        end function
+
+        ' The state titles among texts, in order.
+        function titles(texts as Object) as Object
+            out = []
+            for each text in texts
+                message = ParseJson(text)
+                if message.type = "state" then out.Push(message.state.title)
+            end for
+            return out
+        end function
+
+        @describe("backpressure")
+
+        @it("sends whole frames in order when the socket takes a few bytes at a time")
+        sub _()
+            node = m.task()
+            id = node.callFunc("probeConnect")
+            node.callFunc("probeRoom", id, 0)
+            node.callFunc("probeCommand", m.state("one"))
+            node.callFunc("probeCommand", { kind: "send", id: id, text: silocontrol.protocol.error("player_not_ready", "Not yet.") })
+            node.callFunc("probeRoom", id, 7)
+            for i = 1 to 200
+                node.callFunc("probeRoom", id, 0)
+                node.callFunc("probeRoom", id, 7)
+            end for
+            read = node.callFunc("probeRead", id)
+            m.assertEqual(m.types(read.texts), ["hello", "state", "state", "error"])
+            m.assertTrue(node.callFunc("probeOpen", id))
+        end sub
+
+        @it("closes a controller whose unsent frames pass the cap")
+        sub _()
+            node = m.task()
+            id = node.callFunc("probeConnect")
+            other = node.callFunc("probeConnect")
+            node.callFunc("probeRoom", id, 0)
+            filler = string(8000, "x")
+            for i = 1 to 20
+                node.callFunc("probeCommand", { kind: "send", id: id, text: silocontrol.protocol.error("filler", filler) })
+            end for
+            m.assertFalse(node.callFunc("probeOpen", id))
+            m.assertTrue(node.callFunc("probeOpen", other))
+        end sub
+
+        @it("counts a state held behind unsent frames toward the cap")
+        sub _()
+            node = m.task()
+            id = node.callFunc("probeConnect")
+            node.callFunc("probeRoom", id, 0)
+            filler = string(8000, "x")
+            for i = 1 to 15
+                node.callFunc("probeCommand", { kind: "send", id: id, text: silocontrol.protocol.error("filler", filler) })
+            end for
+            m.assertTrue(node.callFunc("probeOpen", id))
+            node.callFunc("probeCommand", m.state(string(12000, "y")))
+            m.assertFalse(node.callFunc("probeOpen", id))
+        end sub
+
+        @it("closes a controller whose socket takes nothing for ten seconds")
+        sub _()
+            node = m.task()
+            id = node.callFunc("probeConnect")
+            node.callFunc("probeRoom", id, 0)
+            node.callFunc("probeCommand", m.state("one"))
+            node.callFunc("probeElapse", 9999)
+            m.assertTrue(node.callFunc("probeOpen", id))
+            node.callFunc("probeElapse", 1)
+            m.assertFalse(node.callFunc("probeOpen", id))
+        end sub
+
+        @it("keeps a slow reader that keeps reading")
+        sub _()
+            node = m.task()
+            id = node.callFunc("probeConnect")
+            for t = 1 to 40
+                node.callFunc("probeRoom", id, 0)
+                node.callFunc("probeCommand", m.state("t" + t.ToStr()))
+                node.callFunc("probeElapse", 500)
+                node.callFunc("probeRoom", id, 64)
+                read = node.callFunc("probeRead", id)
+                for each text in read.texts
+                    if ParseJson(text).type = "ping" then node.callFunc("probePhone", id, silocontrol.protocol.pong())
+                end for
+            end for
+            m.assertTrue(node.callFunc("probeOpen", id))
+        end sub
+
+        @it("sends only the newest of the states a stalled socket missed, sealed in sequence, with replies in order")
+        sub _()
+            node = m.task({ pairingKey: "000102030405060708090a0b0c0d0e0f" })
+            id = node.callFunc("probeConnect")
+            node.callFunc("probeRoom", id, 0)
+            node.callFunc("probeCommand", m.state("a"))
+            node.callFunc("probeCommand", { kind: "send", id: id, text: silocontrol.protocol.error("first", "First.") })
+            node.callFunc("probeCommand", m.state("b"))
+            node.callFunc("probeCommand", m.state("c"))
+            node.callFunc("probeCommand", { kind: "send", id: id, text: silocontrol.protocol.error("second", "Second.") })
+            node.callFunc("probeCommand", m.state("d"))
+            node.callFunc("probeCommand", m.state("e"))
+            node.callFunc("probeRoom", id, 5)
+            for i = 1 to 400
+                node.callFunc("probeRoom", id, 0)
+                node.callFunc("probeRoom", id, 5)
+            end for
+            read = node.callFunc("probeRead", id)
+            m.assertTrue(read.ok)
+            m.assertEqual(m.types(read.texts), ["hello", "state", "state", "error", "state", "error", "state"])
+            m.assertEqual(m.titles(read.texts), ["start", "a", "c", "e"])
+            ' The phone's next frame still opens in sequence.
+            node.callFunc("probeRoom", id, -1)
+            node.callFunc("probeCommand", m.state("f"))
+            read = node.callFunc("probeRead", id)
+            m.assertTrue(read.ok)
+            m.assertEqual(m.titles(read.texts), ["f"])
+            m.assertTrue(node.callFunc("probeOpen", id))
+        end sub
+
+        @describe("heartbeat")
+
+        @it("drops a controller that reads nothing even when it sends pongs unasked")
+        sub _()
+            node = m.task()
+            id = node.callFunc("probeConnect")
+            node.callFunc("probeRoom", id, 0)
+            ' At 12 seconds, before the write stall's 10 seconds from the
+            ' first ping run out.
+            for t = 1 to 24
+                node.callFunc("probePhone", id, silocontrol.protocol.pong())
+                node.callFunc("probeElapse", 500)
+            end for
+            m.assertFalse(node.callFunc("probeOpen", id))
+        end sub
+
+        @it("counts a pong once its ping has left")
+        sub _()
+            node = m.task()
+            id = node.callFunc("probeConnect")
+            for t = 1 to 10
+                node.callFunc("probeElapse", 3000)
+                read = node.callFunc("probeRead", id)
+                m.assertEqual(m.types(read.texts).Peek(), "ping")
+                node.callFunc("probePhone", id, silocontrol.protocol.pong())
+            end for
+            m.assertTrue(node.callFunc("probeOpen", id))
+        end sub
+    end class
+end namespace

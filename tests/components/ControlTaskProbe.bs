@@ -1,0 +1,210 @@
+' Test build only.
+
+function probeClockNow() as Integer
+    return m.now
+end function
+
+' ---- The fake roStreamSocket
+
+function probeSocketId() as Integer
+    return m.id
+end function
+
+function probeSocketPeer() as Object
+    return { address: "10.20.30.50:52000", getAddress: probeSocketAddress }
+end function
+
+function probeSocketAddress() as String
+    return m.address
+end function
+
+' setMessagePort and notifyReadable: the probe delivers each event itself.
+sub probeSocketIgnore(value as Dynamic)
+    m.ignored = value
+end sub
+
+sub probeSocketWritable(enabled as Boolean)
+    m.wantsWritable = enabled
+end sub
+
+function probeSocketIsWritable() as Boolean
+    return m.wantsWritable and m.room <> 0
+end function
+
+function probeSocketIsReadable() as Boolean
+    return m.inbox.Count() > 0
+end function
+
+function probeSocketSend(bytes as Object, offset as Integer, length as Integer) as Integer
+    if m.closed or m.room = 0
+        m.again = true
+        return -1
+    end if
+    m.again = false
+    count = length
+    if m.room > 0 and m.room < count then count = m.room
+    for i = offset to offset + count - 1
+        m.outbox.Push(bytes[i])
+    end for
+    return count
+end function
+
+function probeSocketAgain() as Boolean
+    return m.again
+end function
+
+function probeSocketReceive(buffer as Object, offset as Integer, length as Integer) as Integer
+    count = m.inbox.Count()
+    if count > length then count = length
+    for i = 0 to count - 1
+        buffer[offset + i] = m.inbox[i]
+    end for
+    rest = CreateObject("roByteArray")
+    for i = count to m.inbox.Count() - 1
+        rest.Push(m.inbox[i])
+    end for
+    m.inbox = rest
+    return count
+end function
+
+sub probeSocketClose()
+    m.closed = true
+end sub
+
+function probeSocket(id as Integer) as Object
+    return { id: id, inbox: CreateObject("roByteArray"), outbox: CreateObject("roByteArray"), room: -1, again: false, closed: false, wantsWritable: false, getID: probeSocketId, getReceivedFromAddress: probeSocketPeer, setMessagePort: probeSocketIgnore, notifyReadable: probeSocketIgnore, notifyWritable: probeSocketWritable, isWritable: probeSocketIsWritable, isReadable: probeSocketIsReadable, send: probeSocketSend, eAgain: probeSocketAgain, receive: probeSocketReceive, close: probeSocketClose }
+end function
+
+function probeListenerAccept() as Dynamic
+    socket = m.next
+    m.next = invalid
+    return socket
+end function
+
+function probeListenerIsReadable() as Boolean
+    return m.next <> invalid
+end function
+
+' ---- The Task
+
+sub probeStart(args as Object)
+    m.port = CreateObject("roMessagePort")
+    m.clock = { now: 0, TotalMilliseconds: probeClockNow }
+    m.connections = {}
+    m.bySocket = {}
+    m.nextId = 0
+    m.buffer = filledBuffer(RECEIVE_BYTES)
+    m.packet = filledBuffer(silocontrol.mdns.MAX_PACKET)
+    m.pairing = false
+    m.receiver = silocontrol.receiver.create({ deviceName: "Living Room", deviceId: "roku-1", origin: "https://silo.example.com", serverId: silocontrol.protocol.serverId("https://silo.example.com"), serverName: "silo.example.com", serverIdentity: "dep-1" })
+    m.receiver.stateText = silocontrol.protocol.state({ "title": "start" })
+    m.listener = { id: 1, next: invalid, getID: probeSocketId, accept: probeListenerAccept, isReadable: probeListenerIsReadable }
+    m.mdns = invalid
+    m.listenPort = FIRST_PORT
+    m.address = ""
+    m.txt = []
+    m.pairingKey = invalid
+    m.keyId = ""
+    if util.isString(args.pairingKey)
+        m.pairingKey = CreateObject("roByteArray")
+        m.pairingKey.FromHexString(args.pairingKey)
+        m.keyId = silocontrol.sealed.keyId(m.pairingKey)
+    end if
+    m.announceAt = []
+    m.addressCheckAt = 1000000000
+    m.probePhones = {}
+    m.probeSockets = 1
+end sub
+
+function probeConnect() as String
+    m.probeSockets = m.probeSockets + 1
+    socket = probeSocket(m.probeSockets)
+    m.listener.next = socket
+    probeEvent(m.listener.getID())
+    id = "c" + m.nextId.ToStr()
+    phone = { socket: socket, reader: silocontrol.protocol.reader(), keys: invalid, sendSeq: 0, recvSeq: 0, ok: true, held: [] }
+    m.probePhones[id] = phone
+    if m.pairingKey <> invalid
+        nonce = silocontrol.sealed.newNonce("phone " + id)
+        probeSend(id, silocontrol.sealed.hello(m.keyId, nonce))
+        ' The Roku's sealed_hello, then frames the phone opens once keyed.
+        phone.held = probeFrames(phone)
+        tvHello = silocontrol.sealed.readHello(phone.held.Shift().ToAsciiString())
+        phone.keys = silocontrol.sealed.sessionKeys(m.pairingKey, nonce, tvHello.nonce)
+    end if
+    probeSend(id, FormatJson({ "type": "hello", "v": 2, "hello": { "role": "phone", "deviceName": "Pixel " + id, "deviceId": "phone-" + id, "serverId": silocontrol.protocol.serverId("https://silo.example.com"), "supportedVersions": [2], "features": ["close_reason"] } }))
+    return id
+end function
+
+sub probePhone(id as String, text as String)
+    probeSend(id, text)
+end sub
+
+sub probeRoom(id as String, bytes as Integer)
+    socket = m.probePhones[id].socket
+    stalled = socket.room = 0
+    socket.room = bytes
+    if stalled and socket.isWritable() then probeEvent(socket.id)
+end sub
+
+function probeRead(id as String) as Object
+    phone = m.probePhones[id]
+    bodies = phone.held
+    phone.held = []
+    bodies.Append(probeFrames(phone))
+    texts = []
+    for each body in bodies
+        if phone.keys = invalid
+            texts.Push(body.ToAsciiString())
+        else
+            opened = silocontrol.sealed.open(phone.keys, silocontrol.sealed.FROM_TV, phone.recvSeq, body)
+            phone.recvSeq = phone.recvSeq + 1
+            if not opened.ok then phone.ok = false
+            texts.Push(opened.text)
+        end if
+    end for
+    return { texts: texts, ok: phone.ok }
+end function
+
+sub probeCommand(command as Object)
+    onCommand(command)
+    housekeeping()
+end sub
+
+sub probeElapse(ms as Integer)
+    m.clock.now = m.clock.now + ms
+    housekeeping()
+end sub
+
+function probeOpen(id as String) as Boolean
+    return m.connections.DoesExist(id) and not m.probePhones[id].socket.closed and m.receiver.controllers.DoesExist(id)
+end function
+
+' The phone sends text, sealed once the session is keyed.
+sub probeSend(id as String, text as String)
+    phone = m.probePhones[id]
+    if phone.keys = invalid
+        bytes = silocontrol.protocol.frame(text)
+    else
+        bytes = silocontrol.protocol.frameBytes(silocontrol.sealed.seal(phone.keys, silocontrol.sealed.FROM_PHONE, phone.sendSeq, text))
+        phone.sendSeq = phone.sendSeq + 1
+    end if
+    phone.socket.inbox.Append(bytes)
+    probeEvent(phone.socket.id)
+end sub
+
+' The bodies of the frames written to the phone since it last looked.
+function probeFrames(phone as Object) as Object
+    socket = phone.socket
+    count = socket.outbox.Count()
+    if count = 0 then return []
+    result = silocontrol.protocol.feed(phone.reader, socket.outbox, count)
+    socket.outbox = CreateObject("roByteArray")
+    return result.frames
+end function
+
+' One roSocketEvent through the Task's loop.
+sub probeEvent(socketId as Integer)
+    onSocket(socketId)
+    housekeeping()
+end sub

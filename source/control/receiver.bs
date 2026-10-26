@@ -6,7 +6,11 @@ import "pkg:/source/util/values.bs"
 ' hello, authorization, the heartbeat, the hello watchdog, the command
 ' budget, eviction, and closing. Pure: ControlTask passes its clock in
 ' milliseconds and carries out the actions each call returns, in order:
-'   { kind: "send", id, text }    frame text and send it to connection id
+'   { kind: "send", id, text }    frame text and send it to connection id;
+'                                 state: true marks a state, which a
+'                                 newer one may replace while unsent, and
+'                                 ping: true a ping, whose leaving the
+'                                 socket ControlTask reports (pingSent)
 '   { kind: "close", id, text }   send text ("" for none), then close id
 '                                 within protocol's grace
 '   { kind: "drop", id }          close id at once
@@ -63,7 +67,7 @@ namespace silocontrol.receiver
         end if
         if decision <> "admit" then actions.Append(closeController(state, decision, "too_many_controllers"))
         state.nextSeq = state.nextSeq + 1
-        state.controllers[id] = { id: id, seq: state.nextSeq, acceptedAt: now, didHello: false, authorized: false, handingOff: false, passive: false, deviceName: "", deviceId: "", serverId: "", serverIdentity: "", features: [], missed: 0, nextPingAt: now + PING_INTERVAL_MS, budget: silocontrol.policy.budget(), noticeAt: invalid }
+        state.controllers[id] = { id: id, seq: state.nextSeq, acceptedAt: now, didHello: false, authorized: false, handingOff: false, passive: false, deviceName: "", deviceId: "", serverId: "", serverIdentity: "", features: [], missed: 0, pingsOut: 0, nextPingAt: now + PING_INTERVAL_MS, budget: silocontrol.policy.budget(), noticeAt: invalid }
         actions.Push(send(id, silocontrol.protocol.hello(state.config)))
         actions.Push(controllersEvent(state))
         return actions
@@ -79,8 +83,12 @@ namespace silocontrol.receiver
         kind = decoded.type
         payload = decoded.payload
         if kind = "ping" then return [send(id, silocontrol.protocol.pong())]
+        ' A pong answers only a ping that left the Roku; any other is
+        ' ignored, so a peer that reads nothing cannot keep itself alive.
         if kind = "pong"
+            if controller.pingsOut = 0 then return []
             controller.missed = 0
+            controller.pingsOut = 0
             return []
         end if
         if kind = "close" then return dropController(state, id)
@@ -144,7 +152,7 @@ namespace silocontrol.receiver
     ' A newly authorized controller gets the state, and the TV announces it.
     function welcome(state as Object, controller as Object) as Object
         actions = []
-        if state.stateText <> "" then actions.Push(send(controller.id, state.stateText))
+        if state.stateText <> "" then actions.Push(sendState(controller.id, state.stateText))
         ' A passive controller (a silent auto-resume, an integration) is
         ' not announced on the TV.
         if not controller.passive then actions.Push({ kind: "emit", event: { type: "connected", id: controller.id, deviceName: controller.deviceName } })
@@ -154,6 +162,7 @@ namespace silocontrol.receiver
     ' The hello watchdog and the heartbeat: a connection silent past
     ' HELLO_WAIT_MS closes with reason timeout; each PING_INTERVAL_MS sends
     ' ping, and more than MAX_MISSED_PONGS unanswered drop the connection.
+    ' A ping counts as answered only by a pong after it left (pingSent).
     function tick(state as Object, now as Integer) as Object
         actions = []
         ids = []
@@ -171,7 +180,7 @@ namespace silocontrol.receiver
                     if controller.missed > MAX_MISSED_PONGS
                         actions.Append(dropController(state, id))
                     else
-                        actions.Push(send(id, silocontrol.protocol.ping()))
+                        actions.Push({ kind: "send", id: id, text: silocontrol.protocol.ping(), ping: true })
                     end if
                 end if
             end if
@@ -191,6 +200,12 @@ namespace silocontrol.receiver
         return wake
     end function
 
+    ' A ping to connection id has left the socket, so a pong may answer it.
+    sub pingSent(state as Object, id as String)
+        controller = state.controllers[id]
+        if controller <> invalid then controller.pingsOut = controller.pingsOut + 1
+    end sub
+
     ' The peer closed or the socket failed.
     function lost(state as Object, id as String) as Object
         return dropController(state, id)
@@ -200,7 +215,11 @@ namespace silocontrol.receiver
     ' each one authorized later.
     function setState(state as Object, text as String) as Object
         state.stateText = text
-        return broadcast(state, text)
+        actions = []
+        for each id in state.controllers
+            if state.controllers[id].authorized then actions.Push(sendState(id, text))
+        end for
+        return actions
     end function
 
     ' text to every authorized controller.
@@ -282,5 +301,9 @@ namespace silocontrol.receiver
 
     function send(id as String, text as String) as Object
         return { kind: "send", id: id, text: text }
+    end function
+
+    function sendState(id as String, text as String) as Object
+        return { kind: "send", id: id, text: text, state: true }
     end function
 end namespace

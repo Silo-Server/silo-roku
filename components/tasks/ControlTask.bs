@@ -29,6 +29,12 @@ const BACKLOG = 4
 const RECEIVE_BYTES = 8192
 ' A close frame waits this long to leave before the socket closes.
 const CLOSE_GRACE_MS = 500
+' A connection is closed once its unsent bytes, with any state held for it,
+' pass this, or once its socket has taken nothing for WRITE_STALL_MS while
+' bytes wait: a peer that reads too slowly is let go rather than queued for.
+' Above the largest frame.
+const MAX_QUEUED_BYTES = 131072
+const WRITE_STALL_MS = 10000
 ' How often the address is checked for a change (section 10).
 const ADDRESS_CHECK_MS = 5000
 ' Announcements go at once, then after these many more milliseconds.
@@ -42,7 +48,9 @@ sub serve()
     m.port = CreateObject("roMessagePort")
     m.top.observeFieldScopedEx("command", m.port)
     m.clock = CreateObject("roTimespan")
-    ' Connection ID to { id, socket, reader, queue, sent, closeAt }.
+    ' Connection ID to { id, socket, reader, queue, sent, queued, stalledAt,
+    ' pendingState, closeAt }: queue holds { bytes, ping } in order, sent
+    ' counts the first's bytes already sent, and queued all bytes unsent.
     m.connections = {}
     ' roSocket GetID() as text to connection ID.
     m.bySocket = {}
@@ -226,7 +234,7 @@ sub accept()
     end if
     socket.setMessagePort(m.port)
     socket.notifyReadable(true)
-    m.connections[id] = { id: id, socket: socket, reader: silocontrol.protocol.reader(), queue: [], sent: 0, closeAt: invalid, sealed: invalid, peer: peer }
+    m.connections[id] = { id: id, socket: socket, reader: silocontrol.protocol.reader(), queue: [], sent: 0, queued: 0, stalledAt: invalid, pendingState: invalid, closeAt: invalid, sealed: invalid, peer: peer }
     m.bySocket[socket.getID().ToStr()] = id
     if m.pairing
         runActions(silocontrol.pairing.accepted(m.receiver, id, peer))
@@ -352,24 +360,55 @@ sub lost(id as String)
     end if
 end sub
 
-sub enqueue(id as String, bytes as Object)
+sub enqueue(id as String, bytes as Object, ping = false as Boolean)
     connection = m.connections[id]
     if connection = invalid or util.isNumber(connection.closeAt) then return
-    connection.queue.Push(bytes)
+    queueBytes(connection, bytes, ping)
     flush(connection)
+    if m.connections.DoesExist(id) and connection.queued > MAX_QUEUED_BYTES then overrun(connection)
+end sub
+
+' Queues text for a connection, framed and sealed in the order it goes. A
+' state while frames wait is held unsealed, replacing any state held before
+' it; it is queued ahead of the next other frame or once the queue drains,
+' so sealed sequence numbers follow the order frames leave.
+sub queueText(connection as Object, text as String, isState as Boolean, isPing as Boolean)
+    if util.isNumber(connection.closeAt) then return
+    if isState and connection.queue.Count() > 0
+        connection.pendingState = text
+        if connection.queued + Len(text) > MAX_QUEUED_BYTES then overrun(connection)
+        return
+    end if
+    if connection.pendingState <> invalid
+        queueBytes(connection, frameFor(connection, connection.pendingState), false)
+        connection.pendingState = invalid
+    end if
+    enqueue(connection.id, frameFor(connection, text), isPing)
+end sub
+
+sub queueBytes(connection as Object, bytes as Object, ping as Boolean)
+    connection.queue.Push({ bytes: bytes, ping: ping })
+    connection.queued = connection.queued + bytes.Count()
 end sub
 
 ' Sends what the connection's queue holds, as far as the socket takes it,
-' and closes a closing connection once its queue is empty.
+' then the state held for it, and closes a closing connection once its
+' queue is empty.
 sub flush(connection as Object)
     socket = connection.socket
-    while connection.queue.Count() > 0
-        bytes = connection.queue[0]
+    while true
+        if connection.queue.Count() = 0
+            if connection.pendingState = invalid or util.isNumber(connection.closeAt) then exit while
+            queueBytes(connection, frameFor(connection, connection.pendingState), false)
+            connection.pendingState = invalid
+        end if
+        entry = connection.queue[0]
+        bytes = entry.bytes
         remaining = bytes.Count() - connection.sent
         written = socket.send(bytes, connection.sent, remaining)
         if written < 0
             if socket.eAgain()
-                socket.notifyWritable(true)
+                blocked(connection)
                 return
             end if
             ' A failed write is a lost peer: the receiver frees its slot and
@@ -378,16 +417,35 @@ sub flush(connection as Object)
             closeSocket(connection.id)
             return
         end if
+        if written > 0 then connection.stalledAt = invalid
         connection.sent = connection.sent + written
+        connection.queued = connection.queued - written
         if connection.sent < bytes.Count()
-            socket.notifyWritable(true)
+            blocked(connection)
             return
         end if
         connection.queue.Shift()
         connection.sent = 0
+        if entry.ping then silocontrol.receiver.pingSent(m.receiver, connection.id)
     end while
+    connection.stalledAt = invalid
     socket.notifyWritable(false)
     if util.isNumber(connection.closeAt) then closeSocket(connection.id)
+end sub
+
+' The socket took no more: wait until it is writable, timing the stall
+' from the last byte it took.
+sub blocked(connection as Object)
+    connection.socket.notifyWritable(true)
+    if not util.isNumber(connection.stalledAt) then connection.stalledAt = clockMs()
+end sub
+
+' A peer too slow to read what it is sent is closed at once, as a lost one:
+' a close frame would only wait behind the rest.
+sub overrun(connection as Object)
+    log.info("control", "closing a connection that is not reading", { id: connection.id, queued: connection.queued })
+    lost(connection.id)
+    closeSocket(connection.id)
 end sub
 
 sub closeSocket(id as String)
@@ -405,9 +463,10 @@ sub runActions(actions as Object)
         connection = invalid
         if util.isString(action.id) then connection = m.connections[action.id]
         if kind = "send"
-            if connection <> invalid then enqueue(action.id, frameFor(connection, action.text))
+            if connection <> invalid then queueText(connection, action.text, util.isTrue(action.state), util.isTrue(action.ping))
         else if kind = "close"
-            if action.text <> "" and connection <> invalid then enqueue(action.id, frameFor(connection, action.text))
+            if connection <> invalid then connection.pendingState = invalid
+            if action.text <> "" and connection <> invalid then queueText(connection, action.text, false, false)
             if connection <> invalid
                 connection.closeAt = clockMs() + CLOSE_GRACE_MS
                 if connection.queue.Count() = 0 then closeSocket(action.id)
@@ -432,6 +491,7 @@ sub housekeeping()
         if connection <> invalid and util.isNumber(connection.closeAt) and t >= connection.closeAt then closeSocket(id)
         ' A connection that never sent its sealed_hello.
         if connection <> invalid and connection.sealed <> invalid and connection.sealed.keys = invalid and t >= connection.sealed.deadline then closeSocket(id)
+        if m.connections.DoesExist(id) and util.isNumber(connection.stalledAt) and t - connection.stalledAt >= WRITE_STALL_MS then overrun(connection)
     end for
     if m.announceAt.Count() > 0 and t >= m.announceAt[0]
         m.announceAt.Shift()
@@ -444,7 +504,7 @@ sub housekeeping()
 end sub
 
 ' Milliseconds until the nearest deadline: a controller's tick, a closing
-' connection, an announcement, or the address check.
+' or stalled connection, an announcement, or the address check.
 function waitMs() as Integer
     if m.receiver = invalid then return 0
     t = clockMs()
@@ -453,8 +513,10 @@ function waitMs() as Integer
     if util.isNumber(wake) and wake < due then due = wake
     if m.announceAt.Count() > 0 and m.announceAt[0] < due then due = m.announceAt[0]
     for each id in m.connections
-        closeAt = m.connections[id].closeAt
+        connection = m.connections[id]
+        closeAt = connection.closeAt
         if util.isNumber(closeAt) and closeAt < due then due = closeAt
+        if util.isNumber(connection.stalledAt) and connection.stalledAt + WRITE_STALL_MS < due then due = connection.stalledAt + WRITE_STALL_MS
     end for
     remaining = due - t
     if remaining < 1 then remaining = 1

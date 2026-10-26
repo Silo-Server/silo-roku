@@ -303,7 +303,12 @@ wire examples as test fixtures. The Roku:
 - ignores an unknown `type` and an unknown `control.name`, and closes on a
   known type with a malformed payload;
 - answers `ping` with `pong`, pings every 3 seconds, and closes a controller
-  after more than 3 missed pongs; only a `pong` resets that count;
+  after more than 3 missed pongs; only a `pong` that arrives after a ping has
+  left the Roku's socket resets that count, so a peer that reads nothing
+  cannot stay connected by sending unasked pongs;
+- closes a controller at once, without a `close`, when more than 128 KB
+  waits to be sent to it or its socket takes nothing for 10 seconds while
+  frames wait;
 - applies tvOS's command budget: 20 commands a second, bursts of 40,
   `error rate_limited` at most once a second;
 - sends `close` with its reason before closing, under a 500 ms limit, and
@@ -312,7 +317,10 @@ wire examples as test fixtures. The Roku:
 ### 6.4 State
 
 The Roku sends `state` to every authorized controller every 500 ms while a
-title plays, after every command, and once on connecting. With no player it
+title plays, after every command, and once on connecting. While earlier
+frames to a controller still wait to be sent, only the newest `state` waits
+behind them; it is sealed and numbered when it is queued, ahead of any later
+reply, so sealed sequence numbers stay consecutive. With no player it
 sends the idle state tvOS sends. Fields:
 
 - `contentId`, `sessionId`, `title`, `subtitle` (the episode line),
