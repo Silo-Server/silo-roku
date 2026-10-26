@@ -184,11 +184,11 @@ lint, format, build, then `check:size` (the package stays under 3.5 MB),
 keys in the package), `check:sca` (Roku Static Analysis, failing on any error or
 memory-monitoring warning; report in `reports/sca.xml`), `check:contract`,
 `check:device-check` (the device lane's parser and its exit handling, without a
-device), and the tests. Static Analysis needs Java 21, unzip, and Python 3; it
-downloads `sca-cmd` once into `~/.cache/silo-roku/sca-cmd` (override with
-`SCA_CMD_CACHE_DIR`) and runs it only when its sha256 matches the pin in
-`scripts/sca.sh`. CI packages carry the run number as `build_version`; local
-builds keep the manifest's value.
+device), `check:header-probe` (the header probe's unit tests), and the tests.
+Static Analysis needs Java 21, unzip, and Python 3; it downloads `sca-cmd` once
+into `~/.cache/silo-roku/sca-cmd` (override with `SCA_CMD_CACHE_DIR`) and runs
+it only when its sha256 matches the pin in `scripts/sca.sh`. CI packages carry
+the run number as `build_version`; local builds keep the manifest's value.
 
 Sideloading replaces the single developer app slot on the device. The script
 checks the installer status, verifies the expected title and version in ECP,
