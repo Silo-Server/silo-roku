@@ -2173,10 +2173,21 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   where the sidecar drew cues (hardware run 22), so Roku reporting such a
   track does not show that it draws it. A track Roku still plays instead
   3 seconds after that selection is logged and left, with no further
-  selection on that load. A `finished` right after it is the client's doing and reloads
+  selection on that load; that check waits for a track change on its way,
+  as the one after a switch in place does. A `finished` right after it is the client's doing and reloads
   at the position (section 9.6), and the reload checks once again; after
   two such stops in a row with the same subtitle selected, the client
   makes no selection of its own for it until the viewer chooses a track.
+  In either case the client tells the viewer with the notice "Can't show
+  the selected subtitles.", which waits behind a busy status and goes if
+  Roku reports drawing the subtitle or the viewer chooses a track first,
+  and not again on a reload Roku still does not draw it on until the
+  viewer chooses a track. Until
+  Roku reports drawing it, or a plan selects no sidecar (Off, burned in,
+  or in the stream), Options and a phone's track list check no
+  subtitle, and Options reads "Not showing" on the chosen one, also when
+  the server refuses a track change meanwhile; choosing it again reloads
+  the plan's selection.
   A viewer's switch in place within the 3 seconds replaces the check with
   its own. Development builds log each `subtitleTrack` write and Roku's
   selected and playing tracks at debug level (listed names and `tmp:/`
@@ -2185,7 +2196,11 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   reloads at the position, as does one after which Roku still reports
   another of the content's sidecars (by any name containing its path, not
   a track Roku found in the stream) as the track it plays
-  (`currentSubtitleTrack`) 3 seconds later. That check waits for another
+  (`currentSubtitleTrack`) 3 seconds later; until that reload draws it,
+  or if the server refuses it, Options checks no subtitle as above. A
+  track Roku found in the stream reported then is left, with the notice
+  and Options as above.
+  That check waits for another
   track change the viewer made meanwhile: if the server refuses it, the
   switch is checked at the next position report; if it is accepted, its
   own selection is checked, or its new content replaces the check. The

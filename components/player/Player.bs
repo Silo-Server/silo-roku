@@ -364,6 +364,11 @@ sub init()
     ' finished right after the player changed it, and how many times in a
     ' row that happened with it selected; a viewer's track choice clears it.
     m.writeStops = { trackId: "", count: 0 }
+    ' The plan's subtitle (its track ID) Roku does not draw once the player
+    ' checked it, or "", and the one the viewer was told of since their last
+    ' track choice (subtitleShows).
+    m.unshownSubtitle = ""
+    m.subtitleNoticed = ""
     m.captionMode = ""
     m.videoMode = ""
     m.pauseLoad = invalid
@@ -1048,6 +1053,9 @@ sub playItem(item as Object, waitedMs as Dynamic)
     drawCaptions()
     m.video.content = item.content
     if item.track <> "" then setSubtitleTrack(item.track)
+    ' A plan with no sidecar (Off, burned in, or in the stream) leaves no
+    ' subtitle for the player to find not drawn (subtitleShows).
+    if playback.media.subtitleArtifact(item.plan) = invalid then subtitleShows(true)
     m.video.control = "play"
     ' The load's startup stall clock starts now (playback.session).
     dispatch({ type: "assigned", load: item.load })
@@ -1541,27 +1549,41 @@ end function
 ' (noteWrite), and the reload's content is checked once again; after
 ' WRITE_STOPS_QUIET such stops in a row with the subtitle selected, the
 ' player selects it on its own no more until the viewer chooses a track. A
-' track Roku still plays instead SUBTITLE_CHECK_MS after the write is
-' logged and left. A viewer's switch before the check replaces it
+' track Roku still plays instead SUBTITLE_CHECK_MS after the write, or
+' when the player selects no more, is left, and the viewer is told
+' (subtitleShows). A viewer's switch before the check replaces it
 ' (retrack).
 sub confirmSubtitle()
     if m.recheckAt <> invalid
-        if m.env.now() < m.recheckAt then return
+        ' A track change on its way checks its own selection, or, refused,
+        ' leaves this check to the next report (as checkSubtitle's).
+        if m.env.now() < m.recheckAt or playback.session.changingTracks(m.state) then return
         m.recheckAt = invalid
         if not isCurrent(m.activeLoad) then return
         logRokuSubtitle("after the selection")
-        if not subtitleDrawn() then log.info(LOG_TAG, "Roku still plays another subtitle track after the player selected the sidecar; left as it is", { playing: trackLabel(util.text(m.video.currentSubtitleTrack)) })
+        drawn = subtitleDrawn()
+        if not drawn then log.info(LOG_TAG, "Roku still plays another subtitle track after the player selected the sidecar; left as it is", { playing: trackLabel(util.text(m.video.currentSubtitleTrack)) })
+        subtitleShows(drawn)
         return
     end if
-    if m.subtitleConfirmed or m.settleUntil = invalid or holdsSubtitle() then return
+    if m.subtitleConfirmed
+        ' A subtitle Roku did not draw is checked again at each report.
+        if m.unshownSubtitle <> "" and m.activeTrack <> "" and isCurrent(m.activeLoad) and subtitleDrawn() then subtitleShows(true)
+        return
+    end if
+    if m.settleUntil = invalid or holdsSubtitle() then return
     m.subtitleConfirmed = true
     path = m.activeTrack
     if path = "" or not isCurrent(m.activeLoad) then return
     logRokuSubtitle("settled")
-    if subtitleDrawn() then return
+    if subtitleDrawn()
+        subtitleShows(true)
+        return
+    end if
     playing = trackLabel(util.text(m.video.currentSubtitleTrack))
     if m.writeStops.count >= WRITE_STOPS_QUIET and m.writeStops.trackId = playback.media.selectedSubtitle(m.state.plan.data)
         log.warn(LOG_TAG, "the sidecar is not selected again after Roku stopped its content twice", { playing: playing })
+        subtitleShows(false)
         return
     end if
     log.info(LOG_TAG, "Roku plays another subtitle track once the content settled; the sidecar is selected", { playing: playing })
@@ -1572,6 +1594,30 @@ end sub
 function subtitleDrawn() as Boolean
     return playback.sidecars.drawn(m.activeTrack, util.text(m.video.subtitleTrack), util.text(m.video.currentSubtitleTrack))
 end function
+
+' Whether Roku draws the plan's subtitle once the player has made the
+' selections it makes on its own (confirmSubtitle, checkSubtitle). One it
+' does not draw gets a notice, which waits behind a busy status
+' (playback.player's noticeShows), and Options checks no subtitle row for
+' it until Roku draws it or a plan selects no sidecar (playback.options'
+' unshownSubtitle); a track change the server refuses leaves that as it
+' is. A reload with it still not drawn says nothing again until the
+' viewer chooses a track or Roku draws it, and a notice still waiting when
+' either happens goes.
+sub subtitleShows(shown as Boolean)
+    trackId = ""
+    if not shown then trackId = playback.media.selectedSubtitle(m.state.plan.data)
+    if trackId = m.unshownSubtitle and trackId = m.subtitleNoticed then return
+    m.unshownSubtitle = trackId
+    m.subtitleNoticed = trackId
+    if trackId <> "" then notice(i18n.text("player.subtitleUnshown")) else dropSubtitleNotice()
+    refreshChrome()
+end sub
+
+' The notice subtitleShows raised goes, whether it shows or still waits.
+sub dropSubtitleNotice()
+    if m.flags.notice = i18n.text("player.subtitleUnshown") then m.flags.notice = ""
+end sub
 
 ' Whether the active content takes no subtitle selection the player makes
 ' on its own: from its start until SUBTITLE_SETTLE_MS after its first frame
@@ -1636,10 +1682,11 @@ end sub
 ' switch in place needs content that has played (playback.session's
 ' retrackRefusals), so its check comes after the settle time (holdsSubtitle). A
 ' track Roku found in the stream (hardware run 20's mkv/3) is not another
-' sidecar and is only logged. While another track change is on its way the
-' check waits for it (W11-3): its plan checks its own selection (retrack)
-' or loads new content, which ends the check, and a refusal leaves this one
-' to the next report.
+' sidecar: Roku draws it instead (hardware runs 21 and 22), so it is left
+' and the viewer is told (subtitleShows), with no reload. While another
+' track change is on its way the check waits for it (W11-3): its plan
+' checks its own selection (retrack) or loads new content, which ends the
+' check, and a refusal leaves this one to the next report.
 sub checkSubtitle()
     check = m.subtitleCheck
     if check = invalid or m.env.now() < check.at or playback.session.changingTracks(m.state) then return
@@ -1649,12 +1696,20 @@ sub checkSubtitle()
     other = playback.sidecars.trackPath(m.current.tracks, playing)
     if other = check.path then return
     if other = ""
-        if playing <> "" then log.info(LOG_TAG, "Roku reports a track of its own as playing after the switch; left as it is", { playing: playing })
+        if playing = "" then return
+        log.info(LOG_TAG, "Roku reports a track of its own as playing after the switch; left as it is", { playing: playing })
+        subtitleShows(false)
         return
     end if
     reload = playback.options.reloadSelection(m.state.plan.data)
-    if reload = invalid then return
+    if reload = invalid
+        subtitleShows(false)
+        return
+    end if
     log.info(LOG_TAG, "Roku did not switch the subtitle in place; the plan reloads", invalid)
+    ' Options checks no subtitle until the reload draws it, nor if the
+    ' server refuses it (subtitleShows).
+    m.unshownSubtitle = playback.media.selectedSubtitle(m.state.plan.data)
     dispatch(reload)
 end sub
 
@@ -1698,6 +1753,7 @@ sub retrack(command as Object)
     end if
     item.track = path
     m.activeTrack = path
+    if selectedId = "" then subtitleShows(true)
     ' The viewer's choice, made whenever it comes; its own check replaces
     ' the one after the content settles.
     selectSubtitle(path)
@@ -2126,7 +2182,8 @@ function optionsState() as Object
         contentTracks: contentTracks,
         rokuSubtitles: m.video.availableSubtitleTracks,
         subtitleLanguage: playback.options.subtitleOrderLanguage(m.watch),
-        burnWanted: m.burnWanted
+        burnWanted: m.burnWanted,
+        unshownSubtitle: m.unshownSubtitle
     }
 end function
 
@@ -2224,11 +2281,15 @@ sub setCaptionMode(mode as String)
 end sub
 
 ' The viewer chose a track; a subtitle replaces one captions Off set aside,
-' and the player selects its sidecar on its own again (confirmSubtitle).
+' and the player selects its sidecar on its own again (confirmSubtitle),
+' telling the viewer again if Roku still does not draw it (subtitleShows)
+' and dropping a notice about the track before.
 sub trackChosen(subtitle as Boolean)
     if subtitle then m.burnWanted = invalid
     m.followedMode = invalid
     m.writeStops = { trackId: "", count: 0 }
+    m.subtitleNoticed = ""
+    dropSubtitleNotice()
 end sub
 
 ' Roku's caption mode changed without a track choice, or a plan arrived
@@ -2752,6 +2813,8 @@ sub clearSession()
     m.recheckAt = invalid
     m.wroteAt = invalid
     m.writeStops = { trackId: "", count: 0 }
+    m.unshownSubtitle = ""
+    m.subtitleNoticed = ""
     m.pauseLoad = invalid
     m.flags = newFlags()
     m.noticeClock = playback.player.newNoticeClock(0)
