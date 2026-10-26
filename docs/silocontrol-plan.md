@@ -8,7 +8,10 @@
 receiver does; this plan says in what order it is built and how each step is
 shown to work. It is Milestone 5 and starts after the first public release
 (spec section 3.3), except the spikes in phase C0 and the Roku question,
-which can run earlier.
+which can run earlier. (Superseded by decision D-7 in
+[`implementation-assumptions.md`](implementation-assumptions.md): the
+receiver and handoff were built ahead of that schedule and ship in every
+build, the first public release included.)
 
 A section number with an R (R8.1) is in [`silocontrol.md`](silocontrol.md);
 "spec section" means [`spec.md`](spec.md).
@@ -115,7 +118,7 @@ plays as the same choice from the detail screen would.
 | --- | --- |
 | C5-1 | Auth coordinator: the borrowed identity lane (R8.3): memory only, its own refresh lane, the player's requests tagged to it, logout on end; tests that the registry and remembered profile never change |
 | C5-2 | `source/control/handoff.bs` (R8.2): capability, start, challenge, poll, cancel, ready, reuse, the 60-second launch timeout, `temporary_session_expired` |
-| C5-3 | "Playing as" card; the `handoff` build switch (on in `dev` and `beta`, off in `release` until the decision in section 6) |
+| C5-3 | "Playing as" card; the `handoff` build switch (on in `dev` and `beta`, off in `release` until the decision in section 6; on in every build since D-7) |
 | C5-4 | Node controller: handoff with a second test account's profile (approve-handoff), including a PIN profile |
 
 Exit, on both devices:

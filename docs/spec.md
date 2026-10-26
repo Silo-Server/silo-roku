@@ -2,7 +2,7 @@
 
 **Status:** Draft for implementation planning
 
-**Last updated:** 2026-10-22
+**Last updated:** 2026-10-25
 
 **Owner:** Silo Roku client
 
@@ -131,7 +131,11 @@ Play:
 Platform:
 
 - deep links and Direct to Play as Roku certification requires;
-- Roku's caption and accessibility settings respected.
+- Roku's caption and accessibility settings respected;
+- the SiloControl receiver: a Silo phone app on the network controls
+  playback, launches titles, and hands off its profile
+  ([`silocontrol.md`](silocontrol.md)), on in every build since 2026-10-25
+  (decision D-7, section 15).
 
 Section 5 describes how each of these looks and behaves.
 
@@ -139,9 +143,9 @@ Section 5 describes how each of these looks and behaves.
 
 - multiple saved Silo servers;
 - local-network discovery of Silo servers, and DIAL;
-- the SiloControl receiver (phone remote, its own DNS-SD advertisement, and
-  profile handoff), planned in
-  [`silocontrol.md`](silocontrol.md) and [`silocontrol-plan.md`](silocontrol-plan.md);
+- SiloControl's Require Pairing (the `sealed` level), offered only in
+  development builds until the phone apps speak it, and cross-server handoff
+  ([`silocontrol.md`](silocontrol.md) section 13);
 - favorites, watchlist, and watched toggles; the history screen (server rows
   that contain this data still display on Home);
 - collection creation and editing, people search results and full person pages, trailers,
@@ -198,10 +202,11 @@ The first implementation uses:
   current 512 MB models.
 
 Roku's Static Analysis rules fix the platform floor. The manifest declares
-`rsg_version=1.3` and a minimum firmware version of 15.1.0, and the app
-registers for the memory monitor APIs (`roAppMemoryMonitor`). Roku's Static
-Analysis page schedules all three to become publishing-blocking errors on
-2026-10-01.
+`rsg_version=1.3`, the Developer Dashboard's Package page sets a minimum
+firmware version of 15.1.0 (it is not a manifest key; release checklist
+section 3), and the app registers for the memory monitor APIs
+(`roAppMemoryMonitor`). Roku's Static Analysis page schedules all three to
+become publishing-blocking errors on 2026-10-01.
 Memory threshold events arrive only from Roku OS 15.2, so the client also
 handles the general low-memory event. The package must stay within Roku's
 4 MB limit. The support claim covers every model that runs the minimum Roku OS
@@ -1174,7 +1179,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | --- | --- | --- |
 | QR or device-code sign-in is the default; password is the alternative | Password sign-in, or a code shown only when a Silo phone app on the network offers to sign the Roku in (companion sign-in) | Certification criterion 2.2 (section 7.2) |
 | "Set up with your phone" and network discovery lead server setup | Address entry, or a Silo phone app pushes the server (companion sign-in); no discovery of servers | Discovery deferred (section 3.3) |
-| The TV's remote-control standby screen takes over while a phone is connected | No Connect a Phone entry is exposed in the avatar menu; the pairing route remains implemented. A phone connecting shows "<phone> connected" for four seconds and nothing else changes | The avatar menu omits the pairing entry for the first release. Roku apps cannot be opened by a phone (no ECP from phone apps), so there is nothing to stand by for; `docs/silocontrol.md` section 4 |
+| The TV's remote-control standby screen takes over while a phone is connected | No Connect a Phone entry is exposed in the avatar menu; the pairing route remains implemented. A phone connecting shows "<phone> connected" for four seconds and nothing else changes | The avatar menu omits the pairing entry for the first release. Roku apps cannot be opened by a phone (no ECP from phone apps), so there is nothing to stand by for; `docs/silocontrol.md` section 4 (every build since decision D-7) |
 | A phone's profile handoff shows a "Playing as" card for six seconds | The player's notice card says "Playing as <profile> · From <phone>" for four seconds | The notice card is the player's one non-focusable card; `docs/silocontrol.md` section 4.2 |
 | The sign-in screens offer phone sign-in over TLS (`_silopair._tcp`) and show the code in their own card | A phone push opens a Companion screen over the server or sign-in screen: Allow / Don't Allow, the check, then the code and match words; the card says "Use your phone"; the service is `_silopair-roku._tcp` over plain TCP | Roku has no TLS on listening sockets, and the sign-in screen shows no code until a phone asks for one; `docs/companion-pairing.md` |
 | Custom PIN keypad | Roku `DynamicPinPad` inside the same layout | Criterion 4.12 requires Roku keyboards for PINs |
@@ -2301,11 +2306,14 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   should draw: subtitles off, a burned-in subtitle, or a selected sidecar
   still downloading, failed, or off the configured origin. It is cleared
   only for the plan's sidecar on the content, selected by the `TrackName`
-  Roku lists for it (above), and for the HLS rendition in a transcode's stream.
-  Roku's caption modes (Off, On, On replay, On mute) then govern only that
-  subtitle, and Off in Options shows none under any of them. An embedded
-  text track the viewer chooses arrives as the server's extracted sidecar
-  (its inventory `url`), as any other sidecar: the client advertises no
+  Roku lists for it (above), and for the HLS rendition in the stream (a
+  transcode's, or a copy remux's from a server that advertises
+  `hls_remux_subtitle_renditions_v1`, assumption AG-316). Roku's caption
+  modes (Off, On, On replay, On mute) then govern only that subtitle, and
+  Off in Options shows none under any of them. An embedded text track the
+  viewer chooses arrives as that rendition in those two cases and
+  otherwise as the server's extracted sidecar (its inventory `url`), as
+  any other sidecar: the client advertises no
   `native_embedded` subtitle capability and never selects one of Roku's own
   container tracks, because Roku documents no `TrackName` for them that
   could be matched to the server's `stream_index` or `container_track_id`
@@ -2333,16 +2341,24 @@ Each path is tested for direct and HLS playback, seeking, resume offsets,
 Unicode, position, and Roku caption-mode changes. If none works reliably, the
 fallback requires a coordinated server contract change before implementation.
 
-Until that proof exists, the Roku capability declaration is conservative:
+The third path is the one that shipped: the client downloads the plan's
+sidecars on the configured origin into `tmp:/` and gives Roku local SRT
+files (section 12.5). Every build declares, for `original_http` and `hls`
+(`source/playback/capabilities.bs`):
 
-- `sidecar_text`: false in production capability reports;
+- `sidecar_text`: true (false only on the disabled `progressive` delivery);
+- `embedded_text`: false (no `native_embedded`, above);
 - `ass_styling`: false;
 - `embedded_bitmap` and `sidecar_bitmap`: false;
 - `font_attachments`: false.
 
-ASS/SSA and bitmap subtitles always request server conversion or burn-in. The
-client respects Roku's global caption mode and caption style settings instead
-of creating a second competing caption preference.
+With `sidecar_text` advertised, the server sends an ASS/SSA track that
+arrives as a sidecar as its extracted `.ass` (assumption AG-216), which the
+client converts to SRT cues on the device, text and timing only (section
+12.5); an embedded one carried as an HLS rendition (above) is converted to
+WebVTT by the server. Bitmap subtitles request a server burn-in. The client
+respects Roku's global caption mode and caption style settings instead of
+creating a second competing caption preference.
 
 ### 9.8 Markers and next episode
 
@@ -2538,9 +2554,9 @@ Subtitle sources:
 | Source | What the viewer gets | Cohorts | Evidence |
 | --- | --- | --- | --- |
 | External or downloaded SRT | The original file (`subrip_sidecar_v1`), downloaded to `tmp:/` with its cues moved onto the plan's timeline and their ASS override tags (`{\an8}`) removed, shown as a Roku SRT track | All | Roku TV: runs 1, 4, 6 (T3), 7 (T1d); tag removal headless only |
-| Embedded text on an original or copy remux | The server's WebVTT sidecar, shifted with `timestamp_offset` and converted to SRT; "Loading subtitles…" until the server's first extraction ends (assumption A-15), then one reload at the position carries it (section 9.7). Roku never draws the container's own copy of the track (`suppressCaptions`, section 9.7), so Off shows none under any caption mode | All | Roku TV: runs 1 (first extraction about 65 s), 4; run 16 (T2l) failed before `suppressCaptions`, not yet re-run; run 19 (T6) stopped when the sidecar came, before the reload (AG-201), not yet re-run |
-| Embedded text on a transcode | The WebVTT rendition inside the HLS stream (`hls_subtitle_renditions_v1`), which Roku shows while captions are on | All | Roku TV: run 4 fetched the rendition; its cues were not checked |
-| ASS/SSA | Converted to SRT on the device: text and timing only; styling, positions, effects, and drawings are dropped, and a sign repeated per frame or layer is one cue | All | None since the conversion landed; runs 22 and 23 refused a typeset track by size before converting it |
+| Embedded text on an original, or on a copy remux from a server without `hls_remux_subtitle_renditions_v1` | The server's WebVTT sidecar, shifted with `timestamp_offset` and converted to SRT; "Loading subtitles…" until the server's first extraction ends (assumption A-15), then one reload at the position carries it (section 9.7). Roku never draws the container's own copy of the track (`suppressCaptions`, section 9.7), so Off shows none under any caption mode | All | Roku TV: runs 1 (first extraction about 65 s), 4; run 16 (T2l) failed before `suppressCaptions`, not yet re-run; run 19 (T6) stopped when the sidecar came, before the reload (AG-201), not yet re-run |
+| Embedded text on a transcode, or on a copy remux from a server that advertises `hls_remux_subtitle_renditions_v1` | The WebVTT rendition inside the HLS stream (`hls_subtitle_renditions_v1`, with `hls_remux_subtitle_renditions_v1` for a remux), which Roku shows while captions are on | All | Roku TV: run 4 fetched a transcode's rendition; its cues were not checked. Ultra: a remux's rendition played (assumption AG-316); its cues were not checked |
+| ASS/SSA | As a sidecar, the raw `.ass` (assumption AG-216), converted to SRT on the device: text and timing only; styling, positions, effects, and drawings are dropped, and a sign repeated per frame or layer is one cue. An embedded track on a transcode, or on a copy remux from a server that advertises `hls_remux_subtitle_renditions_v1`, arrives instead as the stream's WebVTT rendition, converted by the server (row above) | All | Roku TV: runs 24 (T1, a 10.24 MiB typeset track converted on all 16 starts and picks, cues drawn as plain text) and 26 (T2, reused in the session and converted again after a relaunch); runs 22 and 23 refused that track by size before converting it |
 | Bitmap (PGS, VobSub) | Burned in by a server transcode, following captions as Off or On only (section 9.7) | All | Roku TV: runs 4, 6 (T3) |
 | Forced subtitles | As their format; shown only while captions are on (assumption AG-75) | All | Roku TV: run 6 (T7) |
 
@@ -2662,11 +2678,12 @@ the TV.
 
 ## 14. Server coordination
 
-Sign-in needs `request_origin` in `GET /api/v2/system/info` (section 7.1).
-Nothing else in the server needs to change for sign-in, browse, or playback:
-`X-Silo-Device-Platform` is free text, and device registration, rate limits,
-and CORS have no platform allowlist. The following follow-ups are tracked with
-the server:
+Nothing in the server needs to change for sign-in, browse, or playback.
+`request_origin` in `GET /api/v2/system/info` (S-20, merged 2026-10-25) is
+checked when the server reports it, and a server too old to report it is
+accepted with a warning (section 7.1). `X-Silo-Device-Platform` is free
+text, and device registration, rate limits, and CORS have no platform
+allowlist. The following follow-ups are tracked with the server:
 
 - add `roku` to the v2 migration ledger's consumers, with `silo-roku` as its
   source tree;
@@ -2719,7 +2736,7 @@ the server:
 | Device-code sign-in | Development and beta only, except companion sign-in (section 7.2) | None: Roku allows rendezvous linking only in TVE apps (section 7.2) |
 | Reviewer test server | Required; owner not yet assigned | An owner and a host |
 | Media authentication | `HttpHeaders` on the `ContentNode` | Milestone 0 header test |
-| Side-loaded subtitles | Disabled until proven | Section 9.7 matrix |
+| Side-loaded subtitles | Advertised (`sidecar_text`); each sidecar is downloaded and shown as a local SRT track (section 9.7) | Section 12.5 matrix on the cohorts other than the Roku TV |
 | PIN prompt on deep link | Prompt for the remembered profile's PIN | Roku answer |
 | AC-3/E-AC-3 passthrough | Disabled until proven | Codec/output-change hardware tests |
 | Dolby Vision and advanced HDR | Claimed where the probe and display report them (section 9.2) | Dolby Vision on AV1 (profile 10); HDR10+ on a display that reports it |

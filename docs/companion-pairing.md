@@ -103,10 +103,13 @@ objects with `type` and `v: 1`:
    closes. Consent covers the rest of the session.
 2. **Check the server.** The pushed address goes through the same checks as a
    typed one (spec section 7.1): `GET /api/v2/system/info` with `api_major`
-   2 and `request_origin` equal to the address. Failing those is
-   `update_required` (an old server) or `unreachable` (no answer). When the
-   push names a `serverIdentity`, `GET /api/v2/system/identity` must answer
-   with it, else `identity_mismatch`.
+   2 and, when the server reports it, `request_origin` equal to the address
+   (a server too old to report it is accepted with a warning, decision D-7
+   in [`implementation-assumptions.md`](implementation-assumptions.md)).
+   Failing those is `update_required` (an old server) or `unreachable` (no
+   answer). When the push names a `serverIdentity`,
+   `GET /api/v2/system/identity` must answer with it, else
+   `identity_mismatch`.
    - **Unreachable with alternates.** If the pushed address gives no answer
      and the push listed `endpoints`, the Roku checks them in order for the
      same identity and offers the first that matches: "Can't reach

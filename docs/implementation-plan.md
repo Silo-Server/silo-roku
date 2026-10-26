@@ -773,9 +773,11 @@ decisions, following protocol section 5 and each returned plan's `timeline`:
 
 ### 6.8 Subtitles
 
-With `sidecar_text: false` (the spec's current default), selecting an external
-SRT is a terminal error and selecting an embedded text track forces an SDR
-burn-in transcode, so subtitles are a Milestone 0a gate (G13).
+With `sidecar_text: false` (the spec's default when this plan was written),
+selecting an external SRT is a terminal error and selecting an embedded text
+track forces an SDR burn-in transcode, so subtitles were a Milestone 0a gate
+(G13). Since decision D-7 (`implementation-assumptions.md`) G13 is gone and
+every build sends the request below (spec section 9.7).
 
 - **Request:** `subtitle_fidelity_preference: "compatible"`; `sidecar_text: true`
   on every enabled delivery; `ass_styling`, `font_attachments`, `embedded_bitmap`
@@ -1157,7 +1159,7 @@ behaviour behind each was traced on `origin/main` on 2026-10-21.
 | ID | Title | Roku impact | Priority |
 | --- | --- | --- | --- |
 | S-15 | Let v3 clients request MPEG-TS packaging for copy remuxes (the executor already supports it as `CopyVideoMPEGTS`; only the Jellyfin-compatibility layer sets it) | Every copy remux, H.264 included, if H19 shows muxed fMP4 audio fails | Blocking if H19 fails |
-| S-20 | Authenticated `/api/v2` and media routes never redirect off-origin or to HTTP, and the setup check refuses an origin that redirects | Credential confinement if H1 shows Roku forwards headers on redirects | Blocking if H1 shows forwarding |
+| S-20 | Authenticated `/api/v2` and media routes never redirect off-origin or to HTTP, and the setup check refuses an origin that redirects | Credential confinement if H1 shows Roku forwards headers on redirects | Merged (silo-server #3023, 2026-10-25) |
 | S-9 | A short-lived, session- and profile-bound media token for players that cannot set headers on HLS child requests; `?token=` works today but puts the 8-hour account token in every segment URL | Needed only if H1 shows headers missing on API-origin media | Blocking if H1 fails |
 | S-21 | Let clients opt out of `#EXT-X-DEFINE` playlist compaction (a client feature such as `hls_no_variable_substitution_v1`), or move the signed token out of segment queries | Needed if H2 shows Roku cannot parse `#EXT-X-DEFINE`; otherwise long signed HLS titles fail | Blocking if H2 fails |
 | S-4 | Publish a multivariant HLS master with `CODECS`, `VIDEO-RANGE`, and `SUPPLEMENTAL-CODECS`, optionally with demuxed audio as an `EXT-X-MEDIA:TYPE=AUDIO` rendition | Needed if H3 shows Roku will not enter HDR or DV mode from a bare media playlist; an alternative fix for H19 | High if H3 or H19 fail |
@@ -1219,7 +1221,7 @@ records the answers and the assumptions made since.
 | Trickplay when a server has none | **Decided (D-5):** the server provides trickplay; files without sheets show time only with an explanation; Roku is asked, but release does not wait |
 | App-rendered captions if native subtitle paths fail H14 | Open: do not adopt silently; decide with the H14 results, since it gives up Roku's caption styles |
 | Devices without multichannel AAC | **Decided (D-6):** interim stereo conversion until S-13: `max_channels: 2` when the selected track is converted or is multichannel AAC, and a stop-and-restart with the ceiling when a plan returns multichannel AAC (one extra round trip). Alternatives: an `output_change` replan (verified only in the planner, and the output has not changed), or making S-13 a beta blocker |
-| Server issues | Drafts only (assumption A-1): S-15, S-20, S-21, S-4, S-1, S-11, S-13, S-12; file when the maintainers agree |
+| Server issues | Drafts only (assumption A-1): S-15, S-21, S-4, S-1, S-11, S-13, S-12; file when the maintainers agree. S-20 is merged (silo-server #3023, 2026-10-25) |
 | Prior community client (whitepeakcreative/silo-roku, AGPL-3.0-or-later) | Reuse lessons, not code |
 | Owners | Open (assumption A-7): Roku account, signing-key custody, `sca-cmd` mirror, reviewer server, device purchases, activated server dependencies (section 9.1) |
 

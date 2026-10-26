@@ -1,11 +1,11 @@
 # SiloControl receiver for Roku
 
-**Status:** Implemented in development builds (bs_const `silocontrol` and
-`handoff`). Tested on a Roku Ultra with the development phone script
-(`scripts/silocontrol-phone.mjs`), after the discovery spike on a TCL Roku
-TV (section 5.1); not yet with the Silo phone apps or on low-memory hardware
+**Status:** Implemented in every build (bs_const `silocontrol` and
+`handoff`, on since 2026-10-25, decision D-7). Tested on a Roku Ultra with
+the development phone script (`scripts/silocontrol-phone.mjs`), after the
+discovery spike on a TCL Roku TV (section 5.1); not yet with the Silo phone apps or on low-memory hardware
 
-**Last updated:** 2026-10-24
+**Last updated:** 2026-10-25
 
 **Companion to:** [`spec.md`](spec.md) (product and platform rules) and
 [`silocontrol-plan.md`](silocontrol-plan.md) (build order). This document
@@ -72,9 +72,10 @@ What other apps did:
 
 How this design limits the exposure:
 
-- On-device password sign-in stays the only way to sign the Roku in. A
-  handoff never writes the Roku's registry, never changes its saved account or
-  remembered profile, and ends when its playback ends.
+- Only the Roku's own sign-in, password on the device or companion sign-in
+  ([`companion-pairing.md`](companion-pairing.md)), saves an account on the
+  Roku. A handoff never writes the Roku's registry, never changes its saved
+  account or remembered profile, and ends when its playback ends.
 - A phone on the profile the Roku already has open needs no handoff at all
   (section 8.1).
 - A build switch, `handoff`, is on in every build: the project owner
@@ -111,11 +112,11 @@ Its setup layout (spec section 5.4) contains:
 - the phones connected now, by device name;
 - under "Phone can't find this TV?", a QR code of the pairing link (section
   5.3) and the address (`192.168.1.20:52817`);
-- Require Pairing (off by default, section 9.4); when on, the QR code also
-  carries the pairing key, the key shows in groups of four, and Reset
-  Pairing Code disconnects every phone and draws a new key. Until the phone
-  apps speak `sealed`, only development builds offer these two buttons;
-  every build has Done.
+- in development builds only, Require Pairing (off by default, section
+  9.4); when on, the QR code also carries the pairing key, the key shows in
+  groups of four, and Reset Pairing Code disconnects every phone and draws a
+  new key. Until the phone apps speak `sealed`, release builds have no
+  Require Pairing control; every build has Done.
 
 The screen follows address changes as they happen. Back returns to the
 previous screen. Connected phones stay connected while the viewer browses.

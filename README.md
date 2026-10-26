@@ -3,13 +3,18 @@
 Native Roku client for the [Silo](https://github.com/Silo-Server/silo-server)
 self-hosted media server.
 
-> **Status:** Design and platform-validation phase. The repository contains a
-> sideloadable feasibility app that reports the device's display and decoder
-> capabilities; it does not talk to a Silo server yet.
+> **Status:** Pre-release; not yet submitted to Roku. The app signs in to a
+> Silo server, browses, searches, and plays movies and TV through playback
+> protocol v3. Every build runs companion sign-in and, since decision D-7 in
+> [`implementation-assumptions.md`](docs/implementation-assumptions.md), the
+> SiloControl receiver.
+> Hardware testing so far used a Roku TV and a Roku Ultra, nearly all of it
+> in development builds; [`release-checklist.md`](docs/release-checklist.md)
+> lists what still blocks a beta.
 
-The client will be built with Roku SceneGraph and BrightScript. The proposed
-MVP, architecture, Silo API integration, playback behavior, certification
-risks, and delivery milestones are captured in the
+The client is built with Roku SceneGraph and BrightScript. The first
+release's scope, architecture, Silo API integration, playback behavior,
+certification risks, and delivery milestones are captured in the
 [client specification](docs/spec.md).
 
 ## Intended project layout
@@ -247,11 +252,12 @@ playback starts or the player shows an error.
 
 ### Phone remote (SiloControl)
 
-Development builds (`npm run sideload:dev`) run the SiloControl receiver
-(`docs/silocontrol.md`): once signed in, the app listens on TCP 52817 and
-advertises `_silocast-roku._tcp` over multicast DNS, and the avatar menu has
-Connect a Phone. Release builds leave it out until the build switches
-`silocontrol` and `handoff` in `manifest` are turned on.
+Every build runs the SiloControl receiver (`docs/silocontrol.md`), since
+the `silocontrol` and `handoff` build switches in `manifest` are on
+(decision D-7): once signed in, the app listens on TCP 52817 and advertises
+`_silocast-roku._tcp` over multicast DNS. The Connect a Phone screen remains
+implemented but has no avatar-menu entry; only development builds
+(`npm run sideload:dev`) offer Require Pairing on it.
 
 `npm run silocontrol -- <options> <steps>` plays a phone's part against the
 Roku in `.env`, through `ROKU_DEPLOY_VIA` when set. It prints every frame the

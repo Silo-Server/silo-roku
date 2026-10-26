@@ -2,7 +2,7 @@
 
 **Status:** Draft for Milestone 4 (beta and public readiness)
 
-**Last updated:** 2026-10-25 (section 1 items 1 and 2, rows 2.2 and 4.15; other rows still as of 2026-10-22, against integration commit `f1d9d9b`)
+**Last updated:** 2026-10-25 (section 1 items 1 and 2, rows 2.2 and 4.15, and section 7's device, token-refresh, and API-restart rows; other rows still as of 2026-10-22, against integration commit `f1d9d9b`)
 
 **Companion to:** [`spec.md`](spec.md) sections 10–13 and
 [`implementation-plan.md`](implementation-plan.md) sections 7, 9.1, and 9.2.
@@ -70,7 +70,7 @@ Source for every row: Roku certification criteria,
 | --- | --- | --- | --- | --- |
 | 1.1 | Video ads follow Roku's ad requirements | No ads | — | N/A |
 | 2.1 | Transactional apps use Roku Pay | Free, nothing for sale | — | N/A |
-| 2.2 | On-device authentication only; no off-device sign-up, sign-in, or activation | Password sign-in with Roku's `DynamicKeyboard` (spec 7.2). Companion sign-in (a phone approves a device login) and profile handoff ship in public builds by the owner's decision (spec 7.2, D-7) before Roku answers Q10. A server without password sign-in gets an explanation and stops | Hardware runs 4 and 5, onboarding rows | At risk, owner-accepted |
+| 2.2 | On-device authentication only; no off-device sign-up, sign-in, or activation | Password sign-in with Roku's `DynamicKeyboard` (spec 7.2). Companion sign-in (a phone approves a device login) ships in public builds by the owner's decision (spec 7.2), and profile handoff by D-7, both before Roku answers Q10. A server without password sign-in gets an explanation and stops | Hardware runs 4 and 5, onboarding rows | At risk, owner-accepted |
 | 2.3 | Instant Signup for SVOD above 10M hours a month | Not SVOD | — | N/A |
 | 2.4 | No nested apps, browsers, embedded screens, or cross-app features | None. The typed server address is a separate question (section 1, item 5) | Code | Met, pending Roku's answer on the typed address |
 | 2.5 | Disclose any payment SDK | None | — | N/A |
@@ -228,22 +228,26 @@ Plan section 9.1 wanted the store listing inputs by Milestone 3. Status:
 
 ## 7. Device matrix
 
-Spec section 12.4 and plan section 3. Every hardware row so far comes from one
-device, over plain HTTP, to one lab server with no proxy node, using dev
-builds.
+Spec section 12.4 and plan section 3. Every hardware row so far comes from
+dev builds, except runs 4 and 5's release cold launches and the `perf` builds
+(the release configuration with `perf` on) of runs 10 and 19's T7. Runs 1–28
+used the Roku TV: through run 21 against the lab server, whose proxy node was
+off except for run 10's T5, and from run 22 against a Silo development server
+that routes plans through proxy nodes. Runs 29 and 30 used the Ultra, run 30
+against that development server (run 29 does not name its server).
 
 | Role | Device | Tested |
 | --- | --- | --- |
-| Roku TV | TCL 55R625 (A109X), Roku OS 15.3.4, 4K panel with HDR10, HLG, and Dolby Vision, TV speakers | Runs 1–8 |
+| Roku TV | TCL 55R625 (A109X), Roku OS 15.3.4, 4K panel with HDR10, HLG, and Dolby Vision, TV speakers | Runs 1–28 |
 | 512 MB current player | Streaming Stick 3840X | No |
 | 512 MB slow CPU | Express 3930X or 3900X | No |
 | Non-OpenGL | Express 3710X/3700X or Roku TV 5000X | No |
 | Certification reference | Streaming Stick+ 3810X or Premiere+ 3921X (Roku measures 3.2–3.6 on these) | No |
 | 4K player without Dolby Vision | Streaming Stick Plus 3830X or Express 4K+ | No |
 | 4K Dolby Vision player | Streaming Stick 4K 3820X | No |
-| Flagship | Ultra 4850X/4850R | No |
-| Sinks | Dolby Vision TV on a player, HDR10-only TV, SDR 1080p TV, Atmos AVR or soundbar, DTS sink | No (TV speakers only; audio never heard) |
-| Roku OS | 15.1 floor, current 15.x, 16.0 | 15.3.4 only |
+| Flagship | Ultra 4850X/4850R | Ultra 4850X, Roku OS 16.0.4: runs 29 (Settings, TV layout) and 30 (format claims) |
+| Sinks | Dolby Vision TV on a player, HDR10-only TV, SDR 1080p TV, Atmos AVR or soundbar, DTS sink | Dolby Vision TV on the Ultra (run 30); no other sink (TV speakers only; audio never heard) |
+| Roku OS | 15.1 floor, current 15.x, 16.0 | 15.3.4 (Roku TV) and 16.0.4 (Ultra); not the 15.1 floor |
 
 Spec 12.4 per-device list, on the Roku TV:
 
@@ -259,8 +263,8 @@ Spec 12.4 per-device list, on the Roku TV:
 | HLS remux and transcode | PASS in dev builds (runs 3–5) |
 | AC-3/E-AC-3 fallback, output-route changes | Decode reported (runs 2, 4, 5); output changes never run (H13) |
 | Seek, pause/resume, Replay | PASS (runs 5, 6) |
-| Long playback across a token refresh | FAIL (run 8 T1a, T1b); fix verified headless only |
-| API restart during playback | PASS (run 8 T2a, T2b); resume point regression T2c, fix headless only |
+| Long playback across a token refresh | FAIL in run 8 (T1a, T1b); PASS after the fix in runs 9 and 10 (T1a) and run 19 (T4, renewal while buffering) |
+| API restart during playback | PASS (run 8 T2a, T2b); run 8's T2c resume-point regression PASS after the fix in run 9 |
 | Quality, audio, subtitle, forced burn-in replans | PASS or PARTIAL (runs 6, 7) |
 | Skip markers, next-episode countdown | PASS (run 7) |
 | Unicode metadata and subtitles | Partial: CJK and Arabic render as boxes (assumption A-17) |
