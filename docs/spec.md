@@ -1861,8 +1861,11 @@ would then appear in URLs that proxies and server logs may record.
   reading capabilities is never sent.
 - A title's queued progress and stop jobs from an older session are dropped
   once a newer session of that title has a position queued or a progress
-  post accepted, and while one session's job for a title is in flight no
-  other session's job for that title is sent. A title is the content under
+  post accepted, and while one session's job or live progress post for a
+  title is in flight no other session's job or post for that title is sent:
+  a newer session's post waits, in the order the posts came, for an older
+  session's stop on its way, at most one request's timeout for each request
+  ahead of it. A title is the content under
   one server, account, and profile: a job handed over after its identity
   has gone is released at once, with a logged reason, before it can queue,
   hold, or retire anything, and a progress answer for such an identity
@@ -2612,7 +2615,8 @@ the server:
   a restart) writes that attempt's last progress with a last-write-wins
   upsert, over a newer session's position (hardware run 8, T2c). Refusing
   such a stop, or writing it only when newer (`SetProgressIfNewer`), would
-  close the gap the client cannot (a stop already in flight);
+  close the gap the client cannot (a stop whose request timed out but that
+  still reaches the server after a newer session's progress);
 - consider a media credential that lasts as long as the plan: today the
   access token in the content's headers is the only one on the configured
   origin, so a title that outlasts it needs a reload (section 9.4). A

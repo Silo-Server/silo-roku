@@ -674,6 +674,192 @@ namespace tests
             m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-1"), 1, "the stop is not tried again")
         end sub
 
+        ' The stop of s-1 and a progress post of s-2 for the title c-1.
+        function titleStopJob(loop as Object) as Object
+            fence = m.fence(loop, "s-1")
+            fence.contentId = "c-1"
+            return { kind: "stop", id: "s-1:stop", fence: fence, sessionId: "s-1", sequence: 8, uncertain: false, bodyText: `{"position":481.556,"sequence":8,"stop_id":"x"}` }
+        end function
+
+        function titleProgress(loop as Object) as Object
+            newer = m.fence(loop, "s-2")
+            newer.contentId = "c-1"
+            return { type: "progress", fence: newer, session_id: "s-2", sequence: 1, bodyText: `{"installation_id":"inst-1","sequence":1,"position":475.1,"is_paused":false}` }
+        end function
+
+        @it("holds a newer session's progress until an older session's stop for the title answers (F7)")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "j1", playback: "job", job: m.titleStopJob(loop) })
+            stopId = tests.sessions.runningId(loop, "/api/v2/playback/s-1")
+            tests.sessions.send(loop, { requestId: "g1", playback: "progress", command: m.titleProgress(loop) })
+            m.assertInvalid(tests.sessions.runningId(loop, "/api/v2/playback/s-2/progress"), "not sent while the older stop is on its way")
+            m.assertInvalid(playback.worker.nextWake(loop.worker), "the stop's deadline wakes the Task")
+            tests.sessions.respond(loop, stopId, 200, tests.sessions.fixture("playback_stop_completed"))
+            tests.sessions.tick(loop)
+            post = tests.sessions.runningId(loop, "/api/v2/playback/s-2/progress")
+            m.assertNotInvalid(post, "sent once the stop answered")
+            m.assertTrue(tests.sessions.position(loop, "log playback job done") < tests.sessions.position(loop, "start /api/v2/playback/s-2/progress"))
+            m.assertEqual(loop.running[post].request.bodyText, m.titleProgress(loop).bodyText)
+            tests.sessions.respond(loop, post, 200, {})
+            m.assertEqual(loop.delivered.g1.body.kind, "ok")
+        end sub
+
+        @it("sends a held progress post when the older stop fails, and retries that stop only after the post answers (F7)")
+        sub _()
+            loop = m.signedIn()
+            tests.sessions.send(loop, { requestId: "j1", playback: "job", job: m.titleStopJob(loop) })
+            tests.sessions.send(loop, { requestId: "g1", playback: "progress", command: m.titleProgress(loop) })
+            tests.sessions.tick(loop, playback.worker.REQUEST_TIMEOUT_MS)
+            m.assertNotInvalid(tests.sessions.runningId(loop, "/api/v2/playback/s-2/progress"), "sent once the stop timed out")
+            tests.sessions.tick(loop, 1000)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-1"), 1, "the stop's retry waits for the post")
+            m.assertTrue(playback.worker.nextWake(loop.worker) > loop.ms, "no past retry time while it waits")
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/s-2/progress"), 200, {})
+            m.assertEqual(loop.delivered.g1.body.kind, "ok")
+            m.assertEqual(tests.sessions.count(loop, "log playback job superseded"), 1)
+            tests.sessions.tick(loop, 60000)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-1"), 1, "the stop is not tried again")
+        end sub
+
+        @it("never holds a session's progress behind its own job")
+        sub _()
+            loop = m.signedIn()
+            job = m.titleStopJob(loop)
+            job.kind = "progress"
+            job.id = "s-1:progress:3"
+            job.uncertain = true
+            tests.sessions.send(loop, { requestId: "j1", playback: "job", job: job })
+            command = m.titleProgress(loop)
+            command.fence = job.fence
+            command.session_id = "s-1"
+            tests.sessions.send(loop, { requestId: "g1", playback: "progress", command: command })
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/playback/s-1/progress"), 2)
+        end sub
+
+        @it("holds a post only behind another session's request for its own title")
+        sub _()
+            current = { server: "https://silo.example", account: "1", profile: "p-owner" }
+            worker = playback.worker.create()
+            sent = m.submitted(playback.worker.operation(worker, { requestId: "j1", playback: "job", job: m.titleStop(current, "s-1", 8, 480) }, m.envAt(current, 0)))[0]
+            for each contentId in ["c-2", ""]
+                fence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-s-2", session: "s-2", contentId: contentId }
+                decisions = playback.worker.operation(worker, { requestId: "g-" + contentId, playback: "progress", command: { type: "progress", fence: fence, session_id: "s-2", sequence: 1, bodyText: "{}" } }, m.envAt(current, 10))
+                m.assertEqual(m.submitted(decisions).Count(), 1, "contentId " + contentId)
+            end for
+            fence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-s-3", session: "s-3", contentId: "c-1" }
+            decisions = playback.worker.operation(worker, { requestId: "g3", playback: "progress", command: { type: "progress", fence: fence, session_id: "s-3", sequence: 1, bodyText: "{}" } }, m.envAt(current, 10))
+            m.assertEqual(m.submitted(decisions), [], "c-1 waits for s-1's stop")
+            released = m.submitted(playback.worker.settled(worker, sent, m.answered(sent, 200, {}), m.envAt(current, 20)))
+            m.assertEqual(released, [], "an answer sends nothing; the tick after it does")
+            released = m.submitted(playback.worker.tick(worker, m.envAt(current, 20)))
+            m.assertEqual(released.Count(), 1)
+            m.assertEqual(released[0].path, "/api/v2/playback/s-3/progress")
+        end sub
+
+        @it("answers a held progress post fenced once its identity has gone")
+        sub _()
+            current = { server: "https://silo.example", account: "1", profile: "p-owner" }
+            worker = playback.worker.create()
+            stopJob = m.titleStop(current, "s-1", 8, 480)
+            sent = m.submitted(playback.worker.operation(worker, { requestId: "j1", playback: "job", job: stopJob }, m.envAt(current, 0)))[0]
+            fence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-s-2", session: "s-2", contentId: "c-1" }
+            decisions = playback.worker.operation(worker, { requestId: "g1", playback: "progress", command: { type: "progress", fence: fence, session_id: "s-2", sequence: 1, bodyText: "{}" } }, m.envAt(current, 10))
+            m.assertEqual(m.submitted(decisions), [])
+            playback.worker.settled(worker, sent, m.answered(sent, 200, {}), m.envAt(current, 20))
+            gone = playback.values.copy(current)
+            gone.profile = "p-other"
+            decisions = playback.worker.tick(worker, m.envAt(gone, 20))
+            m.assertEqual(m.replyKind(decisions), "fenced")
+            m.assertEqual(m.submitted(decisions), [])
+            m.assertEqual(worker.held, [])
+        end sub
+
+        @it("never lets a held post retire a newer session's stop queued while it waited")
+        sub _()
+            current = { server: "https://silo.example", account: "1", profile: "p-owner" }
+            worker = playback.worker.create()
+            sent = m.submitted(playback.worker.operation(worker, { requestId: "j1", playback: "job", job: m.titleStop(current, "s-1", 8, 480) }, m.envAt(current, 0)))[0]
+            fence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-s-2", session: "s-2", contentId: "c-1" }
+            decisions = playback.worker.operation(worker, { requestId: "g2", playback: "progress", command: { type: "progress", fence: fence, session_id: "s-2", sequence: 1, bodyText: "{}" } }, m.envAt(current, 10))
+            m.assertEqual(m.submitted(decisions), [], "s-2 waits for s-1's stop")
+            newest = m.titleStop(current, "s-3", 4, 520)
+            m.assertEqual(m.submitted(playback.worker.operation(worker, { requestId: "j3", playback: "job", job: newest }, m.envAt(current, 20))), [], "s-3's stop waits for s-1's")
+            playback.worker.settled(worker, sent, m.answered(sent, 200, {}), m.envAt(current, 30))
+            released = m.submitted(playback.worker.tick(worker, m.envAt(current, 30)))
+            m.assertEqual(released.Count(), 1, "the held post, ahead of s-3's stop")
+            m.assertEqual(released[0].path, "/api/v2/playback/s-2/progress")
+            decisions = playback.worker.settled(worker, released[0], m.answered(released[0], 200, {}), m.envAt(current, 40))
+            m.assertEqual(m.logs(decisions), [], "s-3's stop is newer than the post")
+            retry = m.submitted(playback.worker.tick(worker, m.envAt(current, 40)))
+            m.assertEqual(retry.Count(), 1)
+            m.assertEqual(retry[0].bodyText, newest.bodyText)
+        end sub
+
+        @it("keeps a newer session's post behind an older session's post that already waits")
+        sub _()
+            current = { server: "https://silo.example", account: "1", profile: "p-owner" }
+            worker = playback.worker.create()
+            sent = m.submitted(playback.worker.operation(worker, { requestId: "j1", playback: "job", job: m.titleStop(current, "s-1", 8, 480) }, m.envAt(current, 0)))[0]
+            fence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-s-2", session: "s-2", contentId: "c-1" }
+            playback.worker.operation(worker, { requestId: "g2", playback: "progress", command: { type: "progress", fence: fence, session_id: "s-2", sequence: 1, bodyText: "{}" } }, m.envAt(current, 10))
+            ' s-1's stop times out in the scheduler's tick, and s-3's post
+            ' arrives before the worker's tick that would send s-2's.
+            playback.worker.settled(worker, sent, { requestId: sent.requestId, ok: false, status: 0, headers: {}, body: invalid, error: { kind: "timeout" } }, m.envAt(current, 15000))
+            fence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-s-3", session: "s-3", contentId: "c-1" }
+            decisions = playback.worker.operation(worker, { requestId: "g3", playback: "progress", command: { type: "progress", fence: fence, session_id: "s-3", sequence: 1, bodyText: "{}" } }, m.envAt(current, 15000))
+            m.assertEqual(m.submitted(decisions), [], "s-3 waits behind s-2's post")
+            released = m.submitted(playback.worker.tick(worker, m.envAt(current, 15000)))
+            m.assertEqual(released.Count(), 1)
+            m.assertEqual(released[0].path, "/api/v2/playback/s-2/progress")
+            playback.worker.settled(worker, released[0], m.answered(released[0], 200, {}), m.envAt(current, 15100))
+            released = m.submitted(playback.worker.tick(worker, m.envAt(current, 15100)))
+            m.assertEqual(released.Count(), 1, "s-1's stop was superseded")
+            m.assertEqual(released[0].path, "/api/v2/playback/s-3/progress")
+        end sub
+
+        @it("retires an older stop when its session's late progress answer comes before a newer session's post")
+        sub _()
+            current = { server: "https://silo.example", account: "1", profile: "p-owner" }
+            worker = playback.worker.create()
+            oldFence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-s-1", session: "s-1", contentId: "c-1" }
+            oldPost = m.submitted(playback.worker.operation(worker, { requestId: "g1", playback: "progress", command: { type: "progress", fence: oldFence, session_id: "s-1", sequence: 7, bodyText: "{}" } }, m.envAt(current, 0)))[0]
+            oldStop = m.submitted(playback.worker.operation(worker, { requestId: "j1", playback: "job", job: m.titleStop(current, "s-1", 8, 480) }, m.envAt(current, 10)))[0]
+            fence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-s-2", session: "s-2", contentId: "c-1" }
+            m.assertEqual(m.submitted(playback.worker.operation(worker, { requestId: "g2", playback: "progress", command: { type: "progress", fence: fence, session_id: "s-2", sequence: 1, bodyText: "{}" } }, m.envAt(current, 20))), [])
+            playback.worker.settled(worker, oldPost, m.answered(oldPost, 200, {}), m.envAt(current, 30))
+            playback.worker.settled(worker, oldStop, m.answered(oldStop, 503), m.envAt(current, 40))
+            released = m.submitted(playback.worker.tick(worker, m.envAt(current, 40)))
+            m.assertEqual(released.Count(), 1)
+            m.assertEqual(released[0].path, "/api/v2/playback/s-2/progress")
+            decisions = playback.worker.settled(worker, released[0], m.answered(released[0], 200, {}), m.envAt(current, 50))
+            m.assertEqual(m.logs(decisions), ["playback job superseded"])
+            m.assertEqual(m.submitted(playback.worker.tick(worker, m.envAt(current, 60000))), [], "the old stop is not sent after the newer position")
+        end sub
+
+        @it("wakes the Task for a held post whose wait ended while a tick's decisions ran")
+        sub _()
+            current = { server: "https://silo.example", account: "1", profile: "p-owner" }
+            worker = playback.worker.create()
+            sent = m.submitted(playback.worker.operation(worker, { requestId: "j1", playback: "job", job: m.titleStop(current, "s-1", 8, 480) }, m.envAt(current, 0)))[0]
+            for each sessionId in ["s-2", "s-3"]
+                fence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-" + sessionId, session: sessionId, contentId: "c-1" }
+                playback.worker.operation(worker, { requestId: "g-" + sessionId, playback: "progress", command: { type: "progress", fence: fence, session_id: sessionId, sequence: 1, bodyText: "{}" } }, m.envAt(current, 10))
+            end for
+            playback.worker.settled(worker, sent, m.answered(sent, 200, {}), m.envAt(current, 20))
+            released = m.submitted(playback.worker.tick(worker, m.envAt(current, 20)))
+            m.assertEqual(released.Count(), 1, "s-3 waits for s-2's post")
+            m.assertInvalid(playback.worker.nextWake(worker), "s-2's answer wakes the Task")
+            ' ApiTask could not issue s-2's post: it answers at once, while the
+            ' tick's decisions run, and no tick follows that answer.
+            playback.worker.settled(worker, released[0], { requestId: released[0].requestId, ok: false, status: 0, headers: {}, body: invalid, error: { kind: "network" } }, m.envAt(current, 20))
+            m.assertEqual(playback.worker.nextWake(worker), 10, "s-3's post is due")
+            released = m.submitted(playback.worker.tick(worker, m.envAt(current, 21)))
+            m.assertEqual(released.Count(), 1)
+            m.assertEqual(released[0].path, "/api/v2/playback/s-3/progress")
+            m.assertInvalid(playback.worker.nextWake(worker))
+        end sub
+
         @it("replays an uncertain start of a player that left, then stops its session")
         sub _()
             loop = m.signedIn()
@@ -903,10 +1089,14 @@ namespace tests
                 sent = m.submitted(playback.worker.operation(worker, { requestId: "j1", playback: "job", job: unplayed }, m.envAt(current, 10)))[0]
                 playback.worker.settled(worker, sent, m.answered(sent, 502), m.envAt(current, 10))
                 newFence = { server: current.server, account: current.account, profile: current.profile, attempt: "attempt-s-next", session: "s-next", contentId: "c-1" }
-                playback.worker.operation(worker, { requestId: "g2", playback: "progress", command: { type: "progress", fence: newFence, session_id: "s-next", sequence: 1, bodyText: `{"installation_id":"inst-1","sequence":1,"position":20,"is_paused":false}` } }, m.envAt(current, 20))
+                newPost = m.submitted(playback.worker.operation(worker, { requestId: "g2", playback: "progress", command: { type: "progress", fence: newFence, session_id: "s-next", sequence: 1, bodyText: `{"installation_id":"inst-1","sequence":1,"position":20,"is_paused":false}` } }, m.envAt(current, 20)))[0]
                 decisions = playback.worker.settled(worker, oldPost, m.answered(oldPost, 200, {}), m.envAt(current, 30))
                 m.assertEqual(m.logs(decisions), [], member + ": nothing superseded")
                 m.assertEqual(m.replyKind(decisions), "ok", member + ": the old player still hears its answer")
+                ' The stop's retry waits for the new session's post, whose
+                ' uncertain answer retires nothing either.
+                m.assertEqual(m.submitted(playback.worker.tick(worker, m.envAt(current, 60000))), [], member + ": behind the new post")
+                playback.worker.settled(worker, newPost, m.answered(newPost, 502), m.envAt(current, 60000))
                 retry = m.submitted(playback.worker.tick(worker, m.envAt(current, 60000)))
                 m.assertEqual(retry.Count(), 1, member)
                 m.assertEqual(retry[0].bodyText, unplayed.bodyText, member)

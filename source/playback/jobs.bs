@@ -25,9 +25,13 @@ import "pkg:/source/playback/values.bs"
 ' title remembers it with a serial, so an older job that was in flight
 ' meanwhile is retired when it comes back for a retry (finish), and an
 ' answer to a post sent before a newer session's position retires
-' nothing. And while one session's job for a title is in flight, no other
-' session's job for that title goes, so an older answer never lands after
-' a newer one. A title is the content of one identity (titleOf): the same
+' nothing. And while one session's request for a title is in flight, no
+' other session's request for that title goes, so an older answer never
+' lands after a newer one: that covers the player's live progress posts,
+' which playback.worker sends outside the queue but notes here
+' (sendLive, landLive) and holds while holdsLive. A request that timed
+' out may still reach the server later; only the server can order that.
+' A title is the content of one identity (titleOf): the same
 ' content under another server, account, or profile is another title, so
 ' a job of an identity that has gone never retires, holds, or outranks the
 ' current identity's (playback.worker releases such a job before it is
@@ -42,9 +46,11 @@ namespace playback.jobs
     const MAX_TITLES = 16
 
     ' serial counts the titles' newest sessions as they are noted; titles
-    ' maps a titleOf key to { session, serial }.
+    ' maps a titleOf key to { session, serial }; live maps the request ID of
+    ' each live progress post in flight, and "job:" and the ID of each job
+    ' released while in flight, to { title, session }.
     function create() as Object
-        return { queue: [], serial: 0, titles: {} }
+        return { queue: [], serial: 0, titles: {}, live: {} }
     end function
 
     ' Delay before retry n (1-based): 1, 2, 4, 8, 16 s, then every 30 s.
@@ -109,7 +115,8 @@ namespace playback.jobs
     ' The jobs to send now with identity's credentials ({server, account,
     ' profile}): for each session, its first job if it is due, unexpired, not
     ' already in flight, fenced to identity, and not held behind another
-    ' session's job for its title. They are marked in flight.
+    ' session's job or live progress post for its title. They are marked in
+    ' flight.
     function due(state as Object, now as Dynamic, identity as Object) as Object
         out = []
         seen = {}
@@ -133,11 +140,14 @@ namespace playback.jobs
     ' A progress post of sessionId, fenced by fence, was accepted; since is
     ' the serial when it was sent. Unless a newer session's position has been
     ' noted since, the jobs of the title's other sessions that are not in
-    ' flight go, as {id, kind, reason: "superseded"}.
+    ' flight go, as {id, kind, reason: "superseded"}. A session already the
+    ' title's newest keeps its serial: its late answer is no position newer
+    ' than a post another session sent meanwhile.
     function supersede(state as Object, fence as Object, sessionId as String, since as Integer) as Object
         title = titleOf(fence)
         if title = "" or newerSession(state, title, sessionId, since) then return []
-        noteNewest(state, title, sessionId)
+        newest = state.titles[title]
+        if newest = invalid or newest.session <> sessionId then noteNewest(state, title, sessionId)
         dropped = []
         kept = []
         for each item in state.queue
@@ -156,6 +166,7 @@ namespace playback.jobs
     ' 404 is done (the session had already ended). Returns {id, kind, reason}
     ' for a removed job, else invalid.
     function finish(state as Object, id as String, result as String, now as Dynamic) as Dynamic
+        state.live.Delete("job:" + id)
         index = indexOf(state, id)
         if index < 0 then return invalid
         item = state.queue[index]
@@ -193,6 +204,25 @@ namespace playback.jobs
         return expired
     end function
 
+    ' A live progress post of sessionId, fenced by fence, went out as
+    ' request id; until landLive, it holds the other sessions' jobs and
+    ' posts for its title.
+    sub sendLive(state as Object, id as String, fence as Object, sessionId as String)
+        title = titleOf(fence)
+        if title <> "" then state.live[id] = { title: title, session: sessionId }
+    end sub
+
+    ' The live progress post sent as request id answered.
+    sub landLive(state as Object, id as String)
+        state.live.Delete(id)
+    end sub
+
+    ' Whether a live progress post of sessionId, fenced by fence, waits:
+    ' another session's job or post for its title is in flight.
+    function holdsLive(state as Object, fence as Object, sessionId as String) as Boolean
+        return heldBehind({ fence: fence, sessionId: sessionId }, titlesInFlight(state))
+    end function
+
     ' The number of jobs fenced to identity, in flight or not.
     function pending(state as Object, identity as Object) as Integer
         count = 0
@@ -202,12 +232,15 @@ namespace playback.jobs
         return count
     end function
 
-    ' Removes every job fenced to identity, as {id, kind, reason}.
+    ' Removes every job fenced to identity, as {id, kind, reason}. One in
+    ' flight still holds its title until its answer (finish).
     function release(state as Object, identity as Object, reason as String) as Object
         released = []
         kept = []
         for each item in state.queue
             if sameIdentity(item.fence, identity)
+                title = titleOf(item.fence)
+                if item.sending and title <> "" then state.live["job:" + item.id] = { title: title, session: item.sessionId }
                 released.Push(record(item, reason))
             else
                 kept.Push(item)
@@ -248,7 +281,7 @@ namespace playback.jobs
 
     ' The earliest time a queued job becomes due or expires, or invalid. As in
     ' due(), only each session's first job can become due, and not while it or
-    ' another session's job for its title is in flight, so a job queued
+    ' another session's job or post for its title is in flight, so a job queued
     ' behind another never sets a retry time that has already passed; every
     ' job not in flight still counts its expiry.
     ' A job in flight wakes the Task through its request's deadline.
@@ -288,16 +321,19 @@ namespace playback.jobs
         return title <> "" and not item.sending and item.sessionId <> sessionId and titleOf(item.fence) = title
     end function
 
-    ' Marks sessionId the newest session of title.
+    ' Marks sessionId the newest session of title. Past MAX_TITLES the
+    ' stalest title is forgotten, but not one with a request in flight, whose
+    ' answer still compares against it (supersede).
     sub noteNewest(state as Object, title as String, sessionId as String)
         state.serial = state.serial + 1
         state.titles[title] = { session: sessionId, serial: state.serial }
         if state.titles.Count() <= MAX_TITLES then return
+        busy = titlesInFlight(state)
         stalest = invalid
         for each key in state.titles
-            if stalest = invalid or state.titles[key].serial < state.titles[stalest].serial then stalest = key
+            if key <> title and not busy.DoesExist(key) and (stalest = invalid or state.titles[key].serial < state.titles[stalest].serial) then stalest = key
         end for
-        state.titles.Delete(stalest)
+        if stalest <> invalid then state.titles.Delete(stalest)
     end sub
 
     ' Whether a session of title other than sessionId has had a position
@@ -307,9 +343,13 @@ namespace playback.jobs
         return newest <> invalid and newest.session <> sessionId and newest.serial > serial
     end function
 
-    ' The titles with a job in flight, each to its session.
+    ' The titles with a job or live progress post in flight, each to its
+    ' session.
     function titlesInFlight(state as Object) as Object
         titles = {}
+        for each id in state.live
+            titles[state.live[id].title] = state.live[id].session
+        end for
         for each item in state.queue
             title = titleOf(item.fence)
             if item.sending and title <> "" then titles[title] = item.sessionId
@@ -317,7 +357,7 @@ namespace playback.jobs
         return titles
     end function
 
-    ' Whether another session's job for item's title is in flight.
+    ' Whether another session's job or post for item's title is in flight.
     function heldBehind(item as Object, titles as Object) as Boolean
         title = titleOf(item.fence)
         return title <> "" and titles.DoesExist(title) and titles[title] <> item.sessionId

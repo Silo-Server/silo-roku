@@ -81,8 +81,10 @@ namespace playback.worker
 
     ' starts: { attemptId, owner, fence, installationId, bodyText, sessionId,
     ' requestId (the start in flight, or ""), orphaned, tries, retryAt }.
+    ' held: { input, since, at } for each progress operation waiting for
+    ' another session's request for its title (postProgress).
     function create() as Object
-        return { ops: {}, nextId: 0, capabilities: invalid, ladders: {}, jobs: playback.jobs.create(), deferred: invalid, refusedAudio: [], contexts: {}, contextOrder: [], starts: [] }
+        return { ops: {}, nextId: 0, capabilities: invalid, ladders: {}, jobs: playback.jobs.create(), deferred: invalid, refusedAudio: [], contexts: {}, contextOrder: [], starts: [], held: [] }
     end function
 
     ' Whether requestId is a request built here, whose result goes to settled().
@@ -113,7 +115,7 @@ namespace playback.worker
         if (op = "start" or op = "replan") and departing(state, command.fence) and not playback.values.isText(command.bodyText) then return [reply(answer(input, "fenced", 0))]
         if op = "start" then return startPlayback(state, input, env)
         if op = "replan" then return replan(state, input, env)
-        if op = "progress" then return [submit(build(state, { method: "POST", path: sessionPath(command.session_id) + "/progress", bodyText: util.text(command.bodyText), fence: command.fence }, { kind: "progress", input: input, since: state.jobs.serial }))]
+        if op = "progress" then return postProgress(state, input, env)
         if op = "routeEvent" then return [submit(build(state, { method: "POST", path: ROUTE_EVENTS_PATH, bodyText: FormatJson(command.body), fence: command.fence }, { kind: "routeEvent", input: input }))]
         return [reply(answer(input, "rejected", 0))]
     end function
@@ -128,6 +130,7 @@ namespace playback.worker
         kind = resultKind(result)
         decisions = []
         if op.kind = "start" then decisions = startSettled(state, op, kind, result, env)
+        if op.kind = "progress" then playback.jobs.landLive(state.jobs, request.requestId)
         if op.kind = "progress" or op.kind = "replan"
             command = op.input.command
             ' The reducer gives up a session the server no longer has, and
@@ -155,8 +158,9 @@ namespace playback.worker
 
     ' Expires jobs, stops the sessions of an identity that is leaving, runs
     ' session operations whose wait is over, releases jobs and starts of an
-    ' identity that is gone, replays the starts of players that are gone, and
-    ' sends the jobs that are due with the current identity's credentials.
+    ' identity that is gone, replays the starts of players that are gone,
+    ' sends the progress posts whose wait is over, and sends the jobs that
+    ' are due with the current identity's credentials.
     function tick(state as Object, env as Object) as Object
         decisions = []
         for each record in playback.jobs.expire(state.jobs, env.now)
@@ -169,6 +173,7 @@ namespace playback.worker
         end for
         decisions.Append(releaseStarts(state, liveIdentities(env)))
         decisions.Append(replayOrphans(state, env))
+        decisions.Append(releaseHeld(state, env))
         for each identity in liveIdentities(env)
             for each job in playback.jobs.due(state.jobs, env.now, identity)
                 decisions.Push(submit(jobRequest(state, job)))
@@ -177,12 +182,23 @@ namespace playback.worker
         return decisions
     end function
 
-    ' When tick() next has work, on env's clock, or invalid.
+    ' When tick() next has work, on env's clock, or invalid. A held progress
+    ' post that nothing holds any more is due at once: the answer it waited
+    ' for may have come while tick()'s own decisions ran (a request that
+    ' could not be issued), with no tick after it.
     function nextWake(state as Object) as Dynamic
         wake = playback.jobs.nextWake(state.jobs)
         if state.deferred <> invalid and (wake = invalid or state.deferred.until < wake) then wake = state.deferred.until
         for each entry in state.starts
             if awaitsReplay(entry) and (wake = invalid or entry.retryAt < wake) then wake = entry.retryAt
+        end for
+        ahead = []
+        for each entry in state.held
+            if waits(state, entry.input.command, ahead)
+                ahead.Push(entry)
+            else if wake = invalid or entry.at < wake
+                wake = entry.at
+            end if
         end for
         return wake
     end function
@@ -559,6 +575,68 @@ namespace playback.worker
     function replanRequest(state as Object, input as Object, bodyText as String) as Object
         command = input.command
         return build(state, { method: "POST", path: sessionPath(command.session_id) + "/replan", bodyText: bodyText, fence: command.fence }, { kind: "replan", input: input, bodyText: bodyText })
+    end function
+
+    ' --- Progress -------------------------------------------------------------
+
+    ' A live progress post goes at once, unless another session's job or post
+    ' for its title is in flight (playback.jobs.holdsLive), or another
+    ' session's post for its title already waits: then it waits for that
+    ' request's answer, in turn, so an older session's stop that is still on
+    ' its way never lands after a newer session's position. The wait is at most
+    ' one request's timeout for each request ahead of it: tick() sends it once
+    ' nothing holds it, before any job that comes due, and jobs of other
+    ' sessions wait behind it in turn. The reducer has one post in flight per session, so it sends no
+    ' other sample meanwhile. A held post keeps the serial it came with, so
+    ' its answer never retires a newer session's job queued while it waited.
+    function postProgress(state as Object, input as Object, env as Object) as Object
+        command = input.command
+        if waits(state, command, state.held)
+            state.held.Push({ input: input, since: state.jobs.serial, at: env.now })
+            return [logged("debug", "progress waits for another session's request for its title", invalid)]
+        end if
+        return [submit(progressRequest(state, input, state.jobs.serial))]
+    end function
+
+    function progressRequest(state as Object, input as Object, since as Integer) as Object
+        command = input.command
+        request = build(state, { method: "POST", path: sessionPath(command.session_id) + "/progress", bodyText: util.text(command.bodyText), fence: command.fence }, { kind: "progress", input: input, since: since })
+        playback.jobs.sendLive(state.jobs, request.requestId, command.fence, util.text(command.session_id))
+        return request
+    end function
+
+    ' Sends the held progress posts that nothing holds now, and answers
+    ' fenced those of an identity that has gone.
+    function releaseHeld(state as Object, env as Object) as Object
+        decisions = []
+        kept = []
+        for each entry in state.held
+            command = entry.input.command
+            if not isLive(command.fence, env)
+                decisions.Push(reply(answer(entry.input, "fenced", 0)))
+            else if waits(state, command, kept)
+                kept.Push(entry)
+            else
+                decisions.Push(submit(progressRequest(state, entry.input, entry.since)))
+            end if
+        end for
+        state.held = kept
+        return decisions
+    end function
+
+    ' Whether the progress command waits: another session's request for its
+    ' title is in flight, or another session's post for its title waits in
+    ' ahead (held entries).
+    function waits(state as Object, command as Object, ahead as Object) as Boolean
+        sessionId = util.text(command.session_id)
+        if playback.jobs.holdsLive(state.jobs, command.fence, sessionId) then return true
+        title = playback.jobs.titleOf(command.fence)
+        if title = "" then return false
+        for each entry in ahead
+            other = entry.input.command
+            if util.text(other.session_id) <> sessionId and playback.jobs.titleOf(other.fence) = title then return true
+        end for
+        return false
     end function
 
     ' --- Jobs -----------------------------------------------------------------
