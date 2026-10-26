@@ -58,8 +58,8 @@ dev build; `scripts/sideload.sh out/silo-roku-perf.zip` installs any other
 package. The variants are `bsconfig.perf.json` and `bsconfig.dev.json`: bsc
 drops inactive `#if` blocks at build time, and `scripts/bsc-manifest-entries.js`
 writes each variant's manifest keys into its package. `npm run lint` checks the
-release and dev builds. `scripts/placeholder-art.py` regenerates the placeholder
-icons and splash screens in `images/`.
+release and dev builds. `scripts/brand-art.py` regenerates the channel
+poster, splash screens, and wordmark in `images/` from a silo-branding checkout.
 
 Screens take colours, sizes, focus scales, art, and the shared `Font` nodes from
 `components/theme/` (`tokens.bs` for the spec's tokens, `helpers.bs` for

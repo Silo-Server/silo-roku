@@ -43,10 +43,10 @@ These stop a beta with households, and therefore public submission:
    to the output (Atmos), and output changes (H13) are untested. Token refresh
    during playback, which failed in hardware run 8, passed in runs 9, 10, and
    19.
-4. **No official artwork.** The icons and splash screens are generated
-   placeholders that typeset "Silo" (`images/NOTICE`, assumption AG-11). The
-   trademark policy needs official art and written permission for a Silo-branded
-   store app.
+4. **No written permission for the store.** The channel poster and splash
+   screens now use the official wordmark (`scripts/brand-art.py`,
+   `images/NOTICE`), but the trademark policy still needs written permission
+   for a Silo-branded store app.
 5. **Roku may not allow a typed server address.** The Roku Distribution
    Agreement says an application must not "allow end users to enter web
    addresses" (Exhibit A §3.2(a)). Silo's setup asks for one; this needs
@@ -102,7 +102,7 @@ Source for every row: Roku certification criteria,
 | 6.1 | Non-zero version, increased for every submitted build | Manifest version 0.1; CI stamps `build_version` from the run number (`scripts/stamp-build-version.sh`); a version-increase check is planned for release tags (plan 8) | — | Partial |
 | 6.2 | Kids and family rules | Not listed as made for kids | — | N/A |
 | 6.3 | No pornographic content in public apps; anything shown outside the app suitable for all ages | The app shows each household's own library; store art and descriptions will be generic | — | Open: Roku answer (Q3) |
-| 6.4 | Splash in FHD and HD; artwork identifies the app, uses broadcast-safe colours, and is not transparent | `splash_screen_fhd` 1920×1080, `_hd` 1280×720, `_sd` 720×480, opaque on `#161616` (`scripts/placeholder-art.py`) | Placeholders only | Open (official art) |
+| 6.4 | Splash in FHD and HD; artwork identifies the app, uses broadcast-safe colours, and is not transparent | `splash_screen_fhd` 1920×1080, `_hd` 1280×720, `_sd` 720×480, the official wordmark opaque on `#161616` (`scripts/brand-art.py`) | Not yet seen on hardware | Open (hardware check) |
 | 6.5 | CVAA for apps pre-selected at device activation | Not pre-selected | — | N/A |
 
 Test credentials: the publishing guide says "Authenticated SVOD, AVOD, TVE, and
@@ -200,13 +200,13 @@ Sources: [publishing guide](https://developer.roku.com/dev/docs/channel-publishi
 
 | Item | Roku requirement | Silo status |
 | --- | --- | --- |
-| App poster | 540×405 JPEG or PNG (graphics diagram: 486×365 safe zone) | Not made |
+| App poster | 540×405 JPEG or PNG (graphics diagram: 486×365 safe zone) | `images/icon_focus_fhd.png` serves; the wordmark sits inside the safe zone |
 | Screenshots | Up to six, 1920×1080 JPEG or PNG | Not made; take them on a server with content the project may show, suitable for all ages (6.3) |
-| `mm_icon_focus_fhd` | 540×405 | Placeholder (`images/icon_focus_fhd.png`) |
-| `mm_icon_focus_hd` | 290×218 | Placeholder (`images/icon_focus_hd.png`) |
-| `splash_screen_fhd` | 1920×1080; the manifest page calls it optional, criterion 6.4 requires FHD | Placeholder |
-| `splash_screen_hd` | 1280×720, required | Placeholder |
-| `splash_screen_sd` | 720×480, required | Placeholder |
+| `mm_icon_focus_fhd` | 540×405 | Official wordmark on the radial blue field of the Android TV banner (`images/icon_focus_fhd.png`) |
+| `mm_icon_focus_hd` | 290×218 | The same (`images/icon_focus_hd.png`) |
+| `splash_screen_fhd` | 1920×1080; the manifest page calls it optional, criterion 6.4 requires FHD | Official wordmark on `#161616` |
+| `splash_screen_hd` | 1280×720, required | The same |
+| `splash_screen_sd` | 720×480, required | The same |
 | Side icons, `mm_icon_focus_sd` | No longer required | None |
 | App name | At most 30 characters; must not include "Roku" | `Silo` (`manifest` `title`); needs the trademark owner's permission (`images/NOTICE`) |
 | On-device description | At most 300 characters | Not written |
@@ -327,7 +327,8 @@ Status: **Open**; nothing above is done.
 - [ ] Privacy policy reviewed by the project owner, published at a stable
   URL, and its findings resolved ([`privacy-policy.md`](privacy-policy.md)).
 - [ ] Terms URL and support contacts.
-- [ ] Official artwork and the trademark owner's written permission.
+- [x] Official artwork (`scripts/brand-art.py`).
+- [ ] The trademark owner's written permission.
 - [ ] Dashboard Static Analysis with no errors; Deep Linking Tester and App
   Behavior Analysis passed on the public app record.
 - [ ] Version and channel mapping: `X-Silo-Client-Channel` `release` for the
