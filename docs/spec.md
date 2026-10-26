@@ -287,7 +287,7 @@ on 2026-10-25.
 | Font | Inter: Regular, Medium, SemiBold, Bold (Heavy and Black fall back to Bold, 5.9) |
 | Side inset | 88 px for the top bar and Home hero; 80 px for row headers and Browse; 100 px on detail pages |
 | Poster card | 176×264 px in rows; 260×390 in Browse; 220×330 in Search results |
-| Landscape card | 360×200 px |
+| Landscape card | 360×200 px, for Continue Watching, in-progress, and "next" rows only (5.5) |
 | Card gap / row spacing | 40 px / 10 px between rows (each strip has 14 px padding above and below) |
 | Card corner radius | 12 px (detail episode stills 18) |
 | Card focus | A lift with no ring (D4) over a shadow, black 50% with tvOS's 20 px radius, 10 px lower: posters grow 38 px in height as tvOS's card lift does (1.14 in rows, 1.10 in Browse), landscape cards scale 1.20, detail episode stills 1.08, each side by whole px, every edge of the lifted card on a whole pixel (5.9). The low tier keeps the list's ring without scaling (5.9) |
@@ -522,8 +522,8 @@ their existing HD/FHD assets.
     row aligns to that top, so one row and the top of the next show.
   - Header: 36 px SemiBold, one line. Cards start 34 px below it, 40 px apart.
   - Card shapes: landscape cards (360×200) for Continue Watching, in-progress,
-    any "next" section, and rows whose items are all episodes, seasons, or
-    series. A row containing movies keeps posters.
+    and any "next" section; every other row shows posters, including rows of
+    episodes (section 5.9).
   - Captions sit 22 px under posters and 14 px under landscape cards. The
     title is 24 px Medium at 45%, white SemiBold when focused. A second line,
     4 px below it, shows the year for movies and series, or "S01E02 · Pilot"
@@ -1218,6 +1218,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The hero's meta line shows the IMDb or TMDB mark before the score | The source's name as text ("IMDb 8.3") | No logo art ships for rating sources |
 | Runtimes read "45m" and "1h 0m" | "45 min" and "1h", as Android TV writes them | The `catalog.` runtime strings serve Home, detail, and Up Next alike; a copy change of its own moves them |
 | Cards carry resolution, HDR, audio, and release-type overlays | No overlays | The node budget per card (plan section 4.6); the server's overlay preferences are not read |
+| A row whose items are all episodes, seasons, or series shows landscape stills (`SectionRow.isEpisodeRow`) | Only Continue Watching, in-progress, and "next" sections show landscape cards; a row of episodes, such as Recently Added TV, shows posters | Maintainer's choice (PR #38): landscape cards mark the rows that resume or continue watching, and the rest of Home stays posters |
 | Continue Watching's header has an icon | Text only | No icon art ships, and `RowList` row labels are text |
 | A card without artwork shows its ThumbHash, or brand glows with a film or TV icon | The brand glows without an icon | Decoding a ThumbHash image costs CPU per card on low-cost hardware, and an icon would add a node to every card |
 | The hero backdrop decodes at the size it is shown | On the low tier it decodes at 819×504 and is stretched to 1229×756, on Home and detail pages alike | Plan section 4.6: texture memory on low-memory devices |
