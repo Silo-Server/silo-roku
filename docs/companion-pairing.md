@@ -87,8 +87,8 @@ objects with `type` and `v: 1`:
 - `serverResult.error` is one of `auth_failed`, `denied`, `expired`,
   `unreachable`, `identity_mismatch`, `update_required`.
 - A Roku keeps one server. Phones push one server to it (their chooser is
-  single-select for a Roku). A push after a sign-in in the same session gets
-  `serverResult failed auth_failed`. A push while one is in flight replaces
+  single-select for a Roku). A push after a sign-in in the same session,
+  the phone's or a password one, gets `serverResult failed auth_failed`. A push while one is in flight replaces
   it, as on the other TVs.
 - Unknown types are ignored; a frame that is not JSON, or larger than the
   limit, closes the connection.
@@ -133,7 +133,9 @@ objects with `type` and `v: 1`:
 6. **Abandoned.** A request the Roku opened and did not collect (the phone
    cancelled, pushed again, or left; the person pressed Cancel or Back) is
    withdrawn with `POST /api/v2/auth/device/cancel`, best effort: a server
-   without that route answers 404, which changes nothing.
+   without that route answers 404, which changes nothing. A password sign-in
+   on the Roku that finishes first, a sign-out, or a server change ends the
+   attempt the same way, and an approval collected after it is dropped.
 
 A failure stays on screen with its reason and Try again (back to waiting for
 a phone) until the person acts; the phone gets `serverResult failed` with

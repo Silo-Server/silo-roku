@@ -21,16 +21,16 @@ namespace tests
             return tests.sessions.create(record)
         end function
 
-        ' Checks https://other.example, whose identity is srv-1.
-        function checked(loop as Object, identity = "srv-1" as String) as Object
-            tests.sessions.send(loop, { requestId: "s1", session: "companionServer", address: "https://other.example", identity: "srv-1" })
-            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, tests.sessions.systemInfo("https://other.example"))
+        ' Checks address (https://other.example), whose identity is srv-1.
+        function checked(loop as Object, identity = "srv-1" as String, address = "https://other.example" as String) as Object
+            tests.sessions.send(loop, { requestId: "s1", session: "companionServer", address: address, identity: "srv-1" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, tests.sessions.systemInfo(address))
             tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/system/identity"), 200, { server_id: identity })
             return loop.delivered.s1
         end function
 
-        function begun(loop as Object) as Object
-            m.checked(loop)
+        function begun(loop as Object, address = "https://other.example" as String) as Object
+            m.checked(loop, "srv-1", address)
             tests.sessions.send(loop, { requestId: "d1", session: "companionStart", deviceName: "Living Room" })
             tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, m.started())
             return loop.delivered.d1
@@ -204,6 +204,86 @@ namespace tests
             m.assertEqual(view.origin, "https://other.example")
             m.assertEqual(view.accountId, "7")
             m.assertEqual(loop.session.saved.refreshToken, "cref")
+        end sub
+
+        @describe("competing sign-ins")
+
+        ' The error kind of a delivered answer, or "" for none.
+        function kindOf(answer as Dynamic) as String
+            if not util.isObject(answer) or not util.isObject(answer.error) then return ""
+            return util.text(answer.error.kind)
+        end function
+
+        ' The sign-in screen's case: a password sign-in is in flight when a
+        ' phone starts a device login for the same server.
+        @it("keeps a password sign-in that finished first, and drops the approval")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            m.begun(loop, "https://silo.example")
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            poll = tests.sessions.runningId(loop, "/api/v2/auth/device/poll")
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("login_ok"))
+            m.assertTrue(loop.delivered.r1.ok)
+            withdraw = tests.sessions.runningId(loop, "/api/v2/auth/device/cancel")
+            tests.sessions.respond(loop, poll, 200, m.approved())
+            saved = api.auth.coordinator.record(loop.session)
+            m.assertEqual([saved.accessToken, saved.refreshToken, saved.accountId], ["acc", "ref", "1"])
+            m.assertEqual(m.kindOf(loop.delivered.p1), "handoff_gone")
+            m.assertNotInvalid(withdraw, "the password sign-in withdraws the open device login")
+            if withdraw <> invalid then m.assertEqual(loop.running[withdraw].request.body, { device_code: "dev-secret" })
+            tests.sessions.send(loop, { requestId: "p2", session: "companionPoll" })
+            m.assertEqual(m.kindOf(loop.delivered.p2), "handoff_gone")
+        end sub
+
+        @it("keeps an approval that finished first, and drops the password sign-in")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            m.begun(loop, "https://silo.example")
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, m.approved())
+            m.assertEqual(loop.delivered.p1.body.status, "approved")
+            published = tests.sessions.count(loop, "publish")
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("login_ok"))
+            saved = api.auth.coordinator.record(loop.session)
+            m.assertEqual([saved.accessToken, saved.refreshToken, saved.accountId], ["cacc", "cref", "7"])
+            m.assertEqual(tests.sessions.count(loop, "publish"), published)
+            m.assertEqual(m.kindOf(loop.delivered.r1), "identity_changed")
+            m.assertFalse(FormatJson(loop.delivered.r1).Instr(Chr(34) + "acc" + Chr(34)) >= 0)
+        end sub
+
+        @it("drops an approval collected after the server changed")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "r1", session: "server", address: "https://third.example" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.systemInfo("https://third.example"))
+            m.assertEqual(api.auth.coordinator.view(loop.session).origin, "https://third.example")
+            withdraw = tests.sessions.runningId(loop, "/api/v2/auth/device/cancel")
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            poll = tests.sessions.runningId(loop, "/api/v2/auth/device/poll")
+            if poll <> invalid then tests.sessions.respond(loop, poll, 200, m.approved())
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.origin], ["signed_out", "https://third.example"])
+            m.assertInvalid(poll, "no poll goes out for the ended attempt")
+            m.assertEqual(m.kindOf(loop.delivered.p1), "handoff_gone")
+            m.assertNotInvalid(withdraw, "the server change withdraws the open device login")
+            if withdraw <> invalid then m.assertEqual(loop.running[withdraw].request.url, "https://other.example/api/v2/auth/device/cancel")
+        end sub
+
+        @it("drops an approval collected after the session ended")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            poll = tests.sessions.runningId(loop, "/api/v2/auth/device/poll")
+            tests.sessions.send(loop, { requestId: "o1", session: "signOut" })
+            tests.sessions.respond(loop, poll, 200, m.approved())
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.origin], ["signed_out", "https://silo.example"])
+            m.assertEqual(loop.session.saved.accessToken, "")
+            m.assertEqual(m.kindOf(loop.delivered.p1), "handoff_gone")
         end sub
 
     end class

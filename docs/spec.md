@@ -1431,7 +1431,9 @@ Roku in with a device login it approves, is the exception: it ships in
 public builds by the project owner's decision, as comparable apps offer it
 ([`companion-pairing.md`](companion-pairing.md) section 1).
 The server and sign-in screens' card then says "Use your phone" beside the
-remote and Roku mobile app keyboard help.
+remote and Roku mobile app keyboard help. When a password sign-in and a
+companion approval overlap, the first to finish keeps the session: the
+other's tokens are dropped, and an open device login is withdrawn.
 
 An app update must not force the viewer to sign in again (criterion 4.1).
 Registry layout changes migrate stored sessions instead of discarding them.

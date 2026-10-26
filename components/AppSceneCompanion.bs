@@ -56,9 +56,18 @@ function companionWanted() as String
     if view = invalid or util.text(view.deviceId) = "" then return ""
     if m.companion.finishing then return m.companion.mode
     ' An approval publishes its session before the poll that collected it
-    ' answers: the attempt keeps the receiver until that answer arrives, so
-    ' the phone hears signedIn rather than a cancel.
-    if m.companion.stage = "code" and m.companion.requestOpen then return m.companion.mode
+    ' answers: a poll in flight keeps the receiver until its answer arrives,
+    ' so the phone hears signedIn rather than a cancel. Any other session
+    ' change (a password sign-in first) ended the attempt in the
+    ' coordinator, and that poll answers handoff_gone.
+    if m.companion.stage = "code" and m.companion.requestOpen and m.companion.handle <> invalid then return m.companion.mode
+    return companionScreenMode()
+end function
+
+' The receiver the screen on top wants, whatever an attempt in flight
+' keeps.
+function companionScreenMode() as String
+    view = m.apiSession
     top = nav.stack.topEntry(m.navStack)
     if top = invalid then return ""
     if top.route = nav.route.COMPANION then return m.companion.mode
@@ -258,14 +267,18 @@ sub companionPhoneLeft(gone as Boolean)
     end if
     m.companion.stage = "idle"
     companionLeaveScreen()
+    ' A receiver kept for the poll this dropped stops now.
+    companionRefresh()
 end sub
 
 ' ---- An attempt (section 5)
 
 sub companionPush(server as Dynamic)
     if not util.isObject(server) then return
-    ' A Roku keeps one server (section 4).
-    if m.companion.signedIn
+    ' A Roku keeps one server (section 4). A receiver kept only for a
+    ' poll's answer, its screen gone with the session it began under,
+    ' starts no other attempt.
+    if m.companion.signedIn or companionScreenMode() <> m.companion.mode
         companionSend(silocontrol.pairing.serverResult(util.text(server.url), "auth_failed"))
         return
     end if
@@ -430,6 +443,17 @@ end sub
 sub onCompanionPolled(event as Object)
     result = companionTake(event)
     if result = invalid then return
+    status = ""
+    if result.ok = true then status = util.text(result.body.status)
+    ' A poll that kept the receiver after its screen went with the session
+    ' (a password sign-in first): only its own approval still counts. Any
+    ' other answer, even one the server gave before that sign-in, stops
+    ' the receiver without showing it.
+    if status <> "approved" and companionScreenMode() <> m.companion.mode
+        m.companion.requestOpen = false
+        companionRefresh()
+        return
+    end if
     if result.ok <> true
         ' A network blip or a 5xx while the phone approves: poll again.
         if companionErrorKind(result) = "handoff_gone"
@@ -440,7 +464,6 @@ sub onCompanionPolled(event as Object)
         end if
         return
     end if
-    status = util.text(result.body.status)
     if status = "pending"
         wait = m.companion.interval
         if util.isNumber(result.body.pollAfter) and result.body.pollAfter > wait then wait = result.body.pollAfter

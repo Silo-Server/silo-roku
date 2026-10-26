@@ -314,11 +314,14 @@ namespace api.auth.coordinator
     ' Its origin is checked before the first credential goes there.
     function useServer(state as Object, origin as String) as Object
         if origin = state.saved.origin then return []
+        ' A companion withdrawal goes after the change cancels every request.
+        withdraw = endCompanion(state)
         decisions = endSession(state, "server_changed")
         state.saved.origin = origin
         state.originCheck = originState("unverified", "", origin)
         decisions.Append(setOriginHold(state, false))
         decisions.Append([{ kind: "server", origin: origin }, persist(), publish()])
+        decisions.Append(withdraw)
         return decisions
     end function
 
@@ -335,7 +338,7 @@ namespace api.auth.coordinator
         if state.saved.origin = "" then return [reply(api.response.failure(input, "no_server"))]
         if not nonEmpty(input.username) or not nonEmpty(input.password) then return [reply(api.response.failure(input, "invalid_request"))]
         body = { username: input.username, password: input.password }
-        request = build(state, input, { method: "POST", path: LOGIN_PATH, body: body, timeoutMs: LOGIN_TIMEOUT_MS }, { kind: "login", origin: state.saved.origin })
+        request = build(state, input, { method: "POST", path: LOGIN_PATH, body: body, timeoutMs: LOGIN_TIMEOUT_MS }, { kind: "login", origin: state.saved.origin, epoch: state.epoch })
         return submitConfidential(state, request)
     end function
 
@@ -589,9 +592,12 @@ namespace api.auth.coordinator
         answer = succeeded(request, { origin: op.origin, changed: changed }, result.status)
         decisions = []
         if changed
+            ' A companion withdrawal goes after the change cancels every request.
+            withdraw = endCompanion(state)
             decisions = endSession(state, "server_changed")
             state.saved.origin = op.origin
             decisions.Append([{ kind: "server", origin: op.origin }, persist()])
+            decisions.Append(withdraw)
         end if
         decisions.Append(originSettled(state, op.origin, check))
         decisions.Push(reply(answer))
@@ -606,9 +612,12 @@ namespace api.auth.coordinator
 
     ' A login never refreshes or retries: its 401 is a wrong username or
     ' password (api.auth.problems INVALID_CREDENTIALS), and any other failure is
-    ' answered as it is.
+    ' answered as it is. A login the session ended under (a companion
+    ' sign-in installed first, or the server changed) answers
+    ' identity_changed, and its tokens are dropped.
     function loggedIn(state as Object, request as Object, op as Object, result as Object, now as Integer) as Object
-        if not result.ok or op.origin <> state.saved.origin then return [reply(withoutBody(result))]
+        if not result.ok then return [reply(withoutBody(result))]
+        if op.epoch <> state.epoch or op.origin <> state.saved.origin then return [reply(api.response.failure(request, "identity_changed"))]
         tokens = parseTokens(result)
         user = invalid
         if tokens <> invalid and util.isObject(result.body.user) then user = result.body.user
@@ -776,7 +785,10 @@ namespace api.auth.coordinator
     ' go, and requests holding for a refresh are released to fail as signed
     ' out. An explicit sign-out or a server change also forgets the account and
     ' its remembered profile; an expired session keeps them, so signing in to
-    ' the same account reopens its profile. reason "" is a new sign-in.
+    ' the same account reopens its profile. reason "" is a new sign-in. A
+    ' companion sign-in in progress ends too (endCompanion), and a login
+    ' started before answers identity_changed (loggedIn): whichever sign-in
+    ' installs first is the one kept.
     function endSession(state as Object, reason as String) as Object
         state.saved.accessToken = ""
         state.saved.refreshToken = ""
@@ -801,6 +813,7 @@ namespace api.auth.coordinator
         state.handoffs = {}
         state.handoffStarts = {}
         decisions = endBorrowed(state, "", true)
+        decisions.Append(endCompanion(state))
         decisions.Append(setHold(state, false))
         ' Media headers waiting for a refresh are answered signed_out.
         decisions.Append(answerMedia(state))
