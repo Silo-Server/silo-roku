@@ -1,0 +1,149 @@
+import "pkg:/components/theme/helpers.bs"
+
+namespace tests
+
+    ' Connect a Phone's QR code (docs/silocontrol.md section 5.4), drawn by a
+    ' QrTask off the render thread. brs-node runs no Task, so each test runs
+    ' the screen's QrTaskProbe's draw() itself, on this thread.
+    @suite("Connect a Phone")
+    class ConnectScreenTests extends rooibos.BaseTestSuite
+
+        function onScreen() as Object
+            theme.install()
+            node = CreateObject("roSGNode", "ConnectScreenProbe")
+            m.top.appendChild(node)
+            return node
+        end function
+
+        protected override sub afterEach()
+            for each child in m.top.getChildren(-1, 0)
+                if child.subtype() = "ConnectScreenProbe" then m.top.removeChild(child)
+            end for
+        end sub
+
+        sub showLink(node as Object, link as String)
+            node.callFunc("onRemoteStatus", { status: { running: true, address: "192.168.1.20", port: 52817, deviceName: "Living Room", link: link, phones: [], sealed: false } })
+        end sub
+
+        ' The screen's QrTask's draw(), run here; the request it answered.
+        function draw(task as Object) as Object
+            request = task.request
+            task.callFunc("probeDraw")
+            return request
+        end function
+
+        function exists(path as String) as Boolean
+            return CreateObject("roFileSystem").Exists(path)
+        end function
+
+        '----------------------------------------------------------------------
+        @describe("QR code")
+
+        @it("hands the link's code to a QrTask, leaving it hidden until the Task has written it")
+        sub _()
+            node = m.onScreen()
+            m.showLink(node, "HELLO")
+            code = node.findNode("code")
+            m.assertFalse(code.visible, "nothing is encoded on the render thread")
+            task = node.callFunc("probeCodeTask")
+            m.assertNotInvalid(task, "a QrTask draws the code")
+            m.assertTrue(task.isSubtype("QrTask"))
+            m.assertEqual([task.functionName, task.control], ["draw", "run"])
+            request = task.request
+            m.assertEqual([request.link, request.remove, request.size, request.quiet], ["HELLO", "", 360, 4])
+            m.assertEqual(Left(request.path, 20), "tmp:/silocontrol-qr-")
+            m.assertFalse(m.exists(request.path))
+            m.draw(task)
+            m.assertEqual(task.result, { link: "HELLO", path: request.path, width: 348 })
+            m.assertTrue(m.exists(request.path))
+            m.assertInvalid(node.callFunc("probeCodeTask"))
+            ' Version 1: 21 modules and 8 of quiet zone at 12 px, as before.
+            m.assertTrue(code.visible)
+            qr = node.findNode("qr")
+            m.assertEqual([qr.uri, Int(qr.width), Int(qr.height)], [request.path, 348, 348])
+            m.assertEqual([Int(code.translation[0]), Int(code.translation[1])], [1266, 366])
+            m.showLink(node, "HELLO")
+            m.assertInvalid(node.callFunc("probeCodeTask"), "the same link draws nothing again")
+            DeleteFile(request.path)
+        end sub
+
+        @it("deletes a code whose link changed while its Task ran, then draws the new link's")
+        sub _()
+            node = m.onScreen()
+            code = node.findNode("code")
+            m.showLink(node, "HELLO")
+            first = node.callFunc("probeCodeTask")
+            m.assertNotInvalid(first)
+            m.showLink(node, "WORLD")
+            m.assertTrue(first.isSameNode(node.callFunc("probeCodeTask")), "one Task at a time")
+            stale = m.draw(first)
+            m.assertFalse(code.visible, "HELLO's code is not shown")
+            second = node.callFunc("probeCodeTask")
+            m.assertNotInvalid(second)
+            m.assertFalse(first.isSameNode(second))
+            request = second.request
+            m.assertEqual([request.link, request.remove], ["WORLD", stale.path])
+            m.draw(second)
+            m.assertFalse(m.exists(stale.path))
+            m.assertTrue(code.visible)
+            m.assertEqual(node.findNode("qr").uri, request.path)
+
+            ' No link: the code hides at once, and a Task deletes its file.
+            m.showLink(node, "")
+            m.assertFalse(code.visible)
+            third = node.callFunc("probeCodeTask")
+            m.assertEqual([third.request.link, third.request.remove], ["", request.path])
+            m.draw(third)
+            m.assertFalse(m.exists(request.path))
+            m.assertFalse(code.visible)
+            m.assertInvalid(node.callFunc("probeCodeTask"))
+        end sub
+
+        @it("shows a code whose link changed and came back while its Task ran")
+        sub _()
+            node = m.onScreen()
+            m.showLink(node, "HELLO")
+            task = node.callFunc("probeCodeTask")
+            m.assertNotInvalid(task)
+            m.showLink(node, "WORLD")
+            m.showLink(node, "HELLO")
+            request = m.draw(task)
+            m.assertInvalid(node.callFunc("probeCodeTask"), "nothing more to draw")
+            m.assertTrue(node.findNode("code").visible)
+            m.assertEqual(node.findNode("qr").uri, request.path)
+            DeleteFile(request.path)
+        end sub
+
+        @it("leaves a released screen's QrTask to finish, the next screen's waiting for it")
+        sub _()
+            first = m.onScreen()
+            m.showLink(first, "HELLO")
+            retiring = first.callFunc("probeCodeTask")
+            m.assertNotInvalid(retiring)
+            retiring.state = "run"
+            first.callFunc("onRelease")
+            m.assertTrue(retiring.isSameNode(m.global.retiringQrTask))
+            m.showLink(first, "WORLD")
+            m.assertInvalid(first.callFunc("probeCodeTask"), "a released screen draws nothing")
+
+            second = m.onScreen()
+            m.showLink(second, "HELLO")
+            m.assertInvalid(second.callFunc("probeCodeTask"), "it waits for the earlier screen's")
+            request = m.draw(retiring)
+            m.assertFalse(first.findNode("code").visible)
+            m.assertInvalid(first.callFunc("probeCodeTask"), "nor once its Task answers")
+            m.assertInvalid(second.callFunc("probeCodeTask"), "the Task still runs")
+            retiring.state = "stop"
+            task = second.callFunc("probeCodeTask")
+            m.assertNotInvalid(task)
+            m.assertEqual([task.request.link, task.request.path, task.request.remove], ["HELLO", request.path, ""])
+            m.draw(task)
+            m.assertTrue(second.findNode("code").visible)
+            m.assertEqual(second.findNode("qr").uri, request.path)
+            m.global.retiringQrTask = invalid
+            DeleteFile(request.path)
+        end sub
+
+    end class
+
+end namespace

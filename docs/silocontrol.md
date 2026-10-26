@@ -237,8 +237,9 @@ silo://cast?v=2&host=...&port=...&id=...&name=...&server=...&security=sealed&key
 
 The Roku draws the QR code itself: byte mode, error correction M, at most
 version 10 (213 bytes). An encoder in BrightScript writes a 1-bit PNG to `tmp:/` for a
-`Poster`. Nothing leaves the device to draw it. Spike C0-4 in the plan chooses
-between the PNG and a grid of `Rectangle`s.
+`Poster`. It runs in a `QrTask`, which keeps the encoding and the file off the
+render thread. Nothing leaves the device to draw it. Spike C0-4 in the plan
+chooses between the PNG and a grid of `Rectangle`s.
 
 ### 5.5 Accepting connections
 
@@ -618,6 +619,7 @@ itself, accepted while `plain` is the default.
 | Player bridge | `components/player/PlayerRemote.bs` | `remoteState()` and `remoteCommand()` interface functions; commands take the Options and key paths |
 | Screen | `components/screens/connect/` | Connect a Phone and its QR code |
 | QR encoder | `source/util/qr.bs` | Byte-mode encoder and PNG writer |
+| `QrTask` | `components/tasks/QrTask.xml/.bs` | Writes Connect a Phone's QR code to `tmp:/` and deletes the previous one |
 | Development controller | `scripts/silocontrol-phone.mjs` | A phone's part, plain or `sealed`, for device tests |
 
 The `silocontrol` build switch (bs_const) builds the receiver into the app;

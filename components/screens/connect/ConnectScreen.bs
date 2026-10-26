@@ -2,7 +2,6 @@ import "pkg:/components/screens/firstRun.bs"
 import "pkg:/source/nav/client.bs"
 import "pkg:/source/platform/client.bs"
 import "pkg:/source/platform/topics.bs"
-import "pkg:/source/util/qr.bs"
 
 ' The text column as the message screens space it: the form 40 px under the
 ' body, its lines 20 px apart, the buttons 40 px under them. The QR code is
@@ -27,6 +26,9 @@ sub init()
     m.qr = m.top.findNode("qr")
     m.link = ""
     m.codePath = ""
+    m.codeTask = invalid
+    m.awaitedCodeTask = invalid
+    m.released = false
     m.status = {}
     m.layout.headline = i18n.text("connect.headline")
 end sub
@@ -44,6 +46,16 @@ end sub
 
 sub onHide()
     m.layout.callFunc("showMesh", false)
+end sub
+
+' A QrTask still running is left to finish; the next screen's waits for it
+' (codeTaskRetiring), as the two would write and delete the same files.
+sub onRelease()
+    m.released = true
+    if m.codeTask = invalid then return
+    if not m.global.hasField("retiringQrTask") then m.global.addField("retiringQrTask", "node", false)
+    m.global.retiringQrTask = m.codeTask
+    m.codeTask = invalid
 end sub
 
 sub onRemoteStatus(event as Object)
@@ -96,30 +108,70 @@ sub arrange(sealed as Boolean)
     setControlRows([buttons], m.top.isInFocusChain())
 end sub
 
-' Writes the link's QR code to tmp:/ and shows it; with no link, none shows.
-' The file is named for the link, since the texture cache keeps an image by
-' URI for the app's life: a name reused for another link would show the old
-' code. The previous link's file is deleted.
+' Shows the link's QR code; with no link, none shows. A QrTask writes it to
+' tmp:/, as the encoder takes too long for the render thread, and deletes the
+' previous link's file. One Task runs at a time, an earlier screen's
+' included: a link that changes while one runs waits for it, and the code it
+' wrote, now stale, is deleted rather than shown (onCodeDrawn). The file is
+' named for the link, since the texture cache keeps an image by URI for the
+' app's life: a name reused for another link would show the old code.
 sub drawCode(link as String)
     if link = m.link then return
     m.link = link
     m.code.visible = false
-    previous = m.codePath
-    m.codePath = ""
-    if link <> ""
-        grid = util.qr.matrix(link)
-        if grid <> invalid then showCode(grid, codePath(link))
-    end if
-    if previous <> "" and previous <> m.codePath then DeleteFile(previous)
+    if m.codeTask = invalid then startCode()
 end sub
 
-sub showCode(grid as Object, path as String)
-    modules = grid.size + 2 * CODE_QUIET
-    scale = CODE_SIZE \ modules
-    if scale < 1 then scale = 1
-    if not util.qr.writePng(grid, scale, CODE_QUIET, path) then return
-    m.codePath = path
-    size = modules * scale
+sub startCode()
+    if m.released or codeTaskRetiring() then return
+    previous = m.codePath
+    m.codePath = ""
+    if m.link = "" and previous = "" then return
+    path = ""
+    if m.link <> "" then path = codePath(m.link)
+    m.codeTask = newCodeTask()
+    m.codeTask.observeField("result", "onCodeDrawn")
+    m.codeTask.request = { link: m.link, path: path, remove: previous, size: CODE_SIZE, quiet: CODE_QUIET }
+    m.codeTask.control = "run"
+end sub
+
+function newCodeTask() as Object
+    return CreateObject("roSGNode", "QrTask")
+end function
+
+' Whether the QrTask an earlier screen left running (onRelease) still runs.
+function codeTaskRetiring() as Boolean
+    if not m.global.hasField("retiringQrTask") then return false
+    retiring = m.global.retiringQrTask
+    if retiring = invalid or retiring.state <> "run" then return false
+    if m.awaitedCodeTask = invalid or not m.awaitedCodeTask.isSameNode(retiring)
+        m.awaitedCodeTask = retiring
+        retiring.observeField("state", "onCodeTaskEnded")
+    end if
+    return true
+end function
+
+sub onCodeTaskEnded()
+    if m.codeTask <> invalid then return
+    m.awaitedCodeTask = invalid
+    startCode()
+end sub
+
+' A released screen's QrTask may still answer.
+sub onCodeDrawn(event as Object)
+    if m.released then return
+    result = event.getData()
+    m.codeTask = invalid
+    if not util.isObject(result) then result = {}
+    m.codePath = util.text(result.path)
+    if util.text(result.link) <> m.link
+        startCode()
+    else if m.codePath <> ""
+        showCode(m.codePath, result.width)
+    end if
+end sub
+
+sub showCode(path as String, size as Integer)
     m.qr.uri = path
     m.qr.width = size
     m.qr.height = size
