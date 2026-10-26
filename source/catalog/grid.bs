@@ -4,8 +4,8 @@ import "pkg:/source/util/values.bs"
 
 ' Paging for the Browse and Search grids (spec sections 5.5 and 5.6, plan
 ' section 4.8), pure. Items are numbered from 0 in result order; the grid
-' holds the items lo to hi - 1, where lo is a multiple of COLUMNS so items
-' never change column when the front is dropped or filled. Cursors are
+' holds the items lo to hi - 1, where lo is a multiple of the grid's columns
+' so items never change column when the front is dropped or filled. Cursors are
 ' opaque positions the server gave: marks [{ offset, cursor }] record where
 ' each is, offset 0 needing none, and next is the cursor at nextAt, where
 ' reading on resumes (hi, or the nearest mark before an end trimmed
@@ -25,6 +25,7 @@ import "pkg:/source/util/values.bs"
 ' started, failed, received, trim, and refreshFor change the state in place;
 ' want and restore only read it.
 namespace catalog.grid
+    ' Browse's columns (theme.browse.GRID_COLUMNS); Search's grid has fewer.
     const COLUMNS = 6
     ' Spec section 5.6 and plan section 4.8: 40 results a page.
     const PAGE_SIZE = 40
@@ -36,13 +37,13 @@ namespace catalog.grid
     ' The furthest one request reads.
     const MAX_READ = catalog.request.MAX_LIMIT
 
-    ' pages is how many pages to hold (memory.policy.actions gridPages).
-    ' gather is the read before lo in progress, { start, end, cursor, lo }:
-    ' its cards from start to end wait in the grid for the rest up to lo.
-    ' stalled is set when the results ended before lo, so nothing before it
-    ' can be read again.
-    function create(pages as Integer) as Object
-        return { lo: 0, hi: 0, next: "", nextAt: 0, complete: false, total: -1, marks: [], loading: invalid, refreshed: {}, maxItems: pages * PAGE_SIZE, gather: invalid, stalled: false }
+    ' pages is how many pages to hold (memory.policy.actions gridPages), and
+    ' columnCount the grid's columns (state.columns). gather is the read
+    ' before lo in progress, { start, end, cursor, lo }: its cards from start
+    ' to end wait in the grid for the rest up to lo. stalled is set when the
+    ' results ended before lo, so nothing before it can be read again.
+    function create(pages as Integer, columnCount = catalog.grid.COLUMNS as Integer) as Object
+        return { columns: columnCount, lo: 0, hi: 0, next: "", nextAt: 0, complete: false, total: -1, marks: [], loading: invalid, refreshed: {}, maxItems: pages * PAGE_SIZE, gather: invalid, stalled: false }
     end function
 
     ' The request to make with focus on item focus, or invalid: the next
@@ -55,17 +56,17 @@ namespace catalog.grid
     function want(state as Object, focus as Integer) as Dynamic
         if state.loading <> invalid then return invalid
         rows = reach(state)
-        focusRow = focus \ COLUMNS
-        lastRow = rowOf(state.hi - 1)
+        focusRow = focus \ state.columns
+        lastRow = rowOf(state, state.hi - 1)
         if not state.complete and lastRow - focusRow <= rows
             newLo = frontAfter(state, state.hi + PAGE_SIZE)
-            if focusRow >= lastRow or newLo = state.lo or focusRow - rowOf(newLo) > rows then return readOn(state)
+            if focusRow >= lastRow or newLo = state.lo or focusRow - rowOf(state, newLo) > rows then return readOn(state)
         end if
-        if state.lo > 0 and not state.stalled and focusRow - rowOf(state.lo) <= rows
+        if state.lo > 0 and not state.stalled and focusRow - rowOf(state, state.lo) <= rows
             decision = before(state)
-            if decision.skip or focusRow <= rowOf(state.lo) then return decision
+            if decision.skip or focusRow <= rowOf(state, state.lo) then return decision
             newHi = endAfter(state, readStart(state, decision))
-            if newHi = state.hi or rowOf(newHi - 1) - focusRow > rows then return decision
+            if newHi = state.hi or rowOf(state, newHi - 1) - focusRow > rows then return decision
         end if
         return invalid
     end function
@@ -75,8 +76,8 @@ namespace catalog.grid
     ' rows for a page read at one end to leave focus out of reach of the
     ' other.
     function reach(state as Object) as Integer
-        pageRows = (PAGE_SIZE + COLUMNS - 1) \ COLUMNS
-        rows = (state.maxItems \ COLUMNS - pageRows) \ 2 - 1
+        pageRows = (PAGE_SIZE + state.columns - 1) \ state.columns
+        rows = (state.maxItems \ state.columns - pageRows) \ 2 - 1
         if rows > LOAD_ROWS then rows = LOAD_ROWS
         if rows < 1 then rows = 1
         return rows
@@ -85,10 +86,10 @@ namespace catalog.grid
     ' The most items one read before lo puts in: whole rows, as many as
     ' leave focus out of reach of the end the read trims, up to MAX_READ.
     function backFill(state as Object) as Integer
-        rows = state.maxItems \ COLUMNS - 2 * reach(state) - 2
-        if rows > MAX_READ \ COLUMNS then rows = MAX_READ \ COLUMNS
+        rows = state.maxItems \ state.columns - 2 * reach(state) - 2
+        if rows > MAX_READ \ state.columns then rows = MAX_READ \ state.columns
         if rows < 1 then rows = 1
-        return rows * COLUMNS
+        return rows * state.columns
     end function
 
     ' The page past hi, read on from nextAt.
@@ -108,11 +109,11 @@ namespace catalog.grid
         if gather <> invalid then return { offset: gather.end, cursor: gather.cursor, limit: state.lo - gather.end, direction: "previous", skip: false }
         mark = { offset: 0, cursor: "" }
         for each candidate in state.marks
-            if alignUp(candidate.offset) < state.lo and candidate.offset > mark.offset then mark = candidate
+            if alignUp(state, candidate.offset) < state.lo and candidate.offset > mark.offset then mark = candidate
         end for
         fill = backFill(state)
         gap = state.lo - mark.offset
-        if gap < fill + COLUMNS and gap <= MAX_READ then return { offset: mark.offset, cursor: mark.cursor, limit: gap, direction: "previous", skip: false }
+        if gap < fill + state.columns and gap <= MAX_READ then return { offset: mark.offset, cursor: mark.cursor, limit: gap, direction: "previous", skip: false }
         walk = state.lo - fill - mark.offset
         if walk > MAX_READ then walk = MAX_READ
         return { offset: mark.offset, cursor: mark.cursor, limit: walk, direction: "previous", skip: true }
@@ -122,7 +123,7 @@ namespace catalog.grid
     ' the read, or of the reads gathered so far.
     function readStart(state as Object, request as Object) as Integer
         if state.gather <> invalid then return state.gather.start
-        return alignUp(request.offset)
+        return alignUp(state, request.offset)
     end function
 
     ' The request is sent.
@@ -187,7 +188,7 @@ namespace catalog.grid
 
     ' An answer to a read before lo, its items from request.offset to
     ' reached. Cards start at boundary, the first row boundary of the read
-    ' (or of the reads gathered so far), so lo stays a multiple of COLUMNS,
+    ' (or of the reads gathered so far), so lo stays a multiple of the columns,
     ' and go in once the reads reach lo. An answer short of lo is gathered;
     ' one that ends there, or brings nothing, means the results changed
     ' since the held items were read, and the grid stops reading back.
@@ -225,7 +226,7 @@ namespace catalog.grid
         change = unchanged()
         if state.hi - state.lo <= state.maxItems then return change
         newLo = frontAfter(state, state.hi)
-        centred = alignDown(focus - state.maxItems \ 2)
+        centred = alignDown(state, focus - state.maxItems \ 2)
         if centred < newLo then newLo = centred
         if newLo > state.lo
             change.dropStart = newLo - state.lo
@@ -246,7 +247,7 @@ namespace catalog.grid
     function frontAfter(state as Object, newHi as Integer) as Integer
         excess = newHi - state.lo - state.maxItems
         if excess <= 0 then return state.lo
-        return alignUp(state.lo + excess)
+        return alignUp(state, state.lo + excess)
     end function
 
     ' Where the end would be with the front at newLo: hi, or maxItems on.
@@ -362,19 +363,20 @@ namespace catalog.grid
         state.marks = kept
     end sub
 
-    function rowOf(index as Integer) as Integer
+    function rowOf(state as Object, index as Integer) as Integer
         if index < 0 then return -1
-        return index \ COLUMNS
+        return index \ state.columns
     end function
 
-    ' The first multiple of COLUMNS at or after index.
-    function alignUp(index as Integer) as Integer
-        return ((index + COLUMNS - 1) \ COLUMNS) * COLUMNS
+    ' The first multiple of the columns at or after index.
+    function alignUp(state as Object, index as Integer) as Integer
+        across = state.columns
+        return ((index + across - 1) \ across) * across
     end function
 
-    ' The last multiple of COLUMNS at or before index, 0 for a negative one.
-    function alignDown(index as Integer) as Integer
+    ' The last multiple of the columns at or before index, 0 for a negative one.
+    function alignDown(state as Object, index as Integer) as Integer
         if index <= 0 then return 0
-        return (index \ COLUMNS) * COLUMNS
+        return (index \ state.columns) * state.columns
     end function
 end namespace

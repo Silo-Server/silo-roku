@@ -317,7 +317,7 @@ functions, and set nodes.
 ### 4.6 Lists, cards, and images
 
 - Rows: `RowList` with `rowFocusAnimationStyle="fixedFocus"`. Grids: `MarkupGrid`
-  (six columns for Browse and Search). No hand-built rows or grids.
+  (six columns for Browse, four for Search). No hand-built rows or grids.
 - Item components hold artwork, progress, and a title `Label`; a second
   `Label` is created only when metadata is present, then reused or hidden on
   recycled cards. They observe `focusPercent` only (never `rowFocusPercent`, which fires
@@ -907,8 +907,8 @@ record the TV's and AVR's info panels.
   | Player or Up Next | Hand the stop and final progress to `ApiTask`, then start the new item |
   | Invalid or inaccessible | Stay on the current screen if running; Home on launch |
 
-- **Keyboards:** `DynamicKeyboard` for server URL, username, password, and search;
-  `DynamicPinPad` for PINs.
+- **Keyboards:** `DynamicKeyboard` for server URL, username, and password,
+  `DynamicMiniKeyboard` for search, and `DynamicPinPad` for PINs.
 - **Back:** journeys assert Back from Home's tab bar exits to the Roku home screen
   (criterion 4.6). The app never sets `disableScreenSaver` outside the `Video`
   node's own handling (4.5).

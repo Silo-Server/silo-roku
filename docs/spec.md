@@ -291,7 +291,7 @@ on 2026-10-25.
 | Progress bar | `#EDEDED` over white 20%, 3 px on tvOS (Roku 4 px, even for HD scaling), on the artwork's bottom edge |
 | Font | Inter: Regular, Medium, SemiBold, Bold (Heavy and Black fall back to Bold, 5.9) |
 | Side inset | 88 px for the top bar and Home hero; 80 px for row headers and Browse; 100 px on detail pages |
-| Poster card | 176×264 px in rows; 260×390 in Browse; 220×330 in Search results |
+| Poster card | 176×264 px in rows; 260×390 in Browse; 240×360 in Search results |
 | Landscape card | 360×200 px, for Continue Watching, in-progress, and "next" rows only (5.5) |
 | Card gap / row spacing | 40 px / 10 px between rows (each strip has 14 px padding above and below) |
 | Card corner radius | 12 px (detail episode stills 18) |
@@ -617,17 +617,23 @@ their existing HD/FHD assets.
 
 - **Search.**
   - The Search circle in the top bar opens Search as a pushed page without the
-    bar (D3). The keyboard sits at the top (5.9).
+    bar (D3). The keyboard sits in a column on the left, from x 80, and the
+    results in a 1080 px column on the right, from x 760; both start at
+    y 232 (5.9).
   - Once a query exists, a 760 px segmented control (All, Movies, Series)
-    appears, centred (D7).
+    appears at the top of the results column (D7).
   - 48 px below it, "N results" in 22 px Regular at 60%. 48 px below that, a
-    centred 1520 px grid of six 220×330 posters, 40 px across and 60 px down.
+    grid of four 240×360 posters across, 40 px across and 60 px down.
   - Queries run 300 ms after typing stops, with 40 results per page (5.9) and
     at most 200 characters. Choosing a segment runs the query again at once.
   - Copy: before a query, "Search Silo" / "Find movies and series"; with no
     matches, "No results" / "Try a different search term".
-  - Back from the results returns to the keyboard; the next Back leaves
-    Search.
+  - Right from the keyboard's right edge moves to the results, or to the
+    filter when there are none to focus; Left from the results' first column or
+    the filter's first segment returns to the keyboard. Focus on results
+    that come back empty moves to the keyboard, and on a failed search to
+    Retry. Back from the results returns to the keyboard; the next Back
+    leaves Search.
   - Captions use Browse's two-line treatment: title and year, or series
     name and "S01E02 · Pilot" for episodes. Both lines truncate at the tail.
   - An episode result opens its series' page with that episode selected.
@@ -1217,7 +1223,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Panels, buttons, cards, and the hero's title cast soft shadows, and a focused card's caption glows; focused controls change over 120 ms or more | Cards use a shadow 9-patch (5.2) and lift with the list's own focus animation; panels open with tvOS's 0.12 s fade; panels, buttons, and the title have no shadow, captions no glow; detail action circles animate width and label reveal on the normal tier (5.6), while the low tier snaps | Roku has no blur, and animations cost frames on 512 MB devices |
 | Focused cards lift on every device | On the low tier, cards do not scale and the list draws a 9-patch ring | Plan section 4.6: frame rate on 512 MB and non-OpenGL devices |
 | Cast and recommendation cards use an outline and a smaller scale than Home | Detail supporting rails use Home's ringless lift and caption highlighting; cast retains round portraits and a round shadow. Low-tier cards keep an outline without lifting | Consistent focus treatment across Roku's Home and detail rails |
-| A focused card scales by one factor (a poster 1.14) about its centre | Each side grows by whole px, so the two axes differ slightly: a row's poster lifts to 202×302, Browse's to 286×428, Search's to 246×368, a landscape card to 432×240, a detail episode still to 388×216. The card scales about its top-left corner and moves back by that lift (a landscape card 36 and 20 px), so its left and top edges are whole px exactly | At a fractional edge Roku drew the art a pixel past the 9-patch frame that rounds the corners, a white line down a lifted card's right edge (hardware run 26). Scaled about its centre, a float's 1.2 put the first Continue Watching card's left edge at x 43.99998, and Roku drew its progress bar, a Rectangle, from x 43, a tick left of the frame's corner (runs 26 and 27) |
+| A focused card scales by one factor (a poster 1.14) about its centre | Each side grows by whole px, so the two axes differ slightly: a row's poster lifts to 202×302, Browse's to 286×428, Search's to 266×398, a landscape card to 432×240, a detail episode still to 388×216. The card scales about its top-left corner and moves back by that lift (a landscape card 36 and 20 px), so its left and top edges are whole px exactly | At a fractional edge Roku drew the art a pixel past the 9-patch frame that rounds the corners, a white line down a lifted card's right edge (hardware run 26). Scaled about its centre, a float's 1.2 put the first Continue Watching card's left edge at x 43.99998, and Roku drew its progress bar, a Rectangle, from x 43, a tick left of the frame's corner (runs 26 and 27) |
 | The detail Subtitles menu leads with the profile's subtitle language; the player's list with the watch projection's effective subtitle language | Both lead with the projection's `effective_subtitle_language`, so the detail menu and Options' Subtitles list the same tracks in the same order and words. Each lists its own source, as on tvOS: the detail menu the version's tracks, Options the plan's inventory, so a sidecar only the plan names shows only in Options | The two lists disagreed on hardware run 27: Options listed the server's order and hid titles the detail menu showed. A detail pick is an ordinal into the projection's list, so the detail menu cannot offer a track the projection does not name |
 | A subtitle's title shows unless it is a release name, a format, a flag, or its language | A title that is a subtitle file's name ("Heat (1995).en.srt") is dropped too, on the detail menu and in Options | The server gives an untitled sidecar its file's name as its title and its inventory label (hardware run 6) |
 | Avatar menu rows have an icon before the label | Labels without icons | No icon art ships for the menu |
@@ -1242,8 +1248,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The focused alphabet rail is a 96 px column the grid makes room for, its chips centred in it | The grid stays where it is under the rail, and the 38 px chips keep to the column's right edge (x 1850–1888), clear of the grid's last column | Reflowing the grid as focus enters the rail would lay out every card again |
 | Focus enters the rail at the letter nearest to where it was (the focus engine) | At the chosen letter, else All | Roku has no geometric focus engine; the chosen letter is where a viewer filtering by letter goes next |
 | A library tab opens the library chosen last, and Browse its last sort, across launches (tvOS and Android TV) | The library chosen last is remembered until the app closes; Browse opens sorted by Title, and keeps its sort and letter only while its page stays on the stack | The registry holds only the session and profiles (plan section 4.3) |
-| The Search keyboard is full screen, with a single row of results under it | A `DynamicKeyboard` sits at the top and has focus when Search opens. While focus is on the filter or results it folds away, the query shows in a field in its place, and Back or Up unfolds it | Roku draws `DynamicKeyboard` at its own size, which leaves room for most of one row of posters, without captions, beneath it |
-| The keyboard's Search key runs the query and moves focus to the results (Android TV) | Play on the keyboard runs the query and moves focus to the filter | Roku keyboards have no Search key, and the results may still be loading |
+| The Search keyboard is full screen, with a single row of results under it | A `DynamicMiniKeyboard` (a–z, 0–9, clear, space, delete, and voice) in a column on the left has focus when Search opens and stays on screen; the filter, count, and a grid of four 240×360 posters across fill a column to its right. Both columns start at y 232 | While a keyboard has focus, Roku OS draws a "Skip the remote. Use your phone." banner with a QR code over x 720–1920, y 0–203, and apps cannot turn it off; it covered the old top keyboard's text field (Ultra, OS 16.0.4). Roku draws `DynamicKeyboard` at its own size, which left room for most of one row of posters beneath it (AG-319) |
+| The keyboard's Search key runs the query and moves focus to the results (Android TV) | Play on the keyboard runs the query and moves focus to the results, or to the filter when there are none; from results still loading, focus goes to Retry if the search fails and back to the keyboard if nothing matches | Roku keyboards have no Search key |
 | While results load, Search shows only a spinner | The count line reads "Searching…" above the spinner | The audio guide reads it after the keyboard's own speech (plan section 4.9) |
 | The result count reads "About N results" or "N+ results" when the server's total is estimated or missing (Android TV) | "N results" from the server's total, and no count without one | The grid drops pages it no longer shows (plan section 4.8), so it cannot count what it has loaded |
 | Leaving Movies or Series for Home returns to Home as it was (Android TV) | Home and each library page are separate stack roots: Home loads again, with focus on its Home tab, as tvOS rebuilds it | One root screen alive keeps the 512 MB player within its memory budget (plan sections 4.5 and 4.7) |
