@@ -213,9 +213,102 @@ namespace tests
             m.assertEqual(playback.autoQuality.check(state, 26000), 7000)
             m.stalling(state, 30000)
             m.segment(state, 40000)
-            m.assertInvalid(playback.autoQuality.check(state, 40000), "no plan has started since")
+            m.assertInvalid(playback.autoQuality.check(state, 40000), "no plan has started since, and the server has not refused it")
             m.assertEqual(playback.autoQuality.estimate(state, 26000 + 1799999), 7000)
             m.assertInvalid(playback.autoQuality.estimate(state, 26000 + 1800000))
+        end sub
+
+        @it("judges the plan playing again after a refused step down, holding five minutes, then twice as long for each refusal in a row")
+        sub _()
+            state = m.started()
+            m.stepDown(state)
+            playback.autoQuality.refused(state, 27000, 26000)
+            m.assertInvalid(playback.autoQuality.estimate(state, 27000), "the refused estimate is dropped")
+            m.assertEqual(state.planAt, 0, "the plan's grace stands")
+            m.stalling(state, 40000)
+            m.segment(state, 50000)
+            m.assertInvalid(playback.autoQuality.check(state, 50000))
+            m.assertEqual(playback.autoQuality.wakeAt(state, 50000), 327000)
+            m.assertEqual(playback.autoQuality.check(state, 327000), 7000)
+            at = 327000
+            for each hold in [600000, 1200000, 1800000, 1800000]
+                playback.autoQuality.refused(state, at, at)
+                m.stalling(state, at + 1000)
+                m.segment(state, at + 7000)
+                m.assertInvalid(playback.autoQuality.check(state, at + hold - 1))
+                m.assertEqual(playback.autoQuality.check(state, at + hold), 7000, hold.ToStr())
+                at = at + hold
+            end for
+
+            ' A plan starting ends the run of refusals, and its hold is its own.
+            playback.autoQuality.refused(state, at, at)
+            playback.autoQuality.planStarted(state, at + 1000, 10000)
+            m.assertEqual(state.holdUntil, at + 1800000, "a refusal's hold still runs")
+            m.assertEqual(state.refusals, 0)
+        end sub
+
+        @it("keeps the estimate before a refused step down, and the one an outage left")
+        sub _()
+            state = m.started()
+            m.stepDown(state)
+            m.segment(state, 27000)
+            playback.autoQuality.planStarted(state, 30000, 5600)
+            m.stalling(state, 50000)
+            m.segment(state, 56000)
+            m.assertEqual(playback.autoQuality.check(state, 56000), 3920)
+            playback.autoQuality.refused(state, 57000, 56000)
+            m.assertEqual(playback.autoQuality.estimate(state, 57000), 7000)
+            playback.autoQuality.planStarted(state, 60000, 5600)
+            m.assertEqual(state.holdUntil, 357000, "the refusal's hold, not a no-lower plan's")
+
+            state = m.started()
+            m.stepDown(state)
+            playback.autoQuality.noteOutage(state)
+            playback.autoQuality.refused(state, 30000, 26000)
+            m.assertInvalid(playback.autoQuality.estimate(state, 30000))
+            playback.autoQuality.refused(state, 40000, 26000)
+            m.assertEqual(state.holdUntil, 330000, "a refusal with no step down waiting changes nothing")
+        end sub
+
+        @it("undoes a refused step down after another request's plan started, and only the latest step down")
+        sub _()
+            state = m.started()
+            m.stepDown(state)
+            ' A track change queued ahead of the step down: its plan starts
+            ' first, and is lower, so it holds nothing off.
+            playback.autoQuality.planStarted(state, 30000, 5000)
+            m.assertEqual(state.holdUntil, 0)
+            playback.autoQuality.refused(state, 35000, 20000)
+            m.assertEqual(playback.autoQuality.estimate(state, 35000), 7000, "not the latest step down")
+            playback.autoQuality.refused(state, 35000, 26000)
+            m.assertInvalid(playback.autoQuality.estimate(state, 35000), "the refused estimate is dropped")
+            m.assertEqual(state.planAt, 30000, "the grace of the plan playing")
+            m.assertEqual(state.holdUntil, 335000)
+        end sub
+
+        @it("judges the plan playing again, with no hold, when a step down is never sent")
+        sub _()
+            state = m.started()
+            m.stepDown(state)
+            playback.autoQuality.loadStarted(state, 28000)
+            playback.autoQuality.unsent(state, 26000)
+            m.assertInvalid(playback.autoQuality.estimate(state, 28000))
+            m.assertEqual(state.planAt, 28000, "the reload's grace")
+            m.stalling(state, 40000)
+            m.segment(state, 46000)
+            m.assertEqual(playback.autoQuality.check(state, 46000), 7000)
+            playback.autoQuality.planStarted(state, 50000, 10000)
+            m.assertEqual(state.holdUntil, 350000, "the step down that was sent still holds a plan no lower")
+
+            ' A plan that started meanwhile was another request's, though no
+            ' lower: the step down held it off, and no longer does.
+            state = m.started()
+            m.stepDown(state)
+            playback.autoQuality.planStarted(state, 30000, 10000)
+            m.assertEqual(state.holdUntil, 330000)
+            playback.autoQuality.unsent(state, 26000)
+            m.assertEqual(state.holdUntil, 0)
+            m.assertEqual(state.planAt, 30000, "the grace of the plan playing")
         end sub
 
         @it("holds for five minutes when the next plan is no lower")

@@ -452,9 +452,14 @@ namespace playback.session
         else
             ' A refused intent keeps the current plan playing, and the
             ' player tells the viewer (run 6 refused an audio change in
-            ' silence).
+            ' silence). Auto's own step down was no viewer's request: it
+            ' says nothing, and Auto judges the plan again after a hold.
             out.Push({ type: "log", level: "warn", message: "replan refused", fields: { operation: request.op, kind: kind } })
-            out.Push({ type: "refused", operation: request.op })
+            if isStepDown(request)
+                playback.autoQuality.refused(state.auto, env.now(), request.askedAt)
+            else
+                out.Push({ type: "refused", operation: request.op })
+            end if
         end if
     end sub
 
@@ -1130,15 +1135,28 @@ namespace playback.session
         if state.mutation = invalid
             send(state, request, env, out)
         else if state.queued = invalid or request.rank >= state.queued.rank
+            if state.queued <> invalid then discard(state, state.queued)
             state.queued = request
+        else
+            discard(state, request)
         end if
+    end sub
+
+    ' A request that will not be sent. An Auto step down that never reached
+    ' the server leaves Auto to judge the plan playing again.
+    sub discard(state as Object, request as Object)
+        if isStepDown(request) then playback.autoQuality.unsent(state.auto, request.askedAt)
     end sub
 
     sub dispatchQueued(state as Object, env as Object, out as Object)
         while state.mutation = invalid and state.queued <> invalid
             request = state.queued
             state.queued = invalid
-            if request.op = "play" or state.phase = "active" then send(state, request, env, out)
+            if request.op = "play" or state.phase = "active"
+                send(state, request, env, out)
+            else
+                discard(state, request)
+            end if
         end while
     end sub
 
@@ -1710,10 +1728,11 @@ namespace playback.session
             renewAt(state, state.player.position, env, out)
         end if
         ' Auto judges only a load that has played: not a reload of the plan
-        ' while the player prepares it or it starts.
-        if state.phase = "active" and state.plan.firstFrame and state.plan.loadPlayed
+        ' while the player prepares it or it starts. It asks one step down at
+        ' a time: a plan that starts while one waits can be another request's.
+        if state.phase = "active" and state.plan.firstFrame and state.plan.loadPlayed and not stepDownPending(state)
             kbps = playback.autoQuality.check(state.auto, now)
-            if util.isNumber(kbps) then submit(state, { rank: RANK_AUTOMATIC, op: "quality_change", estimate: kbps }, env, out)
+            if util.isNumber(kbps) then submit(state, { rank: RANK_AUTOMATIC, op: "quality_change", estimate: kbps, askedAt: now }, env, out)
         end if
     end sub
 
@@ -1756,6 +1775,17 @@ namespace playback.session
     ' Stop and event IDs must be lowercase canonical UUIDs (plan section 5).
     function newId(env as Object) as String
         return LCase(env.uuid())
+    end function
+
+    ' Whether request is Auto's own quality_change (playback.autoQuality.check).
+    function isStepDown(request as Object) as Boolean
+        return request.op = "quality_change" and request.rank = RANK_AUTOMATIC
+    end function
+
+    ' Whether Auto's step down waits in the queue or for its answer.
+    function stepDownPending(state as Object) as Boolean
+        if state.queued <> invalid and isStepDown(state.queued) then return true
+        return state.mutation <> invalid and isStepDown(state.mutation.request)
     end function
 
     function isFailureOp(op as String) as Boolean

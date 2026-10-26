@@ -34,6 +34,9 @@ namespace playback.autoQuality
     ' no lower, the reducer leaves it alone for five minutes.
     const ESTIMATE_TTL_MS = 1800000
     const HOLD_MS = 300000
+    ' A step down the server refuses holds for HOLD_MS, twice as long for
+    ' each refusal in a row since a plan started, up to MAX_HOLD_MS.
+    const MAX_HOLD_MS = 1800000
     ' The server accepts estimates from 100 kbps.
     const MIN_KBPS = 100
 
@@ -48,6 +51,14 @@ namespace playback.autoQuality
             ' When the grace began: the first frame of the plan, or of its
             ' latest reload. Invalid while a step down waits for its plan.
             planAt: invalid,
+            ' The latest step down: when it was asked, and what it replaced,
+            ' { at, planAt, previous, holdUntil }, restored if the server
+            ' refuses it or it is never sent. A plan that starts meanwhile
+            ' may be another request's, so it moves planAt on and keeps the
+            ' rest.
+            stepping: invalid,
+            ' Step downs the server refused in a row since a plan started.
+            refusals: 0,
             deliveredKbps: invalid,
             steppedFromKbps: invalid,
             ' The lowered estimate, { kbps, until, confirmed }, and the one it
@@ -83,6 +94,8 @@ namespace playback.autoQuality
             state.steppedFromKbps = invalid
         end if
         state.planAt = now
+        if state.stepping <> invalid then state.stepping.planAt = now
+        state.refusals = 0
         state.deliveredKbps = kbps
         state.stalls = []
         state.buffering = invalid
@@ -95,6 +108,7 @@ namespace playback.autoQuality
     ' Auto down to a transcode).
     sub loadStarted(state as Object, now as Dynamic)
         if util.isNumber(state.planAt) then state.planAt = now
+        if state.stepping <> invalid then state.stepping.planAt = now
     end sub
 
     ' Buffering began. cause is "stall" for rebuffering during playback; "seek",
@@ -195,7 +209,7 @@ namespace playback.autoQuality
 
     ' A bandwidth_estimate_kbps for an Auto quality_change when the stall
     ' history calls for a step down, else invalid. A step down waits for the
-    ' next plan before the history counts again.
+    ' next plan, or for its refusal, before the history counts again.
     function check(state as Object, now as Dynamic) as Dynamic
         if state.quality <> "auto" or now < state.holdUntil or not util.isNumber(state.planAt) or not util.isNumber(state.deliveredKbps) then return invalid
         if not stalledEnough(state, now) then return invalid
@@ -204,6 +218,7 @@ namespace playback.autoQuality
         last = estimate(state, now)
         if util.isNumber(last) and last < kbps then kbps = last
         if kbps < MIN_KBPS then kbps = MIN_KBPS
+        state.stepping = { at: now, planAt: state.planAt, previous: state.previous, holdUntil: state.holdUntil }
         state.previous = state.estimate
         state.estimate = { kbps: kbps, until: now + ESTIMATE_TTL_MS, confirmed: false }
         state.steppedFromKbps = state.deliveredKbps
@@ -211,6 +226,47 @@ namespace playback.autoQuality
         state.stalls = []
         state.buffering = invalid
         return kbps
+    end function
+
+    ' The server refused the step down asked at at, and the plan playing
+    ' stays: Auto judges it again once a hold ends, so a link that keeps
+    ' stalling asks at most once per hold.
+    sub refused(state as Object, now as Dynamic, at as Dynamic)
+        if not restore(state, at) then return
+        state.refusals = state.refusals + 1
+        hold = HOLD_MS
+        for i = 2 to state.refusals
+            hold = hold * 2
+            if hold >= MAX_HOLD_MS then exit for
+        end for
+        if hold > MAX_HOLD_MS then hold = MAX_HOLD_MS
+        state.holdUntil = now + hold
+    end sub
+
+    ' The step down asked at at was never sent: another request replaced
+    ' it in the queue, kept it out, or ended the plan it judged. Auto
+    ' judges the plan playing again.
+    sub unsent(state as Object, at as Dynamic)
+        restore(state, at)
+    end sub
+
+    ' Undoes the step down asked at at, if it is the latest: its estimate,
+    ' unless an outage already dropped it, and its hold on the next plan,
+    ' or the one it set on a plan that started meanwhile. The stall history
+    ' starts again from the step down. Whether it was.
+    function restore(state as Object, at as Dynamic) as Boolean
+        stepping = state.stepping
+        if stepping = invalid or stepping.at <> at then return false
+        state.stepping = invalid
+        state.planAt = stepping.planAt
+        lowered = state.estimate
+        if lowered <> invalid and lowered.until = at + ESTIMATE_TTL_MS
+            state.estimate = state.previous
+            state.previous = stepping.previous
+        end if
+        state.steppedFromKbps = invalid
+        state.holdUntil = stepping.holdUntil
+        return true
     end function
 
     ' The estimate starts and Auto replans carry while it lasts, else invalid.

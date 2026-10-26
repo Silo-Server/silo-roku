@@ -2018,6 +2018,15 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   reconnects, starts, and Retry carry the estimate before it, or none, and
   its step down holds nothing off. A `quality_change` already sent keeps
   its body when it is replayed.
+- A step down the server refuses leaves the plan playing without a notice,
+  since the viewer asked for nothing. Its estimate is dropped for the one
+  before it, and Auto judges the plan again from a fresh stall history once
+  a hold ends: five minutes, doubling with each refusal in a row until a
+  plan starts, up to 30 minutes. This holds when the plan of a request
+  queued ahead of it starts first, and Auto asks no other step down until
+  it is answered. A step down that another request
+  replaces or keeps out of the queue, or that an error leaves unsent, is
+  dropped the same way, without a hold.
 - Audio and subtitle selection send `selected_tracks.audio` or
   `selected_tracks.subtitle` as `{id, index}` in a `track_change` replan. `id`
   is the inventory's track identity and is required; `index` is sent only when
@@ -2038,9 +2047,9 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   codecs choose (section 8.5). The other kind keeps the
   plan's own `selected_tracks` member, since a `track_change` without a
   subtitle means subtitles off.
-- A track or quality change the server refuses leaves the plan playing as it
-  was, and a notice says so ("Can't switch to that track.", "Can't switch to
-  that quality.").
+- A track or quality change the viewer asked for that the server refuses
+  leaves the plan playing as it was, and a notice says so ("Can't switch to
+  that track.", "Can't switch to that quality.").
 - The first release does not claim client-side audio selection within an
   original file; the server may choose a remux that makes selection
   deterministic.
