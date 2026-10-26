@@ -2179,3 +2179,46 @@ and remained active. No server changes were made.
 Local checks passed: 738 playback tests, 25 overlay tests, three generated
 gradient/contrast checks, 21 collection tests, release/dev lint, API contract,
 formatting for changed BrightScript, package size, and whitespace checks.
+
+## Run 32 — Up Next to tvOS (AG-318)
+
+2026-10-25, physical Ultra 4850X on Roku OS 16.0.4, the release package
+sideloaded, signed in to the lab server. The package from `main` was played
+first for comparison.
+
+- `main`: Dark Matter S2E2 (58 min, a credits range about 60 s before the
+  end) opened Up Next at the credits counting down the runtime left (43 at
+  the capture, from about 60), with no On Deck row and no runtime line
+  under the episode title.
+- This change, the same episode: nothing opened at the credits; Up Next
+  opened 30 s before the end with the ring counting from 30, "S2:E3 ·
+  59 min", the overview, and an On Deck row of Continue Watching items
+  with their progress. The countdown ran out and S2E3 started from 0 in the
+  same player.
+- The controls' Up Next button, 57 min before the end, opened it with no
+  countdown. Down three times reached the first On Deck card (lifted,
+  captioned); Right four times scrolled the strip past the fourth card; Up
+  went to the toggle; Back closed the panel and playback went on.
+- OK on The Commuter (Continue Watching, 37 min in) played it from 37:19,
+  with the Up Next button showing for a movie. 30 s before its end Up Next
+  offered the first On Deck item (Dark Matter S2E3, at the top of Continue
+  Watching) with the row's other items, counting from 30; it advanced to
+  S2E3, which resumed at its saved position.
+- On S2E3, Keep Watching 30 s before the end closed the panel; the end
+  opened "PLAYING NEXT" with Play Now and Back, no Keep Watching, and no
+  countdown, the series' own episodes left out of On Deck. Back replayed
+  from 10 s before the end, and the end after it opened the same way, again
+  without a countdown, with On Deck read again. Play/Pause there started
+  S2E4.
+- Not run: the auto-play toggle, which writes `playback.auto_play_next` for
+  the device on the lab profile; Roku's autoplay setting off; a finale with
+  nothing in On Deck.
+
+### Observations in run 32
+
+- `main` stopped in the debugger once at launch, in `Main`'s loop:
+  `msg.isHdmiStatus()` on an `roHdmiStatusEvent` is "Member function not
+  found" on this firmware (`source/main.bs`). Not part of this change.
+- After `main`'s run, Home showed S2E2 as "54 min left", although Back left
+  it about 57 minutes in after a `seek_reanchor`; the stop's position was
+  not checked against the server.

@@ -1,0 +1,207 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/catalog/requests.bs"
+
+' Up Next's On Deck (spec section 5.7), as tvOS's player reads it
+' (PlayerViewModel.loadNextUpOnDeckItems and resolveOnDeckItems): the
+' profile's Home sections, Continue Watching, In Progress, and Next Up, in
+' server order, without the playing item, its series, or a repeat, up to
+' MAX_ITEMS. A section Home sends without its items (placeholder cards) is
+' read as Home's rows read it (catalog.request.homeSectionItems) before any
+' is chosen; one that fails to read is left out. Episode cards show their
+' own still, read from their seasons' episode lists, rather than the series
+' art Home's landscape cards carry; a season that fails to read keeps the
+' card's art.
+'
+' A request plan, pure but for reading and setting the answers' nodes. The
+' requests are catalog.request.homeSections, homeSectionItems, and
+' episodes, so ApiTask's map step answers with a tree of RowContent rows, or
+' a RowContent, of CardContent cards. The player sends what start and answer return with api.send and
+' passes each answer back with its stage:
+'
+'     m.onDeck = playback.onDeck.create({ itemId, seriesId }, lowTier)
+'     for each item in playback.onDeck.start(m.onDeck)
+'         m.onDeckStages[api.send(item.request, handle)] = item.stage
+'     end for
+'     ' On each answer, with its handle's stage:
+'     follow = playback.onDeck.answer(m.onDeck, stage, result.ok = true, handle.content)
+'     ' Send follow the same way; once settled(m.onDeck), entries(m.onDeck)
+'     ' is playback.upNext's { type: "onDeck" } items.
+namespace playback.onDeck
+    const MAX_ITEMS = 12
+    ' Request stages; a section's items' stage is SECTION_PREFIX and its ID,
+    ' a season's SEASON_PREFIX and its key.
+    const SECTIONS = "sections"
+    const SECTION_PREFIX = "section:"
+    const SEASON_PREFIX = "season:"
+
+    ' current: the playing item, { itemId, seriesId } (seriesId "" for a
+    ' movie).
+    function create(current as Object, lowTier as Boolean) as Object
+        return { current: current, lowTier: lowTier, phase: "pending", rows: [], waitingRows: {}, entries: [], waiting: {} }
+    end function
+
+    function start(state as Object) as Object
+        if state.phase <> "pending" then return []
+        return [{ stage: SECTIONS, request: catalog.request.homeSections(state.lowTier) }]
+    end function
+
+    ' One answer: ok is the result's ok, content its node (the handle's
+    ' content; invalid when it failed). Returns the next requests, [] when
+    ' there are none.
+    function answer(state as Object, stage as String, ok as Boolean, content as Dynamic) as Object
+        if state.phase <> "pending" then return []
+        if stage = SECTIONS
+            if not ok
+                state.phase = "settled"
+                return []
+            end if
+            state.rows = rowsOf(content)
+            follow = []
+            for each row in state.rows
+                if isPending(row.cards) and not state.waitingRows.DoesExist(row.id)
+                    state.waitingRows[row.id] = true
+                    follow.Push({ stage: SECTION_PREFIX + row.id, request: catalog.request.homeSectionItems(row.id, state.lowTier) })
+                end if
+            end for
+            if follow.Count() > 0 then return follow
+            return choose(state)
+        end if
+        if Left(stage, Len(SECTION_PREFIX)) = SECTION_PREFIX
+            id = Mid(stage, Len(SECTION_PREFIX) + 1)
+            if not state.waitingRows.DoesExist(id) then return []
+            state.waitingRows.Delete(id)
+            for each row in state.rows
+                if row.id = id
+                    row.cards = invalid
+                    if ok and type(content) = "roSGNode" then row.cards = content
+                end if
+            end for
+            if state.waitingRows.Count() > 0 then return []
+            return choose(state)
+        end if
+        if Left(stage, Len(SEASON_PREFIX)) <> SEASON_PREFIX then return []
+        key = Mid(stage, Len(SEASON_PREFIX) + 1)
+        season = state.waiting[key]
+        if season = invalid then return []
+        state.waiting.Delete(key)
+        if ok then applyStills(state.entries, season, content)
+        if state.waiting.Count() = 0 then state.phase = "settled"
+        return []
+    end function
+
+    ' Picks the entries from the rows, then reads their episodes' seasons.
+    function choose(state as Object) as Object
+        state.entries = entriesOf(state.rows, state.current)
+        follow = []
+        for each season in seasons(state.entries)
+            state.waiting[season.key] = season
+            follow.Push({ stage: SEASON_PREFIX + season.key, request: catalog.request.episodes(season.seriesId, season.seasonNumber, "") })
+        end for
+        if follow.Count() = 0 then state.phase = "settled"
+        return follow
+    end function
+
+    function settled(state as Object) as Boolean
+        return state.phase <> "pending"
+    end function
+
+    ' The entries playback.upNext takes: { itemId, card, onDeck, seriesId,
+    ' seasonNumber }, [] for a failed read.
+    function entries(state as Object) as Object
+        return state.entries
+    end function
+
+    ' --- Pure selection ----------------------------------------------------------
+
+    ' tvOS's resolveOnDeckItems over a Home tree (catalog.map.rowsTree).
+    function fromRows(tree as Dynamic, current as Object) as Object
+        return entriesOf(rowsOf(tree), current)
+    end function
+
+    ' A Home tree's On Deck sections, { id, cards } in server order, cards
+    ' the section's RowContent.
+    function rowsOf(tree as Dynamic) as Object
+        out = []
+        if type(tree) <> "roSGNode" then return out
+        for each row in tree.getChildren(-1, 0)
+            if isOnDeckSection(row.sectionType) and row.id <> "" then out.Push({ id: row.id, cards: row })
+        end for
+        return out
+    end function
+
+    ' A section Home sent without its items holds placeholder cards.
+    function isPending(cards as Dynamic) as Boolean
+        if type(cards) <> "roSGNode" then return false
+        for each card in cards.getChildren(-1, 0)
+            if card.id = "" then return true
+        end for
+        return false
+    end function
+
+    function entriesOf(rows as Object, current as Object) as Object
+        out = []
+        currentId = util.text(current.itemId)
+        currentSeries = util.text(current.seriesId)
+        seen = {}
+        for each row in rows
+            if type(row.cards) = "roSGNode"
+                for each card in row.cards.getChildren(-1, 0)
+                    id = card.id
+                    series = util.text(card.seriesId)
+                    if id <> "" and id <> currentId and not (currentSeries <> "" and series = currentSeries) and not seen.DoesExist(id)
+                        seen[id] = true
+                        out.Push({ itemId: id, card: card, onDeck: true, seriesId: series, seasonNumber: card.seasonNumber })
+                        if out.Count() >= MAX_ITEMS then return out
+                    end if
+                end for
+            end if
+        end for
+        return out
+    end function
+
+    function isOnDeckSection(sectionType as Dynamic) as Boolean
+        name = LCase(util.text(sectionType))
+        return name = "continue_watching" or name = "in_progress" or name = "next_up"
+    end function
+
+    ' The distinct seasons of the episode entries, { key, seriesId,
+    ' seasonNumber }, in order.
+    function seasons(items as Object) as Object
+        out = []
+        seen = {}
+        for each entry in items
+            card = entry.card
+            if LCase(card.itemType) = "episode" and entry.seriesId <> "" and card.seasonNumber >= 0
+                key = entry.seriesId + "|" + card.seasonNumber.ToStr()
+                if not seen.DoesExist(key)
+                    seen[key] = true
+                    out.Push({ key: key, seriesId: entry.seriesId, seasonNumber: card.seasonNumber })
+                end if
+            end if
+        end for
+        return out
+    end function
+
+    ' Gives the season's episode cards among items their stills, matched
+    ' by ID, else by episode number, as tvOS's horizontalArtwork does.
+    sub applyStills(items as Object, season as Object, content as Dynamic)
+        if type(content) <> "roSGNode" then return
+        episodes = content.getChildren(-1, 0)
+        for each entry in items
+            card = entry.card
+            if entry.seriesId = season.seriesId and card.seasonNumber = season.seasonNumber and LCase(card.itemType) = "episode"
+                still = stillFor(episodes, card)
+                if still <> "" then card.artUri = still
+            end if
+        end for
+    end sub
+
+    function stillFor(episodes as Object, card as Object) as String
+        for each episode in episodes
+            if episode.id = card.id or (card.episodeNum >= 0 and episode.episodeNum = card.episodeNum)
+                return util.text(episode.artUri)
+            end if
+        end for
+        return ""
+    end function
+end namespace

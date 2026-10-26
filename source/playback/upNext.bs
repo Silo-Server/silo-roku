@@ -1,120 +1,154 @@
 import "pkg:/source/util/values.bs"
 import "pkg:/source/playback/values.bs"
 
-' Up Next for episodes (spec section 5.7), as Android TV's player decides it
-' (TvPlayerViewModel onApproachingEnd, commitApproachingEnd, and
-' startNextUpCountdown). Pure: reduce(state, event) updates state in place
-' and returns commands:
+' Up Next (spec section 5.7), as tvOS's player decides it
+' (PlayerViewModel's updateNextUpPresentation, beginNextUpPostroll,
+' startNextUpCountdownIfNeeded, and keepWatchingCurrentEpisode). Pure:
+' reduce(state, event) updates state in place and returns commands:
 '
-'   { type: "show", ended, countdown, total, autoPlay, allowed }
+'   { type: "show", ended, countdown, total, autoPlay, allowed, pick,
+'     loading, failed, carousel }
 '       open or update UpNextPanel (panelFields gives its fields) and shrink
 '       the video to theme.upNext's box. ended: the video has ended, so the
-'       heading is Playing Next and Keep Watching is gone. countdown: whole
-'       seconds left, or invalid for none; total: what the ring counts from.
-'       allowed: false hides the auto-play toggle (device autoplay is off).
+'       heading is Playing Next (Finished with nothing to play) and Keep
+'       Watching is gone. countdown: whole seconds left, or invalid for
+'       none; total: what the ring counts from. allowed: false hides the
+'       auto-play toggle (device autoplay is off). pick: the item Play Now
+'       starts (an entry, below), or invalid; loading: the next episode is
+'       still being looked up; failed: the lookup failed. carousel: the On
+'       Deck entries the panel's row shows, the pick left out.
 '   { type: "close" }   take the panel down; the video returns to full screen
-'   { type: "playNext", itemId, auto, carry }
-'       start itemId from 0 (Android TV starts the next episode over) as an
-'       autoplay start; give the next player's create carry. Last command.
+'   { type: "resume" }  Keep Watching before the end: playback goes on, and
+'                       plays if it was paused
+'   { type: "replay", seconds }
+'       Keep Watching after the end: play the item again from seconds (10 s
+'       before its end), with replayCarry(). Last command.
+'   { type: "playNext", itemId, auto, chosen, onDeck, carry }
+'       start itemId where its watch state resumes (tvOS's
+'       startFromBeginning false); auto: the countdown started it; chosen:
+'       the viewer chose it from the On Deck row, so it is their own start,
+'       not an autoplay one (tvOS's playOnDeckItemNow); onDeck: it came from
+'       On Deck, not the series; give the next player's create carry. Last
+'       command.
 '   { type: "exit" }    stop and leave the player. Last command.
 '
-' When it opens. Only with a next episode (playback.nextEpisode). Playback
-' crossing the start of the credits (playback.markers.creditsStart) opens it
-' once per item, but not resuming or seeking into the credits; the video's
-' end opens it too. The controls' Up Next button opens it without a
-' countdown, which the credits or the end then start. An end that comes
-' while the next episode is still being resolved waits for it, as Android
-' TV does, for up to END_WAIT_MS, then exits; so does a resolution that
-' finds none meanwhile. holdsEnd says whether the player should stay at
-' the end.
+' An entry is { itemId, card, onDeck, seriesId, seasonNumber }: card is its
+' CardContent (playback.onDeck, playback.nextEpisode).
 '
-' The countdown runs when auto-play is on: the profile's
-' playback.auto_play_next, roDeviceInfo.IsAutoplayEnabled() (plan section
-' 6.10), and the panel's toggle, which lasts for this chain of episodes and
-' starts or stops the countdown at once. After PASS_OUT_THRESHOLD automatic
-' advances in a row, Up Next opens without one, so the viewer must choose;
-' Play Now resets the count. Opened at the credits, the countdown is the
-' runtime left: it stops while paused, grows when the viewer seeks back, and
-' the next episode starts when the video ends. Opened at the end, it is
-' END_COUNTDOWN_SECONDS of wall clock.
+' When it opens. Playback inside the last promptSeconds of the runtime
+' (playback.next_up_prompt_seconds, 0 for never) opens it whenever it has
+' something to show (canShow): the next episode, an On Deck item, or either
+' still loading. This holds for movies too, and for a resume or a seek into
+' that window. The video's end always opens it, as Playing Next, or as
+' Finished with nothing to play. The controls' Up Next button opens it at
+' any time.
 '
-' Keep Watching closes it for the rest of the item: crossing the credits
-' again does nothing, and the end reopens it as Playing Next without a
-' countdown. Back while it shows exits the player (spec section 5.7 Back
-' chain), as does the panel's Back.
+' What it offers. An episode's next episode (playback.nextEpisode). With
+' none, for a movie, the last episode, or a series without a next one, the
+' first On Deck item is the pick instead, so playback carries on into what
+' the profile is watching elsewhere; a failed lookup offers none, as the
+' series may still have a next episode. On Deck's other items show in the
+' panel's row, and OK on one plays it.
+'
+' The countdown runs when auto-play is on (the profile's
+' playback.auto_play_next, roDeviceInfo.IsAutoplayEnabled() as plan section
+' 6.10 requires, and the panel's toggle, which the profile keeps) and Keep
+' Watching or the toggle has not turned it off for this opening. Opened
+' before the end, it is the runtime left, from promptSeconds: it stops while
+' paused and grows when the viewer seeks back, and the pick starts as it
+' reaches PLAY_AT_SECONDS, or at the end. Opened by the Up Next button, it
+' shows only within HUD_COUNTDOWN_SECONDS of the end, from that. Opened at
+' the end, it is END_COUNTDOWN_SECONDS of wall clock; an end that comes with
+' the panel already counting starts the pick at once.
+'
+' Keep Watching and Back close it until playback leaves the prompt window
+' (a seek back), when it can open there again. After the end they play the
+' last REPLAY_SECONDS again (Back leaves instead when there is nothing to
+' play), dismissed and without a countdown while inside
+' the window, so the end that follows shows it without one; a window shorter
+' than REPLAY_SECONDS starts the replay outside it, and entering it counts
+' down again, as tvOS's seek to duration - 10 does. Play/Pause is Play Now.
 '
 ' Events, with now in monotonic milliseconds:
 '
-'   { type: "next", next }            playback.nextEpisode.episode once
-'                                     settled (invalid: none)
-'   { type: "timeline", creditsStart, runtime }
-'                                     the playing file's credits start and
-'                                     runtime changed (as create's options)
+'   { type: "next", next, failed }   the next-episode lookup settled: next
+'                                    is an entry or invalid; failed says a
+'                                    read failed
+'   { type: "onDeck", items }        On Deck's entries ([] when its read
+'                                    failed)
+'   { type: "timeline", runtime }    the playing file's runtime changed
+'   { type: "prompt", seconds }      the profile's prompt window, read late
 '   { type: "position", seconds, now } source seconds while playing
-'   { type: "seek" }                  any seek began (skips, the scrubber,
-'                                     Skip Intro), so the next position does
-'                                     not count as crossing the credits, and
-'                                     a crossing still waiting for the next
-'                                     episode opens nothing
-'   { type: "ended", now }            the Video node finished
-'   { type: "open" }                  the controls' Up Next button
+'   { type: "ended", now }           the Video node finished
+'   { type: "open", now }            the controls' Up Next button
 '   { type: "playNow" }, { type: "keepWatching" }, { type: "back" }
-'   { type: "autoPlay", value, now }  the panel's toggle
-'   { type: "tick", now }             at nextWake
+'   { type: "pick", itemId }         OK on an On Deck card
+'   { type: "hide" }                 an error screen covers the player: the
+'                                    panel closes as Keep Watching closes
+'                                    it, without resuming anything
+'   { type: "autoPlay", value, now } the panel's or Options' toggle
+'   { type: "tick", now }            at nextWake
 namespace playback.upNext
-    ' Android TV's NEXT_UP_COUNTDOWN_SECONDS.
+    ' tvOS's nextUpCountdownDefaultSeconds.
     const END_COUNTDOWN_SECONDS = 10
-    ' How long the video's end waits for the next episode to be resolved.
-    const END_WAIT_MS = 10000
-    ' Android TV's default pass-out threshold (player.passout_threshold,
-    ' which has no Roku setting).
-    const PASS_OUT_THRESHOLD = 3
-    ' A position more than this past the last one is a jump the player did
-    ' not announce with a seek event, not playback crossing the credits.
-    const CROSSING_STEP_SECONDS = 2.5
+    ' tvOS's nextUpHUDCountdownThresholdSeconds.
+    const HUD_COUNTDOWN_SECONDS = 100
+    ' The countdown before the end starts the pick this close to it.
+    const PLAY_AT_SECONDS = 0.35
+    ' Keep Watching after the end plays this much again.
+    const REPLAY_SECONDS = 10
+    ' The settings manifest's playback.next_up_prompt_seconds: 30 by
+    ' default, 0 to 120.
+    const PROMPT_SECONDS = 30
+    const MAX_PROMPT_SECONDS = 120
 
-    ' What one player hands the next through playNext: the automatic
-    ' advances in a row, and the toggle (invalid until the viewer sets it).
-    ' Every other start uses newCarry(), as a new Android TV player starts at
-    ' zero.
+    ' What one player hands the next through playNext or replay: the toggle
+    ' (invalid until the viewer sets it), and whether this is Keep
+    ' Watching's replay of the end, which opens dismissed and without a
+    ' countdown. Every other start uses newCarry().
     function newCarry() as Object
-        return { streak: 0, autoPlay: invalid }
+        return { autoPlay: invalid, replay: false }
     end function
 
-    ' options: { creditsStart, runtime, autoPlayNext, deviceAutoplay, carry }.
-    ' creditsStart (playback.markers.creditsStart) and runtime (source
-    ' seconds, playback.seek.runtime) may be invalid; autoPlayNext is the
+    ' options: { promptSeconds, runtime, lookup, autoPlayNext,
+    ' deviceAutoplay, carry }. promptSeconds is the profile's
+    ' playback.next_up_prompt_seconds; runtime (source seconds,
+    ' playback.seek.runtime) may be invalid; lookup says a next-episode
+    ' lookup runs (an episode), so "next" will come; autoPlayNext is the
     ' profile's playback.auto_play_next; deviceAutoplay is
-    ' roDeviceInfo.IsAutoplayEnabled(); carry is newCarry() or a playNext's.
+    ' roDeviceInfo.IsAutoplayEnabled(); carry is newCarry() or a playNext's
+    ' or a replay's. On Deck always loads, so "onDeck" will come.
     function create(options as Object) as Object
         carry = options.carry
         if not util.isObject(carry) then carry = newCarry()
         autoPlay = util.isTrue(options.autoPlayNext)
         if util.isBoolean(carry.autoPlay) then autoPlay = carry.autoPlay
-        streak = 0
-        if util.isNumber(carry.streak) and carry.streak > 0 then streak = Int(carry.streak)
+        replay = util.isTrue(carry.replay)
         return {
-            creditsStart: numberOrInvalid(options.creditsStart),
+            promptSeconds: promptSeconds(options.promptSeconds),
             runtime: numberOrInvalid(options.runtime),
             allowed: util.isTrue(options.deviceAutoplay),
             autoPlay: autoPlay,
-            streak: streak,
             next: invalid,
-            resolved: false,
-            ' { ended, until } when the credits or the end came before the
-            ' next episode was known; it opens once it is. until is when an
-            ' end stops waiting (invalid for the credits).
-            pending: invalid,
+            nextLoading: util.isTrue(options.lookup),
+            nextFailed: false,
+            onDeck: [],
+            onDeckLoading: true,
+            position: invalid,
             open: false,
             ended: false,
-            ' Android TV's autoAdvanceHandled: the credits, the end, or Keep
-            ' Watching has decided this item.
-            committed: false,
+            ' "automatic" (the prompt window or the end) or "hud" (the Up
+            ' Next button): what opened the panel this time.
+            source: "automatic",
+            ' tvOS's nextUpAutoplayCancelled: Keep Watching or the toggle
+            ' stopped the countdown.
+            cancelled: replay,
+            ' tvOS's nextUpPromptDismissed: Keep Watching closed the panel
+            ' inside the prompt window.
+            dismissed: replay,
             ' { atEnd, endsAt, seconds, total }, or invalid.
             countdown: invalid,
-            previous: invalid,
-            position: invalid,
-            ' A playNext or exit went out; nothing follows it.
+            ' A playNext, replay, or exit went out; nothing follows it.
             finished: false,
             ' The last show command as text, or invalid when closed.
             shown: invalid
@@ -127,26 +161,31 @@ namespace playback.upNext
         now = event.now
         t = event.type
         if t = "position"
-            onPosition(state, event.seconds, now, out)
-        else if t = "seek"
-            onSeek(state)
+            if util.isNumber(event.seconds) then state.position = event.seconds
+            present(state, now, out)
         else if t = "ended"
-            approachingEnd(state, true, now, out)
+            if state.runtime <> invalid then state.position = state.runtime
+            beginPostroll(state, true, "automatic", now, out)
         else if t = "next"
-            onNext(state, event.next, now, out)
+            onNext(state, event.next, util.isTrue(event.failed), now, out)
+        else if t = "onDeck"
+            takeOnDeck(state, event.items, now, out)
         else if t = "timeline"
-            state.creditsStart = numberOrInvalid(event.creditsStart)
             state.runtime = numberOrInvalid(event.runtime)
+        else if t = "prompt"
+            state.promptSeconds = promptSeconds(event.seconds)
         else if t = "open"
-            if canOpen(state) then state.open = true
+            if canOpen(state) then beginPostroll(state, false, "hud", now, out)
         else if t = "playNow"
             if state.open then playNext(state, false, out)
-        else if t = "keepWatching"
-            onKeepWatching(state)
-        else if t = "back"
-            if state.open then finish(state, { type: "exit" }, out)
+        else if t = "keepWatching" or t = "back"
+            if state.open then keepWatching(state, out)
+        else if t = "pick"
+            if state.open then pick(state, util.text(event.itemId), out)
+        else if t = "hide"
+            if state.open then dismiss(state)
         else if t = "autoPlay"
-            onAutoPlay(state, event.value, now)
+            onAutoPlay(state, event.value, now, out)
         else if t = "tick"
             onTick(state, now, out)
         end if
@@ -159,35 +198,37 @@ namespace playback.upNext
         return state.open and not state.finished
     end function
 
-    ' Whether the player leaves its item finished, as tvOS's
-    ' PlayerNextUpCompletionPolicy decides when its player closes: the video
-    ' ended (videoEnded), or Up Next was open with playback in the credits.
-    ' state is invalid for a movie. The detail page moves on only from a
-    ' finished episode (spec section 5.6), never from one the server merely
-    ' reports watched before.
-    function leftFinished(state as Dynamic, videoEnded as Boolean) as Boolean
-        if videoEnded then return true
-        if not util.isObject(state) then return false
-        return state.open and inCredits(state)
+    ' tvOS's canShowNextUpScreen: there is a pick or an On Deck item to
+    ' show, or one is still loading.
+    function canShow(state as Object) as Boolean
+        return state.next <> invalid or carousel(state).Count() > 0 or state.nextLoading or state.onDeckLoading
     end function
 
     ' Whether the controls' Up Next button has something to open.
-    function canOpen(state as Object) as Boolean
-        return state.next <> invalid and not state.open and not state.finished
+    function canOpen(state as Dynamic) as Boolean
+        if not util.isObject(state) then return false
+        return canShow(state) and not state.open and not state.finished and not state.ended
     end function
 
-    ' Whether the player stays when the video ends, and gives this the
-    ' "ended" event: the next episode is known, or still being resolved.
-    ' Otherwise it leaves as after a movie.
-    function holdsEnd(state as Object) as Boolean
-        return not state.finished and (state.next <> invalid or not state.resolved)
+    ' Whether the player leaves its item finished, as tvOS's
+    ' PlayerNextUpCompletionPolicy decides when its player closes: the video
+    ' ended, or Up Next was open inside the prompt window. The detail page
+    ' moves on only from a finished episode (spec section 5.6), never from
+    ' one the server merely reports watched before.
+    function leftFinished(state as Dynamic, videoEnded as Boolean) as Boolean
+        if videoEnded then return true
+        if not util.isObject(state) then return false
+        return state.open and inWindow(state, state.position)
+    end function
+
+    ' The carry for Keep Watching's replay of the end.
+    function replayCarry(state as Object) as Object
+        return { autoPlay: state.autoPlay, replay: true }
     end function
 
     ' When to send the next tick, or invalid: as the end countdown's number
-    ' drops, and when an end stops waiting for the next episode.
+    ' drops.
     function nextWake(state as Object, now as Dynamic) as Dynamic
-        if state.finished then return invalid
-        if endWaiting(state) then return state.pending.until
         countdown = endCountdown(state)
         if countdown = invalid or not util.isNumber(now) then return invalid
         left = countdown.endsAt - now
@@ -196,143 +237,196 @@ namespace playback.upNext
     end function
 
     ' UpNextPanel's fields for a show command. A SceneGraph float cannot be
-    ' invalid, so no countdown is -1.
+    ' invalid, so no countdown is -1. The cards are the entries'.
     function panelFields(command as Object) as Object
         countdown = -1
         if util.isNumber(command.countdown) then countdown = command.countdown
-        return { ended: command.ended, countdown: countdown, countdownTotal: command.total, autoPlay: command.autoPlay, autoPlayAllowed: command.allowed }
+        content = invalid
+        pickKind = "none"
+        if command.pick <> invalid
+            content = command.pick.card
+            pickKind = "item"
+        else if command.loading
+            pickKind = "loading"
+        end if
+        cards = []
+        for each entry in command.carousel
+            cards.Push(entry.card)
+        end for
+        return { ended: command.ended, countdown: countdown, countdownTotal: command.total, autoPlay: command.autoPlay, autoPlayAllowed: command.allowed, content: content, pickKind: pickKind, lookupFailed: command.failed, onDeck: cards }
+    end function
+
+    ' The On Deck entries the panel's row shows: all but the pick.
+    function carousel(state as Object) as Object
+        out = []
+        pickId = ""
+        if state.next <> invalid then pickId = state.next.itemId
+        for each entry in state.onDeck
+            if entry.itemId <> pickId then out.Push(entry)
+        end for
+        return out
     end function
 
     ' --- Internals --------------------------------------------------------------
 
-    sub onPosition(state as Object, seconds as Dynamic, now as Dynamic, out as Object)
-        if not util.isNumber(seconds) then return
-        previous = state.previous
-        state.previous = seconds
-        state.position = seconds
-        start = state.creditsStart
-        if util.isNumber(previous) and start <> invalid and previous < start and seconds >= start and seconds - previous <= CROSSING_STEP_SECONDS
-            approachingEnd(state, false, now, out)
-        end if
-        countdown = state.countdown
-        if state.open and countdown <> invalid and not countdown.atEnd
-            countdown.seconds = remaining(state)
-            if countdown.seconds > countdown.total then countdown.total = countdown.seconds
-        end if
-    end sub
-
-    ' A seek is no crossing, and it drops a credits opening still waiting for
-    ' the next episode: a seek back into the episode does not open the panel
-    ' when the answer comes, and crossing the credits again does. A waiting
-    ' end keeps its opening and deadline.
-    sub onSeek(state as Object)
-        state.previous = invalid
-        if state.pending <> invalid and not state.pending.ended then state.pending = invalid
-    end sub
-
-    ' Android TV's onApproachingEnd: the credits (videoEnded false) or the end.
-    sub approachingEnd(state as Object, videoEnded as Boolean, now as Dynamic, out as Object)
-        if state.committed
-            ' The end reopens a dismissed panel without a countdown, and ends
-            ' a credits countdown with the next episode.
-            if not videoEnded then return
-            state.open = true
-            state.ended = true
-            countdown = state.countdown
-            if countdown <> invalid and not countdown.atEnd then playNext(state, true, out)
+    ' tvOS's updateNextUpPresentation: an open panel follows the playhead;
+    ' a closed one opens inside the prompt window unless Keep Watching
+    ' dismissed it there, and playback leaving the window forgets that.
+    sub present(state as Object, now as Dynamic, out as Object)
+        if state.ended then return
+        if state.open
+            followPlayhead(state, out)
             return
         end if
-        if not state.resolved
-            if videoEnded
-                state.pending = { ended: true, until: playback.values.number(now, 0) + END_WAIT_MS }
-            else if state.pending = invalid
-                state.pending = { ended: false, until: invalid }
-            end if
+        if not (canShow(state) and inWindow(state, state.position))
+            if util.isNumber(state.position) then state.dismissed = false
             return
         end if
-        if state.next <> invalid then commit(state, videoEnded, now)
+        if state.dismissed then return
+        beginPostroll(state, false, "automatic", now, out)
     end sub
 
-    sub commit(state as Object, videoEnded as Boolean, now as Dynamic)
-        state.committed = true
-        state.pending = invalid
+    ' tvOS's PlayerNextUpCompletionPolicy.isInPromptWindow.
+    function inWindow(state as Object, position as Dynamic) as Boolean
+        if state.promptSeconds <= 0 or state.runtime = invalid or state.runtime <= 0 or not util.isNumber(position) then return false
+        left = state.runtime - position
+        return left >= 0 and left <= state.promptSeconds
+    end function
+
+    ' tvOS's beginNextUpPostroll.
+    sub beginPostroll(state as Object, videoEnded as Boolean, source as String, now as Dynamic, out as Object)
+        wasOpen = state.open
+        wasCounting = state.open and not state.ended
+        if not wasOpen then state.source = source
         state.open = true
         state.ended = videoEnded
-        state.countdown = invalid
-        if counts(state) then startCountdown(state, now)
-    end sub
-
-    ' Auto-play is on and the pass-out gate has not closed.
-    function counts(state as Object) as Boolean
-        return state.allowed and state.autoPlay and state.streak < PASS_OUT_THRESHOLD
-    end function
-
-    sub startCountdown(state as Object, now as Dynamic)
-        if state.ended
-            endsAt = playback.values.number(now, 0) + END_COUNTDOWN_SECONDS * 1000
-            state.countdown = { atEnd: true, endsAt: endsAt, seconds: END_COUNTDOWN_SECONDS, total: END_COUNTDOWN_SECONDS }
+        if not wasCounting and not videoEnded then state.cancelled = false
+        if videoEnded and wasCounting and counts(state)
+            playNext(state, true, out)
             return
         end if
-        seconds = remaining(state)
-        total = seconds
-        if total < 1 then total = 1
-        state.countdown = { atEnd: false, endsAt: invalid, seconds: seconds, total: total }
+        startCountdown(state, now, out)
     end sub
 
-    ' Whole seconds of runtime left, 0 when the runtime is unknown.
-    function remaining(state as Object) as Integer
-        if state.runtime = invalid or not util.isNumber(state.position) then return 0
-        left = state.runtime - state.position
-        if left <= 0 then return 0
-        return ceiling(left)
+    ' Auto-play is on, there is a pick, and nothing stopped the countdown.
+    function counts(state as Object) as Boolean
+        return state.allowed and state.autoPlay and state.next <> invalid and not state.cancelled
     end function
 
-    ' A waiting end exits when there is no next episode after all. A waiting
-    ' credits opening needs playback still in the credits, which a jump back
-    ' the player did not announce as a seek leaves.
-    sub onNext(state as Object, episode as Dynamic, now as Dynamic, out as Object)
-        state.resolved = true
+    ' tvOS's startNextUpCountdownIfNeeded.
+    sub startCountdown(state as Object, now as Dynamic, out as Object)
+        state.countdown = invalid
+        if not state.open or not counts(state) then return
+        if not state.ended
+            followPlayhead(state, out)
+            return
+        end if
+        endsAt = playback.values.number(now, 0) + END_COUNTDOWN_SECONDS * 1000
+        state.countdown = { atEnd: true, endsAt: endsAt, seconds: END_COUNTDOWN_SECONDS, total: END_COUNTDOWN_SECONDS }
+    end sub
+
+    ' tvOS's updateNextUpCountdownForActivePlayback: before the end, the
+    ' countdown is the runtime left.
+    sub followPlayhead(state as Object, out as Object)
+        if not state.open or state.ended then return
+        state.countdown = invalid
+        if not counts(state) or state.runtime = invalid or state.runtime <= 0 or not util.isNumber(state.position) then return
+        left = state.runtime - state.position
+        if left < 0 then left = 0
+        total = state.promptSeconds
+        if state.source = "hud"
+            if left >= HUD_COUNTDOWN_SECONDS then return
+            total = HUD_COUNTDOWN_SECONDS
+        end if
+        if total < 1 then total = 1
+        state.countdown = { atEnd: false, endsAt: invalid, seconds: ceiling(left), total: total }
+        if left <= PLAY_AT_SECONDS then playNext(state, true, out)
+    end sub
+
+    ' The lookup settled. With no next episode, On Deck may offer one.
+    sub onNext(state as Object, entry as Dynamic, failed as Boolean, now as Dynamic, out as Object)
+        state.nextLoading = false
+        state.nextFailed = failed
         state.next = invalid
-        if util.isObject(episode) and util.text(episode.itemId) <> "" then state.next = episode
-        pending = state.pending
-        state.pending = invalid
-        if pending = invalid then return
-        if state.next <> invalid
-            if pending.ended or inCredits(state) then commit(state, pending.ended, now)
-        else if pending.ended
-            finish(state, { type: "exit" }, out)
+        if util.isObject(entry) and util.text(entry.itemId) <> "" then state.next = entry
+        if state.next = invalid and offerOnDeck(state, now, out) then return
+        refresh(state, now, out)
+    end sub
+
+    sub takeOnDeck(state as Object, items as Dynamic, now as Dynamic, out as Object)
+        state.onDeckLoading = false
+        state.onDeck = []
+        if playback.values.isArray(items)
+            for each entry in items
+                if util.isObject(entry) and util.text(entry.itemId) <> "" then state.onDeck.Push(entry)
+            end for
+        end if
+        if offerOnDeck(state, now, out) then return
+        present(state, now, out)
+    end sub
+
+    ' tvOS's offerOnDeckItemIfNothingNext: the first On Deck item becomes
+    ' the pick when there is no next episode and the lookup did not fail.
+    function offerOnDeck(state as Object, now as Dynamic, out as Object) as Boolean
+        if state.next <> invalid or state.nextLoading or state.nextFailed then return false
+        items = carousel(state)
+        if items.Count() = 0 then return false
+        state.next = items[0]
+        refresh(state, now, out)
+        return true
+    end function
+
+    ' A new pick restarts an open panel's countdown; a closed panel may open.
+    sub refresh(state as Object, now as Dynamic, out as Object)
+        if state.open
+            startCountdown(state, now, out)
+        else
+            present(state, now, out)
         end if
     end sub
 
-    function inCredits(state as Object) as Boolean
-        return state.creditsStart <> invalid and util.isNumber(state.position) and state.position >= state.creditsStart
-    end function
-
-    sub onKeepWatching(state as Object)
-        if not state.open or state.ended then return
-        state.committed = true
-        state.countdown = invalid
-        state.open = false
+    ' tvOS's keepWatchingCurrentEpisode, which Back also is. After an end
+    ' with nothing to play (Finished, nothing loading), Back leaves the
+    ' player instead of replaying the end, as Roku's Back leaves playback.
+    sub keepWatching(state as Object, out as Object)
+        ended = state.ended
+        nothing = state.next = invalid and carousel(state).Count() = 0 and not state.nextLoading and not state.onDeckLoading
+        dismiss(state)
+        if not ended
+            out.Push({ type: "resume" })
+            return
+        end if
+        if nothing or state.runtime = invalid or state.runtime <= 0
+            finish(state, { type: "exit" }, out)
+            return
+        end if
+        seconds = state.runtime - REPLAY_SECONDS
+        if seconds < 0 then seconds = 0
+        finish(state, { type: "replay", seconds: seconds }, out)
     end sub
 
-    ' The toggle starts or stops the countdown of a panel the credits or the
-    ' end opened; one the Up Next button opened waits for them.
-    sub onAutoPlay(state as Object, value as Dynamic, now as Dynamic)
+    sub dismiss(state as Object)
+        state.cancelled = true
+        state.dismissed = true
+        state.open = false
+        state.ended = false
+        state.countdown = invalid
+    end sub
+
+    ' tvOS's setNextUpAutoPlayEnabled.
+    sub onAutoPlay(state as Object, value as Dynamic, now as Dynamic, out as Object)
         if not util.isBoolean(value) or value = state.autoPlay then return
         state.autoPlay = value
-        if not state.open or not state.committed then return
-        if not counts(state)
+        if value
+            state.cancelled = false
+            startCountdown(state, now, out)
+        else
+            state.cancelled = true
             state.countdown = invalid
-        else if state.countdown = invalid
-            startCountdown(state, now)
         end if
     end sub
 
     sub onTick(state as Object, now as Dynamic, out as Object)
-        if endWaiting(state)
-            if util.isNumber(now) and now >= state.pending.until then finish(state, { type: "exit" }, out)
-            return
-        end if
         countdown = endCountdown(state)
         if countdown = invalid or not util.isNumber(now) then return
         left = countdown.endsAt - now
@@ -343,11 +437,6 @@ namespace playback.upNext
         countdown.seconds = ceiling(left / 1000)
     end sub
 
-    ' The video ended before the next episode was known.
-    function endWaiting(state as Object) as Boolean
-        return state.pending <> invalid and state.pending.ended
-    end function
-
     ' The wall-clock countdown of a panel the end opened, or invalid.
     function endCountdown(state as Object) as Dynamic
         countdown = state.countdown
@@ -355,11 +444,20 @@ namespace playback.upNext
         return countdown
     end function
 
-    ' Play Now (auto false) resets the streak; an automatic advance adds one.
     sub playNext(state as Object, auto as Boolean, out as Object)
-        streak = 0
-        if auto then streak = state.streak + 1
-        finish(state, { type: "playNext", itemId: state.next.itemId, auto: auto, carry: { streak: streak, autoPlay: state.autoPlay } }, out)
+        entry = state.next
+        if entry = invalid then return
+        finish(state, { type: "playNext", itemId: entry.itemId, auto: auto, chosen: false, onDeck: util.isTrue(entry.onDeck), carry: { autoPlay: state.autoPlay, replay: false } }, out)
+    end sub
+
+    ' tvOS's playOnDeckItemNow: the viewer's own start, not an automatic one.
+    sub pick(state as Object, itemId as String, out as Object)
+        for each entry in carousel(state)
+            if entry.itemId = itemId
+                finish(state, { type: "playNext", itemId: itemId, auto: false, chosen: true, onDeck: true, carry: { autoPlay: state.autoPlay, replay: false } }, out)
+                return
+            end if
+        end for
     end sub
 
     sub finish(state as Object, command as Object, out as Object)
@@ -375,17 +473,35 @@ namespace playback.upNext
             state.shown = invalid
             return
         end if
-        command = { type: "show", ended: state.ended, countdown: invalid, total: END_COUNTDOWN_SECONDS, autoPlay: state.autoPlay, allowed: state.allowed }
+        items = carousel(state)
+        command = { type: "show", ended: state.ended, countdown: invalid, total: END_COUNTDOWN_SECONDS, autoPlay: state.autoPlay, allowed: state.allowed, pick: state.next, loading: state.next = invalid and state.nextLoading, failed: state.nextFailed, carousel: items }
         countdown = state.countdown
         if countdown <> invalid
             command.countdown = countdown.seconds
             command.total = countdown.total
         end if
-        text = FormatJson(command)
+        ' Cards are nodes; what the panel shows changes with their IDs.
+        ids = []
+        for each entry in items
+            ids.Push(entry.itemId)
+        end for
+        pickId = ""
+        if state.next <> invalid then pickId = state.next.itemId
+        text = FormatJson({ ended: command.ended, countdown: command.countdown, total: command.total, autoPlay: command.autoPlay, allowed: command.allowed, pick: pickId, loading: command.loading, failed: command.failed, carousel: ids })
         if text = state.shown then return
         state.shown = text
         out.Push(command)
     end sub
+
+    ' The prompt window in whole seconds, 0 to MAX_PROMPT_SECONDS, or the
+    ' default for a value that is not a number.
+    function promptSeconds(value as Dynamic) as Integer
+        if not util.isNumber(value) then return PROMPT_SECONDS
+        seconds = Int(value)
+        if seconds < 0 then return 0
+        if seconds > MAX_PROMPT_SECONDS then return MAX_PROMPT_SECONDS
+        return seconds
+    end function
 
     function ceiling(value as Dynamic) as Integer
         return -Int(-value)

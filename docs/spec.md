@@ -124,7 +124,7 @@ Play:
 - audio, subtitle, and quality selection through replan;
 - skip intro and skip recap using server markers, with the profile's recap
   auto-skip;
-- Up Next at the credits, with autoplay;
+- Up Next near the end of every movie and episode, with autoplay and On Deck;
 - periodic and final progress reporting;
 - the profile's server-stored playback preferences (section 8.5).
 
@@ -812,7 +812,7 @@ their existing HD/FHD assets.
   - Sections are 64 px apart, with 140 px below the last.
 - **After the player closes** (D8). Focus stays on the same episode when it
   was stopped partway, a rewatch included. When this playback finished it
-  (its video ended, or Up Next was showing in the credits), whether or not the
+  (its video ended, or Up Next was showing in its prompt window), whether or not the
   server already counted it watched, focus moves to the next episode in play
   order, played or not. If that episode is in the next numbered season (by
   number, so gaps are skipped), the page shows that season. A finished
@@ -847,7 +847,8 @@ Subtitles tab (criterion 4.8).
     cancelling returns them to the playing position.
   - Buttons: 66 px circles with no labels.
     - Left: skip back, play/pause, and skip forward, 10 px apart.
-    - Right: Up Next (an episode with a next episode), Options, and Close.
+    - Right: Up Next (while it has something to show: a next episode or an
+      On Deck item, or either still loading), Options, and Close.
     - At rest they are black 35% with a 1 px white 22% ring; focused, they are
       pure white with a black glyph, without scaling.
   - Focus: the controls open with focus on the scrubber.
@@ -979,7 +980,7 @@ Subtitles tab (criterion 4.8).
   playing. A title without them shows the time where a thumbnail's would be,
   under "Previews aren't available for this title".
 - **Back, first match wins:** cancel a seek or scrub; dismiss Skip Intro's
-  pill; from Up Next, exit the player; close the Quality picker, then
+  pill; from Up Next, Keep Watching (tvOS); close the Quality picker, then
   Options; hide the controls while playing; otherwise stop and exit. Skip
   Recap's pill stays through Back, as tvOS's segment pill stays through
   Menu (assumption AG-291).
@@ -1001,32 +1002,49 @@ Subtitles tab (criterion 4.8).
     seconds running out settle it for good, while an Ask pill whose time ran
     out comes back only after playback leaves the range and returns. A skip
     is a seek like any other (local or `seek_reanchor`).
-- **Up Next** (episodes). It opens when playback passes the start of the
-  credits, or when the video ends (D11); an end that comes before the next
-  episode is known waits up to 10 seconds for it, then the player exits as
-  after the last episode. The countdown is the remaining runtime when Up Next
-  opens at the credits, and 10 seconds when it opens at the end. After three
-  automatic advances in a row, Up Next appears without a countdown so the
-  viewer must choose; Play Now resets the count. As on Android TV, resuming
-  or seeking into the credits does not open it, and Keep Watching closes it
-  for the rest of the episode; the end then reopens it as "Playing Next" with
-  Play Now and Back but no countdown. Opened at the credits, the countdown
-  follows the runtime left: it stops while paused and the next episode starts
-  when the video ends. The controls' Up Next button opens it without a
-  countdown. Auto-play needs the profile's `playback.auto_play_next`, Roku's
-  autoplay setting, and the panel's toggle. Play/Pause does nothing while Up
-  Next shows, and the next episode starts from its beginning in the same
-  player, so Back from it returns to the page the first episode was played
-  from, which then selects the last episode played (section 5.6). Layout:
+- **Up Next**, as tvOS's Next Up screen. It opens for movies and episodes
+  alike, inside the last `playback.next_up_prompt_seconds` of the runtime
+  (default 30, 0 for never), whenever it has something to show; a resume or a
+  seek into that window opens it too. It does not open at the credits marker.
+  It offers an episode's next episode; with none (a movie, a series finale),
+  the first On Deck item is the pick instead, unless the next-episode lookup
+  failed. The countdown is the runtime left, its ring counting from the
+  prompt window: it stops while paused, grows when the viewer seeks back, and
+  the pick starts as it reaches the end. The video's end always opens Up
+  Next, as "Playing Next", or as "Finished" with "End of playback" and why
+  there is nothing to play; an end with Up Next already counting starts the
+  pick at once, and otherwise a 10 second countdown runs. While the
+  next-episode lookup runs, the panel says "Finding the next episode". The
+  controls' Up Next button opens it with no countdown until 100 seconds are
+  left, then one from 100. Keep Watching and Back close it until playback
+  leaves the prompt window (a seek back), and turn the countdown off for
+  that opening; after the end they play the last 10 seconds again (Back
+  leaves the player instead when there is nothing to play), which
+  stay dismissed while inside the window, so with the default window the end
+  that follows opens without a countdown (a window under 10 seconds starts
+  the replay outside it, and entering it counts down again, as on tvOS).
+  Play/Pause is Play Now.
+  Auto-play needs the profile's `playback.auto_play_next`, Roku's autoplay
+  setting, and the panel's toggle, which writes `playback.auto_play_next`
+  for this device and starts or stops the countdown at once. The next item
+  starts where its watch state resumes, in the same player, so Back from it
+  returns to the page the first item was played from, which then selects
+  the last episode of that series played (section 5.6). On Deck is the
+  profile's Home sections Continue Watching, In Progress, and Next Up, in
+  server order, without the playing item, its series, or a repeat, up to 12;
+  its row shows all of them but the pick, as Home's landscape cards with
+  their progress (episodes with their own still), and OK on a card plays it
+  as the viewer's own start. Layout:
   - a 1560 px column centred on the screen, its top at y 112;
   - the video in a 760×428 box at x 180, with radius 8 and a 1 px white 16%
     outline;
   - the panel at x 980, 760 px wide, centred vertically against the video.
     Top to bottom:
-    - "UP NEXT" or "PLAYING NEXT", 18 px SemiBold at 52%;
+    - "UP NEXT" or "PLAYING NEXT" ("MORE TO WATCH" or "FINISHED" with
+      nothing to play), 18 px SemiBold at 52%;
     - the series title, 34 px Bold;
     - "S1:E2" at 62% followed by the episode title, 25 px SemiBold, on one
-      line (two at most);
+      line (two at most); a movie's title alone, 34 px Bold;
     - the air date · runtime, 19 px Medium at 46%;
     - the overview, 22 px Regular at 58%, three lines, 620 px wide;
     - Play Now, a 76 px pill 260 px wide at rest and 360 px focused, with a
@@ -1034,6 +1052,19 @@ Subtitles tab (criterion 4.8).
     - 18 px below: Keep Watching (330 px) and Back (200 px), 20 px apart;
     - 22 px below: the toggle "Auto-play is On/Off", text only, 19 px
       SemiBold at 54% (92% with a 1.5 px outline when focused).
+    - With nothing to play, "Almost finished" or "End of playback" (42 px
+      Bold) and its reason (22 px Medium at 62%, 560 px wide) in place of
+      the metadata, and no Play Now or toggle; while the lookup runs, a
+      spinner and "Finding the next episode" (42 px SemiBold).
+  - 34 px under the taller of the video and the panel, the On Deck row: its
+    header at x 180, tvOS's play.circle.fill (32 px) 14 px before "On Deck"
+    (36 px SemiBold), then 44 px to Home's 360×200 landscape cards, 40 px
+    apart, four across the column; focus moves across them and the strip
+    scrolls past the fourth or the first, and home when focus leaves. With
+    focus in the row, the screen moves up until its captions clear the safe
+    area, the video's box with it. Down from the buttons goes to the toggle,
+    then the row; Up from the row to the toggle, else the first button; Up
+    from the toggle to Play Now.
   - The rest of the screen is black (5.9).
 - **Resume.** The player never asks whether to resume. The detail page's
   Resume and Start Over buttons decide. Resume starts 7 seconds before the
@@ -1239,7 +1270,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The HUD's lists scroll natively and end on part of a row at the panel's edge; the Quality picker centres the checked row and shows about four and a quarter rows | Columns and the Quality picker show whole rows only, a column scrolling a row's top to its own and the picker a row at a time; the picker opens with the checked row second of its four where the list allows | Hardware run 26: a row or line cut at the panel's edge read as a fault (decision AG-292 (1); assumptions AG-294, AG-295) |
 | Subtitles draw under the controls: the controls and their gradient cover a cue while they show | Roku's captions are hidden while the controls show (not over Options or Up Next), and return as they hide; content within 3 s of its first frame is left as it is | Roku draws captions above the UI at a place of its own, so a cue crossed the scrubber and the time row (hardware run 26). The node's own `suppressCaptions`, which Roku documents for UI drawn where captions are, hides them without touching the caption mode or the subtitle selected (assumption AG-293) |
 | The Video tab always has rows (Speed, Aspect) | Without a choice of quality its PLAYBACK column shows the quality as a line, and a movie's Video tab has no rows | Speed and Aspect are not in the first release (section 3.3) |
-| Skip Credits at the credits, and Next Up in the last `next_up_prompt_seconds` (default 30) | Up Next opens at the credits (Android TV), with no Skip Credits | Decision D11 (AG-222): one Up Next moment, at the credits marker |
+| Skip Credits at the credits, and `playback.auto_skip_credits`; skipping credits that run to the end opens Next Up with a 10 s countdown | No Skip Credits; the credits are a band on the scrubber | Not built yet; Up Next opens in the prompt window as on tvOS (AG-318 reverses D11) |
 | Options' Subtitles tab shows only with tracks or a subtitle tool | Stats and Subtitles always show | A fixed set of tabs keeps Left and Right predictable while the player's stats arrive, and Subtitles holds Roku's caption modes even for a title without subtitle tracks (criterion 4.8) |
 | Options' Subtitles tab has TRACKS and OPTIONS columns | Its second column is CAPTIONS: Off, On, On replay, and On mute (Roku TVs only), Roku's global caption mode; while a subtitle is burned into the video, or captions Off set one aside, only Off and On, and Off asks the server for the stream without it. On mute is checked whether Options or Roku's own menu set it, and stays checked as the TV is muted and unmuted | Criterion 4.8 (plan section 6.10); burned-in pixels cannot follow a caption mode |
 | The remote's Menu or Settings key opens the player's options (Android TV) | Options opens from the controls' Options button and from Down with the controls hidden; on a Roku TV, `*` during playback opens Roku's own menu, whose Accessibility entry holds the caption setting | Roku TVs take `*` during full-screen playback whatever has focus (hardware run 6, assumption AG-117); Roku remotes have no Menu key |
@@ -1247,17 +1278,17 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Turning captions on has no effect on the playing stream | With subtitles Off, turning Roku's captions on (in Options or Roku's own menus) reloads the title at its position, without the subtitle sidecars it carried | With captions on, Roku shows a carried track in the caption language whenever none is selected (`Video.currentSubtitleTrack`) |
 | A subtitle the profile's preferences choose shows at once | It is selected, and shows while Roku's caption mode is on | Roku's caption mode governs captions (criterion 4.8), and the client does not turn it on at load |
 | A sign that an SRT cue places at the top with an override tag (`{\an8}`) shows at the top (Android TV, whose Media3 SubRip decoder reads the tag) | It shows at the bottom, without the tag | Roku documents no placement for SRT cues and prints override tags as text (hardware run 16, Roku drawing an MKV's own track), with no documented way to hide them; the client removes the tags from SRT sidecars and never lets Roku draw a container's track itself (section 9.7) |
-| One intro, credits, recap, and preview per file (Android TV) | Every `marker_segments` range, each skipped or drawn on its own; Up Next opens at the last credits range | Section 9.8; the server's collection replaces the single markers |
+| One intro, credits, recap, and preview per file (Android TV) | Every `marker_segments` range, each skipped or drawn on its own | Section 9.8; the server's collection replaces the single markers |
 | The scrubber has rounded ends, a buffered range, chapter ticks, and one band, the intro's, in cyan | A square track with the played range and the intro (tvOS's cyan), recap, and credits bands | Chapters are not in the first release; sections 5.7 and 9.8 name three bands; the ladder's 100 ms tick only moves `Rectangle`s |
 | Holding Left or Right on the focused scrubber starts a fixed-rate auto-seek; OK there commits a scrub and then toggles play/pause | The same 300 ms hold and rate ladder as with the controls hidden; OK commits, or toggles when nothing is pending | Section 5.7's key table; Roku documents no key repeats for a held key |
 | No Replay key | Replay skips back by the skip-back value clamped to 10–25 s, with "Instant replay" captions for the replayed span once its seek commits; a Replay that Back cancels, or whose merged seek lands past where it was pressed, shows none | Certification criteria 4.8 and 4.9 (implementation plan section 6.10) |
 | Scrub previews come from the server's sprite sheets or, without them, from frames the player cuts from the stream | The server's sheets only; a title without them shows the time and "Previews aren't available for this title" | Roku apps cannot read frames from the `Video` node |
 | A sheet decodes at full size, and only the latest one stays decoded | A sheet decodes within 1600 px on each side (a default 300 px thumbnail at 160 px, drawn 320 px wide on the card and 480 px held); the sheet in use and the next one in the direction of travel stay loaded, the sheet in use alone on the low tier | Texture memory on 512 MB devices and sheet changes at 32× (plan sections 4.8 and 6.9; hardware test H20); the drawn size costs no texture |
 | The next episode's still fills the screen behind Up Next, dimmed, around the video | No still: the rest of the screen is black | Roku draws video beneath the UI, so a full-screen image would cover the shrunken video |
-| The auto-play toggle writes `playback.auto_play_next`, and a countdown already running ignores it (Android TV) | The toggle holds for the episodes Up Next plays in a row and starts or stops the countdown at once; it is hidden when Roku's autoplay setting is off | The in-player toggle is session-local; persistent autoplay is available in Settings (section 8.5) |
-| A local setting chooses after how many automatic advances Up Next stops counting down (Android TV, default 3) | Always 3 | This client does not expose the local consecutive-episode limit |
-| A video that ends before the next episode is known shows a "Finished" card while it waits (Android TV) | The ended video stays for up to 10 seconds; Up Next opens if the next episode arrives, else the player exits | The first release has no Finished card, and the bound keeps a slow or failed catalog read from holding a finished player |
-| The next episode may resume where the viewer left it (`startFromBeginning: false`) | It starts at zero (Android TV) | Section 5.7: the next episode starts from its beginning, in the same player |
+| The auto-play toggle shows with any pick | It is hidden, and nothing counts down, while Roku's autoplay setting is off | Plan section 6.10 (certification) |
+| Back on Finished (nothing to play) replays the end, as Keep Watching does | It leaves the player | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
+| Keep Watching after the end replays the last 10 s in the same session | It starts the item again 10 s before its end, as a new session | Roku's session has stopped by the time its video ends |
+| An On Deck item without a backdrop or still reads its detail for one, and is left out without | It shows as Home's Continue Watching card does, its poster standing in | A detail read per card is avoided; Home's cards make the same choice |
 | A screen-level error puts a headline for its cause ("Something went wrong", "Not found") over its message, with Try Again | Home, the libraries, detail, and the profile picker show their one-sentence message as the error's title, without a second line, and Search its own title over a line; the button reads Retry (Try again on the picker) | The client's error copy is one sentence per screen (`locale/`); a copy change of its own adds headlines by cause (assumption AG-285) |
 | Full person page | A person panel with six biography lines and up to 24 mixed movie/series titles | Keeps person navigation within detail-page scope and bounded memory |
 | Watchlist and More buttons; trailers; collection creation and editing; Filter and Shuffle; people, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watchlist, Favorites, and History in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; theme music; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
@@ -1566,7 +1597,8 @@ playback keys the existing TV apps honor:
 | `playback.intro_skip_mode` | Skip button versus automatic skip (`playback.auto_skip_intro` is deprecated) |
 | `playback.auto_skip_recap` | Recaps skip automatically instead of offering Skip Recap (section 5.7) |
 | `ui.title_art` | Off shows the text title instead of the title logo on Home and detail heroes (sections 5.5 and 5.6); the top bar's shell reads it when Home or a library page starts, and the detail page uses that read |
-| `playback.auto_play_next` | Up Next countdown and autoplay |
+| `playback.auto_play_next` | Up Next countdown and autoplay; the player's toggle (Up Next's and Options') writes it for this device (`profile_device`), as tvOS does |
+| `playback.next_up_prompt_seconds` | How long before the end Up Next opens, and what its countdown counts from (0 to 120 s; 0 opens it only at the end) |
 
 Start has no language member, so language preferences are applied by choosing
 tracks, as Android TV does. Settings marked `client_local` in the server's
@@ -2284,23 +2316,21 @@ ordered list of `{kind, start_seconds, end_seconds}` with kind `intro`,
 `credits`, `recap`, or `preview`. A kind may occur more than once; the client
 skips only the active range. Intro ranges drive the skip button and automatic
 skip (section 5.7) according to `playback.intro_skip_mode`. Recap and credits
-ranges are drawn on the scrubber, and the start of the credits range opens Up
-Next.
+ranges are drawn on the scrubber.
 
 The client reads the markers of the version it plays. A server without
 `marker_segments` still sends each version's single `intro`, `credits`,
 `recap`, and `preview`, which stand in. Ranges of an unknown kind, with a
 negative start, or ending at or before their start are dropped. A range
 holds positions from its start up to, not including, its end; when ranges
-of one kind overlap, the one that started last is active. Up Next opens at
-the start of the last credits range, so an earlier one (a cold open's
-credits) is only drawn.
+of one kind overlap, the one that started last is active.
 
 The next episode is resolved as the Android TV client does, when an episode
-starts playing. The client loads the current season's episodes; if that
-fails, it offers no next episode. It then tries the next regular season
-(specials are skipped); a failure there only prevents rollover into that
-season. The next episode is the smallest (season, episode) after the current
+starts playing. The client loads the current season's episodes, then, when
+nothing follows the episode there, the season list and the next regular
+season (specials are skipped). A failed read of any of them offers no next
+episode and marks the lookup failed, as tvOS's does, so Up Next then offers
+no On Deck item in its place. The next episode is the smallest (season, episode) after the current
 one in that combined list: the current episode need not be listed, gaps in
 the numbering are passed over, and from the specials (season 0) playback
 moves through the later specials, then into season 1. The next regular

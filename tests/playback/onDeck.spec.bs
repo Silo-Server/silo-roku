@@ -1,0 +1,154 @@
+namespace tests
+
+    ' tvOS's On Deck for Up Next (spec section 5.7) over answers mapped as
+    ' ApiTask maps them (catalog.map, kinds rows and episodes).
+    @suite("playback on deck")
+    class PlaybackOnDeckTests extends rooibos.BaseTestSuite
+
+        function mapped(kind as String, body as Object) as Object
+            result = catalog.map.apply({ requestId: "r1", map: { kind: kind } }, tests.catalogData.ok(body), tests.catalogData.words())
+            return result.content
+        end function
+
+        function movie(id as String) as Object
+            return { content_id: id, type: "movie", title: id, backdrop_url: "https://img.example/" + id + ".jpg", position_seconds: 600, duration_seconds: 6000 }
+        end function
+
+        function episode(series as String, season as Integer, number as Integer) as Object
+            return { content_id: "episode:" + series + "-s" + season.ToStr() + "e" + number.ToStr(), type: "episode", title: "Episode " + number.ToStr(), series_id: "series:" + series, series_title: series, season_number: season, episode_number: number, backdrop_url: "https://img.example/" + series + "-art.jpg" }
+        end function
+
+        function home(sections as Object) as Object
+            return m.mapped(catalog.kind.ROWS, { sections: sections })
+        end function
+
+        function section(id as String, sectionType as String, items as Object) as Object
+            return { id: id, title: id, section_type: sectionType, items: items, total_count: items.Count() }
+        end function
+
+        function ids(entries as Object) as Object
+            out = []
+            for each entry in entries
+                out.Push(entry.itemId)
+            end for
+            return out
+        end function
+
+        function stills(series as String, season as Integer, numbers as Object) as Object
+            items = []
+            for each number in numbers
+                items.Push({ content_id: "episode:" + series + "-s" + season.ToStr() + "e" + number.ToStr(), season_number: season, episode_number: number, title: "Episode " + number.ToStr(), still_url: "https://img.example/" + series + "-s" + season.ToStr() + "e" + number.ToStr() + ".jpg" })
+            end for
+            return m.mapped(catalog.kind.EPISODES, { items: items })
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("choosing items")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("takes Continue Watching, In Progress, and Next Up in server order")
+        sub _()
+            tree = m.home([
+                m.section("cw", "continue_watching", [m.movie("movie:a")]),
+                m.section("recent", "recently_added", [m.movie("movie:r")]),
+                m.section("next", "next_up", [m.episode("bb", 2, 3)]),
+                m.section("progress", "in_progress", [m.movie("movie:b")])
+            ])
+            entries = playback.onDeck.fromRows(tree, { itemId: "movie:now", seriesId: "" })
+            m.assertEqual(m.ids(entries), ["movie:a", "episode:bb-s2e3", "movie:b"])
+            m.assertTrue(entries[0].onDeck)
+            m.assertEqual(entries[1].seriesId, "series:bb")
+            m.assertEqual(entries[1].seasonNumber, 2)
+            m.assertEqual(entries[0].card.shape, catalog.shape.LANDSCAPE, "Home's landscape card, with its progress")
+            m.assertTrue(entries[0].card.progress > 0)
+        end sub
+
+        @it("leaves out the playing item, its series, and repeats")
+        sub _()
+            tree = m.home([
+                m.section("cw", "continue_watching", [m.episode("sev", 1, 2), m.episode("sev", 1, 3), m.movie("movie:a"), m.episode("bb", 1, 1)]),
+                m.section("next", "next_up", [m.movie("movie:a"), m.episode("bb", 1, 1)])
+            ])
+            entries = playback.onDeck.fromRows(tree, { itemId: "episode:sev-s1e2", seriesId: "series:sev" })
+            m.assertEqual(m.ids(entries), ["movie:a", "episode:bb-s1e1"])
+            entries = playback.onDeck.fromRows(tree, { itemId: "movie:a", seriesId: "" })
+            m.assertEqual(m.ids(entries), ["episode:sev-s1e2", "episode:sev-s1e3", "episode:bb-s1e1"])
+        end sub
+
+        @it("keeps at most 12")
+        sub _()
+            items = []
+            for i = 1 to 15
+                items.Push(m.movie("movie:" + i.ToStr()))
+            end for
+            entries = playback.onDeck.fromRows(m.home([m.section("cw", "continue_watching", items)]), { itemId: "movie:now", seriesId: "" })
+            m.assertEqual(entries.Count(), 12)
+        end sub
+
+        @it("has nothing from a tree that is not one")
+        sub _()
+            m.assertEqual(playback.onDeck.fromRows(invalid, { itemId: "x", seriesId: "" }), [])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("the reads")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("reads Home, then each episode season once, and gives episodes their stills")
+        sub _()
+            state = playback.onDeck.create({ itemId: "movie:now", seriesId: "" }, false)
+            first = playback.onDeck.start(state)
+            m.assertEqual(first, [{ stage: playback.onDeck.SECTIONS, request: catalog.request.homeSections(false) }])
+            tree = m.home([m.section("cw", "continue_watching", [m.episode("bb", 2, 3), m.movie("movie:a"), m.episode("bb", 2, 4), m.episode("got", 1, 1)])])
+            follow = playback.onDeck.answer(state, playback.onDeck.SECTIONS, true, tree)
+            m.assertEqual(follow.Count(), 2)
+            m.assertEqual(follow[0].request, catalog.request.episodes("series:bb", 2, ""))
+            m.assertEqual(follow[1].request, catalog.request.episodes("series:got", 1, ""))
+            m.assertFalse(playback.onDeck.settled(state))
+            playback.onDeck.answer(state, follow[0].stage, true, m.stills("bb", 2, [1, 3, 4]))
+            m.assertFalse(playback.onDeck.settled(state))
+            playback.onDeck.answer(state, follow[1].stage, false, invalid)
+            m.assertTrue(playback.onDeck.settled(state))
+            entries = playback.onDeck.entries(state)
+            m.assertEqual(entries[0].card.artUri, "https://img.example/bb-s2e3.jpg")
+            m.assertEqual(entries[1].card.artUri, "https://img.example/movie:a.jpg")
+            m.assertEqual(entries[2].card.artUri, "https://img.example/bb-s2e4.jpg")
+            m.assertEqual(entries[3].card.artUri, "https://img.example/got-art.jpg", "a failed season keeps the card's art")
+        end sub
+
+        @it("settles at once without episodes, and with none when Home fails")
+        sub _()
+            state = playback.onDeck.create({ itemId: "movie:now", seriesId: "" }, true)
+            m.assertEqual(playback.onDeck.answer(state, playback.onDeck.SECTIONS, true, m.home([m.section("cw", "continue_watching", [m.movie("movie:a")])])), [])
+            m.assertTrue(playback.onDeck.settled(state))
+            m.assertEqual(m.ids(playback.onDeck.entries(state)), ["movie:a"])
+            state = playback.onDeck.create({ itemId: "movie:now", seriesId: "" }, false)
+            m.assertEqual(playback.onDeck.answer(state, playback.onDeck.SECTIONS, false, invalid), [])
+            m.assertTrue(playback.onDeck.settled(state))
+            m.assertEqual(playback.onDeck.entries(state), [])
+        end sub
+
+        @it("reads a section Home sent without its items before choosing, in server order")
+        sub _()
+            state = playback.onDeck.create({ itemId: "movie:now", seriesId: "" }, false)
+            tree = m.home([{ id: "cw", title: "Continue Watching", section_type: "continue_watching", items: [], total_count: 2 }, m.section("next", "next_up", [m.movie("movie:n")]), { id: "progress", title: "In Progress", section_type: "in_progress", items: [], total_count: 1 }])
+            follow = playback.onDeck.answer(state, playback.onDeck.SECTIONS, true, tree)
+            m.assertEqual(follow, [{ stage: playback.onDeck.SECTION_PREFIX + "cw", request: catalog.request.homeSectionItems("cw", false) }, { stage: playback.onDeck.SECTION_PREFIX + "progress", request: catalog.request.homeSectionItems("progress", false) }])
+            m.assertEqual(playback.onDeck.answer(state, follow[1].stage, false, invalid), [], "a failed section is left out")
+            m.assertFalse(playback.onDeck.settled(state))
+            m.assertEqual(playback.onDeck.answer(state, follow[0].stage, true, m.mapped(catalog.kind.ROW, { items: [m.movie("movie:a"), m.movie("movie:b")] })), [])
+            m.assertTrue(playback.onDeck.settled(state))
+            m.assertEqual(m.ids(playback.onDeck.entries(state)), ["movie:a", "movie:b", "movie:n"])
+        end sub
+
+        @it("ignores answers once settled, and unknown stages")
+        sub _()
+            state = playback.onDeck.create({ itemId: "movie:now", seriesId: "" }, false)
+            m.assertEqual(playback.onDeck.answer(state, "season:nope", true, invalid), [])
+            m.assertFalse(playback.onDeck.settled(state))
+            playback.onDeck.answer(state, playback.onDeck.SECTIONS, false, invalid)
+            m.assertEqual(playback.onDeck.start(state), [])
+            m.assertEqual(playback.onDeck.answer(state, playback.onDeck.SECTIONS, true, invalid), [])
+        end sub
+    end class
+end namespace

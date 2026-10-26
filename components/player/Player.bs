@@ -14,6 +14,7 @@ import "pkg:/source/playback/intent.bs"
 import "pkg:/source/playback/markers.bs"
 import "pkg:/source/playback/media.bs"
 import "pkg:/source/playback/nextEpisode.bs"
+import "pkg:/source/playback/onDeck.bs"
 import "pkg:/source/playback/options.bs"
 import "pkg:/source/playback/player.bs"
 import "pkg:/source/playback/preferences.bs"
@@ -131,9 +132,8 @@ import "pkg:/source/util/values.bs"
 ' changed.
 '
 ' Markers (playback.markers, spec section 9.8): the version the plan plays
-' gives the scrubber its bands, Skip Intro its intro ranges, and Up Next its
-' credits start, read when the intent arrives and again when a replan
-' changes the file.
+' gives the scrubber its bands and Skip Intro its intro ranges, read when
+' the intent arrives and again when a replan changes the file.
 '
 ' Skip intro (playback.skipIntro, components/player/skip/SkipIntroButton):
 ' positions and the Video state drive it, and the panelTimer its fill. The
@@ -149,32 +149,36 @@ import "pkg:/source/util/values.bs"
 ' seek_reanchor).
 '
 ' Up Next (playback.upNext, components/player/upnext/UpNextPanel), for
-' episodes: the next episode is resolved after the first plan
-' (playback.nextEpisode, through ApiTask's catalog reads), and the controls'
-' Up Next button shows once there is one. The panel opens at the credits,
+' every item, as tvOS's: after the first plan, an episode's next episode is
+' resolved (playback.nextEpisode) and On Deck is read (playback.onDeck),
+' both through ApiTask's catalog reads, and the controls' Up Next button
+' shows while Up Next has something to show. The panel opens in the
+' profile's prompt window before the end (playback.next_up_prompt_seconds),
 ' at the video's end, or from the button; it attaches under upNextLayer,
 ' takes focus, and shrinks the video into theme.upNext's box (setVideoBox).
-' An end that comes before the resolution waits for it, for up to
-' playback.upNext.END_WAIT_MS, then the player leaves as after a movie.
-' Auto-play next is one toggle for Options and the panel (m.autoplayNext):
-' the profile's playback.auto_play_next until the viewer changes it, and the
+' Back on it is Keep Watching. Auto-play next is one toggle for Options and
+' the panel (m.autoplayNext): the profile's playback.auto_play_next, which
+' the viewer's change writes for this device (writeAutoplay), and the
 ' countdown also needs roDeviceInfo.IsAutoplayEnabled().
 '
-' The next episode starts in this player (assumption AG-100). Play Now or
-' the countdown stops the session as Back does, with its final position and
-' durable stop job (plan section 6.6); once the reducer is done, the player
-' clears what was the episode's (clearSession) and starts
-' nav.player.nextEpisode's intent: from 0, as an autoplay start, with the
-' carry (automatic advances in a row and the toggle). The same Video node
-' plays it once it has stopped (playback.slot), and load numbers keep
-' counting, so a late callback of the episode before never matches a load
-' of the next. The stack entry stays the first episode's: Back returns to
-' the page it came from, and the pages beneath refresh once, when the
-' player closes. Each next episode is noted on the entry (nav.notePlayed), so
-' that page selects the episode the chain played last, and as the player
-' leaves, so is its last item and whether this playback finished it
+' The next item starts in this player (assumption AG-100). Play Now, the
+' countdown, or an On Deck card stops the session as Back does, with its
+' final position and durable stop job (plan section 6.6); once the reducer
+' is done, the player clears what was the item's (clearSession) and starts
+' nav.player.nextEpisode's intent: where the item resumes, with the carry
+' (the toggle), as an autoplay start unless the viewer chose an On Deck
+' card. Keep Watching after the end starts the same item 10 s before its end
+' the same way (nav.player.replay). The same Video node plays it once it has
+' stopped (playback.slot), and load numbers keep counting, so a late
+' callback of the item before never matches a load of the next. The stack
+' entry stays the first item's: Back returns to the page it came from, and
+' the pages beneath refresh once, when the player closes. Each next episode
+' of the first item's series is noted on the entry (nav.notePlayed), so that
+' page selects the episode the chain played last, and as the player leaves,
+' so is its last item and whether this playback finished it
 ' (playback.upNext.leftFinished), which decides whether that page moves on
-' (spec section 5.6).
+' (spec section 5.6). Once the chain moves to another title (On Deck), the
+' notes stop at the last item of the first one (m.leftSeries).
 
 const LOG_TAG = "player"
 ' The sidecar download's deadline. First extractions of embedded text take
@@ -377,7 +381,7 @@ sub init()
     m.preferencesRequested = false
     m.preferencesRead = false
     ' Auto-play next for Up Next: the profile's until the viewer changes it
-    ' in Options, for this session only.
+    ' in Options or on the panel, which writes it for this device.
     m.autoplayNext = m.preferences.autoPlayNext
     m.autoplayChosen = false
     ' The Options panel while it is open, its copy, and the model it was
@@ -405,8 +409,8 @@ sub init()
     m.followedMode = invalid
     ' The playing file's markers (playback.markers) and the file they are
     ' for; Skip Intro's and Up Next's reducers, Up Next's panel while it
-    ' shows, and the next episode's resolution until it settles, then what it
-    ' found.
+    ' shows, the next episode's resolution and On Deck's read until they
+    ' settle.
     m.markers = []
     m.markersFileId = ""
     m.skip = invalid
@@ -414,11 +418,15 @@ sub init()
     m.upNext = invalid
     m.upNextPanel = invalid
     m.resolution = invalid
-    m.nextUp = invalid
+    m.onDeck = invalid
     ' The item's video played to its end (endOfVideo).
     m.videoEnded = false
-    ' Up Next's { itemId, carry } until the session it ends is done.
+    ' Up Next's next start ({ itemId, carry, seasonNumber, auto, replay,
+    ' foreign }) until the session it ends is done.
     m.advance = invalid
+    ' The chain moved on from the first item's title to an On Deck item:
+    ' the entry's page is told no more (notePlayed).
+    m.leftSeries = false
     m.errorVisible = false
     m.retryable = false
     ' The error says the server could not be reached: Try Anyway shows, and
@@ -559,6 +567,7 @@ sub onPreferences(event as Object)
     m.preferences = playback.preferences.parse(body)
     m.preferencesRead = true
     if not m.autoplayChosen then setAutoplay(m.preferences.autoPlayNext)
+    runUpNext({ type: "prompt", seconds: m.preferences.nextUpPromptSeconds })
     if m.skip <> invalid and playback.skipIntro.modeOf(m.preferences.introSkipMode) <> m.skip.mode then runSkip({ type: "mode", mode: m.preferences.introSkipMode })
     runRecap({ type: "autoSkip", value: m.preferences.autoSkipRecap })
     m.overlay.skipBackSeconds = m.preferences.skipBackSeconds
@@ -616,8 +625,9 @@ sub onWatch(event as Object)
 end sub
 
 ' Resume starts 7 s before the saved position, Start Over at 0, and a title
-' never started where the server says. Up Next's next episode starts at 0
-' as an autoplay start, with the carry of the episode before.
+' never started where the server says. Up Next's next item resumes the same
+' way, with the carry of the item before, and is an autoplay start unless
+' the viewer chose it from On Deck.
 sub begin(intent as Object)
     m.intent = intent
     m.version = playback.intent.versionOf(m.watch, intent.fileId)
@@ -629,7 +639,7 @@ sub begin(intent as Object)
     if chained
         ' The page the first episode was played from selects this one when
         ' the player leaves.
-        nav.notePlayed(m.itemId, playingSeason())
+        if not m.leftSeries then nav.notePlayed(m.itemId, playingSeason())
         if util.isBoolean(carry.autoPlay)
             m.autoplayChosen = true
             setAutoplay(carry.autoPlay)
@@ -638,12 +648,9 @@ sub begin(intent as Object)
     readMarkers(intent.fileId)
     m.skip = playback.skipIntro.create(m.preferences.introSkipMode, m.markers)
     m.recap = playback.skipRecap.create(m.preferences.autoSkipRecap, m.markers)
-    m.upNext = invalid
-    if intent.kind = "episode"
-        if not chained then carry = playback.upNext.newCarry()
-        m.upNext = playback.upNext.create({ creditsStart: playback.markers.creditsStart(m.markers), runtime: intent.runtime, autoPlayNext: m.autoplayNext, deviceAutoplay: CreateObject("roDeviceInfo").IsAutoplayEnabled(), carry: carry })
-    end if
-    ' The Up Next button waits for a next episode (resolveNext).
+    if not chained then carry = playback.upNext.newCarry()
+    m.upNext = playback.upNext.create({ promptSeconds: m.preferences.nextUpPromptSeconds, runtime: intent.runtime, lookup: intent.kind = "episode", autoPlayNext: m.autoplayNext, deviceAutoplay: CreateObject("roDeviceInfo").IsAutoplayEnabled(), carry: carry })
+    ' The Up Next button waits for the first plan (resolveNext).
     showUpNextButton(false)
     ' A phone's launch may play as its own profile, borrowed for this
     ' player (AppScene fences the player's requests to it).
@@ -676,7 +683,7 @@ sub begin(intent as Object)
     ' The profile's quality and bitrate cap, as read before the start or the
     ' defaults (Auto, no cap); an Options choice replaces the quality for
     ' this title's session.
-    dispatch({ type: "play", intent: playIntent, quality: m.preferences.preferredQuality, bandwidthCapKbps: m.preferences.maxBitrateKbps, autoplay: chained, catalogRuntime: intent.runtime, startPosition: startPosition })
+    dispatch({ type: "play", intent: playIntent, quality: m.preferences.preferredQuality, bandwidthCapKbps: m.preferences.maxBitrateKbps, autoplay: nav.player.isAutoStart(m.wanted), catalogRuntime: intent.runtime, startPosition: startPosition })
 end sub
 
 ' --- The reducer ----------------------------------------------------------------
@@ -820,7 +827,7 @@ end function
 ' leaves Roku's caption mode alone (assumption AG-75). With captions off, a
 ' subtitle only a burn-in would show is set aside for On instead. Any other
 ' plan may need to follow the caption mode (followCaptions). The first plan
-' also starts the next episode's resolution.
+' also starts Up Next's reads: the next episode's resolution and On Deck.
 sub planLoaded(plan as Object)
     fileId = playback.intent.playingFile(plan, m.intent.fileId)
     m.version = playback.intent.versionOf(m.watch, fileId)
@@ -1760,9 +1767,10 @@ sub leavePlayer()
 end sub
 
 ' Hands the page the player was opened from its last item and whether
-' this playback finished it, before the player leaves.
+' this playback finished it, before the player leaves, unless the chain
+' moved on to another title (advanceWhenDone told it then).
 sub notePlayedLast()
-    if m.itemId = "" then return
+    if m.itemId = "" or m.leftSeries then return
     nav.notePlayed(m.itemId, playingSeason(), playback.upNext.leftFinished(m.upNext, m.videoEnded))
 end sub
 
@@ -1798,7 +1806,7 @@ end sub
 sub showLocalError(copy as Object, retryable as Boolean, unreachable = false as Boolean)
     closeOptionsPanel()
     ' Up Next closes as Keep Watching closes it; the end opens it again.
-    if m.upNextPanel <> invalid then runUpNext({ type: "keepWatching" })
+    if m.upNextPanel <> invalid then runUpNext({ type: "hide" })
     m.errorTitle.text = copy.title
     m.errorMessage.text = copy.message
     m.retryable = retryable
@@ -2024,6 +2032,8 @@ sub executeControl(command as Object)
         openOptions(command.tab)
     else if t = "openUpNext"
         openUpNext()
+    else if t = "upNextBack"
+        runUpNext({ type: "back" })
     else if t = "activateSkip"
         activateSkip()
     else if t = "activateRecap"
@@ -2175,8 +2185,7 @@ sub applyChoice(choice as Object)
     else if kind = playback.options.OUTCOME_QUALITY
         dispatch(outcome.event)
     else if kind = playback.options.OUTCOME_AUTOPLAY
-        m.autoplayChosen = true
-        setAutoplay(outcome.autoplay)
+        chooseAutoplay(outcome.autoplay)
     end if
     refreshOptions()
 end sub
@@ -2338,14 +2347,13 @@ sub readMarkers(fileId as String)
 end sub
 
 ' A plan's file: a replan that changes it reads its version's markers for
-' the bands and Skip Intro, and Up Next takes the credits start and the
-' plan's runtime.
+' the bands and Skip Intro, and Up Next takes the plan's runtime.
 sub followMarkers(fileId as String)
     if fileId <> m.markersFileId
         readMarkers(fileId)
         runSkip({ type: "markers", markers: m.markers })
     end if
-    runUpNext({ type: "timeline", creditsStart: playback.markers.creditsStart(m.markers), runtime: m.state.plan.runtime })
+    runUpNext({ type: "timeline", runtime: m.state.plan.runtime })
 end sub
 
 ' Reduces a Skip Intro event at the clock's now and carries out what it
@@ -2409,16 +2417,14 @@ sub dismissSkip()
 end sub
 
 ' A seek from the controls or Skip Intro, through the session reducer (a
-' local seek or a seek_reanchor). Up Next does not take the jump for
-' playback crossing the credits.
+' local seek or a seek_reanchor).
 ' resume: Play committed the seek while paused, so a load the seek opens
 ' plays (playback.session.onSeekTo).
 sub commitSeek(position as Dynamic, resume = false as Boolean)
-    runUpNext({ type: "seek" })
     dispatch({ type: "seekTo", position: position, resume: resume })
 end sub
 
-' Skip Intro's fill and Up Next's end countdown and wait.
+' Skip Intro's fill and Up Next's end countdown.
 sub schedulePanels()
     now = m.env.now()
     wake = invalid
@@ -2437,16 +2443,20 @@ sub onPanelTimer()
     runUpNext({ type: "tick" })
 end sub
 
-' --- Next episode and Up Next -------------------------------------------------------
+' --- Next episode, On Deck, and Up Next --------------------------------------------
 
-' The episode after this one (playback.nextEpisode), read through ApiTask
-' once the first plan is in; an episode the projection does not place in a
-' series settles at once with none.
+' Up Next's reads once the first plan is in: the episode after this one
+' (playback.nextEpisode), which settles at once with none for a movie or an
+' episode the projection does not place in a series, and On Deck
+' (playback.onDeck), both through ApiTask.
 sub resolveNext()
     if m.upNext = invalid then return
     m.resolution = playback.nextEpisode.create(playback.nextEpisode.currentFromWatch(m.watch))
     sendNext(playback.nextEpisode.start(m.resolution))
     settleNext()
+    m.onDeck = playback.onDeck.create({ itemId: m.itemId, seriesId: util.text(m.watch.series_id) }, isLowTier())
+    sendOnDeck(playback.onDeck.start(m.onDeck))
+    settleOnDeck()
 end sub
 
 sub sendNext(plans as Object)
@@ -2455,8 +2465,8 @@ sub sendNext(plans as Object)
     end for
 end sub
 
-' An answer for the resolution of the episode still playing; one for an
-' episode before, or after the player closed, was dropped with its request.
+' An answer for the resolution of the item still playing; one for an item
+' before, or after the player closed, was dropped with its request.
 sub onNextEpisode(event as Object)
     handle = event.getRoSGNode()
     context = takeRequest(handle)
@@ -2466,18 +2476,45 @@ sub onNextEpisode(event as Object)
     settleNext()
 end sub
 
-' Once settled, the Up Next button shows if there is a next episode, and Up
-' Next learns which.
+' Once settled, Up Next learns the next episode, as an entry, or that there
+' is none.
 sub settleNext()
     if not playback.nextEpisode.settled(m.resolution) then return
-    m.nextUp = playback.nextEpisode.episode(m.resolution)
+    found = playback.nextEpisode.episode(m.resolution)
+    failed = playback.nextEpisode.failed(m.resolution)
     m.resolution = invalid
-    log.info(LOG_TAG, "next episode", { found: m.nextUp <> invalid })
-    showUpNextButton(m.nextUp <> invalid)
-    runUpNext({ type: "next", next: m.nextUp })
+    log.info(LOG_TAG, "next episode", { found: found <> invalid, failed: failed })
+    entry = invalid
+    if found <> invalid then entry = { itemId: found.itemId, card: found.card, onDeck: false, seriesId: util.text(m.watch.series_id), seasonNumber: found.seasonNumber }
+    runUpNext({ type: "next", next: entry, failed: failed })
 end sub
 
+sub sendOnDeck(plans as Object)
+    for each item in plans
+        m.requests[api.send(item.request, handleFor("onOnDeck"))] = { onDeckStage: item.stage }
+    end for
+end sub
+
+sub onOnDeck(event as Object)
+    handle = event.getRoSGNode()
+    context = takeRequest(handle)
+    if context = invalid or m.onDeck = invalid or m.closed then return
+    result = api.resultOf(handle)
+    sendOnDeck(playback.onDeck.answer(m.onDeck, context.onDeckStage, result <> invalid and result.ok = true, handle.content))
+    settleOnDeck()
+end sub
+
+sub settleOnDeck()
+    if not playback.onDeck.settled(m.onDeck) then return
+    items = playback.onDeck.entries(m.onDeck)
+    m.onDeck = invalid
+    log.info(LOG_TAG, "on deck", { items: items.Count() })
+    runUpNext({ type: "onDeck", items: items })
+end sub
+
+' The controls' Up Next button shows while Up Next has something to show.
 sub showUpNextButton(shown as Boolean)
+    if m.overlay.episode = shown then return
     m.overlay.episode = shown
     dispatchControls({ type: "content", episode: shown })
 end sub
@@ -2498,20 +2535,25 @@ sub runUpNext(event as Object)
             showUpNext(command)
         else if t = "close"
             closeUpNext()
+        else if t = "resume"
+            if m.video.state = "paused" then togglePause()
         else if t = "playNext"
             advanceTo(command)
+        else if t = "replay"
+            replayEnd(command.seconds)
         else if t = "exit"
             exitPlayer()
         end if
     end for
+    if m.upNext <> invalid then showUpNextButton(playback.upNext.canOpen(m.upNext) or playback.upNext.isOpen(m.upNext))
     schedulePanels()
 end sub
 
-' The video ended. The session has stopped; Up Next holds the player while
-' it has the next episode or is still resolving it, else the player leaves.
+' The video ended. The session has stopped; Up Next holds the player, as
+' Playing Next, or as Finished with nothing to play.
 sub endOfVideo()
     m.videoEnded = true
-    if m.upNext = invalid or not playback.upNext.holdsEnd(m.upNext)
+    if m.upNext = invalid
         leavePlayer()
         return
     end if
@@ -2519,8 +2561,8 @@ sub endOfVideo()
 end sub
 
 ' Opens the panel over the shrunken video, or gives it the command's
-' heading, countdown, and toggle. It closes Options and the controls and
-' takes focus.
+' heading, pick, countdown, toggle, and On Deck row. It closes Options and
+' the controls and takes focus.
 sub showUpNext(command as Object)
     panel = m.upNextPanel
     opening = panel = invalid
@@ -2528,9 +2570,9 @@ sub showUpNext(command as Object)
         closeOptionsPanel()
         panel = m.upNextLayer.createChild("UpNextPanel")
         m.upNextPanel = panel
-        if m.nextUp <> invalid then panel.content = m.nextUp.card
-        panel.seriesTitle = util.text(m.watch.series_title)
+        panel.lowTier = isLowTier()
     end if
+    panel.seriesTitle = pickSeries(command.pick)
     panel.setFields(playback.upNext.panelFields(command))
     if not opening then return
     panel.observeField("action", "onUpNextAction")
@@ -2542,6 +2584,20 @@ sub showUpNext(command as Object)
     dispatchControls({ type: "hide" })
     panel.setFocus(true)
 end sub
+
+' The series line over the pick: the playing series' for its next episode,
+' an On Deck episode's own, and none for a movie.
+function pickSeries(entry as Dynamic) as String
+    if entry = invalid then return ""
+    if not entry.onDeck then return util.text(m.watch.series_title)
+    card = entry.card
+    if LCase(card.itemType) = "episode" then return card.caption
+    return ""
+end function
+
+function isLowTier() as Boolean
+    return util.text(platform.current().memory.tier) = "low"
+end function
 
 ' The panel's text moved its video box.
 sub onUpNextBox()
@@ -2558,17 +2614,32 @@ sub closeUpNext()
     setOverlayFlags({ upNext: false })
 end sub
 
-' Play Now, Keep Watching, or Back on the panel.
+' Play Now, Keep Watching, or Back on the panel, or OK on an On Deck card.
 sub onUpNextAction()
-    if m.upNextPanel <> invalid then runUpNext({ type: m.upNextPanel.action })
+    panel = m.upNextPanel
+    if panel = invalid then return
+    action = panel.action
+    if action = "pick"
+        runUpNext({ type: "pick", itemId: panel.picked })
+    else
+        runUpNext({ type: action })
+    end if
 end sub
 
 ' The panel's toggle is Options' Auto-play next too.
 sub onUpNextAutoPlay()
     panel = m.upNextPanel
     if panel = invalid or m.upNext = invalid or panel.autoPlay = m.upNext.autoPlay then return
+    chooseAutoplay(panel.autoPlay)
+end sub
+
+' The viewer turned Auto-play next on or off, in Options or on the panel:
+' tvOS keeps the choice in the profile's playback.auto_play_next for this
+' device.
+sub chooseAutoplay(value as Boolean)
     m.autoplayChosen = true
-    setAutoplay(panel.autoPlay)
+    setAutoplay(value)
+    writeAutoplay(value)
 end sub
 
 ' Auto-play next, for Options and Up Next alike.
@@ -2578,32 +2649,72 @@ sub setAutoplay(value as Boolean)
     refreshOptions()
 end sub
 
-' Play Now or the countdown: the session stops with its final position, as
-' Back stops it (plan section 6.6), then the next episode starts here.
+' Writes the toggle for this device, as Settings does; a failed write
+' leaves the profile as it was, and the toggle holds for this player.
+sub writeAutoplay(value as Boolean)
+    m.preferences.autoPlayNext = value
+    request = playback.preferences.autoPlayWrite(value)
+    m.requests[api.send(request, handleFor("onAutoplayWritten"))] = "autoplayWrite"
+end sub
+
+sub onAutoplayWritten(event as Object)
+    handle = event.getRoSGNode()
+    takeRequest(handle)
+    result = api.resultOf(handle)
+    if result = invalid or result.ok <> true
+        status = 0
+        if result <> invalid then status = result.status
+        log.warn(LOG_TAG, "auto-play next could not be saved", { status: status })
+    end if
+end sub
+
+' Play Now, the countdown, or an On Deck card: the session stops with its
+' final position, as Back stops it (plan section 6.6), then the next item
+' starts here.
 sub advanceTo(command as Object)
-    log.info(LOG_TAG, "playing the next episode", { auto: command.auto, streak: command.carry.streak })
+    log.info(LOG_TAG, "playing the next item", { auto: command.auto, chosen: command.chosen, onDeck: command.onDeck })
     closeUpNext()
     season = -1
-    if m.nextUp <> invalid and util.isNumber(m.nextUp.seasonNumber) then season = Int(m.nextUp.seasonNumber)
-    m.advance = { itemId: command.itemId, carry: command.carry, seasonNumber: season }
+    pick = m.upNext.next
+    if pick <> invalid and pick.itemId = command.itemId and util.isNumber(pick.seasonNumber) then season = Int(pick.seasonNumber)
+    m.advance = { itemId: command.itemId, carry: command.carry, seasonNumber: season, auto: not command.chosen, replay: invalid, foreign: command.onDeck }
+    if not m.done then dispatch({ type: "back" })
+    advanceWhenDone()
+end sub
+
+' Keep Watching after the end: the same item again from seconds.
+sub replayEnd(seconds as Dynamic)
+    log.info(LOG_TAG, "replaying the end", { seconds: seconds })
+    closeUpNext()
+    m.advance = { itemId: m.itemId, carry: playback.upNext.replayCarry(m.upNext), seasonNumber: playingSeason(), auto: false, replay: seconds, foreign: false }
     if not m.done then dispatch({ type: "back" })
     advanceWhenDone()
 end sub
 
 ' Once the session the advance ends is done, and no reduction is under way.
+' An item of another title tells the entry's page about the last one of the
+' first title first, as the player leaving would.
 sub advanceWhenDone()
     if m.advance = invalid or not m.done or m.dispatching or m.leaving or m.closed then return
     chosen = m.advance
     m.advance = invalid
+    if chosen.foreign and not m.leftSeries
+        notePlayedLast()
+        m.leftSeries = true
+    end if
     clearSession()
     m.itemId = chosen.itemId
     m.itemSeason = chosen.seasonNumber
-    m.startOver = true
-    m.wanted = nav.player.nextEpisode(chosen.itemId, chosen.carry)
+    m.startOver = false
+    if chosen.replay <> invalid
+        m.wanted = nav.player.replay(chosen.itemId, chosen.replay, chosen.carry)
+    else
+        m.wanted = nav.player.nextEpisode(chosen.itemId, chosen.carry, chosen.auto)
+    end if
     loadWatch()
 end sub
 
-' What belonged to the episode that ended goes before the next one starts
+' What belonged to the item that ended goes before the next one starts
 ' in this player. Its session is done; the Video node stops, and the next
 ' content waits for that (playback.slot). The profile's preferences stay.
 sub clearSession()
@@ -2652,7 +2763,7 @@ sub clearSession()
     m.recap = invalid
     m.upNext = invalid
     m.resolution = invalid
-    m.nextUp = invalid
+    m.onDeck = invalid
     m.videoEnded = false
     m.done = false
     dispatchControls({ type: "hide" })

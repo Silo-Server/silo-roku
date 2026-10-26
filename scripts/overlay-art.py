@@ -12,6 +12,8 @@
                      o'clock clockwise. countdown_30.png is the whole ring,
                      which also serves as the track at 12%
                      (components/theme/upNext.bs)
+  play_circle.png    the On Deck row's header glyph: tvOS's play.circle.fill,
+                     a 32 px disc with the play triangle cut out
 
 Shapes are white, for a Poster's blendColor and opacity. The 9-patches follow
 scripts/first-run-art.py: HD sizes are the FHD sizes times 2/3, a capsule's
@@ -37,6 +39,10 @@ FRAME_RADIUS = 8
 RING = 58  # FHD px
 RING_STROKE = 3
 STEPS = 30
+PLAY_CIRCLE = 32  # FHD px
+# The play triangle inside it, in px of PLAY_CIRCLE: its left edge, top and
+# bottom, and its point, a little right of centre as the symbol draws it.
+PLAY_TRIANGLE = ((12.0, 9.0), (12.0, 23.0), (23.5, 16.0))
 
 
 def hd(fhd_px):
@@ -97,6 +103,35 @@ def arc_alpha(size, stroke, fraction):
     return rows
 
 
+def triangle_distance(x, y, points):
+    """Signed distance from (x, y) to a triangle: negative inside."""
+    distance = math.inf
+    inside = True
+    for i, (ax, ay) in enumerate(points):
+        bx, by = points[(i + 1) % len(points)]
+        ex, ey = bx - ax, by - ay
+        t = clamp(((x - ax) * ex + (y - ay) * ey) / (ex * ex + ey * ey))
+        distance = min(distance, math.hypot(x - ax - ex * t, y - ay - ey * t))
+        if ex * (y - ay) - ey * (x - ax) > 0:
+            inside = False
+    return -distance if inside else distance
+
+
+def play_circle_alpha(size):
+    """Coverage rows of a disc with the play triangle cut out."""
+    centre = size / 2
+    rows = []
+    for py in range(size):
+        row = []
+        for px in range(size):
+            x, y = px + 0.5, py + 0.5
+            disc = clamp(0.5 - (math.hypot(x - centre, y - centre) - centre))
+            cut = clamp(0.5 - triangle_distance(x, y, PLAY_TRIANGLE))
+            row.append(max(disc - cut, 0.0))
+        rows.append(row)
+    return rows
+
+
 def rgba(alpha):
     return [[WHITE + (round(255 * a),) for a in line] for line in alpha]
 
@@ -138,6 +173,7 @@ def images():
         yield f"ring_{FRAME_RADIUS}_{res}.9.png", nine_patch(rounded_alpha(2 * radius + STRETCH, radius, 1))
     for step in range(1, STEPS + 1):
         yield f"countdown_{step:02d}.png", rgba(arc_alpha(RING, RING_STROKE, step / STEPS))
+    yield "play_circle.png", rgba(play_circle_alpha(PLAY_CIRCLE))
 
 
 def main():
