@@ -38,6 +38,10 @@ namespace storage
     const MAX_PROFILE_TOKENS_BYTES = 4096
     const MAX_SECONDS_BYTES = 10
     const PAIRING_KEY_BYTES = 32
+    ' After a failed write the writer saves again this long later, doubling
+    ' to MAX_RETRY_MS while writes keep failing (save).
+    const RETRY_MS = 1000
+    const MAX_RETRY_MS = 60000
     ' Every key this module writes; write() never touches others, such as keys
     ' a newer layout added.
     const KEYS = "schema|origin|device|account|access_token|refresh_token|expires_at|refresh_at|profile|profile_tokens|pairing_key"
@@ -116,16 +120,68 @@ namespace storage
     end function
 
     ' Writes the raw section's changed keys, deletes the managed keys it lacks,
-    ' and flushes. Gives whether the flush succeeded.
+    ' and flushes. Gives whether every write, delete, and the flush succeeded;
+    ' after a failure the section may hold part of raw, and the next write
+    ' compares again, so it retries just the keys that still differ.
     function write(section as Object, raw as Object) as Boolean
+        ok = true
         for each key in KEYS.Split("|")
             if raw.DoesExist(key)
-                if not section.Exists(key) or section.Read(key) <> raw[key] then section.Write(key, raw[key])
+                if not section.Exists(key) or section.Read(key) <> raw[key]
+                    if not section.Write(key, raw[key]) then ok = false
+                end if
             else if section.Exists(key)
-                section.Delete(key)
+                if not section.Delete(key) then ok = false
             end if
         end for
-        return section.Flush()
+        if not section.Flush() then ok = false
+        return ok
+    end function
+
+    ' The only writer's hold on the section (ApiTask). A failed save leaves
+    ' it dirty, to save the then-current record again delay milliseconds
+    ' after failedAt: RETRY_MS after the first failure, doubling to
+    ' MAX_RETRY_MS; a save that succeeds, the retry or any other, makes it
+    ' clean. Times are the caller's milliseconds, on a clock that is never
+    ' reset, so they wrap after 24 days; only elapsed time is compared.
+    function writer(section as Object) as Object
+        return { section: section, dirty: false, failedAt: invalid, delay: 0 }
+    end function
+
+    ' Writes raw through store, a writer (write). Gives whether it succeeded.
+    function save(store as Object, raw as Object, now as Integer) as Boolean
+        if write(store.section, raw)
+            store.dirty = false
+            store.failedAt = invalid
+            store.delay = 0
+            return true
+        end if
+        store.dirty = true
+        store.failedAt = now
+        if store.delay = 0
+            store.delay = RETRY_MS
+        else
+            store.delay = store.delay * 2
+            if store.delay > MAX_RETRY_MS then store.delay = MAX_RETRY_MS
+        end if
+        return false
+    end function
+
+    ' Milliseconds from now until a dirty writer's retry, 0 once it is due,
+    ' or invalid when the writer is clean. A clock that went back since the
+    ' failure wrapped, and the retry is due at once.
+    function retryIn(store as Object, now as Integer) as Dynamic
+        if not store.dirty then return invalid
+        if now < store.failedAt then return 0
+        elapsed = now - store.failedAt
+        if elapsed >= store.delay then return 0
+        return store.delay - elapsed
+    end function
+
+    ' Whether a dirty writer's retry is due at now.
+    function retryDue(store as Object, now as Integer) as Boolean
+        remaining = retryIn(store, now)
+        return remaining <> invalid and remaining = 0
     end function
 
     ' The bytes a raw section takes: its keys and values as UTF-8.

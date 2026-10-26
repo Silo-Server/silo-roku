@@ -1,0 +1,72 @@
+namespace tests
+
+    @suite("storage writer")
+    class StorageWriterTests extends rooibos.BaseTestSuite
+
+        @describe("save")
+
+        @it("keeps rotated tokens the registry refused dirty and stores them when the retry is due")
+        sub _()
+            section = tests.registry.section({})
+            store = storage.writer(section)
+            m.assertTrue(storage.save(store, storage.encode(tests.sessions.signedIn()), 0))
+            m.assertFalse(store.dirty)
+            m.assertInvalid(storage.retryIn(store, 0))
+
+            rotated = tests.sessions.signedIn()
+            rotated.accessToken = "acc-2"
+            rotated.refreshToken = "ref-2"
+            section.writeResult = false
+            m.assertFalse(storage.save(store, storage.encode(rotated), 5000))
+            m.assertTrue(store.dirty)
+            m.assertEqual(storage.retryIn(store, 5000), storage.RETRY_MS)
+            m.assertFalse(storage.retryDue(store, 5000 + storage.RETRY_MS - 1))
+            m.assertTrue(storage.retryDue(store, 5000 + storage.RETRY_MS))
+            m.assertEqual(storage.load(section).refreshToken, "ref")
+
+            section.writeResult = true
+            m.assertTrue(storage.save(store, storage.encode(rotated), 5000 + storage.RETRY_MS))
+            m.assertFalse(store.dirty)
+            m.assertInvalid(storage.retryIn(store, 5000 + storage.RETRY_MS))
+            m.assertFalse(storage.retryDue(store, 999999))
+            m.assertEqual([storage.load(section).accessToken, storage.load(section).refreshToken], ["acc-2", "ref-2"])
+        end sub
+
+        @it("doubles the retry delay while saves keep failing, up to MAX_RETRY_MS, and starts over after a success")
+        sub _()
+            section = tests.registry.section({})
+            section.flushResult = false
+            store = storage.writer(section)
+            raw = storage.encode(tests.sessions.signedIn())
+            delays = []
+            now = 0
+            for i = 1 to 8
+                storage.save(store, raw, now)
+                delays.Push(storage.retryIn(store, now))
+                now = now + store.delay
+            end for
+            m.assertEqual(delays, [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000])
+            section.flushResult = true
+            m.assertTrue(storage.save(store, raw, now))
+            section.flushResult = false
+            storage.save(store, raw, now)
+            m.assertEqual(storage.retryIn(store, now), storage.RETRY_MS)
+        end sub
+
+        @it("retries at once when the clock wraps before the retry is due")
+        sub _()
+            section = tests.registry.section({})
+            section.flushResult = false
+            store = storage.writer(section)
+            failedAt = 2147483647 - 400
+            storage.save(store, storage.encode(tests.sessions.signedIn()), failedAt)
+            m.assertEqual(storage.retryIn(store, 2147483647), storage.RETRY_MS - 400)
+            m.assertFalse(storage.retryDue(store, 2147483647))
+            ' 2147483647 + 1 wraps to -2147483648, still before the retry.
+            m.assertTrue(storage.retryDue(store, -2147483647 - 1))
+            m.assertEqual(storage.retryIn(store, -2147483647 - 1), 0)
+        end sub
+
+    end class
+
+end namespace

@@ -260,10 +260,12 @@ transport and refresh still in `ApiTask`.
 
 `Main()` reads a registry snapshot before creating the scene and passes it in.
 After that `ApiTask` is the only writer, and it writes and flushes rotated tokens
-before releasing requests queued behind a refresh. The registry holds the server
-origin, installation ID, tokens, last profile, and profile tokens, within a
-budget well under Roku's 32 KB per app, enforced by a unit test. Layout changes
-migrate stored sessions (spec section 7.2).
+before releasing requests queued behind a refresh. When the registry refuses a
+write, delete, or flush, the session goes on from memory and `ApiTask` saves the
+current record again 1 s later, doubling to a minute, until a save succeeds. The
+registry holds the server origin, installation ID, tokens, last profile, and
+profile tokens, within a budget well under Roku's 32 KB per app, enforced by a
+unit test. Layout changes migrate stored sessions (spec section 7.2).
 
 ### 4.4 Repository layout
 

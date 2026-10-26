@@ -85,6 +85,8 @@ sub serve()
         checkSizes()
         ' Due playback jobs, expiries, and session operations that waited.
         runWorker(playback.worker.tick(m.worker, workerEnv()))
+        ' A record the registry refused is saved again when its retry is due.
+        if storage.retryDue(m.store, workerMs()) then persist()
     end while
 end sub
 
@@ -98,7 +100,7 @@ end sub
 sub startSession()
     record = storage.decode(storage.encode(m.top.snapshot))
     m.top.snapshot = {}
-    m.section = CreateObject("roRegistrySection", storage.SECTION_NAME)
+    m.store = storage.writer(CreateObject("roRegistrySection", storage.SECTION_NAME))
     info = CreateObject("roDeviceInfo")
     generated = record.deviceId = ""
     if generated then record.deviceId = LCase(info.GetRandomUUID())
@@ -128,8 +130,9 @@ function nowSeconds() as Integer
     return m.wallClock.AsSeconds()
 end function
 
-' Milliseconds until the nearest deadline or playback job, or the next size
-' check while transfers run, or 0 (wait for a message) when nothing is pending.
+' Milliseconds until the nearest deadline, playback job, or registry retry, or
+' the next size check while transfers run, or 0 (wait for a message) when
+' nothing is pending.
 function waitMs() as Integer
     remaining = invalid
     deadline = api.scheduler.nextDeadline(m.scheduler)
@@ -142,6 +145,8 @@ function waitMs() as Integer
     end if
     wake = playback.worker.nextWake(m.worker)
     if wake <> invalid and (remaining = invalid or wake - workerMs() < remaining) then remaining = wake - workerMs()
+    retry = storage.retryIn(m.store, workerMs())
+    if retry <> invalid and (remaining = invalid or retry < remaining) then remaining = retry
     if remaining = invalid then return 0
     if remaining < 1 then remaining = 1
     if remaining > SIZE_CHECK_MS and not m.transfers.IsEmpty() then remaining = SIZE_CHECK_MS
@@ -556,10 +561,12 @@ sub clearBodyFiles()
     end for
 end sub
 
-' Writes and flushes the session's record; the only registry write.
+' Writes and flushes the session's record; the only registry write. When the
+' registry refuses it, the session goes on from memory and the loop saves the
+' record again later (storage.save), until a save succeeds.
 sub persist()
-    if not storage.write(m.section, storage.encode(api.auth.coordinator.record(m.session)))
-        log.warn("storage", "registry flush failed")
+    if not storage.save(m.store, storage.encode(api.auth.coordinator.record(m.session)), workerMs())
+        log.warn("storage", "registry write failed; retrying", { retryMs: m.store.delay })
     end if
 end sub
 
