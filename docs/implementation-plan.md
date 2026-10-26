@@ -550,8 +550,9 @@ codec in `codecs_audio` is copied as the original bitstream.
   `b10`/`Dv` or an Auto Display Type.
 - Dolby Vision profiles only with evidence that the Roku itself outputs DV: a
   Roku TV's display flag, or `Dv` in a player's mode string (spec section 9.2).
-  Only P5 is reported, with `dolby_vision_profile_levels` (`max_level` 9 until
-  H3 measures one). P8 is not claimed (run 31): its base layer plays through the
+  Only P5 is reported, with `dolby_vision_profile_levels` (`max_level` within
+  the HEVC Main 10 shape: 9 at 2160p60, 7 at 2160p30, 5 at 1080p60, until H3
+  measures one). P8 is not claimed (run 31): its base layer plays through the
   `client_dv8_base_layer_fallback_v1` claim for ID 1.
 - `output.display.hdr_evidence` is `"exact"` when `GetDisplayProperties()`
   answers; the probe retries once before reporting `"unknown"`, because `unknown`

@@ -1706,12 +1706,16 @@ no per-build or per-cohort switches (decision D-7 of
 2026-10-25 in `implementation-assumptions.md`):
 
 - video: H.264 and HEVC at the measured levels, and VP9 (profiles 0 and 2)
-  and AV1 where `CanDecodeVideo` passes them. `CanDecodeVideo` reports no
-  VP9 or AV1 size or frame rate, so both take the largest H.264 or HEVC
-  shape the ladder proved. HEVC levels above 5.1 are recorded but never
-  counted;
+  and AV1 where `CanDecodeVideo` passes them. `CanDecodeVideo` takes no
+  size or frame rate, Roku documents no VP9 level, and no recorded probe
+  shows an AV1 level answered, so both take the largest H.264 or HEVC shape
+  the ladder proved, and neither is claimed when the ladder proved none.
+  That bound, and AV1's 8 and 10 bits from a bare `av1` answer (AV1's Main
+  profile covers both), are inferred rather than probed. HEVC levels above
+  5.1 are recorded but never counted;
 - audio: AAC and MP3, AC-3 and E-AC-3 when every container passes, FLAC,
-  Opus, and `pcm_s16le` and `pcm_s24le` when their probes pass. DTS is not
+  Opus, and `pcm_s16le` and `pcm_s24le` when their probes pass (one `pcm`
+  answer covers both: `CanDecodeAudio` takes no bit depth). DTS is not
   claimed until the server matches DTS variants (implementation plan S-8),
   because it would send a DTS-HD MA or DTS:X source as `dts`; DTS 5.1
   passthrough is still probed and names the output context. TrueHD, MLP, and
@@ -1719,10 +1723,13 @@ no per-build or per-cohort switches (decision D-7 of
 - output: HDR10 and HLG where the display reports them, HDR10+ beside HDR10
   where the display reports it, under the HDR output rule (an HEVC Main 10
   decoder, a 2160-line output, and an exact display answer);
-- Dolby Vision P5 (level 9) on the output and on `original_http` where the
-  Roku is shown to output it. P8 is never claimed: a P8.1 TS remux showed a
-  green picture on the Ultra, and Roku documents only `dvhe.05` for HEVC
-  Dolby Vision, so a P8 source plays its base layer (below). A Roku TV's panel does
+- Dolby Vision P5 on the output and on `original_http` where the Roku is
+  shown to output it, at the Dolby Vision level the HEVC Main 10 shape allows
+  (9 at 2160p60, 7 at 2160p30, 5 at 1080p60). Roku has no Dolby Vision
+  decoder probe, so that level is inferred from the HEVC ladder. P8 is never
+  claimed: a P8.1 TS remux showed a green picture on the Ultra, and Roku
+  documents only `dvhe.05` for HEVC Dolby Vision, so a P8 source plays its
+  base layer (below). A Roku TV's panel does
   the Dolby Vision processing, so `GetVideoMode()` never shows it (run 11 read
   `2160p60` throughout) and the display's Dolby Vision flag is the evidence. A
   player shows it in its mode string: the Ultra 4850X reads `2160p60dv`
