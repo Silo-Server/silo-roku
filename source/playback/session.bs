@@ -230,6 +230,37 @@ namespace playback.session
         return state.queued <> invalid and state.queued.op = "track_change"
     end function
 
+    ' The newest track_change on its way that names a selection, waiting
+    ' or else in flight, or invalid (a reconnect's keeps the plan's).
+    function pendingTrackChange(state as Object) as Dynamic
+        queued = state.queued
+        if queued <> invalid and queued.op = "track_change" and util.isObject(queued.tracks) then return queued
+        if state.mutation = invalid then return invalid
+        request = state.mutation.request
+        if request.op = "track_change" and util.isObject(request.tracks) then return request
+        return invalid
+    end function
+
+    ' A waiting track_change that took a member from request, a
+    ' track_change the server refused (onTrackChange), asks for the plan's
+    ' own member instead, which plays on: a subtitle chosen behind a
+    ' refused audio is not refused with it.
+    sub dropRefusedTracks(state as Object, request as Object)
+        queued = pendingTrackChange(state)
+        if queued = invalid or not util.isObject(request.tracks) then return
+        selected = state.plan.data.selected_tracks
+        if not util.isObject(selected) then selected = {}
+        tracks = playback.values.copy(queued.tracks)
+        for each member in ["audio", "subtitle"]
+            asked = request.tracks[member]
+            if sameTrack(tracks[member], asked) and not sameTrack(selected[member], asked)
+                tracks.Delete(member)
+                if util.isObject(selected[member]) then tracks[member] = selected[member]
+            end if
+        end for
+        queued.tracks = tracks
+    end sub
+
     ' --- Viewer intents -------------------------------------------------------
 
     ' {intent, quality, bandwidthCapKbps, autoplay, catalogRuntime,
@@ -274,13 +305,32 @@ namespace playback.session
         playback.seek.skip(state.skips, from, event.seconds, state.plan.runtime, env.now())
     end sub
 
-    ' {tracks, inPlace}: the complete selection, {audio, subtitle}; no
+    ' {tracks, inPlace, chosen}: the complete selection, {audio, subtitle}; no
     ' subtitle means off. inPlace says the playing content already carries
     ' the chosen subtitle (playback.sidecars.inPlace), so a plan that streams
-    ' the same media switches it there instead of reloading.
+    ' the same media switches it there instead of reloading. chosen, when
+    ' given, names the one member the viewer changed, "audio" or
+    ' "subtitle"; the other is the current plan's, so it is taken from what
+    ' a track_change on its way asks for (pendingTrackChange): audio B and
+    ' then a subtitle, chosen before B's plan arrives, ask for both. inPlace
+    ' then holds only when that change asks to keep the content too, since
+    ' a reload's content may carry other subtitles.
     sub onTrackChange(state as Object, event as Object, env as Object, out as Object)
         if state.phase <> "active" then return
-        submit(state, { rank: RANK_INTENT, op: "track_change", tracks: event.tracks, inPlace: util.isTrue(event.inPlace) }, env, out)
+        request = { rank: RANK_INTENT, op: "track_change", tracks: event.tracks, inPlace: util.isTrue(event.inPlace) }
+        kept = ""
+        chosen = util.text(event.chosen)
+        if chosen = "audio" then kept = "subtitle"
+        if chosen = "subtitle" then kept = "audio"
+        pending = pendingTrackChange(state)
+        if kept <> "" and pending <> invalid and util.isObject(event.tracks)
+            tracks = playback.values.copy(event.tracks)
+            tracks.Delete(kept)
+            if util.isObject(pending.tracks[kept]) then tracks[kept] = pending.tracks[kept]
+            if not util.isTrue(pending.inPlace) then request.inPlace = false
+            request.tracks = tracks
+        end if
+        submit(state, request, env, out)
     end sub
 
     ' {quality}: "auto" or a label from available_qualities. During a start it
@@ -460,6 +510,7 @@ namespace playback.session
             else
                 out.Push({ type: "refused", operation: request.op })
             end if
+            if request.op = "track_change" then dropRefusedTracks(state, request)
         end if
     end sub
 
@@ -1827,6 +1878,13 @@ namespace playback.session
     function hasFeature(state as Object, name as String) as Boolean
         if util.contains(state.features, name) then return true
         return state.attempt <> invalid and util.contains(state.attempt.serverFeatures, name)
+    end function
+
+    ' Whether two selected_tracks members name the same track, or are both
+    ' absent (subtitles off).
+    function sameTrack(a as Dynamic, b as Dynamic) as Boolean
+        if not util.isObject(a) or not util.isObject(b) then return not util.isObject(a) and not util.isObject(b)
+        return sameText(a.id, b.id)
     end function
 
     function sameText(a as Dynamic, b as Dynamic) as Boolean

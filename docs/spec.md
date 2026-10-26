@@ -2092,10 +2092,14 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   tvOS does, else the track the profile's audio language and the device's
   codecs choose (section 8.5). The other kind keeps the
   plan's own `selected_tracks` member, since a `track_change` without a
-  subtitle means subtitles off.
+  subtitle means subtitles off, or, while another `track_change` is in
+  flight or waiting, the member that one asks for: an audio and a subtitle
+  chosen before either's plan arrives are both requested.
 - A track or quality change the viewer asked for that the server refuses
   leaves the plan playing as it was, and a notice says so ("Can't switch to
-  that track.", "Can't switch to that quality.").
+  that track.", "Can't switch to that quality."). A `track_change` waiting
+  behind a refused one asks for the plan's own member in place of the
+  refused one it took.
 - The first release does not claim client-side audio selection within an
   original file; the server may choose a remux that makes selection
   deterministic.

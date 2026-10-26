@@ -2917,6 +2917,110 @@ namespace tests
             m.assertEqual(body.quality_preference, "auto")
         end sub
 
+        ' The recorded start's plan as id: English audio 0 of three, subtitles
+        ' off, and an inventory of five subtitles; audio and subtitle are the
+        ' plan's selection when given, and the version is Options'.
+        function recordedPlan(id as String, audio as Dynamic, subtitle as Dynamic) as Object
+            plan = tests.sessions.fixture("playback_start_opaque_ids").playback_plan
+            plan.plan_id = id
+            plan.plan_attempt_key = "v3:" + id
+            if audio <> invalid then plan.selected_tracks.audio = audio
+            if subtitle <> invalid
+                plan.selected_tracks.subtitle = subtitle
+                plan.subtitle.mode = "render"
+                plan.subtitle.track_id = subtitle.id
+            end if
+            return plan
+        end function
+
+        ' A row chosen in Options on the plan the session plays, as the
+        ' player dispatches it.
+        function choose(state as Object, env as Object, kind as String, value as Dynamic) as Object
+            version = { audio_tracks: [{ language: "eng", codec: "eac3", default: true }, { language: "eng", codec: "aac" }, { language: "jpn", codec: "truehd" }] }
+            outcome = playback.options.choose({ plan: state.plan.data, version: version, captionMode: "Off" }, { kind: kind, value: value })
+            m.assertEqual(outcome.kind, "trackChange")
+            return m.send(state, env, outcome.event)
+        end function
+
+        @it("keeps a chosen audio when a subtitle is chosen before its plan arrives")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, m.recordedPlan("plan-1", invalid, invalid))
+            japanese = { id: "file:42:audio:2", index: 2 }
+            english = { id: "file:42:subtitle:0", index: 0 }
+            m.assertEqual(m.cmd(m.choose(state, env, "audio", 2), "replan").members.selected_tracks, { audio: japanese })
+            m.assertEqual(m.choose(state, env, "subtitle", "file:42:subtitle:0"), [], "it waits for the audio's plan")
+            replan = m.cmd(m.replanResult(state, env, "ok", tests.playable("s-1", m.recordedPlan("plan-2", japanese, invalid))), "replan")
+            m.assertEqual(replan.members.selected_tracks, { audio: japanese, subtitle: english })
+        end sub
+
+        @it("keeps a chosen subtitle when an audio is chosen before its plan arrives")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, m.recordedPlan("plan-1", invalid, invalid))
+            japanese = { id: "file:42:audio:2", index: 2 }
+            spanish = { id: "file:42:subtitle:4", index: 4 }
+            m.assertEqual(m.cmd(m.choose(state, env, "subtitle", "file:42:subtitle:4"), "replan").members.selected_tracks, { audio: { id: "file:42:audio:0", index: 0 }, subtitle: spanish })
+            m.assertEqual(m.choose(state, env, "audio", 2), [], "it waits for the subtitle's plan")
+            replan = m.cmd(m.replanResult(state, env, "ok", tests.playable("s-1", m.recordedPlan("plan-2", invalid, spanish))), "replan")
+            m.assertEqual(replan.members.selected_tracks, { audio: japanese, subtitle: spanish })
+        end sub
+
+        @it("asks for the last of each member chosen while they wait")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, m.recordedPlan("plan-1", invalid, invalid))
+            m.choose(state, env, "subtitle", "file:42:subtitle:4")
+            m.choose(state, env, "audio", 1)
+            m.choose(state, env, "subtitle", "file:42:subtitle:0")
+            m.choose(state, env, "audio", 2)
+            replan = m.cmd(m.replanResult(state, env, "ok", tests.playable("s-1", m.recordedPlan("plan-2", invalid, { id: "file:42:subtitle:4", index: 4 }))), "replan")
+            m.assertEqual(replan.members.selected_tracks, { audio: { id: "file:42:audio:2", index: 2 }, subtitle: { id: "file:42:subtitle:0", index: 0 } })
+        end sub
+
+        @it("asks for the plan's own audio with a subtitle chosen behind an audio the server refuses")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, m.recordedPlan("plan-1", invalid, invalid))
+            m.choose(state, env, "audio", 2)
+            m.choose(state, env, "subtitle", "file:42:subtitle:0")
+            cmds = m.replanResult(state, env, "rejected", invalid)
+            m.assertEqual(m.cmd(cmds, "refused"), { type: "refused", operation: "track_change" })
+            m.assertEqual(m.cmd(cmds, "replan").members.selected_tracks, { audio: { id: "file:42:audio:0", index: 0 }, subtitle: { id: "file:42:subtitle:0", index: 0 } })
+        end sub
+
+        @it("keeps the plan's own subtitle with an audio chosen behind a subtitle the server refuses")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, m.recordedPlan("plan-1", invalid, invalid))
+            m.choose(state, env, "subtitle", "file:42:subtitle:4")
+            m.choose(state, env, "audio", 1)
+            m.choose(state, env, "subtitle", "file:42:subtitle:0")
+            m.choose(state, env, "audio", 2)
+            replan = m.cmd(m.replanResult(state, env, "rejected", invalid), "replan")
+            m.assertEqual(replan.members.selected_tracks, { audio: { id: "file:42:audio:2", index: 2 }, subtitle: { id: "file:42:subtitle:0", index: 0 } }, "a later choice of the refused member stands")
+            m.replanResult(state, env, "rejected", invalid)
+            m.choose(state, env, "subtitle", "file:42:subtitle:4")
+            m.choose(state, env, "audio", 1)
+            replan = m.cmd(m.replanResult(state, env, "rejected", invalid), "replan")
+            m.assertEqual(replan.members.selected_tracks, { audio: { id: "file:42:audio:1", index: 1 } })
+        end sub
+
+        @it("switches a subtitle chosen behind another change in place only when that change keeps the content")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.directPlan("plan-1", "v3:k1"))
+            audio = { id: "audio-1", index: 1 }
+            m.send(state, env, { type: "trackChange", tracks: { audio: audio, subtitle: { id: "sub-1", index: 0 } }, inPlace: true, chosen: "subtitle" })
+            m.send(state, env, { type: "trackChange", tracks: { audio: audio, subtitle: { id: "sub-2", index: 1 } }, inPlace: true, chosen: "subtitle" })
+            m.assertEqual([state.queued.tracks, state.queued.inPlace], [{ audio: audio, subtitle: { id: "sub-2", index: 1 } }, true], "behind a subtitle switched in place")
+            m.send(state, env, { type: "trackChange", tracks: { audio: audio, subtitle: { id: "sub-3", index: 2 } }, inPlace: false, chosen: "subtitle" })
+            m.send(state, env, { type: "trackChange", tracks: { audio: audio, subtitle: { id: "sub-2", index: 1 } }, inPlace: true, chosen: "subtitle" })
+            m.assertFalse(state.queued.inPlace, "behind one that reloads")
+            m.send(state, env, { type: "trackChange", tracks: { audio: { id: "audio-2", index: 2 } }, inPlace: false, chosen: "audio" })
+            m.assertEqual([state.queued.tracks, state.queued.inPlace], [{ audio: { id: "audio-2", index: 2 }, subtitle: { id: "sub-2", index: 1 } }, false], "an audio keeps the subtitle")
+        end sub
+
         @it("sends output_change on a new context and accepts the same key back")
         sub _()
             env = tests.fakeEnv()
