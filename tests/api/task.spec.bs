@@ -1,0 +1,84 @@
+namespace tests
+
+    ' The real ApiTask (components/tasks/ApiTask.bs) through an ApiTaskProbe
+    ' (tests/components/ApiTaskProbe.bs): its setup and the path from a
+    ' transfer's event to the session. tests.sessions stands in for this glue
+    ' in the other specs; these keep the two in step.
+    @suite("api task")
+    class ApiTaskTests extends rooibos.BaseTestSuite
+
+        ' tests.sessions.signedIn() with tokens that last until 2038 on
+        ' ApiTask's wall clock, so no refresh starts.
+        function signedIn() as Object
+            record = tests.sessions.signedIn()
+            record.expiresAt = 2147000000
+            record.refreshAt = 2146000000
+            return record
+        end function
+
+        function started(record as Object) as Object
+            task = CreateObject("roSGNode", "ApiTaskProbe")
+            m.view = task.callFunc("probeStart", record)
+            return task
+        end function
+
+        ' The ID of the running request to url, or invalid.
+        function runningTo(view as Object, url as String) as Dynamic
+            for each id in view.running
+                if view.running[id].url = url then return id
+            end for
+            return invalid
+        end function
+
+        @describe("setup")
+
+        @it("configures the session and scheduler as tests.sessions does")
+        sub _()
+            record = m.signedIn()
+            m.started(record)
+            loop = tests.sessions.create(record, false)
+            m.assertEqual(m.view.allowUnconfirmedOrigin, loop.session.allowUnconfirmedOrigin, "the same origin policy")
+            m.assertEqual(m.view.maxConcurrent, loop.scheduler.maxConcurrent)
+            m.assertEqual(m.view.baseUrl, loop.baseUrl)
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([m.view.session.status, m.view.session.originStatus], [view.status, view.originStatus])
+            m.assertEqual(m.view.running.Count(), loop.running.Count(), "only the launch check runs")
+            check = m.runningTo(m.view, "https://silo.example" + api.auth.server.INFO_PATH)
+            m.assertNotInvalid(check)
+            ' tests.sessions applies no body budget, so the check gets the usual one.
+            m.assertEqual(m.view.running[check].budget, api.response.MAX_BODY_BYTES)
+        end sub
+
+        @it("reads the snapshot once and clears it")
+        sub _()
+            m.started(m.signedIn())
+            m.assertEqual(m.view.snapshot, {})
+            m.assertEqual(m.view.session.deviceId, "device-1")
+            m.assertEqual(m.view.session.accountId, "1")
+        end sub
+
+        @describe("the launch check")
+
+        @it("sends account requests to a server without request_origin once it answers")
+        sub _()
+            task = m.started(m.signedIn())
+            task.callFunc("probeRequest", { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
+            view = task.callFunc("probeView")
+            m.assertInvalid(view.running.r1, "waits for the check")
+            check = m.runningTo(view, "https://silo.example" + api.auth.server.INFO_PATH)
+            view = task.callFunc("probeRespond", { requestId: check, code: 200, body: tests.sessions.fixture("get_system_info_ok") })
+            m.assertEqual(view.session.originStatus, "verified")
+            m.assertEqual(view.running.r1.url, "https://silo.example/api/v2/account/me")
+        end sub
+
+        @it("refuses a server that reports another origin")
+        sub _()
+            task = m.started(m.signedIn())
+            task.callFunc("probeRequest", { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
+            check = m.runningTo(m.view, "https://silo.example" + api.auth.server.INFO_PATH)
+            view = task.callFunc("probeRespond", { requestId: check, code: 200, body: tests.sessions.systemInfo("https://other.example") })
+            m.assertEqual([view.session.originStatus, view.session.originProblem], ["refused", "origin_mismatch"])
+            m.assertTrue(view.running.IsEmpty())
+        end sub
+    end class
+end namespace
