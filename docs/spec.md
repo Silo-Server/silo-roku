@@ -855,15 +855,19 @@ Subtitles tab (criterion 4.8).
   - They are not drawn while Options is open.
   - Captions: Roku's are hidden while the controls show and return as they
     hide (5.9).
-  - Showing and hiding: those a title's start shows hide when its picture
-    first plays, unless a key came meanwhile or it opens paused, so Left and
-    Right skip from then on (section 5.9). They hide 5 seconds after the last
-    key unless playback is paused, buffering, or seeking, a seek is pending,
-    or a panel is open.
+  - Showing and hiding: a title starts on black behind the spinner, with
+    the controls hidden and only Back working; from its first frame keys
+    show them, and Left and Right skip. A stall later neither shows nor
+    hides them. They hide 5 seconds after the last key unless playback is
+    paused, buffering, or seeking, a seek is pending, or a panel is open.
 - **Status and notices.**
-  - Busy states show "Loading…" with a small spinner in a capsule at the top
-    right (y 124, right edge 1760), in 20 px Medium at 82%. It appears only
-    after 1.5 s of loading or buffering.
+  - A start, a stall, or a reconnection's reload shows the 128 px spinner
+    (5.8) without text, centred on the picture (Up Next's frame while it
+    shows, and 28 px under an open Options panel). It appears after 0.5 s
+    of loading or buffering and stays at least 0.5 s.
+  - Roku's own busy states (5.9) show by name with a small spinner in a
+    capsule at the top right (y 124, right edge 1760), in 20 px Medium at
+    82%, after 1.5 s.
   - Notices and Reconnecting show as a centred card at y 140, at most 760 px
     wide, radius 28, filled `#1A1A1A` at 88%. The card holds a symbol, a
     30 px SemiBold title, and a 24 px message at 72%, for example
@@ -1083,7 +1087,7 @@ Subtitles tab (criterion 4.8).
   meanwhile, and a seek the viewer makes replaces it. In hardware run 9 it
   never landed (Roku rebuffered and played on from the late position); the
   fix is the server's (a complete playlist at start, or `#EXT-X-START`).
-- **Waiting and errors.** The busy capsule shows while the player buffers, and
+- **Waiting and errors.** The spinner shows while the player buffers, and
   the Reconnecting card while recovery (section 9.6) runs. A failure shows,
   centred, a 40 px warning triangle in `#B00020`, the message in 26 px
   Regular, then buttons 16 px apart, 62 px tall with 28 px SemiBold labels:
@@ -1259,9 +1263,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The Details table has no Genres row | Genres is a row (Android TV) | The metadata line shows only the first two genres |
 | A detail page visited lately paints at once from a cache of 20 pages and refreshes quietly | Every visit reads the page again, painting the card's seed meanwhile | Implementation plan section 4.8 bounds the metadata kept on 512 MB devices |
 | Rewind and fast-forward skip (Android TV) | Rewind and fast-forward drive the rate ladder | Roku remote convention |
-| The controls hide at the first frame | They show while a title starts and hide when its picture first plays, unless a key came meanwhile or it opens paused; Left and Right then skip | Roku keeps the controls up while playback buffers and for 5 s after, so after a late first frame a skip moved focus instead (hardware run 9, T4b) |
 | The player has a bottom-240 px gradient ending at black 55%, with a shadow behind the title footer | A bottom-600 px gradient ending at black 94%, reaching 72–76% behind the series, title, and episode tag | Covers Roku's fixed title block and preserves muted-text contrast over bright video without additional text nodes |
-| The busy capsule says "Loading…" | It also names Roku's own states: "Stopping…", "Playback progress is pending…", and "Loading subtitles…"; a notice waits while the capsule shows | The player's durable stop and sidecar downloads have no tvOS counterpart, and a notice that came during a stall expired unseen behind it (hardware run 23; assumption AG-262) |
+| A start or a stall shows only the centred spinner | Roku's own states also show by name in a capsule at the top right: "Stopping…", "Playback progress is pending…", and "Loading subtitles…"; a notice waits while the spinner or the capsule shows | The player's durable stop and sidecar downloads have no tvOS counterpart, and a notice that came during a stall expired unseen behind it (hardware run 23; assumption AG-262) |
 | The hold indicator's thumbnail has radius 20 corners and a 1 px white 18% outline; its hint names Siri Remote gestures | Square corners without the outline; the hint names Roku keys ("← → Speed, OK Play, Back Cancel") | Over video Roku can round an image only with a `MaskGroup`, which does not clip on devices without OpenGL (plan section 4.6); a square outline would cross rounded art |
 | Skip Recap sits 96 px up, or 156 px over the controls | It sits where Skip Intro does (156 px up, 460 px over the controls, on the safe area), and above it while both show | At tvOS's raised place it would cover the scrubber's right end and the time left; Skip Intro's place clears the controls (assumption AG-260) |
 | Focused pills grow (Play Now 1.085×, Keep Watching and Back 1.06×, Skip Recap 1.025×, the failure screen's buttons 1.055×) | They change fill and width only | Section 5.2's pill rule: only the Sort pill, first-run buttons, fields, and Skip Intro scale; the owner's call is open (audit U3, assumption AG-265) |
@@ -2562,7 +2565,7 @@ is):
 | Custom controls say their label when focused, through `roAudioGuide`: setup and sign-in fields, the top bar and avatar menu, the library list, sort, alphabet rail, Search filter and result count, Detail's buttons (Versions, Audio Tracks, and Subtitles with their values), seasons, and menus, the player's controls with the position, Options tabs and rows (with "selected"), Skip Intro, Skip Recap, Up Next, and the player error's buttons | All | None |
 | Setup, sign-in, the profile picker, and PIN say their inline errors as they appear | All | None |
 | Full-screen errors and empty states say their title and message, then the focused action, as they appear, at once and again when they repeat (assumption AG-176): the player's error with Retry (Try again for a lost connection), Try Anyway, or Go Back; the shared empty and error state on Home, a library, Search, and Detail, with its Retry or Refresh once it has focus; Detail's episode message; "Server update required" and the other first-run messages, on each show; sign-in's "Can't reach {server}" before Try again | All | Headless only (`tests/views/audioGuide.spec.bs`) |
-| The busy capsule says its state once it shows ("Loading…", "Playback progress is pending…", "Loading subtitles…", "Stopping…"), after what is being said, at once when it replaces an earlier state; a notice card says its title and message ("Reconnecting… The connection to the server was lost…", a refused track or quality change); neither says anything while the player's error covers it | All | Headless only |
+| The spinner says "Loading" and the busy capsule its state once it shows ("Playback progress is pending…", "Loading subtitles…", "Stopping…"), after what is being said, at once when it replaces an earlier state; a notice card says its title and message ("Reconnecting… The connection to the server was lost…", a refused track or quality change); neither says anything while the player's error covers it | All | Headless only |
 | Options says a tab as focus reaches its pill (Info and Stats with what they show), and a column's header with the first row focus reaches in it ("Captions, Off"), so Captions' Off is not heard as Tracks' Off | All | Headless only |
 | Audio-description tracks are ordinary rows in the Audio picker, ranked with commentary, so they are never chosen automatically | All | None |
 
