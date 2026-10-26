@@ -375,8 +375,10 @@ namespace tests
 
         @describe("configured origin")
 
-        ' A launch on record whose origin check is still running.
-        function launching(record as Object, allowUnconfirmed = false as Boolean) as Object
+        ' A launch on record whose origin check is still running, in
+        ' compatibility mode as ApiTask starts it, or in strict mode with
+        ' allowUnconfirmed false.
+        function launching(record as Object, allowUnconfirmed = true as Boolean) as Object
             return tests.sessions.create(record, false, allowUnconfirmed)
         end function
 
@@ -410,11 +412,11 @@ namespace tests
             m.assertEqual(api.auth.coordinator.view(loop.session).originStatus, "verified")
         end sub
 
-        @it("refuses every credential for a server that does not confirm the origin, in a release build")
+        @it("refuses every credential for a server that does not confirm the origin, in strict mode")
         sub _()
             record = tests.sessions.signedIn()
             record.expiresAt = tests.sessions.NOW - 5
-            loop = m.launching(record)
+            loop = m.launching(record, false)
             tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/profiles", auth: "account" })
             tests.sessions.send(loop, { requestId: "p1", session: "verifyPin", profile: { id: "p-owner", name: "Laura", hasPin: true, isChild: false }, pin: "1234" })
             m.answerCheck(loop, 200, tests.sessions.fixture("get_system_info_ok"))
@@ -434,17 +436,17 @@ namespace tests
             m.assertEqual(api.auth.coordinator.record(loop.session).accessToken, "acc", "the session is kept for an updated server")
         end sub
 
-        @it("sends credentials with a warning to a server without request_origin only in a debug build")
+        @it("sends credentials with a warning to a server without request_origin in compatibility mode, as every build does")
         sub _()
-            loop = m.launching(tests.sessions.signedIn(), true)
+            loop = m.launching(tests.sessions.signedIn())
             tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/account/me", auth: "account" })
             m.answerCheck(loop, 200, tests.sessions.fixture("get_system_info_ok"))
             m.assertEqual(loop.running.r1.headers.Authorization, "Bearer acc")
             m.assertEqual(api.auth.coordinator.view(loop.session).originStatus, "verified")
-            m.assertEqual(tests.sessions.count(loop, "warn the server does not confirm which origin a request reached; a debug build sends credentials to it anyway"), 1)
+            m.assertEqual(tests.sessions.count(loop, "warn the server does not confirm which origin a request reached; credentials are sent to it anyway"), 1)
         end sub
 
-        @it("refuses a redirected launch check in every build")
+        @it("refuses a redirected launch check in either mode")
         sub _()
             for each allowUnconfirmed in [false, true]
                 loop = m.launching(tests.sessions.signedIn(), allowUnconfirmed)
@@ -514,7 +516,7 @@ namespace tests
         @it("checks a refused origin again when asked, and takes the server to the update screen meanwhile")
         sub _()
             loop = m.launching(tests.sessions.signedIn())
-            m.answerCheck(loop, 200, tests.sessions.fixture("get_system_info_ok"))
+            m.answerCheck(loop, 200, tests.sessions.systemInfo("https://other.example"))
             shell = nav.phase.onSession(nav.phase.create(), api.auth.coordinator.view(loop.session)).shell
             m.assertEqual(shell.phase, nav.phase.UPDATE_REQUIRED)
             tests.sessions.send(loop, { requestId: "c1", session: "checkOrigin" })
@@ -529,7 +531,7 @@ namespace tests
         @it("confirms a refused origin when the setup check of the same server passes")
         sub _()
             loop = m.launching(tests.sessions.signedIn())
-            m.answerCheck(loop, 200, tests.sessions.fixture("get_system_info_ok"))
+            m.answerCheck(loop, 200, tests.sessions.systemInfo("https://other.example"))
             tests.sessions.send(loop, { requestId: "s1", session: "server", address: "https://silo.example" })
             tests.sessions.respond(loop, "s1", 200, tests.sessions.systemInfo())
             m.assertEqual(loop.delivered.s1.body.changed, false)
@@ -567,9 +569,9 @@ namespace tests
             m.assertNotInvalid(loop.running.i1, "the setup check confirmed the origin")
         end sub
 
-        @it("refuses a new server that does not confirm the origin, and keeps no server")
+        @it("refuses a new server that does not confirm the origin, and keeps no server, in strict mode")
         sub _()
-            loop = tests.sessions.create(storage.empty())
+            loop = tests.sessions.create(storage.empty(), true, false)
             tests.sessions.send(loop, { requestId: "r1", session: "server", address: "silo.example" })
             tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("get_system_info_ok"))
             m.assertEqual(loop.delivered.r1.error.kind, "origin_unconfirmed")
@@ -579,6 +581,20 @@ namespace tests
             m.assertEqual(loop.delivered.r2.error.kind, "origin_mismatch")
             tests.sessions.send(loop, { requestId: "i1", session: "signIn", username: "laura", password: "pw" })
             m.assertEqual(loop.delivered.i1.error.kind, "no_server")
+        end sub
+
+        @it("stores a new server that does not confirm the origin, with a warning, in compatibility mode")
+        sub _()
+            loop = tests.sessions.create(storage.empty())
+            tests.sessions.send(loop, { requestId: "r1", session: "server", address: "silo.example" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("get_system_info_ok"))
+            m.assertEqual(loop.delivered.r1.body, { origin: "https://silo.example", changed: true })
+            m.assertEqual(loop.persisted.Peek().origin, "https://silo.example")
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.originStatus], ["signed_out", "verified"])
+            m.assertEqual(tests.sessions.count(loop, "warn the server does not confirm which origin a request reached; credentials are sent to it anyway"), 1)
+            tests.sessions.send(loop, { requestId: "i1", session: "signIn", username: "laura", password: "pw" })
+            m.assertNotInvalid(loop.running.i1)
         end sub
 
         @it("ends the session and cancels other requests when the server changes")
