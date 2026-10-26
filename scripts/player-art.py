@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the player's generated art into images/player/ (spec section 5.7, tvOS's sizes).
 
-  capsule_{66,36,46,62,84}_{fill,ring}_{fhd,hd}.9.png
+  capsule_{66,46,62,84}_{fill,ring}_{fhd,hd}.9.png, capsule_36_fill_{fhd,hd}.9.png
                           capsules of exactly that height, filled or as a 1 px
                           outline: the round buttons (66), the rate chip and busy capsule (36), the
                           Options tabs (46), the error buttons (62, its ring
@@ -10,10 +10,10 @@
                           the Info pane's outlined badges
   capsule_44_{fill,ring}_{fhd,hd}.9.png
                           Up Next's auto-play toggle outline (2 px)
-  rounded_{8,10,20,28}_{fill,ring}_{fhd,hd}.9.png
-                          rounded rectangles with a 1 px outline: track rows
-                          (8), setting rows (10), the preview card (20), and the
-                          Options panel, its picker, and the notice card (28)
+  rounded_{8,10,20,28}_fill_{fhd,hd}.9.png, rounded_28_ring_{fhd,hd}.9.png
+                          rounded rectangles, the 28 also as a 1 px outline: track
+                          rows (8), setting rows (10), the preview card (20), and
+                          the Options panel, its picker, and the notice card (28)
   frame_14_{fhd,hd}.9.png the preview thumbnail's corners outside radius 14,
                           tinted to the card's colour
   knob.png, knob_scrub.png
@@ -276,14 +276,15 @@ def controls_gradient():
 
 def images():
     yield from capsule(66)
-    yield from capsule(36)
+    yield from capsule(36, rings=(0,))
     yield from capsule(46)
     yield from capsule(62, rings=(0, 4))
     yield from capsule(84)
     yield from capsule(26, rings=(1,))
     yield from capsule(44, rings=(2,))
-    for radius in (8, 10, 20, 28):
-        yield from rounded(radius)
+    for radius in (8, 10, 20):
+        yield from rounded(radius, rings=(0,))
+    yield from rounded(28)
     yield from corner_frame(14)
     yield "knob.png", art.rgba(art.disc_alpha(30, 15), WHITE)
     yield "knob_scrub.png", scrub_knob()

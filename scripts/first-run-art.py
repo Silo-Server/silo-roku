@@ -7,10 +7,10 @@
                           the left and at the bottom (spec section 5.4)
   mesh_profiles.png       the same light, warmer and lower, behind the profile
                           picker and the PIN screen, darkened towards the bottom
-  capsule_{76,60,52}_{fill,ring}_{fhd,hd}.9.png
+  capsule_{76,60}_{fill,ring}_{fhd,hd}.9.png, capsule_52_fill_{fhd,hd}.9.png
                           capsules for buttons (76 px), chips (60 px), and
-                          a series' season capsules (52 px), filled or as a
-                          2 px outline
+                          a series' season capsules (52 px), filled or (76
+                          and 60) as a 2 px outline
   rounded_16_{fill,ring}_{fhd,hd}.9.png, rounded_40_fill_{fhd,hd}.9.png
                           rounded rectangles for fields (radius 16), filled
                           or as a 2 px outline, and the card (radius 40)
@@ -161,8 +161,8 @@ def rounded_nine_patches(name, radius_fhd, radius_hd, with_ring=True):
             yield f"{name}_ring_{res}.9.png", nine_patch(shape_alpha(size, size, radius, ring))
 
 
-def capsule_nine_patches(height):
-    yield from rounded_nine_patches(f"capsule_{height}", height // 2 - 1, hd(height) // 2 - 1)
+def capsule_nine_patches(height, with_ring=True):
+    yield from rounded_nine_patches(f"capsule_{height}", height // 2 - 1, hd(height) // 2 - 1, with_ring)
 
 
 def line_nine_patches(name, radius_fhd, radius_hd, ring_fhd, suffix="line"):
@@ -448,8 +448,9 @@ def png(rows):
 def images():
     yield "mesh_setup.png", mesh_image("setup")
     yield "mesh_profiles.png", mesh_image("profiles")
-    for height in (76, 60, 52):
+    for height in (76, 60):
         yield from capsule_nine_patches(height)
+    yield from capsule_nine_patches(52, with_ring=False)
     yield from rounded_nine_patches("rounded_16", 16, hd(16))
     yield from rounded_nine_patches("rounded_40", 40, hd(40), with_ring=False)
     yield "avatar_disc.png", rgba(disc_alpha(AVATAR, AVATAR / 2), WHITE)
