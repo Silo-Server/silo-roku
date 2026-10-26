@@ -15,7 +15,7 @@ namespace playback.intent
 
     ' The play intent for a watch projection, or invalid when it has no file:
     ' { itemId, title, fileId, pinned, runtime, audioTracks,
-    ' effectiveAudioIndex, resumeSeconds, kind, name, seriesTitle,
+    ' effectiveAudioIndex, versions, resumeSeconds, kind, name, seriesTitle,
     ' seasonNumber, episodeNumber, year }. The
     ' version is pinnedFile when the projection lists it (a detail page's
     ' Version choice, nav.player.pinnedFile), which pinned then says; else
@@ -23,7 +23,10 @@ namespace playback.intent
     ' default, bitrate }, what playback.options.initialAudio ranks: title is
     ' the track's title, else its embedded title; effectiveAudioIndex is the
     ' version's effective_audio_track_index (the track the server's
-    ' preferences choose), or -1; resumeSeconds is the saved
+    ' preferences choose), or -1; versions are every listed file's
+    ' { fileId, audioTracks, effectiveAudioIndex } (fileTracks), for a
+    ' restart after the server fell back to another one (onFile);
+    ' resumeSeconds is the saved
     ' position to resume (resumeOf), or invalid. kind is the projection's
     ' type ("movie", "episode"), and name its own title; playback.markers
     ' reads the version's markers.
@@ -33,6 +36,31 @@ namespace playback.intent
         pinned = version <> invalid
         if not pinned then version = chooseVersion(detail)
         if version = invalid then return invalid
+        file = fileTracks(version)
+        runtime = invalid
+        if util.isNumber(version.duration_seconds) and version.duration_seconds > 0 then runtime = version.duration_seconds
+        return {
+            itemId: itemId,
+            title: titleOf(detail),
+            fileId: file.fileId,
+            pinned: pinned,
+            runtime: runtime,
+            audioTracks: file.audioTracks,
+            effectiveAudioIndex: file.effectiveAudioIndex,
+            versions: listedFiles(detail),
+            resumeSeconds: resumeOf(detail),
+            kind: util.text(detail.type),
+            name: util.text(detail.title),
+            seriesTitle: util.text(detail.series_title),
+            seasonNumber: detail.season_number,
+            episodeNumber: detail.episode_number,
+            year: detail.year
+        }
+    end function
+
+    ' A version's { fileId, audioTracks, effectiveAudioIndex }, as fromWatch
+    ' gives them.
+    function fileTracks(version as Object) as Object
         tracks = []
         if playback.values.isArray(version.audio_tracks)
             for each track in version.audio_tracks
@@ -43,26 +71,46 @@ namespace playback.intent
                 end if
             end for
         end if
-        runtime = invalid
-        if util.isNumber(version.duration_seconds) and version.duration_seconds > 0 then runtime = version.duration_seconds
         effectiveAudio = -1
         if util.isNumber(version.effective_audio_track_index) then effectiveAudio = Int(version.effective_audio_track_index)
-        return {
-            itemId: itemId,
-            title: titleOf(detail),
-            fileId: util.text(version.file_id),
-            pinned: pinned,
-            runtime: runtime,
-            audioTracks: tracks,
-            effectiveAudioIndex: effectiveAudio,
-            resumeSeconds: resumeOf(detail),
-            kind: util.text(detail.type),
-            name: util.text(detail.title),
-            seriesTitle: util.text(detail.series_title),
-            seasonNumber: detail.season_number,
-            episodeNumber: detail.episode_number,
-            year: detail.year
-        }
+        return { fileId: util.text(version.file_id), audioTracks: tracks, effectiveAudioIndex: effectiveAudio }
+    end function
+
+    ' fileTracks for every file the projection lists, among its versions and
+    ' its playback variants' parts (versionOf's lists).
+    function listedFiles(detail as Object) as Object
+        out = []
+        for each list in versionLists(detail)
+            if playback.values.isArray(list)
+                for each version in list
+                    if util.isObject(version) and util.text(version.file_id) <> "" then out.Push(fileTracks(version))
+                end for
+            end if
+        end for
+        return out
+    end function
+
+    ' The play intent for a new attempt on fileId, a file the server fell
+    ' back to (a plan's effective_media_file_id), or invalid when the intent
+    ' lists no tracks for it. It names that file with its own audio tracks
+    ' and effective track, so the start's track identities and the interim
+    ' AAC rule's codec and channels describe the file it names; the detail
+    ' page's audioIndex and subtitleIndex were ordinals in another file, so
+    ' they go.
+    function onFile(intent as Object, fileId as String) as Dynamic
+        if fileId = "" or not playback.values.isArray(intent.versions) then return invalid
+        for each file in intent.versions
+            if util.isObject(file) and util.text(file.fileId) = fileId
+                out = playback.values.copy(intent)
+                out.fileId = fileId
+                out.audioTracks = file.audioTracks
+                out.effectiveAudioIndex = file.effectiveAudioIndex
+                out.Delete("audioIndex")
+                out.Delete("subtitleIndex")
+                return out
+            end if
+        end for
+        return invalid
     end function
 
     ' The saved position a resume starts from, before the rewind, or invalid:
@@ -129,6 +177,19 @@ namespace playback.intent
     ' (chooseVersion): Options describes the file the plan plays.
     function versionOf(detail as Object, fileId as String) as Dynamic
         if fileId = "" then return chooseVersion(detail)
+        for each list in versionLists(detail)
+            if playback.values.isArray(list)
+                for each version in list
+                    if util.isObject(version) and util.text(version.file_id) = fileId then return version
+                end for
+            end if
+        end for
+        return chooseVersion(detail)
+    end function
+
+    ' The projection's version lists: its versions, then each playback
+    ' variant part's.
+    function versionLists(detail as Object) as Object
         lists = [detail.versions]
         if playback.values.isArray(detail.playback_variants)
             for each variant in detail.playback_variants
@@ -139,14 +200,7 @@ namespace playback.intent
                 end if
             end for
         end if
-        for each list in lists
-            if playback.values.isArray(list)
-                for each version in list
-                    if util.isObject(version) and util.text(version.file_id) = fileId then return version
-                end for
-            end if
-        end for
-        return chooseVersion(detail)
+        return lists
     end function
 
     ' The file a plan plays: its effective_media_file_id, else fallback (the

@@ -1838,6 +1838,14 @@ would then appear in URLs that proxies and server logs may record.
 - A new attempt the client starts by itself (an ended session, a changed
   installation, a persistent conflict) opens paused when the viewer had
   paused. Retry and Play always play.
+- Such a new attempt, and Retry, name the playing plan's `selected_tracks`
+  with the file they belong to. After the server fell back to another
+  version (the plan's `effective_media_file_id` is not the `file_id` the
+  start sent), the start sends that file's ID, and the interim AAC rule
+  reads that file's audio tracks from the watch projection. When the
+  projection does not list that file, the start sends the original file
+  and its tracks instead. It never pairs one file with another file's
+  track IDs.
 - A session that a start creates after its player has closed is stopped by
   the network task, which replays an uncertain start up to five times to
   find it. A session the client gave up because the server no longer had it

@@ -213,6 +213,53 @@ namespace tests
             end for
         end sub
 
+        @it("restarts on the version the server fell back to, with that version's tracks")
+        sub _()
+            loop = m.signedIn()
+            loop.device = tests.devices.fromFixture(tests.devices.fixture("no-multichannel-aac-player"))
+            ' Auto plays file 42; the projection also lists file 43, whose
+            ' second track is 5.1 AAC.
+            detail = tests.contract.fixture("get_watch_state_ok")
+            other = playback.values.copy(detail.versions[0])
+            other.file_id = "43"
+            other.audio_tracks = [{ language: "eng", codec: "aac", channels: 2, default: true }, { language: "jpn", codec: "aac", channels: 6 }]
+            detail.versions.Push(other)
+            watched = playback.intent.fromWatch(detail, "movie:heat-1995")
+            m.assertEqual(watched.fileId, "42")
+            ' The intent the player hands the reducer (Player begin).
+            intent = { contentId: "movie:heat-1995", fileId: watched.fileId, pinsVersion: watched.pinned, audioTracks: watched.audioTracks, effectiveAudioIndex: watched.effectiveAudioIndex, versions: watched.versions, audioIndex: 0, subtitleIndex: playback.tracks.OFF, audioLanguage: "en" }
+            env = tests.fakeEnv()
+            identity = api.auth.coordinator.identity(loop.session)
+            state = playback.session.create({ identity: { server: identity.server, account: identity.account, profile: identity.profile } })
+            first = playback.session.reduce(state, { type: "play", intent: intent, quality: "auto", autoplay: false }, env)[0]
+            tests.sessions.send(loop, { requestId: "p1", playback: "start", command: first })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/playback/capabilities"), 200, tests.sessions.fixture("playback_capability_available"))
+            id = tests.sessions.runningId(loop, "/api/v2/playback/start")
+            m.assertEqual(m.body(loop, id).file_id, "42")
+            ' The server falls back to file 43, and the viewer has its
+            ' Japanese track.
+            decision = tests.sessions.fixture("playback_start_opaque_ids")
+            plan = decision.playback_plan
+            plan.effective_media_file_id = "43"
+            plan.source.media_file_id = "43"
+            plan.selected_tracks = { audio: { id: "file:43:audio:1", index: 1 } }
+            tests.sessions.respond(loop, id, 201, decision)
+            playback.session.reduce(state, playback.player.answerEvent(first, loop.delivered.p1.body), env)
+            playback.session.reduce(state, { type: "player", load: state.plan.load, state: "playing" }, env)
+            ' The session ends on the server: a new attempt where it is.
+            playback.session.reduce(state, { type: "tick" }, env)
+            cmds = playback.session.reduce(state, { type: "progressResult", session_id: state.attempt.sessionId, sequence: state.attempt.progress.sample.sequence, kind: "notFound" }, env)
+            restart = invalid
+            for each command in cmds
+                if command.type = "start" then restart = command
+            end for
+            tests.sessions.send(loop, { requestId: "p2", playback: "start", command: restart })
+            sent = m.body(loop, tests.sessions.runningId(loop, "/api/v2/playback/start"))
+            m.assertEqual([sent.file_id, sent.audio_track_id, sent.audio_track_index], ["43", "file:43:audio:1", 1], "the file and the track identity are the same file's")
+            m.assertAANotHasKeys(sent, ["allow_alternate_versions", "subtitle_track_id", "subtitle_track_index"])
+            m.assertEqual(sent.client_playback_context.deliveries.original_http.max_channels, 2, "the interim AAC rule reads file 43's 5.1 AAC track")
+        end sub
+
         @it("sends the start's quality preference and bitrate cap")
         sub _()
             loop = m.signedIn()
