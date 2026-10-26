@@ -1,0 +1,138 @@
+import "pkg:/source/library/collections.bs"
+
+namespace tests
+    @suite("library collections contract")
+    class LibraryCollectionsTests extends rooibos.BaseTestSuite
+        function mapped(body as Object) as Object
+            return catalog.map.apply(catalog.request.libraryCollections("1"), tests.catalogData.ok(body), tests.catalogData.words())
+        end function
+
+        @describe("collections")
+
+        @it("offers Collections in both library menus and remembers the mode")
+        sub _()
+            for each kind in ["movies", "series"]
+                library = { id: "opaque:library", type: kind }
+                model = libraryTab.listModel([library], library.id)
+                m.assertEqual(model.sections, ["recommended", "browse", "collections"])
+                action = libraryTab.listAction(kind, library, "collections", invalid)
+                m.assertEqual(action.params, { type: kind, libraryId: library.id, libraryType: kind, mode: "collections" })
+                m.assertEqual(libraryTab.resolve(action.params, invalid, "").mode, "collections")
+                m.assertEqual(libraryTab.reopenMode({ key: "collections" }, "key"), "collections")
+            end for
+        end sub
+
+        @it("maps real grouped fixtures without leaking editor metadata or duplicating the flat list")
+        sub _()
+            result = m.mapped(tests.catalogData.fixture("get_library_collections_ok"))
+            m.assertTrue(result.ok)
+            m.assertInvalid(result.content)
+            groups = result.body.sections
+            m.assertEqual(groups.Count(), 2)
+            m.assertEqual([groups[0].id, groups[0].name, groups[0].kind], ["g1", "Mine", "user_collections"])
+            card = groups[0].items[0]
+            m.assertEqual([card.id, card.caption, card.captionDetail, card.collectionKind, card.artUri], ["u1", "Rainy days", "4 ITEMS", "user_collections", ""])
+            m.assertEqual(groups[1].items[0].id, "c1")
+            m.assertInvalid(groups[1].items[0].query_definition)
+            m.assertInvalid(result.body.collections)
+        end sub
+
+        @it("keeps native opaque IDs, titles, poster URLs and exact server order")
+        sub _()
+            body = tests.catalogData.fixture("get_library_collections_ok")
+            body.ungrouped.sort_order = -1
+            body.ungrouped.collections[0].id = "native:collection/a"
+            body.ungrouped.collections[0].poster_url = "https://img.example/collection?signature=fixture"
+            result = m.mapped(body)
+            m.assertEqual(result.body.sections[0].items[0].id, "native:collection/a")
+            m.assertEqual(result.body.sections[0].items[0].artUri, body.ungrouped.collections[0].poster_url)
+            m.assertEqual(result.body.sections[1].items[0].id, "u1")
+            card = CreateObject("roSGNode", "CardContent")
+            card.setFields(result.body.sections[0].items[0])
+            m.assertEqual(libraryCollections.params(card, { id: "lib", type: "mixed" }, "series"), { collectionId: "native:collection/a", collectionKind: "regular", title: "Oscar Winners", libraryId: "lib", mediaType: "series" })
+        end sub
+
+        @it("resolves relative signed posters at the request origin without changing the signature or adding credentials")
+        sub _()
+            body = tests.catalogData.fixture("get_library_collections_ok")
+            relative = "/api/v2/artwork/user-collection-images/fixture.webp?sig=fixture%2Fonly%2B%3D&expires=1"
+            body.groups[0].collections[0].poster_url = relative
+            body.ungrouped.collections[0].poster_url = relative
+            request = catalog.request.libraryCollections("1")
+            request.map.origin = "https://silo.example:8443/prefix"
+            result = catalog.map.apply(request, tests.catalogData.ok(body), tests.catalogData.words())
+            card = result.body.sections[0].items[0]
+            m.assertEqual(card.artUri, "https://silo.example:8443" + relative)
+            m.assertEqual(result.body.sections[1].items[0].artUri, card.artUri)
+            m.assertInvalid(card.headers)
+            m.assertInvalid(card.httpHeaders)
+            m.assertEqual(request.auth, "profile")
+            external = "https://images.example/fixture.webp?sig=fixture%2Bexternal"
+            body.groups[0].collections[0].poster_url = external
+            result = catalog.map.apply(request, tests.catalogData.ok(body), tests.catalogData.words())
+            m.assertEqual(result.body.sections[0].items[0].artUri, external)
+            m.assertInvalid(result.body.sections[0].items[0].httpHeaders)
+        end sub
+
+        @it("rejects unsupported artwork URLs and never embeds account credentials in image URLs")
+        sub _()
+            for each target in ["file:///tmp/fixture.webp", "javascript:fixture", "https://name:secret@images.example/fixture.webp", "//name:secret@images.example/fixture.webp"]
+                m.assertEqual(catalog.art.uri(target, "https://silo.example"), "")
+            end for
+            m.assertEqual(catalog.art.uri("/api/v2/artwork/fixture.webp", ""), "")
+            m.assertEqual(catalog.art.uri("", "https://silo.example"), "")
+        end sub
+
+        @it("uses flat collections only when groups are unconfigured, and skips empty groups")
+        sub _()
+            body = tests.catalogData.fixture("get_library_collections_ok")
+            body.Delete("ungrouped")
+            body.groups = []
+            m.assertEqual(m.mapped(body).body.sections[0].items[0].id, "c1")
+            body.groups = [{ id: "empty", name: "Empty", kind: "admin", collections: [] }]
+            m.assertEqual(m.mapped(body).body.sections, [])
+            m.assertFalse(m.mapped({ collections: [] }).ok)
+            m.assertFalse(m.mapped({ collections: [], groups: [{ collections: "bad" }] }).ok)
+        end sub
+
+        @it("leaves ordinary library collections unscoped and narrows only mixed-library category views")
+        sub _()
+            card = { id: "cross-library", collectionKind: "regular", title: "Across libraries" }
+            for each category in ["movies", "series"]
+                for each libraryType in ["movie", "movies", "series", "show", "shows", "tv", "video", ""]
+                    route = libraryCollections.params(card, { id: "12", type: libraryType }, category)
+                    m.assertEqual(route.mediaType, "", category + " / " + libraryType)
+                    request = catalog.request.collectionItems(route.collectionId, route.collectionKind, route.libraryId, route.mediaType, false)
+                    m.assertInvalid(request.query.type)
+                    m.assertInvalid(request.query.library_id, "cross-library members stay visible")
+                    nextPage = catalog.request.continued(request, "opaque:next", 40, catalog.kind.PAGE)
+                    m.assertInvalid(nextPage.query.type)
+                    m.assertInvalid(nextPage.query.library_id)
+                end for
+                route = libraryCollections.params(card, { id: "12", type: "mixed" }, category)
+                expected = "movie"
+                if category = "series" then expected = "series"
+                m.assertEqual(route.mediaType, expected)
+                request = catalog.request.collectionItems(route.collectionId, route.collectionKind, route.libraryId, route.mediaType, false)
+                m.assertEqual([request.query.type, request.query.library_id], [expected, "12"])
+            end for
+        end sub
+
+        @it("sends no unsupported artwork or paging query to the index, and pages each kind through catalog")
+        sub _()
+            index = catalog.request.libraryCollections("library/a")
+            m.assertEqual([index.path, index.query, index.auth], ["/api/v2/library/library%2Fa/collections", {}, "profile"])
+            for each kind in ["regular", "user_collections"]
+                request = catalog.request.collectionItems("opaque:id/a", kind, "12", "movie", true)
+                expected = "library_collection"
+                if kind = "user_collections" then expected = "user_collection"
+                m.assertEqual([request.path, request.query.source, request.query.collection_id, request.query.library_id, request.query.type, request.query.sort], ["/api/v2/catalog", expected, "opaque:id/a", "12", "movie", invalid])
+                nextPage = catalog.request.continued(request, "opaque cursor/+", 40, catalog.kind.PAGE)
+                m.assertEqual([nextPage.query.cursor, nextPage.query.source, nextPage.query.collection_id, nextPage.auth], ["opaque cursor/+", expected, "opaque:id/a", "profile"])
+            end for
+            untyped = catalog.request.collectionItems("c1", "regular", "12", "", false)
+            m.assertInvalid(untyped.query.library_id)
+            m.assertInvalid(untyped.query.type)
+        end sub
+    end class
+end namespace

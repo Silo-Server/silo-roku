@@ -1,0 +1,539 @@
+namespace tests
+    @suite("detail supporting content")
+    class DetailSupportingTests extends tests.DetailScreenSuite
+        function movie(cast = invalid as Dynamic) as Object
+            body = tests.catalogData.item(1, { crew: [{ name: "Director", job: "Director" }] })
+            if cast <> invalid then body.cast = cast
+            return body
+        end function
+
+        function withCast() as Object
+            probe = m.opened({ itemId: "movie:m1" })
+            m.answer(probe, 0, m.movie([{ name: "Actor", character: "Detective", person_id: "7", photo_url: "https://img.example/person.jpg" }]))
+            return probe
+        end function
+
+        @describe("cast, recommendations, and person navigation")
+
+        @it("requests only native profile-scoped supporting endpoints at bounded sizes")
+        sub _()
+            similar = catalog.request.similar("movie:a b")
+            m.assertEqual(similar.path, "/api/v2/recommendations/similar/movie:a%20b")
+            m.assertEqual(similar.query, { limit: 12, poster_width: 440 })
+            m.assertEqual(similar.auth, "profile")
+            person = catalog.request.person("7")
+            m.assertEqual([person.path, person.auth], ["/api/v2/catalog/people/7", "profile"])
+            m.assertEqual(person.query, {})
+            titles = catalog.request.personTitles("7")
+            m.assertEqual([titles.path, titles.auth], ["/api/v2/catalog", "profile"])
+            m.assertEqual(titles.query, { source: "person", person_id: "7", type: "video", limit: 24, poster_width: 440 })
+        end sub
+
+        @it("maps the native person fixture with string ID, calendar date, and optional metadata")
+        sub _()
+            request = catalog.request.person("7")
+            result = catalog.map.apply(request, tests.catalogData.ok(tests.catalogData.fixture("get_person_ok")), tests.catalogData.words())
+            m.assertTrue(result.ok)
+            m.assertEqual(result.body.id, "7")
+            m.assertEqual(result.body.name, "Al Pacino")
+            m.assertEqual(result.body.bio, "Actor")
+            m.assertEqual(result.body.born, "April 25, 1940 · New York")
+            m.assertEqual(result.body.photoUri, "https://cdn.example/people/7.jpg")
+            m.assertEqual(result.body.died, "")
+        end sub
+
+        @it("keeps the first 24 usable cast entries in server order with actor, character, and photo")
+        sub _()
+            cast = [invalid, { name: "" }]
+            for i = 1 to 26
+                cast.Push({ person_id: i.ToStr(), name: "Actor " + i.ToStr(), character: "Role", photo_url: "https://img.example/person.jpg", ignored: "raw" })
+            end for
+            detail = catalog.detail.fromItem(m.movie(cast), tests.catalogData.words())
+            m.assertEqual(detail.cast.Count(), 24)
+            m.assertEqual(detail.cast[0], { id: "1", name: "Actor 1", character: "Role", photoUri: "https://img.example/person.jpg" })
+            m.assertEqual(detail.cast[23].id, "24")
+            m.assertEqual(catalog.detail.castMembers(invalid), [])
+            m.assertEqual(catalog.detail.castMembers([{ name: "Without portrait" }])[0].photoUri, "")
+        end sub
+
+        @it("maps bounded recommendations to existing movie and series detail cards in ranked order")
+        sub _()
+            request = catalog.request.similar("movie:m1")
+            items = [tests.catalogData.item(1, { type: "ebook" }), tests.catalogData.item(2, { type: "series", content_id: "series:s" })]
+            items.Append(tests.catalogData.items(20))
+            result = catalog.map.apply(request, tests.catalogData.ok({ items: items }), tests.catalogData.words())
+            m.assertTrue(result.ok)
+            m.assertEqual(result.body, { size: 12 })
+            m.assertEqual(result.content.getChildCount(), 12)
+            m.assertEqual(result.content.getChild(0).id, "series:s")
+            m.assertEqual(catalog.detail.routeParams(result.content.getChild(0)).itemId, "series:s")
+            m.assertEqual(result.content.getChild(1).id, "movie:m1")
+            bad = catalog.map.apply(request, tests.catalogData.ok({}), tests.catalogData.words())
+            m.assertFalse(bad.ok)
+        end sub
+
+        @it("places cast before movie recommendations before Details without changing playback selection")
+        sub _()
+            probe = m.withCast()
+            cast = probe.findNode("cast")
+            similar = probe.findNode("similar")
+            details = probe.findNode("details")
+            m.assertTrue(cast.visible)
+            m.assertEqual(cast.heading, "Cast & Crew")
+            m.assertEqual(similar.heading, "Related Movies")
+            m.assertTrue(similar.loading)
+            m.assertTrue(cast.translation[1] < similar.translation[1])
+            m.assertTrue(similar.translation[1] < details.translation[1])
+            target = probe.callFunc("inspect").target
+            probe.callFunc("pressKey", "down")
+            m.assertEqual(probe.callFunc("inspect").zone, "cast")
+            probe.callFunc("loadRecommendations")
+            at = m.sentIndex(probe, "similar", "/api/v2/recommendations/similar/movie:m1")
+            m.assertTrue(at >= 0)
+            request = probe.callFunc("sent")[at].request
+            request.requestId = "recommendation-test"
+            normalized = api.request.normalize(request)
+            m.assertNotInvalid(normalized, "the real API client must accept the emitted request")
+            m.assertEqual(normalized.lane, api.scheduler.LANE_PREFETCH)
+            decisions = api.scheduler.submit(api.scheduler.create(), normalized, 0)
+            m.assertEqual(decisions.Count(), 1)
+            m.assertEqual([decisions[0].kind, decisions[0].requestId], ["start", "recommendation-test"])
+            m.answer(probe, at, { items: tests.catalogData.items(2) })
+            m.assertEqual(probe.callFunc("inspect").zone, "cast", "the answer never steals focus")
+            probe.callFunc("pressKey", "down")
+            m.assertEqual(probe.callFunc("inspect").zone, "similar")
+            m.assertEqual(probe.callFunc("inspect").target, target)
+            similar.chosen = 1
+            m.assertEqual(probe.pushedDetail.itemId, "movie:m2")
+        end sub
+
+        @it("uses Recommended Series after the episode rail")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.throughSeasons(probe, [1], 1)
+            m.answer(probe, 2, m.episodes(1, 2))
+            m.assertEqual(probe.findNode("similar").heading, "Recommended Series")
+            m.assertTrue(probe.findNode("similar").translation[1] > probe.findNode("rail").translation[1])
+        end sub
+
+        @it("centres recommendation captions 16 px below artwork while retaining Home's ringless lift")
+        sub _()
+            probe = m.withCast()
+            probe.callFunc("loadRecommendations")
+            at = m.sentIndex(probe, "similar", "/api/v2/recommendations/similar/movie:m1")
+            m.answer(probe, at, { items: [tests.catalogData.item(1, { year: 1995 })] })
+            rail = probe.findNode("similar")
+            cell = rail.findNode("strip").getChild(1)
+            card = cell.getChild(0)
+            caption = card.findNode("caption")
+            detail = card.findNode("captionDetail")
+            m.assertEqual([caption.horizAlign, detail.horizAlign], ["center", "center"])
+            m.assertEqual([caption.width, detail.width], [220.0, 220.0])
+            m.assertEqual([caption.font.size, detail.font.size], [24, 20])
+            m.assertEqual(caption.translation, [0, 346])
+            m.assertEqual(detail.translation, [0, 380])
+            probe.callFunc("pressKey", "down")
+            probe.callFunc("pressKey", "down")
+            m.assertEqual(probe.callFunc("inspect").zone, "similar")
+            m.assertEqual(caption.translation, [0, 357])
+            m.assertEqual(detail.translation, [0, 391])
+            m.assertTrue(caption.font.isSameNode(theme.font(theme.textStyle.CARD_TITLE_FOCUSED)))
+            m.assertTrue(detail.font.isSameNode(theme.font(theme.textStyle.CARD_META_FOCUSED)))
+            m.assertEqual(card.findNode("card").translation, [-13.0, -19.0])
+            m.assertFalse(cell.getChild(1).visible, "the rail's low-tier ring stays hidden")
+            m.assertEqual(card.findNode("shadow").opacity, 1.0)
+        end sub
+
+        @it("hides the optional recommendation section on empty or failed responses")
+        sub _()
+            for each fail in [false, true]
+                probe = m.withCast()
+                probe.callFunc("loadRecommendations")
+                at = m.sentIndex(probe, "similar", "/api/v2/recommendations/similar/movie:m1")
+                if fail
+                    m.failed(probe, at, 500)
+                else
+                    m.answer(probe, at, { items: [] })
+                end if
+                m.assertFalse(probe.findNode("similar").visible)
+                m.assertFalse(probe.findNode("status").visible)
+                probe.callFunc("pressKey", "down")
+                probe.callFunc("pressKey", "down")
+                m.assertEqual(probe.callFunc("inspect").zone, "details")
+            end for
+        end sub
+
+        @it("uses Home's centered lift and caption styles with a round shadow and a brief transition")
+        sub _()
+            probe = m.withCast()
+            cast = probe.findNode("cast")
+            cell = cast.findNode("strip").getChild(1)
+            portrait = cell.getChild(0)
+            shadow = portrait.getChild(0)
+            name = cell.getChild(2)
+            role = cell.getChild(3)
+            animation = cell.getChild(4)
+            colors = CreateObject("roSGNode", "Label")
+            colors.color = theme.color.CAPTION_REST
+            m.assertEqual(name.color, colors.color)
+            m.assertTrue(name.font.isSameNode(theme.font(theme.textStyle.CARD_TITLE)))
+            m.assertEqual(portrait.scale, [1.0, 1.0])
+            m.assertEqual(shadow.uri, "pkg:/images/ui/cast_shadow.png")
+            m.assertEqual(shadow.opacity, 0.0)
+            m.assertEqual(shadow.translation, [-30, -20])
+            m.assertFalse(cell.getChild(1).visible)
+            probe.callFunc("pressKey", "down")
+            m.assertFalse(cell.getChild(1).visible, "normal-tier focus has no circle ring")
+            m.assertEqual(animation.control, "start")
+            m.assertTrue(Abs(animation.duration - 0.12) < 0.0001)
+            m.assertEqual(animation.getChild(0).keyValue[1], theme.browse.liftScale("poster", 200, 200))
+            m.assertEqual(animation.getChild(1).keyValue[1], [-19, -19])
+            m.assertEqual(animation.getChild(2).keyValue[1], [0, 227])
+            m.assertEqual(animation.getChild(4).keyValue[1], 1)
+            colors.color = theme.color.WHITE
+            m.assertEqual(name.color, colors.color)
+            colors.color = theme.color.CAPTION_SECOND_FOCUSED
+            m.assertEqual(role.color, colors.color)
+            m.assertTrue(name.font.isSameNode(theme.font(theme.textStyle.CARD_TITLE_FOCUSED)))
+            m.assertTrue(role.font.isSameNode(theme.font(theme.textStyle.CARD_META_FOCUSED)))
+            m.assertEqual(animation.getChild(3).keyValue[1][1], 227 + name.boundingRect().height + 6)
+            probe.callFunc("pressKey", "up")
+            m.assertEqual(animation.getChild(0).keyValue[1], [1.0, 1.0])
+            m.assertEqual(animation.getChild(4).keyValue[1], 0)
+            m.assertTrue(name.font.isSameNode(theme.font(theme.textStyle.CARD_TITLE)))
+        end sub
+
+        @it("keeps low-tier cast focus clear without lift or animation and reuses cells")
+        sub _()
+            probe = m.withCast()
+            cast = probe.findNode("cast")
+            cast.lowTier = true
+            cell = cast.findNode("strip").getChild(1)
+            probe.callFunc("pressKey", "down")
+            m.assertTrue(cell.getChild(1).visible)
+            m.assertEqual(cell.getChild(0).scale, [1.0, 1.0])
+            m.assertEqual(cell.getChild(0).translation, [0, 0])
+            m.assertEqual(cell.getChild(0).getChild(0).opacity, 0.0)
+            m.assertEqual(cell.getChild(4).control, "stop")
+            m.assertEqual(cell.getChild(2).translation, [0, 216])
+            m.assertTrue(cell.getChild(2).font.isSameNode(theme.font(theme.textStyle.CARD_TITLE_FOCUSED)))
+            probe.callFunc("pressKey", "up")
+            m.assertFalse(cell.getChild(1).visible)
+            m.assertTrue(cast.findNode("strip").getChild(1).isSameNode(cell))
+            m.assertEqual(cell.getChild(3).translation[1], cell.getChild(2).translation[1] + cell.getChild(2).boundingRect().height + 6)
+        end sub
+
+        @it("places character text just below one-line and wrapped cast names")
+        sub _()
+            probe = m.opened({ itemId: "movie:m1" })
+            m.answer(probe, 0, m.movie([
+                { name: "Li Jiaqi", character: "Role" },
+                { name: "A Particularly Long Performer Name", character: "Another Role" }
+            ]))
+            strip = probe.findNode("cast").findNode("strip")
+            shortName = strip.getChild(1).getChild(2)
+            shortRole = strip.getChild(1).getChild(3)
+            longName = strip.getChild(2).getChild(2)
+            longRole = strip.getChild(2).getChild(3)
+            m.assertEqual(shortName.numLines, 1)
+            m.assertEqual(longName.numLines, 2)
+            m.assertEqual([shortName.width, longName.width], [200.0, 200.0])
+            m.assertEqual(probe.findNode("cast").height, 370.0)
+            m.assertEqual(shortRole.translation[1], shortName.translation[1] + shortName.boundingRect().height + 6)
+            m.assertTrue(shortRole.translation[1] < 270, "a single-line name has no reserved second-line gap")
+            m.assertTrue(longName.boundingRect().height > shortName.boundingRect().height)
+            m.assertEqual(longRole.translation[1], longName.translation[1] + longName.boundingRect().height + 6)
+        end sub
+
+        ' The cell pool is stable; content indices reuse its nine slots.
+        function supportingCell(rail as Object, index as Integer) as Object
+            return rail.findNode("strip").getChild(1 + index mod 9)
+        end function
+
+        sub checkFloating(rail as Object, capacity as Integer, stepX as Integer)
+            first = m.supportingCell(rail, 0)
+            second = m.supportingCell(rail, 1)
+            third = m.supportingCell(rail, 2)
+            positions = [first.translation, second.translation, third.translation]
+            rail.callFunc("onKeyEvent", "right", true)
+            rail.callFunc("onKeyEvent", "right", true)
+            m.assertEqual(rail.index, 2)
+            m.assertEqual(rail.firstVisible, 0)
+            m.assertEqual([first.translation, second.translation, third.translation], positions, "focus moves without moving the first three cells")
+            for i = 3 to capacity - 1
+                rail.callFunc("onKeyEvent", "right", true)
+            end for
+            m.assertEqual(rail.firstVisible, 0, "the last fully visible card needs no scroll")
+            rail.callFunc("onKeyEvent", "right", true)
+            m.assertEqual(rail.firstVisible, 1, "crossing the right edge scrolls one cell")
+            m.assertEqual(first.translation, [116 - stepX, 0])
+            m.assertEqual(m.supportingCell(rail, capacity).translation, [116 + (capacity - 1) * stepX, 0])
+            for i = capacity - 1 to 1 step -1
+                rail.callFunc("onKeyEvent", "left", true)
+                m.assertEqual(rail.firstVisible, 1, "moving back within the viewport does not scroll")
+            end for
+            rail.callFunc("onKeyEvent", "left", true)
+            m.assertEqual([rail.index, rail.firstVisible], [0, 0])
+            m.assertEqual(first.translation, positions[0], "crossing the left edge restores the original viewport")
+            m.assertTrue(rail.findNode("strip").getChildCount() <= 10)
+        end sub
+
+        @it("floats cast and recommendation focus across the full visible viewport before scrolling")
+        sub _()
+            people = []
+            for i = 1 to 24
+                people.Push({ name: "Actor " + i.ToStr(), person_id: i.ToStr() })
+            end for
+            probe = m.opened({ itemId: "movie:m1" })
+            m.answer(probe, 0, m.movie(people))
+            probe.callFunc("pressKey", "down")
+            m.checkFloating(probe.findNode("cast"), 7, 260)
+            probe.callFunc("loadRecommendations")
+            m.answer(probe, m.sentIndex(probe, "similar", "/api/v2/recommendations/similar/movie:m1"), { items: tests.catalogData.items(12) })
+            probe.callFunc("pressKey", "down")
+            rail = probe.findNode("similar")
+            m.assertFalse(rail.content.lowTier)
+            m.assertFalse(m.supportingCell(rail, 0).getChild(1).visible, "normal-tier recommendations use Home's ringless focus")
+            m.assertEqual(m.supportingCell(rail, 0).getChild(0).findNode("card").scale, theme.browse.liftScale("poster", 220, 330))
+            m.checkFloating(rail, 6, 264)
+        end sub
+
+        @it("fits seven low-tier posters without lift and retains their focus ring")
+        sub _()
+            probe = m.withCast()
+            probe.callFunc("loadRecommendations")
+            m.answer(probe, m.sentIndex(probe, "similar", "/api/v2/recommendations/similar/movie:m1"), { items: tests.catalogData.items(12) })
+            rail = probe.findNode("similar")
+            ' Install content with the tier a low-memory detail screen supplies.
+            content = rail.content.clone(true)
+            content.lowTier = true
+            rail.lowTier = true
+            rail.content = content
+            rail.setFocus(true)
+            cell = m.supportingCell(rail, 0)
+            m.assertTrue(cell.getChild(1).visible)
+            m.assertEqual(cell.getChild(0).findNode("card").scale, [1.0, 1.0])
+            m.checkFloating(rail, 7, 264)
+        end sub
+
+        @it("restores cast and recommendation positions without rendering more than nine cells")
+        sub _()
+            people = []
+            for i = 1 to 24
+                people.Push({ name: "Actor " + i.ToStr(), person_id: i.ToStr() })
+            end for
+            probe = m.opened({ itemId: "movie:m1" }, { zone: "cast", cast: 15, castFirst: 11, similar: 7, similarFirst: 4 })
+            m.answer(probe, 0, m.movie(people))
+            cast = probe.findNode("cast")
+            m.assertEqual(cast.index, 15)
+            m.assertEqual(cast.firstVisible, 11)
+            m.assertEqual(probe.callFunc("inspect").zone, "cast")
+            strip = cast.findNode("strip")
+            m.assertTrue(strip.getChildCount() <= 10, "nine cells and a placeholder group")
+            cells = strip.getChildren(-1, 0)
+            cast.callFunc("onKeyEvent", "right", true)
+            m.assertEqual(cast.index, 16)
+            m.assertEqual(cast.firstVisible, 11)
+            m.assertEqual(strip.getChildCount(), cells.Count())
+            m.assertTrue(strip.getChild(1).isSameNode(cells[1]), "arrow movement reuses the portrait cells")
+            probe.callFunc("loadRecommendations")
+            at = m.sentIndex(probe, "similar", "/api/v2/recommendations/similar/movie:m1")
+            m.answer(probe, at, { items: tests.catalogData.items(12) })
+            m.assertEqual(probe.findNode("similar").index, 7)
+            m.assertEqual(probe.findNode("similar").firstVisible, 4)
+            key = probe.callFunc("focusKey")
+            m.assertEqual([key.castFirst, key.similarFirst], [11, 4])
+            before = m.supportingCell(cast, 16).translation
+            m.cover(probe)
+            probe.visible = true
+            probe.callFunc("onShow", { first: false, refresh: false })
+            m.assertEqual([cast.index, cast.firstVisible], [16, 11])
+            m.assertEqual(m.supportingCell(cast, 16).translation, before)
+            m.assertEqual(probe.callFunc("inspect").zone, "cast")
+        end sub
+
+        @it("opens a person with biography and visible library titles and returns to cast on Back")
+        sub _()
+            probe = m.withCast()
+            cast = probe.findNode("cast")
+            cast.chosen = 0
+            panel = probe.findNode("person")
+            m.assertTrue(panel.visible)
+            m.assertEqual(panel.findNode("photo").uri, "https://img.example/person.jpg")
+            at = m.sentIndex(probe, "person", "/api/v2/catalog/people/7")
+            m.answer(probe, at, { id: "7", name: "Actor", bio: "Biography", birth_date: "1970-01-01", birthplace: "New York", photo_url: "https://img.example/person-full.jpg" })
+            m.assertEqual(panel.person.bio, "Biography")
+            m.assertEqual(panel.findNode("photo").uri, "https://img.example/person.jpg", "the cast card's photo is kept, not reloaded")
+            m.assertTrue(Instr(1, panel.person.born, "New York") > 0)
+            m.assertEqual(panel.message, "")
+            m.assertTrue(panel.isInFocusChain())
+            watchAt = m.sentIndex(probe, "watch", "/api/v2/watch/movie:m1")
+            if watchAt >= 0 then m.answer(probe, watchAt, m.watched("movie:m1", 0, false))
+            m.assertTrue(panel.isInFocusChain(), "an underlying watch answer cannot take focus")
+            titlesAt = m.sentIndex(probe, "personTitles", "/api/v2/catalog")
+            m.answer(probe, titlesAt, { items: [tests.catalogData.item(3)] })
+            m.assertEqual(panel.content.getChildCount(), 1)
+            panel.findNode("titles").chosen = 0
+            m.assertEqual(probe.pushedDetail.itemId, "movie:m3")
+            panel.closed = true
+            m.assertFalse(panel.visible)
+            m.assertEqual(probe.callFunc("inspect").zone, "cast")
+            m.assertEqual(cast.index, 0)
+        end sub
+
+        ' Navigate from a later person title, save the router's focus key,
+        ' then release the old screen as the navigation pressure policy does.
+        function savedPersonTitle(index as Integer) as Object
+            probe = m.withCast()
+            probe.findNode("cast").chosen = 0
+            panel = probe.findNode("person")
+            m.answer(probe, m.sentIndex(probe, "personTitles", "/api/v2/catalog"), { items: tests.catalogData.items(12) })
+            panel.callFunc("onKeyEvent", "down", true)
+            rail = panel.findNode("titles")
+            for i = 1 to index
+                rail.callFunc("onKeyEvent", "right", true)
+            end for
+            rail.callFunc("onKeyEvent", "right", true)
+            rail.callFunc("onKeyEvent", "right", true)
+            rail.callFunc("onKeyEvent", "left", true)
+            rail.callFunc("onKeyEvent", "left", true)
+            rail.callFunc("onKeyEvent", "OK", true)
+            m.assertEqual(probe.pushedDetail.itemId, "movie:m" + (index + 1).ToStr())
+            key = probe.callFunc("focusKey")
+            m.assertEqual(key.person, "7")
+            m.assertEqual(key.personFocus.index, index)
+            m.assertEqual(key.personFocus.region, "titles")
+            m.assertEqual(key.personFocus.firstVisible, 4)
+            m.cover(probe)
+            probe.callFunc("release")
+            return key
+        end function
+
+        function rebuiltPerson(key as Object) as Object
+            probe = m.opened({ itemId: "movie:m1" }, key)
+            m.answer(probe, 0, m.movie([{ name: "Actor", person_id: "7" }]))
+            return probe
+        end function
+
+        @it("restores the selected person title and its focus after the original screen is reclaimed")
+        sub _()
+            key = m.savedPersonTitle(7)
+            probe = m.rebuiltPerson(key)
+            panel = probe.findNode("person")
+            rail = panel.findNode("titles")
+            m.assertTrue(panel.visible)
+            m.assertEqual(rail.index, 7)
+            m.assertFalse(rail.isInFocusChain(), "the restored rail waits for its titles")
+            m.answer(probe, m.sentIndex(probe, "person", "/api/v2/catalog/people/7"), { id: "7", name: "Actor" })
+            m.assertFalse(rail.isInFocusChain(), "biography data alone cannot complete title focus")
+            m.answer(probe, m.sentIndex(probe, "personTitles", "/api/v2/catalog"), { items: tests.catalogData.items(12) })
+            m.assertEqual(rail.index, 7)
+            m.assertEqual(rail.firstVisible, 4)
+            m.assertEqual(m.supportingCell(rail, 7).translation, [908, 0])
+            m.assertTrue(rail.isInFocusChain())
+            rail.callFunc("onKeyEvent", "OK", true)
+            m.assertEqual(probe.pushedDetail.itemId, "movie:m8")
+        end sub
+
+        @it("does not steal focus on a normal first response or after the viewer moves during restore")
+        sub _()
+            probe = m.withCast()
+            probe.findNode("cast").chosen = 0
+            panel = probe.findNode("person")
+            m.answer(probe, m.sentIndex(probe, "personTitles", "/api/v2/catalog"), { items: tests.catalogData.items(12) })
+            m.assertFalse(panel.findNode("titles").isInFocusChain(), "ordinary initial data leaves focus on the body")
+            m.assertEqual(panel.callFunc("focusKey"), { index: 0, firstVisible: 0, region: "body" })
+
+            key = m.savedPersonTitle(7)
+            for each direction in ["up", "down"]
+                probe = m.rebuiltPerson(key)
+                panel = probe.findNode("person")
+                panel.callFunc("onKeyEvent", direction, true)
+                m.answer(probe, m.sentIndex(probe, "personTitles", "/api/v2/catalog"), { items: tests.catalogData.items(12) })
+                m.answer(probe, m.sentIndex(probe, "person", "/api/v2/catalog/people/7"), { id: "7", name: "Actor" })
+                m.assertEqual(panel.findNode("titles").index, 7)
+                m.assertFalse(panel.findNode("titles").isInFocusChain(), "new " + direction + " input cancels automatic focus")
+                m.assertEqual(panel.callFunc("focusKey").region, "body")
+            end for
+        end sub
+
+        @it("preserves body focus and clamps a restored index when the person's titles shrink")
+        sub _()
+            key = m.savedPersonTitle(7)
+            key.personFocus.region = "body"
+            probe = m.rebuiltPerson(key)
+            panel = probe.findNode("person")
+            m.answer(probe, m.sentIndex(probe, "personTitles", "/api/v2/catalog"), { items: tests.catalogData.items(3) })
+            m.assertEqual(panel.findNode("titles").index, 2)
+            m.assertFalse(panel.findNode("titles").isInFocusChain())
+            m.assertEqual(panel.callFunc("focusKey"), { index: 2, firstVisible: 0, region: "body" })
+
+            key.personFocus.region = "titles"
+            probe = m.rebuiltPerson(key)
+            panel = probe.findNode("person")
+            m.answer(probe, m.sentIndex(probe, "personTitles", "/api/v2/catalog"), { items: tests.catalogData.items(3) })
+            m.assertEqual(panel.findNode("titles").index, 2)
+            m.assertTrue(panel.findNode("titles").isInFocusChain())
+        end sub
+
+        @it("does not request an unresolved person and drops a person's late answers after close")
+        sub _()
+            probe = m.opened({ itemId: "movie:m1" })
+            m.answer(probe, 0, m.movie([{ name: "Unresolved" }]))
+            before = probe.callFunc("sent").Count()
+            probe.findNode("cast").chosen = 0
+            m.assertEqual(probe.callFunc("sent").Count(), before)
+            m.assertFalse(probe.findNode("person").visible)
+            probe = m.withCast()
+            probe.findNode("cast").chosen = 0
+            at = m.sentIndex(probe, "person", "/api/v2/catalog/people/7")
+            probe.findNode("person").closed = true
+            m.assertFalse(m.answer(probe, at, { id: "7", name: "Too late" }))
+            m.assertFalse(probe.findNode("person").visible)
+        end sub
+
+        @it("takes Up from the person's titles to an anchor of its own, so OK then retries")
+        sub _()
+            probe = m.withCast()
+            probe.findNode("cast").chosen = 0
+            m.failed(probe, m.sentIndex(probe, "person", "/api/v2/catalog/people/7"), 500)
+            panel = probe.findNode("person")
+            m.answer(probe, m.sentIndex(probe, "personTitles", "/api/v2/catalog"), { items: tests.catalogData.items(3) })
+            titles = panel.findNode("titles")
+            panel.callFunc("onKeyEvent", "down", true)
+            m.assertTrue(titles.isInFocusChain())
+            ' Roku OS 15.3.4 ignores setFocus on an ancestor of the focused
+            ' node, so Up focuses the empty anchor beside the titles.
+            panel.callFunc("onKeyEvent", "up", true)
+            m.assertTrue(panel.findNode("bodyAnchor").hasFocus())
+            m.assertFalse(titles.isInFocusChain())
+            m.assertTrue(panel.findNode("retryButton").highlighted)
+            before = probe.callFunc("sent").Count()
+            panel.callFunc("onKeyEvent", "OK", true)
+            m.assertEqual(m.sentIndex(probe, "person", "/api/v2/catalog/people/7"), before)
+        end sub
+
+        @it("keeps person errors in the panel, allows retry, and hides its textures when covered")
+        sub _()
+            probe = m.withCast()
+            probe.findNode("cast").chosen = 0
+            at = m.sentIndex(probe, "person", "/api/v2/catalog/people/7")
+            m.failed(probe, at, 500)
+            panel = probe.findNode("person")
+            m.assertTrue(panel.retryable)
+            m.assertEqual(panel.message, "Can't load this person.")
+            m.assertFalse(probe.findNode("status").visible)
+            panel.retry = true
+            at = m.sentIndex(probe, "person", "/api/v2/catalog/people/7")
+            m.answer(probe, at, { id: "7", name: "Actor", photo_url: "https://img.example/person.jpg" })
+            m.cover(probe)
+            m.assertEqual(probe.findNode("cast").findNode("strip").getChildCount(), 0)
+            m.assertEqual(panel.findNode("photo").uri, "")
+            m.answer(probe, m.sentIndex(probe, "personTitles", "/api/v2/catalog"), { items: tests.catalogData.items(2) })
+            m.assertEqual(panel.findNode("titles").findNode("strip").getChildCount(), 0)
+            probe.visible = true
+            probe.callFunc("onShow", { first: false, refresh: false })
+            m.assertTrue(panel.findNode("titles").findNode("strip").getChildCount() > 0)
+        end sub
+    end class
+end namespace

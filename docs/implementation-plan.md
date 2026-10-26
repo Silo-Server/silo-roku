@@ -119,9 +119,9 @@ converted to something the device decodes (section 6.3).
 | H.264 High, Main, or Constrained Baseline up to level 4.2, with AAC, AC-3, or E-AC-3 | Original (MKV, MP4) | The original streams. Plain Baseline is transcoded |
 | HEVC Main/Main 10 up to 4K and the probed HEVC level, SDR/HDR10/HLG | Original | The original streams, in their range when the output is 4K HDR. Above the probed level: SDR H.264 at up to 1080p (S-5, S-10) |
 | HDR10+ | Original | HDR10+ on an HDR10+ panel, else HDR10 |
-| Dolby Vision P5, or P8.1 (compatibility ID 1), within the probed HEVC level and DV `max_level` | Original or remux; both carry Dolby Vision since D-7 | DV video bytes unchanged where the Roku outputs DV (run 30: P5 original and P8.1 remux on the Ultra) |
-| Dolby Vision P8.4 (HLG base, as iPhones record) or P8.2 on a DV output | Tone-mapping transcode until H3 proves IDs 4 and 2 | SDR H.264 at up to 1080p; DV once H3 adds the IDs |
-| Dolby Vision P8.x on an output without DV | P8.1: remux with the server's RPU strip, or the original with the base-layer claim (ID 1, on an HDR10 output). P8.4 and P8.2: not claimed (IDs 4 and 2 untested). Otherwise a tone-mapping transcode | HDR10, HLG, or SDR |
+| Dolby Vision P5 within the probed HEVC level and DV `max_level` | Original; HLS advertises no Dolby Vision (run 31) | DV video bytes unchanged where the Roku outputs DV (run 30: P5 original on the Ultra, correct colours) |
+| Dolby Vision P8.1 (compatibility ID 1), on any output | P8 is never claimed (run 31 green picture; Roku documents only `dvhe.05`). The original with the base-layer claim (ID 1, on an HDR10 output), or a remux with the server's RPU strip | HDR10 |
+| Dolby Vision P8.4 (HLG base, as iPhones record) or P8.2 | Not claimed (IDs 4 and 2 untested): a tone-mapping transcode | SDR H.264 at up to 1080p |
 | Dolby Vision P5 on an output without DV | Tone-mapping transcode (P5 has no HDR10 base layer) | SDR H.264 at up to 1080p, or a terminal error when the server has no DV tone mapper |
 | Dolby Vision P7 (FEL/MEL) | Remux with the `server_dv7_to_hdr10` strip | HDR10; DV needs server issue S-2 |
 | E-AC-3 JOC, E-AC-3, AC-3 | Copied on the original and on HLS copy remuxes; a video transcode re-encodes them to AAC (5.1 at 384 kbps, or stereo under the interim rule in section 6.1) | When copied, the source bitstream: Atmos where the model and sink pass or decode it, else the 5.1 core |
@@ -316,21 +316,26 @@ functions, and set nodes.
 
 - Rows: `RowList` with `rowFocusAnimationStyle="fixedFocus"`. Grids: `MarkupGrid`
   (six columns for Browse and Search). No hand-built rows or grids.
-- Item components hold a `Poster`, a progress `Rectangle`, and at most one
-  `Label`, and observe `focusPercent` only (never `rowFocusPercent`, which fires
+- Item components hold artwork, progress, and a title `Label`; a second
+  `Label` is created only when metadata is present, then reused or hidden on
+  recycled cards. They observe `focusPercent` only (never `rowFocusPercent`, which fires
   per frame for every item in two rows). `loadWidth`, `loadHeight`, and
   `loadDisplayMode` are set in item XML before any `uri`. On the low tier cards do
   not scale and use the list's native 9-patch `focusBitmapUri` (a spec section
   5.9 deviation); elsewhere the spec's focus scale stays if H17 shows ≥ 30 fps on
   the 512 MB device.
-- Rounded corners use a 9-patch frame painted in the background colour; the
-  hero's bottom fade reaches full black at the top of the row band so painted
-  corners never sit over artwork. `MaskGroup` is not used for anything functional
-  (it does not clip on non-OpenGL devices). On Roku OS 16 an `Effect` node, created
-  at runtime only when `CreateObject("roSGNode", "Effect")` returns a node whose
-  `supported` is true, may replace the frame once H17 shows no frame-rate cost;
-  each Poster's `shaderCompatible` is then set at runtime before its `uri` (the
-  field does not exist on 15.x).
+- Rounded corners: where AppScene's probe finds a supported Roku OS 16 `Effect`
+  (`m.global.cardEffects`) and the device is not on the low tier, cards round
+  their art, placeholder, and played dim with an `Effect` (each Poster's
+  `shaderCompatible` set before its `uri`), draw their progress on 9-patches
+  whose bottom corners follow the card's curve, and the detail rails clip at
+  their inset; this is what lets the ambient wash run under the rows (spec
+  section 5.5). Elsewhere a 9-patch frame painted in the background colour
+  rounds them, and the hero's bottom fade reaches full black at the top of the
+  row band so painted corners never sit over artwork. `MaskGroup` is not used
+  for cards (it does not clip on non-OpenGL devices). On the Ultra 4850X the
+  Effect path with the wash scrolls a poster row at a median of 50–54 fps
+  against 59.9 with the frame (AG-317).
 - **Artwork:** catalog requests pass `poster_width`/`backdrop_width`/`logo_width`
   for the card (the server stores posters at 1000/500/300 and backdrops at
   2560/1920/1280/300 px), and Posters also set load dimensions. Logos are fitted in
@@ -543,9 +548,9 @@ codec in `codecs_audio` is copied as the original bitstream.
   `b10`/`Dv` or an Auto Display Type.
 - Dolby Vision profiles only with evidence that the Roku itself outputs DV: a
   Roku TV's display flag, or `Dv` in a player's mode string (spec section 9.2).
-  P5 and P8 are reported with `dolby_vision_profile_levels` (`max_level` 9 until
-  H3 measures one) and `bl_compatibility_ids: [1]` for P8. IDs 4 and 2 are added
-  once H3 passes them.
+  Only P5 is reported, with `dolby_vision_profile_levels` (`max_level` 9 until
+  H3 measures one). P8 is not claimed (run 31): its base layer plays through the
+  `client_dv8_base_layer_fallback_v1` claim for ID 1.
 - `output.display.hdr_evidence` is `"exact"` when `GetDisplayProperties()`
   answers; the probe retries once before reporting `"unknown"`, because `unknown`
   turns every HDR and DV source into an SDR transcode.

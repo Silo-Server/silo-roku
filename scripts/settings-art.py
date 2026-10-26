@@ -8,7 +8,8 @@
   sign_out.png   rectangle.portrait.and.arrow.right: an open frame with an
                  arrow leaving it to the right
 
-Each glyph is 40 px square, white on transparent, for a Poster's blendColor:
+Each glyph has a logical 40 px square canvas, rasterized at 2x by player-art
+for aligned bilinear minification, white on transparent for blendColor:
 the rail draws it at 30 px beside each category, and the pane header at 40 px
 inside its 72 px icon tile. The glyphs are plain geometry drawn after the
 shapes of the tvOS rail's SF Symbols on scripts/player-art.py's 48-unit grid;

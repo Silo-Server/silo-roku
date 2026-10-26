@@ -5,6 +5,7 @@ import "pkg:/components/views/pending.bs"
 import "pkg:/source/api/client.bs"
 import "pkg:/source/catalog/actions.bs"
 import "pkg:/source/catalog/detail.bs"
+import "pkg:/source/catalog/palette.bs"
 import "pkg:/source/catalog/requests.bs"
 import "pkg:/source/catalog/series.bs"
 import "pkg:/source/nav/routes.bs"
@@ -25,9 +26,21 @@ const ZONE_ACTIONS = "actions"
 const ZONE_SEASONS = "seasons"
 const ZONE_EPISODES = "episodes"
 const ZONE_DETAILS = "details"
+const ZONE_CAST = "cast"
+const ZONE_SIMILAR = "similar"
 
 sub init()
     m.top.findNode("background").color = theme.color.BACKGROUND
+    m.ambientLayer = m.top.findNode("ambient")
+    m.ambientBase = m.top.findNode("ambientBase")
+    m.accentGlow = m.top.findNode("accentGlow")
+    m.shadowGlow = m.top.findNode("shadowGlow")
+    for each glow in [{ node: m.accentGlow, box: theme.browse.ACCENT_GLOW, uri: theme.browseArt.ACCENT_GLOW, opacity: theme.browse.ACCENT_OPACITY }, { node: m.shadowGlow, box: theme.browse.SHADOW_GLOW, uri: theme.browseArt.SHADOW_GLOW, opacity: theme.browse.SHADOW_OPACITY }]
+        glow.node.setFields({ uri: glow.uri, translation: [glow.box[0], glow.box[1]], width: glow.box[2], height: glow.box[3], opacity: glow.opacity })
+    end for
+    ' Sampled tints by ThumbHash (catalog.palette.tints).
+    m.palettes = {}
+    m.ambient = false
     i18n.install()
     m.copy = m.global.strings
     m.page = m.top.findNode("page")
@@ -37,6 +50,7 @@ sub init()
     m.actionPlaceholders = m.top.findNode("actionPlaceholders")
     m.actions = m.top.findNode("actions")
     m.actions.observeField("activated", "onAction")
+    m.actions.observeField("highlightX", "onActionPosition")
     m.seasons = m.top.findNode("seasons")
     m.seasons.translation = [theme.size.DETAIL_SIDE_INSET, theme.detail.SEASONS_TOP]
     m.seasons.span = 1920 - 2 * theme.size.DETAIL_SIDE_INSET
@@ -47,6 +61,7 @@ sub init()
     m.rail.observeField("selectedIndex", "onRailSelected")
     m.rail.observeField("retry", "onEpisodeRetry")
     m.details = m.top.findNode("details")
+    initSupporting()
     m.status = m.top.findNode("status")
     m.status.observeField("activated", "onRetry")
     m.picker = m.top.findNode("picker")
@@ -103,15 +118,19 @@ end sub
 ' --- Screen hooks -----------------------------------------------------------
 
 sub onShow(event as Object)
+    m.actions.active = true
     if event.first
         start(event.restore, util.isTrue(event.refresh), event.played)
     else
         nav.textures.restore(m.textures)
         showArt()
         attachRail()
+        attachSupporting()
         if event.refresh then returnFromPlayer(event.played)
     end if
-    if m.status.visible
+    if m.person.visible
+        m.person.callFunc("focus")
+    else if m.status.visible
         focusStatus()
     else
         focusZone(m.zone)
@@ -119,17 +138,22 @@ sub onShow(event as Object)
 end sub
 
 sub onHide()
+    m.actions.active = false
     m.watchTimer.control = "stop"
     m.refreshTimer.control = "stop"
     nav.textures.hide(m.textures)
+    hideSupporting()
 end sub
 
 sub onPressure(_level as String)
     detachRail()
+    hideSupporting()
 end sub
 
 sub onRelease()
+    m.actions.active = false
     m.released = true
+    m.supportingTimer.control = "stop"
     m.watchTimer.control = "stop"
     m.refreshTimer.control = "stop"
     cancelPending()
@@ -138,7 +162,8 @@ end sub
 ' Where focus was, the season and episode shown, and what the player was
 ' given, so a page rebuilt from its entry opens the same way.
 function focusKey() as Dynamic
-    key = { zone: m.zone, button: m.actions.focusedKey, season: -1, episode: "", played: "" }
+    key = { cast: m.castRail.index, castFirst: m.castRail.firstVisible, similar: m.similarRail.index, similarFirst: m.similarRail.firstVisible, person: m.personId, zone: m.zone, button: m.actions.focusedKey, season: -1, episode: "", played: "" }
+    if m.person.visible then key.personFocus = m.person.callFunc("focusKey")
     if m.seasonIndex >= 0 and m.seasonIndex < m.seasonNodes.Count() then key.season = m.seasonNodes[m.seasonIndex].seasonNumber
     if m.target <> invalid and m.target.episode then key.episode = m.target.contentId
     if m.playing <> invalid then key.played = m.playing.contentId
@@ -146,11 +171,17 @@ function focusKey() as Dynamic
 end function
 
 function backContext() as Object
-    return { overlay: m.picker.visible, zone: nav.zone.NONE }
+    return { overlay: m.picker.visible or m.person.visible, zone: nav.zone.NONE }
 end function
 
 function onBack(action as String) as Boolean
-    if action = nav.action.CLOSE_OVERLAY then closePicker()
+    if action = nav.action.CLOSE_OVERLAY
+        if m.person.visible
+            closePerson()
+        else
+            closePicker()
+        end if
+    end if
     return true
 end function
 
@@ -192,7 +223,19 @@ sub start(restore as Dynamic, refresh as Boolean, played as Dynamic)
             end if
         end if
     end if
+    if util.isObject(restore)
+        if util.isNumber(restore.cast) then m.castRail.index = restore.cast
+        if util.isNumber(restore.castFirst) then m.castRail.firstVisible = restore.castFirst
+        if util.isNumber(restore.similar) then m.similarRail.index = restore.similar
+        if util.isNumber(restore.similarFirst) then m.similarRail.firstVisible = restore.similarFirst
+        m.restorePerson = util.text(restore.person)
+        m.restorePersonFocus = restore.personFocus
+    end if
     m.lowTier = isLowTier()
+    m.ambient = theme.ambientWash(m.lowTier)
+    m.ambientLayer.visible = m.ambient
+    m.hero.flat = m.ambient
+    m.actions.lowTier = m.lowTier
     m.hero.lowTier = m.lowTier
     m.rail.lowTier = m.lowTier
     m.scroll.duration = theme.detail.MOVIE_SCROLL_SECONDS
@@ -200,6 +243,24 @@ sub start(restore as Dynamic, refresh as Boolean, played as Dynamic)
     showSkeleton(seed, m.wantedEpisode <> "" or (seed <> invalid and seed.series))
     showTitleArt()
     loadItem(m.itemId)
+end sub
+
+' The page's wash for an item: in the ambient wash its sampled tints, the
+' base at 42% over black (tvOS TVDetailPageSurface) on the whole page and
+' in the hero's fades, else tint in the hero's own wash.
+sub showWash(tint as String, hash as Dynamic)
+    if not m.ambient
+        m.hero.tint = tint
+        return
+    end if
+    tints = catalog.palette.tints(hash, m.palettes)
+    black = theme.color.BACKGROUND
+    if tints = invalid then tints = { base: black, accent: black, shadow: black }
+    base = catalog.palette.over(tints.base, theme.browse.AMBIENT_BASE_OPACITY)
+    m.ambientBase.color = base
+    m.accentGlow.blendColor = tints.accent
+    m.shadowGlow.blendColor = tints.shadow
+    m.hero.tint = base
 end sub
 
 ' Paints seed (or, without one, placeholder bars) on the hero, and holds the
@@ -210,7 +271,7 @@ sub showSkeleton(seed as Dynamic, series as Boolean)
     m.hero.placeholders = seed = invalid
     if seed <> invalid
         m.hero.content = { title: seed.title, metadata: seed.metadata, synopsis: seed.synopsis }
-        m.hero.tint = seed.tint
+        showWash(seed.tint, seed.tintHash)
         m.art = { backdropUri: seed.backdropUri, logoUri: seed.logoUri }
         showArt()
     end if
@@ -230,7 +291,7 @@ end function
 
 sub send(request as Object, entry as Object)
     if m.dev <> invalid then request.dev = m.dev
-    request.lane = "interactive"
+    if util.text(request.lane) = "" then request.lane = "interactive"
     sendPending(request, entry)
 end sub
 
@@ -271,6 +332,8 @@ end sub
 sub onAnswer(entry as Object, result as Object, content as Dynamic)
     if entry.kind = "item"
         onItem(result)
+    else if entry.kind = "similar" or entry.kind = "person" or entry.kind = "personTitles"
+        onSupportingAnswer(entry, result, content)
     else if entry.kind = "seasons"
         onSeasons(result, content)
     else if entry.kind = "episodes" or entry.kind = "neighbour" or entry.kind = "refresh"
@@ -313,7 +376,8 @@ sub onItem(result as Object)
     m.series = detail.itemType = "series"
     m.scroll.duration = theme.detail.MOVIE_SCROLL_SECONDS
     if m.series then m.scroll.duration = theme.detail.SERIES_SCROLL_SECONDS
-    m.hero.setFields({ fixed: m.series, placeholders: false, tint: detail.tint })
+    m.hero.setFields({ fixed: m.series, placeholders: false })
+    showWash(detail.tint, detail.tintHash)
     showSeriesText()
     m.art = { backdropUri: detail.backdropUri, logoUri: detail.logoUri }
     showArt()
@@ -339,6 +403,7 @@ sub onItem(result as Object)
     updateActions()
     layout()
     m.top.ready = true
+    startSupporting()
     focusRestored()
 end sub
 
@@ -396,6 +461,14 @@ end sub
 sub layout()
     top = theme.detail.HERO_HEIGHT
     if m.series then top = theme.detail.railBottom() + theme.detail.SECTION_GAP
+    if m.castRail.visible
+        m.castRail.translation = [0, top]
+        top = top + m.castRail.height + theme.detail.SECTION_GAP
+    end if
+    if m.similarRail.visible
+        m.similarRail.translation = [0, top]
+        top = top + m.similarRail.height + theme.detail.SECTION_GAP
+    end if
     m.detailsTop = top
     m.details.translation = [theme.size.DETAIL_SIDE_INSET, top]
 end sub
@@ -409,13 +482,17 @@ function zones() as Object
     if m.series and (m.railItems.Count() > 0 or m.rail.action <> "") then out.Push(ZONE_EPISODES)
     ' A series page offers Details once its seasons have answered, so focus
     ' does not settle below a rail still loading.
-    if m.details.visible and (not m.series or not m.seasonsLoading) then out.Push(ZONE_DETAILS)
+    supportingReady = not m.series or not m.seasonsLoading
+    if supportingReady and m.castRail.visible then out.Push(ZONE_CAST)
+    if supportingReady and hasSimilar() then out.Push(ZONE_SIMILAR)
+    if m.details.visible and supportingReady then out.Push(ZONE_DETAILS)
     return out
 end function
 
 ' Focuses zone, or the nearest zone below it, else above, when it is empty.
 sub focusZone(zone as String)
-    order = [ZONE_ACTIONS, ZONE_SEASONS, ZONE_EPISODES, ZONE_DETAILS]
+    if m.person.visible then return
+    order = [ZONE_ACTIONS, ZONE_SEASONS, ZONE_EPISODES, ZONE_CAST, ZONE_SIMILAR, ZONE_DETAILS]
     available = zones()
     ' A hidden page (the player above it) only remembers the zone.
     if available.Count() = 0 or not m.top.visible
@@ -440,6 +517,10 @@ sub focusZone(zone as String)
         m.seasons.setFocus(true)
     else if chosen = ZONE_EPISODES
         m.rail.setFocus(true)
+    else if chosen = ZONE_CAST
+        m.castRail.setFocus(true)
+    else if chosen = ZONE_SIMILAR
+        m.similarRail.setFocus(true)
     else
         m.details.setFocus(true)
     end if
@@ -461,7 +542,11 @@ end sub
 ' below it, and back down for the zones above it.
 sub scrollFor(zone as String)
     offset = 0
-    if zone = ZONE_DETAILS
+    if zone = ZONE_CAST
+        offset = m.castRail.translation[1] - 180
+    else if zone = ZONE_SIMILAR
+        offset = m.similarRail.translation[1] - 180
+    else if zone = ZONE_DETAILS
         overflow = m.detailsTop + m.details.height + theme.detail.PAGE_BOTTOM - 1080
         if overflow > 0 then offset = overflow
     end if
@@ -506,6 +591,7 @@ end sub
 
 function onKeyEvent(key as String, press as Boolean) as Boolean
     if not press or m.status.visible then return false
+    if m.person.visible then return true
     if key = "up" or key = "down"
         m.wantedZone = ""
         available = zones()

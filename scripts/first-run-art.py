@@ -87,6 +87,9 @@ MESH_SIZE = (640, 360)
 SERVER_MARK = 80
 HELP_SYMBOL = 112
 WARNING = (56, 48)
+# Only the lock, remote and warning use 2x intrinsic resolution. Their geometry
+# stays in logical FHD pixels; meshes, masks, rings and other shapes stay 1x.
+GLYPH_SCALE = 2
 MARK_GRADIENT = [(0xEA, 0xA6, 0x5C), (0xA8, 0x52, 0x1D), (0x5E, 0x29, 0x0D)]
 
 
@@ -114,25 +117,25 @@ def rounded_rect_distance(x, y, width, height, radius):
     return outside + min(max(qx, qy), 0.0) - radius
 
 
-def shape_alpha(width, height, radius, ring=0, inset=0):
+def shape_alpha(width, height, radius, ring=0, inset=0, scale=1):
     """Coverage rows of a rounded rectangle inset from the image edge, or of its outline ring px wide."""
     rows = []
-    for py in range(height):
+    for py in range(height * scale):
         row = []
-        for px in range(width):
-            x, y = px + 0.5 - inset, py + 0.5 - inset
+        for px in range(width * scale):
+            x, y = (px + 0.5) / scale - inset, (py + 0.5) / scale - inset
             w, h = width - 2 * inset, height - 2 * inset
-            outer = clamp(0.5 - rounded_rect_distance(x, y, w, h, radius))
+            outer = clamp(0.5 - scale * rounded_rect_distance(x, y, w, h, radius))
             if ring:
-                inner = clamp(0.5 - rounded_rect_distance(x - ring, y - ring, w - 2 * ring, h - 2 * ring, max(radius - ring, 0)))
+                inner = clamp(0.5 - scale * rounded_rect_distance(x - ring, y - ring, w - 2 * ring, h - 2 * ring, max(radius - ring, 0)))
                 outer = max(outer - inner, 0.0)
             row.append(outer)
         rows.append(row)
     return rows
 
 
-def disc_alpha(size, radius, ring=0):
-    return shape_alpha(size, size, radius, ring, inset=size / 2 - radius)
+def disc_alpha(size, radius, ring=0, scale=1):
+    return shape_alpha(size, size, radius, ring, inset=size / 2 - radius, scale=scale)
 
 
 def nine_patch(alpha, rgb=WHITE):
@@ -210,26 +213,26 @@ def avatar_ring():
     return rgba(disc_alpha(size, size / 2, ring=AVATAR_RING_WIDTH), WHITE)
 
 
-def lock_badge():
+def lock_badge(scale=GLYPH_SCALE):
     """#1C1C1E disc with a black edge and a padlock in #EDEDED at 75%."""
     size = LOCK_BADGE
-    disc = disc_alpha(size, size / 2)
-    edge = disc_alpha(size, size / 2, ring=round(size * 0.07))
+    disc = disc_alpha(size, size / 2, scale=scale)
+    edge = disc_alpha(size, size / 2, ring=round(size * 0.07), scale=scale)
     glyph = size * 0.42
     left, top = (size - glyph) / 2, (size - glyph) / 2
     stroke = glyph * 0.16
     body_top = top + glyph * 0.45
     rows = []
-    for py in range(size):
+    for py in range(size * scale):
         row = []
-        for px in range(size):
-            x, y = px + 0.5, py + 0.5
+        for px in range(size * scale):
+            x, y = (px + 0.5) / scale, (py + 0.5) / scale
             color = mix((0x1C, 0x1C, 0x1E), BLACK, edge[py][px])
             # The body: a rounded rectangle in the lower part of the glyph box.
-            body = clamp(0.5 - rounded_rect_distance(x - left, y - body_top, glyph, glyph * 0.55, glyph * 0.1))
+            body = clamp(0.5 - scale * rounded_rect_distance(x - left, y - body_top, glyph, glyph * 0.55, glyph * 0.1))
             # The shackle: the upper half of a ring above the body.
             cx, cy, r = size / 2, body_top, glyph * 0.3
-            arc = clamp(0.5 - abs(math.hypot(x - cx, y - cy) - r) + stroke / 2) if y <= cy else 0.0
+            arc = clamp(0.5 - scale * (abs(math.hypot(x - cx, y - cy) - r) - stroke / 2)) if y <= cy else 0.0
             ink = max(body, arc) * 0.75
             color = mix(color, INK, ink)
             row.append(tuple(round(c) for c in color) + (round(255 * disc[py][px]),))
@@ -277,23 +280,23 @@ def segment_distance(x, y, ax, ay, bx, by):
     return math.hypot(x - ax - t * dx, y - ay - t * dy)
 
 
-def help_remote():
+def help_remote(scale=GLYPH_SCALE):
     """A glass circle (white 8% under a 1 px white 14% outline) holding a remote:
     a rounded outline with a ring for its pad and two buttons below."""
     size = HELP_SYMBOL
-    disc = disc_alpha(size, size / 2)
-    edge = disc_alpha(size, size / 2, ring=1)
+    disc = disc_alpha(size, size / 2, scale=scale)
+    edge = disc_alpha(size, size / 2, ring=1, scale=scale)
     width, height, stroke = 26, 52, 3.5
     left, top = (size - width) / 2, (size - height) / 2
     pad_x, pad_y, pad_r = size / 2, top + 15, 7
     rows = []
-    for py in range(size):
+    for py in range(size * scale):
         row = []
-        for px in range(size):
-            x, y = px + 0.5, py + 0.5
-            body = clamp(0.5 - abs(rounded_rect_distance(x - left, y - top, width, height, 9) + stroke / 2) + stroke / 2)
-            pad = clamp(0.5 - abs(math.hypot(x - pad_x, y - pad_y) - pad_r) + 1.5)
-            buttons = max(clamp(0.5 - (math.hypot(x - pad_x, y - b) - 2.5)) for b in (top + 31, top + 40))
+        for px in range(size * scale):
+            x, y = (px + 0.5) / scale, (py + 0.5) / scale
+            body = clamp(0.5 - scale * (abs(rounded_rect_distance(x - left, y - top, width, height, 9) + stroke / 2) - stroke / 2))
+            pad = clamp(0.5 - scale * (abs(math.hypot(x - pad_x, y - pad_y) - pad_r) - 1.5))
+            buttons = max(clamp(0.5 - scale * (math.hypot(x - pad_x, y - b) - 2.5)) for b in (top + 31, top + 40))
             ink = max(body, pad, buttons)
             glass = 0.08 + (0.14 - 0.08) * edge[py][px]
             alpha = ink + glass * (1 - ink)
@@ -303,24 +306,24 @@ def help_remote():
     return rows
 
 
-def warning_triangle():
+def warning_triangle(scale=GLYPH_SCALE):
     """exclamationmark.triangle.fill: a triangle with rounded corners, white,
     with the mark cut out, for blendColor."""
     width, height = WARNING
     radius = 5
     corners = [(width / 2, radius + 1), (width - radius - 1, height - radius - 1), (radius + 1, height - radius - 1)]
     rows = []
-    for py in range(height):
+    for py in range(height * scale):
         row = []
-        for px in range(width):
-            x, y = px + 0.5, py + 0.5
+        for px in range(width * scale):
+            x, y = (px + 0.5) / scale, (py + 0.5) / scale
             inside = all((bx - ax) * (y - ay) - (by - ay) * (x - ax) >= 0
                          for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1]))
             edge = min(segment_distance(x, y, *a, *b) for a, b in zip(corners, corners[1:] + corners[:1]))
             distance = -edge if inside else edge
-            shape = clamp(0.5 - (distance - radius))
-            bar = clamp(0.5 - (segment_distance(x, y, width / 2, height * 0.36, width / 2, height * 0.62) - 2.5))
-            dot = clamp(0.5 - (math.hypot(x - width / 2, y - height * 0.77) - 3))
+            shape = clamp(0.5 - scale * (distance - radius))
+            bar = clamp(0.5 - scale * (segment_distance(x, y, width / 2, height * 0.36, width / 2, height * 0.62) - 2.5))
+            dot = clamp(0.5 - scale * (math.hypot(x - width / 2, y - height * 0.77) - 3))
             row.append(WHITE + (round(255 * shape * (1 - max(bar, dot))),))
         rows.append(row)
     return rows

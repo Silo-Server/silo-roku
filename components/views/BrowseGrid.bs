@@ -27,6 +27,7 @@ sub init()
     ' (catalog.grid gather), or invalid.
     m.gathered = invalid
     m.template = invalid
+    m.localItems = invalid
     m.dev = invalid
     ' Whether the grid shows m.root: detach() takes it away under memory
     ' pressure, and pages arriving meanwhile change only m.root.
@@ -44,6 +45,7 @@ end sub
 
 function load(options as Object) as Boolean
     cancelPending()
+    m.localItems = options.items
     m.template = options.request
     m.dev = options.dev
     m.lowTier = util.isTrue(options.lowTier)
@@ -87,6 +89,7 @@ function clear() as Boolean
     m.restoreKey = invalid
     m.restoreTimer.control = "stop"
     m.root = invalid
+    m.localItems = invalid
     m.gathered = invalid
     m.grid.content = invalid
     m.focus = 0
@@ -99,10 +102,46 @@ end function
 sub readToward(target as Integer)
     decision = catalog.grid.want(m.paging, target)
     if decision = invalid then return
+    if type(m.localItems) = "roArray"
+        readLocal(decision)
+        return
+    end if
     kind = catalog.kind.PAGE
     if decision.skip then kind = catalog.kind.SKIP
     catalog.grid.started(m.paging, decision)
     send(catalog.request.continued(m.template, decision.cursor, decision.limit, kind), { kind: "page", decision: decision })
+end sub
+
+' A complete, unpaginated collection index was mapped to lightweight
+' fields on ApiTask. Materialize only the current grid window. These local
+' offsets never become server cursors or HTTP query parameters.
+sub readLocal(decision as Object)
+    catalog.grid.started(m.paging, decision)
+    last = decision.offset + decision.limit
+    if last > m.localItems.Count() then last = m.localItems.Count()
+    content = CreateObject("roSGNode", "RowContent")
+    if not decision.skip
+        for i = decision.offset to last - 1
+            card = content.createChild("CardContent")
+            card.setFields(m.localItems[i])
+        end for
+    end if
+    more = last < m.localItems.Count()
+    cursor = ""
+    if more then cursor = last.ToStr()
+    page = { size: last - decision.offset, total: m.localItems.Count(), hasMore: more, nextCursor: cursor }
+    applyChange(catalog.grid.received(m.paging, decision, page), content)
+    m.top.total = m.paging.total
+    if m.paging.hi = 0
+        m.top.state = "empty"
+    else
+        m.top.state = "ready"
+    end if
+    if m.restoreKey <> invalid
+        tryRestore(false)
+    else
+        readToward(m.paging.lo + m.focus)
+    end if
 end sub
 
 sub send(request as Object, entry as Object)
@@ -194,6 +233,10 @@ end sub
 ' A card's image failed: read its page again for fresh signed URLs, once.
 sub onArtFailed(event as Object)
     if m.root = invalid or not m.root.isSameNode(event.getRoSGNode()) then return
+    if m.localItems <> invalid
+        m.top.refreshRequested = m.root.artFailed
+        return
+    end if
     id = m.root.artFailed
     for i = 0 to m.root.getChildCount() - 1
         if m.root.getChild(i).id = id

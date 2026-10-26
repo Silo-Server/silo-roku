@@ -1,3 +1,4 @@
+import "pkg:/source/library/collections.bs"
 import "pkg:/source/api/response.bs"
 import "pkg:/source/catalog/cards.bs"
 import "pkg:/source/catalog/detail.bs"
@@ -26,6 +27,8 @@ import "pkg:/source/util/values.bs"
 '   seasons   RowContent of season cards      { size, seasons: catalog.series.rollup }
 '   episodes  RowContent of episode cards     { size }
 '   detail    none                            catalog.detail.fromItem
+'   person    none                            catalog.detail.person
+'   supporting RowContent, movie/series only  { size }
 '   resume    none                            catalog.detail.resume
 '   watch     none                            catalog.detail.resume with selection
 '                                             (catalog.selection)
@@ -35,11 +38,10 @@ import "pkg:/source/util/values.bs"
 '
 ' map options besides kind: shape, the card shape of a row or page whose
 ' answer does not say (default poster); skipFeatured, true to leave a rows
-' answer's featured sections out (a library's Recommended); episodeTags,
-' true to caption a page's
-' episodes with their tag after the series title (catalog.cards.taggedCaption);
+' answer's featured sections out (a library's Recommended);
 ' fileId and baseUrl, the file a trickplay manifest must be for and the base
-' URL its sheet URLs resolve against.
+' URL its sheet URLs resolve against; origin is captured by ApiTask when
+' issuing the request, for server-relative collection artwork.
 namespace catalog.map
     ' Runs request.map on a successful result and gives the result to post.
     ' copy is catalog.cards.words(); invalid reads the device locale's
@@ -59,10 +61,13 @@ namespace catalog.map
             content = rowsTree(body, copy, util.isTrue(mapping.skipFeatured))
             if content <> invalid then summary = { rows: content.getChildCount() }
         else if kind = catalog.kind.ROW
-            content = row(body, shape, copy, util.isTrue(mapping.episodeTags))
+            content = row(body, shape, copy)
             if content <> invalid then summary = catalog.summary.page(body, content.getChildCount())
+        else if kind = catalog.kind.SUPPORTING
+            content = supporting(body, pageLimit(request), copy)
+            if content <> invalid then summary = { size: content.getChildCount() }
         else if kind = catalog.kind.PAGE
-            content = page(body, pageLimit(request), shape, copy, util.isTrue(mapping.episodeTags))
+            content = page(body, pageLimit(request), shape, copy)
             if content <> invalid then summary = catalog.summary.page(body, content.getChildCount())
         else if kind = catalog.kind.SKIP
             if type(body.items) = "roArray" then summary = catalog.summary.page(body, body.items.Count())
@@ -73,7 +78,7 @@ namespace catalog.map
         else if kind = playback.trickplay.KIND
             summary = playback.trickplay.parseManifest(body, util.text(mapping.fileId), util.text(mapping.baseUrl))
         else
-            summary = document(kind, body, copy)
+            summary = document(kind, body, copy, util.text(mapping.origin))
         end if
         if summary = invalid then return malformed(result)
         result.body = summary
@@ -81,9 +86,11 @@ namespace catalog.map
         return result
     end function
 
-    function document(kind as String, body as Object, copy as Object) as Dynamic
+    function document(kind as String, body as Object, copy as Object, origin = "" as String) as Dynamic
+        if kind = catalog.kind.COLLECTIONS then return libraryCollections.fromResponse(body, strings(), origin)
         if kind = "settingsContract" then return settings.contract(body, strings())
         if kind = catalog.kind.DETAIL then return catalog.detail.fromItem(body, copy)
+        if kind = catalog.kind.PERSON then return catalog.detail.person(body)
         if kind = catalog.kind.RESUME then return catalog.detail.resume(body)
         if kind = catalog.kind.WATCH then return watchState(body, strings())
         if kind = catalog.kind.AUDIO_PREFERENCE then return catalog.selection.audioPreferenceOf(body)
@@ -124,7 +131,7 @@ namespace catalog.map
     ' type and items decide the shape (catalog.cards.rowShape). An item
     ' without a card is left out, or with holdPlaces keeps its place as a
     ' placeholder card.
-    function row(body as Object, shape as String, copy as Object, episodeTags = false as Boolean, bound = catalog.rows.MAX_ITEMS as Integer, holdPlaces = false as Boolean) as Dynamic
+    function row(body as Object, shape as String, copy as Object, bound = catalog.rows.MAX_ITEMS as Integer, holdPlaces = false as Boolean) as Dynamic
         if type(body.items) <> "roArray" then return invalid
         node = CreateObject("roSGNode", "RowContent")
         resumeRow = false
@@ -141,10 +148,6 @@ namespace catalog.map
             if node.getChildCount() >= bound then exit for
             fields = catalog.cards.fromItem(item, shape, copy, resumeRow)
             if fields <> invalid
-                if episodeTags and fields.itemType = "episode"
-                    fields.caption = catalog.cards.taggedCaption(item, copy)
-                    fields.captionTag = catalog.cards.episodeTag(item.season_number, item.episode_number, copy)
-                end if
                 card(node, fields)
             else if holdPlaces
                 card(node, { id: "", shape: node.shape })
@@ -158,9 +161,21 @@ namespace catalog.map
     ' position in the results and the size the cursor follows. An answer
     ' with more items than the request's limit is malformed: its cursor
     ' comes after all of them.
-    function page(body as Object, limit as Integer, shape as String, copy as Object, episodeTags as Boolean) as Dynamic
+    function page(body as Object, limit as Integer, shape as String, copy as Object) as Dynamic
         if type(body.items) <> "roArray" or body.items.Count() > limit then return invalid
-        return row(body, shape, copy, episodeTags, limit, true)
+        return row(body, shape, copy, limit, true)
+    end function
+
+    ' Only first-release detail routes can open from a supporting rail.
+    ' Preserve server ranking; never derive recommendations on the client.
+    function supporting(body as Object, limit as Integer, copy as Object) as Dynamic
+        if type(body.items) <> "roArray" then return invalid
+        supported = []
+        for each item in body.items
+            if supported.Count() >= limit then exit for
+            if util.isObject(item) and (item.type = "movie" or item.type = "series") then supported.Push(item)
+        end for
+        return row({ items: supported }, catalog.shape.POSTER, copy, limit)
     end function
 
     ' The limit a /catalog request sent, or the most the server answers.

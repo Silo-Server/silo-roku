@@ -1,0 +1,184 @@
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/api/scheduler.bs"
+
+' Optional lower-page content never blocks the hero, playback, or selectors.
+sub initSupporting()
+    m.castRail = m.top.findNode("cast")
+    m.castRail.heading = i18n.text("detail.cast")
+    m.castRail.observeField("chosen", "onCastChosen")
+    m.similarRail = m.top.findNode("similar")
+    m.similarRail.observeField("chosen", "onSimilarChosen")
+    m.supportingTimer = m.top.findNode("supportingTimer")
+    m.supportingTimer.observeField("fire", "loadSimilar")
+    m.similarContent = invalid
+    m.similarRequested = false
+    m.person = m.top.findNode("person")
+    m.person.observeField("closed", "closePerson")
+    m.person.observeField("retry", "loadPerson")
+    m.person.observeField("selectedItem", "onPersonTitleChosen")
+    m.personId = ""
+    m.restorePerson = ""
+    m.restorePersonFocus = invalid
+end sub
+
+sub startSupporting()
+    m.castRail.lowTier = m.lowTier
+    m.similarRail.lowTier = m.lowTier
+    m.castRail.people = { items: m.detail.cast }
+    m.castRail.visible = m.detail.cast.Count() > 0
+    key = "detail.relatedMovies"
+    if m.series then key = "detail.recommendedSeries"
+    m.similarRail.heading = i18n.text(key)
+    m.similarRail.loading = true
+    m.similarRail.visible = true
+    layout()
+    if m.top.visible
+        m.supportingTimer.control = "start"
+    else
+        hideSupporting()
+    end if
+    if m.restorePerson <> ""
+        id = m.restorePerson
+        m.restorePerson = ""
+        savedFocus = m.restorePersonFocus
+        m.restorePersonFocus = invalid
+        openPerson(id, savedFocus)
+    end if
+end sub
+
+sub loadSimilar()
+    if m.detail = invalid or m.similarRequested or not m.top.visible then return
+    m.similarRequested = true
+    request = catalog.request.similar(m.detail.id)
+    request.lane = api.scheduler.LANE_PREFETCH
+    send(request, { kind: "similar", id: m.detail.id })
+end sub
+
+function hasSimilar() as Boolean
+    return m.similarContent <> invalid and m.similarContent.getChildCount() > 0
+end function
+
+sub onSupportingAnswer(entry as Object, result as Object, content as Dynamic)
+    if entry.kind = "similar"
+        if m.detail = invalid or entry.id <> m.detail.id then return
+        m.similarContent = invalid
+        if result.ok then m.similarContent = content
+        ' TVSimilarRail uses TVMediaCard's centred, 16 pt-spaced caption.
+        ' Keep the requested Home artwork lift and floating navigation.
+        if m.similarContent <> invalid then m.similarContent.setFields({ lowTier: m.lowTier, captionStyle: "grid" })
+        m.similarRail.loading = false
+        m.similarRail.content = m.similarContent
+        m.similarRail.visible = hasSimilar()
+        layout()
+        if m.top.visible and not m.person.visible
+            if m.wantedZone = ZONE_SIMILAR and hasSimilar()
+                focusRestored()
+            else
+                scrollFor(m.zone)
+            end if
+        end if
+        return
+    end if
+    if entry.id <> m.personId or not m.person.visible then return
+    if entry.kind = "person"
+        if result.ok
+            ' Keep the cast card's photo so the panel does not reload it.
+            body = result.body
+            shown = m.person.person
+            if shown <> invalid and util.text(shown.photoUri) <> "" then body.photoUri = shown.photoUri
+            m.person.person = body
+            if m.person.message = i18n.text("detail.personLoading") then m.person.message = ""
+        else
+            m.person.message = i18n.text("detail.personError")
+            m.person.retryable = result.status <> 403 and result.status <> 404
+        end if
+    else if entry.kind = "personTitles"
+        m.person.titlesLoading = false
+        if result.ok and content <> invalid and content.getChildCount() > 0
+            content.lowTier = m.lowTier
+            m.person.content = content
+            if m.person.message = i18n.text("detail.personLoading") then m.person.message = ""
+        else if result.ok
+            if not m.person.retryable then m.person.message = i18n.text("detail.personEmpty")
+        else
+            m.person.message = i18n.text("detail.personTitlesError")
+            m.person.retryable = true
+        end if
+    end if
+end sub
+
+sub onCastChosen()
+    index = m.castRail.chosen
+    if m.detail = invalid or index < 0 or index >= m.detail.cast.Count() then return
+    member = m.detail.cast[index]
+    if member.id = "" then return
+    m.person.person = { name: member.name, photoUri: member.photoUri, bio: "", born: "", died: "" }
+    openPerson(member.id)
+end sub
+
+sub openPerson(id as String, savedFocus = invalid as Dynamic)
+    m.personId = id
+    m.person.visible = true
+    m.person.lowTier = m.lowTier
+    m.person.content = invalid
+    m.person.callFunc("restoreFocus", savedFocus)
+    m.person.callFunc("attach")
+    loadPerson()
+    m.person.callFunc("focus")
+end sub
+
+sub loadPerson()
+    cancelKind("person")
+    cancelKind("personTitles")
+    m.person.message = i18n.text("detail.personLoading")
+    m.person.retryable = false
+    m.person.titlesLoading = true
+    send(catalog.request.person(m.personId), { kind: "person", id: m.personId })
+    send(catalog.request.personTitles(m.personId), { kind: "personTitles", id: m.personId })
+end sub
+
+sub closePerson()
+    cancelKind("person")
+    cancelKind("personTitles")
+    m.person.visible = false
+    m.person.callFunc("detach")
+    m.person.person = invalid
+    m.person.content = invalid
+    m.personId = ""
+    focusZone(ZONE_CAST)
+end sub
+
+sub onSimilarChosen()
+    if hasSimilar() then openSupportingTitle(m.similarContent.getChild(m.similarRail.chosen))
+end sub
+
+sub onPersonTitleChosen()
+    if m.person.selectedItem <> invalid then openSupportingTitle(m.person.selectedItem)
+end sub
+
+sub openSupportingTitle(card as Object)
+    if card.id = "" then return
+    params = catalog.detail.routeParams(card)
+    if m.dev <> invalid then params.dev = m.dev
+    ' Recommendations can come from a different library: let the server
+    ' resolve the chosen item's presentation instead of carrying our scope.
+    pushSupportingDetail(params)
+end sub
+
+sub hideSupporting()
+    m.supportingTimer.control = "stop"
+    m.castRail.callFunc("detach")
+    m.similarRail.callFunc("detach")
+    m.person.callFunc("detach")
+end sub
+
+sub attachSupporting()
+    m.castRail.callFunc("attach")
+    m.similarRail.callFunc("attach")
+    if m.person.visible then m.person.callFunc("attach")
+    if m.detail <> invalid and not m.similarRequested then m.supportingTimer.control = "start"
+end sub
+
+sub pushSupportingDetail(params as Object)
+    nav.push(nav.route.DETAIL, params)
+end sub

@@ -19,6 +19,9 @@
   knob.png, knob_scrub.png
                           the scrubber's 30 px knob, and the 42 px knob with
                           its 8 px white 55% stroke (4 px of it outside)
+  controls_gradient.png   2x256 black alpha ramp, stretched over y 480..1080:
+                          clear to 94% with a cubic ease-out, covering the
+                          series, title, tag, scrubber, times, and buttons
   play.png, pause.png     44 px glyphs (tvOS's 30 pt play.fill and pause.fill)
   skip_back.png, skip_forward.png, up_next.png, options.png, close.png
                           36 px glyphs (25 pt): a circular arrow each way with
@@ -35,13 +38,19 @@
   keep_watching.png, back.png
                           Up Next's rectangle.inset.filled and chevron.left, 30 px
 
-Everything is white, so the player tints it with a Poster's blendColor and
-opacity. The glyphs are plain geometry drawn here after the shapes of tvOS's
+Shapes and glyphs are white, so the player tints them with a Poster's blendColor
+and opacity. The controls gradient is black with its opacity baked in. The
+glyphs are plain geometry drawn here after the shapes of tvOS's
 SF Symbols, on a 48-unit design grid scaled to each canvas; no icon file is
 copied. The 9-patches follow scripts/first-run-art.py: HD sizes are the FHD
 sizes times 2/3, a capsule's radius is half its height less 1 px, a 2 px band
 stretches in the middle, and 1 px outlines stay 1 px in HD.
 
+Glyph canvases are rendered at 2x the logical sizes above, directly from the
+same design grid. At the FHD layout size, aligned bilinear minification
+averages each 2x2 texel block and preserves the antialiased edge coverage.
+Layout sizes and optical offsets stay the same; the 9-patches and scrubber
+knobs keep their existing resolution.
 Glyph edges are antialiased by 8x8 supersampling. Uses only the standard
 library, so the pixels are the same on every machine. Run from anywhere:
 python3 scripts/player-art.py
@@ -56,6 +65,7 @@ art = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(art)
 
 GRID = 48  # glyph design units
+GLYPH_SCALE = 2  # intrinsic pixels per logical FHD pixel
 SAMPLES = 8
 WHITE = (255, 255, 255)
 STRETCH = 2
@@ -109,11 +119,11 @@ def in_rounded_rect(x, y, left, top, right, bottom, radius):
     return math.hypot(x - cx, y - cy) <= radius
 
 
-def glyph(size, *shapes, height=None, cut=()):
-    """White RGBA rows covering the union of shapes less the cut shapes, on a size (x height) canvas."""
+def glyph(size, *shapes, height=None, cut=(), scale=GLYPH_SCALE):
+    """Render a logical size (x height) canvas at scale, preserving its design grid."""
     def covered(x, y):
         return any(shape(x, y) for shape in shapes) and not any(hole(x, y) for hole in cut)
-    return art.rgba(coverage(covered, size, height or size), WHITE)
+    return art.rgba(coverage(covered, size * scale, (height or size) * scale), WHITE)
 
 
 # --- Glyphs ---------------------------------------------------------------------------
@@ -254,6 +264,16 @@ def scrub_knob():
     return [[WHITE + (round(255 * max(d, 0.55 * h)),) for d, h in zip(dl, hl)] for dl, hl in zip(disc, halo)]
 
 
+def controls_gradient():
+    """Black, alpha = .94 * (1 - (1 - t)^3), t from top to bottom.
+
+    Over the bottom 600 FHD px this reaches 72% at the series (y 710),
+    76% at the title/tag (y 736), and 92% at the buttons (y 906). This keeps
+    even the muted text readable on white video without a boxed backdrop.
+    """
+    return [[(0, 0, 0, round(255 * .94 * (1 - (1 - y / 255) ** 3)))] * 2 for y in range(256)]
+
+
 def images():
     yield from capsule(66)
     yield from capsule(36)
@@ -267,6 +287,7 @@ def images():
     yield from corner_frame(14)
     yield "knob.png", art.rgba(art.disc_alpha(30, 15), WHITE)
     yield "knob_scrub.png", scrub_knob()
+    yield "controls_gradient.png", controls_gradient()
     yield "play.png", play()
     yield "pause.png", pause()
     yield "skip_back.png", skip_arrow(False)

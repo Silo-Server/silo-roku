@@ -1,10 +1,119 @@
-' A ThumbHash's average colour (https://evanw.github.io/thumbhash/), read
-' from the DC terms in its header alone, as the reference decoder's
-' thumbHashToAverageRGBA does: no image is decoded. Pure.
+' A ThumbHash (https://evanw.github.io/thumbhash/) read as the reference
+' decoder (thumbhash 0.1.1) reads it: averageColor from the DC terms in its
+' header alone, as thumbHashToAverageRGBA does, and decode through the DCT,
+' as thumbHashToRGBA does, at any size. Pure.
 namespace util.thumbhash
     ' The average colour of a base64 ThumbHash as { r, g, b }, each 0 to 1,
     ' or invalid for a hash that is not one.
     function averageColor(hash as Dynamic) as Dynamic
+        bytes = bytesOf(hash)
+        ' The 3-byte header and the 2 that follow it.
+        if bytes = invalid or bytes.Count() < 5 then return invalid
+        header = bytes[0] + bytes[1] * 256 + bytes[2] * 65536
+        l = (header and 63) / 63
+        p = ((header \ 64) and 63) / 31.5 - 1
+        q = ((header \ 4096) and 63) / 31.5 - 1
+        return rgbOf(l, p, q)
+    end function
+
+    ' The hash's picture at width x height as { r, g, b } pixels, each 0 to
+    ' 1, row by row from the top left, or invalid for a hash that is not one.
+    ' Alpha is not decoded. The reference picks a size of at most 32 px from
+    ' the hash's aspect ratio; a caller after colour statistics asks for a
+    ' small square.
+    function decode(hash as Dynamic, width as Integer, height as Integer) as Dynamic
+        bytes = bytesOf(hash)
+        if bytes = invalid or bytes.Count() < 5 or width < 1 or height < 1 then return invalid
+        header24 = bytes[0] + bytes[1] * 256 + bytes[2] * 65536
+        header16 = bytes[3] + bytes[4] * 256
+        lDc = (header24 and 63) / 63
+        pDc = ((header24 \ 64) and 63) / 31.5 - 1
+        qDc = ((header24 \ 4096) and 63) / 31.5 - 1
+        lScale = ((header24 \ 262144) and 31) / 31
+        hasAlpha = (header24 \ 8388608) = 1
+        pScale = ((header16 \ 8) and 63) / 63
+        qScale = ((header16 \ 512) and 63) / 63
+        landscape = (header16 \ 32768) = 1
+        lx = header16 and 7
+        ly = 7
+        if hasAlpha then ly = 5
+        if landscape
+            ly = lx
+            lx = 7
+            if hasAlpha then lx = 5
+        end if
+        if lx < 3 then lx = 3
+        if ly < 3 then ly = 3
+        acStart = 5
+        if hasAlpha then acStart = 6
+        ' Every AC term is a nibble; a hash too short for its own counts is
+        ' not one.
+        needed = acCount(lx, ly) + 2 * acCount(3, 3)
+        if bytes.Count() < acStart + (needed + 1) \ 2 then return invalid
+        reader = { bytes: bytes, start: acStart, index: 0 }
+        lAc = channel(reader, lx, ly, lScale)
+        ' The reference boosts saturation by 1.25 against quantization.
+        pAc = channel(reader, 3, 3, pScale * 1.25)
+        qAc = channel(reader, 3, 3, qScale * 1.25)
+
+        pi = 3.14159265358979
+        ' The cosines along each axis, the vertical ones doubled as the
+        ' reference doubles them.
+        fxs = []
+        for x = 0 to width - 1
+            row = []
+            for cx = 0 to lx - 1
+                row.Push(Cos(pi / width * (x + 0.5) * cx))
+            end for
+            fxs.Push(row)
+        end for
+        fys = []
+        for y = 0 to height - 1
+            row = []
+            for cy = 0 to ly - 1
+                row.Push(Cos(pi / height * (y + 0.5) * cy) * 2)
+            end for
+            fys.Push(row)
+        end for
+
+        pixels = []
+        for y = 0 to height - 1
+            fy = fys[y]
+            for x = 0 to width - 1
+                fx = fxs[x]
+                l = lDc
+                p = pDc
+                q = qDc
+                j = 0
+                for cy = 0 to ly - 1
+                    cx = 0
+                    if cy = 0 then cx = 1
+                    while cx * ly < lx * (ly - cy)
+                        l = l + lAc[j] * fx[cx] * fy[cy]
+                        j = j + 1
+                        cx = cx + 1
+                    end while
+                end for
+                j = 0
+                for cy = 0 to 2
+                    cx = 0
+                    if cy = 0 then cx = 1
+                    while cx < 3 - cy
+                        f = fx[cx] * fy[cy]
+                        p = p + pAc[j] * f
+                        q = q + qAc[j] * f
+                        j = j + 1
+                        cx = cx + 1
+                    end while
+                end for
+                pixels.Push(rgbOf(l, p, q))
+            end for
+        end for
+        return pixels
+    end function
+
+    ' The bytes of a base64 ThumbHash, or invalid.
+    function bytesOf(hash as Dynamic) as Dynamic
         if type(hash) <> "String" and type(hash) <> "roString" then return invalid
         encoded = hash.Trim()
         if not CreateObject("roRegex", "^[A-Za-z0-9+/]+={0,2}$", "").IsMatch(encoded) then return invalid
@@ -14,13 +123,38 @@ namespace util.thumbhash
         end while
         bytes = CreateObject("roByteArray")
         bytes.FromBase64String(encoded)
-        ' The 3-byte header and the 2 that follow it.
-        if bytes.Count() < 5 then return invalid
-        header = bytes[0] + bytes[1] * 256 + bytes[2] * 65536
-        l = (header and 63) / 63
-        p = ((header \ 64) and 63) / 31.5 - 1
-        q = ((header \ 4096) and 63) / 31.5 - 1
-        ' LPQ to RGB.
+        return bytes
+    end function
+
+    ' How many AC terms an nx x ny channel carries.
+    function acCount(nx as Integer, ny as Integer) as Integer
+        count = 0
+        for cy = 0 to ny - 1
+            cx = 0
+            if cy = 0 then cx = 1
+            while cx * ny < nx * (ny - cy)
+                count = count + 1
+                cx = cx + 1
+            end while
+        end for
+        return count
+    end function
+
+    ' The next channel's AC terms, a nibble each, low nibble first.
+    function channel(reader as Object, nx as Integer, ny as Integer, scale as Float) as Object
+        ac = []
+        for i = 1 to acCount(nx, ny)
+            index = reader.index
+            byte = reader.bytes[reader.start + index \ 2]
+            if (index and 1) = 1 then byte = byte \ 16
+            ac.Push(((byte and 15) / 7.5 - 1) * scale)
+            reader.index = index + 1
+        end for
+        return ac
+    end function
+
+    ' LPQ to RGB, each clamped to 0 to 1.
+    function rgbOf(l as Float, p as Float, q as Float) as Object
         b = l - 2 / 3 * p
         r = (3 * l - b + q) / 2
         g = r - q

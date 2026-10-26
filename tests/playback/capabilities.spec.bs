@@ -118,7 +118,7 @@ namespace tests
             m.assertEqual(deliveries.hls.audio_decode_codecs, ["aac"])
         end sub
 
-        @it("claims the DV8 base layer for ID 1 on an HDR10 output, only when the server honours the list")
+        @it("claims the DV8 base layer for ID 1 on any HDR10 output, only when the server honours the list")
         sub _()
             probe = tests.devices.probeResult()
             stock = m.body(probe, { serverFeatures: ["sequenced_progress_v1"] }).client_playback_context.deliveries.original_http
@@ -133,15 +133,20 @@ namespace tests
             ' A replan makes the same claim.
             original = m.parts(probe, { serverFeatures: features }).client_playback_context.deliveries.original_http
             m.assertEqual(original.dv8_base_layer_compatibility_ids, [1])
-            ' Not on an SDR output, nor where the output has Dolby Vision itself.
+            ' Not on an SDR output.
             sdr = tests.devices.probeResult()
             sdr.display.hdr10 = false
             sdr.display.hlg = false
             m.assertEqual(m.parts(sdr, { serverFeatures: features }).client_playback_context.deliveries.original_http.validated_claims, [])
+            ' P8 is never claimed, so an output with Dolby Vision makes the
+            ' claim too.
             dv = tests.devices.probeResult()
             dv.display.dolbyVision = true
             dv.display.modeDolbyVision = true
-            m.assertEqual(m.parts(dv, { serverFeatures: features }).client_playback_context.deliveries.original_http.validated_claims, [])
+            original = m.parts(dv, { serverFeatures: features }).client_playback_context.deliveries.original_http
+            m.assertEqual(original.hdr_details.dolby_vision_profiles, [5])
+            m.assertEqual(original.validated_claims, ["client_dv8_base_layer_fallback_v1"])
+            m.assertEqual(original.dv8_base_layer_compatibility_ids, [1])
         end sub
 
         @describe("output")
@@ -165,17 +170,40 @@ namespace tests
             m.assertFalse(m.body(probe).client_capabilities.hdr)
         end sub
 
-        @it("reports Dolby Vision on the output and on original_http where the Roku outputs it")
+        @it("reports Dolby Vision P5 alone on the output and on original_http where the Roku outputs it")
         sub _()
             probe = tests.devices.probeResult()
             probe.display.dolbyVision = true
             probe.display.modeDolbyVision = true
             context = m.body(probe).client_playback_context
-            m.assertEqual(context.output.hdr_details.dolby_vision_profiles, [5, 8])
-            m.assertEqual(context.output.hdr_details.dolby_vision_profile_levels, [{ profile: 5, max_level: 9 }, { profile: 8, max_level: 9, bl_compatibility_ids: [1] }])
+            m.assertEqual(context.output.hdr_details.dolby_vision_profiles, [5])
+            m.assertEqual(context.output.hdr_details.dolby_vision_profile_levels, [{ profile: 5, max_level: 9 }])
             m.assertEqual(context.output.display.hdr_types, context.output.hdr_details)
             m.assertEqual(context.deliveries.original_http.hdr_details, context.output.hdr_details)
-            m.assertFalse(context.deliveries.hls.DoesExist("hdr_details"))
+            m.assertEqual(context.deliveries.hls.hdr_details.dolby_vision_profiles, [])
+            m.assertFalse(context.deliveries.hls.hdr_details.DoesExist("dolby_vision_profile_levels"))
+        end sub
+
+        @it("serializes the HLS-only DV restriction at start and replan without narrowing other HDR paths")
+        sub _()
+            probe = tests.devices.probeResult()
+            probe.display.dolbyVision = true
+            probe.display.modeDolbyVision = true
+            probe.display.hdr10Plus = true
+            probe.display.hlg = true
+            for each parts in [m.body(probe), m.parts(probe)]
+                ' Check the wire shape, including an explicit empty profile
+                ' list: the server inherits output DV if hdr_details is absent.
+                wire = ParseJson(FormatJson(parts))
+                context = wire.client_playback_context
+                m.assertEqual(context.deliveries.hls.hdr_details, { hdr10: true, hdr10_plus: true, hlg: true, dolby_vision_profiles: [] })
+                expected = { hdr10: true, hdr10_plus: true, hlg: true, dolby_vision_profiles: [5], dolby_vision_profile_levels: [{ profile: 5, max_level: 9 }] }
+                m.assertEqual(context.deliveries.original_http.hdr_details, expected)
+                m.assertEqual(context.output.hdr_details, expected)
+                m.assertEqual(context.output.display.hdr_types, expected)
+                m.assertEqual(wire.client_capabilities.hdr_details, expected)
+                m.assertEqual(context.deliveries.hls.validated_claims, [])
+            end for
         end sub
 
         @it("takes a Roku TV's Dolby Vision from its display, and a player's from its mode string")
@@ -184,7 +212,7 @@ namespace tests
             probe.display.dolbyVision = true
             m.assertEqual(m.body(probe).client_capabilities.hdr_details.dolby_vision_profiles, [], "a player whose mode shows no DV")
             probe.device.modelType = "TV"
-            m.assertEqual(m.body(probe).client_capabilities.hdr_details.dolby_vision_profiles, [5, 8], "a Roku TV")
+            m.assertEqual(m.body(probe).client_capabilities.hdr_details.dolby_vision_profiles, [5], "a Roku TV")
             probe.display.dolbyVision = false
             m.assertEqual(m.body(probe).client_capabilities.hdr_details.dolby_vision_profiles, [], "a Roku TV whose panel has no DV")
         end sub

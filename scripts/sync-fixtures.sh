@@ -43,6 +43,8 @@ CATALOG = {
     "listUserLibraries", "listHomeSections", "getHomeSectionItems", "listLibrarySections", "getLibrarySectionItems",
     "listCatalogItems", "getCatalogSearchCapabilities", "getCatalogItem", "listSeriesSeasons", "listSeasonEpisodes",
     "getWatchState", "getBranding", "getWatchTrickplay",
+    # Detail supporting content: person metadata and recommendations.
+    "getPerson", "listSimilar", "getLibraryCollections",
     # The detail page's remembered audio and subtitle tracks (catalog.request.savePreference).
     "getAudioPreference", "updateAudioPreference", "deleteAudioPreference", "updateSubtitlePreference", "deleteSubtitlePreference",
 }

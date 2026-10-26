@@ -103,8 +103,8 @@ and sign nothing in, so neither is a sign-in mechanism.
 
 ### 4.1 Connect a Phone
 
-A new avatar-menu row, Connect a Phone, sits above Switch Profile. It opens a
-screen in the setup layout (spec section 5.4) with:
+The Connect a Phone screen remains implemented but has no avatar-menu entry.
+Its setup layout (spec section 5.4) contains:
 
 - the heading "Control Silo from your phone" and the line "Open Silo on a
   phone on this Wi-Fi network and choose this TV";

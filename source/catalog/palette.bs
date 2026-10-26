@@ -1,0 +1,167 @@
+import "pkg:/source/util/thumbhash.bs"
+
+' The ambient wash's three tints (spec section 5.5), tvOS's
+' HeroBackdropPalette: the backdrop's average (base), its strongest hue
+' (accent), and its darkest quarter (shadow), each moved toward the dark
+' theme. tvOS samples a 24 px redraw of a 64 px thumbnail; Roku cannot read
+' a picture's pixels, so it samples the backdrop's ThumbHash decoded at
+' SAMPLE_EDGE px square (util.thumbhash.decode), which carries the same
+' low-frequency colour. Pure.
+namespace catalog.palette
+    const SAMPLE_EDGE = 12
+    const BASE_LUMINANCE = 0.22
+    const ACCENT_LUMINANCE = 0.22
+    const SHADOW_LUMINANCE = 0.07
+    const HUE_BINS = 12
+
+    ' { base, accent, shadow } as "0xRRGGBBFF" at full strength for a
+    ' ThumbHash, or invalid for none. cache (an AA) keeps each hash's tints,
+    ' since decoding costs a few ms of BrightScript.
+    function tints(hash as Dynamic, cache = invalid as Dynamic) as Dynamic
+        if type(hash) <> "String" and type(hash) <> "roString" then return invalid
+        if hash = "" then return invalid
+        if cache <> invalid and cache.DoesExist(hash) then return cache[hash]
+        result = invalid
+        pixels = util.thumbhash.decode(hash, SAMPLE_EDGE, SAMPLE_EDGE)
+        if pixels <> invalid
+            sampled = sample(pixels)
+            if sampled <> invalid then result = { base: hex(sampled.base, 1), accent: hex(sampled.accent, 1), shadow: hex(sampled.shadow, 1) }
+        end if
+        if cache <> invalid then cache[hash] = result
+        return result
+    end function
+
+    ' Base, accent, and shadow ({ r, g, b }, 0 to 1) for pixels, already
+    ' normalized for the dark theme (HeroBackdropPalette.sample), or invalid
+    ' for none.
+    function sample(pixels as Object) as Dynamic
+        if pixels.Count() = 0 then return invalid
+        base = normalize(mean(pixels), BASE_LUMINANCE)
+        ' Shadows: the darkest quarter, so the bottom left keeps the art's
+        ' low-key colour instead of going neutral black.
+        ranked = []
+        for each pixel in pixels
+            ranked.Push({ r: pixel.r, g: pixel.g, b: pixel.b, lum: luminance(pixel) })
+        end for
+        ranked.SortBy("lum")
+        count = pixels.Count() \ 4
+        if count < 1 then count = 1
+        darkest = []
+        for i = 0 to count - 1
+            darkest.Push(ranked[i])
+        end for
+        shadow = normalize(mean(darkest), SHADOW_LUMINANCE)
+        accent = base
+        hue = dominantHue(pixels)
+        if hue <> invalid then accent = normalize(hue, ACCENT_LUMINANCE)
+        return { base: base, accent: accent, shadow: shadow }
+    end function
+
+    ' The mean colour of the strongest of HUE_BINS hue buckets, each pixel
+    ' weighted by (saturation x value) squared, so a small vivid area
+    ' outweighs a larger muted one; invalid for near-grey art, whose accent
+    ' is its base.
+    function dominantHue(pixels as Object) as Dynamic
+        weights = []
+        sums = []
+        for i = 1 to HUE_BINS
+            weights.Push(0.0)
+            sums.Push({ r: 0.0, g: 0.0, b: 0.0 })
+        end for
+        for each pixel in pixels
+            top = pixel.r
+            if pixel.g > top then top = pixel.g
+            if pixel.b > top then top = pixel.b
+            bottom = pixel.r
+            if pixel.g < bottom then bottom = pixel.g
+            if pixel.b < bottom then bottom = pixel.b
+            chroma = top - bottom
+            if top > 0.15 and chroma > 0
+                saturation = chroma / top
+                if saturation > 0.2
+                    if top = pixel.r
+                        hue = (pixel.g - pixel.b) / chroma
+                    else if top = pixel.g
+                        hue = (pixel.b - pixel.r) / chroma + 2
+                    else
+                        hue = (pixel.r - pixel.g) / chroma + 4
+                    end if
+                    hue = hue / 6
+                    hue = hue - Int(hue)
+                    bin = Int(hue * HUE_BINS)
+                    if bin > HUE_BINS - 1 then bin = HUE_BINS - 1
+                    vividness = saturation * top
+                    weight = vividness * vividness
+                    weights[bin] = weights[bin] + weight
+                    sums[bin].r = sums[bin].r + pixel.r * weight
+                    sums[bin].g = sums[bin].g + pixel.g * weight
+                    sums[bin].b = sums[bin].b + pixel.b * weight
+                end if
+            end if
+        end for
+        best = 0
+        for i = 1 to HUE_BINS - 1
+            if weights[i] > weights[best] then best = i
+        end for
+        weight = weights[best]
+        if weight <= 0 or weight < pixels.Count() * 0.01 then return invalid
+        return { r: sums[best].r / weight, g: sums[best].g / weight, b: sums[best].b / weight }
+    end function
+
+    function mean(pixels as Object) as Object
+        total = { r: 0.0, g: 0.0, b: 0.0 }
+        for each pixel in pixels
+            total.r = total.r + pixel.r
+            total.g = total.g + pixel.g
+            total.b = total.b + pixel.b
+        end for
+        count = pixels.Count()
+        return { r: total.r / count, g: total.g / count, b: total.b / count }
+    end function
+
+    function luminance(rgb as Object) as Float
+        return 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b
+    end function
+
+    ' Moves a colour's luminance toward target: a brighter one is dimmed to
+    ' it, a darker one lifted, at most from 0.05, and black stays black.
+    function normalize(rgb as Object, target as Float) as Object
+        lum = luminance(rgb)
+        if lum <= 0.001
+            scale = 0.0
+        else if lum > target
+            scale = target / lum
+        else
+            floor = lum
+            if floor < 0.05 then floor = 0.05
+            scale = target / floor
+            if scale < 1 then scale = 1.0
+        end if
+        result = {}
+        for each channel in ["r", "g", "b"]
+            value = rgb[channel] * scale
+            if value > 1 then value = 1.0
+            result[channel] = value
+        end for
+        return result
+    end function
+
+    ' A colour at weight over black as "0xRRGGBBFF".
+    function hex(rgb as Object, weight as Float) as String
+        out = "0x"
+        for each channel in [rgb.r, rgb.g, rgb.b]
+            byte = UCase(StrI(Int(channel * weight * 255 + 0.5), 16))
+            if Len(byte) < 2 then byte = "0" + byte
+            out = out + byte
+        end for
+        return out + "FF"
+    end function
+
+    ' A "0xRRGGBBFF" tint at weight over black, for the detail page's flat
+    ' base (tvOS: base at 42% over black).
+    function over(color as String, weight as Float) as String
+        value = Val(Mid(color, 3, 6), 16)
+        rgb = { r: (value \ 65536) / 255, g: ((value \ 256) and 255) / 255, b: (value and 255) / 255 }
+        return hex(rgb, weight)
+    end function
+end namespace

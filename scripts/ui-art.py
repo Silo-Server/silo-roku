@@ -10,7 +10,8 @@
   scrim_bottom.png           black, clear at the top and opaque at the bottom
   card_placeholder.png       a card without artwork: Android TV's default
                              artwork, three brand glows over #16171C
-  search_glyph.png           the top bar's magnifier, white, for blendColor
+  search_glyph.png           the top bar's magnifier, white, for blendColor;
+                             2x its logical 28 px canvas for display scaling
 
 tvOS's shared art (spec section 5, silo-apple b90a86ea; AG-222):
 
@@ -38,6 +39,21 @@ tvOS's shared art (spec section 5, silo-apple b90a86ea; AG-222):
   wash_fade.png              white, opaque at the top and clear at the bottom,
                              2x256, stretched from y 287 to the wash foot and
                              tinted with the wash's colour
+  ambient_glow_half.png, ambient_glow_quarter.png
+                             white, alpha falling linearly from 1 at the centre
+                             to 0 at an ellipse, for the accent's glow (the top
+                             half, centred on its bottom edge: 1152x324 at
+                             x 768, the foot of the page) and the shadow's pool
+                             (a quarter, centred on its bottom-left corner:
+                             806x454 at the page's bottom left); tinted, at the
+                             wash's opacity
+  flat_fade_{left,bottom}.png
+                             the backdrop's two fades in white, alpha as
+                             scrim_left.png and backdrop_fade_bottom.png, for
+                             the ambient wash's flat base (spec 5.5)
+  progress_{12_4,18_6}.9.png a progress track where a card rounds its own
+                             corners: white, 4 px (6 px) tall, its bottom
+                             corners on a radius-12 (18) card's curve; FHD only
   still_frame_{fhd,hd}.9.png card_frame at radius 18, for detail episode stills
   card_shadow_{fhd,hd}.9.png a focused card's shadow, black 50% blurred with a
                              10 px sigma (EpisodeThumbCard's radius 20, read as
@@ -55,8 +71,9 @@ tvOS's shared art (spec section 5, silo-apple b90a86ea; AG-222):
   tab_{fill,ring}_{fhd,hd}.9.png
                              the top bar's 56 px tab capsule, filled or as a
                              1 px outline, white
-  check_disc.png             the watched mark: a 40 px #EDEDED disc with a black
-                             check
+  check_disc.png             the watched mark: a logical 40 px #EDEDED disc
+                             with a black check, rasterized at 2x
+  cast_shadow.png            circular portrait shadow using the card shadow blur
   circle_ring_3.png          the focused top bar avatar's ring: 3 px inside a 58 px
                              circle, white
   rounded_{14,12}_{fhd,hd}.9.png
@@ -100,6 +117,7 @@ PLACEHOLDER_BASE = (0x16, 0x17, 0x1C)
 GLOWS = (((0x00, 0x34, 0xFB), 0.176, (0.0, 0.0)), ((0xFD, 0x74, 0x03), 0.144, (1.0, 1.0)), ((0xF5, 0x0B, 0x4F), 0.112, (0.7, 0.3)))
 CIRCLE = 58  # top bar search and avatar circles, FHD px
 GLYPH = 28  # magnifier, FHD px: SF Symbols' magnifyingglass at 27 pt semibold
+GLYPH_SCALE = 2  # intrinsic pixels per logical FHD pixel; glyphs only
 AVATAR_RING = 3  # the focused avatar's ring, inside the circle
 WHITE = (0xFF, 0xFF, 0xFF)
 INK = (0xED, 0xED, 0xED)
@@ -111,6 +129,8 @@ WASH_TOP = 287  # the wash is full to here, then fades (the backdrop mask's firs
 WASH_FEET = (("hero", 596), ("detail", 690))  # where Home's and detail's wash reach black
 FADE_LEFT_COLUMNS = 64
 FADE_LEFT_ROW = 4  # px of the 756 px box per row of the grey-coded left fade
+GLOW_HALF = (128, 36)
+GLOW_QUARTER = (128, 72)
 SHADOW_SIGMA = 10
 SHADOW_ALPHA = 0.5
 SHADOW_MARGIN = 3 * SHADOW_SIGMA  # past the card's edge on every side
@@ -141,15 +161,15 @@ def inside_rounded_rect(x, y, size, inset, radius, height=None):
     return (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2
 
 
-def coverage(size, covered, height=None):
+def coverage(size, covered, height=None, scale=1):
     """Per-pixel alpha (0-255) over a size-wide square (or height-tall rectangle) for a point predicate."""
     height = size if height is None else height
     rows = []
-    for py in range(height):
+    for py in range(height * scale):
         row = []
-        for px in range(size):
+        for px in range(size * scale):
             hits = sum(
-                covered(px + (sx + 0.5) / SAMPLES, py + (sy + 0.5) / SAMPLES, size)
+                covered((px + (sx + 0.5) / SAMPLES) / scale, (py + (sy + 0.5) / SAMPLES) / scale, size)
                 for sy in range(SAMPLES) for sx in range(SAMPLES))
             row.append(round(255 * hits / SAMPLES ** 2))
         rows.append(row)
@@ -164,6 +184,14 @@ def focus_ring(radius, width):
     def covered(x, y, size):
         return inside_rounded_rect(x, y, size, 0, radius) and not inside_rounded_rect(x, y, size, width, radius - width)
     return coverage(2 * radius + STRETCH, covered)
+
+
+def progress_track(radius, height):
+    """The bottom height rows of a rounded rectangle 2 * radius + STRETCH wide."""
+    tall = 4 * radius
+    width = 2 * radius + STRETCH
+    alpha = coverage(width, lambda x, y, size: inside_rounded_rect(x, y + tall - height, size, 0, radius, tall), height)
+    return nine_patch_rgba([[WHITE + (a,) for a in line] for line in alpha], band=height)
 
 
 def nine_patch(alpha, rgb):
@@ -226,7 +254,7 @@ def magnifier(size):
         u = ((x - cx) + (y - cy)) / 2 ** 0.5
         v = ((x - cx) - (y - cy)) / 2 ** 0.5
         return t0 <= u <= t1 and abs(v) <= stroke / 2 + 0.4
-    return [[WHITE + (a,) for a in line] for line in coverage(size, covered)]
+    return [[WHITE + (a,) for a in line] for line in coverage(size, covered, scale=GLYPH_SCALE)]
 
 
 def scrim(width, height, alpha_at):
@@ -270,6 +298,22 @@ def hero_fade_bottom(foot):
     return rows
 
 
+def glow(size, centre):
+    """White, alpha 1 at centre (a fraction of size) falling linearly to 0 at
+    the ellipse whose radii reach the image's far edges from it."""
+    width, height = size
+    cx, cy = centre[0] * width, centre[1] * height
+    rx, ry = max(cx, width - cx), max(cy, height - cy)
+    out = []
+    for y in range(height):
+        line = []
+        for x in range(width):
+            d = math.hypot((x + 0.5 - cx) / rx, (y + 0.5 - cy) / ry)
+            line.append(WHITE + (round(255 * max(0.0, 1 - d)),))
+        out.append(line)
+    return out
+
+
 def top_scrim():
     height, top = TOP_SCRIM
     return scrim(2, height, lambda x, y: round(255 * top * (1 - (y + 0.5) / height)))
@@ -287,6 +331,16 @@ def card_shadow(sigma, margin):
     def along(i):
         return edge(min(i, size - 1 - i))
     return [[BACKGROUND + (round(255 * SHADOW_ALPHA * along(x) * along(y)),) for x in range(size)] for y in range(size)]
+
+
+def cast_shadow(diameter=200):
+    """Radial falloff for round cast portraits, with the Home card shadow's
+    opacity, sigma, and margin; a regular PNG so it cannot stretch square."""
+    size = diameter + 2 * SHADOW_MARGIN
+    centre = size / 2
+    return [[BACKGROUND + (round(255 * SHADOW_ALPHA * 0.5 * math.erfc(
+        (math.hypot(x + 0.5 - centre, y + 0.5 - centre) - diameter / 2)
+        / (SHADOW_SIGMA * 2 ** 0.5))),) for x in range(size)] for y in range(size)]
 
 
 def over(top, bottom):
@@ -363,7 +417,8 @@ def check_disc(size):
 
     def on_disc(x, y, size):
         return (x - size / 2) ** 2 + (y - size / 2) ** 2 <= (size / 2) ** 2
-    disc, check = coverage(size, on_disc), coverage(size, on_check)
+    disc = coverage(size, on_disc, scale=GLYPH_SCALE)
+    check = coverage(size, on_check, scale=GLYPH_SCALE)
     rows = []
     for d_line, c_line in zip(disc, check):
         row = []
@@ -400,6 +455,10 @@ def images():
         yield f"{page}_fade_left.png", hero_fade_left(foot)
         yield f"{page}_fade_bottom.png", hero_fade_bottom(foot)
     yield "wash_fade.png", [[WHITE + (255 - y,)] * 2 for y in range(RAMP)]
+    yield "ambient_glow_half.png", glow(GLOW_HALF, (0.5, 1.0))
+    yield "ambient_glow_quarter.png", glow(GLOW_QUARTER, (0.0, 1.0))
+    yield "flat_fade_left.png", [[WHITE + (255 - x,) for x in range(RAMP)]] * 2
+    yield "flat_fade_bottom.png", [[WHITE + (round(255 * (1 - piecewise(BACKDROP_STOPS, y + 0.5))),)] * 2 for y in range(BACKDROP_HEIGHT)]
     for res, scale in (("fhd", lambda px: px), ("hd", hd)):
         yield f"still_frame_{res}.9.png", nine_patch(card_frame(scale(STILL_RADIUS)), BACKGROUND)
         yield f"card_shadow_{res}.9.png", nine_patch_rgba(card_shadow(scale(SHADOW_SIGMA), scale(SHADOW_MARGIN)))
@@ -408,8 +467,11 @@ def images():
             yield f"panel_{radius}_{res}.9.png", nine_patch_rgba(panel(scale(radius)), PANEL_BAND)
         yield f"tab_fill_{res}.9.png", nine_patch(capsule(scale(TAB), 0), WHITE)
         yield f"tab_ring_{res}.9.png", nine_patch(capsule(scale(TAB), 1), WHITE)
+    for radius, height in ((CARD_RADIUS, 4), (STILL_RADIUS, 6)):
+        yield f"progress_{radius}_{height}.9.png", progress_track(radius, height)
     yield "check_disc.png", check_disc(CHECK_DISC)
     yield "circle_ring_3.png", circle_ring(CIRCLE, AVATAR_RING)
+    yield "cast_shadow.png", cast_shadow()
     for res, scale in (("fhd", lambda px: px), ("hd", hd)):
         for radius in ROW_RADII:
             yield f"rounded_{radius}_{res}.9.png", nine_patch(rounded(scale(radius)), WHITE)

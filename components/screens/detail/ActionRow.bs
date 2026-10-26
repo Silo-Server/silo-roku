@@ -10,10 +10,18 @@ sub init()
     m.at = 0
     m.primaryWidth = 0
     m.top.observeField("focusedChild", "onFocusChange")
+    m.top.observeField("visible", "onMotionPolicy")
 end sub
 
 sub build()
     previous = m.top.focusedKey
+    for each item in m.items
+        item.motion.control = "stop"
+        item.fade.control = "stop"
+        item.fill.unobserveField("width")
+        item.group.unobserveField("translation")
+        item.text.unobserveField("opacity")
+    end for
     m.top.removeChildrenIndex(m.top.getChildCount(), 0)
     m.items = []
     buttons = []
@@ -25,8 +33,13 @@ sub build()
     for each button in buttons
         group = m.top.createChild("Group")
         fill = group.createChild("Poster")
+        group.id = "action" + m.items.Count().ToStr()
+        group.observeField("translation", "onPosition")
+        fill.id = group.id + "Fill"
+        fill.observeField("width", "onWidth")
         fill.uri = theme.firstRunArt.BUTTON_FILL
         glyph = group.createChild("Poster")
+        glyph.id = group.id + "Glyph"
         glyph.uri = glyphFor(button.key)
         glyph.width = theme.detail.GLYPH
         glyph.height = theme.detail.GLYPH
@@ -36,6 +49,8 @@ sub build()
         else
             text.font = theme.font(theme.textStyle.TAB_LABEL)
         end if
+        text.id = group.id + "Text"
+        text.observeField("opacity", "onTextOpacity")
         text.text = button.label
         text.vertAlign = "center"
         text.height = theme.detail.BUTTON
@@ -45,11 +60,18 @@ sub build()
         if util.isBoolean(button.enabled) then enabled = button.enabled
         group.opacity = 1
         if not enabled then group.opacity = theme.detail.DISABLED_OPACITY
-        m.items.Push({ key: button.key, label: button.label, speech: speech, enabled: enabled, group: group, fill: fill, glyph: glyph, text: text, labelWidth: Int(text.boundingRect().width) })
+        motion = group.createChild("Animation")
+        motion.setFields({ duration: theme.detail.BUTTON_RESIZE_SECONDS, easeFunction: "inOutCubic" })
+        motion.createChild("Vector2DFieldInterpolator").setFields({ key: [0, 1], fieldToInterp: group.id + ".translation" })
+        motion.createChild("FloatFieldInterpolator").setFields({ key: [0, 1], fieldToInterp: fill.id + ".width" })
+        motion.createChild("Vector2DFieldInterpolator").setFields({ key: [0, 1], fieldToInterp: glyph.id + ".translation" })
+        fade = group.createChild("Animation")
+        fade.createChild("FloatFieldInterpolator").fieldToInterp = text.id + ".opacity"
+        m.items.Push({ motion: motion, fade: fade, target: invalid, key: button.key, label: button.label, speech: speech, enabled: enabled, group: group, fill: fill, glyph: glyph, text: text, labelWidth: Int(text.boundingRect().width) })
     end for
     m.at = enabledFrom(indexOf(previous))
     m.top.focusedKey = keyAt(m.at)
-    restyle()
+    layout(false)
 end sub
 
 function glyphFor(key as String) as String
@@ -94,11 +116,16 @@ sub onFocusChange()
     if m.top.isInFocusChain() and m.at < m.items.Count() then speak(m.items[m.at].speech)
 end sub
 
-' Lays the buttons out left to right. Play always shows its label, centred in
-' at least m.primaryWidth; another button shows its label only while it is
-' highlighted and the row has focus or holds it (held).
+' A single geometry timeline per button moves its left edge, width and glyph
+' together. Re-target from the rendered fields, including halfway through a
+' reversal; repeated focus/held notifications must not restart the reveal.
 sub restyle()
+    layout(true)
+end sub
+
+sub layout(animate as Boolean)
     focused = m.top.isInFocusChain() or m.top.held
+    animate = animate and m.top.active and m.top.visible and not m.top.lowTier
     x = 0
     size = theme.detail.BUTTON
     for i = 0 to m.items.Count() - 1
@@ -112,18 +139,65 @@ sub restyle()
             if width < m.primaryWidth then width = m.primaryWidth
             glyphX = (width - content) \ 2
             item.text.translation = [glyphX + theme.detail.GLYPH + theme.detail.PLAY_LABEL_GAP, 0]
-        else if open
-            content = theme.detail.GLYPH + theme.detail.LABEL_GAP + item.labelWidth
-            width = content + 2 * theme.detail.BUTTON_PADDING
-            glyphX = theme.detail.BUTTON_PADDING
-            item.text.translation = [glyphX + theme.detail.GLYPH + theme.detail.LABEL_GAP, 0]
+        else
+            item.text.translation = [theme.detail.BUTTON_PADDING + theme.detail.GLYPH + theme.detail.LABEL_GAP, 0]
+            if open
+                width = theme.detail.GLYPH + theme.detail.LABEL_GAP + item.labelWidth + 2 * theme.detail.BUTTON_PADDING
+                glyphX = theme.detail.BUTTON_PADDING
+            end if
         end if
-        item.group.translation = [x, 0]
-        if i = m.at then m.top.highlightX = x
-        item.fill.width = width
+        target = { x: x, width: width, glyphX: glyphX, shown: open or item.key = catalog.action.PLAY }
+        move = item.target = invalid
+        reveal = move
+        if item.target <> invalid
+            move = item.target.x <> x or item.target.width <> width or item.target.glyphX <> glyphX
+            reveal = item.target.shown <> target.shown
+        end if
+        if move or not animate
+            ' Capture before stop: the next start is the current presentation,
+            ' never the previous endpoint, even on Roku versions that reset stop.
+            current = [item.group.translation, item.fill.width, item.glyph.translation]
+            item.motion.control = "stop"
+            destination = [[x, 0], width, [glyphX, (size - theme.detail.GLYPH) / 2]]
+            if animate
+                item.group.translation = current[0]
+                item.fill.width = current[1]
+                item.glyph.translation = current[2]
+                for field = 0 to 2
+                    item.motion.getChild(field).keyValue = [current[field], destination[field]]
+                end for
+                item.motion.control = "start"
+            else
+                item.group.translation = destination[0]
+                item.fill.width = width
+                item.glyph.translation = destination[2]
+            end if
+        end if
+        if reveal or not animate
+            opacity = item.text.opacity
+            item.fade.control = "stop"
+            level = 0.0
+            if target.shown then level = 1.0
+            if animate
+                item.text.visible = true
+                item.text.opacity = opacity
+                item.fade.delay = 0
+                item.fade.duration = theme.detail.BUTTON_DISMISS_SECONDS
+                item.fade.easeFunction = "inQuad"
+                if target.shown
+                    item.fade.delay = theme.detail.BUTTON_REVEAL_DELAY
+                    item.fade.duration = theme.detail.BUTTON_REVEAL_SECONDS
+                    item.fade.easeFunction = "outQuad"
+                end if
+                item.fade.getChild(0).setFields({ key: [0, 1], keyValue: [opacity, level] })
+                item.fade.control = "start"
+            else
+                item.text.opacity = level
+                item.text.visible = target.shown
+            end if
+        end if
+        item.target = target
         item.fill.height = size
-        item.glyph.translation = [glyphX, (size - theme.detail.GLYPH) / 2]
-        item.text.visible = open or item.key = catalog.action.PLAY
         if open
             item.fill.blendColor = theme.color.PILL_FOCUS
             item.fill.opacity = 1
@@ -137,6 +211,31 @@ sub restyle()
         end if
         x = x + width + theme.detail.BUTTON_GAP
     end for
+    updateHighlight()
+end sub
+
+' Clip the arriving/departing label to the capsule's current bounds. No
+' timers or completion callbacks can resurrect a previously focused pill.
+sub onWidth(event as Object)
+    fill = event.getRoSGNode()
+    fill.getParent().clippingRect = [0, 0, fill.width, theme.detail.BUTTON]
+end sub
+
+sub onTextOpacity(event as Object)
+    label = event.getRoSGNode()
+    label.visible = label.opacity > 0
+end sub
+
+sub onPosition()
+    updateHighlight()
+end sub
+
+sub updateHighlight()
+    if m.at < m.items.Count() then m.top.highlightX = m.items[m.at].group.translation[0]
+end sub
+
+sub onMotionPolicy()
+    layout(false)
 end sub
 
 function onKeyEvent(key as String, press as Boolean) as Boolean

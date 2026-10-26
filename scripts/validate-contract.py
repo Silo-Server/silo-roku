@@ -327,8 +327,16 @@ def client_problems(body):
             errors.append(f"{where}.audio_passthrough_codecs must be empty")
         if "failure_reason" in delivery and delivery["enabled"] and delivery["supported_on_device"]:
             errors.append(f"{where}.failure_reason is only for a disabled class")
-        if "hdr_details" in delivery and name != "original_http":
-            errors.append(f"{where}.hdr_details is sent only on original_http")
+        if "hdr_details" in delivery and name not in ("original_http", "hls"):
+            errors.append(f"{where}.hdr_details is sent only on original_http and hls")
+        if name == "hls":
+            # Omission inherits native output DV on the server. Keep the
+            # explicit restriction across serialization without losing HDR.
+            native_hdr = output.get("hdr_details", {})
+            expected_hdr = {key: native_hdr.get(key, False) for key in ("hdr10", "hdr10_plus", "hlg")}
+            expected_hdr["dolby_vision_profiles"] = []
+            if delivery.get("hdr_details") != expected_hdr:
+                errors.append(f"{where}.hdr_details must preserve output HDR with an explicit empty Dolby Vision profile list")
         if delivery.get("max_channels", 2) != 2:
             errors.append(f"{where}.max_channels is only the interim two-channel ceiling")
         if delivery["transformations"]:
@@ -386,6 +394,11 @@ def self_test(sample):
         "a track index that disagrees with its ID": lambda b: b.update(audio_track_id=f"file:{b['file_id']}:audio:1", audio_track_index=2),
         "base-layer IDs without the claim": lambda b: b["client_playback_context"]["deliveries"]["hls"].update(dv8_base_layer_compatibility_ids=[1]),
         "a base-layer ID above 15": lambda b: b["client_playback_context"]["deliveries"]["original_http"].update(dv8_base_layer_compatibility_ids=[16]),
+        "omitted HLS HDR restriction": lambda b: b["client_playback_context"]["deliveries"]["hls"].pop("hdr_details"),
+        "HLS Dolby Vision claim": lambda b: b["client_playback_context"]["deliveries"]["hls"]["hdr_details"].update(dolby_vision_profiles=[8]),
+        "HLS Dolby Vision level claim": lambda b: b["client_playback_context"]["deliveries"]["hls"]["hdr_details"].update(dolby_vision_profile_levels=[{"profile": 8, "max_level": 9}]),
+        "changed HLS HDR10 support": lambda b: b["client_playback_context"]["deliveries"]["hls"]["hdr_details"].update(hdr10=not b["client_playback_context"]["output"]["hdr_details"]["hdr10"]),
+        "changed HLS HLG support": lambda b: b["client_playback_context"]["deliveries"]["hls"]["hdr_details"].update(hlg=not b["client_playback_context"]["output"]["hdr_details"]["hlg"]),
     }
     failed = [name for name, change in cases.items() if not problems(mutate(change), "start")]
     session_cases = {

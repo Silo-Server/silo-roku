@@ -103,10 +103,11 @@ Browse:
 
 - Home built from the server's home sections, including the Continue Watching
   and Next Up rows the server provides;
-- Movies and Series library tabs, each with Recommended rows and a Browse
-  grid with sort and an alphabet rail;
+- Movies and Series library tabs, each with Recommended rows, a Browse
+  grid with sort and an alphabet rail, and read-only Collections pages;
 - search across movies, series, and episodes;
-- movie detail, and series detail with season and episode lists;
+- movie detail, and series detail with season and episode lists, cast, and
+  recommendations;
 - on the heroes, the detail page's credit line ("Directed by", "Starring")
   and the server's external ratings, Home's quality badges, and the
   profile's title-art preference (`ui.title_art`).
@@ -143,8 +144,8 @@ Section 5 describes how each of these looks and behaves.
   [`silocontrol.md`](silocontrol.md) and [`silocontrol-plan.md`](silocontrol-plan.md);
 - favorites, watchlist, and watched toggles; the history screen (server rows
   that contain this data still display on Home);
-- collections, people pages and search results, cast, trailers, extras,
-  related titles, and an edition picker (the Version menu names each
+- collection creation and editing, people search results and full person pages, trailers,
+  extras, and an edition picker (the Version menu names each
   version's edition, section 5.6);
 - library filters and shuffle;
 - requests, calendar, the For You tab, and notifications;
@@ -267,8 +268,10 @@ The values below were read from silo-apple `b90a86ea` and silo-android
 `0545b85de` on 2026-10-23. When tvOS changes a first-release screen, this
 section changes with it. Screens outside the first-release scope are not
 described. Where a deferred control has a fixed place on tvOS (Watchlist and
-More in the detail action row; Collections in the library list; Cast & Crew,
-Trailers & More, and Related above Details), Roku leaves that place free.
+More in the detail action row; Collections in the library list; Trailers &
+More above Details), Roku leaves that place free. The card captions and
+detail cast and recommendations were checked against silo-apple `b514800f`
+on 2026-10-25.
 
 ### 5.2 Design tokens
 
@@ -308,6 +311,12 @@ Type sizes in px (weight), named in `theme.textStyle`:
 Inter is licensed under the OFL and is what Android TV ships. Roku ships four
 weights, subset to Latin, Latin Extended, Greek, Cyrillic, and Vietnamese.
 Timecodes use monospaced digits.
+
+Generated player, detail, settings, search, watched-mark, and first-run symbol
+assets use two raster pixels per logical FHD pixel. Their displayed sizes
+and placement remain fixed by the components; the higher-resolution source
+preserves edges when scaled. Stretchable backgrounds and focus rings retain
+their existing HD/FHD assets.
 
 ### 5.3 Shell, top bar, and Back
 
@@ -470,13 +479,24 @@ Timecodes use monospaced digits.
     680.
   - A full-width 190 px scrim, from black 50% to clear, sits under the top
     bar.
-  - Wash: behind the backdrop, the shown card's colour (the average of its
-    `backdrop_thumbhash`, or of `poster_thumbhash` when the poster stands
-    in; tvOS's base tint, its luminance moved to 0.22, at 42% over black)
-    fills the hero to y 287 and fades to black at the row band (y 596). The
-    backdrop's fades blend the art into the wash. Its colour changes with
-    the backdrop's 0.24 s cross-fade; without a ThumbHash the page stays
-    black (5.9).
+  - Wash (tvOS's ambient backdrop wash, silo-apple #829): three tints from
+    the shown card's picture (its `backdrop_thumbhash`, or `poster_thumbhash`
+    when the poster stands in), decoded at 12×12 and sampled as tvOS's
+    `HeroBackdropPalette` samples: the average (base), the strongest hue
+    weighted by saturation times value squared (accent), and the darkest
+    quarter (shadow), each moved to luminance 0.22, 0.22, and 0.07. Where
+    cards round their own corners (Roku OS 16 `Effect`, not the low tier),
+    the base at 42% over black fills the whole page; the accent glows up
+    from the page's foot, an ellipse 0.3 of the page across and high
+    centred at x 1344, at 30%; the shadow pools in the bottom-left corner,
+    0.42 of the page across and high, at 55%. Elsewhere only the base, at
+    42%, fills the hero to y 287 and fades to black at the row band
+    (y 596), above the cards' painted corners. The backdrop's fades blend
+    the art into the base, and the colours change with the backdrop's
+    0.24 s cross-fade. Without a ThumbHash the page stays black (5.9).
+  - Once focus rests on a card, the backdrops and logos of the cards on
+    either side are decoded ahead at the hero's sizes (not on the low
+    tier), so moving to either shows them at once.
   - Text block: 880 px wide at x 88, its bottom at y 536 (D12: from the repo's
     tvOS screenshot; check it against a tvOS frame when one can be captured),
     with 14 px between items, top to bottom:
@@ -505,8 +525,21 @@ Timecodes use monospaced digits.
     any "next" section, and rows whose items are all episodes, seasons, or
     series. A row containing movies keeps posters.
   - Captions sit 22 px under posters and 14 px under landscape cards. The
-    title is 24 px Medium at 45%, white SemiBold when focused (one line on
-    Roku; 5.9).
+    title is 24 px Medium at 45%, white SemiBold when focused. A second line,
+    4 px below it, shows the year for movies and series, or "S01E02 · Pilot"
+    beneath an episode's series name. Metadata is 20 px Regular at 32%, white
+    at 92% and Medium when focused. Both lines stay single-line and truncate
+    at the tail; they drop together clear of focused artwork. Rows and grids
+    reserve space for both lines and the focus drop. The low tier keeps both
+    lines without scaling or dropping them.
+    Focus does not change caption width, horizontal position, or font size.
+    The vertical drop is 5 px under row posters and 13 px under landscape
+    cards, matching tvOS's fixed 19 px overhang and 8 px clearance.
+    Episodes use their own title when the series name is missing, omit an
+    episode title that repeats the series name, and show whichever metadata
+    is available (the code requires both season and episode numbers). Missing
+    years leave the second line empty. This follows Apple TV's card captions
+    at `silo-apple` revision `b514800f`.
   - Played items carry a watched check (a 40 px `#EDEDED` disc with a black
     check, 12 px from the top right; 14 px on landscape cards).
   - OK on any card opens the detail page; from Continue Watching, the detail
@@ -519,8 +552,9 @@ Timecodes use monospaced digits.
 - **Browse.**
   - Page: the Sort pill at (80, 248), then the grid 32 px below it. The grid
     has six columns of 260×390 posters, 40 px apart across and 60 px down.
-  - Captions: centred, 16 px below the poster. The title is 24 px Medium at
-    45%, white SemiBold when focused.
+  - Captions: centred, 16 px below the poster, with the same two-line title
+    and metadata treatment as Home. The vertical spacing includes both lines
+    and their focus drop.
   - Focus: entering Browse focuses Sort. Down goes to the first poster.
   - Sort pill: "Sort · Title A–Z", 24 px Medium, padding 22. At rest, a white
     7% fill and a 9% border. Focused, an `#EDEDED` fill with black text,
@@ -542,6 +576,29 @@ Timecodes use monospaced digits.
     - focused: 96 px wide, with 38×38 letter chips 4 px apart in 15 px
       SemiBold. Lit chips are `#EDEDED` with black letters; the others are at
       60%. No panel.
+- **Collections.**
+  - The Movies and Series library menus offer Collections alongside
+    Recommended and Browse. Each opens the selected library's ordered
+    collections, including profile-visible personal collections.
+  - Posters show the collection title and a nonzero item count. Missing
+    artwork uses the existing poster placeholder. Relative artwork resolves
+    against the API origin; failed images retain that placeholder. One
+    background renewal preserves the current navigation focus.
+  - The server supplies the complete collection index. Roku retains only
+    lightweight card metadata and materializes a bounded grid window.
+    Groups retain server order, including the ungrouped section's declared
+    position; empty groups are omitted.
+  - A pill labeled "Collection groups" selects one group at a time through
+    a scrollable menu. The ungrouped curated section is labeled "Server
+    collections", distinct from "My collections".
+    Opening a collection shows a paginated poster grid in server order;
+    opening a title uses the existing detail page. Back restores the group
+    and selected collection or title. Ordinary libraries retain all visible
+    collection members; only a typed mixed-library view narrows membership.
+    Empty and failed reads use the
+    standard empty state or Retry.
+  - These pages are read-only. Creating, editing, and deleting collections
+    remain deferred.
 - **Empty states.**
   - Home: "Nothing to watch yet" / "Add media to your libraries or start
     watching to see it here."
@@ -566,12 +623,16 @@ Timecodes use monospaced digits.
     matches, "No results" / "Try a different search term".
   - Back from the results returns to the keyboard; the next Back leaves
     Search.
+  - Captions use Browse's two-line treatment: title and year, or series
+    name and "S01E02 · Pilot" for episodes. Both lines truncate at the tail.
   - An episode result opens its series' page with that episode selected.
 - **Detail hero.**
   - Frame: 690 px tall, 100 px side inset, text starting 116 px from the top
     in a 1080 px column. The backdrop, its fades, and its wash are the Home
-    hero's (5.5), the wash reaching black at the hero's foot, y 690, above
-    the first content below the action row.
+    hero's (5.5). The ambient wash stays fixed behind the page as it
+    scrolls; without it the wash reaches black at the hero's foot, y 690,
+    above the first content below the action row. The logo decodes at
+    Home's size, so a page opened from Home reuses the hero's bitmap.
   - Title: the logo, fitted within 650×160 (small logos are enlarged), or the
     title in uppercase, split at ": ", " — ", " – ", or " - " into a main line
     and a 40 px subtitle. The text title shows when the profile turns title
@@ -605,7 +666,13 @@ Timecodes use monospaced digits.
     with white content; focused, a white fill with black content.
   - The other buttons are 76 px circles: white 10% at rest, no ring. Focused,
     they fill white and widen to show their 26 px label. Buttons are 18 px
-    apart.
+    apart. On the normal tier, focusing a circle animates its width and
+    neighboring button positions over 280 ms with cubic ease-in/out,
+    approximating tvOS’s smooth curve with Roku’s native interpolator. Its
+    label fades in over 180 ms after a 60 ms delay, and fades out over 80 ms.
+    Rapid focus changes retarget from the current geometry. The low tier
+    snaps to the same layout. A selector stays expanded while its menu is
+    open, and the menu follows the button during expansion.
   - Focus starts on Play; Left and Right move along the row. Play and Resume
     start where the watch state says (section 5.7); Start Over starts at 0.
 - **Version, audio, and subtitles.** As tvOS ships them (D1; silo-apple
@@ -705,6 +772,33 @@ Timecodes use monospaced digits.
     or a search result), in that episode's season, then the last episode
     focused; switching season makes its first episode active, as both
     existing apps do.
+- **Cast and recommendations.**
+  - After the hero on movies, or the episode rail on series, show Cast &
+    Crew, then Related Movies or Recommended Series, then Details. Cast
+    preserves server order and displays up to 24 people with 200 px
+    portraits, names, and characters. Missing portraits use initials;
+    entries without a person ID remain readable but cannot open a person.
+    Focus follows Home's card treatment: a centred 38 px lift with a round
+    shadow and highlighted captions, without an outline. The low tier uses
+    an outline without lifting. Names wrap to at most two lines, with the
+    character 6 px below; both captions stay clear of the lifted portrait.
+    All supporting rails use floating focus: cards remain stationary until
+    selection crosses the visible edge. Selection and viewport position
+    survive Back and screen reconstruction. Poster cards use Home's
+    ringless lift and shadow, or an outline without lift on the low tier.
+  - Recommendations preserve server order, show up to 12 movie/series
+    poster cards, and open the existing detail route. Their two-line captions
+    are centred 16 px under each poster, dropping 11 px with the Home-style
+    focus lift. Their request starts
+    900 ms after primary detail loading; placeholders are not focusable,
+    and empty or failed responses remove the whole section. Up and Down
+    move between available sections; late responses do not take focus.
+  - Selecting a person opens a panel containing their biography,
+    birth/death information, and up to 24 visible movie/series titles under
+    In Your Library. The biography displays at most six lines. Back returns
+    to the selected cast card. Person errors stay within the panel and
+    offer Retry for transient failures. Full person pages, pagination,
+    external links, and metadata-refresh controls remain deferred.
 - **Details.**
   - The header "Details" is 36 px SemiBold, 14 px above the table.
   - The table is one column, up to 1400 px wide. Labels are 260 px wide,
@@ -732,7 +826,10 @@ The player's chrome follows tvOS (D9), keeping Roku's caption modes in the
 Subtitles tab (criterion 4.8).
 
 - **Controls overlay.**
-  - Gradient: covers the bottom 240 px, clear to black 55%.
+  - Gradient: covers the bottom 600 px, clear to black 94% with cubic
+    ease-out coverage. It reaches about 72% behind the series line and 76%
+    behind the title and episode tag, keeping all three readable over bright
+    video without changing their size or placement (5.9).
   - Layout: left-aligned on the tvOS safe area, x 160 to 1760. Top to bottom:
     - on an episode, the series title in 20 px Medium at 65%;
     - the title in 36 px SemiBold, with "S1 · E2" in 20 px Regular at 60%
@@ -1042,7 +1139,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | --- | --- | --- |
 | QR or device-code sign-in is the default; password is the alternative | Password sign-in, or a code shown only when a Silo phone app on the network offers to sign the Roku in (companion sign-in) | Certification criterion 2.2 (section 7.2) |
 | "Set up with your phone" and network discovery lead server setup | Address entry, or a Silo phone app pushes the server (companion sign-in); no discovery of servers | Discovery deferred (section 3.3) |
-| The TV's remote-control standby screen takes over while a phone is connected | Connect a Phone in the avatar menu, above Switch Profile, shows the connected phones, the address, and a QR code; a phone connecting shows "<phone> connected" for four seconds and nothing else changes | Roku apps cannot be opened by a phone (no ECP from phone apps), so there is nothing to stand by for; `docs/silocontrol.md` section 4 (development builds until the receiver ships) |
+| The TV's remote-control standby screen takes over while a phone is connected | No Connect a Phone entry is exposed in the avatar menu; the pairing route remains implemented. A phone connecting shows "<phone> connected" for four seconds and nothing else changes | The avatar menu omits the pairing entry for the first release. Roku apps cannot be opened by a phone (no ECP from phone apps), so there is nothing to stand by for; `docs/silocontrol.md` section 4 |
 | A phone's profile handoff shows a "Playing as" card for six seconds | The player's notice card says "Playing as <profile> · From <phone>" for four seconds | The notice card is the player's one non-focusable card; `docs/silocontrol.md` section 4.2 |
 | The sign-in screens offer phone sign-in over TLS (`_silopair._tcp`) and show the code in their own card | A phone push opens a Companion screen over the server or sign-in screen: Allow / Don't Allow, the check, then the code and match words; the card says "Use your phone"; the service is `_silopair-roku._tcp` over plain TCP | Roku has no TLS on listening sockets, and the sign-in screen shows no code until a phone asks for one; `docs/companion-pairing.md` |
 | Custom PIN keypad | Roku `DynamicPinPad` inside the same layout | Criterion 4.12 requires Roku keyboards for PINs |
@@ -1072,13 +1169,14 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A list that fails to load shows the error with Try Again only | The error with Try again, and Change server and Sign out pinned below | An account the server refuses (a password that must change) has no Try again; the buttons are its only way out |
 | A profile that fails to open leaves the picker as it was | The account line shows the error in `#FF6961` until the next choice | Without it, OK on a profile would seem to do nothing |
 | Try Again on an error state rests as a light pill (`#EDEDED` at 72%, black text) | The first-run button: glass at rest, `#EDEDED` when focused | Roku draws its own focus, and a light pill at rest would read as focused |
-| A wash from three tints sampled from the backdrop (base, accent, shadow) sits behind the hero backdrop and carries on under the rows; on detail, the base at 42% fills the whole page | Only the base, from the average colour in the backdrop's `backdrop_thumbhash` at 42% on Home and detail alike, fills the hero to y 287 and fades to black at Home's row band (y 596) and at the detail hero's foot (y 690); the rows and the rest of the detail page sit on black. Without a ThumbHash the page stays black | BrightScript cannot read image pixels for the accent and shadow, and a ThumbHash's DC term gives only the average. Cards' rounded corners are painted black by a 9-patch frame (plan section 4.6), so the wash ends above the first cards (AG-253, AG-292) |
+| A wash from three tints sampled from the backdrop (base, accent, shadow): on Home the base runs from full at the top right to 18% at the bottom left; on detail the base at 42% fills the whole page; the accent and shadow glow under the rows on both | The tints sampled from the backdrop's `backdrop_thumbhash` decoded at 12×12, not from its pixels. Where cards round their own corners (Roku OS 16 `Effect`, not the low tier), the base is flat at 42% on Home as on detail, with the accent and shadow glows. Elsewhere only the base, at 42%, fills the hero to y 287 and fades to black at Home's row band (y 596) and at the detail hero's foot (y 690); the rows sit on black. Without a ThumbHash the page stays black | BrightScript cannot read image pixels. A full-screen texture or shader gradient under the rows cost the Ultra 4850X about 10 fps of row scrolling (median 59.9 to 47–50), where a flat Rectangle costs none. Cards' rounded corners without an `Effect` are painted black by a 9-patch frame (plan section 4.6), so there the wash ends above the first cards (AG-253, AG-292, AG-317) |
 | SF Pro, and SF Mono for small uppercase headers | Inter, as on Android TV | SF Pro and SF Mono cannot ship outside Apple platforms |
 | Heavy and Black titles; the detail title in Black Compressed at 92 px | Inter Bold; the detail title at 84 px | Package size: four weights only, and Inter ships no compressed width at that weight |
 | Letter-spaced small text (badge chips, uppercase headers) | Spacing approximated with hair spaces (`theme.tracked`) | Roku `Label` has no letter-spacing field |
 | System fonts cover every script | Titles in scripts outside Latin, Greek, Cyrillic, and Vietnamese (for example CJK and Arabic) render as boxes | Neither the packaged Inter subset nor Roku's system font covers them, and a CJK font does not fit the 4 MB package |
-| Panels, buttons, cards, and the hero's title cast soft shadows, and a focused card's caption glows; focused controls change over 120 ms or more | Cards use a shadow 9-patch (5.2) and lift with the list's own focus animation; panels open with tvOS's 0.12 s fade; panels, buttons, and the title have no shadow, captions no glow, and other focus changes are immediate | Roku has no blur, and animations cost frames on 512 MB devices |
+| Panels, buttons, cards, and the hero's title cast soft shadows, and a focused card's caption glows; focused controls change over 120 ms or more | Cards use a shadow 9-patch (5.2) and lift with the list's own focus animation; panels open with tvOS's 0.12 s fade; panels, buttons, and the title have no shadow, captions no glow; detail action circles animate width and label reveal on the normal tier (5.6), while the low tier snaps | Roku has no blur, and animations cost frames on 512 MB devices |
 | Focused cards lift on every device | On the low tier, cards do not scale and the list draws a 9-patch ring | Plan section 4.6: frame rate on 512 MB and non-OpenGL devices |
+| Cast and recommendation cards use an outline and a smaller scale than Home | Detail supporting rails use Home's ringless lift and caption highlighting; cast retains round portraits and a round shadow. Low-tier cards keep an outline without lifting | Consistent focus treatment across Roku's Home and detail rails |
 | A focused card scales by one factor (a poster 1.14) about its centre | Each side grows by whole px, so the two axes differ slightly: a row's poster lifts to 202×302, Browse's to 286×428, Search's to 246×368, a landscape card to 432×240, a detail episode still to 388×216. The card scales about its top-left corner and moves back by that lift (a landscape card 36 and 20 px), so its left and top edges are whole px exactly | At a fractional edge Roku drew the art a pixel past the 9-patch frame that rounds the corners, a white line down a lifted card's right edge (hardware run 26). Scaled about its centre, a float's 1.2 put the first Continue Watching card's left edge at x 43.99998, and Roku drew its progress bar, a Rectangle, from x 43, a tick left of the frame's corner (runs 26 and 27) |
 | The detail Subtitles menu leads with the profile's subtitle language; the player's list with the watch projection's effective subtitle language | Both lead with the projection's `effective_subtitle_language`, so the detail menu and Options' Subtitles list the same tracks in the same order and words. Each lists its own source, as on tvOS: the detail menu the version's tracks, Options the plan's inventory, so a sidecar only the plan names shows only in Options | The two lists disagreed on hardware run 27: Options listed the server's order and hid titles the detail menu showed. A detail pick is an ordinal into the projection's list, so the detail menu cannot offer a track the projection does not name |
 | A subtitle's title shows unless it is a release name, a format, a flag, or its language | A title that is a subtitle file's name ("Heat (1995).en.srt") is dropped too, on the detail menu and in Options | The server gives an untitled sidecar its file's name as its title and its inventory label (hardware run 6) |
@@ -1088,7 +1186,6 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The hero's logo shows as soon as it is decoded | The logo loads once focus rests 150 ms on the card, with the backdrop; the text title shows until then | Decoding a logo for every card passed while scrolling churns texture memory on 512 MB devices |
 | The hero's meta line shows the IMDb or TMDB mark before the score | The source's name as text ("IMDb 8.3") | No logo art ships for rating sources |
 | Runtimes read "45m" and "1h 0m" | "45 min" and "1h", as Android TV writes them | The `catalog.` runtime strings serve Home, detail, and Up Next alike; a copy change of its own moves them |
-| Cards carry a second caption line (a year, or an episode's date and runtime) | One caption line on rows and grids: the title, or an episode's series title; detail episode stills take two, "S01E02 · Title" over the date and runtime | Plan section 4.6 allows one `Label` per card, for scrolling speed on 512 MB devices; the hero shows the rest |
 | Cards carry resolution, HDR, audio, and release-type overlays | No overlays | The node budget per card (plan section 4.6); the server's overlay preferences are not read |
 | Continue Watching's header has an icon | Text only | No icon art ships, and `RowList` row labels are text |
 | A card without artwork shows its ThumbHash, or brand glows with a film or TV icon | The brand glows without an icon | Decoding a ThumbHash image costs CPU per card on low-cost hardware, and an icon would add a node to every card |
@@ -1099,6 +1196,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A failed Home shows the server's message, or "Failed to load home sections" | The message every browse page uses for a failed load, with Retry | Section 5.8; the client's copy lives in `locale/` |
 | Library pages draw skeletons while they load | A centred 128 px spinner | One `Poster` instead of a placeholder per card on 512 MB devices |
 | On a mixed library, each Recommended section shows only the tab's type | Both tabs show every item of a mixed library's sections | Not built (AG-280): the server's section reads refuse a type, so the client would filter each section and refill it page by page, as tvOS does, which `BrowseRows`' loading and dropping of rows around focus does not yet support |
+| Collection groups appear as vertically stacked grids with uppercase headers | One group at a time, selected with a group pill and scrollable menu | Reuses the bounded Roku grid and keeps only one group's rendered cards active |
 | The Sort pill, with a swap icon, is the first item of the Browse grid and scrolls away with it | The pill stays above the grid, without the icon, and the grid keeps its focused row at the top (fixed focus) instead of scrolling the page | `MarkupGrid` has no full-width header item, and no icon art ships |
 | The focused alphabet rail is a 96 px column the grid makes room for, its chips centred in it | The grid stays where it is under the rail, and the 38 px chips keep to the column's right edge (x 1850–1888), clear of the grid's last column | Reflowing the grid as focus enters the rail would lay out every card again |
 | Focus enters the rail at the letter nearest to where it was (the focus engine) | At the chosen letter, else All | Roku has no geometric focus engine; the chosen letter is where a viewer filtering by letter goes next |
@@ -1106,13 +1204,12 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The Search keyboard is full screen, with a single row of results under it | A `DynamicKeyboard` sits at the top and has focus when Search opens. While focus is on the filter or results it folds away, the query shows in a field in its place, and Back or Up unfolds it | Roku draws `DynamicKeyboard` at its own size, which leaves room for most of one row of posters, without captions, beneath it |
 | The keyboard's Search key runs the query and moves focus to the results (Android TV) | Play on the keyboard runs the query and moves focus to the filter | Roku keyboards have no Search key, and the results may still be loading |
 | While results load, Search shows only a spinner | The count line reads "Searching…" above the spinner | The audio guide reads it after the keyboard's own speech (plan section 4.9) |
-| An episode in search results is captioned with its series title and "S01E02 · Pilot" | One line: the series title and tag, "Severance · S01E02"; a series title too long for the card is shortened with "…" so the tag stays whole | One `Label` per card (plan section 4.6); the tag tells an episode from its series' card |
 | The result count reads "About N results" or "N+ results" when the server's total is estimated or missing (Android TV) | "N results" from the server's total, and no count without one | The grid drops pages it no longer shows (plan section 4.8), so it cannot count what it has loaded |
 | Leaving Movies or Series for Home returns to Home as it was (Android TV) | Home and each library page are separate stack roots: Home loads again, with focus on its Home tab, as tvOS rebuilds it | One root screen alive keeps the 512 MB player within its memory budget (plan sections 4.5 and 4.7) |
 | The detail metadata line leads with the content rating in an outlined 18 px Bold chip, and its 45% dots are 22 px SemiBold | The rating sits in Home's hero chip (15 px SemiBold on a white 7% fill, 5.5), and the dots are in the line's 24 px Medium | One chip for both heroes (AG-292), and the type scale has no 22 px SemiBold dot style |
 | TMDB's score in the metadata line carries TMDB's logo | "TMDB 7.8" in text, as IMDb and RT are | No logo art ships |
 | The detail title's subtitle is letter-spaced 1.5 pt | It is not letter-spaced | Roku `Label` has no tracking, and hair spaces (`theme.tracked`) would space 40 px capitals about twice as wide |
-| A focused round button (Start Over, Versions, Audio Tracks, Subtitles) widens with an animation | It widens at once | Each frame of the animation would move every button after it; one layout per focus move keeps the row cheap on low-cost hardware |
+| A focused round button (Start Over, Versions, Audio Tracks, Subtitles) widens with an animation | Native 280 ms width and position animation with delayed label reveal on the normal tier; immediate layout on the low tier | Native interpolators keep motion off script-driven per-frame layout; low-memory devices avoid the extra animation work |
 | The Versions, Audio Tracks, and Subtitles menu is Liquid Glass tinted black 45%, with a 14 px monospaced header, and opens and closes over 0.18 s | The menu panel's gradient art (`theme.art.PANEL`), the header in Inter Medium spaced with hair spaces, shown and hidden at once | Roku has no blur and ships no monospaced face; animations cost frames on 512 MB devices |
 | The readout's items sit in slots 313, 364, and 338 px wide (`TVPlaybackSelectionSummaryView`), a value too long for its slot shrinks to 75%, and its labels are letter-spaced | The items flow inline, 20 px apart, as tvOS's `movie-detail.jpg` shows them; a line that would pass 1031 px cuts its longest values with an ellipsis; the labels are not letter-spaced | Decision AG-292 (3) from the reference screenshots; Roku `Label` has neither a minimum scale nor tracking |
 | A menu that fits neither below its button nor above it is pinned 48 px from the screen's foot | It opens below the button or above the readout, on the side with room for more rows, and shows as many rows as fit there, scrolling the rest | Pinned, a long Subtitles menu covered its own button and the readout (hardware run 26, AG-292) |
@@ -1131,6 +1228,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A detail page visited lately paints at once from a cache of 20 pages and refreshes quietly | Every visit reads the page again, painting the card's seed meanwhile | Implementation plan section 4.8 bounds the metadata kept on 512 MB devices |
 | Rewind and fast-forward skip (Android TV) | Rewind and fast-forward drive the rate ladder | Roku remote convention |
 | The controls hide at the first frame | They show while a title starts and hide when its picture first plays, unless a key came meanwhile or it opens paused; Left and Right then skip | Roku keeps the controls up while playback buffers and for 5 s after, so after a late first frame a skip moved focus instead (hardware run 9, T4b) |
+| The player has a bottom-240 px gradient ending at black 55%, with a shadow behind the title footer | A bottom-600 px gradient ending at black 94%, reaching 72–76% behind the series, title, and episode tag | Covers Roku's fixed title block and preserves muted-text contrast over bright video without additional text nodes |
 | The busy capsule says "Loading…" | It also names Roku's own states: "Stopping…", "Playback progress is pending…", and "Loading subtitles…"; a notice waits while the capsule shows | The player's durable stop and sidecar downloads have no tvOS counterpart, and a notice that came during a stall expired unseen behind it (hardware run 23; assumption AG-262) |
 | The hold indicator's thumbnail has radius 20 corners and a 1 px white 18% outline; its hint names Siri Remote gestures | Square corners without the outline; the hint names Roku keys ("← → Speed, OK Play, Back Cancel") | Over video Roku can round an image only with a `MaskGroup`, which does not clip on devices without OpenGL (plan section 4.6); a square outline would cross rounded art |
 | Skip Recap sits 96 px up, or 156 px over the controls | It sits where Skip Intro does (156 px up, 460 px over the controls, on the safe area), and above it while both show | At tvOS's raised place it would cover the scrubber's right end and the time left; Skip Intro's place clears the controls (assumption AG-260) |
@@ -1161,7 +1259,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A video that ends before the next episode is known shows a "Finished" card while it waits (Android TV) | The ended video stays for up to 10 seconds; Up Next opens if the next episode arrives, else the player exits | The first release has no Finished card, and the bound keeps a slow or failed catalog read from holding a finished player |
 | The next episode may resume where the viewer left it (`startFromBeginning: false`) | It starts at zero (Android TV) | Section 5.7: the next episode starts from its beginning, in the same player |
 | A screen-level error puts a headline for its cause ("Something went wrong", "Not found") over its message, with Try Again | Home, the libraries, detail, and the profile picker show their one-sentence message as the error's title, without a second line, and Search its own title over a line; the button reads Retry (Try again on the picker) | The client's error copy is one sentence per screen (`locale/`); a copy change of its own adds headlines by cause (assumption AG-285) |
-| Watchlist and More buttons; cast, trailers, and related sections; Collections in the library list; Filter and Shuffle; people, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watchlist, Favorites, and History in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; theme music; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| Full person page | A person panel with six biography lines and up to 24 mixed movie/series titles | Keeps person navigation within detail-page scope and bounded memory |
+| Watchlist and More buttons; trailers; collection creation and editing; Filter and Shuffle; people, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watchlist, Favorites, and History in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; theme music; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
 
 ## 6. Application architecture
 
@@ -1399,12 +1498,23 @@ The first release consumes:
 - `GET /api/v2/library/{id}/sections` and
   `GET /api/v2/library/{id}/sections/{section_id}/items` for a library's
   Recommended rows;
+- `GET /api/v2/library/{id}/collections` for the library's collection index;
+- `GET /api/v2/catalog?source=library_collection&collection_id={id}` or
+  `source=user_collection` for collection titles, with `limit=40`, cursor
+  pagination, and supported artwork widths. Only explicitly typed mixed-library
+  views add `library_id` and `type=movie|series`; ordinary and untyped views
+  preserve collection membership across libraries;
 - `GET /api/v2/catalog` for paginated browse, with `type`, `sort`, and
   `name_prefix` for the alphabet rail;
 - `GET /api/v2/catalog` with `q` for search, using `type=video_with_episodes`
   when `GET /api/v2/catalog/search/capabilities` advertises it, and `video`
   otherwise;
 - `GET /api/v2/catalog/items/{id}` for detail;
+- `GET /api/v2/recommendations/similar/{item_id}?limit=12` for detail
+  recommendations;
+- `GET /api/v2/catalog/people/{id}` for person information;
+- `GET /api/v2/catalog?source=person&person_id={id}&type=video&limit=24`
+  for the person panel's library titles;
 - `GET /api/v2/catalog/series/{id}/seasons` and
   `GET /api/v2/catalog/series/{id}/seasons/{num}/episodes`;
 - `GET /api/v2/watch/{id}` for the playable projection, including
@@ -1566,13 +1676,20 @@ no per-build or per-cohort switches (decision D-7 of
 - output: HDR10 and HLG where the display reports them, HDR10+ beside HDR10
   where the display reports it, under the HDR output rule (an HEVC Main 10
   decoder, a 2160-line output, and an exact display answer);
-- Dolby Vision P5 and P8 (levels 9, P8 base layer ID 1) on the output and on
-  `original_http` where the Roku is shown to output it. A Roku TV's panel does
+- Dolby Vision P5 (level 9) on the output and on `original_http` where the
+  Roku is shown to output it. P8 is never claimed: a P8.1 TS remux showed a
+  green picture on the Ultra, and Roku documents only `dvhe.05` for HEVC
+  Dolby Vision, so a P8 source plays its base layer (below). A Roku TV's panel does
   the Dolby Vision processing, so `GetVideoMode()` never shows it (run 11 read
   `2160p60` throughout) and the display's Dolby Vision flag is the evidence. A
   player shows it in its mode string: the Ultra 4850X reads `2160p60dv`
   outside playback too, and a player without Dolby Vision output never does;
-- on an HDR10 output without Dolby Vision, `original_http` sends
+- HLS explicitly advertises no Dolby Vision profiles while retaining the
+  output's HDR10, HDR10+, and HLG support. A Dolby Vision P8.1 TS remux
+  produced a green picture on the Ultra; the server chooses the supported
+  HDR10 base-layer or tone-mapped fallback rather than sending native DV
+  through that route. Direct originals keep P5;
+- on an HDR10 output, with or without Dolby Vision, `original_http` sends
   `client_dv8_base_layer_fallback_v1` with `dv8_base_layer_compatibility_ids:
   [1]`, so a P8.1 original plays as its HDR10 base layer, and only when the
   capabilities document's `features` lists
@@ -1580,8 +1697,10 @@ no per-build or per-cohort switches (decision D-7 of
   and would also admit ID 2 (SDR) and ID 4 (HLG) sources, neither tested.
 
 Hardware run 30 played one example of each claim the Ultra makes, not every
-format and bound: Dolby Vision P8.1 as a TS copy remux and P5 as an MKV
-original (Dolby Vision engaged with correct colours, confirmed on the TV),
+format and bound: Dolby Vision P8.1 as a TS copy remux decoded, but its colour
+was not independently confirmed; a later P8.1 TS remux showed a green picture.
+P5 as an MKV original engaged Dolby Vision with correct colours, confirmed
+on the TV. Other exercised formats were
 HDR10 and E-AC-3 5.1 as a copy remux, HLG, AV1 at 2160p50, and VP9 profile 0
 at 2160p24 and profile 2 HDR10 as originals, and Opus, FLAC, and 16-bit PCM
 decoded. 24-bit PCM, VP9 and AV1 at 60 fps, and HDR10+ were not exercised.

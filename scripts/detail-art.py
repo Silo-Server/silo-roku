@@ -15,7 +15,9 @@
                  rows' highlight and the action placeholders
 
 Each glyph is white on transparent, for a Poster's blendColor: 34 px square
-inside the action row's 76 px round buttons; Roku scales it for an HD UI.
+inside the action row's 76 px round buttons. Glyphs are rasterized at 2x
+those logical FHD sizes for aligned bilinear minification. Their
+geometry, stroke widths and optical offsets stay in logical pixels.
 The fills are white 9-patches for blendColor and opacity, loaded through the
 manifest's uri_resolution_autosub ($$RES$$ becomes fhd or hd); HD radii are
 the FHD radii times 2/3, rounded. Shapes are plain geometry, not brand
@@ -30,6 +32,7 @@ import zlib
 
 GLYPH = 34  # FHD px
 CHECK = 26  # FHD px
+GLYPH_SCALE = 2  # intrinsic pixels per logical FHD pixel
 STROKE = 3.4
 STRETCH = 2  # a 9-patch's stretchable band between the corners, px
 FILL_RADII = (8, 10, 14)  # FHD px
@@ -37,14 +40,14 @@ SAMPLES = 16
 WHITE = (0xFF, 0xFF, 0xFF)
 
 
-def coverage(size, covered):
+def coverage(size, covered, scale=1):
     """White RGBA rows over a size x size square for a point predicate."""
     rows = []
-    for py in range(size):
+    for py in range(size * scale):
         row = []
-        for px in range(size):
+        for px in range(size * scale):
             hits = sum(
-                covered(px + (sx + 0.5) / SAMPLES, py + (sy + 0.5) / SAMPLES)
+                covered((px + (sx + 0.5) / SAMPLES) / scale, (py + (sy + 0.5) / SAMPLES) / scale)
                 for sy in range(SAMPLES) for sx in range(SAMPLES))
             row.append(WHITE + (round(255 * hits / SAMPLES ** 2),))
         rows.append(row)
@@ -72,7 +75,7 @@ def play(size):
     top, bottom = size * 0.16, size * 0.84
     left, right = size * 0.24, size * 0.86
     points = ((left, top), (right, size / 2), (left, bottom))
-    return coverage(size, lambda x, y: inside_triangle(x, y, points))
+    return coverage(size, lambda x, y: inside_triangle(x, y, points), GLYPH_SCALE)
 
 
 def restart(size):
@@ -86,7 +89,7 @@ def restart(size):
         angle = math.degrees(math.atan2(x - cx, cy - y)) % 360  # 0 at the top, clockwise
         on_ring = abs(math.hypot(x - cx, y - cy) - r) <= STROKE / 2
         return (on_ring and angle <= 290) or inside_triangle(x, y, head)
-    return coverage(size, covered)
+    return coverage(size, covered, GLYPH_SCALE)
 
 
 def versions(size):
@@ -107,7 +110,7 @@ def versions(size):
         if abs(frame_distance(x, y)) <= STROKE / 2:
             return True
         return any(segment_distance(x, y, *line) <= STROKE / 2 for line in layers)
-    return coverage(size, covered)
+    return coverage(size, covered, GLYPH_SCALE)
 
 
 def audio(size):
@@ -127,7 +130,7 @@ def audio(size):
         d = math.hypot(x - ox, y - cy)
         span = abs(math.degrees(math.atan2(y - cy, x - ox))) <= 48
         return span and any(abs(d - radius) <= STROKE / 2 for radius in (size * 0.26, size * 0.42))
-    return coverage(size, covered)
+    return coverage(size, covered, GLYPH_SCALE)
 
 
 def subtitles(size):
@@ -146,7 +149,7 @@ def subtitles(size):
         if abs(frame_distance(x, y)) <= STROKE / 2:
             return True
         return any(segment_distance(x, y, *line) <= STROKE / 2 for line in lines)
-    return coverage(size, covered)
+    return coverage(size, covered, GLYPH_SCALE)
 
 
 def check(size):
@@ -157,7 +160,7 @@ def check(size):
 
     def covered(x, y):
         return any(segment_distance(x, y, *a, *b) <= half_stroke for a, b in zip(points, points[1:]))
-    return coverage(size, covered)
+    return coverage(size, covered, GLYPH_SCALE)
 
 
 def rounded_fill(radius):

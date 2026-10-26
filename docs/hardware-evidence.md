@@ -2111,7 +2111,7 @@ their detail pages, one with a version chosen there.
 
 | Test | Date | Device / OS | Sink | File class | Harness settings | Result | Observed facts |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Dolby Vision P8.1, copy remux | 2026-10-25 | 4850X / 16.0.4 | TV | MKV HEVC Main 10 2160p DV P8.1, DTS-HD 7.1 | detail page, Resume | PASS | `server_remux_hls` (TS), `dynamic_range` dolby_vision; ECP `hevc_b`, playing. DTS converted to stereo AAC (`hls_audio_adaptation`; no DTS sink, no multichannel AAC, S-1) |
+| Dolby Vision P8.1, copy remux | 2026-10-25 | 4850X / 16.0.4 | TV | MKV HEVC Main 10 2160p DV P8.1, DTS-HD 7.1 | detail page, Resume | PARTIAL | `server_remux_hls` (TS), `dynamic_range` dolby_vision; ECP `hevc_b`, playing. DTS converted to stereo AAC (`hls_audio_adaptation`; no DTS sink, no multichannel AAC, S-1). This established decoding only; colour was not independently confirmed. A later run with this format produced a green picture, so HLS DV is now restricted. |
 | Dolby Vision P5, original | 2026-10-25 | 4850X / 16.0.4 | TV | MKV HEVC Main 10 2160p DV P5, E-AC-3 5.1 | detail page, 2160p DV version chosen, Play | PASS | `original_http`, `validated_original_playback`; ECP 3840×2160 23.976 `hevc`, `eac3`. A person at the TV confirmed Dolby Vision mode and correct colours |
 | HDR10, copy remux | 2026-10-25 | 4850X / 16.0.4 | TV | MKV HEVC Main 10 2160p HDR10, E-AC-3 5.1 (Auto of two versions) | deep link | PASS | `server_remux_hls` (`hls_packaging_required`), E-AC-3 6 channels copied; ECP `hevc_b`, `eac3`, captions `webvtt` |
 | HLG, original | 2026-10-25 | 4850X / 16.0.4 | TV | MKV HEVC Main 10 2160p25 HLG, AAC | deep link | PASS | `original_http`, `dynamic_range` hlg; ECP 3840×2160 25 fps |
@@ -2131,3 +2131,51 @@ their detail pages, one with a version chosen there.
    advanced 14–32 s each.
 3. Another session installed a different build on the device twice during
    the run; the matrix above was run after it finished, on this run's build.
+
+## Run 31 — interface polish and HLS Dolby Vision restriction
+
+2026-10-25, physical Ultra 4850X on Roku OS 16.0.4. Release package installed
+and remained active. No server changes were made.
+
+- The 32 generated glyphs use twice their logical raster dimensions. Native
+  captures verified the transport controls at rest and focused: glyphs remain
+  centred in their 66 px circles. A three-times raster experiment produced
+  rougher curves when reduced to FHD and was replaced before this build.
+- The HUD's dedicated gradient now covers its title block. Its geometry was
+  checked on the device; analytical SDR white-frame tests give minimum
+  contrast of 5.03:1 for the series, 11.02:1 for the title, and 5.14:1 for the
+  episode tag. Roku screenshots omit the video plane, so they do not establish
+  readability over actual HDR content.
+- A viewer reported a green picture from a DV P8.1, level 6, HDR10-compatible
+  HEVC MKV with DTS audio. The selected plan preserved DV in an MPEG-TS HLS
+  remux while adapting audio. After the HLS-only capability restriction, the
+  same file received an HDR10 MPEG-TS copy remux with stereo AAC and explicit
+  server-side DV metadata removal. ECP reached playback without error and
+  reported `hevc_b` / `aac_adts`. The viewer subsequently confirmed correct
+  colours and reported an HDR badge instead of Dolby Vision, consistent with
+  the selected HDR10 fallback. This validates the fallback for this source;
+  native HLS Dolby Vision remains restricted. HUD title readability over the
+  video remains awaiting viewer confirmation.
+- Follow-up (no device run): the green picture is not a server signaling
+  fault. A reproduction of the server's MPEG-TS copy remux of this file on
+  the shared development server (jellyfin-ffmpeg 8.1.3) carries stream type
+  0x24, a `DOVI` registration descriptor, and a DOVI video stream descriptor
+  for profile 8, level 6, compatibility ID 1, matching the source, with RPUs
+  in the frames. Roku's streaming specification lists only `dvhe.05` for
+  HEVC Dolby Vision and does not support CMAF segments that mux audio with
+  video. Decision: the Roku claims Dolby Vision P5 only; P8 is not claimed on
+  any delivery, and a P8.1 original plays its HDR10 base layer through the
+  base-layer claim, now sent on Dolby Vision outputs too. Not yet run on the
+  Ultra.
+- The active profile's collection index returned 84 curated movie collections
+  and 16 curated series collections, with My collections first in server
+  order. The selector now says Collection groups and labels the ungrouped
+  curated section Server collections; the data was not absent. Both Movies
+  and Series opened this section on the Ultra. Opening a curated movie
+  collection loaded its titles, and Back restored the selected group and
+  collection. The collection artwork still used placeholders, consistent
+  with the previously observed server artwork 404 responses.
+
+Local checks passed: 738 playback tests, 25 overlay tests, three generated
+gradient/contrast checks, 21 collection tests, release/dev lint, API contract,
+formatting for changed BrightScript, package size, and whitespace checks.
