@@ -156,7 +156,8 @@ loading, empty, error, and episode views, all on fixture data answered by
 switches to the signed-in server's data, Options (`*`) switches to the
 low-tier focus, and Back closes. `scripts/sync-fixtures.sh` also vendors the
 catalog fixtures and `tests/fixtures/openapi/catalog-operations.json`, the
-query parameters the request specs check against.
+methods, paths, and query parameters the request specs check built requests
+against.
 
 Lint and build fail on any warning. Specs live under `tests/`, mirroring the
 module they cover (`tests/util/log.spec.bs` for `source/util/log.bs`), and are
