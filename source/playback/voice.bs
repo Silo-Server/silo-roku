@@ -1,0 +1,137 @@
+import "pkg:/source/util/values.bs"
+
+' Roku voice transport commands (spec section 5.9): "pause", "fast forward",
+' "rewind 30 seconds", "start over", "skip intro", and the rest, which Roku
+' sends as roInput events once Main calls EnableTransportEvents. Main hands
+' each event's GetInfo() to AppScene, which answers it with the status Main
+' passes to EventResponse within Roku's 5 seconds. Pure:
+' decide(info, facts) returns { status, actions }, the actions the player
+' carries out in order.
+'
+' info: { type: "transport", id, command, direction, duration }, every value
+'   a string; direction ("forward" or "backward") and duration (seconds)
+'   come with "seek" only.
+' facts: invalid when no player is open, else { ready, ended, state,
+'   scrubbing, panel, position, runtime, hasNext, skipIntro, skipRecap }:
+'   ready once the title played its first frame with no error showing; ended
+'   once the video ended or the session is done, when only Up Next holds the
+'   player; state the Video node's; position in source seconds (a seek in
+'   flight's target);
+'   runtime invalid when unknown; panel true while Options or a picker
+'   takes the remote's keys (the player closes Up Next for a seek or a scan
+'   key itself).
+'
+' Actions:
+'   {type: "key", key}: a press and release of a remote key, through the
+'     controls reducer as the viewer's own key goes (fastforward and rewind
+'     start the rate ladder, replay is Replay, play commits a scan).
+'   {type: "togglePause"}, {type: "seek", position}, {type: "next"} (Up
+'   Next's Play Now), {type: "skipIntro"}, {type: "skipRecap"}, {type: "exit"}
+'   {type: "replayFrom", position}: after the end, the title again from
+'     position, as Up Next's Keep Watching replays it; a seek can no longer
+'     reach the stopped session.
+namespace playback.voice
+    ' Where a seek past the end lands: this far before it, as Roku's sample
+    ' does, so the seek plays a moment rather than ending.
+    const END_MARGIN_SECONDS = 30
+
+    ' EventResponse statuses (ifInput).
+    const SUCCESS = "success"
+    const SEEK_START = "success.seek-start"
+    const SEEK_END = "success.seek-end"
+    const UNHANDLED = "unhandled"
+    const FAILED = "error"
+    const NOT_AVAILABLE = "error.generic"
+    const NO_MEDIA = "error.no-media"
+
+    ' The commands Silo answers; anything else (nowplaying, like, dislike,
+    ' shuffle, loop, ok) is left to the OS.
+    const COMMANDS = "|play|pause|stop|forward|rewind|replay|seek|startover|next|skip|"
+
+    function decide(info as Object, facts as Dynamic) as Object
+        command = LCase(util.text(info.command))
+        if Instr(1, COMMANDS, "|" + command + "|") = 0 then return answer(UNHANDLED)
+        if facts = invalid then return answer(NO_MEDIA)
+        if command = "stop" then return answer(SUCCESS, [{ type: "exit" }])
+        if not util.isTrue(facts.ready) then return answer(FAILED)
+        if util.isTrue(facts.ended) then return afterEnd(command, info, facts)
+        if command = "play" then return play(facts)
+        if command = "pause" then return pause(facts)
+        if command = "forward" or command = "rewind" or command = "replay"
+            ' Options and a picker swallow these keys.
+            if util.isTrue(facts.panel) then return answer(FAILED)
+            key = command
+            if command = "forward" then key = "fastforward"
+            return answer(SUCCESS, [{ type: "key", key: key }])
+        end if
+        if command = "seek" then return seek(info, facts)
+        if command = "startover" then return answer(SUCCESS, [{ type: "seek", position: 0 }])
+        if command = "skip"
+            if util.isTrue(facts.skipIntro) then return answer(SUCCESS, [{ type: "skipIntro" }])
+            if util.isTrue(facts.skipRecap) then return answer(SUCCESS, [{ type: "skipRecap" }])
+        end if
+        ' "next", and "skip" with no intro or recap showing (Roku: skip is
+        ' next then).
+        if util.isTrue(facts.hasNext) then return answer(SUCCESS, [{ type: "next" }])
+        return answer(NOT_AVAILABLE)
+    end function
+
+    ' After the end only Up Next is up: "next" and "skip" are its Play Now,
+    ' "start over" and a seek replay the title, and the rest have nothing
+    ' playing to act on.
+    function afterEnd(command as String, info as Object, facts as Object) as Object
+        if command = "next" or command = "skip"
+            if util.isTrue(facts.hasNext) then return answer(SUCCESS, [{ type: "next" }])
+            return answer(NOT_AVAILABLE)
+        end if
+        if command = "startover" then return answer(SUCCESS, [{ type: "replayFrom", position: 0 }])
+        if command <> "seek" then return answer(NOT_AVAILABLE)
+        decision = seek(info, facts)
+        for each action in decision.actions
+            action.type = "replayFrom"
+        end for
+        return decision
+    end function
+
+    ' "play" and "resume": a scan commits as Play commits it; paused content
+    ' resumes; playing content is acknowledged, and Roku shows "Playing".
+    function play(facts as Object) as Object
+        if util.isTrue(facts.scrubbing) then return answer(SUCCESS, [{ type: "key", key: "play" }])
+        if facts.state = "paused" then return answer(SUCCESS, [{ type: "togglePause" }])
+        return answer(SUCCESS)
+    end function
+
+    ' Roku asks for "unhandled" when the content is already paused.
+    function pause(facts as Object) as Object
+        if util.isTrue(facts.scrubbing) then return answer(FAILED)
+        if facts.state = "playing" then return answer(SUCCESS, [{ type: "togglePause" }])
+        if facts.state = "paused" then return answer(UNHANDLED)
+        return answer(FAILED)
+    end function
+
+    ' "rewind 30 seconds", "forward 10 minutes": duration seconds from the
+    ' current position. Before the start lands on it; past the end lands
+    ' END_MARGIN_SECONDS before it.
+    function seek(info as Object, facts as Object) as Object
+        duration = Val(util.text(info.duration))
+        if duration <= 0 then return answer(FAILED)
+        if LCase(util.text(info.direction)) = "backward" then duration = -duration
+        position = 0#
+        if util.isNumber(facts.position) then position = facts.position
+        target = position + duration
+        status = SUCCESS
+        if target < 0
+            target = 0
+            status = SEEK_START
+        else if util.isNumber(facts.runtime) and target > facts.runtime
+            target = facts.runtime - END_MARGIN_SECONDS
+            if target < 0 then target = 0
+            status = SEEK_END
+        end if
+        return answer(status, [{ type: "seek", position: target }])
+    end function
+
+    function answer(status as String, actions = [] as Object) as Object
+        return { status: status, actions: actions }
+    end function
+end namespace

@@ -1,0 +1,166 @@
+namespace tests
+
+    ' Roku voice transport commands. Decisions are summarized as the status,
+    ' then each action: "seek:90", "key:fastforward", "togglePause".
+    @suite("playback voice")
+    class PlaybackVoiceTests extends rooibos.BaseTestSuite
+
+        function playing(extra = {} as Object) as Object
+            facts = { ready: true, state: "playing", scrubbing: false, panel: false, position: 600#, runtime: 3600, hasNext: false, skipIntro: false, skipRecap: false }
+            facts.Append(extra)
+            return facts
+        end function
+
+        function said(command as String, facts as Dynamic, extra = {} as Object) as String
+            info = { type: "transport", id: "5", command: command }
+            info.Append(extra)
+            decision = playback.voice.decide(info, facts)
+            parts = [decision.status]
+            for each action in decision.actions
+                if action.type = "seek" or action.type = "replayFrom"
+                    parts.Push(action.type + ":" + Int(action.position).ToStr())
+                else if action.type = "key"
+                    parts.Push("key:" + action.key)
+                else
+                    parts.Push(action.type)
+                end if
+            end for
+            return parts.Join(" ")
+        end function
+
+        function seekBy(direction as String, duration as String, facts as Object) as String
+            return m.said("seek", facts, { direction: direction, duration: duration })
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("play and pause")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("resumes paused content and acknowledges content already playing")
+        sub _()
+            m.assertEqual(m.said("play", m.playing({ state: "paused" })), "success togglePause")
+            m.assertEqual(m.said("play", m.playing()), "success")
+        end sub
+
+        @it("commits a scan on play, as the Play key does")
+        sub _()
+            m.assertEqual(m.said("play", m.playing({ scrubbing: true })), "success key:play")
+        end sub
+
+        @it("pauses playing content and leaves paused content to Roku")
+        sub _()
+            m.assertEqual(m.said("pause", m.playing()), "success togglePause")
+            m.assertEqual(m.said("pause", m.playing({ state: "paused" })), "unhandled")
+            m.assertEqual(m.said("pause", m.playing({ state: "buffering" })), "error")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("scanning and seeking")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("runs fast forward, rewind, and replay through the remote's keys")
+        sub _()
+            m.assertEqual(m.said("forward", m.playing()), "success key:fastforward")
+            m.assertEqual(m.said("rewind", m.playing()), "success key:rewind")
+            m.assertEqual(m.said("replay", m.playing()), "success key:replay")
+        end sub
+
+        @it("refuses the scan keys while a panel holds the remote")
+        sub _()
+            m.assertEqual(m.said("forward", m.playing({ panel: true })), "error")
+        end sub
+
+        @it("seeks by the spoken seconds from the current position")
+        sub _()
+            m.assertEqual(m.seekBy("forward", "600", m.playing()), "success seek:1200")
+            m.assertEqual(m.seekBy("backward", "30", m.playing()), "success seek:570")
+        end sub
+
+        @it("lands a seek before the start on it and one past the end 30 s before it")
+        sub _()
+            m.assertEqual(m.seekBy("backward", "900", m.playing()), "success.seek-start seek:0")
+            m.assertEqual(m.seekBy("forward", "7200", m.playing()), "success.seek-end seek:3570")
+        end sub
+
+        @it("seeks forward without a ceiling when the runtime is unknown")
+        sub _()
+            m.assertEqual(m.seekBy("forward", "7200", m.playing({ runtime: invalid })), "success seek:7800")
+        end sub
+
+        @it("refuses a seek without a duration")
+        sub _()
+            m.assertEqual(m.seekBy("forward", "", m.playing()), "error")
+        end sub
+
+        @it("starts over from the beginning")
+        sub _()
+            m.assertEqual(m.said("startover", m.playing()), "success seek:0")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("skip and next")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("skips the intro, else the recap, else plays the next episode")
+        sub _()
+            m.assertEqual(m.said("skip", m.playing({ skipIntro: true, skipRecap: true, hasNext: true })), "success skipIntro")
+            m.assertEqual(m.said("skip", m.playing({ skipRecap: true, hasNext: true })), "success skipRecap")
+            m.assertEqual(m.said("skip", m.playing({ hasNext: true })), "success next")
+        end sub
+
+        @it("plays the next episode, or says it is not available")
+        sub _()
+            m.assertEqual(m.said("next", m.playing({ hasNext: true })), "success next")
+            m.assertEqual(m.said("next", m.playing()), "error.generic")
+            m.assertEqual(m.said("skip", m.playing()), "error.generic")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("after the end")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("replays the title for start over and a seek, which the stopped session cannot take")
+        sub _()
+            ended = m.playing({ ended: true, position: 3600# })
+            m.assertEqual(m.said("startover", ended), "success replayFrom:0")
+            m.assertEqual(m.seekBy("backward", "60", ended), "success replayFrom:3540")
+        end sub
+
+        @it("plays the next item for next and skip, and has nothing for the other commands")
+        sub _()
+            m.assertEqual(m.said("next", m.playing({ ended: true, hasNext: true })), "success next")
+            m.assertEqual(m.said("skip", m.playing({ ended: true, hasNext: true, skipIntro: true })), "success next")
+            m.assertEqual(m.said("next", m.playing({ ended: true })), "error.generic")
+            m.assertEqual(m.said("pause", m.playing({ ended: true })), "error.generic")
+            m.assertEqual(m.said("forward", m.playing({ ended: true })), "error.generic")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("outside playback")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("answers no media with no player open")
+        sub _()
+            m.assertEqual(m.said("pause", invalid), "error.no-media")
+            m.assertEqual(m.said("startover", invalid), "error.no-media")
+        end sub
+
+        @it("refuses commands before the first frame, but stop still leaves")
+        sub _()
+            m.assertEqual(m.said("pause", { ready: false }), "error")
+            m.assertEqual(m.said("stop", { ready: false }), "success exit")
+        end sub
+
+        @it("leaves the commands Silo does not handle to Roku")
+        sub _()
+            m.assertEqual(m.said("nowplaying", m.playing()), "unhandled")
+            m.assertEqual(m.said("like", m.playing()), "unhandled")
+            m.assertEqual(m.said("shuffle", invalid), "unhandled")
+        end sub
+
+        @it("reads the command in any case")
+        sub _()
+            m.assertEqual(m.said("Pause", m.playing()), "success togglePause")
+        end sub
+    end class
+end namespace
