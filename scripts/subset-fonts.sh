@@ -34,10 +34,12 @@ TABULAR_WEIGHT=SemiBold
 UNICODES=U+0000-036F,U+0370-03FF,U+0400-052F,U+1E00-1EFF,U+2000-206F,U+20A0-20CF,U+2100-214F,U+2190-2193,U+2212,U+2C60-2C7F,U+A720-A7FF,U+FEFF,U+FFFD
 # The license name records (IDs 13 and 14) stay with the copyright, as the OFL
 # asks. The .notdef box is kept so a missing glyph is visible rather than
-# blank. Hinting is dropped: Roku scales the FHD layout and the TTFs carry none
-# worth the bytes. Layout features are pyftsubset's defaults; Label cannot turn
-# on tnum, so timecodes use the variant below.
-COMMON_OPTIONS=(--name-IDs+=13,14 --notdef-outline --no-hinting)
+# blank. The release's TrueType hinting (fpgm, prep, cvt, and glyph programs)
+# stays: Roku rasterizes Labels at their pixel size, and without hinting stems
+# fall between pixels, so text at 24 px and under renders soft and uneven.
+# Layout features are pyftsubset's defaults; Label cannot turn on tnum, so
+# timecodes use the variant below.
+COMMON_OPTIONS=(--name-IDs+=13,14 --notdef-outline)
 SUBSET_OPTIONS=(--unicodes="$UNICODES" "${COMMON_OPTIONS[@]}")
 # The timecode variant keeps only what elapsed time, time left, and end time
 # need: space, hyphen, period, the slash between position and runtime
