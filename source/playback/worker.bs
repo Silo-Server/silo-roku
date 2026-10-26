@@ -58,7 +58,8 @@ import "pkg:/source/playback/options.bs"
 ' start whose answer stayed uncertain. When that owner is released
 ' (cancel) before then, the session the start was accepted with is stopped
 ' here, and a start whose answer was uncertain is replayed, byte for byte,
-' to learn whether there is one.
+' to learn whether there is one. A start whose owner is released while its
+' capabilities are still being read is never sent.
 namespace playback.worker
     const CAPABILITIES_PATH = "/api/v2/playback/capabilities"
     const START_PATH = "/api/v2/playback/start"
@@ -188,10 +189,11 @@ namespace playback.worker
 
     ' Cancellation from the render thread ({ owner } or { requestId }), before
     ' the scheduler's: session operations still waiting (deferSession) are
-    ' dropped, their password and PIN discarded, and answered cancelled; and
-    ' the starts of a released owner pass to this file. A sign-out is the one
-    ' exception: the viewer asked to leave this device's session, and it runs
-    ' whatever becomes of the screen that asked.
+    ' dropped, their password and PIN discarded, and answered cancelled. A
+    ' sign-out is the one exception: the viewer asked to leave this device's
+    ' session, and it runs whatever becomes of the screen that asked. A
+    ' released owner's start still reading capabilities is answered cancelled
+    ' too, and never sent; its other starts pass to this file.
     function cancel(state as Object, rule as Object, env as Object) as Object
         key = "requestId"
         reason = "request"
@@ -219,6 +221,13 @@ namespace playback.worker
             if kept.Count() = 0 then state.deferred = invalid
         end if
         if key <> "owner" then return decisions
+        for each id in state.ops
+            op = state.ops[id]
+            if op.kind = "capabilities" and util.text(op.input.owner) = target and not util.isTrue(op.released)
+                op.released = true
+                decisions.Push(reply(api.response.failure(op.input, "cancelled", reason)))
+            end if
+        end for
         for each entry in startsOf(state, target)
             if entry.sessionId <> invalid
                 decisions.Append(stopStart(state, entry, env, "its player left"))
@@ -252,27 +261,30 @@ namespace playback.worker
     end function
 
     ' Plan section 6.6: playback needs state "available", allowed, protocol
-    ' 3, and sequenced_progress_v1.
+    ' 3, and sequenced_progress_v1. A document read for a player released
+    ' meanwhile (cancel) is still cached, but its start is never sent, so it
+    ' creates no session that nothing would stop.
     function capabilitiesRead(state as Object, op as Object, result as Object, env as Object) as Object
         caps = state.capabilities
+        body = result.body
         if result.status = 304 and caps <> invalid
             caps.readAt = env.now
-            return buildStart(state, op.input, caps, env)
+        else if result.ok = true and isAvailable(body)
+            etag = ""
+            if util.isObject(result.headers) then etag = util.text(result.headers.etag)
+            caps = { key: capabilitiesKey(op.input.command.fence), etag: etag, installationId: body.installation_id, features: body.features, readAt: env.now }
+            state.capabilities = caps
+        else
+            caps = invalid
         end if
+        if util.isTrue(op.released) then return [logged("info", "no start sent for a player that left while capabilities were read", invalid)]
+        if caps <> invalid then return buildStart(state, op.input, caps, env)
         if result.ok <> true then return [reply(answer(op.input, resultKind(result), result.status))]
-        body = result.body
-        if not isAvailable(body)
-            fields = {}
-            if util.isObject(body) then fields = { state: util.text(body.state), allowed: util.isTrue(body.allowed) }
-            out = answer(op.input, "rejected", result.status)
-            out.body.reason = "playback_unavailable"
-            return [logged("warn", "playback is not available", fields), reply(out)]
-        end if
-        etag = ""
-        if util.isObject(result.headers) then etag = util.text(result.headers.etag)
-        caps = { key: capabilitiesKey(op.input.command.fence), etag: etag, installationId: body.installation_id, features: body.features, readAt: env.now }
-        state.capabilities = caps
-        return buildStart(state, op.input, caps, env)
+        fields = {}
+        if util.isObject(body) then fields = { state: util.text(body.state), allowed: util.isTrue(body.allowed) }
+        out = answer(op.input, "rejected", result.status)
+        out.body.reason = "playback_unavailable"
+        return [logged("warn", "playback is not available", fields), reply(out)]
     end function
 
     function isAvailable(body as Dynamic) as Boolean

@@ -1847,7 +1847,8 @@ would then appear in URLs that proxies and server logs may record.
   newer session's position (hardware run 8, T2c). Nor is a start the
   player gave up for a newer attempt replayed, whatever its answer was: a
   session it did create is left to the server's expiry (hardware run 9,
-  T3d).
+  T3d). A start whose player closes while the network task is still
+  reading capabilities is never sent.
 - A title's queued progress and stop jobs from an older session are dropped
   once a newer session of that title has a position queued or a progress
   post accepted, and while one session's job for a title is in flight no
