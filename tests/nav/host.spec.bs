@@ -1,0 +1,188 @@
+import "pkg:/components/theme/helpers.bs"
+
+namespace tests
+
+    ' AppScene's screen host (components/AppSceneNav.bs) with the real stack
+    ' and screens (tests/components/NavHostProbe), the test scene handing it
+    ' what the screens ask for: an answer that reaches a screen the
+    ' Companion screen covers changes nothing above it.
+    @suite("nav host")
+    class NavHostTests extends rooibos.BaseTestSuite
+
+        ' A host in the test scene, so focus can move; afterEach takes it out.
+        function host() as Object
+            tests.scene.reset()
+            theme.install()
+            node = CreateObject("roSGNode", "NavHostProbe")
+            m.top.appendChild(node)
+            m.top.callFunc("sceneHostNav", node)
+            return node
+        end function
+
+        protected override sub afterEach()
+            tests.scene.reset()
+            for each child in m.top.getChildren(-1, 0)
+                if Right(child.subtype(), 5) = "Probe" then m.top.removeChild(child)
+            end for
+        end sub
+
+        function cancelled() as Object
+            return m.top.callFunc("sceneLog").cancelled
+        end function
+
+        function routes(host as Object) as Object
+            return host.callFunc("probeRoutes")
+        end function
+
+        ' Answers the sign-in screen's system/setup: a server still waiting
+        ' for its first administrator.
+        sub answerSetupNeeded()
+            entry = tests.scene.last(api.auth.server.SETUP_PATH)
+            tests.scene.deliver(entry.handle, { ok: true, status: 200, body: { needs_setup: true } }, "ok")
+        end sub
+
+        @describe("a screen's navigation")
+
+        @it("acts at once from the top screen")
+        sub _()
+            host = m.host()
+            host.callFunc("probeStart", nav.route.SIGN_IN)
+            m.answerSetupNeeded()
+            m.assertEqual(m.routes(host), [nav.route.SERVER_NOT_READY])
+        end sub
+
+        @it("from a screen the Companion screen covers leaves Companion on top, and acts once that screen is back")
+        sub _()
+            host = m.host()
+            host.callFunc("probeStart", nav.route.SIGN_IN)
+            host.callFunc("probeCompanion", true)
+            m.answerSetupNeeded()
+            m.assertEqual(m.routes(host), [nav.route.SIGN_IN, nav.route.COMPANION])
+            companion = host.callFunc("probeScreen", nav.route.COMPANION)
+            m.assertNotInvalid(companion)
+            m.assertTrue(companion.visible)
+            m.assertFalse(host.callFunc("probeScreen", nav.route.SIGN_IN).visible)
+
+            host.callFunc("probeCompanion", false)
+            m.assertEqual(m.routes(host), [nav.route.SERVER_NOT_READY])
+            m.assertTrue(host.callFunc("probeScreen", nav.route.SERVER_NOT_READY).visible)
+        end sub
+
+        @it("from a covered screen goes with the screen when it is released first")
+        sub _()
+            host = m.host()
+            host.callFunc("probeStart", nav.route.SIGN_IN)
+            first = tests.scene.last(api.auth.server.SETUP_PATH)
+            host.callFunc("probeCompanion", true)
+            m.answerSetupNeeded()
+            ' Memory pressure releases the covered sign-in screen and keeps its
+            ' entry; its screen is built again, asking again, when it is back.
+            host.callFunc("navPressure", nav.pressure.SHED)
+            host.callFunc("probeCompanion", false)
+            m.assertEqual(m.routes(host), [nav.route.SIGN_IN])
+            again = tests.scene.last(api.auth.server.SETUP_PATH)
+            m.assertFalse(again.handle.isSameNode(first.handle))
+        end sub
+
+        @describe("server setup")
+
+        ' A server screen on top with Connect pressed for an HTTPS address;
+        ' returns its check.
+        function serverChecking() as Object
+            tests.scene.reset()
+            theme.install()
+            screen = CreateObject("roSGNode", "ServerScreenProbe")
+            m.top.appendChild(screen)
+            screen.entry = { id: "e1", route: nav.route.SETUP, params: {} }
+            screen.owner = "screen.1"
+            screen.visible = true
+            screen.callFunc("onShow", { restore: invalid, first: true, refresh: false, played: invalid })
+            screen.callFunc("probeConnect", "media.example.com")
+            sent = tests.scene.sent()
+            check = sent[sent.Count() - 1]
+            m.assertEqual(check.request.session, "server")
+            return { screen: screen, check: check }
+        end function
+
+        sub failCheck(check as Object)
+            tests.scene.deliver(check.handle, api.response.failure(check.request, "unreachable"), "error")
+        end sub
+
+        ' The Companion screen covers it, as AppScene hides a screen, or goes.
+        sub cover(screen as Object, covered as Boolean)
+            screen.visible = not covered
+            if covered
+                screen.callFunc("onHide")
+            else
+                screen.callFunc("onShow", { restore: invalid, first: false, refresh: false, played: invalid })
+            end if
+        end sub
+
+        @it("stops a check the Companion screen covers, as Back does, so its answer changes nothing")
+        sub _()
+            setup = m.serverChecking()
+            m.cover(setup.screen, true)
+            m.assertEqual(m.cancelled(), [setup.check.request.requestId])
+            m.failCheck(setup.check)
+            m.assertInvalid(setup.screen.callFunc("probeDialog"))
+            m.assertInvalid(m.top.dialog)
+
+            m.cover(setup.screen, false)
+            m.assertInvalid(setup.screen.callFunc("probeDialog"))
+        end sub
+
+        @it("closes “Connect without encryption?” while covered, and asks again once it is on top again")
+        sub _()
+            setup = m.serverChecking()
+            m.failCheck(setup.check)
+            asked = setup.screen.callFunc("probeDialog")
+            m.assertNotInvalid(asked)
+            sent = tests.scene.sent().Count()
+            m.cover(setup.screen, true)
+            m.assertInvalid(setup.screen.callFunc("probeDialog"))
+            ' Its answer, if one still came, does nothing to the covered screen.
+            asked.buttonSelected = 0
+            m.assertEqual(tests.scene.sent().Count(), sent)
+            m.top.dialog = invalid
+
+            m.cover(setup.screen, false)
+            dialog = setup.screen.callFunc("probeDialog")
+            m.assertNotInvalid(dialog)
+            m.assertTrue(dialog.isSameNode(m.top.dialog))
+            m.assertFalse(dialog.isSameNode(asked))
+            m.assertEqual(dialog.title, i18n.text("setup.cleartext.title"))
+            dialog.close = true
+            m.top.dialog = invalid
+        end sub
+
+        @describe("sign-in")
+
+        @it("stops a sign-in the Companion screen covers, as Back does, and lets system/setup and auth/providers answer")
+        sub _()
+            tests.scene.reset()
+            theme.install()
+            screen = CreateObject("roSGNode", "SignInScreenProbe")
+            m.top.appendChild(screen)
+            screen.callFunc("probeGuide")
+            screen.entry = { id: "e1", route: nav.route.SIGN_IN, params: {} }
+            screen.owner = "screen.1"
+            screen.visible = true
+            screen.callFunc("onShow", { restore: invalid, first: true, refresh: false, played: invalid })
+            m.cover(screen, true)
+            setup = tests.scene.last(api.auth.server.SETUP_PATH)
+            tests.scene.deliver(setup.handle, { ok: true, status: 200, body: { needs_setup: false } }, "ok")
+            providers = tests.scene.last(api.auth.server.PROVIDERS_PATH)
+            m.assertNotInvalid(providers)
+            tests.scene.deliver(providers.handle, { ok: true, status: 200, body: {} }, "ok")
+            m.assertEqual(m.cancelled(), [])
+            m.cover(screen, false)
+
+            screen.callFunc("probeSignIn", { username: "viewer", password: "secret" })
+            sent = tests.scene.sent()
+            login = sent[sent.Count() - 1]
+            m.assertEqual(login.request.session, "signIn")
+            m.cover(screen, true)
+            m.assertEqual(m.cancelled(), [login.request.requestId])
+        end sub
+    end class
+end namespace

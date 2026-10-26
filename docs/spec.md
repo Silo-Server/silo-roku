@@ -1337,7 +1337,12 @@ server setup -> sign-in -> profile selection -> main shell -> detail -> player
 
 The scene owns one navigation stack. Each stack entry records its route,
 parameters, and focus restoration key. Back behavior follows section 5.3. No
-screen may infer its previous screen from global flags.
+screen may infer its previous screen from global flags. A screen's own
+navigation acts only while that screen is on top: a change it asks for while
+another screen covers it, such as an answer that arrives under the Companion
+screen, waits until it is on top again and is dropped if it is released first.
+A server check or sign-in under way when another screen covers its screen
+stops, as Back stops it, so its answer cannot change the session under it.
 
 ### 6.3 Threading and ownership
 
