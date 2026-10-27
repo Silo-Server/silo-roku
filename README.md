@@ -53,14 +53,17 @@ npm run sideload       # build out/silo-roku.zip and install it as the dev app
 npm run console        # stream the BrightScript debug console (port 8085)
 ```
 
-Three build variants come from one source. `npm run build` makes the release
-package, `out/silo-roku.zip`. `npm run build:perf` makes `out/silo-roku-perf.zip`,
+Four build variants come from one source. `npm run build` makes the release
+package, `out/silo-roku.zip`. `npm run build:beta` makes `out/silo-roku-beta.zip`,
+which sets the `beta` `bs_const` so an installed beta reports
+`X-Silo-Client-Channel: beta`. `npm run build:perf` makes `out/silo-roku-perf.zip`,
 which adds `run_as_process=1` (needed by `chanperf`, Resource Monitor, and
 Perfetto) and sets the `perf` `bs_const`. `npm run build:dev` makes
 `out/silo-roku-dev.zip`, which sets `debug` and is the only package that
 contains `source/dev/` and `components/dev/`. `npm run sideload:dev` installs the
 dev build; `scripts/sideload.sh out/silo-roku-perf.zip` installs any other
-package. The variants are `bsconfig.perf.json` and `bsconfig.dev.json`: bsc
+package. The variants are `bsconfig.beta.json`, `bsconfig.perf.json`, and
+`bsconfig.dev.json`: bsc
 drops inactive `#if` blocks at build time, and `scripts/bsc-manifest-entries.js`
 writes each variant's manifest keys into its package. `npm run lint` checks the
 release and dev builds. `scripts/brand-art.py` regenerates the channel
@@ -206,6 +209,44 @@ use `npm run console` to inspect startup errors. Credentials travel over stdin
 and are stored only in a temporary, private curl configuration during upload.
 
 Sideloaded builds are for development only; they are not release evidence.
+
+### Signed packages
+
+Roku signs packages only on a device in Developer Mode, with a key made once by
+`genkey` (telnet to port 8080 on the device). Any package signed with that key,
+together with the key's password, loads the key onto another device ("rekey").
+Every beta and store package must use the same key: Roku keys the registry by
+developer ID, so a new key means a new app and a forced sign-in for everyone.
+Keep the key package, its password, and its developer ID in the team's secret
+manager, never in git.
+
+`scripts/package.sh <app.zip> <out.pkg>` rekeys the device when `ROKU_SIGN_KEY`
+names a key package, sideloads the zip, runs the device's packager, and
+downloads the signed package. It reads `ROKU_SIGN_PASSWORD` and, optionally,
+`ROKU_DEV_ID` (checked against the device's keyed developer ID) alongside the
+sideload settings, and uses the same `ROKU_DEPLOY_VIA` relay. Without
+`ROKU_SIGN_KEY` the device's current key signs, which makes the first key
+package after `genkey`. Signing replaces the device's dev app.
+
+`.github/workflows/package.yml` builds signed packages. Running it by hand
+(Actions, Package, Run workflow) makes a beta package; pushing a tag
+`v<major>.<minor>` (or `v<major>.<minor>.<anything>`) that matches the manifest
+makes the release package and a draft GitHub Release with the `.pkg`
+attached. Both run the pull request checks first and carry the Package run
+number as `build_version`. The sign job runs on a self-hosted runner labelled
+`roku-signer` that reaches a Roku in Developer Mode, in the `roku-signing`
+environment, which holds the variables `ROKU_HOST` and `ROKU_DEV_ID` and the
+secrets `ROKU_PASSWORD` (the device's installer password),
+`ROKU_SIGN_PASSWORD`, and `ROKU_SIGN_KEY_BASE64` (a key package, base64; sign a
+minimal app for it, since secrets are limited to 48 KB). On a macOS runner
+installed as a service, keep the runner's `.path` to system directories
+(`/usr/bin:/bin:/usr/sbin:/sbin` before Homebrew) and its `.env` free of
+paths on external volumes: a background service that touches an external
+volume waits forever on a privacy prompt, and macOS denies local network
+access to non-system binaries such as Python, which is why the scripts reach
+the device with `curl`. Roku has no upload
+API: download the `.pkg` from the run or the release and upload it to the beta
+or public app in the Roku Developer Dashboard.
 
 ### Remote control
 

@@ -28,9 +28,9 @@ if [ "$http_code" != 200 ]; then echo "install failed: HTTP $http_code" >&2; exi
 python3 - "$tmp/response" "$tmp/app.zip" "$ROKU_HOST" <<'VERIFY'
 import json
 import re
+import subprocess
 import sys
 import time
-import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -65,9 +65,17 @@ with zipfile.ZipFile(archive) as package:
 version = ".".join(manifest[key].strip() for key in ("major_version", "minor_version", "build_version"))
 base = "http://" + host + ":8060"
 
+# ECP goes through curl: macOS denies local network access to Python started
+# by a background service, such as a self-hosted CI runner, but not to curl.
+def ecp(path, timeout, *args):
+    result = subprocess.run(["curl", "-sSf", "--max-time", str(timeout), *args, base + path],
+                            capture_output=True)
+    if result.returncode != 0:
+        raise OSError(result.stderr.decode(errors="replace").strip() or "curl failed")
+    return result.stdout
+
 def query(path):
-    with urllib.request.urlopen(base + path, timeout=5) as result:
-        return ET.fromstring(result.read())
+    return ET.fromstring(ecp(path, 5))
 
 def installed():
     return any(app.get("id") == "dev" and app.get("version") == version
@@ -83,10 +91,10 @@ try:
         fail("expected dev app is absent from /query/apps (including after an install timeout)")
     active = query("/query/active-app").find("app")
     if active is None or active.get("id") != "dev":
-        request = urllib.request.Request(base + "/launch/dev", data=b"", method="POST")
-        with urllib.request.urlopen(request, timeout=10) as result:
-            if result.status != 200:
-                fail("ECP could not launch the dev app")
+        try:
+            ecp("/launch/dev", 10, "-X", "POST")
+        except OSError:
+            fail("ECP could not launch the dev app")
     for attempt in range(10):
         active = query("/query/active-app").find("app")
         if active is not None and active.get("id") == "dev":

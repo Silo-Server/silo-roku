@@ -54,9 +54,9 @@ These stop a beta with households, and therefore public submission:
 6. **Roku limits beta apps to "internal testing only"** (Distribution
    Agreement Exhibit A §2.1). Spec section 13 wants real households in the
    beta; this also needs Roku's confirmation.
-7. **Beta builds report the wrong channel.** `X-Silo-Client-Channel` is never
-   `beta`; Roku gives a beta no flag, so a build constant is needed
-   (assumption AG-38, `source/auth/headers.bs`).
+7. ~~**Beta builds report the wrong channel.**~~ Resolved: `npm run build:beta`
+   sets the `beta` build constant, and an installed beta package reports
+   `X-Silo-Client-Channel: beta` (assumption AG-38, `source/auth/headers.bs`).
 8. **No owners** for the Roku developer account, signing key custody, the
    reviewer server, or the store listing (plan section 9.1, assumption A-7).
 
@@ -294,7 +294,9 @@ beta environment "for internal testing only".
   forced sign-in for every viewer (criterion 4.1).
 - [ ] Release build from a clean checkout: `npm ci`, `npm run ci` green,
   `build_version` stamped, debug and test components excluded
-  (`scripts/hygiene.sh`), then packaged and signed with the key.
+  (`scripts/hygiene.sh`), then packaged and signed with the key. The Package
+  workflow (`.github/workflows/package.yml`) does this for beta and release
+  packages; see the README's "Signed packages".
 - [ ] Uploaded to a beta app; dashboard Static Analysis run and its
   authentication findings triaged (section 3).
 - [ ] Install-over-existing-data rehearsal: a newer package signed with the
@@ -335,8 +337,8 @@ Status: **Open**; nothing above is done.
 - [ ] The trademark owner's written permission.
 - [ ] Dashboard Static Analysis with no errors; Deep Linking Tester and App
   Behavior Analysis passed on the public app record.
-- [ ] Version and channel mapping: `X-Silo-Client-Channel` `release` for the
-  store package, `beta` for beta packages.
+- [x] Version and channel mapping: `X-Silo-Client-Channel` `release` for the
+  store package, `beta` for beta packages (`npm run build:beta`).
 
 ## 10. Milestone 4 gates without a section above
 
