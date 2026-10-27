@@ -141,12 +141,15 @@ import "pkg:/source/util/values.bs"
 ' While it shows (the controls reducer's skipButton flag), OK with the
 ' controls hidden, or on the pill when it has the controls' focus, arrives
 ' as activateSkip() and Back as dismissSkip(). Skip Recap
-' (playback.skipRecap, SkipRecapButton) takes the same positions, Video
-' state, and markers, shows while playback is inside a recap, and skips it
-' itself under the profile's playback.auto_skip_recap; its OK arrives as
-' activateRecap. Their seeks, Watch Intro's back to the intro's start too,
-' go through the session reducer as every seek does (commitSeek: local or
-' seek_reanchor).
+' (playback.skipRecap) and Skip Credits (playback.skipCredits) take the
+' same positions, Video state, and markers, and share the segment pill
+' (SkipSegmentButton), Skip Recap first: each shows while playback is inside
+' its range and skips it itself under the profile's
+' playback.auto_skip_recap or playback.auto_skip_credits; the pill's OK
+' arrives as activateSegment. Their seeks, Watch Intro's back to the
+' intro's start too, go through the session reducer as every seek does
+' (commitSeek: local or seek_reanchor). Credits that run to the end of the
+' file open Up Next instead (creditsToEnd).
 '
 ' Up Next (playback.upNext, components/player/upnext/UpNextPanel), for
 ' every item, as tvOS's: after the first plan, an episode's next episode is
@@ -244,7 +247,7 @@ sub init()
     m.overlay = m.top.findNode("overlay")
     m.overlayFocus = m.overlay.findNode("keyFocus")
     m.skipButton = m.top.findNode("skipButton")
-    m.recapButton = m.top.findNode("recapButton")
+    m.segmentButton = m.top.findNode("segmentButton")
     m.optionsLayer = m.top.findNode("optionsLayer")
     m.upNextLayer = m.top.findNode("upNextLayer")
     m.preview = m.top.findNode("preview")
@@ -422,6 +425,7 @@ sub init()
     m.markersFileId = ""
     m.skip = invalid
     m.recap = invalid
+    m.credits = invalid
     m.upNext = invalid
     m.upNextPanel = invalid
     m.resolution = invalid
@@ -577,6 +581,7 @@ sub onPreferences(event as Object)
     runUpNext({ type: "prompt", seconds: m.preferences.nextUpPromptSeconds })
     if m.skip <> invalid and playback.skipIntro.modeOf(m.preferences.introSkipMode) <> m.skip.mode then runSkip({ type: "mode", mode: m.preferences.introSkipMode })
     runRecap({ type: "autoSkip", value: m.preferences.autoSkipRecap })
+    runCredits({ type: "autoSkip", value: m.preferences.autoSkipCredits })
     m.overlay.skipBackSeconds = m.preferences.skipBackSeconds
     m.overlay.skipForwardSeconds = m.preferences.skipForwardSeconds
     dispatchControls({ type: "preferences", skipBackSeconds: m.preferences.skipBackSeconds, skipForwardSeconds: m.preferences.skipForwardSeconds })
@@ -655,6 +660,7 @@ sub begin(intent as Object)
     readMarkers(intent.fileId)
     m.skip = playback.skipIntro.create(m.preferences.introSkipMode, m.markers)
     m.recap = playback.skipRecap.create(m.preferences.autoSkipRecap, m.markers)
+    m.credits = playback.skipCredits.create(m.preferences.autoSkipCredits, m.markers, intent.runtime, playback.skipCredits.carriedKey(carry))
     if not chained then carry = playback.upNext.newCarry()
     m.upNext = playback.upNext.create({ promptSeconds: m.preferences.nextUpPromptSeconds, runtime: intent.runtime, lookup: intent.kind = "episode", autoPlayNext: m.autoplayNext, deviceAutoplay: CreateObject("roDeviceInfo").IsAutoplayEnabled(), carry: carry })
     ' The Up Next button waits for the first plan (resolveNext).
@@ -2082,7 +2088,7 @@ sub executeControl(command as Object)
         applyFocus()
         if command.shown then logFocus("controls shown") else logFocus("controls hidden")
     else if t = "seek"
-        commitSeek(command.position, util.isTrue(command.resume))
+        viewerSeek(command.position, util.isTrue(command.resume))
     else if t = "togglePause"
         togglePause()
     else if t = "openOptions"
@@ -2093,8 +2099,8 @@ sub executeControl(command as Object)
         runUpNext({ type: "back" })
     else if t = "activateSkip"
         activateSkip()
-    else if t = "activateRecap"
-        runRecap({ type: "press" })
+    else if t = "activateSegment"
+        activateSegment()
     else if t = "dismissSkip"
         dismissSkip()
     else if t = "closeOptions"
@@ -2395,9 +2401,9 @@ sub restyleSkipPills()
     idle = not c.shown and not c.options and not c.upNext
     m.skipButton.raised = shown
     m.skipButton.highlighted = idle or (shown and c.focus = playback.controls.SKIP_INTRO)
-    m.recapButton.raised = shown
-    m.recapButton.stacked = m.skipButton.visible
-    m.recapButton.highlighted = (idle and not c.skipButton) or (shown and c.focus = playback.controls.SKIP_RECAP)
+    m.segmentButton.raised = shown
+    m.segmentButton.stacked = m.skipButton.visible
+    m.segmentButton.highlighted = (idle and not c.skipButton) or (shown and c.focus = playback.controls.SKIP_SEGMENT)
 end sub
 
 ' The markers of the version a file belongs to, and the scrubber's bands.
@@ -2409,22 +2415,27 @@ sub readMarkers(fileId as String)
 end sub
 
 ' A plan's file: a replan that changes it reads its version's markers for
-' the bands and Skip Intro, and Up Next takes the plan's runtime.
+' the bands and the skip pills, and Up Next and Skip Credits take the
+' plan's runtime.
 sub followMarkers(fileId as String)
     if fileId <> m.markersFileId
         readMarkers(fileId)
         runSkip({ type: "markers", markers: m.markers })
     end if
+    runCredits({ type: "timeline", runtime: m.state.plan.runtime })
     runUpNext({ type: "timeline", runtime: m.state.plan.runtime })
 end sub
 
 ' Reduces a Skip Intro event at the clock's now and carries out what it
-' returns; Skip Recap takes the positions, the Video state, and the markers
-' too.
+' returns; Skip Recap and Skip Credits take the positions, the Video state,
+' and the markers too.
 sub runSkip(event as Object)
     if m.skip = invalid or m.leaving then return
     t = event.type
-    if t = "position" or t = "player" or t = "markers" then runRecap(event)
+    if t = "position" or t = "player" or t = "markers"
+        runRecap(event)
+        runCredits(event)
+    end if
     event.now = m.env.now()
     for each command in playback.skipIntro.reduce(m.skip, event)
         if command.type = "seek"
@@ -2457,15 +2468,68 @@ sub runRecap(event as Object)
         if command.type = "seek"
             commitSeek(command.seconds)
         else
-            showRecap(command.type = "show")
+            showSegment()
         end if
     end for
 end sub
 
-sub showRecap(shown as Boolean)
-    if m.recapButton.visible = shown then return
-    m.recapButton.visible = shown
-    setOverlayFlags({ recapButton: shown })
+' Reduces a Skip Credits event (playback.skipCredits): a skip seeks past
+' the credits, or, for credits that run to the end, opens Up Next over
+' them (creditsToEnd).
+sub runCredits(event as Object)
+    if m.credits = invalid or m.leaving then return
+    for each command in playback.skipCredits.reduce(m.credits, event)
+        if command.type = "seek"
+            commitSeek(command.seconds)
+        else if command.type = "toEnd"
+            creditsToEnd(command)
+        else
+            showSegment()
+        end if
+    end for
+end sub
+
+' tvOS's performCreditsSkip at the end of the file: Up Next opens while the
+' credits play on, or, with nothing for it to show, the seek to the end
+' ends the item as any end does.
+sub creditsToEnd(command as Object)
+    if playback.upNext.takesCredits(m.upNext)
+        log.info(LOG_TAG, "skipped credits that run to the end; Up Next opens over them", {})
+        runUpNext({ type: "credits", start: command.start })
+    else
+        commitSeek(command.seconds)
+    end if
+end sub
+
+' The segment pill shows Skip Recap, else Skip Credits, while either
+' reducer shows its pill (tvOS's segmentSkipLabel), except under Up Next,
+' which takes the controls' place as on tvOS, and once Up Next has moved
+' on to another item.
+sub showSegment()
+    kind = segmentKind()
+    if kind <> "" then m.segmentButton.kind = kind
+    movedOn = m.upNext <> invalid and m.upNext.finished
+    shown = kind <> "" and m.upNextPanel = invalid and not movedOn
+    if m.segmentButton.visible = shown then return
+    m.segmentButton.visible = shown
+    setOverlayFlags({ segmentButton: shown })
+end sub
+
+' "recap", "credits", or "" for neither.
+function segmentKind() as String
+    if m.recap <> invalid and playback.skipRecap.visible(m.recap) then return "recap"
+    if m.credits <> invalid and playback.skipCredits.visible(m.credits) then return "credits"
+    return ""
+end function
+
+' OK on the segment pill, for the reducer whose pill it shows.
+sub activateSegment()
+    kind = segmentKind()
+    if kind = "recap"
+        runRecap({ type: "press" })
+    else if kind = "credits"
+        runCredits({ type: "press" })
+    end if
 end sub
 
 ' OK with the skip button showing and the controls hidden.
@@ -2478,7 +2542,34 @@ sub dismissSkip()
     runSkip({ type: "back" })
 end sub
 
-' A seek from the controls or Skip Intro, through the session reducer (a
+' The viewer's own seek, from the controls, a spoken seek, or the phone
+' remote. Under Up Next before the end it is the viewer staying with this
+' title: Keep Watching closes the panel first, whose countdown would
+' otherwise start the next item (over skipped credits it counts the clock,
+' whatever the playhead does). After the end the session has stopped, so
+' the seek replays the title from there, as Keep Watching replays the end;
+' once Up Next has started another item, the seek has nothing to move.
+' Skip Credits shows again for credits it lands in, even before an earlier
+' skip has landed. The seek goes out first, so an automatic skip of those
+' credits wins over it.
+sub viewerSeek(position as Dynamic, resume = false as Boolean)
+    if m.upNext <> invalid and m.upNext.finished then return
+    if upNextHolds()
+        replayEnd(position)
+        return
+    end if
+    if m.upNext <> invalid and playback.upNext.isOpen(m.upNext) then runUpNext({ type: "keepWatching" })
+    commitSeek(position, resume)
+    runCredits({ type: "seek", seconds: position })
+end sub
+
+' The video ended or the session is done, and only Up Next holds the
+' player.
+function upNextHolds() as Boolean
+    return (m.videoEnded or m.done) and m.upNext <> invalid
+end function
+
+' A seek, the viewer's or a skip's, through the session reducer (a
 ' local seek or a seek_reanchor).
 ' resume: Play committed the seek while paused, so a load the seek opens
 ' plays (playback.session.onSeekTo).
@@ -2642,6 +2733,7 @@ sub showUpNext(command as Object)
     panel.observeField("videoBox", "onUpNextBox")
     setVideoBox(panel.videoBox)
     panel.visible = true
+    showSegment()
     setOverlayFlags({ upNext: true })
     dispatchControls({ type: "hide" })
     panel.setFocus(true)
@@ -2674,6 +2766,7 @@ sub closeUpNext()
     m.upNextLayer.removeChild(panel)
     setVideoBox(invalid)
     setOverlayFlags({ upNext: false })
+    showSegment()
 end sub
 
 ' Play Now, Keep Watching, or Back on the panel, or OK on an On Deck card.
@@ -2748,7 +2841,7 @@ end sub
 sub replayEnd(seconds as Dynamic)
     log.info(LOG_TAG, "replaying the end", { seconds: seconds })
     closeUpNext()
-    m.advance = { itemId: m.itemId, carry: playback.upNext.replayCarry(m.upNext), seasonNumber: playingSeason(), auto: false, replay: seconds, foreign: false }
+    m.advance = { itemId: m.itemId, carry: playback.upNext.replayCarry(m.upNext, playback.skipCredits.skippedKey(m.credits)), seasonNumber: playingSeason(), auto: false, replay: seconds, foreign: false }
     if not m.done then dispatch({ type: "back" })
     advanceWhenDone()
 end sub
@@ -2783,7 +2876,9 @@ sub clearSession()
     closeOptionsPanel()
     closeUpNext()
     hideSkip()
-    showRecap(false)
+    m.recap = invalid
+    m.credits = invalid
+    showSegment()
     m.progressTimer.control = "stop"
     m.panelTimer.control = "stop"
     replayCaptions(false)
@@ -2825,6 +2920,7 @@ sub clearSession()
     m.markersFileId = ""
     m.skip = invalid
     m.recap = invalid
+    m.credits = invalid
     m.upNext = invalid
     m.resolution = invalid
     m.onDeck = invalid

@@ -335,3 +335,161 @@ namespace playback.skipRecap
         end if
     end sub
 end namespace
+
+' The Skip Credits pill and credits auto-skip (spec section 5.7), as
+' tvOS's player decides them (silo-apple 2c8f2e1b PlayerViewModel:
+' showCreditsSkip, skipCredits, autoSkipCreditsIfNeeded,
+' CreditsAutoSkipPolicy, performCreditsSkip). Pure, as playback.skipRecap:
+' reduce(state, event) updates state in place and returns commands,
+' { type: "seek", seconds }, { type: "toEnd", start, seconds },
+' { type: "show" }, or { type: "hide" }, each sent when it changes
+' something.
+'
+' The pill shows while playback is inside a credits range
+' (playback.markers) once the item has first played, and shares the
+' segment pill with Skip Recap, which wins when both show. OK skips the
+' range: to its end, or, for credits that run to the end of the file
+' (ending within END_SLACK_SECONDS of the runtime, or past it), toEnd,
+' which the player gives Up Next (playback.upNext's "credits"), or, with
+' nothing for Up Next to show, carries out as a seek to the end, so the
+' item ends as it does at any end. The credits keep playing under Up Next,
+' and the pill shows while they do, as tvOS's does.
+'
+' With the profile's playback.auto_skip_credits on, playback entering a
+' range skips it the same way, once: the range skipped last, by the pill
+' or automatically, is not skipped again when the viewer goes back into it
+' (tvOS's lastSkippedKey), and shows the pill then. Keep Watching's replay
+' of the end starts a new reducer with that key (skippedKey, carried through
+' playback.upNext.replayCarry and taken back by carriedKey), as tvOS's
+' latch outlives its seek to duration - 10: the replay plays the credits
+' rather than skipping them again and reopening Up Next with a countdown.
+' After a seek past a range, the pill stays down until playback has left
+' it, so positions reported before the seek lands show nothing, or until
+' the viewer seeks: a viewer who goes back into the credits before the
+' skip has landed gets the pill back, as tvOS shows it whenever playback
+' is in them.
+'
+' Events, as playback.skipRecap takes them: position, player, markers,
+' press, and autoSkip; { type: "timeline", runtime } when the playing
+' file's runtime (source seconds) changes; and { type: "seek", seconds }
+' when the viewer commits a seek of their own to a source position.
+namespace playback.skipCredits
+    ' tvOS's performCreditsSkip: a target this close to the runtime is the
+    ' end of the file.
+    const END_SLACK_SECONDS = 0.5
+
+    ' skipped is the key of a range already skipped, from carriedKey.
+    function create(autoSkip as Boolean, markers as Object, runtime as Dynamic, skipped = "" as String) as Object
+        state = {
+            autoSkip: autoSkip,
+            credits: playback.markers.ofKind(markers, playback.markers.CREDITS),
+            runtime: invalid,
+            ' The key of the range skipped last, by OK or automatically.
+            skipped: skipped,
+            ' The range a seek just passed, whose pill stays down until
+            ' playback has left it or the viewer seeks.
+            leaving: "",
+            position: invalid,
+            played: false,
+            shown: false
+        }
+        if util.isNumber(runtime) and runtime > 0 then state.runtime = runtime
+        return state
+    end function
+
+    function reduce(state as Object, event as Object) as Object
+        out = []
+        t = event.type
+        if t = "position"
+            if util.isNumber(event.seconds) then state.position = event.seconds
+        else if t = "player"
+            if util.text(event.state) = "playing" then state.played = true
+        else if t = "markers" and type(event.markers) = "roArray"
+            state.credits = playback.markers.ofKind(event.markers, playback.markers.CREDITS)
+        else if t = "timeline"
+            state.runtime = invalid
+            if util.isNumber(event.runtime) and event.runtime > 0 then state.runtime = event.runtime
+        else if t = "autoSkip"
+            state.autoSkip = util.isTrue(event.value)
+        else if t = "seek"
+            state.leaving = ""
+            if util.isNumber(event.seconds) then state.position = event.seconds
+        else if t = "press"
+            range = activeRange(state)
+            if range <> invalid and state.played
+                skip(state, range, out)
+                return out
+            end if
+        end if
+        evaluate(state, out)
+        return out
+    end function
+
+    function visible(state as Object) as Boolean
+        return state.shown
+    end function
+
+    ' The key of the range skipped last, or "" for none (or no reducer).
+    function skippedKey(state as Dynamic) as String
+        if not util.isObject(state) then return ""
+        return state.skipped
+    end function
+
+    ' The skipped key a start's carry (nav.player.carryOf) hands on: only
+    ' Keep Watching's replay of the same item has one.
+    function carriedKey(carry as Dynamic) as String
+        if not util.isObject(carry) or not util.isTrue(carry.replay) then return ""
+        return util.text(carry.skippedCredits)
+    end function
+
+    function activeRange(state as Object) as Dynamic
+        return playback.markers.activeRange(state.credits, playback.markers.CREDITS, state.position)
+    end function
+
+    ' Whether range runs to the end of the file. Without a runtime it
+    ' cannot tell, and says no: the seek to its end then ends the item.
+    function runsToEnd(state as Object, range as Object) as Boolean
+        return state.runtime <> invalid and range.end_seconds >= state.runtime - END_SLACK_SECONDS
+    end function
+
+    sub evaluate(state as Object, out as Object)
+        range = activeRange(state)
+        key = ""
+        if range <> invalid then key = playback.skipIntro.keyOf(range)
+        if key <> state.leaving then state.leaving = ""
+        if range = invalid or not state.played or key = state.leaving
+            setShown(state, false, out)
+            return
+        end if
+        if state.autoSkip and key <> state.skipped
+            skip(state, range, out)
+            return
+        end if
+        setShown(state, true, out)
+    end sub
+
+    ' Skips range, which is kept as skipped before the seek goes out:
+    ' positions reported before it lands must see it handled.
+    sub skip(state as Object, range as Object, out as Object)
+        key = playback.skipIntro.keyOf(range)
+        state.skipped = key
+        if runsToEnd(state, range)
+            out.Push({ type: "toEnd", start: range.start_seconds, seconds: state.runtime })
+            setShown(state, true, out)
+            return
+        end if
+        state.leaving = key
+        setShown(state, false, out)
+        out.Push({ type: "seek", seconds: range.end_seconds })
+    end sub
+
+    sub setShown(state as Object, shown as Boolean, out as Object)
+        if state.shown = shown then return
+        state.shown = shown
+        if shown
+            out.Push({ type: "show" })
+        else
+            out.Push({ type: "hide" })
+        end if
+    end sub
+end namespace

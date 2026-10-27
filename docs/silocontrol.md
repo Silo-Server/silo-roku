@@ -353,7 +353,7 @@ server. `overview` is left out to keep frames small.
 | `control.name` | Roku |
 | --- | --- |
 | `play`, `pause`, `play_pause` | The player's own play and pause |
-| `seek` | The player's seek path, as a committed scrub |
+| `seek` | The player's seek path, as a committed scrub; under Up Next, Keep Watching first, and after the end a replay from there (spec section 5.7) |
 | `stop` | Closes the player as Back does, final progress included |
 | `play_next` | Up Next's next episode; `error command_failed` without one |
 | `select_audio_track`, `select_subtitle_track` | The Options menu's track change (a replan where the plan needs one); `trackId` absent means subtitles off |

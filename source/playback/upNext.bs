@@ -61,6 +61,14 @@ import "pkg:/source/playback/values.bs"
 ' the end, it is END_COUNTDOWN_SECONDS of wall clock; an end that comes with
 ' the panel already counting starts the pick at once.
 '
+' Skip Credits on credits that run to the end of the file (tvOS's
+' presentNextUpOverCredits, playback.skipCredits) opens it as well, while
+' the credits play on in the video's box, with the END_COUNTDOWN_SECONDS
+' wall-clock countdown; already open, it switches to that countdown. The
+' item then counts as finished (leftFinished) while playback stays in the
+' credits, Keep Watching included. takesCredits says whether it can: with
+' nothing to show, the player seeks to the end instead.
+'
 ' Keep Watching and Back close it until playback leaves the prompt window
 ' (a seek back), when it can open there again. After the end they play the
 ' last REPLAY_SECONDS again (Back leaves instead when there is nothing to
@@ -87,6 +95,9 @@ import "pkg:/source/playback/values.bs"
 '                                    panel closes as Keep Watching closes
 '                                    it, without resuming anything
 '   { type: "autoPlay", value, now } the panel's or Options' toggle
+'   { type: "credits", start, now }  Skip Credits reached the end of the
+'                                    file; start is where the credits
+'                                    begin (source seconds)
 '   { type: "tick", now }            at nextWake
 namespace playback.upNext
     ' tvOS's nextUpCountdownDefaultSeconds.
@@ -137,16 +148,23 @@ namespace playback.upNext
             position: invalid,
             open: false,
             ended: false,
-            ' "automatic" (the prompt window or the end) or "hud" (the Up
-            ' Next button): what opened the panel this time.
+            ' "automatic" (the prompt window or the end), "hud" (the Up
+            ' Next button), or "credits" (Skip Credits at the end of the
+            ' file): what opened the panel this time.
             source: "automatic",
+            ' tvOS's didSkipCreditsToEnd, and where those credits begin
+            ' (invalid when unknown).
+            skippedCredits: false,
+            creditsStart: invalid,
             ' tvOS's nextUpAutoplayCancelled: Keep Watching or the toggle
             ' stopped the countdown.
             cancelled: replay,
             ' tvOS's nextUpPromptDismissed: Keep Watching closed the panel
             ' inside the prompt window.
             dismissed: replay,
-            ' { atEnd, endsAt, seconds, total }, or invalid.
+            ' { clock, endsAt, seconds, total }, or invalid; clock: it
+            ' counts wall-clock time to endsAt (at the end, or over the
+            ' credits), not the runtime left.
             countdown: invalid,
             ' A playNext, replay, or exit went out; nothing follows it.
             finished: false,
@@ -186,6 +204,8 @@ namespace playback.upNext
             if state.open then dismiss(state)
         else if t = "autoPlay"
             onAutoPlay(state, event.value, now, out)
+        else if t = "credits"
+            onCredits(state, event.start, now, out)
         else if t = "tick"
             onTick(state, now, out)
         end if
@@ -212,18 +232,34 @@ namespace playback.upNext
 
     ' Whether the player leaves its item finished, as tvOS's
     ' PlayerNextUpCompletionPolicy decides when its player closes: the video
-    ' ended, or Up Next was open inside the prompt window. The detail page
-    ' moves on only from a finished episode (spec section 5.6), never from
-    ' one the server merely reports watched before.
+    ' ended, Up Next was open inside the prompt window, or Skip Credits
+    ' reached the end of the file and playback is still in those credits
+    ' (tvOS's skippedCreditsToEnd). The detail page moves on only from a
+    ' finished episode (spec section 5.6), never from one the server merely
+    ' reports watched before.
     function leftFinished(state as Dynamic, videoEnded as Boolean) as Boolean
         if videoEnded then return true
         if not util.isObject(state) then return false
+        if state.skippedCredits
+            if state.creditsStart = invalid then return true
+            if util.isNumber(state.position) and state.position >= state.creditsStart then return true
+        end if
         return state.open and inWindow(state, state.position)
     end function
 
-    ' The carry for Keep Watching's replay of the end.
-    function replayCarry(state as Object) as Object
-        return { autoPlay: state.autoPlay, replay: true }
+    ' Whether Skip Credits at the end of the file opens Up Next (tvOS's
+    ' presentNextUpOverCredits): it has something to show, and the video
+    ' has not ended.
+    function takesCredits(state as Dynamic) as Boolean
+        if not util.isObject(state) then return false
+        return canShow(state) and not state.ended and not state.finished
+    end function
+
+    ' The carry for Keep Watching's replay of the end. skippedCredits is
+    ' playback.skipCredits.skippedKey: the replay does not skip those
+    ' credits again.
+    function replayCarry(state as Object, skippedCredits = "" as String) as Object
+        return { autoPlay: state.autoPlay, replay: true, skippedCredits: skippedCredits }
     end function
 
     ' When to send the next tick, or invalid: as the end countdown's number
@@ -313,22 +349,23 @@ namespace playback.upNext
         return state.allowed and state.autoPlay and state.next <> invalid and not state.cancelled
     end function
 
-    ' tvOS's startNextUpCountdownIfNeeded.
+    ' tvOS's startNextUpCountdownIfNeeded: at the end and over skipped
+    ' credits, END_COUNTDOWN_SECONDS of wall clock.
     sub startCountdown(state as Object, now as Dynamic, out as Object)
         state.countdown = invalid
         if not state.open or not counts(state) then return
-        if not state.ended
+        if not state.ended and state.source <> "credits"
             followPlayhead(state, out)
             return
         end if
         endsAt = playback.values.number(now, 0) + END_COUNTDOWN_SECONDS * 1000
-        state.countdown = { atEnd: true, endsAt: endsAt, seconds: END_COUNTDOWN_SECONDS, total: END_COUNTDOWN_SECONDS }
+        state.countdown = { clock: true, endsAt: endsAt, seconds: END_COUNTDOWN_SECONDS, total: END_COUNTDOWN_SECONDS }
     end sub
 
     ' tvOS's updateNextUpCountdownForActivePlayback: before the end, the
-    ' countdown is the runtime left.
+    ' countdown is the runtime left; over skipped credits it is the clock's.
     sub followPlayhead(state as Object, out as Object)
-        if not state.open or state.ended then return
+        if not state.open or state.ended or state.source = "credits" then return
         state.countdown = invalid
         if not counts(state) or state.runtime = invalid or state.runtime <= 0 or not util.isNumber(state.position) then return
         left = state.runtime - state.position
@@ -339,7 +376,7 @@ namespace playback.upNext
             total = HUD_COUNTDOWN_SECONDS
         end if
         if total < 1 then total = 1
-        state.countdown = { atEnd: false, endsAt: invalid, seconds: ceiling(left), total: total }
+        state.countdown = { clock: false, endsAt: invalid, seconds: ceiling(left), total: total }
         if left <= PLAY_AT_SECONDS then playNext(state, true, out)
     end sub
 
@@ -413,6 +450,21 @@ namespace playback.upNext
         state.countdown = invalid
     end sub
 
+    ' tvOS's presentNextUpOverCredits: the credits play on under the panel,
+    ' which counts END_COUNTDOWN_SECONDS; an open panel switches to that
+    ' countdown.
+    sub onCredits(state as Object, start as Dynamic, now as Dynamic, out as Object)
+        if not takesCredits(state) then return
+        state.skippedCredits = true
+        state.creditsStart = numberOrInvalid(start)
+        if state.open
+            state.source = "credits"
+            startCountdown(state, now, out)
+        else
+            beginPostroll(state, false, "credits", now, out)
+        end if
+    end sub
+
     ' tvOS's setNextUpAutoPlayEnabled.
     sub onAutoPlay(state as Object, value as Dynamic, now as Dynamic, out as Object)
         if not util.isBoolean(value) or value = state.autoPlay then return
@@ -437,10 +489,11 @@ namespace playback.upNext
         countdown.seconds = ceiling(left / 1000)
     end sub
 
-    ' The wall-clock countdown of a panel the end opened, or invalid.
+    ' The wall-clock countdown of a panel the end or skipped credits
+    ' opened, or invalid.
     function endCountdown(state as Object) as Dynamic
         countdown = state.countdown
-        if state.finished or not state.open or countdown = invalid or not countdown.atEnd then return invalid
+        if state.finished or not state.open or countdown = invalid or not countdown.clock then return invalid
         return countdown
     end function
 

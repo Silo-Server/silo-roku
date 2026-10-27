@@ -5,14 +5,20 @@ brs-node keeps every component a run creates until its process exits (about
 23 MB a Player), so one process for the whole suite outgrows V8's default
 heap. The specs run in shards instead (SHARDS): each a test package of its
 own, built with bsconfig.tests.json and only its specs, and run in its own
-brs-node process, TEST_JOBS at a time (default 4, at most the CPU count).
+brs-node process, TEST_JOBS at a time (default 4, at most the CPU count),
+with a JS heap of HEAP_MB whatever the host: V8 sizes its default by the
+host's memory, so a shard that fits in this machine's heap can die of heap
+exhaustion on CI's smaller runner.
 
 brs-cli exits 0 even when tests fail, so a shard passes only when it exits 0
 within TIMEOUT seconds, reports "[Rooibos Result]: PASS" and no FAIL, and ran
-at least one test. With --junit the shards' reports are merged into
-reports/junit.xml, written whenever every shard produced one, failures
-included (scripts/update-goldens.sh reads them). Standard library only; run
-it through scripts/test-headless.sh.
+at least one test. A shard that crashes or times out is reported with the
+cause and the case it was running, and on GitHub Actions also as an error
+annotation, since the job's log view can cut the output short. With
+--junit the shards' reports are merged into reports/junit.xml, written
+whenever every shard produced one, failures included
+(scripts/update-goldens.sh reads them). Standard library only; run it
+through scripts/test-headless.sh.
 """
 import concurrent.futures
 import json
@@ -33,6 +39,8 @@ BASE_CONFIG = ROOT / "bsconfig.tests.json"
 # The base config's spec entry, which each shard replaces with its own specs.
 SPEC_ENTRY = {"src": "tests/**/*.spec.bs", "dest": "source/tests"}
 TIMEOUT = 300
+# The default heap on CI's 7 GB runner; every shard should pass at 1536.
+HEAP_MB = 2048
 KILL_AFTER = 10
 
 # Each shard is a name and the paths under tests/ whose specs it runs: a
@@ -47,7 +55,8 @@ SHARDS = [
     ("player-sidecars", ["player/captionSidecars.spec.bs", "api", "deeplink", "dev", "memory", "nav", "platform"]),
     ("detail", ["views/detailScreen.spec.bs", "onboarding", "storage", "theme", "util", "smoke.spec.bs"]),
     ("detail-tracks", ["views/detailTracks.spec.bs", "auth", "control"]),
-    ("views", ["views", "player"]),
+    ("views", ["views"]),
+    ("player", ["player"]),
     ("screens", ["home", "library", "search", "settings"]),
 ]
 
@@ -97,11 +106,11 @@ def write_config(base, name, specs):
     return path
 
 
-def run(command, log, cwd=ROOT, timeout=None):
+def run(command, log, cwd=ROOT, timeout=None, env=None):
     """Runs command in cwd with its output in log; returns its status, or None
     when it outlived timeout and was stopped."""
     with open(log, "wb") as out:
-        process = subprocess.Popen(command, cwd=cwd, stdout=out, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(command, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT)
         try:
             return process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -129,6 +138,16 @@ def report_of(text):
         return None
 
 
+def crash_of(text):
+    """Why a run stopped short and the case it was in, as a phrase, or ''."""
+    cause = re.findall(r"^\[host\] App worker error: (.*)$|^(FATAL ERROR: .*)$", text, re.M)
+    case = re.findall(r"^\s*Location: \S*?/(tests/\S+)\s*$", text, re.M)
+    parts = [next(c for c in cause[-1] if c)] if cause else []
+    if case:
+        parts.append(f"in {case[-1]}")
+    return ": " + ", ".join(parts) if parts else ""
+
+
 def count(text, label):
     found = re.findall(rf"^\s*{label}:\s*(\d+)\s*$", text, re.M)
     return int(found[-1]) if found else 0
@@ -146,15 +165,16 @@ def run_shard(base, name, entries, specs, printed):
     else:
         # In the shard's directory: a request cut short by the timeout
         # leaves brs-node's temporary file in the working directory.
-        status = run([str(ROOT / "node_modules/.bin/brs-cli"), str(WORK / name / "tests.zip")], log, WORK / name, TIMEOUT)
+        env = dict(os.environ, NODE_OPTIONS=f"{os.environ.get('NODE_OPTIONS', '')} --max-old-space-size={HEAP_MB}".strip())
+        status = run([str(ROOT / "node_modules/.bin/brs-cli"), str(WORK / name / "tests.zip")], log, WORK / name, TIMEOUT, env)
         output = log.read_text(errors="replace")
         shard["report"] = report_of(output)
         shard["tests"] = count(output, "Total")
         shard["passed"] = count(output, "Passed")
         if status is None:
-            shard["failure"] = f"timed out after {TIMEOUT} seconds"
+            shard["failure"] = f"timed out after {TIMEOUT} seconds{crash_of(output)}"
         elif status != 0:
-            shard["failure"] = f"brs-cli exited {status}"
+            shard["failure"] = f"brs-cli exited {status}{crash_of(output)}"
         elif "[Rooibos Result]: FAIL" in output:
             shard["failure"] = "Rooibos reported FAIL"
         elif "[Rooibos Result]: PASS" not in output:
@@ -204,6 +224,9 @@ def main(args):
     failed = [shard for shard in shards if shard["failure"]]
     if failed:
         print("headless tests failed: " + "; ".join(f"{s['name']} ({s['failure']})" for s in failed), file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            for shard in failed:
+                print(f"::error title=headless shard {shard['name']}::{shard['failure']}", flush=True)
     if junit:
         missing = [shard["name"] for shard in shards if shard["report"] is None]
         if missing:

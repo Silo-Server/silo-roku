@@ -122,8 +122,9 @@ Play:
 - play/pause, skip, the rate ladder, scrubbing, Replay, and stop;
 - seek-preview thumbnails (trickplay) from the server's sprite sheets;
 - audio, subtitle, and quality selection through replan;
-- skip intro and skip recap using server markers, with the profile's recap
-  auto-skip;
+- Skip Intro, Skip Recap, and Skip Credits using server markers, with the
+  profile's recap and credits auto-skip (`playback.auto_skip_recap`,
+  `playback.auto_skip_credits`);
 - Up Next near the end of every movie and episode, with autoplay and On Deck;
 - periodic and final progress reporting;
 - the profile's server-stored playback preferences (section 8.5).
@@ -139,41 +140,73 @@ Platform:
 
 Section 5 describes how each of these looks and behaves.
 
-### 3.3 Deferred until after the first release
+### 3.3 After the first release
 
-- multiple saved Silo servers;
-- local-network discovery of Silo servers, and DIAL;
+The owner chose this list on 2026-10-26 (decision D-8 in
+[`implementation-assumptions.md`](implementation-assumptions.md)), after
+comparing the Roku client with the tvOS and Android TV apps (silo-apple
+`2c8f2e1b`, silo-android `9867edfa4`). The order is not set. Each item names
+the Silo TV app that already ships it; that app is the reference when the
+item is built, tvOS first where both have it (section 5.1).
+
+Planned:
+
+- Watchlist, Favorites, and History screens, with the add and remove
+  toggles and mark watched or unwatched (tvOS, Android TV); until then,
+  server rows that contain this data still display on Home;
+- full person pages with filmography (tvOS, Android TV), replacing the
+  first release's person panel (section 5.9);
+- trailers and extras in the detail page's Trailers & More rail (tvOS,
+  Android TV); tvOS opens remote trailers in the YouTube app, which
+  criterion 5.3 rules out on Roku, so remote trailers need another route;
+- library filters and Shuffle (tvOS, Android TV);
+- Requests, Calendar, and the For You tab (tvOS, Android TV); Shuffle and
+  Requests show only when the server offers them;
+- chapters, playback speed, and aspect in the player's Options (tvOS,
+  Android TV);
+- a sleep timer in the video player (Android TV; tvOS sets one only in its
+  audio player);
+- episode spoiler hiding (tvOS, Android TV);
+- theme music on detail pages (tvOS, Android TV);
+- the buffering-quality pill and its prompts, with
+  `playback.buffering_quality_mode` (the pill on tvOS and Android TV; the
+  mode setting on Android TV);
+- the marker on AI-translated subtitle tracks (Android TV);
+- subtitle search and download (tvOS, Android TV);
+- multiple saved Silo servers, with Switch Server (tvOS, Android TV);
+- profile creation (tvOS, Android TV) and editing (Android TV).
+
+Not decided yet, and deferred until the owner chooses:
+
+- audio delay (Android TV) and subtitle delay (tvOS, Android TV);
+- subtitle translation and sync (tvOS, Android TV);
+- local-network discovery of Silo servers (tvOS, Android TV), and DIAL;
+- Home row editing (Android TV);
+- an edition picker (Android TV); the Version menu names each version's
+  edition (section 5.6);
+- hosted diagnostics upload (tvOS, Android TV);
+- Home's hero line for the focused item's air date and cast, which costs an
+  item read per card the viewer rests on.
+
+Roku platform work, still deferred:
+
 - SiloControl's Require Pairing (the `sealed` level), offered only in
   development builds until the phone apps speak it, and cross-server handoff
   ([`silocontrol.md`](silocontrol.md) section 13);
-- favorites, watchlist, and watched toggles; the history screen (server rows
-  that contain this data still display on Home);
-- collection creation and editing, people search results and full person pages, trailers,
-  extras, and an edition picker (the Version menu names each
-  version's edition, section 5.6);
-- library filters and shuffle;
-- requests, calendar, the For You tab, and notifications;
-- music and audiobooks;
-- settings for features this client does not implement; supported settings
-  are available in Settings (section 5.8.1);
-- profile creation and editing, and home-row editing;
-- subtitle search, download, translation, and sync, and the marker on
-  AI-translated subtitle tracks;
-- the buffering-quality pill and its prompts
-  (`playback.buffering_quality_mode`);
-- episode spoiler hiding;
-- theme music;
-- Home's hero line for the focused item's air date and cast, which costs an
-  item read per card the viewer rests on;
-- chapters, playback speed, aspect, sleep timer, and audio or subtitle delay;
-- hosted diagnostics upload;
 - Roku Search feed and Continue Watching integration;
 - theme catalog integration beyond server branding.
+
+Settings for features this client does not implement stay out of Settings;
+supported settings are available there (section 5.8.1).
 
 ### 3.4 Excluded from the first release
 
 - browser-based (OIDC/OAuth) sign-in, account sign-up, and device-code sign-in
   in public builds other than companion sign-in (section 7.2);
+- music and audiobooks (decision D-8), although tvOS and Android TV play
+  them;
+- a notifications inbox, and collection creation and editing, which no Silo
+  TV app offers;
 - ebooks, comics, and document reading;
 - downloads or offline playback;
 - Silo server first-run setup and administration;
@@ -779,8 +812,10 @@ their existing HD/FHD assets.
     when focused or current), over "Feb 18, 2026 · 52m" in 17 px Medium at
     60%.
   - A focused episode updates the hero's metadata line (series rating · air
-    date · runtime · ratings · Season N · Episode M) and synopsis. OK plays
-    it.
+    date · runtime · ratings · Season N · Episode M) and synopsis. The air
+    date and runtime come from its card at once; its ratings follow when
+    its item is read, once focus rests 150 ms (assumption AG-270). OK
+    plays it.
   - On a series, Play targets the active episode: first the play target
     (section 8.3) or the episode card that opened the page (Continue Watching
     or a search result), in that episode's season, then the last episode
@@ -826,9 +861,10 @@ their existing HD/FHD assets.
   - Sections are 64 px apart, with 140 px below the last.
 - **After the player closes** (D8). Focus stays on the same episode when it
   was stopped partway, a rewatch included. When this playback finished it
-  (its video ended, or Up Next was showing in its prompt window), whether or not the
-  server already counted it watched, focus moves to the next episode in play
-  order, played or not. If that episode is in the next numbered season (by
+  (its video ended, Up Next was showing in its prompt window, or Skip
+  Credits skipped credits that run to the end and playback was still in
+  them), whether or not the server already counted it watched, focus moves
+  to the next episode in play order, played or not. If that episode is in the next numbered season (by
   number, so gaps are skipped), the page shows that season. A finished
   finale stays, and play never moves into Specials. After Up Next played on,
   the same rule applies to the last episode played, and the page switches to
@@ -999,9 +1035,9 @@ Subtitles tab (criterion 4.8).
   under "Previews aren't available for this title".
 - **Back, first match wins:** cancel a seek or scrub; dismiss Skip Intro's
   pill; from Up Next, Keep Watching (tvOS); close the Quality picker, then
-  Options; hide the controls while playing; otherwise stop and exit. Skip
-  Recap's pill stays through Back, as tvOS's segment pill stays through
-  Menu (assumption AG-291).
+  Options; hide the controls while playing; otherwise stop and exit. The
+  segment pill (Skip Recap or Skip Credits) stays through Back, as tvOS's
+  stays through Menu (assumption AG-291).
 - **Skip pills.**
   - The profile chooses never, ask, or always for intros (default ask).
   - Skip Intro is a 72 px pill at the bottom right: right edge 1760, bottom
@@ -1011,10 +1047,25 @@ Subtitles tab (criterion 4.8).
     grows from left to right over 5 s and pauses while playback is paused.
   - Always skips, then shows "Intro skipped" in 22 px at 72% above a Watch
     Intro pill for 5 s.
-  - Recaps get a "Skip Recap" pill (76 px, compact), and are skipped
-    automatically when the profile's `playback.auto_skip_recap` is on (D10).
-  - There is no Skip Credits pill (5.9). The pill is focusable while the
-    controls show and takes focus as it appears.
+  - Recaps and credits share tvOS's segment pill (76 px, compact): "Skip
+    Recap" while playback is inside a recap, "Skip Credits" inside credits,
+    Skip Recap first if both apply. It shows once the title has played its
+    first frame and stays while playback is in the range. Recaps are
+    skipped automatically when the profile's `playback.auto_skip_recap` is
+    on (D10), credits when `playback.auto_skip_credits` is on (default
+    off); a range skipped automatically is not skipped again when the
+    viewer seeks back into it, or in Keep Watching's replay of the end, and
+    the pill shows there instead.
+  - Skip Credits seeks to the end of the credits. Credits that run to the
+    end of the file (ending within 0.5 s of the runtime, or past it) open
+    Up Next instead, as tvOS does: the credits keep playing in Up Next's
+    video box, its countdown is 10 seconds, and the title counts as
+    finished (section 5.6) while playback stays in those credits, after
+    Keep Watching too. With nothing for Up Next to show, the skip seeks to
+    the end, and the end opens Up Next as Finished.
+  - The pills are focusable while the controls show and take focus as they
+    appear. The segment pill is not drawn while Up Next shows, as tvOS
+    hides its controls there.
   - As on Android TV, each intro range is offered once per title: Skip Intro,
     Watch Intro (which seeks back to the start), Back, or Watch Intro's 5
     seconds running out settle it for good, while an Ask pill whose time ran
@@ -1023,13 +1074,17 @@ Subtitles tab (criterion 4.8).
 - **Up Next**, as tvOS's Next Up screen. It opens for movies and episodes
   alike, inside the last `playback.next_up_prompt_seconds` of the runtime
   (default 30, 0 for never), whenever it has something to show; a resume or a
-  seek into that window opens it too. It does not open at the credits marker.
+  seek into that window opens it too. It does not open at the credits marker,
+  only when Skip Credits skips credits that run to the end (above).
   It offers an episode's next episode; with none (a movie, a series finale),
   the first On Deck item is the pick instead, unless the next-episode lookup
   failed. The countdown is the runtime left, its ring counting from the
-  prompt window: it stops while paused, grows when the viewer seeks back, and
-  the pick starts as it reaches the end. The video's end always opens Up
-  Next, as "Playing Next", or as "Finished" with "End of playback" and why
+  prompt window: it stops while paused, and the pick starts as it reaches
+  the end. A seek the viewer makes while it shows, spoken or from a phone
+  (the remote's keys are the panel's), is Keep Watching first, so no
+  countdown, over skipped credits included, starts the next item after it;
+  after the end such a seek plays the title again from there. The video's
+  end always opens Up Next, as "Playing Next", or as "Finished" with "End of playback" and why
   there is nothing to play; an end with Up Next already counting starts the
   pick at once, and otherwise a 10 second countdown runs. While the
   next-episode lookup runs, the panel says "Finding the next episode". The
@@ -1063,7 +1118,8 @@ Subtitles tab (criterion 4.8).
     - the series title, 34 px Bold;
     - "S1:E2" at 62% followed by the episode title, 25 px SemiBold, on one
       line (two at most); a movie's title alone, 34 px Bold;
-    - the air date · runtime, 19 px Medium at 46%;
+    - the air date · runtime, 19 px Medium at 46% (an On Deck pick's
+      runtime alone, as tvOS has no air date for it);
     - the overview, 22 px Regular at 58%, three lines, 620 px wide;
     - Play Now, a 76 px pill 260 px wide at rest and 360 px focused, with a
       58 px countdown ring (3 px) 56 px to its right;
@@ -1162,7 +1218,8 @@ seven-row scrolling window.
 
 - General: Show Title Art.
 - Playback: Resolution, Maximum Bitrate, Audio Language, Auto-Play Next
-  Episode, Skip Intros, Auto-Skip Recaps, Skip Back, and Skip Forward.
+  Episode, Skip Intros, Skip Credits, Auto-Skip Recaps, Skip Back, and Skip
+  Forward.
 - Subtitles: Language, Behavior, and Show Forced Subtitles. A footer points
   to Roku's caption visibility and appearance controls.
 - Server: the connected server address and Change Server; app version is
@@ -1271,7 +1328,6 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The episode rail keeps the five seasons nearest the one shown, and reads the seasons either side in the background | It keeps three, and reads the next (or previous) season once focus is two cards from the rail's end | Implementation plan section 4.8 bounds the metadata and cards kept on 512 MB devices |
 | Resting on a season pill switches season after 70 ms | After 300 ms | A season not yet read is read when the viewer stops on it, and its cards replace the rail's; switching only where the viewer stops keeps requests and texture churn down on 512 MB devices |
 | While a series' episodes load, Play reads "Loading episodes…" and is disabled | Play plays the server's play target at once and names its episode when the episodes arrive | The server names the play target (section 8.3), so nothing has to wait |
-| A focused episode's air date and runtime show at once, and its ratings once its item is read | Its rating and "Season N · Episode M" show at once, and the air date, runtime, and ratings once its item is read (when focus rests 150 ms) | The episode cards' mapping keeps no ratings, and their date and runtime only as the caption's second line (`catalog.cards.fromEpisode`, `CardContent.captionDetail`); To build: the line shows the card's date and runtime at once (assumption AG-270) |
 | More › Show Series Info (tvOS) or a Show capsule (Android TV) puts the series back in the hero | The hero keeps the last episode focused | Section 5.6 lists only season pills, and More is not in the first release |
 | Both apps hide episode spoilers per the profile's settings | Episode titles, stills, and synopses always show | Spoiler hiding is deferred (section 3.3, D10) |
 | The Details table has no Genres row | Genres is a row (Android TV) | The metadata line shows only the first two genres |
@@ -1280,15 +1336,16 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The player has a bottom-240 px gradient ending at black 55%, with a shadow behind the title footer | A bottom-600 px gradient ending at black 94%, reaching 72–76% behind the series, title, and episode tag | Covers Roku's fixed title block and preserves muted-text contrast over bright video without additional text nodes |
 | A start or a stall shows only the centred spinner | Roku's own states also show by name in a capsule at the top right: "Stopping…", "Playback progress is pending…", and "Loading subtitles…"; a notice waits while the spinner or the capsule shows | The player's durable stop and sidecar downloads have no tvOS counterpart, and a notice that came during a stall expired unseen behind it (hardware run 23; assumption AG-262) |
 | The hold indicator's thumbnail has radius 20 corners and a 1 px white 18% outline; its hint names Siri Remote gestures | Square corners without the outline; the hint names Roku keys ("← → Speed, OK Play, Back Cancel") | Over video Roku can round an image only with a `MaskGroup`, which does not clip on devices without OpenGL (plan section 4.6); a square outline would cross rounded art |
-| Skip Recap sits 96 px up, or 156 px over the controls | It sits where Skip Intro does (156 px up, 460 px over the controls, on the safe area), and above it while both show | At tvOS's raised place it would cover the scrubber's right end and the time left; Skip Intro's place clears the controls (assumption AG-260) |
-| Focused pills grow (Play Now 1.085×, Keep Watching and Back 1.06×, Skip Recap 1.025×, the failure screen's buttons 1.055×) | They change fill and width only | Section 5.2's pill rule: only the Sort pill, first-run buttons, fields, and Skip Intro scale; the owner's call is open (audit U3, assumption AG-265) |
-| Up Next's metadata reads "air date · runtime" | The runtime alone | The episode card (`CardContent`) carries no air date; WP1's episode-card date line can feed it |
+| The segment pill (Skip Recap, Skip Credits) sits 96 px up, or 156 px over the controls | It sits where Skip Intro does (156 px up, 460 px over the controls, on the safe area), and above it while both show | At tvOS's raised place it would cover the scrubber's right end and the time left; Skip Intro's place clears the controls (assumption AG-260) |
+| Skip Credits on credits that run to the end, with nothing for Next Up to show, ends the item there | It seeks to the end, and the end follows when the Video node reaches it, a moment later (a `seek_reanchor` on a remux), then opens Up Next as Finished | The player has no end of its own: Roku's `finished` drives the session's stop and Up Next's end (section 9.5), so the skip reaches it as Skip Forward to the end does (assumption AG-321) |
+| A SiloControl seek moves the playhead under Next Up and leaves it open: over skipped credits its 10 s countdown runs on and starts the next item, and after the end the seek is refused | A phone's seek while Up Next shows is Keep Watching, then the seek; after the end it plays the title again from there, as a new session, as a spoken seek does | The viewer chose to stay with this title, and over skipped credits the countdown counts the clock, not the playhead; every viewer seek takes one path (`viewerSeek`, assumption AG-321) |
+| An item that Skip Credits finished, or that closes with Next Up open in its window, reports its runtime as the final position | The stop's final sample is the position playing (section 9.5) | The session reducer reports only the Video node's position; whether the server then counts the item watched follows its own rule, not checked here (assumption AG-321) |
+| Focused pills grow (Play Now 1.085×, Keep Watching and Back 1.06×, Skip Recap and Skip Credits 1.025×, the failure screen's buttons 1.055×) | They change fill and width only | Section 5.2's pill rule: only the Sort pill, first-run buttons, fields, and Skip Intro scale; the owner's call is open (audit U3, assumption AG-265) |
 | The failure screen shows one message at the top of the safe area, as coded | A 30 px title over the message, the stack centred on the screen | Roku's failure copy is a title and a message (`playback.player.errorCopy`), as its other errors are; centred, the stack stays clear of overscan (assumption AG-266) |
 | Info's STREAM column lists Route, Audio, Subtitles, and the chapter; Stats shows buffer, network, and engine figures; Info and Stats page with Down and Up | STREAM adds a File row (container, the plan's bitrate, size) and Route names the plan's delivery; Stats shows the plan's source and the `Video` node's state; the panes do not take focus, and the overview takes the whole lines left, the last ending in an ellipsis | Roku's player reports neither tvOS's buffer and network figures nor an engine name; the device runs read the file facts; with the overview clamped both panes fit the 380 px panel |
 | The HUD's lists scroll natively and end on part of a row at the panel's edge; the Quality picker centres the checked row and shows about four and a quarter rows | Columns and the Quality picker show whole rows only, a column scrolling a row's top to its own and the picker a row at a time; the picker opens with the checked row second of its four where the list allows | Hardware run 26: a row or line cut at the panel's edge read as a fault (decision AG-292 (1); assumptions AG-294, AG-295) |
 | Subtitles draw under the controls: the controls and their gradient cover a cue while they show | Roku's captions are hidden while the controls show (not over Options or Up Next), and return as they hide; content within 3 s of its first frame is left as it is | Roku draws captions above the UI at a place of its own, so a cue crossed the scrubber and the time row (hardware run 26). The node's own `suppressCaptions`, which Roku documents for UI drawn where captions are, hides them without touching the caption mode or the subtitle selected (assumption AG-293) |
 | The Video tab always has rows (Speed, Aspect) | Without a choice of quality its PLAYBACK column shows the quality as a line, and a movie's Video tab has no rows | Speed and Aspect are not in the first release (section 3.3) |
-| Skip Credits at the credits, and `playback.auto_skip_credits`; skipping credits that run to the end opens Next Up with a 10 s countdown | No Skip Credits; the credits are a band on the scrubber | Not built yet; Up Next opens in the prompt window as on tvOS (AG-318 reverses D11) |
 | Options' Subtitles tab shows only with tracks or a subtitle tool | Stats and Subtitles always show | A fixed set of tabs keeps Left and Right predictable while the player's stats arrive, and Subtitles holds Roku's caption modes even for a title without subtitle tracks (criterion 4.8) |
 | Options' Subtitles tab has TRACKS and OPTIONS columns | Its second column is CAPTIONS: Off, On, On replay, and On mute (Roku TVs only), Roku's global caption mode; while a subtitle is burned into the video, or captions Off set one aside, only Off and On, and Off asks the server for the stream without it. On mute is checked whether Options or Roku's own menu set it, and stays checked as the TV is muted and unmuted | Criterion 4.8 (plan section 6.10); burned-in pixels cannot follow a caption mode |
 | The remote's Menu or Settings key opens the player's options (Android TV) | Options opens from the controls' Options button and from Down with the controls hidden; on a Roku TV, `*` during playback opens Roku's own menu, whose Accessibility entry holds the caption setting | Roku TVs take `*` during full-screen playback whatever has focus (hardware run 6, assumption AG-117); Roku remotes have no Menu key |
@@ -1306,11 +1363,11 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The auto-play toggle shows with any pick | It is hidden, and nothing counts down, while Roku's autoplay setting is off | Plan section 6.10 (certification) |
 | Back on Finished (nothing to play) replays the end, as Keep Watching does | It leaves the player | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
 | Keep Watching after the end replays the last 10 s in the same session | It starts the item again 10 s before its end, as a new session | Roku's session has stopped by the time its video ends |
-| Siri (tvOS) and the Google Assistant (Android TV) drive the system player's transport | Roku voice transport commands (`roInput.EnableTransportEvents`) take the remote's paths: "play" and "pause", "fast forward" and "rewind" start the speed ladder, "replay" is Replay, "rewind 30 seconds" or "forward 10 minutes" seeks, "start over" seeks to the start, "skip intro" presses Skip Intro or Skip Recap, "next" is Up Next's Play Now, and "stop" leaves the player. A seek or scan during Up Next's credits prompt closes it as Keep Watching does; after the end, "start over" and a seek replay the title as a new session. "Turn on captions" changes Roku's global caption mode, which the player already follows (spec 9.7) | Roku delivers voice commands to the app as transport events and expects an answer for each within 5 s (`source/playback/voice.bs`); criterion 4.11 does not require them below its threshold |
+| Siri (tvOS) and the Google Assistant (Android TV) drive the system player's transport | Roku voice transport commands (`roInput.EnableTransportEvents`) take the remote's paths: "play" and "pause", "fast forward" and "rewind" start the speed ladder, "replay" is Replay, "rewind 30 seconds" or "forward 10 minutes" seeks, "start over" seeks to the start, "skip intro" presses Skip Intro, or else the Skip Recap or Skip Credits pill, "next" is Up Next's Play Now, and "stop" leaves the player. A seek or scan while Up Next shows closes it as Keep Watching does; after the end, "start over" and a seek replay the title as a new session. "Turn on captions" changes Roku's global caption mode, which the player already follows (spec 9.7) | Roku delivers voice commands to the app as transport events and expects an answer for each within 5 s (`source/playback/voice.bs`); criterion 4.11 does not require them below its threshold |
 | An On Deck item without a backdrop or still reads its detail for one, and is left out without | It shows as Home's Continue Watching card does, its poster standing in | A detail read per card is avoided; Home's cards make the same choice |
 | A screen-level error puts a headline for its cause ("Something went wrong", "Not found") over its message, with Try Again | Home, the libraries, detail, and the profile picker show their one-sentence message as the error's title, without a second line, and Search its own title over a line; the button reads Retry (Try again on the picker) | The client's error copy is one sentence per screen (`locale/`); a copy change of its own adds headlines by cause (assumption AG-285) |
 | Full person page | A person panel with six biography lines and up to 24 mixed movie/series titles | Keeps person navigation within detail-page scope and bounded memory |
-| Watchlist and More buttons; trailers; collection creation and editing; Filter and Shuffle; people, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watchlist, Favorites, and History in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; theme music; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| Watchlist and More buttons; trailers; Filter and Shuffle; people, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watchlist, Favorites, and History in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; theme music; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
 
 ## 6. Application architecture
 
@@ -1620,6 +1677,7 @@ playback keys the existing TV apps honor:
 | `playback.preferred_quality`, `playback.max_bitrate_kbps` | `quality_preference` and `bandwidth_cap_kbps` sent with start; the cap goes with every later start and replan too, and a quality chosen in Options replaces the preference for that title |
 | `playback.intro_skip_mode` | Skip button versus automatic skip (`playback.auto_skip_intro` is deprecated) |
 | `playback.auto_skip_recap` | Recaps skip automatically instead of offering Skip Recap (section 5.7) |
+| `playback.auto_skip_credits` | Credits skip automatically instead of offering Skip Credits (section 5.7) |
 | `ui.title_art` | Off shows the text title instead of the title logo on Home and detail heroes (sections 5.5 and 5.6); the top bar's shell reads it when Home or a library page starts, and the detail page uses that read |
 | `playback.auto_play_next` | Up Next countdown and autoplay; the player's toggle (Up Next's and Options') writes it for this device (`profile_device`), as tvOS does |
 | `playback.next_up_prompt_seconds` | How long before the end Up Next opens, and what its countdown counts from (0 to 120 s; 0 opens it only at the end) |
@@ -2384,7 +2442,8 @@ ordered list of `{kind, start_seconds, end_seconds}` with kind `intro`,
 `credits`, `recap`, or `preview`. A kind may occur more than once; the client
 skips only the active range. Intro ranges drive the skip button and automatic
 skip (section 5.7) according to `playback.intro_skip_mode`. Recap and credits
-ranges are drawn on the scrubber.
+ranges are drawn on the scrubber and drive Skip Recap and Skip Credits, with
+`playback.auto_skip_recap` and `playback.auto_skip_credits`.
 
 The client reads the markers of the version it plays. A server without
 `marker_segments` still sends each version's single `intro`, `credits`,
@@ -2626,7 +2685,7 @@ is):
 | --- | --- | --- |
 | Roku's keyboards, PIN pad, and the "Connect without encryption?" dialog speak themselves | All | None |
 | Lists read each card's `audioGuideText` (title, season and episode, rating, year, runtime) and each profile's name, PIN, and Kids marks | All | None |
-| Custom controls say their label when focused, through `roAudioGuide`: setup and sign-in fields, the top bar and avatar menu, the library list, sort, alphabet rail, Search filter and result count, Detail's buttons (Versions, Audio Tracks, and Subtitles with their values), seasons, and menus, the player's controls with the position, Options tabs and rows (with "selected"), Skip Intro, Skip Recap, Up Next, and the player error's buttons | All | None |
+| Custom controls say their label when focused, through `roAudioGuide`: setup and sign-in fields, the top bar and avatar menu, the library list, sort, alphabet rail, Search filter and result count, Detail's buttons (Versions, Audio Tracks, and Subtitles with their values), seasons, and menus, the player's controls with the position, Options tabs and rows (with "selected"), Skip Intro, Skip Recap, Skip Credits, Up Next, and the player error's buttons | All | None |
 | Setup, sign-in, the profile picker, and PIN say their inline errors as they appear | All | None |
 | Full-screen errors and empty states say their title and message, then the focused action, as they appear, at once and again when they repeat (assumption AG-176): the player's error with Retry (Try again for a lost connection), Try Anyway, or Go Back; the shared empty and error state on Home, a library, Search, and Detail, with its Retry or Refresh once it has focus; Detail's episode message; "Server update required" and the other first-run messages, on each show; sign-in's "Can't reach {server}" before Try again | All | Headless only (`tests/views/audioGuide.spec.bs`) |
 | The spinner says "Loading" and the busy capsule its state once it shows ("Playback progress is pending…", "Loading subtitles…", "Stopping…"), after what is being said, at once when it replaces an earlier state; a notice card says its title and message ("Reconnecting… The connection to the server was lost…", a refused track or quality change); neither says anything while the player's error covers it | All | Headless only |
@@ -2757,6 +2816,7 @@ allowlist. The following follow-ups are tracked with the server:
 | PIN prompt on deep link | Prompt for the remembered profile's PIN | Roku answer |
 | AC-3/E-AC-3 passthrough | Disabled until proven | Codec/output-change hardware tests |
 | Dolby Vision and advanced HDR | Claimed where the probe and display report them (section 9.2) | Dolby Vision on AV1 (profile 10); HDR10+ on a display that reports it |
+| Features after the first release | Section 3.3's planned list (D-8) | The order of the planned items, and a choice on each undecided one |
 | Roku Search feed | Not planned | Roku guidance if usage grows |
 | SiloControl receiver | Built behind bs_const `silocontrol` and `handoff`, on in every build since 2026-10-25; see [`silocontrol.md`](silocontrol.md) section 13 | Spikes C0-1 to C0-7, hardware tests HC-1 to HC-6, and Roku's confirmation |
 

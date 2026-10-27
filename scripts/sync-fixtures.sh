@@ -52,7 +52,7 @@ OPERATIONS |= CATALOG
 # The keys Settings edits (settings.supportedControls).
 SETTINGS = [
     "ui.title_art", "playback.preferred_quality", "playback.max_bitrate_kbps", "playback.audio_language",
-    "playback.auto_play_next", "playback.intro_skip_mode", "playback.auto_skip_recap",
+    "playback.auto_play_next", "playback.intro_skip_mode", "playback.auto_skip_credits", "playback.auto_skip_recap",
     "player.video_skip_back_seconds", "player.video_skip_forward_seconds",
     "playback.subtitle_language", "playback.subtitle_mode", "playback.show_forced_subtitles",
 ]

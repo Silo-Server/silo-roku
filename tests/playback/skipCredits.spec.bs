@@ -1,0 +1,128 @@
+namespace tests
+
+    ' The Skip Credits pill and credits auto-skip (spec section 5.7, tvOS
+    ' 2c8f2e1b), for a file of 2600 s with credits from 2400 s to 2480 s
+    ' and from 2540 s to its end unless a test says otherwise. Commands are
+    ' summarized as "seek:2480", "toEnd:2540:2600", "show", and "hide".
+    @suite("playback skip credits")
+    class PlaybackSkipCreditsTests extends rooibos.BaseTestSuite
+
+        function credits(autoSkip as Boolean, runtime = 2600 as Dynamic) as Object
+            markers = playback.markers.parse([{ kind: "credits", start_seconds: 2400, end_seconds: 2480 }, { kind: "credits", start_seconds: 2540, end_seconds: 2600.6 }, { kind: "recap", start_seconds: 0, end_seconds: 60 }])
+            return playback.skipCredits.create(autoSkip, markers, runtime)
+        end function
+
+        function feed(state as Object, events as Object) as Object
+            out = []
+            for each event in events
+                for each command in playback.skipCredits.reduce(state, event)
+                    if command.type = "seek"
+                        out.Push("seek:" + command.seconds.ToStr())
+                    else if command.type = "toEnd"
+                        out.Push("toEnd:" + command.start.ToStr() + ":" + command.seconds.ToStr())
+                    else
+                        out.Push(command.type)
+                    end if
+                end for
+            end for
+            return out
+        end function
+
+        function at(seconds as Dynamic) as Object
+            return { type: "position", seconds: seconds }
+        end function
+
+        function playing() as Object
+            return { type: "player", state: "playing" }
+        end function
+
+        @describe("skipCredits")
+
+        @it("offers Skip Credits inside credits once the item has played, and OK seeks past them")
+        sub _()
+            state = m.credits(false)
+            m.assertEqual(m.feed(state, [m.at(2410)]), [], "nothing before the picture")
+            m.assertEqual(m.feed(state, [m.playing()]), ["show"])
+            m.assertTrue(playback.skipCredits.visible(state))
+            m.assertEqual(m.feed(state, [m.at(2420)]), [], "shown once")
+            m.assertEqual(m.feed(state, [{ type: "press" }]), ["hide", "seek:2480"])
+            m.assertEqual(m.feed(state, [m.at(2421)]), [], "a position from before the seek landed")
+            m.assertEqual(m.feed(state, [m.at(2480), m.at(30)]), [], "past the credits, and the recap is not credits")
+            m.assertEqual(m.feed(state, [m.at(2410)]), ["show"], "back in them, the pill shows again")
+        end sub
+
+        @it("shows the pill again when the viewer seeks back into the credits before the skip has landed")
+        sub _()
+            state = m.credits(false)
+            m.feed(state, [m.playing(), m.at(2420)])
+            m.assertEqual(m.feed(state, [{ type: "press" }]), ["hide", "seek:2480"])
+            m.assertEqual(m.feed(state, [m.at(2421)]), [], "a position from before the skip landed")
+            m.assertEqual(m.feed(state, [{ type: "seek", seconds: 2450 }]), ["show"], "the viewer's own seek into them")
+            m.assertEqual(m.feed(state, [m.at(2422), m.at(2450)]), [])
+            m.assertEqual(m.feed(state, [{ type: "seek", seconds: 2500 }]), ["hide"], "and out of them")
+        end sub
+
+        @it("hands credits that run to the end of the file to Up Next, and keeps the pill while they play")
+        sub _()
+            state = m.credits(false)
+            m.feed(state, [m.playing(), m.at(2550)])
+            m.assertTrue(playback.skipCredits.visible(state))
+            m.assertEqual(m.feed(state, [{ type: "press" }]), ["toEnd:2540:2600"])
+            m.assertTrue(playback.skipCredits.visible(state), "tvOS's pill shows while the credits play")
+            m.assertEqual(m.feed(state, [m.at(2560)]), [])
+        end sub
+
+        @it("counts credits ending within half a second of the runtime as running to the end, and without a runtime, seeks")
+        sub _()
+            markers = playback.markers.parse([{ kind: "credits", start_seconds: 2540, end_seconds: 2599.6 }])
+            state = playback.skipCredits.create(false, markers, 2600)
+            m.feed(state, [m.playing(), m.at(2550)])
+            m.assertEqual(m.feed(state, [{ type: "press" }]), ["toEnd:2540:2600"])
+            state = playback.skipCredits.create(false, playback.markers.parse([{ kind: "credits", start_seconds: 2540, end_seconds: 2599 }]), 2600)
+            m.feed(state, [m.playing(), m.at(2550)])
+            m.assertEqual(m.feed(state, [{ type: "press" }]), ["hide", "seek:2599"])
+            state = m.credits(false, invalid)
+            m.feed(state, [m.playing(), m.at(2550)])
+            m.assertEqual(m.feed(state, [{ type: "press" }]), ["hide", "seek:2600.6"])
+            m.assertEqual(m.feed(state, [{ type: "timeline", runtime: 2600 }, m.at(2530), m.at(2541), { type: "press" }]), ["show", "toEnd:2540:2600"], "the plan's runtime arrives")
+        end sub
+
+        @it("skips credits once with the profile's playback.auto_skip_credits, then offers the pill if the viewer goes back")
+        sub _()
+            state = m.credits(true)
+            m.assertEqual(m.feed(state, [m.at(2400)]), [], "not before the first frame")
+            m.assertEqual(m.feed(state, [m.playing()]), ["seek:2480"])
+            m.assertEqual(m.feed(state, [m.at(2401)]), [], "a position from before the seek landed")
+            m.assertEqual(m.feed(state, [m.at(2485), m.at(2405)]), ["show"], "skipped once: back in them, the pill shows")
+            m.assertEqual(m.feed(state, [m.at(2541)]), ["toEnd:2540:2600"], "the next credits skip too, to Up Next")
+            m.assertTrue(playback.skipCredits.visible(state))
+            m.assertEqual(m.feed(state, [m.at(2560)]), [], "once")
+        end sub
+
+        @it("does not skip credits again in Keep Watching's replay of the end, which carries the skipped range, as tvOS's latch outlives its seek")
+        sub _()
+            state = m.credits(true)
+            m.assertEqual(m.feed(state, [m.playing(), m.at(2541)]), ["toEnd:2540:2600", "show"])
+            key = playback.skipCredits.skippedKey(state)
+            m.assertNotEqual(key, "")
+            carry = nav.player.replay("episode:a", 2590, playback.upNext.replayCarry({ autoPlay: true }, key)).carry
+            m.assertEqual(playback.skipCredits.carriedKey(carry), key)
+            m.assertEqual(playback.skipCredits.carriedKey({ autoPlay: true, replay: false, skippedCredits: key }), "", "only a replay of the same item")
+            m.assertEqual(playback.skipCredits.carriedKey(invalid), "")
+            replay = playback.skipCredits.create(true, playback.markers.parse([{ kind: "credits", start_seconds: 2540, end_seconds: 2600.6 }]), 2600, playback.skipCredits.carriedKey(carry))
+            m.assertEqual(m.feed(replay, [m.at(2590), m.playing()]), ["show"], "the pill, and no toEnd that would reopen Up Next")
+            m.assertEqual(m.feed(replay, [m.at(2595)]), [])
+        end sub
+
+        @it("follows the preference when it arrives, and new markers")
+        sub _()
+            state = m.credits(false)
+            m.feed(state, [m.playing(), m.at(2410)])
+            m.assertEqual(m.feed(state, [{ type: "autoSkip", value: true }]), ["hide", "seek:2480"])
+            state = m.credits(false)
+            m.feed(state, [m.playing(), m.at(2410)])
+            m.assertEqual(m.feed(state, [{ type: "markers", markers: [] }]), ["hide"])
+            m.assertEqual(m.feed(state, [{ type: "press" }]), [], "nothing to skip")
+        end sub
+    end class
+end namespace

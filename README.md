@@ -175,11 +175,14 @@ shards: each shard in `SHARDS` (`scripts/test-headless.py`) is its own test
 package and brs-node process, four at a time (`TEST_JOBS=1 npm test` runs them
 one after another; use 2 on an 8 GB machine). brs-node keeps every component a
 process creates until it exits, so a shard's memory grows with the players and
-detail pages its specs build; the largest peaks near 1.8 GB. A new spec
-directory needs a place in `SHARDS`, which the run checks. The run passes only
-when every shard finishes within 5 minutes and reports
+detail pages its specs build; the largest peaks near 2.4 GB. Each shard gets
+a 2 GB JS heap (`HEAP_MB`) on any host, as on GitHub's runner, where V8's
+default is that size; split a shard that no longer passes at 1.5 GB. A new
+spec directory needs a place in `SHARDS`, which the run checks. The run passes
+only when every shard finishes within 5 minutes and reports
 `[Rooibos Result]: PASS` after at least one test; it prints each shard's output
-and a table of their counts and times. `npm test -- --junit` also merges the
+and a table of their counts and times, naming the cause and the case a shard
+crashed or timed out in. `npm test -- --junit` also merges the
 shards' reports into `reports/junit.xml`. Headless results are not device
 evidence.
 
