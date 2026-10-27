@@ -1,0 +1,358 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/util/values.bs"
+
+' Theme music on detail pages (spec section 5.6), as tvOS plays it
+' (ThemeMusicCenter, ThemeMusicController, ThemeMusicPreferences at
+' silo-apple a623fd61): the first local theme of the page's set, or of the
+' selected season's, while the page is the screen on top; paused while it
+' loads; stopped when another screen or the player covers it (Back starts
+' it again from the beginning), when the page goes, and when the profile
+' changes.
+' The profile's ui.theme_music_enabled and ui.theme_music_loop decide
+' whether it plays and repeats, and GET /api/v2/catalog/themes/capabilities
+' whether the server offers it. Pure: request builders, the map step's
+' mappers, the decision (decide), and the player's state (the controller
+' functions, which give commands); components/audio/ThemeMusic carries
+' them out with one Audio node.
+namespace playback.themeMusic
+    const ENABLED_KEY = "ui.theme_music_enabled"
+    const LOOP_KEY = "ui.theme_music_loop"
+    ' How long a capability or setting answer stands before a page asks
+    ' again (tvOS ThemeMusicCenter.capabilityLifetime).
+    const ANSWER_SECONDS = 60
+    ' The most season sets kept for one identity.
+    const MAX_SEASONS = 24
+    ' The map step's kinds (source/catalog/map.bs).
+    const CAPABILITY_KIND = "themeCapability"
+    const GRANT_KIND = "themeGrant"
+    const SEASON_KIND = "themeSeason"
+
+    ' Containers and codecs a Roku Audio node plays (its streamformat values
+    ' mp3, mp4, es.aac-adts, and flac); the server converts any other theme
+    ' to AAC in audio-only MP4 (assumption AG-362).
+    function acceptedFormats() as Object
+        return [
+            { container: "mp3", audio_codec: "mp3" }
+            { container: "mp4", audio_codec: "aac" }
+            { container: "m4a", audio_codec: "aac" }
+            { container: "aac", audio_codec: "aac" }
+            { container: "flac", audio_codec: "flac" }
+        ]
+    end function
+
+    ' --- Requests ---------------------------------------------------------------
+
+    function capabilityRequest() as Object
+        return catalog.request.read("/api/v2/catalog/themes/capabilities", {}, { kind: CAPABILITY_KIND })
+    end function
+
+    ' The two settings as the server resolves them for this Roku: its
+    ' profile_device value, then the profile's, then the default (off).
+    function settingRequest() as Object
+        return { path: "/api/v2/settings/values/effective", query: { keys: [ENABLED_KEY, LOOP_KEY] }, auth: "profile" }
+    end function
+
+    ' A short-lived grant for one theme of ownerId's set, listing what the
+    ' Audio node plays so the server converts the rest. The grant's URL is
+    ' a credential: the map step keeps it only in its result, which nothing
+    ' logs. invalid without an owner or a theme.
+    function grantRequest(ownerId as String, themeId as String) as Dynamic
+        if ownerId = "" or themeId = "" then return invalid
+        path = "/api/v2/catalog/items/" + catalog.request.segment(ownerId) + "/themes/" + catalog.request.segment(themeId) + "/playback"
+        return { method: "POST", path: path, body: { accepted_formats: acceptedFormats() }, auth: "profile", map: { kind: GRANT_KIND } }
+    end function
+
+    ' A season's detail, for the theme set it resolves (tvOS reads the
+    ' selected season's item); only its theme crosses to the render thread.
+    function seasonRequest(seasonId as String) as Dynamic
+        if seasonId = "" then return invalid
+        out = catalog.request.read("/api/v2/catalog/items/" + catalog.request.segment(seasonId), {}, { kind: SEASON_KIND })
+        out.lane = "prefetch"
+        return out
+    end function
+
+    ' --- The map step -------------------------------------------------------------
+
+    ' { available }: the server serves themes and lets this profile use
+    ' them (tvOS isAvailable: state "available" and allowed not false).
+    ' invalid when the body is not a capability document.
+    function capability(body as Dynamic) as Dynamic
+        if not util.isObject(body) or not util.isString(body.state) then return invalid
+        return { available: body.state = "available" and not (util.isBoolean(body.allowed) and not body.allowed) }
+    end function
+
+    ' { enabled, loop } from an EffectiveSettingCollection: only a true
+    ' value turns either on; a missing row is the contract's default, off.
+    function settingOf(body as Dynamic) as Object
+        out = { enabled: false, loop: false }
+        if not util.isObject(body) or type(body.items) <> "roArray" then return out
+        for each item in body.items
+            if util.isObject(item) and util.isTrue(item.value)
+                key = util.text(item.key)
+                if key = ENABLED_KEY then out.enabled = true
+                if key = LOOP_KEY then out.loop = true
+            end if
+        end for
+        return out
+    end function
+
+    ' The theme a ThemeSongSet plays: { ownerId, themeId } of its first
+    ' song (tvOS plays selection.items.first), or invalid for none.
+    function themeOf(set as Dynamic) as Dynamic
+        if not util.isObject(set) or type(set.items) <> "roArray" or set.items.Count() = 0 then return invalid
+        song = set.items[0]
+        owner = util.text(set.owner_id)
+        if not util.isObject(song) or owner = "" or util.text(song.id) = "" then return invalid
+        return { ownerId: owner, themeId: song.id }
+    end function
+
+    ' A season item's answer: { known, theme }. known says the item came
+    ' with a set; without one the series' theme stands (tvOS: a nil set).
+    function seasonOf(body as Dynamic) as Object
+        if not util.isObject(body) or not util.isObject(body.themes) then return { known: false, theme: invalid }
+        return { known: true, theme: themeOf(body.themes) }
+    end function
+
+    ' A ThemePlayback as { url, streamFormat, converted }: the URL resolved
+    ' against origin, the server that answered, when it is relative (an
+    ' absolute one is a proxy's and is used as given); invalid when the URL
+    ' or its media type is one the Audio node cannot play.
+    function grant(body as Dynamic, origin as String) as Dynamic
+        if not util.isObject(body) then return invalid
+        delivery = util.text(body.delivery)
+        url = resolve(util.text(body.url), origin)
+        format = streamFormat(util.text(body.content_type), delivery)
+        if url = "" or format = "" then return invalid
+        return { url: url, streamFormat: format, converted: delivery = "converted" }
+    end function
+
+    function resolve(raw as String, origin as String) as String
+        if Left(raw, 1) = "/" and Left(raw, 2) <> "//"
+            if not api.request.isHttpUrl(origin) then return ""
+            return origin + raw
+        end if
+        if api.request.originOf(raw) = invalid then return ""
+        return raw
+    end function
+
+    ' The Audio node's streamformat for a media type; a converted grant is
+    ' AAC in MP4 whatever it says.
+    function streamFormat(contentType as String, delivery as String) as String
+        if delivery = "converted" then return "mp4"
+        kind = contentType
+        cut = Instr(1, kind, ";")
+        if cut > 0 then kind = Left(kind, cut - 1)
+        kind = LCase(kind.Trim())
+        if kind = "audio/mpeg" or kind = "audio/mp3" then return "mp3"
+        if kind = "audio/mp4" or kind = "audio/m4a" or kind = "audio/x-m4a" then return "mp4"
+        if kind = "audio/aac" or kind = "audio/aacp" then return "es.aac-adts"
+        if kind = "audio/flac" or kind = "audio/x-flac" then return "flac"
+        return ""
+    end function
+
+    ' --- Answers ----------------------------------------------------------------
+
+    ' Whether answer ({ key, at, ... }) is for key and younger than
+    ' ANSWER_SECONDS at seconds (the clock answer.at was read from).
+    function fresh(answer as Dynamic, key as String, seconds as Float) as Boolean
+        return util.isObject(answer) and util.text(answer.key) = key and seconds - answer.at < ANSWER_SECONDS
+    end function
+
+    ' Whether answer is for key, fresh or not: an older answer stands while
+    ' a newer read is on its way.
+    function heldFor(answer as Dynamic, key as String) as Boolean
+        return util.isObject(answer) and util.text(answer.key) = key
+    end function
+
+    ' --- The decision -------------------------------------------------------------
+
+    ' What the app's one theme player does now, as tvOS's ThemeMusicCenter
+    ' .apply decides it, from
+    '   page     the title page that reported last: { id, theme, seasonId,
+    '            loading }, or invalid once it went
+    '   top      the stack's top entry, { id, route }
+    '   setting  { enabled, loop } for the open profile, or invalid unread
+    '   available  true or false from the capability, or invalid unread
+    '   season   the selected season's resolved { known, theme }, or invalid
+    '            while it is read
+    '   playing  the page whose theme the player was last asked to play
+    ' as { action, theme, loop }, action one of
+    '   "stop"     nothing plays: no page, theme music off, the player or
+    '              another screen on top, the server offers none, or no
+    '              theme. Roku has no fade, so tvOS's fade and hand-off
+    '              stops are one.
+    '   "suspend"  pause in place: the page is still loading, or another
+    '              page's theme while a season's set is read
+    '   "wait"     keep what plays: the capability is still to come, or this
+    '              page's season is read while its theme plays on
+    '   "play"     play theme, resuming it when it is the one paused
+    function decide(page as Dynamic, top as Dynamic, setting as Dynamic, available as Dynamic, season as Dynamic, playing as String) as Object
+        out = { action: "stop", theme: invalid, loop: false }
+        if not util.isObject(page) or not util.isObject(setting) or not util.isTrue(setting.enabled) then return out
+        out.loop = util.isTrue(setting.loop)
+        if util.isObject(top) and util.text(top.route) = nav.route.PLAYER then return out
+        if available = invalid
+            out.action = "wait"
+            return out
+        end if
+        if not util.isTrue(available) then return out
+        ' Another screen over the page ends its theme, as tvOS's page leaves
+        ' on onDisappear when a route is pushed over it: Back starts it again.
+        if not util.isObject(top) or util.text(top.id) <> page.id then return out
+        if util.isTrue(page.loading)
+            out.action = "suspend"
+            return out
+        end if
+        wanted = page.theme
+        if util.text(page.seasonId) <> ""
+            if season = invalid
+                out.action = "suspend"
+                if playing = page.id then out.action = "wait"
+                return out
+            end if
+            if season.known then wanted = season.theme
+        end if
+        if wanted = invalid then return out
+        out.action = "play"
+        out.theme = wanted
+        return out
+    end function
+
+    ' --- The player's state ---------------------------------------------------------
+
+    ' As tvOS's ThemeMusicController: the theme chosen ({ ownerId, themeId }
+    ' as owner and theme, "" for none), phase "idle" (nothing loaded),
+    ' "granting" (its grant is on the way), "playing", or "paused";
+    ' generation, which every load and stop bumps so an older grant or
+    ' audio state is ignored; the one retry a failure spends; whether the
+    ' grant is a conversion, which cannot loop in place; whether the audio
+    ' has played; suspended, while the page loads; and finished, once the
+    ' theme played to its end with nothing to replay it, so staying on the
+    ' page does not start it again (a stop clears it, as on tvOS, so a page
+    ' shown again after another screen plays it again).
+    function create() as Object
+        return { owner: "", theme: "", phase: "idle", generation: 0, retry: 0, converted: false, loop: false, played: false, suspended: false, finished: false }
+    end function
+
+    ' Commands for the Audio node, in order:
+    '   { type: "grant", generation, ownerId, themeId }  ask for a grant
+    '   { type: "load", grant, loop, play }  load the grant's URL; play it
+    '                                        unless the page is suspended
+    '   { type: "pause" } / { type: "resume" }
+    '   { type: "loop", on }                 loop the loaded audio or not
+    '   { type: "release" }                  stop, unload, drop the grant
+
+    ' Plays wanted's song ({ ownerId, themeId }), or stops for none.
+    function select(state as Object, wanted as Dynamic, loop as Boolean) as Object
+        state.loop = loop
+        if wanted = invalid then return halt(state)
+        if state.owner = wanted.ownerId and state.theme = wanted.themeId
+            out = []
+            if state.phase = "playing" or state.phase = "paused" then out.Push({ type: "loop", on: loop and not state.converted })
+            if state.suspended
+                state.suspended = false
+                if state.phase = "paused"
+                    state.phase = "playing"
+                    out.Push({ type: "resume" })
+                else if state.phase = "idle" and not state.finished
+                    out.Push(startLoad(state))
+                end if
+            end if
+            return out
+        end if
+        out = halt(state)
+        state.owner = wanted.ownerId
+        state.theme = wanted.themeId
+        state.retry = 0
+        out.Push(startLoad(state))
+        return out
+    end function
+
+    ' Pauses in place, keeping the theme so selecting it again resumes it.
+    function suspend(state as Object) as Object
+        state.suspended = true
+        if state.phase = "playing"
+            state.phase = "paused"
+            return [{ type: "pause" }]
+        end if
+        if state.phase = "idle" and not state.finished then return halt(state)
+        return []
+    end function
+
+    ' Ends the theme.
+    function halt(state as Object) as Object
+        state.suspended = false
+        state.finished = false
+        state.generation = state.generation + 1
+        state.owner = ""
+        state.theme = ""
+        if state.phase = "idle" then return []
+        state.phase = "idle"
+        return [{ type: "release" }]
+    end function
+
+    ' The grant for generation (answer, grant's mapping) arrived: load it,
+    ' playing unless suspended.
+    function granted(state as Object, generation as Integer, answer as Object) as Object
+        if generation <> state.generation or state.phase <> "granting" then return []
+        state.converted = util.isTrue(answer.converted)
+        state.played = false
+        state.finished = false
+        state.phase = "playing"
+        if state.suspended then state.phase = "paused"
+        return [{ type: "load", grant: answer, loop: state.loop and not state.converted, play: not state.suspended }]
+    end function
+
+    ' The grant for generation was refused or failed: the page stays
+    ' silent (themes are optional), and coming back to it asks again.
+    function grantFailed(state as Object, generation as Integer) as Object
+        if generation <> state.generation or state.phase <> "granting" then return []
+        state.phase = "idle"
+        return []
+    end function
+
+    ' The audio started playing.
+    sub progressed(state as Object)
+        if state.phase <> "playing" then return
+        state.played = true
+        state.retry = 0
+    end sub
+
+    ' The audio reached its end. A converted stream cannot seek back, so a
+    ' loop replays it with a fresh grant; one that ended without playing
+    ' spends the single retry. Otherwise the theme is finished.
+    function ended(state as Object) as Object
+        if state.phase <> "playing" and state.phase <> "paused" then return []
+        out = [{ type: "release" }]
+        state.phase = "idle"
+        if state.converted and state.loop and not state.suspended and (state.played or spendRetry(state))
+            out.Push(startLoad(state))
+            return out
+        end if
+        state.finished = true
+        return out
+    end function
+
+    ' The audio failed: one retry with a fresh grant.
+    function failed(state as Object) as Object
+        if state.phase <> "playing" and state.phase <> "paused" then return []
+        out = [{ type: "release" }]
+        state.phase = "idle"
+        if not state.suspended and spendRetry(state) then out.Push(startLoad(state))
+        return out
+    end function
+
+    function startLoad(state as Object) as Object
+        state.generation = state.generation + 1
+        state.phase = "granting"
+        return { type: "grant", generation: state.generation, ownerId: state.owner, themeId: state.theme }
+    end function
+
+    function spendRetry(state as Object) as Boolean
+        spent = state.retry = 0
+        state.retry = state.retry + 1
+        return spent
+    end function
+end namespace

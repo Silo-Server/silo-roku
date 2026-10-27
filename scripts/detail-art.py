@@ -14,6 +14,8 @@
   check.png      a bold check mark, 26 px: the choice in the Version, Audio
                  Tracks, and Subtitles menus (tvOS's 20 pt bold checkmark in
                  its 26 pt column)
+  film.png       a film frame with sprocket holes down both sides, 48 px:
+                 a Trailers & More card without a still (tvOS's 48 pt film)
   rounded_{8,10,14}_fill_{fhd,hd}.9.png
                  rounded rectangles of radius 8, 10, and 14: the Details
                  table's focus fill, the season placeholders, and the menu
@@ -37,6 +39,7 @@ import zlib
 
 GLYPH = 34  # FHD px
 CHECK = 26  # FHD px
+FILM = 48  # FHD px
 GLYPH_SCALE = 2  # intrinsic pixels per logical FHD pixel
 STROKE = 3.4
 STRETCH = 2  # a 9-patch's stretchable band between the corners, px
@@ -210,6 +213,30 @@ def check(size):
     return coverage(size, covered, GLYPH_SCALE)
 
 
+def film(size):
+    """SF Symbols' film: a rounded frame, a band down each side cut off by a
+    line, and three sprocket holes in each band, in a 4 px stroke."""
+    stroke = 4.0
+    cx, cy = size / 2, size / 2
+    half_w, half_h, radius = size * 0.42, size * 0.34, size * 0.09
+    bands = (size * 0.29, size * 0.71)
+    hole = size * 0.034
+    holes = [(x, size * y) for x in (size * 0.185, size * 0.815) for y in (0.30, 0.50, 0.70)]
+
+    def frame_distance(x, y):
+        qx = abs(x - cx) - (half_w - radius)
+        qy = abs(y - cy) - (half_h - radius)
+        return math.hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - radius
+
+    def covered(x, y):
+        if abs(frame_distance(x, y)) <= stroke / 2:
+            return True
+        if any(segment_distance(x, y, band, cy - half_h, band, cy + half_h) <= stroke / 2 for band in bands):
+            return True
+        return any(abs(x - hx) <= hole and abs(y - hy) <= hole for hx, hy in holes)
+    return coverage(size, covered, GLYPH_SCALE)
+
+
 def rounded_fill(radius):
     """A white rounded square of 2 * radius + STRETCH px as a 9-patch: the
     1 px border marks the middle STRETCH px to stretch and the whole image as
@@ -251,6 +278,7 @@ def images():
     yield "bookmark_fill.png", bookmark_fill(GLYPH)
     yield "more.png", more(GLYPH)
     yield "check.png", check(CHECK)
+    yield "film.png", film(FILM)
     for radius in FILL_RADII:
         yield f"rounded_{radius}_fill_fhd.9.png", rounded_fill(radius)
         yield f"rounded_{radius}_fill_hd.9.png", rounded_fill(round(radius * 2 / 3))

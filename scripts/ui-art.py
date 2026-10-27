@@ -10,6 +10,9 @@
   scrim_bottom.png           black, clear at the top and opaque at the bottom
   card_placeholder.png       a card without artwork: Android TV's default
                              artwork, three brand glows over #16171C
+  still_ring_{fhd,hd}.9.png  a 3 px white ring (2 px in HD) inside a radius-18
+                             card: a focused Trailers & More card, at 90%
+                             opacity (tvOS's tvFocusRing)
   search_glyph.png           the top bar's magnifier, white, for blendColor;
                              2x its logical 28 px canvas for display scaling
 
@@ -119,6 +122,7 @@ CIRCLE = 58  # top bar search and avatar circles, FHD px
 GLYPH = 28  # magnifier, FHD px: SF Symbols' magnifyingglass at 27 pt semibold
 GLYPH_SCALE = 2  # intrinsic pixels per logical FHD pixel; glyphs only
 AVATAR_RING = 3  # the focused avatar's ring, inside the circle
+EXTRA_RING = 3  # a focused Trailers & More card's ring (tvOS's tvFocusRing), inside the card
 WHITE = (0xFF, 0xFF, 0xFF)
 INK = (0xED, 0xED, 0xED)
 # The backdrop box's vertical fade (TVBackdropArtworkFadeMask): (y, art alpha).
@@ -461,6 +465,7 @@ def images():
     yield "flat_fade_bottom.png", [[WHITE + (round(255 * (1 - piecewise(BACKDROP_STOPS, y + 0.5))),)] * 2 for y in range(BACKDROP_HEIGHT)]
     for res, scale in (("fhd", lambda px: px), ("hd", hd)):
         yield f"still_frame_{res}.9.png", nine_patch(card_frame(scale(STILL_RADIUS)), BACKGROUND)
+        yield f"still_ring_{res}.9.png", nine_patch(focus_ring(scale(STILL_RADIUS), scale(EXTRA_RING)), WHITE)
         yield f"card_shadow_{res}.9.png", nine_patch_rgba(card_shadow(scale(SHADOW_SIGMA), scale(SHADOW_MARGIN)))
         yield f"chip_{res}.9.png", nine_patch_rgba(chip(scale(CHIP[0])))
         for radius in (22, 18):

@@ -31,7 +31,7 @@ import sys
 
 REPOSITORY = "https://github.com/Silo-Server/silo-server"
 # Request bodies the client serializes; their $ref closure is kept.
-ROOTS = ["PlaybackStartBody", "PlaybackReplanBody", "PlaybackProgressBody", "PlaybackStopBody", "PlaybackRouteEventBody", "HistoryRemoveInputBody"]
+ROOTS = ["PlaybackStartBody", "PlaybackReplanBody", "PlaybackProgressBody", "PlaybackStopBody", "PlaybackRouteEventBody", "HistoryRemoveInputBody", "ThemePlaybackRequest"]
 OPERATIONS = {
     "getPlaybackCapabilities", "startPlayback", "replanPlayback", "updatePlaybackProgress", "stopPlayback", "reportPlaybackRouteEvent",
     # Server setup, sign-in, and profiles (source/auth/).
@@ -50,6 +50,8 @@ CATALOG = {
     # Watchlist, Favorites, History, and watched state (source/catalog/personal.bs).
     "getPersonalListCapability", "listWatchlist", "addToWatchlist", "deleteWatchlistEntry", "listFavorites", "addFavorite",
     "deleteFavorite", "listHistory", "removeHistoryEntries", "markWatched", "unmarkWatched",
+    # Theme music on detail pages (source/playback/themeMusic.bs).
+    "getThemeSongsCapability", "createThemeSongPlayback",
 }
 OPERATIONS |= CATALOG
 # The keys Settings edits (settings.supportedControls).
@@ -58,6 +60,7 @@ SETTINGS = [
     "playback.auto_play_next", "playback.intro_skip_mode", "playback.auto_skip_credits", "playback.auto_skip_recap",
     "player.video_skip_back_seconds", "player.video_skip_forward_seconds",
     "playback.subtitle_language", "playback.subtitle_mode", "playback.show_forced_subtitles",
+    "ui.theme_music_enabled", "ui.theme_music_loop",
 ]
 MANIFEST = "contracts/settings/v1/manifest.json"
 MANIFEST_OUT = "settings/manifest.json"

@@ -110,6 +110,11 @@ Browse:
   recommendations;
 - a person page from the detail page's cast: biography and the person's
   movies and series, filtered by All, Movies, or Series;
+- the detail page's Trailers & More rail: the item's local trailers and
+  extras, which play in the player from their start;
+- theme music on detail pages, when the profile turns it on for the Roku
+  (`ui.theme_music_enabled`) and the server offers it
+  (`GET /api/v2/catalog/themes/capabilities`);
 - on the heroes, the detail page's credit line ("Directed by", "Starring")
   and the server's external ratings, Home's quality badges, and the
   profile's title-art preference (`ui.title_art`).
@@ -164,9 +169,6 @@ item is built, tvOS first where both have it (section 5.1).
 
 Planned:
 
-- trailers and extras in the detail page's Trailers & More rail (tvOS,
-  Android TV); tvOS opens remote trailers in the YouTube app, which
-  criterion 5.3 rules out on Roku, so remote trailers need another route;
 - library filters and Shuffle (tvOS, Android TV);
 - Requests, Calendar, and the For You tab (tvOS, Android TV); Shuffle and
   Requests show only when the server offers them;
@@ -175,7 +177,6 @@ Planned:
 - a sleep timer in the video player (Android TV; tvOS sets one only in its
   audio player);
 - episode spoiler hiding (tvOS, Android TV);
-- theme music on detail pages (tvOS, Android TV);
 - the buffering-quality pill and its prompts, with
   `playback.buffering_quality_mode` (the pill on tvOS and Android TV; the
   mode setting on Android TV);
@@ -198,6 +199,10 @@ Not decided yet, and deferred until the owner chooses:
 
 Roku platform work, still deferred:
 
+- remote (YouTube) trailers in Trailers & More, which tvOS and Android TV
+  open in the YouTube app: criterion 5.3 rules that out, and the server
+  gives only the video's site and key, no stream it hosts or relays
+  (section 5.9);
 - SiloControl's Require Pairing (the `sealed` level), offered only in
   development builds until the phone apps speak it, and cross-server handoff
   ([`silocontrol.md`](silocontrol.md) section 13);
@@ -314,8 +319,7 @@ The values below were read from silo-apple `b90a86ea` and silo-android
 `0545b85de` on 2026-10-23. When tvOS changes a first-release screen, this
 section changes with it. Screens outside the first-release scope are not
 described. Where a deferred control has a fixed place on tvOS (Collections
-in the library list; Trailers & More above Details), Roku leaves that place
-free. The card captions and
+in the library list), Roku leaves that place free. The card captions and
 detail cast and recommendations were checked against silo-apple `b514800f`
 on 2026-10-25.
 
@@ -917,7 +921,8 @@ their existing HD/FHD assets.
     existing apps do.
 - **Cast and recommendations.**
   - After the hero on movies, or the episode rail on series, show Cast &
-    Crew, then Related Movies or Recommended Series, then Details. Cast
+    Crew, then Trailers & More, then Related Movies or Recommended Series,
+    then Details. Cast
     preserves server order and displays up to 24 people with 200 px
     portraits, names, and characters. Missing portraits use initials;
     entries without a person ID remain readable but cannot open a person.
@@ -938,6 +943,71 @@ their existing HD/FHD assets.
     move between available sections; late responses do not take focus.
   - OK on a cast card with a person ID opens the person's page; Back from
     it returns to that card.
+- **Trailers & More** (tvOS's `TVTrailersRail`).
+  - The item's local extras (`extras` on `GET /api/v2/catalog/items/{id}`:
+    trailers, teasers, featurettes, behind the scenes, and the rest) in
+    server order, up to 24 (assumption AG-360). The rail shows only when
+    the item has one, and needs no request of its own. Remote videos
+    (`videos`, YouTube) are left out (5.9).
+  - Cards are 470×264 at radius 18, 48 px apart, the first at x 116, with
+    the extra's still (`still_url`, a root-relative signed path read
+    against the server's origin); without one, `#15171C` with a 48 px
+    film glyph at `#EDEDED` 60% in the centre (tvOS's `TrailerCardLabel`).
+    A 60 px black disc at 55% (72% focused) with a 24 px play glyph sits
+    at the centre. Centred 14 px under the card: the extra's title (21 px
+    SemiBold, `#EDEDED` at 92%), else its kind ("Trailer", "Featurette",
+    "Behind the Scenes"; "Extra" for a kind the client does not know), and
+    5 px under it its runtime ("2:31", "1:02:03"; 17 px Medium at
+    `#EDEDED` 60%).
+  - Focus draws a 3 px white ring at 90% inside the card's edge (2 px in
+    HD) and brightens the title to full `#EDEDED`, with Home's shadow; the
+    card does not lift and the caption does not drop, as both tvOS detail
+    pages pass `TVTrailersRail` `focusScale: 1.0`. The same on every tier.
+    Floating focus and the selection kept across Back and rebuilding, as
+    on the other supporting rails.
+  - OK plays the extra in the player from its start, through protocol v3
+    like any item; Back returns to its card. The page does not read its own
+    watch state again afterwards.
+- **Theme music** (tvOS's `ThemeMusicCenter` and `ThemeMusicController`).
+  - It plays while the profile's `ui.theme_music_enabled` is on for this
+    Roku and `GET /api/v2/catalog/themes/capabilities` answers `available`
+    with `allowed` not false. The theme is the first song of the item's
+    `themes` set. On a series it is the season's, once the season shown is
+    read (`GET /api/v2/catalog/items/{season}`), the series' playing on
+    meanwhile; a season item without a set keeps the series' theme, and an
+    empty set plays nothing. A series page starts nothing before its
+    seasons are read.
+  - `POST /api/v2/catalog/items/{owner}/themes/{theme_id}/playback` gives a
+    short-lived grant for the theme, the request listing what the Roku's
+    Audio node plays (MP3, AAC in MP4, M4A, or ADTS, and FLAC; AG-362); the
+    server converts any other theme to AAC in MP4. The grant's URL,
+    relative to the server or on a proxy's origin, plays in an Audio node
+    without account credentials and is never logged.
+  - It plays only while its page is the screen on top, and waits, paused,
+    while the page is still loading. Any screen over the page (a person,
+    another detail page, Settings, the player) stops it at once, as tvOS's
+    page stops its theme when a route is pushed over it, and the page
+    starts it again from the beginning when it is back on top. Leaving the
+    page (Back, a deep link, a phone's launch), switching profile, and
+    signing out stop it. The screen host reports every navigation, whatever
+    caused it, through one call (`themeMusicNavigated`); a page that is
+    not shown reports nothing, so a late answer under another page cannot
+    take the player from the page on top.
+  - It plays once to its end and then stays silent while the page stays
+    open; shown again after another screen, the page plays it again. With
+    `ui.theme_music_loop` on, an original file loops in place and a
+    converted one replays with a new grant. A refused grant leaves the
+    page silent until it is shown again; a stream that fails is retried
+    once with a new grant.
+  - Reads (AG-363). The two settings (`GET /api/v2/settings/values/effective`)
+    and the capability are read when a page needs them, and each answer
+    stands for 60 s; a failed read counts as off. Each read carries the
+    profile it was asked for and is dropped once another profile or server
+    is open. One read of each kind is on its way at a time. Settings' own
+    read of the values replaces the player's and drops one sent before it.
+    Each grant carries the player's generation, so a grant that lands after
+    a newer theme, a stop, or the page's release is dropped; a season's
+    set is read once per profile.
 - **Person page** (tvOS's `PersonDetailView`), a pushed page without the
   bar.
   - Header: a 300×450 portrait at (80, 48), radius 12 with a 1 px white
@@ -1349,7 +1419,10 @@ focus is in the pane. The icons are generated by `scripts/settings-art.py`.
 The existing option-list component is centered for Settings and retains its
 seven-row scrolling window.
 
-- General: Show Title Art.
+- General: Show Title Art; Play Theme Music and Loop Theme Music, under
+  Theme Music, when the server offers theme music
+  (`GET /api/v2/catalog/themes/capabilities`), each written for this Roku
+  (`profile_device`) as tvOS writes them, with Use profile setting.
 - Playback: Resolution, Maximum Bitrate, Audio Language, Auto-Play Next
   Episode, Skip Intros, Skip Credits, Auto-Skip Recaps, Skip Back, and Skip
   Forward.
@@ -1510,10 +1583,15 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Watchlist's empty state says "Tap the bookmark icon on any item to add it here", Favorites' "Tap the heart icon on any item to add it here" | "Add titles from a detail page and they will appear here." and "Add favorites from a detail page and they will appear here." (the iOS words), with a Back button | A remote has no tap, and a page without the bar needs a way out from its empty state |
 | A card's context menu (press and hold) offers Mark as Watched, Favorites, and Watchlist; a Watchlist or Favorites page drops a card whose flag turns off. History offers no removal | Options (*) on a list page's card offers one row: Remove from Watchlist, Remove from Favorites, or Remove from History (`POST /api/v2/history/remove`, the card's item, which for a series covers its episodes) | Roku has no press and hold; the phase's scope is removal from the lists, including the server's History removal |
 | An episode card's context menu marks that episode watched or unwatched | More on a series page has Mark Episode Watched or Unwatched for the episode Play plays (the active one) | Roku's episode rail has no context menu; the action row already names that episode |
-| More also offers Find Trailers, Translate Description, Shuffle, Show Series Info, and Watch Party where they apply | Favorites and the watched rows only | Scope (sections 3.3 and 3.4) |
+| More also offers Find Trailers, Translate Description, Shuffle, Show Series Info, and Watch Party where they apply | Favorites and the watched rows only | Scope (sections 3.3 and 3.4); Find Trailers (`POST /api/v2/catalog/items/{id}/trailers/refresh`, offered by `GET /api/v2/capabilities/trailers`) fetches remote videos, which Roku leaves out (next row) |
+| Trailers & More also lists the item's remote trailers and clips (`videos`, YouTube only), captioned "YouTube" with YouTube's still, which open in the YouTube app; tvOS drops them when the app is not installed | Only the local extras, which play in Silo's player | Certification criterion 5.3 forbids opening another app, and the server gives a remote video only as its site and key (`ItemVideoInfo`), with no stream it hosts or relays (silo-server `3e2d306b2`; assumption AG-361) |
+| A theme fades in to 35% of the volume over 300 ms and fades out as it stops | It plays at the TV's volume and starts and stops at once | Roku's `Audio` node has no volume or gain field, only `mute` (AG-363) |
+| A theme pauses while the app is in the background and resumes on return | Pressing Home closes the app, and the theme with it | Roku keeps no app running in the background without Instant Resume, which this client does not use |
+| Themes in MP3, AAC or ALAC in MP4, FLAC, and WAV play as they are | MP3, AAC in MP4, M4A, or ADTS, and FLAC play as they are; the server converts the rest to AAC in MP4 | The `Audio` node's stream formats are mp3, mp4, es.aac-adts, flac, and hls (assumption AG-362) |
+| Play Theme Music and Loop Theme Music show whenever the server knows the settings, and Loop is disabled while Play is off | Both show only when `GET /api/v2/catalog/themes/capabilities` answers available, and Loop can be set while Play is off; each also offers Use profile setting | Section 3.3: Settings shows only what the client can use here, and Roku's Settings rows have no disabled state (assumption AG-364) |
 | Watchlist and Favorites always show (neither tvOS nor Android TV reads a capability) | They show only when `GET /api/v2/capabilities/personal-lists` answers `available` and `allowed`: the avatar rows, the Watchlist button, and More's Favorites row | The phase gates them on the server's capability (assumption AG-323); an older server without the document hides them |
 | A refused change shows the alert "Couldn't Update Item" / "Your change wasn't saved. Please try again."; an unanswered one is held until the viewer discards it | The change goes back and "Couldn't update item. Your change wasn't saved." shows top centre for four seconds; an unanswered write counts as refused and nothing is held | Roku's passive notice line needs no focus; no held-change list is kept (assumption AG-326) |
-| Trailers; Filter and Shuffle; people, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; theme music; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| Filter and Shuffle; people, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
 
 ## 6. Application architecture
 
@@ -1793,7 +1871,10 @@ The first release consumes:
   pages; `PUT` and `DELETE` on `/api/v2/watchlist/{id}` and
   `/api/v2/favorites/{id}`; `POST /api/v2/history/remove` with one target;
 - `POST` and `DELETE /api/v2/watched/{id}` to mark a movie, episode,
-  season, or series watched or unwatched.
+  season, or series watched or unwatched;
+- `GET /api/v2/catalog/themes/capabilities` for whether theme music plays,
+  and `POST /api/v2/catalog/items/{id}/themes/{theme_id}/playback` for a
+  theme's grant, whose URL the Audio node plays (section 5.6).
 
 ### 8.2 Loading rules
 
@@ -1837,6 +1918,7 @@ playback keys the existing TV apps honor:
 | `ui.title_art` | Off shows the text title instead of the title logo on Home and detail heroes (sections 5.5 and 5.6); the top bar's shell reads it when Home or a library page starts, and the detail page uses that read |
 | `playback.auto_play_next` | Up Next countdown and autoplay; the player's toggle (Up Next's and Options') writes it for this device (`profile_device`), as tvOS does |
 | `playback.next_up_prompt_seconds` | How long before the end Up Next opens, and what its countdown counts from (0 to 120 s; 0 opens it only at the end) |
+| `ui.theme_music_enabled`, `ui.theme_music_loop` | Whether detail pages play their theme music, and whether it repeats (section 5.6); the theme player reads them when a page needs them, and Settings writes them for this device (`profile_device`), as tvOS does |
 
 Start has no language member, so language preferences are applied by choosing
 tracks, as Android TV does. Settings marked `client_local` in the server's

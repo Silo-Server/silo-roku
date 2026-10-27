@@ -1,0 +1,271 @@
+namespace tests
+
+    ' Theme music's pure side (source/playback/themeMusic.bs): its requests
+    ' against the server contract, the map step's mappers, the decision,
+    ' and the player's state.
+    @suite("theme music")
+    class ThemeMusicTests extends rooibos.BaseTestSuite
+
+        ' Whether path fits an OpenAPI path template such as /a/{id}/b.
+        function fits(path as String, template as String) as Boolean
+            parts = path.Split("/")
+            pattern = template.Split("/")
+            if parts.Count() <> pattern.Count() then return false
+            for i = 0 to parts.Count() - 1
+                if Left(pattern[i], 1) = "{"
+                    if parts[i] = "" then return false
+                else if parts[i] <> pattern[i]
+                    return false
+                end if
+            end for
+            return true
+        end function
+
+        function theme() as Object
+            return { ownerId: "movie:heat-1995", themeId: "7" }
+        end function
+
+        function page(extra = invalid as Dynamic) as Object
+            out = { id: "e2", theme: m.theme(), seasonId: "", loading: false }
+            if extra <> invalid then out.Append(extra)
+            return out
+        end function
+
+        function onTop(id = "e2" as String, route = "detail" as String) as Object
+            return { id: id, route: route }
+        end function
+
+        function enabled(loop = false as Boolean) as Object
+            return { enabled: true, loop: loop }
+        end function
+
+        function decide(page as Dynamic, top as Dynamic, setting as Dynamic, available as Dynamic, season as Dynamic, playing as String) as Object
+            return playback.themeMusic.decide(page, top, setting, available, season, playing)
+        end function
+
+        function types(commands as Object) as String
+            out = []
+            for each command in commands
+                out.Push(command.type)
+            end for
+            return out.Join(",")
+        end function
+
+        ' A player state that has loaded theme() and plays it.
+        function playing(loop = false as Boolean, converted = false as Boolean) as Object
+            state = playback.themeMusic.create()
+            grant = playback.themeMusic.select(state, m.theme(), loop)[0]
+            playback.themeMusic.granted(state, grant.generation, { url: "https://silo.example/a", streamFormat: "mp3", converted: converted })
+            return state
+        end function
+
+        @describe("the server contract")
+
+        @it("reads the capability and the settings, and asks for a grant, with the operations' methods and paths, as the profile")
+        sub _()
+            operations = tests.catalogData.operations()
+            reads = [
+                ["getThemeSongsCapability", playback.themeMusic.capabilityRequest()]
+                ["createThemeSongPlayback", playback.themeMusic.grantRequest("movie:heat-1995", "7")]
+                ["getCatalogItem", playback.themeMusic.seasonRequest("season:s1")]
+            ]
+            for each entry in reads
+                operation = operations[entry[0]]
+                request = tests.catalogData.sent(entry[1])
+                m.assertNotInvalid(request, entry[0] + " cannot be sent")
+                m.assertEqual([request.method, request.auth], [operation.method, "profile"], entry[0])
+                m.assertTrue(m.fits(request.path, operation.path), request.path + " is not " + operation.path)
+                for each name in request.query
+                    m.assertNotInvalid(operation.query[name], entry[0] + " has no query parameter " + name)
+                end for
+            end for
+            m.assertEqual(playback.themeMusic.grantRequest("movie:a b", "7").path, "/api/v2/catalog/items/movie:a%20b/themes/7/playback")
+            m.assertEqual(playback.themeMusic.seasonRequest("season:s1").lane, "prefetch")
+            m.assertInvalid(playback.themeMusic.grantRequest("", "7"))
+            m.assertInvalid(playback.themeMusic.grantRequest("movie:a", ""))
+            m.assertInvalid(playback.themeMusic.seasonRequest(""))
+            setting = playback.themeMusic.settingRequest()
+            m.assertEqual([setting.path, setting.auth], ["/api/v2/settings/values/effective", "profile"])
+            m.assertEqual(setting.query.keys, ["ui.theme_music_enabled", "ui.theme_music_loop"])
+        end sub
+
+        @it("asks for a grant with the golden ThemePlaybackRequest: what the Audio node plays")
+        sub _()
+            golden = tests.devices.loadJson("pkg:/tests/fixtures/golden/theme-playback/grant.json")
+            body = playback.themeMusic.grantRequest("movie:heat-1995", "7").body
+            m.assertEqual(body, golden, "GOLDEN theme-playback/grant.json " + FormatJson(body))
+        end sub
+
+        @describe("the map step")
+
+        @it("reads the capability (theme_songs_capability.json), off unless available and allowed")
+        sub _()
+            m.assertEqual(playback.themeMusic.capability(tests.catalogData.fixture("theme_songs_capability")), { available: true })
+            m.assertEqual(playback.themeMusic.capability({ state: "available" }), { available: true }, "allowed absent is not a refusal (tvOS)")
+            m.assertEqual(playback.themeMusic.capability({ state: "available", allowed: false }), { available: false })
+            m.assertEqual(playback.themeMusic.capability({ state: "disabled", allowed: true }), { available: false })
+            m.assertInvalid(playback.themeMusic.capability({}))
+            mapped = catalog.map.apply(playback.themeMusic.capabilityRequest(), tests.catalogData.ok({ revision: "r" }), tests.catalogData.words())
+            m.assertFalse(mapped.ok, "a body without a state is malformed")
+        end sub
+
+        @it("resolves a grant's relative URL against the server that answered (theme_songs_playback.json)")
+        sub _()
+            request = playback.themeMusic.grantRequest("movie:heat-1995", "7")
+            request.map.origin = "https://silo.example"
+            mapped = catalog.map.apply(request, tests.catalogData.ok(tests.catalogData.fixture("theme_songs_playback")), tests.catalogData.words())
+            m.assertTrue(mapped.ok)
+            m.assertEqual(mapped.body, { url: "https://silo.example/api/v2/catalog/items/movie:heat-1995/themes/7/audio?token=fixture-theme-grant", streamFormat: "mp3", converted: false })
+            converted = playback.themeMusic.grant(tests.catalogData.fixture("theme_songs_playback_converted"), "https://silo.example")
+            m.assertEqual([converted.streamFormat, converted.converted], ["mp4", true])
+        end sub
+
+        @it("uses a proxy's absolute URL as given and refuses one the Audio node cannot play")
+        sub _()
+            proxy = playback.themeMusic.grant({ url: "https://proxy.example:8443/a?token=t", delivery: "original", content_type: "audio/flac" }, "https://silo.example")
+            m.assertEqual([proxy.url, proxy.streamFormat], ["https://proxy.example:8443/a?token=t", "flac"])
+            m.assertInvalid(playback.themeMusic.grant({ url: "/a", delivery: "original", content_type: "audio/ogg" }, "https://silo.example"), "ogg: the server converts it only on request")
+            m.assertInvalid(playback.themeMusic.grant({ url: "//other.example/a", delivery: "original", content_type: "audio/mpeg" }, "https://silo.example"))
+            m.assertInvalid(playback.themeMusic.grant({ url: "ftp://x/a", delivery: "original", content_type: "audio/mpeg" }, "https://silo.example"))
+            m.assertInvalid(playback.themeMusic.grant({ url: "/a", delivery: "original", content_type: "audio/mpeg" }, ""), "no origin for a relative URL")
+            formats = { "audio/mpeg": "mp3", "audio/mp4": "mp4", "audio/x-m4a": "mp4", "audio/aac": "es.aac-adts", "Audio/FLAC; q=1": "flac", "audio/wav": "" }
+            for each kind in formats
+                m.assertEqual(playback.themeMusic.streamFormat(kind, "original"), formats[kind], kind)
+            end for
+            m.assertEqual(playback.themeMusic.streamFormat("", "converted"), "mp4")
+        end sub
+
+        @it("reads the settings, the first song of a set, and a season's own set")
+        sub _()
+            m.assertEqual(playback.themeMusic.settingOf({ items: [{ key: "ui.theme_music_enabled", value: true }, { key: "ui.theme_music_loop", value: "true" }] }), { enabled: true, loop: false })
+            m.assertEqual(playback.themeMusic.settingOf({ items: [{ key: "ui.theme_music_loop", value: true }] }), { enabled: false, loop: true })
+            m.assertEqual(playback.themeMusic.settingOf(invalid), { enabled: false, loop: false })
+            item = tests.catalogData.fixture("get_catalog_item_ok")
+            m.assertEqual(playback.themeMusic.themeOf(item.themes), m.theme())
+            m.assertEqual(catalog.detail.fromItem(item, tests.catalogData.words()).theme, m.theme())
+            m.assertInvalid(playback.themeMusic.themeOf({ owner_id: "movie:a", items: [] }))
+            m.assertInvalid(playback.themeMusic.themeOf({ owner_id: "", items: [{ id: "1" }] }))
+            m.assertEqual(playback.themeMusic.seasonOf({ themes: { owner_id: "season:s1", items: [{ id: "3" }] } }), { known: true, theme: { ownerId: "season:s1", themeId: "3" } })
+            m.assertEqual(playback.themeMusic.seasonOf({ themes: { owner_id: "season:s1", items: [] } }), { known: true, theme: invalid }, "a season's empty set plays nothing")
+            m.assertEqual(playback.themeMusic.seasonOf({ content_id: "season:s1" }), { known: false, theme: invalid }, "without a set the series' theme stands")
+        end sub
+
+        @it("keeps an answer for its identity, fresh for 60 seconds")
+        sub _()
+            answer = { key: "a|1", at: 10.0 }
+            m.assertTrue(playback.themeMusic.fresh(answer, "a|1", 69.0))
+            m.assertFalse(playback.themeMusic.fresh(answer, "a|1", 70.0))
+            m.assertFalse(playback.themeMusic.fresh(answer, "a|2", 11.0))
+            m.assertTrue(playback.themeMusic.heldFor(answer, "a|1"))
+            m.assertFalse(playback.themeMusic.heldFor(answer, "b|1"))
+            m.assertFalse(playback.themeMusic.fresh(invalid, "a|1", 0.0))
+        end sub
+
+        @describe("the decision")
+
+        @it("plays the page's theme only while it is on top, enabled, and offered")
+        sub _()
+            m.assertEqual(m.decide(m.page(), m.onTop(), m.enabled(true), true, invalid, ""), { action: "play", theme: m.theme(), loop: true })
+            m.assertEqual(m.decide(invalid, m.onTop(), m.enabled(), true, invalid, "").action, "stop", "no page")
+            m.assertEqual(m.decide(m.page(), m.onTop(), invalid, true, invalid, "").action, "stop", "settings not read: off")
+            m.assertEqual(m.decide(m.page(), m.onTop(), { enabled: false, loop: true }, true, invalid, "").action, "stop")
+            m.assertEqual(m.decide(m.page(), m.onTop("e3", "player"), m.enabled(), true, invalid, "").action, "stop", "the player opened")
+            m.assertEqual(m.decide(m.page(), m.onTop(), m.enabled(), invalid, invalid, "").action, "wait", "the capability is on its way")
+            m.assertEqual(m.decide(m.page(), m.onTop(), m.enabled(), false, invalid, "").action, "stop")
+            m.assertEqual(m.decide(m.page(), m.onTop("e3", "person"), m.enabled(), true, invalid, "").action, "stop", "covered: tvOS's page leaves when a route is pushed over it")
+            m.assertEqual(m.decide(m.page({ loading: true }), m.onTop(), m.enabled(), true, invalid, "").action, "suspend", "loading")
+            m.assertEqual(m.decide(m.page({ theme: invalid }), m.onTop(), m.enabled(), true, invalid, "").action, "stop", "no theme")
+        end sub
+
+        @it("plays the selected season's own set, keeping this page's theme while it is read")
+        sub _()
+            page = m.page({ seasonId: "season:s2" })
+            m.assertEqual(m.decide(page, m.onTop(), m.enabled(), true, invalid, "e2").action, "wait", "this page's theme plays on")
+            m.assertEqual(m.decide(page, m.onTop(), m.enabled(), true, invalid, "e1").action, "suspend", "another page's does not")
+            own = { ownerId: "season:s2", themeId: "4" }
+            m.assertEqual(m.decide(page, m.onTop(), m.enabled(), true, { known: true, theme: own }, "e2").theme, own)
+            m.assertEqual(m.decide(page, m.onTop(), m.enabled(), true, { known: false, theme: invalid }, "e2").theme, m.theme(), "no set: the series' theme")
+            m.assertEqual(m.decide(page, m.onTop(), m.enabled(), true, { known: true, theme: invalid }, "e2").action, "stop", "an empty set: none")
+        end sub
+
+        @describe("the player's state")
+
+        @it("asks for a grant, loads it, pauses when covered, and resumes in place")
+        sub _()
+            state = playback.themeMusic.create()
+            commands = playback.themeMusic.select(state, m.theme(), false)
+            m.assertEqual(m.types(commands), "grant")
+            m.assertEqual([commands[0].ownerId, commands[0].themeId], ["movie:heat-1995", "7"])
+            m.assertEqual(m.types(playback.themeMusic.select(state, m.theme(), false)), "", "the same theme asks once")
+            grant = { url: "https://silo.example/a", streamFormat: "mp3", converted: false }
+            loaded = playback.themeMusic.granted(state, commands[0].generation, grant)
+            m.assertEqual(loaded, [{ type: "load", grant: grant, loop: false, play: true }])
+            playback.themeMusic.progressed(state)
+            m.assertEqual(m.types(playback.themeMusic.suspend(state)), "pause")
+            m.assertEqual(m.types(playback.themeMusic.select(state, m.theme(), true)), "loop,resume")
+            m.assertEqual(m.types(playback.themeMusic.halt(state)), "release")
+            m.assertEqual(m.types(playback.themeMusic.halt(state)), "", "stopping twice does nothing")
+        end sub
+
+        @it("drops a grant that lands after a newer theme or a stop, and loads one that lands while covered without playing")
+        sub _()
+            state = playback.themeMusic.create()
+            first = playback.themeMusic.select(state, m.theme(), false)[0]
+            second = playback.themeMusic.select(state, { ownerId: "movie:b", themeId: "2" }, false)
+            m.assertEqual(m.types(second), "release,grant", "the first grant is cancelled")
+            grant = { url: "https://silo.example/a", streamFormat: "mp3", converted: false }
+            m.assertEqual(playback.themeMusic.granted(state, first.generation, grant), [], "the older answer is dropped")
+            playback.themeMusic.suspend(state)
+            loaded = playback.themeMusic.granted(state, second[1].generation, grant)
+            m.assertFalse(loaded[0].play, "covered: loaded, not played")
+            m.assertEqual(state.phase, "paused")
+            m.assertEqual(m.types(playback.themeMusic.select(state, { ownerId: "movie:b", themeId: "2" }, false)), "loop,resume")
+            third = playback.themeMusic.select(state, m.theme(), false)
+            playback.themeMusic.halt(state)
+            m.assertEqual(playback.themeMusic.granted(state, third[1].generation, grant), [], "a grant after a stop is dropped")
+            m.assertEqual(playback.themeMusic.grantFailed(state, third[1].generation), [])
+        end sub
+
+        @it("stays silent after a refused grant until the page is covered and shown again")
+        sub _()
+            state = playback.themeMusic.create()
+            grant = playback.themeMusic.select(state, m.theme(), false)[0]
+            m.assertEqual(playback.themeMusic.grantFailed(state, grant.generation), [])
+            m.assertEqual(m.types(playback.themeMusic.select(state, m.theme(), false)), "", "staying on the page asks nothing")
+            playback.themeMusic.suspend(state)
+            m.assertEqual(m.types(playback.themeMusic.select(state, m.theme(), false)), "grant", "coming back asks again")
+        end sub
+
+        @it("finishes an original theme at its end, and replays a converted loop with a fresh grant")
+        sub _()
+            state = m.playing()
+            playback.themeMusic.progressed(state)
+            m.assertEqual(m.types(playback.themeMusic.ended(state)), "release")
+            m.assertTrue(state.finished)
+            m.assertEqual(m.types(playback.themeMusic.select(state, m.theme(), false)), "", "staying does not start it again")
+            playback.themeMusic.suspend(state)
+            m.assertEqual(m.types(playback.themeMusic.select(state, m.theme(), false)), "", "nor does coming back")
+            looped = m.playing(true, true)
+            playback.themeMusic.progressed(looped)
+            m.assertEqual(m.types(playback.themeMusic.ended(looped)), "release,grant")
+            m.assertEqual(looped.phase, "granting")
+            original = m.playing(true, false)
+            m.assertEqual(original.phase, "playing")
+        end sub
+
+        @it("retries a failed stream once with a fresh grant, and a converted loop that never played once")
+        sub _()
+            state = m.playing()
+            m.assertEqual(m.types(playback.themeMusic.failed(state)), "release,grant")
+            grant = { url: "https://silo.example/a", streamFormat: "mp3", converted: false }
+            playback.themeMusic.granted(state, state.generation, grant)
+            m.assertEqual(m.types(playback.themeMusic.failed(state)), "release", "the retry is spent")
+            m.assertEqual(state.phase, "idle")
+            looped = m.playing(true, true)
+            m.assertEqual(m.types(playback.themeMusic.ended(looped)), "release,grant", "one retry")
+            playback.themeMusic.granted(looped, looped.generation, { url: "https://silo.example/a", streamFormat: "mp4", converted: true })
+            m.assertEqual(m.types(playback.themeMusic.ended(looped)), "release", "then it is finished")
+            m.assertEqual(playback.themeMusic.failed(playback.themeMusic.create()), [], "nothing loaded: nothing to fail")
+        end sub
+    end class
+end namespace

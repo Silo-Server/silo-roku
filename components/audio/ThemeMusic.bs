@@ -1,0 +1,355 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/api/session.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/playback/themeMusic.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' Carries out playback.themeMusic: keeps the open profile's answers (the two
+' settings and the capability, each standing ANSWER_SECONDS), the selected
+' seasons' sets, and the player's state, decides on every report
+' (playback.themeMusic.decide), and runs the commands on an Audio node.
+'
+' One rule per read, so answers out of order cannot win: each carries the
+' identity it was asked for (themeKey) and is dropped once another profile
+' or server is open; one of each kind is in flight at a time; a settings
+' read also carries the revision Settings had given when it was sent, and
+' a value Settings gives later wins over it; a grant carries the player's
+' generation, and an older one is dropped (playback.themeMusic.granted). A
+' failed read counts as an answer (off, or the last value for this
+' profile) until it is ANSWER_SECONDS old, so a failing server is not asked
+' again on every report. Each theme gets its own Audio node, unobserved and
+' dropped when it stops, so an old node's late state cannot reach the next.
+
+' Reads go under this owner, which is never released: they outlive the page
+' that caused them, and a page's release must not cancel them.
+const THEME_OWNER = "themeMusic"
+const CA_BUNDLE = "common:/certs/ca-bundle.crt"
+
+sub init()
+    m.clock = CreateObject("roTimespan")
+    m.state = playback.themeMusic.create()
+    m.audio = invalid
+    ' The identity the answers below are for: "<origin>|<profile ID>".
+    m.key = ""
+    m.page = invalid
+    m.stackTop = invalid
+    m.playing = ""
+    m.setting = invalid
+    m.capability = invalid
+    m.settingRevision = 0
+    m.settingRead = invalid
+    m.capabilityRead = invalid
+    m.grantRead = invalid
+    ' Season ID to { known, theme }, oldest first in m.seasonOrder; the reads
+    ' on their way by season ID.
+    m.seasons = {}
+    m.seasonOrder = []
+    m.seasonReads = {}
+end sub
+
+' --- The interface ----------------------------------------------------------------
+
+function showPage(page as Object) as Boolean
+    m.page = { id: util.text(page.id), theme: page.theme, seasonId: util.text(page.seasonId), loading: util.isTrue(page.loading) }
+    apply()
+    return true
+end function
+
+function leavePage(id as String) as Boolean
+    if m.page <> invalid and m.page.id = id
+        m.page = invalid
+        apply()
+    end if
+    return true
+end function
+
+function navigated(top as Object) as Boolean
+    m.stackTop = { id: util.text(top.id), route: util.text(top.route) }
+    apply()
+    return true
+end function
+
+function sessionChanged(_args = invalid as Dynamic) as Boolean
+    apply()
+    return true
+end function
+
+' Settings read the two values for the open profile after a change: they
+' replace this player's, and a read sent before them is dropped.
+function settingChanged(value as Object) as Boolean
+    refreshKey()
+    m.settingRevision = m.settingRevision + 1
+    m.setting = { key: m.key, at: clockSeconds(), enabled: util.isTrue(value.enabled), loop: util.isTrue(value.loop) }
+    apply()
+    return true
+end function
+
+' Whether the server offers theme music to the open profile: true or
+' false, or invalid until the capability is read (offer changes then).
+function offered(_args = invalid as Dynamic) as Dynamic
+    refreshKey()
+    if m.key = "" then return false
+    askCapability()
+    if playback.themeMusic.heldFor(m.capability, m.key) then return m.capability.available
+    return invalid
+end function
+
+function inspect(_args = invalid as Dynamic) as Object
+    return { state: m.state, page: m.page, top: m.stackTop, setting: m.setting, capability: m.capability, playing: m.playing, audio: m.audio <> invalid, seasons: m.seasons }
+end function
+
+' --- Deciding ---------------------------------------------------------------------
+
+sub apply()
+    refreshKey()
+    ' Under the player nothing plays, and nothing is read while it streams.
+    if m.key = "" or m.page = invalid or (m.stackTop <> invalid and m.stackTop.route = nav.route.PLAYER)
+        perform(playback.themeMusic.halt(m.state))
+        return
+    end if
+    askSetting()
+    setting = invalid
+    if playback.themeMusic.heldFor(m.setting, m.key) then setting = m.setting
+    available = invalid
+    if setting <> invalid and setting.enabled
+        askCapability()
+        if playback.themeMusic.heldFor(m.capability, m.key) then available = m.capability.available
+    end if
+    season = invalid
+    seasonId = m.page.seasonId
+    if seasonId <> ""
+        season = m.seasons[seasonId]
+        if season = invalid and util.isTrue(available) then askSeason(seasonId)
+    end if
+    decision = playback.themeMusic.decide(m.page, m.stackTop, setting, available, season, m.playing)
+    if decision.action = "play"
+        m.playing = m.page.id
+        perform(playback.themeMusic.select(m.state, decision.theme, decision.loop))
+    else if decision.action = "suspend"
+        perform(playback.themeMusic.suspend(m.state))
+    else if decision.action = "stop"
+        perform(playback.themeMusic.halt(m.state))
+    end if
+end sub
+
+' Another profile or server: stop at once and forget its answers.
+sub refreshKey()
+    key = identityKey()
+    if key = m.key then return
+    perform(playback.themeMusic.halt(m.state))
+    for each handle in [m.settingRead, m.capabilityRead]
+        if handle <> invalid then api.cancel(handle)
+    end for
+    for each id in m.seasonReads
+        api.cancel(m.seasonReads[id])
+    end for
+    m.settingRead = invalid
+    m.capabilityRead = invalid
+    m.seasonReads = {}
+    m.seasons = {}
+    m.seasonOrder = []
+    m.setting = invalid
+    m.capability = invalid
+    m.playing = ""
+    m.key = key
+    m.top.offer = { key: key, available: invalid }
+end sub
+
+function identityKey() as String
+    session = api.session.current()
+    if not util.isObject(session) or util.text(session.status) <> "signed_in" or not util.isObject(session.profile) then return ""
+    profile = util.text(session.profile.id)
+    if profile = "" then return ""
+    return util.text(session.origin) + "|" + profile
+end function
+
+function clockSeconds() as Float
+    return m.clock.TotalMilliseconds() / 1000
+end function
+
+' --- Reads ------------------------------------------------------------------------
+
+function newRead(callback as String) as Object
+    handle = api.newHandle(THEME_OWNER)
+    handle.addFields({ themeKey: m.key })
+    handle.observeField("status", callback)
+    return handle
+end function
+
+' A read's handle, when it is the one this player waits for and is still
+' for the open identity.
+function awaited(event as Object, waiting as Dynamic) as Boolean
+    handle = event.getRoSGNode()
+    return waiting <> invalid and handle.isSameNode(waiting) and handle.themeKey = m.key
+end function
+
+sub askSetting()
+    if m.settingRead <> invalid or playback.themeMusic.fresh(m.setting, m.key, clockSeconds()) then return
+    m.settingRead = newRead("onSetting")
+    m.settingRead.addFields({ themeRevision: m.settingRevision })
+    api.send(playback.themeMusic.settingRequest(), m.settingRead)
+end sub
+
+sub onSetting(event as Object)
+    handle = event.getRoSGNode()
+    if not awaited(event, m.settingRead) then return
+    m.settingRead = invalid
+    if handle.themeRevision <> m.settingRevision then return
+    result = api.resultOf(handle)
+    value = { enabled: false, loop: false }
+    if util.isTrue(result.ok)
+        value = playback.themeMusic.settingOf(result.body)
+    else if playback.themeMusic.heldFor(m.setting, m.key)
+        value = m.setting
+    end if
+    m.setting = { key: m.key, at: clockSeconds(), enabled: value.enabled, loop: value.loop }
+    apply()
+end sub
+
+sub askCapability()
+    if m.key = "" or m.capabilityRead <> invalid or playback.themeMusic.fresh(m.capability, m.key, clockSeconds()) then return
+    m.capabilityRead = newRead("onCapability")
+    api.send(playback.themeMusic.capabilityRequest(), m.capabilityRead)
+end sub
+
+sub onCapability(event as Object)
+    if not awaited(event, m.capabilityRead) then return
+    result = api.resultOf(m.capabilityRead)
+    m.capabilityRead = invalid
+    available = util.isTrue(result.ok) and util.isObject(result.body) and util.isTrue(result.body.available)
+    m.capability = { key: m.key, at: clockSeconds(), available: available }
+    m.top.offer = { key: m.key, available: available }
+    apply()
+end sub
+
+sub askSeason(id as String)
+    if m.seasonReads.DoesExist(id) then return
+    request = playback.themeMusic.seasonRequest(id)
+    if request = invalid then return
+    handle = newRead("onSeason")
+    handle.addFields({ themeSeason: id })
+    m.seasonReads[id] = handle
+    api.send(request, handle)
+end sub
+
+sub onSeason(event as Object)
+    handle = event.getRoSGNode()
+    id = handle.themeSeason
+    if not awaited(event, m.seasonReads[id]) then return
+    m.seasonReads.Delete(id)
+    result = api.resultOf(handle)
+    value = { known: false, theme: invalid }
+    if util.isTrue(result.ok) and util.isObject(result.body) then value = result.body
+    if m.seasonOrder.Count() >= playback.themeMusic.MAX_SEASONS
+        m.seasons.Delete(m.seasonOrder[0])
+        m.seasonOrder.Shift()
+    end if
+    m.seasons[id] = value
+    m.seasonOrder.Push(id)
+    apply()
+end sub
+
+' --- Commands ---------------------------------------------------------------------
+
+sub perform(commands as Object)
+    for each command in commands
+        if command.type = "grant"
+            askGrant(command)
+        else if command.type = "load"
+            load(command)
+        else if command.type = "pause"
+            if m.audio <> invalid then m.audio.control = "pause"
+        else if command.type = "resume"
+            resume()
+        else if command.type = "loop"
+            if m.audio <> invalid then m.audio.loop = command.on
+        else if command.type = "release"
+            release()
+        end if
+    end for
+end sub
+
+sub askGrant(command as Object)
+    if m.grantRead <> invalid then api.cancel(m.grantRead)
+    m.grantRead = invalid
+    request = playback.themeMusic.grantRequest(command.ownerId, command.themeId)
+    if request = invalid
+        perform(playback.themeMusic.grantFailed(m.state, command.generation))
+        return
+    end if
+    m.grantRead = newRead("onGrant")
+    m.grantRead.addFields({ themeGeneration: command.generation })
+    log.info("themeMusic", "grant", { owner: command.ownerId, theme: command.themeId })
+    api.send(request, m.grantRead)
+end sub
+
+sub onGrant(event as Object)
+    if not awaited(event, m.grantRead) then return
+    handle = m.grantRead
+    m.grantRead = invalid
+    result = api.resultOf(handle)
+    if util.isTrue(result.ok) and util.isObject(result.body)
+        perform(playback.themeMusic.granted(m.state, handle.themeGeneration, result.body))
+    else
+        log.info("themeMusic", "no grant", { status: result.status })
+        perform(playback.themeMusic.grantFailed(m.state, handle.themeGeneration))
+    end if
+end sub
+
+sub load(command as Object)
+    release()
+    audio = m.top.createChild("Audio")
+    agent = CreateObject("roHttpAgent")
+    agent.SetCertificatesFile(CA_BUNDLE)
+    audio.setHttpAgent(agent)
+    content = CreateObject("roSGNode", "ContentNode")
+    content.url = command.grant.url
+    content.streamFormat = command.grant.streamFormat
+    audio.loop = command.loop
+    audio.content = content
+    audio.observeField("state", "onAudioState")
+    m.audio = audio
+    log.info("themeMusic", "load", { format: command.grant.streamFormat, converted: command.grant.converted, loop: command.loop, play: command.play })
+    if command.play then audio.control = "play"
+end sub
+
+sub resume()
+    if m.audio = invalid then return
+    if m.audio.state = "paused"
+        m.audio.control = "resume"
+    else
+        m.audio.control = "play"
+    end if
+end sub
+
+' Stops and drops the Audio node, its URL with it, and any grant on its way.
+sub release()
+    if m.grantRead <> invalid then api.cancel(m.grantRead)
+    m.grantRead = invalid
+    if m.audio = invalid then return
+    audio = m.audio
+    m.audio = invalid
+    audio.unobserveField("state")
+    audio.control = "stop"
+    audio.content = invalid
+    m.top.removeChild(audio)
+    log.info("themeMusic", "stop")
+end sub
+
+sub onAudioState(event as Object)
+    audioStateChanged(event.getRoSGNode(), event.getData())
+end sub
+
+sub audioStateChanged(audio as Object, state as String)
+    if m.audio = invalid or not audio.isSameNode(m.audio) then return
+    log.info("themeMusic", "audio", { state: state })
+    if state = "playing"
+        playback.themeMusic.progressed(m.state)
+    else if state = "finished"
+        perform(playback.themeMusic.ended(m.state))
+    else if state = "error"
+        log.warn("themeMusic", "audio failed", { code: m.audio.errorCode })
+        perform(playback.themeMusic.failed(m.state))
+    end if
+end sub

@@ -2,6 +2,7 @@ import "pkg:/components/theme/browse.bs"
 import "pkg:/components/theme/detail.bs"
 import "pkg:/components/theme/helpers.bs"
 import "pkg:/components/views/pending.bs"
+import "pkg:/components/views/themeMusic.bs"
 import "pkg:/source/api/client.bs"
 import "pkg:/source/catalog/actions.bs"
 import "pkg:/source/catalog/detail.bs"
@@ -18,9 +19,10 @@ import "pkg:/source/util/values.bs"
 ' episode rail, and active episode in DetailSeries.bs; the action row, the
 ' Versions, Audio Tracks, and Subtitles menus and readout, the player
 ' handoff, and the refresh after playback in DetailPlayback.bs; Watchlist,
-' Favorites, and Mark as Watched in DetailPersonal.bs. Every request
-' goes through components/views/pending.bs under the screen's owner; an
-' answer for a season or item no longer shown is dropped.
+' Favorites, and Mark as Watched in DetailPersonal.bs; Cast & Crew,
+' Trailers & More, recommendations, and theme music in DetailSupporting.bs.
+' Every request goes through components/views/pending.bs under the screen's
+' owner; an answer for a season or item no longer shown is dropped.
 
 ' Focus zones, top to bottom.
 const ZONE_ACTIONS = "actions"
@@ -28,6 +30,7 @@ const ZONE_SEASONS = "seasons"
 const ZONE_EPISODES = "episodes"
 const ZONE_DETAILS = "details"
 const ZONE_CAST = "cast"
+const ZONE_EXTRAS = "extras"
 const ZONE_SIMILAR = "similar"
 
 sub init()
@@ -136,6 +139,7 @@ sub onShow(event as Object)
         syncPersonalLists()
         if event.refresh then returnFromPlayer(event.played)
     end if
+    reportTheme()
     if m.status.visible
         focusStatus()
     else
@@ -159,6 +163,7 @@ end sub
 sub onRelease()
     m.actions.active = false
     m.released = true
+    leaveTheme()
     m.supportingTimer.control = "stop"
     m.watchTimer.control = "stop"
     m.refreshTimer.control = "stop"
@@ -168,7 +173,7 @@ end sub
 ' Where focus was, the season and episode shown, and what the player was
 ' given, so a page rebuilt from its entry opens the same way.
 function focusKey() as Dynamic
-    key = { cast: m.castRail.index, castFirst: m.castRail.firstVisible, similar: m.similarRail.index, similarFirst: m.similarRail.firstVisible, zone: m.zone, button: m.actions.focusedKey, season: -1, episode: "", played: "" }
+    key = { cast: m.castRail.index, castFirst: m.castRail.firstVisible, extras: m.extrasRail.index, extrasFirst: m.extrasRail.firstVisible, similar: m.similarRail.index, similarFirst: m.similarRail.firstVisible, zone: m.zone, button: m.actions.focusedKey, season: -1, episode: "", played: "" }
     if m.seasonIndex >= 0 and m.seasonIndex < m.seasonNodes.Count() then key.season = m.seasonNodes[m.seasonIndex].seasonNumber
     if m.target <> invalid and m.target.episode then key.episode = m.target.contentId
     if m.playing <> invalid then key.played = m.playing.contentId
@@ -225,6 +230,8 @@ sub start(restore as Dynamic, refresh as Boolean, played as Dynamic)
     if util.isObject(restore)
         if util.isNumber(restore.cast) then m.castRail.index = restore.cast
         if util.isNumber(restore.castFirst) then m.castRail.firstVisible = restore.castFirst
+        if util.isNumber(restore.extras) then m.extrasRail.index = restore.extras
+        if util.isNumber(restore.extrasFirst) then m.extrasRail.firstVisible = restore.extrasFirst
         if util.isNumber(restore.similar) then m.similarRail.index = restore.similar
         if util.isNumber(restore.similarFirst) then m.similarRail.firstVisible = restore.similarFirst
     end if
@@ -352,7 +359,7 @@ end sub
 ' The answer to the request sent with entry, its mapped content alongside.
 sub onAnswer(entry as Object, result as Object, content as Dynamic)
     if entry.kind = "item"
-        onItem(result)
+        onItem(result, content)
     else if entry.kind = "similar"
         onSupportingAnswer(entry, result, content)
     else if entry.kind = "seasons"
@@ -376,7 +383,8 @@ sub onAnswer(entry as Object, result as Object, content as Dynamic)
     end if
 end sub
 
-sub onItem(result as Object)
+' content is the item's extra cards (catalog.map's detail kind), or invalid.
+sub onItem(result as Object, content = invalid as Dynamic)
     if result.ok <> true
         if result.status = 403 or result.status = 404
             showError("detail.error.missing", false)
@@ -431,8 +439,9 @@ sub onItem(result as Object)
     updateActions()
     layout()
     m.top.ready = true
-    startSupporting()
+    startSupporting(content)
     focusRestored()
+    reportTheme()
 end sub
 
 ' The hero's text for the movie or series itself: its title, metadata line,
@@ -493,6 +502,10 @@ sub layout()
         m.castRail.translation = [0, top]
         top = top + m.castRail.height + theme.detail.SECTION_GAP
     end if
+    if m.extrasRail.visible
+        m.extrasRail.translation = [0, top]
+        top = top + m.extrasRail.height + theme.detail.SECTION_GAP
+    end if
     if m.similarRail.visible
         m.similarRail.translation = [0, top]
         top = top + m.similarRail.height + theme.detail.SECTION_GAP
@@ -512,6 +525,7 @@ function zones() as Object
     ' does not settle below a rail still loading.
     supportingReady = not m.series or not m.seasonsLoading
     if supportingReady and m.castRail.visible then out.Push(ZONE_CAST)
+    if supportingReady and hasExtras() then out.Push(ZONE_EXTRAS)
     if supportingReady and hasSimilar() then out.Push(ZONE_SIMILAR)
     if m.details.visible and supportingReady then out.Push(ZONE_DETAILS)
     return out
@@ -519,7 +533,7 @@ end function
 
 ' Focuses zone, or the nearest zone below it, else above, when it is empty.
 sub focusZone(zone as String)
-    order = [ZONE_ACTIONS, ZONE_SEASONS, ZONE_EPISODES, ZONE_CAST, ZONE_SIMILAR, ZONE_DETAILS]
+    order = [ZONE_ACTIONS, ZONE_SEASONS, ZONE_EPISODES, ZONE_CAST, ZONE_EXTRAS, ZONE_SIMILAR, ZONE_DETAILS]
     available = zones()
     ' A hidden page (the player above it) only remembers the zone.
     if available.Count() = 0 or not m.top.visible
@@ -546,6 +560,8 @@ sub focusZone(zone as String)
         m.rail.setFocus(true)
     else if chosen = ZONE_CAST
         m.castRail.setFocus(true)
+    else if chosen = ZONE_EXTRAS
+        m.extrasRail.setFocus(true)
     else if chosen = ZONE_SIMILAR
         m.similarRail.setFocus(true)
     else
@@ -571,6 +587,8 @@ sub scrollFor(zone as String)
     offset = 0
     if zone = ZONE_CAST
         offset = m.castRail.translation[1] - 180
+    else if zone = ZONE_EXTRAS
+        offset = m.extrasRail.translation[1] - 180
     else if zone = ZONE_SIMILAR
         offset = m.similarRail.translation[1] - 180
     else if zone = ZONE_DETAILS

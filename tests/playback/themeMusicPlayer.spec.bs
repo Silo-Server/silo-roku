@@ -1,0 +1,216 @@
+import "pkg:/source/tests/helpers/scene.bs"
+
+namespace tests
+
+    ' The theme player (components/audio/ThemeMusic) through
+    ' ThemeMusicProbe: its reads in the test scene's log, answered in and out
+    ' of order, and what it does with the Audio node.
+    @suite("theme music player")
+    class ThemeMusicPlayerTests extends rooibos.BaseTestSuite
+        protected override sub afterEach()
+            for each child in m.top.getChildren(-1, 0)
+                if child.subtype() = "ThemeMusicProbe" then m.top.removeChild(child)
+            end for
+        end sub
+
+        function player() as Object
+            tests.scene.reset()
+            probe = CreateObject("roSGNode", "ThemeMusicProbe")
+            m.top.appendChild(probe)
+            probe.callFunc("navigated", { id: "e2", route: "detail" })
+            return probe
+        end function
+
+        function page(extra = invalid as Dynamic) as Object
+            out = { id: "e2", theme: { ownerId: "movie:heat-1995", themeId: "7" }, seasonId: "", loading: false }
+            if extra <> invalid then out.Append(extra)
+            return out
+        end function
+
+        function settings(enabled as Boolean, loop = false as Boolean) as Object
+            return { items: [{ key: "ui.theme_music_enabled", value: enabled }, { key: "ui.theme_music_loop", value: loop }] }
+        end function
+
+        function count(path as String) as Integer
+            n = 0
+            for each sent in tests.scene.paths()
+                if sent = path then n = n + 1
+            end for
+            return n
+        end function
+
+        sub grant()
+            entry = tests.scene.last("/api/v2/catalog/items/movie:heat-1995/themes/7/playback")
+            entry.request.map.origin = "https://silo.example"
+            tests.scene.answer(entry, tests.catalogData.fixture("theme_songs_playback"))
+        end sub
+
+        ' A player with the page shown, theme music on, and the server
+        ' offering it: the grant is the next request.
+        function asked(loop = false as Boolean) as Object
+            probe = m.player()
+            probe.callFunc("showPage", m.page())
+            tests.scene.answer(tests.scene.last("/api/v2/settings/values/effective"), m.settings(true, loop))
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/themes/capabilities"), tests.catalogData.fixture("theme_songs_capability"))
+            return probe
+        end function
+
+        function phase(probe as Object) as String
+            return probe.callFunc("inspect").state.phase
+        end function
+
+        @describe("playing")
+
+        @it("reads the setting, then the capability, then a grant, and plays it on its own Audio node")
+        sub _()
+            probe = m.player()
+            probe.callFunc("showPage", m.page())
+            m.assertEqual(tests.scene.paths(), ["/api/v2/settings/values/effective"], "only the setting until it says on")
+            tests.scene.answer(tests.scene.last("/api/v2/settings/values/effective"), m.settings(true))
+            m.assertEqual(tests.scene.paths(), ["/api/v2/settings/values/effective", "/api/v2/catalog/themes/capabilities"])
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/themes/capabilities"), tests.catalogData.fixture("theme_songs_capability"))
+            m.assertEqual(tests.scene.paths(), ["/api/v2/settings/values/effective", "/api/v2/catalog/themes/capabilities", "/api/v2/catalog/items/movie:heat-1995/themes/7/playback"])
+            m.assertEqual(tests.scene.last("/api/v2/catalog/items/movie:heat-1995/themes/7/playback").request.method, "POST")
+            m.grant()
+            audio = probe.callFunc("probeAudioNode")
+            m.assertNotInvalid(audio)
+            m.assertEqual([audio.content.url, audio.content.streamFormat, audio.loop], ["https://silo.example/api/v2/catalog/items/movie:heat-1995/themes/7/audio?token=fixture-theme-grant", "mp3", false])
+            m.assertEqual(audio.control, "play")
+            m.assertEqual(m.phase(probe), "playing")
+        end sub
+
+        @it("plays nothing with the setting off, and asks no capability")
+        sub _()
+            probe = m.player()
+            probe.callFunc("showPage", m.page())
+            tests.scene.answer(tests.scene.last("/api/v2/settings/values/effective"), m.settings(false, true))
+            m.assertEqual(tests.scene.paths(), ["/api/v2/settings/values/effective"])
+            m.assertInvalid(probe.callFunc("probeAudioNode"))
+        end sub
+
+        @it("stops under another screen and under the player, and starts again from the beginning when its page is back on top")
+        sub _()
+            probe = m.asked(true)
+            m.grant()
+            audio = probe.callFunc("probeAudioNode")
+            m.assertTrue(audio.loop, "an original theme loops in place")
+            probe.callFunc("probeAudio", "playing")
+            probe.callFunc("navigated", { id: "e3", route: "person" })
+            m.assertInvalid(probe.callFunc("probeAudioNode"))
+            m.assertEqual(audio.control, "stop")
+            m.assertEqual(m.phase(probe), "idle")
+            probe.callFunc("navigated", { id: "e2", route: "detail" })
+            m.assertEqual(m.phase(probe), "granting")
+            m.assertEqual(m.count("/api/v2/catalog/items/movie:heat-1995/themes/7/playback"), 2, "back from the person page: a fresh grant")
+            m.grant()
+            audio = probe.callFunc("probeAudioNode")
+            probe.callFunc("navigated", { id: "e4", route: "player" })
+            m.assertInvalid(probe.callFunc("probeAudioNode"))
+            m.assertEqual(audio.control, "stop")
+            m.assertEqual(m.phase(probe), "idle")
+            probe.callFunc("navigated", { id: "e2", route: "detail" })
+            m.assertEqual(m.count("/api/v2/catalog/items/movie:heat-1995/themes/7/playback"), 3, "back from the player: a fresh grant")
+        end sub
+
+        @it("plays a finished theme again when its page is back on top after another screen")
+        sub _()
+            probe = m.asked()
+            m.grant()
+            probe.callFunc("probeAudio", "playing")
+            probe.callFunc("probeAudio", "finished")
+            m.assertTrue(probe.callFunc("inspect").state.finished)
+            probe.callFunc("showPage", m.page())
+            m.assertEqual(m.count("/api/v2/catalog/items/movie:heat-1995/themes/7/playback"), 1, "staying on the page: silent")
+            probe.callFunc("navigated", { id: "e3", route: "person" })
+            probe.callFunc("navigated", { id: "e2", route: "detail" })
+            m.assertEqual(m.count("/api/v2/catalog/items/movie:heat-1995/themes/7/playback"), 2, "shown again: it plays again, as on tvOS")
+        end sub
+
+        @it("stops when its page goes and when the profile changes")
+        sub _()
+            probe = m.asked()
+            m.grant()
+            probe.callFunc("leavePage", "e9")
+            m.assertNotInvalid(probe.callFunc("probeAudioNode"), "another page's leave changes nothing")
+            probe.callFunc("leavePage", "e2")
+            m.assertInvalid(probe.callFunc("probeAudioNode"))
+            probe = m.asked()
+            m.grant()
+            probe.probeKey = "https://silo.example|p2"
+            probe.callFunc("sessionChanged")
+            m.assertInvalid(probe.callFunc("probeAudioNode"))
+            m.assertInvalid(probe.callFunc("inspect").setting, "the old profile's answers are gone")
+            probe.probeKey = ""
+            probe.callFunc("sessionChanged")
+            m.assertEqual(m.phase(probe), "idle")
+        end sub
+
+        @describe("answers out of order")
+
+        @it("drops a grant that lands after its page went, or after a newer theme")
+        sub _()
+            probe = m.asked()
+            entry = tests.scene.last("/api/v2/catalog/items/movie:heat-1995/themes/7/playback")
+            probe.callFunc("leavePage", "e2")
+            m.assertTrue(util.contains(m.top.callFunc("sceneLog").cancelled, entry.request.requestId), "the grant is cancelled")
+            entry.request.map.origin = "https://silo.example"
+            tests.scene.answer(entry, tests.catalogData.fixture("theme_songs_playback"))
+            m.assertInvalid(probe.callFunc("probeAudioNode"))
+            probe = m.asked()
+            first = tests.scene.last("/api/v2/catalog/items/movie:heat-1995/themes/7/playback")
+            probe.callFunc("showPage", m.page({ theme: { ownerId: "movie:other", themeId: "3" } }))
+            first.request.map.origin = "https://silo.example"
+            tests.scene.answer(first, tests.catalogData.fixture("theme_songs_playback"))
+            m.assertInvalid(probe.callFunc("probeAudioNode"), "the first theme's grant is dropped")
+            m.assertEqual(m.phase(probe), "granting")
+        end sub
+
+        @it("drops a setting read that another profile's, or a newer Settings value, overtook")
+        sub _()
+            probe = m.player()
+            probe.callFunc("showPage", m.page())
+            old = tests.scene.last("/api/v2/settings/values/effective")
+            probe.probeKey = "https://silo.example|p2"
+            probe.callFunc("sessionChanged")
+            pending = tests.scene.last("/api/v2/settings/values/effective")
+            m.assertFalse(pending.handle.isSameNode(old.handle), "p2 asks for its own")
+            tests.scene.answer(old, m.settings(true))
+            m.assertInvalid(probe.callFunc("inspect").setting, "p1's answer is not p2's")
+            probe.callFunc("settingChanged", { enabled: false, loop: false })
+            tests.scene.answer(pending, m.settings(true))
+            m.assertFalse(probe.callFunc("inspect").setting.enabled, "Settings' value, read later, wins")
+            m.assertEqual(m.count("/api/v2/catalog/themes/capabilities"), 0)
+        end sub
+
+        @it("counts a failed read as an answer for 60 seconds, then asks again")
+        sub _()
+            probe = m.player()
+            probe.callFunc("showPage", m.page())
+            tests.scene.fail(tests.scene.last("/api/v2/settings/values/effective"))
+            m.assertFalse(probe.callFunc("inspect").setting.enabled)
+            probe.callFunc("showPage", m.page())
+            m.assertEqual(m.count("/api/v2/settings/values/effective"), 1, "not asked again at once")
+            probe.callFunc("probeClock", 60)
+            probe.callFunc("showPage", m.page())
+            m.assertEqual(m.count("/api/v2/settings/values/effective"), 2)
+            tests.scene.answer(tests.scene.last("/api/v2/settings/values/effective"), m.settings(true))
+            tests.scene.fail(tests.scene.last("/api/v2/catalog/themes/capabilities"))
+            m.assertFalse(probe.callFunc("inspect").capability.available)
+            m.assertEqual(m.count("/api/v2/catalog/items/movie:heat-1995/themes/7/playback"), 0)
+        end sub
+
+        @it("reads the selected season's set and plays its own theme, keeping the series' while it reads")
+        sub _()
+            probe = m.asked()
+            m.grant()
+            probe.callFunc("showPage", m.page({ seasonId: "season:s2" }))
+            season = tests.scene.last("/api/v2/catalog/items/season:s2")
+            m.assertNotInvalid(season)
+            m.assertEqual(m.phase(probe), "playing", "this page's theme plays on meanwhile")
+            tests.scene.answer(season, { content_id: "season:s2", type: "season", themes: { owner_id: "season:s2", items: [{ id: "4", title: "S2", duration_seconds: 30, container: "mp3" }] } })
+            m.assertNotInvalid(tests.scene.last("/api/v2/catalog/items/season:s2/themes/4/playback"))
+            probe.callFunc("showPage", m.page({ seasonId: "season:s2" }))
+            m.assertEqual(m.count("/api/v2/catalog/items/season:s2"), 1, "a season is read once")
+        end sub
+    end class
+end namespace

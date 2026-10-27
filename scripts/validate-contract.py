@@ -4,7 +4,8 @@ History page's removal body, against the server contract.
 
 Every tests/fixtures/golden/<kind>/*.json must be a valid body of its kind
 (GOLDEN below: start, replan, progress, stop, route-event, and
-history-remove, which is checked against its schema only), checked three ways:
+history-remove and theme-playback, which are checked against their schemas
+only), checked three ways:
 
 1. The vendored schema subset (tests/fixtures/openapi/playback-v3.json, from
    scripts/sync-fixtures.sh): required members, additionalProperties, types,
@@ -53,6 +54,8 @@ GOLDEN = {
     # The History page's removal (catalog.personal.removeHistory): the schema
     # alone, as the server adds no rule beyond it.
     "history-remove": "HistoryRemoveInputBody",
+    # A theme's playback grant request (playback.themeMusic.grantRequest).
+    "theme-playback": "ThemePlaybackRequest",
 }
 PLAYBACK = {"start", "replan", "progress", "stop", "route-event"}
 REQUESTS = {
@@ -61,6 +64,7 @@ REQUESTS = {
     "updatePlaybackProgress": "PlaybackProgressBody",
     "stopPlayback": "PlaybackStopBody",
     "reportPlaybackRouteEvent": "PlaybackRouteEventBody",
+    "createThemeSongPlayback": "ThemePlaybackRequest",
 }
 # Keywords the walker checks, and ones that only document a schema (format
 # adds nothing here: every int64 and double member also has a type).
