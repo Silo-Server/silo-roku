@@ -782,6 +782,9 @@ their existing HD/FHD assets.
     series Mark Series Watched or Unwatched, Mark Season Watched or
     Unwatched for the season shown, and Mark Episode Watched or Unwatched
     for the episode Play plays (5.9). The menu holds nothing else (5.9).
+    Each row does what it said when the menu opened, even if a read that
+    lands while it is open, such as the seasons read after a mark, turns
+    the state it names.
   - The flags come from the item's `user_state` (`in_watchlist`,
     `is_favorite`) and watched state (`user_data.played`, a season's counts
     of unplayed and watched episodes, an episode card's `played`). A change
@@ -816,7 +819,8 @@ their existing HD/FHD assets.
     open on the same item, such as the item opened again before the write
     landed, shows a Watchlist or Favorites change as applied, unless a
     write of its own for it is out, and reads again what a watched change
-    moves.
+    moves. While its own write is out, the other page's applied change
+    becomes what a refusal of that write puts back.
 - **Version, audio, and subtitles.** As tvOS ships them (D1; silo-apple
   `b90a86ea`, `TVPlaybackSelectorRow.swift` and `TVDetailHero.swift`; the
   design spec's squared selector row with an Edition selector was not

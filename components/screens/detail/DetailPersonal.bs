@@ -30,6 +30,8 @@ sub initPersonal()
     ' Changes other pages sent that landed while the item was being read
     ' (onPersonalChange), which the item read may predate.
     m.otherChanges = []
+    ' More's state as its menu last opened (moreState).
+    m.moreOffered = invalid
 end sub
 
 ' On the page's first show: the capability as the shell under the page
@@ -84,6 +86,9 @@ sub openMore()
     for each row in catalog.personal.moreRows(moreState())
         items.Push({ value: row.value, title: i18n.text(row.key), detail: "" })
     end for
+    ' What the menu offers, which its rows do even if a read changes the
+    ' page while it is open.
+    m.moreOffered = moreState()
     m.pickerKey = catalog.action.MORE
     m.picker.setFields({ title: i18n.text("detail.more"), options: { items: items }, chosen: -1 })
     showPicker()
@@ -122,32 +127,39 @@ function activeEpisode() as Dynamic
     return card
 end function
 
+' A row does what it said when the menu opened (m.moreOffered), as a read
+' landing meanwhile, such as the series' seasons after a mark, may have
+' turned the state it would read now.
 sub onMorePicked(value as Integer)
-    if m.detail = invalid then return
+    if m.detail = invalid or m.moreOffered = invalid then return
+    offered = m.moreOffered
     if value = catalog.more.FAVORITE
         if not util.isTrue(m.lists) then return
-        requested = not m.detail.isFavorite
+        requested = not offered.isFavorite
+        before = m.detail.isFavorite
         m.detail.isFavorite = requested
-        sendChange({ kind: catalog.personal.FAVORITES, id: m.detail.id, value: requested }, not requested, catalog.personal.membership(catalog.personal.FAVORITES, m.detail.id, requested))
+        sendChange({ kind: catalog.personal.FAVORITES, id: m.detail.id, value: requested }, before, catalog.personal.membership(catalog.personal.FAVORITES, m.detail.id, requested))
     else if value = catalog.more.WATCHED
-        requested = not moreState().played
+        requested = not offered.played
+        before = moreState().played
         m.detail.played = requested
         watch = currentWatch()
         if watch <> invalid and not m.series then watch.played = requested
-        markWatched("item", m.detail.id, requested, -1, not requested)
+        markWatched("item", m.detail.id, requested, -1, before)
     else if value = catalog.more.SEASON_WATCHED
         position = m.seasonIndex
         if position < 0 or position >= m.seasonRollups.Count() then return
-        requested = not catalog.personal.seasonPlayed(m.seasonRollups[position])
+        requested = not offered.seasonPlayed
         previous = m.seasonRollups[position]
         m.seasonRollups[position] = catalog.personal.markedRollup(previous, requested)
         markWatched("season", m.seasonNodes[position].id, requested, position, previous, m.seasonRollups[position])
     else if value = catalog.more.EPISODE_WATCHED
         card = activeEpisode()
         if card = invalid then return
-        requested = not card.played
+        requested = not offered.episodePlayed
+        before = card.played
         card.played = requested
-        markWatched("episode", card.id, requested, positionOf(card.seasonNumber), not requested)
+        markWatched("episode", card.id, requested, positionOf(card.seasonNumber), before)
     end if
 end sub
 
@@ -242,11 +254,7 @@ sub personalWritten(change as Object, result as Object)
         return
     end if
     if entry <> invalid
-        if change.what = "season"
-            entry.confirmed = change.shown
-        else
-            entry.confirmed = change.value
-        end if
+        confirm(entry, change)
         entry.applied = not last
     end if
     if change.kind = "watched" then m.marks = m.marks + 1
@@ -258,8 +266,19 @@ end sub
 ' for this item, such as a page of it the viewer left before its write
 ' landed, may postdate what this page read. A Watchlist or Favorites change
 ' shows as the server applied it, unless this page has a write of its own
-' for it out, which decides; a watched one reads again what it moves, as
-' playback does. One landing while the item is read waits for it.
+' for it out, which decides what shows while the change becomes what a
+' refusal of that write puts back (heldElsewhere); a watched one reads
+' again what it moves, as playback does. One landing while the item is
+' read waits for it.
+' The server applied change: what a refused write for it puts back.
+sub confirm(entry as Object, change as Object)
+    if change.what = "season"
+        entry.confirmed = change.shown
+    else
+        entry.confirmed = change.value
+    end if
+end sub
+
 function onPersonalChange(event as Object) as Boolean
     if m.released or util.text(event.sender) = m.top.owner or not util.isObject(event.change) then return true
     if m.detail = invalid
@@ -281,7 +300,7 @@ end sub
 
 sub otherChange(change as Object)
     if change.kind = catalog.personal.WATCHLIST or change.kind = catalog.personal.FAVORITES
-        if change.id <> m.detail.id or heldBack(change.kind, "", change.id) then return
+        if change.id <> m.detail.id or heldElsewhere(change) then return
         if change.kind = catalog.personal.WATCHLIST
             m.detail.inWatchlist = change.value
         else
@@ -293,9 +312,21 @@ sub otherChange(change as Object)
     if change.kind <> "watched" or util.text(change.item) <> m.detail.id then return
     ' A first read out now may predate it (markedSince).
     m.marks = m.marks + 1
-    if not m.series and change.what = "item" and not heldBack("watched", "item", m.detail.id) then m.detail.played = change.value
+    held = heldElsewhere(change)
+    if not m.series and change.what = "item" and not held then m.detail.played = change.value
     afterWatched({ kind: "watched", what: "item", id: m.detail.id, value: change.value }, false)
 end sub
+
+' Whether this page has a write of its own out for a change another page
+' sent (heldBack), which keeps what the page shows; the server applied the
+' other page's, so a refusal of this page's last write puts that back.
+function heldElsewhere(change as Object) as Boolean
+    entry = m.writes[personalKey(change)]
+    if entry = invalid or entry.pending <= 0 then return false
+    confirm(entry, change)
+    entry.stale = true
+    return true
+end function
 
 ' Puts back what the server last confirmed for a refused change (value: a
 ' flag, or a season's rollup), while the page still shows its item.

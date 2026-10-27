@@ -52,11 +52,12 @@ SHARDS = [
     ("catalog", ["catalog", "views/detailPersonalBack.spec.bs", "views/detailExtras.spec.bs"]),
     ("playback", ["playback"]),
     ("player-captions", ["player/captions.spec.bs"]),
+    ("detail-personal", ["views/detailPersonal.spec.bs"]),
     ("player-sidecars", ["player/captionSidecars.spec.bs", "api", "deeplink", "dev", "memory", "nav", "platform"]),
     ("detail", ["views/detailScreen.spec.bs", "onboarding", "storage", "theme", "util", "smoke.spec.bs"]),
     ("detail-tracks", ["views/detailTracks.spec.bs", "auth", "control"]),
     ("views", ["views"]),
-    ("player", ["player", "views/detailPersonal.spec.bs"]),
+    ("player", ["player"]),
     ("screens", ["home", "library", "people", "personal", "search", "settings"]),
 ]
 
