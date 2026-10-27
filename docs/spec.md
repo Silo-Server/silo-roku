@@ -183,9 +183,6 @@ Planned:
 - a sleep timer in the video player (Android TV; tvOS sets one only in its
   audio player);
 - episode spoiler hiding (tvOS, Android TV);
-- the buffering-quality pill and its prompts, with
-  `playback.buffering_quality_mode` (the pill on tvOS and Android TV; the
-  mode setting on Android TV);
 - the marker on AI-translated subtitle tracks (Android TV);
 - subtitle search and download (tvOS, Android TV);
 - multiple saved Silo servers, with Switch Server (tvOS, Android TV);
@@ -1217,7 +1214,20 @@ Subtitles tab (criterion 4.8).
     continue where you left off."
   - Notices draw over the Options panel. The busy capsule moves to y 560
     while Options is open.
-  - The buffering-quality pill and its prompts are deferred (section 3.3).
+  - The buffering card follows tvOS's (`TVBufferingQualityPill`): a glass
+    card at the top right, at y 140, below any notice. The prompt reads
+    "Playback keeps buffering" over "Try a lower quality to keep watching",
+    with Lower quality and Keep quality; the undo card reads "Quality
+    lowered to stop buffering" with Restore quality. A 4 px track along its
+    bottom drains over 15 s and stands still while paused. Skip Intro, Skip
+    Recap, Up Next, Options, and the error screen hold it back with its time
+    left. With the controls hidden, OK presses the lit capsule and Left and
+    Right move between the prompt's two; with them shown, the card takes
+    focus as it appears and Down returns to the scrubber. Back on the
+    prompt keeps the quality and on the undo card only hides it, after a
+    pending seek and before Skip Intro. "Quality lowered to stop buffering"
+    and "Can't lower quality for this video" show as information notices
+    for 5 s (section 9.7).
 - **Options panel.**
   - Tabs: pills above the panel, centred at y 92, 12 px apart, 22 px
     SemiBold, about 46 px tall. The active tab is white with black text, and
@@ -1557,9 +1567,16 @@ seven-row scrolling window.
   Theme Music, when the server offers theme music
   (`GET /api/v2/catalog/themes/capabilities`), each written for this Roku
   (`profile_device`) as tvOS writes them, with Use profile setting.
-- Playback: Resolution, Maximum Bitrate, Audio Language, Auto-Play Next
-  Episode, Skip Intros, Skip Credits, Auto-Skip Recaps, Skip Back, and Skip
-  Forward.
+- Playback: Resolution, Maximum Bitrate, Lower Quality When Buffering
+  (where the server's contract lists `playback.buffering_quality_mode`),
+  Audio Language, Auto-Play Next Episode, Skip Intros, Skip Credits,
+  Auto-Skip Recaps, Skip Back, and Skip Forward; then a Connection section,
+  where the server has it: the learned limit ("Limited to 44 Mbps after
+  buffering on Oct 17") with Reset, hidden in Never, and Connection Speed
+  ("48 Mbps · measured 3 minutes ago on Ethernet"), where OK runs Test speed
+  and the footer gives the Auto budget, "Try again in N seconds" after a
+  429, and a failed test, save, or reset (`docs/buffering-quality.md`
+  section 5.5).
 - Subtitles: Language, Behavior, and Show Forced Subtitles. A footer points
   to Roku's caption visibility and appearance controls.
 - Server: the connected server address and Change Server; app version is
@@ -1731,7 +1748,9 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Play Theme Music and Loop Theme Music show whenever the server knows the settings, and Loop is disabled while Play is off | Both show only when `GET /api/v2/catalog/themes/capabilities` answers available, and Loop can be set while Play is off; each also offers Use profile setting | Section 3.3: Settings shows only what the client can use here, and Roku's Settings rows have no disabled state (assumption AG-364) |
 | Watchlist and Favorites always show (neither tvOS nor Android TV reads a capability) | They show only when `GET /api/v2/capabilities/personal-lists` answers `available` and `allowed`: the avatar rows, the Watchlist button, and More's Favorites row | The phase gates them on the server's capability (assumption AG-323); an older server without the document hides them |
 | A refused change shows the alert "Couldn't Update Item" / "Your change wasn't saved. Please try again."; an unanswered one is held until the viewer discards it | The change goes back and "Couldn't update item. Your change wasn't saved." shows top centre for four seconds; an unanswered write counts as refused and nothing is held | Roku's passive notice line needs no focus; no held-change list is kept (assumption AG-326) |
-| People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| The connection speed test times one streamed download in 500 ms windows, following the probe's redirect without credentials | Back-to-back chunks, each timed whole and spread over the windows, which reads low by the gaps; only against a server with `bandwidth_probe_location_v1`, whose credential-free URL is fetched without the redirect | Roku shows no bytes inside a transfer, and forwards profile headers across a redirect (assumptions AG-391 and A-14) |
+| Buffering is told from a slow device by the buffered duration, and plan summaries survive the app's exit | No renderer waits; a progressive plan measures no throughput, so it lowers before its first frame only on its 20 s deadline's failure path; a plan the Home button ends sends no summary; no foreground check | Roku reports only a fill percentage and segment downloads, and gives a channel no exit callback or background state (AG-390, AG-391; Android TV keeps no exit journal either) |
+| People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
 
 ## 6. Application architecture
 
@@ -2504,41 +2523,40 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   checks Auto only under an Auto preference; a saved resolution the plan
   reports no rung for checks no row and names itself on the Quality row
   (5.7).
-- With Auto selected, sustained buffering after a load's first frame steps
-  the quality down (implementation plan section 6.7). A load's own start
-  never counts: a plan's, or a reload of a plan already playing (a reopen or
-  a credential renewal, section 9.4), and neither does stall time in the ten
-  seconds after either's first frame (hardware run 9). Buffering under way
-  when a load fails or a reload replaces it is the failure's, not a
-  bandwidth shortage, so it never counts, and Auto makes no decision until
-  the replacement plays, however long its headers or the old content's
-  stop take; stalls recorded earlier still count.
-- Only a rebuffer that media still reaches is a bandwidth shortage. Its
-  stall time counts from the first media to arrive in it to the latest: a
-  `bufferingStatus.percentage` above the rebuffer's previous reading, a
-  downloaded segment, or the node playing again. The rebuffer's first
-  reading only says where the buffer stands. A rebuffer that nothing
-  reaches is an outage: Auto never steps down on it, and the stall timeout
-  and the reconnect (section 9.6) handle it. Hardware run 15 cut an
-  original's connection; Roku played 88 s from its buffer, rebuffered with
-  its reading held at 2%, and the client stepped down to a transcode six
-  seconds in, with an estimate the reconnect and Retry then carried.
-- An estimate no media has followed (no rising reading, segment, or load
-  playing since it was taken) may have been measured across an outage. It
-  is discarded when one begins (the reconnect's first drop, a stall
-  timeout with nothing arriving, or an unreachable server): later replans,
-  reconnects, starts, and Retry carry the estimate before it, or none, and
-  its step down holds nothing off. A `quality_change` already sent keeps
-  its body when it is replayed.
-- A step down the server refuses leaves the plan playing without a notice,
-  since the viewer asked for nothing. Its estimate is dropped for the one
-  before it, and Auto judges the plan again from a fresh stall history once
-  a hold ends: five minutes, doubling with each refusal in a row until a
-  plan starts, up to 30 minutes. This holds when the plan of a request
-  queued ahead of it starts first, and Auto asks no other step down until
-  it is answered. A step down that another request
-  replaces or keeps out of the queue, or that an error leaves unsent, is
-  dropped the same way, without a hold.
+- Lowering quality when playback keeps buffering follows the shared Silo
+  design every client runs (silo-server
+  `docs/design/2026-10-17-buffering-quality.md`), with the Roku specifics in
+  `docs/buffering-quality.md`. `playback.bufferingQuality` is the shared
+  controller and replays the vendored vectors
+  (`tests/fixtures/buffering-quality/vectors.json`); `playback.buffering`
+  turns the Video node's reports into its events. On Auto in Automatically
+  (the default), two counted stalls within two minutes or one of 6 s, after
+  a plan's 10 s grace, send a `quality_change` with `floor(delivered × 7 /
+  10)` as `observed_rebuffer`, then the undo card; a quality the viewer
+  picked, or Ask first, gets the prompt; Never only reports.
+- A wait is an outage, never a stall, while no media arrives: no
+  `bufferingStatus.percentage` above the wait's last reading and no
+  downloaded segment for 4 s on a progressive plan, 15 s on HLS, counted
+  from the wait's start, and for a reconnect from its start until a load
+  plays. Hardware run 15's cut original, its reading held at 2%, is an
+  outage and never steps down. Buffering after the session's own seek is
+  the seek's, a load of a plan that has played is a source reload, and
+  neither counts; a reload has no grace of its own. Roku reports no
+  buffered duration, so no wait is taken for the renderer's
+  (`docs/buffering-quality.md` section 5.2).
+- The session never queues a lowering behind a start or replan in flight;
+  the controller watches the plan again a minute later. After a lowering,
+  the client's own Auto replans repeat its estimate without a source until
+  Restore quality, a quality change, or a new attempt (Retry, a restart),
+  whose starts carry the connection's speed reading instead and the server
+  plans under its learned limit. Restore quality sends `learned_limit:
+  "clear"`, owed to the next request when another replaces it; Never sends
+  `"ignore"` on every request. A start that has not played lowers at its
+  20 s deadline only when its segments arrived more slowly than it plays;
+  otherwise, and on a second 20 s, the failure path runs.
+- `buffering_quality_v1` and its fields go only to a server that
+  advertises it, and `plan_summary` only to one with
+  `playback_plan_summary_v1`.
 - Audio and subtitle selection send `selected_tracks.audio` or
   `selected_tracks.subtitle` as `{id, index}` in a `track_change` replan. `id`
   is the inventory's track identity and is required; `index` is sent only when

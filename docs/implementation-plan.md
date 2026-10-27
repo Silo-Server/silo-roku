@@ -768,13 +768,12 @@ decisions, following protocol section 5 and each returned plan's `timeline`:
   `max_channels` change. The chain starts empty with a plan that has played past
   its first frame, and every intent replan starts a new chain. Reducer cases cover Auto → explicit quality →
   Auto and an output change that returns the same key.
-- **Auto quality:** a transcode is a single rendition the player cannot step
-  down on its own. With Auto selected, the client keeps a bounded stall history
-  that separates outages and seeks from bandwidth shortage; after sustained
-  buffering it sends a `quality_change` replan with a measured, lower
-  `bandwidth_estimate_kbps`, with hysteresis before stepping again. An explicit
-  quality choice is never overridden. The reducer is tested with injected stall
-  histories in Milestone 0a; H18 tests it on hardware.
+- **Auto quality:** the shared buffering-quality controller
+  (`playback.bufferingQuality`, silo-server
+  `docs/design/2026-10-17-buffering-quality.md`) replaced the Roku-only
+  reducer; `docs/buffering-quality.md` is the Roku design and spec section
+  9.7 the behaviour. It replays the shared vectors headless; H18 tests it on
+  hardware, with the connection speed test.
 - One recovery runs at a time; a newer user intent replaces a queued one.
 
 ### 6.8 Subtitles

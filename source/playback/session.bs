@@ -3,7 +3,8 @@ import "pkg:/source/playback/values.bs"
 import "pkg:/source/playback/results.bs"
 import "pkg:/source/playback/seek.bs"
 import "pkg:/source/playback/recovery.bs"
-import "pkg:/source/playback/autoQuality.bs"
+import "pkg:/source/playback/capabilities.bs"
+import "pkg:/source/playback/buffering.bs"
 import "pkg:/source/playback/jobs.bs"
 import "pkg:/source/playback/sidecars.bs"
 import "pkg:/source/playback/intent.bs"
@@ -115,7 +116,10 @@ namespace playback.session
             ' invalid for no cap: every start and replan sends it, since a
             ' replan without it lifts the cap (spec section 8.5).
             bandwidthCap: invalid,
-            auto: playback.autoQuality.create(),
+            ' Lowering quality when playback keeps buffering
+            ' (playback.buffering): the title's controller, which every
+            ' attempt of the title shares.
+            buffering: playback.buffering.create(util.text(context.bufferingMode)),
             attempt: invalid,
             plan: invalid,
             player: newPlayer(0),
@@ -173,6 +177,21 @@ namespace playback.session
             onRetry(state, env, out)
         else if t = "unplayable"
             onUnplayable(state, event, env, out)
+        else if t = "bufferingMode"
+            ' The profile's playback.buffering_quality_mode, read after the
+            ' start. Never hides a card without an output.
+            playback.buffering.setMode(state.buffering, event.mode)
+            out.Push({ type: "bufferingPill", pill: playback.bufferingQuality.pill(state.buffering.controller, Int(env.now())) })
+        else if t = "bufferingAnswer"
+            ' {answer}: select_lower, select_keep, select_restore, or back on
+            ' the buffering card.
+            if state.phase = "active" then apply(state, playback.buffering.feed(state.buffering, { type: event.answer }, env.now()), env, out)
+        else if t = "bufferingObscured"
+            ' {obscured}: a pill that outranks the buffering card, or a panel
+            ' that covers it, appeared or the last one went.
+            name = "pill_unobscured"
+            if util.isTrue(event.obscured) then name = "pill_obscured"
+            if state.phase = "active" then apply(state, playback.buffering.feed(state.buffering, { type: name }, env.now()), env, out)
         else if isCurrentLoad(state, event)
             ' The node reports only on content assigned to it.
             if t = "assigned" or t = "player" or t = "position" or t = "input" then contentAssigned(state, env)
@@ -185,7 +204,7 @@ namespace playback.session
                 ' percent) or a downloaded segment (no buffer).
                 if not util.isNumber(event.buffer) or event.buffer > 0 then state.plan.loadMedia = true
                 playback.recovery.noteMedia(state.stall, event.buffer, waitingForMedia(state), env.now())
-                playback.autoQuality.noteMedia(state.auto, env.now(), event.buffer)
+                apply(state, playback.buffering.media(state.buffering, event, env.now()), env, out)
             else if t = "credentials"
                 onCredentials(state, event)
             else if t = "subtitleReady"
@@ -202,8 +221,8 @@ namespace playback.session
     end function
 
     ' The next time the host should send {type: "wake"}, or invalid: a retry,
-    ' an outage's next try or its end, a merged skip, the stall clock, an
-    ' Auto quality check, or the credential's renewal. epoch is the
+    ' an outage's next try or its end, a merged skip, the stall clock, the
+    ' buffering controller's next timer, or the credential's renewal. epoch is the
     ' device's wall clock in seconds (env.epoch()), for the last.
     function nextWake(state as Object, now as Dynamic, epoch = invalid as Dynamic) as Dynamic
         wake = invalid
@@ -214,7 +233,7 @@ namespace playback.session
         end if
         wake = earliest(wake, state.skips.at)
         if stallClockRunning(state) then wake = earliest(wake, playback.recovery.stallDeadline(state.stall))
-        if state.phase = "active" then wake = earliest(wake, playback.autoQuality.wakeAt(state.auto, now))
+        if state.phase = "active" then wake = earliest(wake, playback.buffering.nextWake(state.buffering))
         if util.isNumber(epoch) and renewalWaits(state)
             delay = (renewalTime(state.plan) - epoch) * 1000
             if delay < 0 then delay = 0
@@ -277,6 +296,9 @@ namespace playback.session
         if util.isNumber(event.bandwidthCapKbps) and event.bandwidthCapKbps > 0 then state.bandwidthCap = Int(event.bandwidthCapKbps)
         request = { rank: RANK_PLAY, op: "play", intent: event.intent, quality: quality, autoplay: util.isTrue(event.autoplay), catalogRuntime: event.catalogRuntime, restarts: 0, requestedAt: invalid }
         if util.isNumber(event.startPosition) then request.startPosition = event.startPosition
+        ' The connection's speed reading (playback.connection.freshEstimate),
+        ' which an Auto start sends as a probe estimate.
+        if util.isNumber(event.estimate) then request.estimate = Int(event.estimate)
         if not request.autoplay then request.requestedAt = env.now()
         submit(state, request, env, out)
     end sub
@@ -334,11 +356,17 @@ namespace playback.session
     end sub
 
     ' {quality}: "auto" or a label from available_qualities. During a start it
-    ' waits for the plan.
+    ' waits for the plan. It is the viewer's pick: a buffering card hides as
+    ' it is sent, and the controller waits for its plan (pick_sent).
     sub onQualityChange(state as Object, event as Object, env as Object, out as Object)
         state.quality = event.quality
-        playback.autoQuality.setQuality(state.auto, event.quality)
-        if state.phase = "active" or state.phase = "starting" then submit(state, { rank: RANK_INTENT, op: "quality_change" }, env, out)
+        if state.phase = "active"
+            state.buffering.pick = true
+            submit(state, { rank: RANK_INTENT, op: "quality_change", pick: true, quality: event.quality }, env, out)
+            if state.buffering.pick then apply(state, playback.buffering.feed(state.buffering, { type: "pick_sent" }, env.now()), env, out)
+        else if state.phase = "starting"
+            submit(state, { rank: RANK_INTENT, op: "quality_change", quality: event.quality }, env, out)
+        end if
     end sub
 
     ' {outputContextId}: the normalized output context after a re-probe.
@@ -381,6 +409,9 @@ namespace playback.session
         request = state.resume
         state.resume = invalid
         request.requestedAt = env.now()
+        ' A new attempt of the same title: the controller keeps the viewer's
+        ' answer, and drops its kept estimate.
+        apply(state, playback.buffering.feed(state.buffering, { type: "new_attempt" }, env.now()), env, out)
         request.Delete("playIntent")
         submit(state, request, env, out)
     end sub
@@ -418,7 +449,7 @@ namespace playback.session
             ' A newer play waited for this start: it replaces this attempt, and
             ' stops the session if there is one, before anything opens.
         else if playable
-            adopt(state, decision.playback_plan, "start", env, out)
+            adopt(state, decision.playback_plan, "start", mutation.command, env, out)
         else if kind = "ok"
             terminal = decisionTerminal(decision)
             out.Push(routeEvent(state, env, "terminal", {}))
@@ -477,7 +508,7 @@ namespace playback.session
                     out.Push(refusalLog(state, decision.playback_plan, refusals, env))
                 end if
             end if
-            adopt(state, decision.playback_plan, how, env, out)
+            adopt(state, decision.playback_plan, how, request, env, out)
         else if kind = "ok"
             terminal = decisionTerminal(decision)
             if request.op = "seek_reanchor"
@@ -502,12 +533,14 @@ namespace playback.session
         else
             ' A refused intent keeps the current plan playing, and the
             ' player tells the viewer (run 6 refused an audio change in
-            ' silence). Auto's own step down was no viewer's request: it
-            ' says nothing, and Auto judges the plan again after a hold.
+            ' silence). The buffering controller's own lowering was no
+            ' viewer's request: it says nothing, and the controller watches
+            ' the plan again after its rearm.
             out.Push({ type: "log", level: "warn", message: "replan refused", fields: { operation: request.op, kind: kind } })
-            if isStepDown(request)
-                playback.autoQuality.refused(state.auto, env.now(), request.askedAt)
+            if util.isTrue(request.buffering)
+                apply(state, playback.buffering.feed(state.buffering, { type: "replan_failed" }, env.now()), env, out)
             else
+                if util.isTrue(request.pick) then unpicked(state, env, out)
                 out.Push({ type: "refused", operation: request.op })
             end if
             if request.op = "track_change" then dropRefusedTracks(state, request)
@@ -619,12 +652,7 @@ namespace playback.session
     sub onPlayer(state as Object, event as Object, env as Object, out as Object)
         now = env.now()
         p = state.player
-        if event.state = "playing" and p.state <> "paused"
-            ' Out of buffering, or a load's start: media reached the node.
-            playback.autoQuality.played(state.auto, now)
-        else if p.state = "buffering" and event.state <> "buffering"
-            playback.autoQuality.bufferingEnded(state.auto, now)
-        end if
+        noteBuffering(state, event.state, env, out)
         if event.state = "buffering" and p.state <> "buffering" and state.plan.loadPlayed then playback.recovery.rebufferStarted(state.stall)
         p.state = event.state
         plan = state.plan
@@ -636,9 +664,6 @@ namespace playback.session
             if plan.seekBack <> invalid and plan.seekBack.buffered then plan.seekBack.resumed = true
             if not plan.loadPlayed
                 if isHls(plan.data) and util.isNumber(plan.loadStart) then plan.startCheck = { at: now }
-                ' A reload of a plan that has played starts Auto's grace
-                ' again, as the plan's first frame does.
-                if plan.firstFrame then playback.autoQuality.loadStarted(state.auto, now)
             end if
             plan.loadPlayed = true
             plan.loadMedia = true
@@ -651,14 +676,6 @@ namespace playback.session
         else if event.state = "buffering"
             ' The seek back's own rebuffering, once it has been sent.
             if plan.seekBack <> invalid then plan.seekBack.buffered = true
-            ' A load buffers until its first frame: a plan's start, or a
-            ' reload of it (a reopen or a credential renewal), which is
-            ' never a bandwidth stall (hardware run 9, T1b).
-            cause = "stall"
-            if p.seeking then cause = "seek"
-            if not plan.loadPlayed then cause = "reload"
-            if not state.reachable then cause = "outage"
-            playback.autoQuality.bufferingStarted(state.auto, now, cause)
             ' Content whose credential has expired buffers because its
             ' requests are refused: a progressive original's range request
             ' answered 401 reports no error, and Roku retries it about 11
@@ -795,7 +812,6 @@ namespace playback.session
             if util.isNumber(a.request.requestedAt) then diagnostics.first_frame_ms = Int(now - a.request.requestedAt).ToStr()
             out.Push(routeEvent(state, env, "first_frame", { diagnostics: diagnostics }))
         end if
-        playback.autoQuality.planStarted(state.auto, now, playback.autoQuality.deliveredKbps(plan.data))
     end sub
 
     ' One failure is handled per load; a reopen starts a new load. A failure
@@ -809,7 +825,6 @@ namespace playback.session
         plan = state.plan
         if plan.failedLoad = plan.load then return
         plan.failedLoad = plan.load
-        playback.autoQuality.loadEnded(state.auto)
         if state.mutation <> invalid
             plan.failure = { kind: kind, message: message }
             if kind = "auth" then oweRenewal(state)
@@ -924,7 +939,9 @@ namespace playback.session
         end if
         if refresh then renewed(state, expiry)
         playback.recovery.restartStall(state.stall, env.now(), invalid)
-        playback.autoQuality.loadEnded(state.auto)
+        ' The source reload begins: its buffering is never a stall, unless
+        ' the attempt has not played, when it is still the start's.
+        if state.attempt.played and state.buffering.phase <> "paused" then apply(state, playback.buffering.waiting(state.buffering, "reload", env.now()), env, out)
         out.Push({ type: "reopen", load: plan.load, playerPosition: playerPosition, autoplay: not state.player.paused, refresh: refresh })
     end sub
 
@@ -1102,8 +1119,7 @@ namespace playback.session
         state.reconnect = { playIntent: not state.player.paused }
         if state.outage <> invalid then return
         state.outage = { startedAt: env.now(), tries: 0, retryAt: invalid }
-        ' Before the first reconnect is built, which carries Auto's estimate.
-        playback.autoQuality.noteOutage(state.auto)
+        apply(state, playback.buffering.reconnect(state.buffering, true, env.now()), env, out)
         out.Push({ type: "reconnecting", active: true })
     end sub
 
@@ -1129,6 +1145,8 @@ namespace playback.session
         state.reconnect = invalid
         if state.outage = invalid then return
         state.outage = invalid
+        ' The playing that ends it ends the controller's outage too.
+        playback.buffering.reconnect(state.buffering, false, 0)
         out.Push({ type: "reconnecting", active: false })
     end sub
 
@@ -1173,6 +1191,7 @@ namespace playback.session
                 return
             end if
             playback.recovery.restartStall(state.stall, env.now(), invalid)
+            apply(state, playback.buffering.sought(state.buffering, env.now()), env, out)
             out.Push({ type: "seek", load: plan.load, playerPosition: decision.position })
         else
             submit(state, { rank: RANK_INTENT, op: "seek_reanchor", position: target }, env, out)
@@ -1186,17 +1205,19 @@ namespace playback.session
         if state.mutation = invalid
             send(state, request, env, out)
         else if state.queued = invalid or request.rank >= state.queued.rank
-            if state.queued <> invalid then discard(state, state.queued)
+            if state.queued <> invalid then discard(state, state.queued, env, out)
             state.queued = request
         else
-            discard(state, request)
+            discard(state, request, env, out)
         end if
     end sub
 
-    ' A request that will not be sent. An Auto step down that never reached
-    ' the server leaves Auto to judge the plan playing again.
-    sub discard(state as Object, request as Object)
-        if isStepDown(request) then playback.autoQuality.unsent(state.auto, request.askedAt)
+    ' A request that will not be sent. A viewer's pick that never reached
+    ' the server is refused to the controller; a Restore quality's
+    ' learned_limit "clear" rides on the next request instead.
+    sub discard(state as Object, request as Object, env = invalid as Dynamic, out = invalid as Dynamic)
+        if util.isTrue(request.buffering) and util.isObject(request.body) and request.body.learned_limit = "clear" then state.buffering.owedClear = true
+        if util.isTrue(request.pick) and env <> invalid then unpicked(state, env, out)
     end sub
 
     sub dispatchQueued(state as Object, env as Object, out as Object)
@@ -1206,7 +1227,7 @@ namespace playback.session
             if request.op = "play" or state.phase = "active"
                 send(state, request, env, out)
             else
-                discard(state, request)
+                discard(state, request, env, out)
             end if
         end while
     end sub
@@ -1256,13 +1277,27 @@ namespace playback.session
         fields.playback_attempt_id = a.id
         fields.replan_request_id = id
         fields.position_seconds = playback.values.roundMs(position)
+        ' A viewer's pick asks for its own quality: a controller lowering
+        ' adopted while it waited set the session's to the lowered one.
+        if op = "quality_change" and not util.isTrue(request.buffering) and playback.values.isText(request.quality) then state.quality = request.quality
         fields.quality_preference = state.quality
         fields.selected_tracks = plan.data.selected_tracks
         if request.tracks <> invalid then fields.selected_tracks = request.tracks
-        estimate = request.estimate
-        if not util.isNumber(estimate) and state.quality = "auto" then estimate = playback.autoQuality.estimate(state.auto, env.now())
-        if util.isNumber(estimate) then fields.bandwidth_estimate_kbps = estimate
+        if util.isTrue(request.buffering)
+            ' The controller's lowering or Restore quality: its own body.
+            fields.Append(request.body)
+            if request.body.bandwidth_estimate_source = "observed_rebuffer"
+                throughput = playback.buffering.throughputKbps(state.buffering)
+                if util.isNumber(throughput) then fields.observed_throughput_kbps = throughput
+            end if
+            playback.buffering.addLearnedLimit(state.buffering, fields)
+        else
+            playback.buffering.addReplanFields(state.buffering, fields, state.quality)
+        end if
         if util.isNumber(state.bandwidthCap) then fields.bandwidth_cap_kbps = state.bandwidthCap
+        playback.capabilities.gateBuffering(fields, serverFeatures(state))
+        playback.buffering.sent(state.buffering, fields)
+        request.sentEstimate = fields.bandwidth_estimate_kbps
 
         ' Seek replans are rebuilt from the server's stored request, so they do
         ' not carry the current output context.
@@ -1272,10 +1307,7 @@ namespace playback.session
     end sub
 
     sub beginAttempt(state as Object, request as Object, env as Object, out as Object)
-        if state.quality <> request.quality or state.auto.quality <> request.quality
-            state.quality = request.quality
-            playback.autoQuality.setQuality(state.auto, request.quality)
-        end if
+        state.quality = request.quality
         id = newId(env)
         identity = state.identity
         fence = { server: identity.server, account: identity.account, profile: identity.profile, attempt: id, session: invalid }
@@ -1309,10 +1341,14 @@ namespace playback.session
         command = { type: "start", fence: playback.values.copy(state.attempt.fence), playback_attempt_id: id, retry: false, intent: request.intent, quality_preference: state.quality, stereoAacRestart: state.attempt.stereoAacRestart, refreshCapabilities: util.isTrue(request.refreshCapabilities) }
         if util.isNumber(request.startPosition) then command.start_position = playback.values.roundMs(request.startPosition)
         if request.tracks <> invalid then command.selected_tracks = request.tracks
-        if state.quality = "auto"
-            estimate = playback.autoQuality.estimate(state.auto, env.now())
-            if util.isNumber(estimate) then command.bandwidth_estimate_kbps = estimate
+        ' On Auto, the connection's speed reading the player had at the
+        ' play (request.estimate); the server fills in its own otherwise.
+        if state.quality = "auto" and util.isNumber(request.estimate)
+            command.bandwidth_estimate_kbps = Int(request.estimate)
+            command.bandwidth_estimate_source = "probe"
         end if
+        playback.buffering.addLearnedLimit(state.buffering, command)
+        playback.buffering.sent(state.buffering, command)
         if util.isNumber(state.bandwidthCap) then command.bandwidth_cap_kbps = state.bandwidthCap
         state.output.planned = state.output.current
         state.output.seen = false
@@ -1374,7 +1410,8 @@ namespace playback.session
     ' player_start_seconds, and the plan's timeline for every later position.
     ' A new load carries a renewal owed: its headers come from refreshed
     ' tokens.
-    sub adopt(state as Object, plan as Object, how as String, env as Object, out as Object)
+    ' request is the start command or the replan request the plan answers.
+    sub adopt(state as Object, plan as Object, how as String, request as Object, env as Object, out as Object)
         a = state.attempt
         if playback.recovery.needsStereoRestart(plan, state.multichannelAac)
             if a.stereoAacRestart
@@ -1385,6 +1422,9 @@ namespace playback.session
             return
         end if
         previous = state.plan
+        ' The plan playing stops being the playing plan: its summary now, and
+        ' the controller's new adoption once the plan is in place.
+        planEnded(state, env, out, true)
         if how = "retrack"
             ' The content plays on under the new plan, as the same load, from
             ' the URL it has.
@@ -1402,6 +1442,10 @@ namespace playback.session
             state.plan.credentialRenewFrom = previous.credentialRenewFrom
             state.plan.renewedExpiry = previous.renewedExpiry
             out.Push({ type: "retrack", load: previous.load, plan: plan })
+            adoptBuffering(state, plan, request, env, out)
+            ' The content plays on unreloaded, and no Video event will say
+            ' so: the new adoption starts in the state it is in.
+            noteBuffering(state, state.player.state, env, out)
             requestOutputChange(state, env, out)
             return
         end if
@@ -1439,6 +1483,7 @@ namespace playback.session
         end if
         out.Push({ type: "load", load: state.loads, plan: plan, playerStart: playerStart, autoplay: autoplay, refresh: renew })
         if how = "reanchor" then out.Push(playback.seek.subtitleShift(timeline))
+        adoptBuffering(state, plan, request, env, out)
         ' The output may have changed while this plan was being chosen.
         requestOutputChange(state, env, out)
     end sub
@@ -1567,6 +1612,9 @@ namespace playback.session
             ' repeated before it expires (a renewing plan carries it on).
             renewLoad: 0,
             renewedExpiry: 0,
+            ' The load whose start deadline went to the buffering controller
+            ' (startDeadline).
+            deadlineLoad: 0,
             ' Where the load should start, in player seconds, and while its
             ' first positions are checked against it, { at } (checkStart);
             ' then, until a reading shows where the seek back went,
@@ -1603,6 +1651,8 @@ namespace playback.session
         end if
         request = resumeRequest(state)
         request.restarts = restarts
+        ' A card the new attempt drops hides with it.
+        apply(state, playback.buffering.feed(state.buffering, { type: "new_attempt" }, env.now()), env, out)
         request.stereoAacRestart = a.stereoAacRestart or util.isTrue(options.stereoAacRestart)
         request.refreshCapabilities = util.isTrue(options.refreshCapabilities)
         request.sessionEnded = util.isTrue(options.sessionEnded)
@@ -1620,6 +1670,10 @@ namespace playback.session
         request.rank = RANK_PLAY
         request.op = "play"
         request.quality = state.quality
+        ' The speed reading belonged to the network and moment of the first
+        ' play; a later attempt leaves the estimate to the server, which
+        ' plans with the connection's current reading.
+        request.Delete("estimate")
         request.requestedAt = invalid
         request.restarts = 0
         request.sessionEnded = false
@@ -1664,6 +1718,7 @@ namespace playback.session
     sub retire(state as Object, env as Object, out as Object, stopSession as Boolean)
         a = state.attempt
         if a = invalid then return
+        planEnded(state, env, out)
         if stopSession and playback.values.isText(a.sessionId)
             sample = a.progress.sample
             if sample <> invalid and sample.failed then out.Push(jobCommand(a, "progress", sample.sequence, sample.bodyText))
@@ -1769,22 +1824,21 @@ namespace playback.session
             if util.isString(kind) and credentialExpired(state.plan, env) then kind = "auth"
             if util.isString(kind)
                 out.Push({ type: "log", level: "warn", message: "no progress for 20 s", fields: { kind: kind, buffer: state.stall.level } })
-                ' 20 s with nothing arriving is an outage, not a slow network.
-                if kind = "stall" then playback.autoQuality.noteOutage(state.auto)
-                handleFailure(state, kind, invalid, env, out)
+                ' A start that never played may lower instead, once per load,
+                ' with evidence that its media arrived more slowly than it
+                ' plays; a second 20 s runs the failure path.
+                if kind = "stall" and not state.attempt.played and state.plan.deadlineLoad <> state.plan.load
+                    startDeadline(state, env, out)
+                else
+                    handleFailure(state, kind, invalid, env, out)
+                end if
             end if
         end if
         if renewalWaits(state) and env.epoch() >= renewalTime(state.plan)
             out.Push({ type: "log", level: "info", message: "renewing the media credential before it expires", fields: { seconds: state.plan.credentialExpiresAt - env.epoch() } })
             renewAt(state, state.player.position, env, out)
         end if
-        ' Auto judges only a load that has played: not a reload of the plan
-        ' while the player prepares it or it starts. It asks one step down at
-        ' a time: a plan that starts while one waits can be another request's.
-        if state.phase = "active" and state.plan.firstFrame and state.plan.loadPlayed and not stepDownPending(state)
-            kbps = playback.autoQuality.check(state.auto, now)
-            if util.isNumber(kbps) then submit(state, { rank: RANK_AUTOMATIC, op: "quality_change", estimate: kbps, askedAt: now }, env, out)
-        end if
+        if state.phase = "active" then apply(state, playback.buffering.advance(state.buffering, now), env, out)
     end sub
 
     ' The stall clock runs while the viewer wants playback on a load whose
@@ -1798,6 +1852,135 @@ namespace playback.session
     ' it is rebuffering.
     function waitingForMedia(state as Object) as Boolean
         return not state.plan.loadPlayed or state.player.state = "buffering"
+    end function
+
+    ' --- Buffering quality ----------------------------------------------------
+
+    ' Carries out the buffering controller's outputs: its replans, the card
+    ' it shows or hides, and its notices.
+    sub apply(state as Object, outputs as Object, env as Object, out as Object)
+        pillChanged = false
+        for each output in outputs
+            if output.type = "replan"
+                lowerOrRestore(state, output.body, env, out)
+            else if output.type = "prompt_shown" or output.type = "undo_shown" or output.type = "pill_hidden"
+                pillChanged = true
+            else if output.type = "notice"
+                out.Push({ type: "bufferingNotice", copy: output.copy })
+            else if output.type = "deadline_refused"
+                deadlineFailure(state, env, out)
+            end if
+        end for
+        if pillChanged then out.Push({ type: "bufferingPill", pill: playback.bufferingQuality.pill(state.buffering.controller, Int(env.now())) })
+    end sub
+
+    ' The controller's replan. A lowering that cannot go now, because a
+    ' start or replan is in flight, fails rather than waiting (the shared
+    ' spec's "the client does not queue it"), and the controller watches
+    ' the plan again after its rearm. Restore quality waits its turn as a
+    ' viewer's request does, and its learned_limit "clear" is owed until a
+    ' request carries it.
+    sub lowerOrRestore(state as Object, body as Object, env as Object, out as Object)
+        restore = body.learned_limit = "clear"
+        if restore then state.buffering.owedClear = true
+        if state.phase <> "active" or (state.mutation <> invalid and not restore)
+            if not restore then apply(state, playback.buffering.feed(state.buffering, { type: "replan_refused" }, env.now()), env, out)
+            return
+        end if
+        rank = RANK_AUTOMATIC
+        if restore then rank = RANK_INTENT
+        quality = util.text(body.quality_preference)
+        if quality = "" then quality = state.quality
+        submit(state, { rank: rank, op: "quality_change", buffering: true, body: body, quality: quality }, env, out)
+    end sub
+
+    ' The viewer's pick never became a plan: refused, or replaced before it
+    ' was sent.
+    sub unpicked(state as Object, env as Object, out as Object)
+        if not state.buffering.pick then return
+        state.buffering.pick = false
+        apply(state, playback.buffering.feed(state.buffering, { type: "pick_refused" }, env.now()), env, out)
+    end sub
+
+    ' The Video node's state, as the controller's playing, waiting, and
+    ' pause. Before the attempt has played, every wait is the start's; a
+    ' load of a plan that has played is a source reload until it plays,
+    ' which is never a stall (hardware run 9, T1b); and buffering after the
+    ' session's own seek is the seek's.
+    sub noteBuffering(state as Object, videoState as String, env as Object, out as Object)
+        b = state.buffering
+        now = env.now()
+        if videoState = "playing"
+            ' A load that plays ends the reconnect's outage (endOutage
+            ' follows), so the controller watches it at once.
+            if state.reconnect = invalid then b.reconnecting = false
+            apply(state, playback.buffering.playing(b, now), env, out)
+        else if videoState = "buffering"
+            cause = invalid
+            if state.player.seeking
+                cause = "seek"
+            else if state.attempt.played and not state.plan.loadPlayed
+                cause = "reload"
+            end if
+            apply(state, playback.buffering.waiting(b, cause, now), env, out)
+        else if videoState = "paused" or videoState = "finished"
+            apply(state, playback.buffering.paused(b, now), env, out)
+        end if
+    end sub
+
+    ' A plan was adopted: the controller's new adoption. A plan the
+    ' controller asked for carries its quality (a lowered picked quality
+    ' plays as that label for this playback); the viewer's pick arrives as
+    ' quality_changed first.
+    sub adoptBuffering(state as Object, plan as Object, request as Object, env as Object, out as Object)
+        controllerInitiated = util.isTrue(request.buffering)
+        if controllerInitiated and playback.values.isText(request.quality) then state.quality = request.quality
+        estimate = request.sentEstimate
+        if not util.isNumber(estimate) then estimate = request.bandwidth_estimate_kbps
+        outputs = playback.buffering.adopted(state.buffering, plan, state.quality, estimate, controllerInitiated, util.isTrue(request.pick), env.now())
+        apply(state, outputs, env, out)
+    end sub
+
+    ' The playing plan stops being the playing plan (replaced, stopped,
+    ' failed, or a new attempt): its plan_summary, when the server takes
+    ' one. successor says a new adoption replaces it; without one, the
+    ' controller drops it (plan_ended).
+    sub planEnded(state as Object, env as Object, out as Object, successor = false as Boolean)
+        diagnostics = playback.buffering.finish(state.buffering, env.now())
+        if diagnostics = invalid then return
+        ' A card the ended plan showed hides with it.
+        if not successor then apply(state, playback.buffering.feed(state.buffering, { type: "plan_ended" }, env.now()), env, out)
+        if state.attempt = invalid or state.plan = invalid then return
+        if not hasFeature(state, playback.buffering.SUMMARY_FEATURE) then return
+        out.Push(routeEvent(state, env, "plan_summary", { diagnostics: diagnostics }))
+    end sub
+
+    ' The start's 20 s without progress, once per load of a plan that has
+    ' not played: the controller lowers in place of the failure path when
+    ' it may (Auto, Automatically, evidence of a slow link, nothing
+    ' pending), else answers deadline_refused, which runs it
+    ' (deadlineFailure), as does a lowering that then fails.
+    sub startDeadline(state as Object, env as Object, out as Object)
+        plan = state.plan
+        plan.deadlineLoad = plan.load
+        playback.recovery.restartStall(state.stall, env.now(), invalid)
+        apply(state, playback.bufferingQuality.startDeadlinePassed(state.buffering.controller, Int(env.now())), env, out)
+    end sub
+
+    ' The controller will not lower the start that missed its deadline:
+    ' the stall clock's failure path runs (a reopen, then failure_recovery).
+    sub deadlineFailure(state as Object, env as Object, out as Object)
+        if state.phase <> "active" or state.plan = invalid or state.plan.loadPlayed then return
+        handleFailure(state, "stall", invalid, env, out)
+    end sub
+
+    ' The features the server advertises: its capabilities' and the
+    ' attempt's latest decision's.
+    function serverFeatures(state as Object) as Object
+        features = []
+        if playback.values.isArray(state.features) then features.Append(state.features)
+        if state.attempt <> invalid and playback.values.isArray(state.attempt.serverFeatures) then features.Append(state.attempt.serverFeatures)
+        return features
     end function
 
     ' --- Helpers --------------------------------------------------------------
@@ -1828,17 +2011,6 @@ namespace playback.session
         return LCase(env.uuid())
     end function
 
-    ' Whether request is Auto's own quality_change (playback.autoQuality.check).
-    function isStepDown(request as Object) as Boolean
-        return request.op = "quality_change" and request.rank = RANK_AUTOMATIC
-    end function
-
-    ' Whether Auto's step down waits in the queue or for its answer.
-    function stepDownPending(state as Object) as Boolean
-        if state.queued <> invalid and isStepDown(state.queued) then return true
-        return state.mutation <> invalid and isStepDown(state.mutation.request)
-    end function
-
     function isFailureOp(op as String) as Boolean
         return op = "failure_recovery" or op = "seek_failure_recovery"
     end function
@@ -1850,7 +2022,6 @@ namespace playback.session
     sub noteResult(state as Object, event as Object)
         status = playback.values.number(event.status, 0)
         state.reachable = event.kind <> "offline" and not (status = 502 or status = 503 or status = 504)
-        if not state.reachable then playback.autoQuality.noteOutage(state.auto)
     end sub
 
     function routeEvent(state as Object, env as Object, name as String, extra as Object) as Object

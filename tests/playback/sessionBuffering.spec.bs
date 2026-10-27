@@ -1,0 +1,408 @@
+namespace tests
+
+    ' The session's side of lowering quality when playback keeps buffering
+    ' (playback.buffering): what its requests carry for the controller, the
+    ' card and notices it hands the player, and each plan's plan_summary.
+    ' The controller's own rules are tests/playback/bufferingQuality.spec.bs.
+    @suite("playback session buffering quality")
+    class PlaybackSessionBufferingTests extends rooibos.BaseTestSuite
+
+        function newSession(features = [] as Object, mode = "always" as String) as Object
+            all = ["sequenced_progress_v1"]
+            all.Append(features)
+            return playback.session.create({ identity: { server: "srv-1", account: "acc-1", profile: "p-1" }, installationId: "inst-1", features: all, multichannelAac: false, outputContextId: "out-1", bufferingMode: mode })
+        end function
+
+        function send(state as Object, env as Object, event as Object) as Object
+            return playback.session.reduce(state, event, env)
+        end function
+
+        function cmd(cmds as Object, kind as String) as Dynamic
+            for each c in cmds
+                if c.type = kind then return c
+            end for
+            return invalid
+        end function
+
+        function cmdsOf(cmds as Object, kind as String) as Object
+            out = []
+            for each c in cmds
+                if c.type = kind then out.Push(c)
+            end for
+            return out
+        end function
+
+        function player(state as Object, env as Object, playerState as String) as Object
+            return m.send(state, env, { type: "player", load: state.plan.load, state: playerState })
+        end function
+
+        ' A session playing plan since 0, its first frame at once.
+        function playing(env as Object, plan as Object, features = [] as Object, mode = "always" as String) as Object
+            state = m.newSession(features, mode)
+            start = m.send(state, env, { type: "play", intent: { file_id: "file-1" }, autoplay: false, catalogRuntime: 5400 })[0]
+            m.send(state, env, { type: "startResult", playback_attempt_id: start.playback_attempt_id, kind: "ok", decision: tests.playable("s-1", plan) })
+            m.send(state, env, { type: "assigned", load: state.plan.load })
+            m.player(state, env, "playing")
+            return state
+        end function
+
+        sub playFor(state as Object, env as Object, seconds as Integer)
+            for i = 1 to seconds
+                env.t = env.t + 1000
+                m.send(state, env, { type: "position", load: state.plan.load, position: tests.dbl(env.t / 1000) })
+            end for
+        end sub
+
+        ' A rebuffer whose readings rise every 500 ms for ms, so media
+        ' still arrives: a slow link, not an outage.
+        function slowRebuffer(state as Object, env as Object, ms as Integer) as Object
+            cmds = m.player(state, env, "buffering")
+            level = 2
+            for elapsed = 0 to ms step 500
+                if elapsed > 0 then env.t = env.t + 500
+                level = level + 1
+                cmds.Append(m.send(state, env, { type: "input", load: state.plan.load, buffer: level }))
+            end for
+            return cmds
+        end function
+
+        function replanResult(state as Object, env as Object, plan as Object) as Object
+            id = state.mutation.command.replan_request_id
+            return m.send(state, env, { type: "replanResult", replan_request_id: id, kind: "ok", decision: tests.playable("s-1", plan) })
+        end function
+
+        ' A step down after the grace: the replan's members.
+        function lowered(state as Object, env as Object) as Object
+            m.playFor(state, env, 15)
+            return m.cmd(m.slowRebuffer(state, env, 6000), "replan").members
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("requests")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("lowers with the observed_rebuffer source and the plan's throughput where the server has buffering_quality_v1")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000), ["buffering_quality_v1"])
+            m.send(state, env, { type: "input", load: state.plan.load, segmentBytes: 1500000, segmentMs: 2000 })
+            body = m.lowered(state, env)
+            m.assertEqual([body.operation, body.quality_preference, body.bandwidth_estimate_kbps, body.bandwidth_estimate_source], ["quality_change", "auto", 7000, "observed_rebuffer"])
+            m.assertEqual(body.observed_throughput_kbps, 6000)
+            m.assertFalse(body.DoesExist("learned_limit"))
+        end sub
+
+        @it("sends the same lowering without the feature's fields to a server that lacks it")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
+            m.send(state, env, { type: "input", load: state.plan.load, segmentBytes: 1500000, segmentMs: 2000 })
+            body = m.lowered(state, env)
+            m.assertEqual(body.bandwidth_estimate_kbps, 7000)
+            m.assertFalse(body.DoesExist("bandwidth_estimate_source"))
+            m.assertFalse(body.DoesExist("observed_throughput_kbps"))
+        end sub
+
+        @it("strips what a server without buffering_quality_v1 rejects, and what no server takes alone")
+        sub _()
+            body = { bandwidth_estimate_kbps: 7000, bandwidth_estimate_source: "observed_rebuffer", observed_throughput_kbps: 6000, learned_limit: "clear" }
+            playback.capabilities.gateBuffering(body, ["seek_reanchor_v1"])
+            m.assertEqual(body, { bandwidth_estimate_kbps: 7000 })
+            body = { bandwidth_estimate_source: "probe", observed_throughput_kbps: 6000, learned_limit: "ignore" }
+            playback.capabilities.gateBuffering(body, ["buffering_quality_v1"])
+            m.assertEqual(body, { learned_limit: "ignore" })
+            m.assertTrue(util.contains(playback.capabilities.clientFeatures({ serverFeatures: ["buffering_quality_v1"] }), "buffering_quality_v1"))
+            m.assertFalse(util.contains(playback.capabilities.clientFeatures({ serverFeatures: [] }), "buffering_quality_v1"))
+        end sub
+
+        @it("sends learned_limit ignore on the start and every replan in never mode, and never lowers")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.newSession(["buffering_quality_v1"], "never")
+            start = m.send(state, env, { type: "play", intent: { file_id: "file-1" }, autoplay: false, catalogRuntime: 5400 })[0]
+            m.assertEqual(start.learned_limit, "ignore")
+            m.send(state, env, { type: "startResult", playback_attempt_id: start.playback_attempt_id, kind: "ok", decision: tests.playable("s-1", tests.transcodePlan("plan-1", "v3:k1", 10000)) })
+            m.send(state, env, { type: "assigned", load: state.plan.load })
+            m.player(state, env, "playing")
+            m.playFor(state, env, 15)
+            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 12000), "replan"), [])
+            m.player(state, env, "playing")
+            replan = m.cmd(m.send(state, env, { type: "trackChange", tracks: { audio: { id: "audio-2", index: 2 } } }), "replan")
+            m.assertEqual(replan.members.learned_limit, "ignore")
+        end sub
+
+        @it("sends the player's speed reading as a probe estimate on an Auto start")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.newSession(["buffering_quality_v1"])
+            start = m.send(state, env, { type: "play", intent: { file_id: "file-1" }, autoplay: false, catalogRuntime: 5400, estimate: 48000 })[0]
+            m.assertEqual([start.bandwidth_estimate_kbps, start.bandwidth_estimate_source], [48000, "probe"])
+            state = m.newSession(["buffering_quality_v1"])
+            start = m.send(state, env, { type: "play", intent: { file_id: "file-1" }, quality: "1080p", autoplay: false, catalogRuntime: 5400, estimate: 48000 })[0]
+            m.assertFalse(start.DoesExist("bandwidth_estimate_kbps"), "a fixed quality takes no estimate")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("the card")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("shows the undo card once the lower plan is adopted, and Restore quality clears the learned limit")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000), ["buffering_quality_v1"])
+            m.lowered(state, env)
+            cmds = m.replanResult(state, env, tests.transcodePlan("plan-2", "v3:k2", 4000))
+
+            pill = m.cmd(cmds, "bufferingPill").pill
+            m.assertEqual([pill.kind, pill.visible, pill.remainingMs], ["undo", true, 15000])
+            m.player(state, env, "playing")
+            env.t = env.t + 2000
+            cmds = m.send(state, env, { type: "bufferingAnswer", answer: "select_restore" })
+            body = m.cmd(cmds, "replan").members
+            m.assertEqual([body.operation, body.quality_preference, body.learned_limit], ["quality_change", "auto", "clear"])
+            m.assertFalse(body.DoesExist("bandwidth_estimate_kbps"))
+            m.assertInvalid(m.cmd(cmds, "bufferingPill").pill, "the card hides")
+        end sub
+
+        @it("carries a Restore quality's clear on the request that replaces it")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000), ["buffering_quality_v1"])
+            m.lowered(state, env)
+            m.replanResult(state, env, tests.transcodePlan("plan-2", "v3:k2", 4000))
+            m.player(state, env, "playing")
+            m.send(state, env, { type: "trackChange", tracks: { audio: { id: "audio-2", index: 2 } } })
+            m.send(state, env, { type: "bufferingAnswer", answer: "select_restore" })
+            m.assertEqual(state.queued.op, "quality_change", "Restore waits for the track change")
+            m.send(state, env, { type: "seekTo", position: 1200 })
+            m.assertEqual(state.queued.op, "seek", "the viewer's seek replaces it")
+            m.replanResult(state, env, tests.transcodePlan("plan-3", "v3:k3", 4000))
+            replan = m.cmd(m.send(state, env, { type: "trackChange", tracks: { audio: { id: "audio-1", index: 1 } } }), "replan")
+            m.assertEqual(replan.members.learned_limit, "clear", "owed until a request carries it")
+            replan = m.cmd(m.replanResult(state, env, tests.transcodePlan("plan-4", "v3:k4", 4000)), "replan")
+            m.assertInvalid(replan)
+            replan = m.cmd(m.send(state, env, { type: "trackChange", tracks: { audio: { id: "audio-2", index: 2 } } }), "replan")
+            m.assertFalse(replan.members.DoesExist("learned_limit"), "carried once")
+        end sub
+
+        @it("asks before lowering a quality the viewer picked, and lowers one rung for this playback on Lower quality")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.newSession(["buffering_quality_v1"])
+            start = m.send(state, env, { type: "play", intent: { file_id: "file-1" }, quality: "1080p-medium", autoplay: false, catalogRuntime: 5400 })[0]
+            m.send(state, env, { type: "startResult", playback_attempt_id: start.playback_attempt_id, kind: "ok", decision: tests.playable("s-1", tests.transcodePlan("plan-1", "v3:k1", 6000)) })
+            m.send(state, env, { type: "assigned", load: state.plan.load })
+            m.player(state, env, "playing")
+            m.playFor(state, env, 15)
+            cmds = m.slowRebuffer(state, env, 6000)
+            m.assertEqual(m.cmdsOf(cmds, "replan"), [])
+            m.assertEqual(m.cmd(cmds, "bufferingPill").pill.kind, "prompt")
+            body = m.cmd(m.send(state, env, { type: "bufferingAnswer", answer: "select_lower" }), "replan").members
+            m.assertEqual(body.quality_preference, "720p-high")
+            m.assertFalse(body.DoesExist("bandwidth_estimate_kbps"))
+            m.replanResult(state, env, tests.transcodePlan("plan-2", "v3:k2", 4000))
+            m.assertEqual(state.quality, "720p-high", "the lower rung plays on")
+        end sub
+
+        @it("hides the card as the viewer's pick is sent")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
+            m.lowered(state, env)
+            m.replanResult(state, env, tests.transcodePlan("plan-2", "v3:k2", 4000))
+            m.player(state, env, "playing")
+            cmds = m.send(state, env, { type: "qualityChange", quality: "1080p-medium" })
+            m.assertEqual(cmds[0].type, "replan")
+            m.assertInvalid(m.cmd(cmds, "bufferingPill").pill, "the card hides")
+        end sub
+
+        @it("says once that the video cannot go lower")
+        sub _()
+            env = tests.fakeEnv()
+            plan = tests.transcodePlan("plan-1", "v3:k1", 10000)
+            plan.available_qualities = [{ label: "original", preserves_source: true, bitrate_kbps: 10000 }]
+            state = m.playing(env, plan)
+            m.playFor(state, env, 15)
+            cmds = m.slowRebuffer(state, env, 6000)
+            m.assertEqual(m.cmdsOf(cmds, "replan"), [])
+            m.assertEqual(m.cmd(cmds, "bufferingNotice").copy, "cant_lower")
+            m.player(state, env, "playing")
+            m.playFor(state, env, 10)
+            m.assertInvalid(m.cmd(m.slowRebuffer(state, env, 6000), "bufferingNotice"))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("plan_summary")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("reports each plan as it is replaced or the session stops, where the server takes plan_summary")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000), ["buffering_quality_v1", "playback_plan_summary_v1"])
+            m.send(state, env, { type: "input", load: state.plan.load, segmentBytes: 1500000, segmentMs: 2000 })
+            m.lowered(state, env)
+            cmds = m.replanResult(state, env, tests.transcodePlan("plan-2", "v3:k2", 4000))
+            summary = m.cmd(cmds, "routeEvent").body
+            m.assertEqual([summary.event, summary.plan_id], ["plan_summary", "plan-1"])
+            d = summary.diagnostics
+            m.assertEqual([d.buffering_mode, d.buffering_action, d.delivered_kbps, d.stall_count, d.throughput_kbps], ["always", "lowered", "10000", "1", "6000"])
+            m.assertEqual(d.played_ms, "15000")
+            m.assertEqual(d.stall_longest_ms, "6000")
+            m.assertFalse(d.DoesExist("bandwidth_estimate_kbps"), "the start carried none")
+            m.player(state, env, "playing")
+            m.playFor(state, env, 30)
+            cmds = m.send(state, env, { type: "back" })
+            summary = invalid
+            for each c in m.cmdsOf(cmds, "routeEvent")
+                if c.body.event = "plan_summary" then summary = c.body
+            end for
+            m.assertEqual([summary.plan_id, summary.diagnostics.bandwidth_estimate_kbps, summary.diagnostics.played_ms], ["plan-2", "7000", "30000"])
+        end sub
+
+        @it("sends no plan_summary to a server that does not take it")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
+            m.lowered(state, env)
+            m.assertEqual(m.cmdsOf(m.replanResult(state, env, tests.transcodePlan("plan-2", "v3:k2", 4000)), "routeEvent"), [])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("a start that never plays")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("lowers at the start's 20 s when its segments arrive more slowly than the plan plays, instead of reopening")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.newSession(["buffering_quality_v1"])
+            start = m.send(state, env, { type: "play", intent: { file_id: "file-1" }, autoplay: false, catalogRuntime: 5400 })[0]
+            m.send(state, env, { type: "startResult", playback_attempt_id: start.playback_attempt_id, kind: "ok", decision: tests.playable("s-1", tests.transcodePlan("plan-1", "v3:k1", 10000)) })
+            m.send(state, env, { type: "assigned", load: state.plan.load })
+            m.player(state, env, "buffering")
+            ' One slow segment, then nothing that fills the buffer.
+            env.t = env.t + 3000
+            m.send(state, env, { type: "input", load: state.plan.load, segmentBytes: 1000000, segmentMs: 3000 })
+            env.t = env.t + 17001
+            cmds = m.send(state, env, { type: "tick" })
+            replan = m.cmd(cmds, "replan")
+            m.assertNotInvalid(replan, "a lowering, not the reopen")
+            m.assertEqual([replan.members.operation, replan.members.bandwidth_estimate_kbps, replan.members.observed_throughput_kbps], ["quality_change", 7000, 2666])
+            m.assertEqual(m.cmdsOf(cmds, "reopen"), [])
+        end sub
+
+        @it("keeps the start's failure path without evidence of a slow link")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.newSession(["buffering_quality_v1"])
+            start = m.send(state, env, { type: "play", intent: { file_id: "file-1" }, autoplay: false, catalogRuntime: 5400 })[0]
+            m.send(state, env, { type: "startResult", playback_attempt_id: start.playback_attempt_id, kind: "ok", decision: tests.playable("s-1", tests.directPlan("plan-1", "v3:k1")) })
+            m.send(state, env, { type: "assigned", load: state.plan.load })
+            m.player(state, env, "buffering")
+            env.t = env.t + 20001
+            cmds = m.send(state, env, { type: "tick" })
+            m.assertEqual(m.cmdsOf(cmds, "replan"), [])
+            m.assertEqual(m.cmdsOf(cmds, "reopen").Count(), 1, "the plan's one reopen")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("plans that play on")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("keeps watching content a track change retracks in place: its playing time counts and its stalls lower")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000), ["playback_plan_summary_v1"])
+            m.playFor(state, env, 15)
+            m.send(state, env, { type: "trackChange", tracks: { audio: { id: "audio-1", index: 1 } }, inPlace: true })
+            cmds = m.replanResult(state, env, tests.transcodePlan("plan-2", "v3:k2", 10000))
+            m.assertNotInvalid(m.cmd(cmds, "retrack"), "the content plays on")
+            m.playFor(state, env, 20)
+            body = m.cmd(m.slowRebuffer(state, env, 6000), "replan")
+            m.assertNotInvalid(body, "the retracked plan's stall is the network's, not a start's")
+            m.assertEqual(body.members.bandwidth_estimate_kbps, 7000)
+        end sub
+
+        @it("ends the controller's outage as a reconnect's load plays")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.directPlan("plan-1", "v3:k1"))
+            m.playFor(state, env, 15)
+            failure = playback.video.failure(state.plan.load, -3, { category: "mediaplayer" }, "reader pick stream error:bad:Transfer error: Failure when receiving data from the peer response code:(http://192.0.2.10/x):extra:content_id:9:err_clip_idx:0:etype:buffer:program_id:", false, "Video error")
+            cmds = m.send(state, env, failure.event)
+            m.assertNotInvalid(m.cmd(cmds, "reconnecting"))
+            m.replanResult(state, env, tests.directPlan("plan-2", "v3:k2"))
+            m.send(state, env, { type: "assigned", load: state.plan.load })
+            cmds = m.player(state, env, "playing")
+            m.assertEqual(m.cmd(cmds, "reconnecting").active, false)
+            m.playFor(state, env, 30)
+            ' Its first reading only says where the buffer stands; a stall
+            ' outside an outage counts from the wait's start.
+            body = m.cmd(m.slowRebuffer(state, env, 6000), "replan")
+            m.assertNotInvalid(body, "a 6 s stall lowers")
+            m.assertEqual(body.members.bandwidth_estimate_kbps, 5600)
+        end sub
+
+        @it("asks for the viewer's quality when their pick waited behind a lowering")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
+            m.lowered(state, env)
+            m.player(state, env, "playing")
+            m.assertEqual(m.cmdsOf(m.send(state, env, { type: "qualityChange", quality: "1080p-medium" }), "replan"), [], "the lowering is in flight")
+            replan = m.cmd(m.replanResult(state, env, tests.transcodePlan("plan-2", "v3:k2", 4000)), "replan")
+            m.assertEqual(replan.members.quality_preference, "1080p-medium")
+        end sub
+
+        @it("hides the card when the session restarts the attempt by itself")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
+            m.lowered(state, env)
+            m.assertEqual(m.cmd(m.replanResult(state, env, tests.transcodePlan("plan-2", "v3:k2", 4000)), "bufferingPill").pill.kind, "undo")
+            m.player(state, env, "playing")
+            progress = m.cmd(m.send(state, env, { type: "tick" }), "progress")
+            cmds = m.send(state, env, { type: "progressResult", session_id: progress.session_id, sequence: progress.sequence, kind: "notFound" })
+            m.assertNotInvalid(m.cmd(cmds, "start"), "the session ended, so a new attempt starts")
+            pill = m.cmd(cmds, "bufferingPill")
+            m.assertNotInvalid(pill, "the player hears the card go")
+            m.assertInvalid(pill.pill)
+        end sub
+
+        @it("counts a plan's throughput past the 32-bit Integer")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
+            for i = 1 to 3
+                m.send(state, env, { type: "input", load: state.plan.load, segmentBytes: 1000000000, segmentMs: 10000 })
+            end for
+            m.assertEqual(playback.buffering.throughputKbps(state.buffering), 800000)
+        end sub
+
+        @it("hides the card when the session ends with it showing")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
+            m.lowered(state, env)
+            m.assertEqual(m.cmd(m.replanResult(state, env, tests.transcodePlan("plan-2", "v3:k2", 4000)), "bufferingPill").pill.kind, "undo")
+            m.player(state, env, "playing")
+            pill = m.cmd(m.send(state, env, { type: "back" }), "bufferingPill")
+            m.assertNotInvalid(pill, "the player hears the card go")
+            m.assertInvalid(pill.pill)
+        end sub
+
+        @it("sends the speed reading only on the first start, never on an attempt the session starts by itself")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.newSession(["buffering_quality_v1"])
+            start = m.send(state, env, { type: "play", intent: { file_id: "file-1" }, autoplay: false, catalogRuntime: 5400, estimate: 48000 })[0]
+            m.assertEqual(start.bandwidth_estimate_kbps, 48000)
+            m.send(state, env, { type: "startResult", playback_attempt_id: start.playback_attempt_id, kind: "ok", decision: tests.playable("s-1", tests.transcodePlan("plan-1", "v3:k1", 10000)) })
+            m.send(state, env, { type: "assigned", load: state.plan.load })
+            m.player(state, env, "playing")
+            progress = m.cmd(m.send(state, env, { type: "tick" }), "progress")
+            restart = m.cmd(m.send(state, env, { type: "progressResult", session_id: progress.session_id, sequence: progress.sequence, kind: "notFound" }), "start")
+            m.assertNotInvalid(restart)
+            m.assertFalse(restart.DoesExist("bandwidth_estimate_kbps"), "the server fills in the connection's current reading")
+        end sub
+    end class
+end namespace

@@ -2222,3 +2222,72 @@ first for comparison.
 - After `main`'s run, Home showed S2E2 as "54 min left", although Back left
   it about 57 minutes in after a `seek_reanchor`; the stop's position was
   not checked against the server.
+
+## Run 33 — buffering quality and the connection speed test (AG-390, AG-391)
+
+2026-10-27, physical Ultra 4850X on Roku OS 16.0.4 over Ethernet, the dev
+package sideloaded, signed in to a lab sandbox built from silo-server
+`feat/bandwidth-probe-target` (it advertises `buffering_quality_v1`,
+`playback_plan_summary_v1`, `connection_speed_v1`, and
+`bandwidth_probe_location_v1`) through the header probe on the relay host
+(`--playback-bodies`, with its `throttle-media` and `refuse-media` modes).
+1917 (one 8,489 kbps MKV version, 2160p Dolby Vision) throughout.
+
+- Sign-in ran the connection check at once and, 5 s later, the quick test:
+  eight 2 MB chunks of about 375 ms each read 35,255 kbps, reported with a
+  204, and Settings showed "35 Mbps · measured just now on Ethernet" with
+  "Auto plays videos up to 28 Mbps without converting them." The relay host read
+  164 Mbps through the same probe, so each request cost about 200 ms. Test
+  speed (accurate) read 38,168 kbps the same way.
+- Chunks sized to take a second at the last chunk's rate
+  (`playback.speedTest.nextTimedChunk`) grew 2, 6.4, 9.5, then about 10 MB a
+  second, and Test speed read 79,035 kbps, against 76 Mbps from 20 MB of
+  Cloudflare's endpoint on the same Ultra the day before. Two other runs read
+  12,528 and 7,106 kbps while single chunks took 3.3 to 6.5 s on the path;
+  the cause was not found.
+- The start sent `bandwidth_estimate_kbps` 79035 with source `probe` and
+  `buffering_quality_v1` in `client_features`; the first frame came 2.6 s
+  after Play.
+- `throttle-media` at 3000 kbit/s: 2 min 20 s later, with the buffer spent,
+  a `quality_change` went out on Auto with 5942 (`floor(8489 × 7 / 10)`) as
+  `observed_rebuffer`, no throughput (a progressive plan measures none). The
+  undo card showed at the top right with Restore quality lit and its track
+  draining; the server answered with an HEVC 10-bit transcode. The original's
+  `plan_summary`: lowered, always, 8489 delivered, 178 s played, 2 stalls,
+  6.9 s stalled, the longest 3.4 s.
+- The transcode is a multi-variant HLS ladder: at 3000 and then 1500
+  kbit/s per connection, Roku's own player moved within it (segments fell
+  from about 1 MB to 0.1 to 0.4 MB) and played on, so the controller rightly
+  lowered nothing more.
+- A restart of the title began on the transcode, and Options read "Auto ·
+  limited after buffering" (cut to "Auto · limited after bu…" until the
+  value's width went from 240 to 330 px). Settings showed "Limited to 5.9
+  Mbps after buffering on Oct 27" with Reset and a 4.7 Mbps budget; Reset
+  sent the DELETE (204), the row went, and the budget read 63 Mbps.
+- `refuse-media` for 75 s: "Reconnecting…" showed; track_change reconnects
+  went out 1, 3, 4, 8, 16, and then about 15 s apart, carrying no estimate,
+  with no `quality_change`; playback resumed once media came back. Each
+  reconnect plan that never played sent a `plan_summary` with `played_ms` 0.
+- A second lowering under the throttle, then OK on the undo card with the
+  controls hidden: `quality_change` on Auto with no estimate and
+  `learned_limit` `clear`.
+- Settings' Lower Quality When Buffering read Automatically; the picker
+  offered Use profile setting, Never, Ask first, and Automatically, and Ask
+  first saved. Under the throttle the prompt showed ("Playback keeps
+  buffering", "Try a lower quality to keep watching", Lower quality lit);
+  Right lit Keep quality, Left and OK on Lower quality sent the same Auto
+  lowering, and the plan's summary read accepted, ask. The "Quality lowered
+  to stop buffering" notice after it was not captured.
+- Not run: a picked quality's prompt and one-rung lowering, Never, a start
+  that never plays (the deadline lowering), and the automatic quick test
+  with the new chunk sizes.
+
+### Observations in run 33
+
+- `Main` stopped in the debugger on the first HDMI event (the TV waking the
+  Ultra from Suspend): `msg.isHdmiStatus()` is not a member on this firmware,
+  as run 32 saw. `source/main.bs` now reads `GetInfo()` alone.
+- Settings' scroll hint draws "↕" as an empty box once a pane scrolls both
+  ways (Playback has eleven rows with Connection); "↓" draws.
+- The lab relay throttles each connection separately, so HLS over
+  parallel connections is not held to the rate.

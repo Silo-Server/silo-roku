@@ -1,0 +1,329 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/playback/bufferingQuality.bs"
+
+' The session's side of lowering quality when playback keeps buffering
+' (docs/buffering-quality.md, the shared design in silo-server
+' docs/design/2026-10-17-buffering-quality.md). playback.bufferingQuality is
+' the shared controller every Silo client runs; this turns the Video node's
+' reports into its events, keeps what the session's requests carry for it,
+' and builds each plan's plan_summary.
+'
+' Outages. Roku's Video node reports no request it makes, only its buffer
+' fill (bufferingStatus) and, on HLS, each downloaded segment. Media arrives
+' when a reading rises above the last or a segment downloads (the stall
+' clock's rule, AG-165). A wait in which none arrives for OUTAGE_NO_DATA_MS
+' (progressive) or OUTAGE_NO_DATA_SEGMENTED_MS (HLS, whose server holds a
+' segment request silent while it produces it) is an outage, which the
+' reconnect path owns and the controller never counts: hardware run 15's
+' cut original held its reading at 2% and would otherwise have stepped
+' down. A reconnect is an outage too, from its start until a load plays.
+'
+' Throughput. A downloadedSegment report that names its size and download
+' time adds to the plan's throughput when the download took at least
+' MIN_RECEIVING_MS: a short segment on a warm connection arrives at the
+' connection's burst rate. A progressive plan has no such reports and
+' measures nothing.
+namespace playback.buffering
+    const OUTAGE_NO_DATA_MS = 4000
+    const OUTAGE_NO_DATA_SEGMENTED_MS = 15000
+    const MIN_RECEIVING_MS = 1000
+    const MIN_KBPS = 100
+    const MAX_KBPS = 1000000
+    const SUMMARY_FEATURE = "playback_plan_summary_v1"
+
+    ' mode is "always", "ask" or "never": the profile's
+    ' playback.buffering_quality_mode, or the last one this device saw.
+    function create(mode as String) as Object
+        mode = normalMode(mode)
+        return {
+            controller: playback.bufferingQuality.create(mode),
+            mode: mode,
+            adoptions: 0,
+            ' The adoption playing: { label, estimate, deliveredKbps,
+            ' segmented, bytes, receivingMs }, estimate being what the
+            ' request that brought it carried.
+            current: invalid,
+            ' "idle", "playing", "waiting" or "paused", and a wait's cause.
+            phase: "idle",
+            cause: invalid,
+            lastMediaAt: invalid,
+            lastLevel: invalid,
+            outage: false,
+            reconnecting: false,
+            ' A Restore quality's learned_limit "clear" that no request has
+            ' carried yet: the next one carries it.
+            owedClear: false,
+            ' A viewer's quality pick on its way to the server.
+            pick: false
+        }
+    end function
+
+    function normalMode(mode as Dynamic) as String
+        if mode = "never" or mode = "ask" or mode = "always" then return mode
+        return "always"
+    end function
+
+    sub setMode(b as Object, mode as Dynamic)
+        b.mode = normalMode(mode)
+        playback.bufferingQuality.setMode(b.controller, b.mode)
+    end sub
+
+    ' --- Controller events ------------------------------------------------------
+
+    ' An event for the controller at now, after any outage that began
+    ' before it (catchUp).
+    function feed(b as Object, event as Object, now as Dynamic) as Object
+        out = catchUp(b, now)
+        out.Append(playback.bufferingQuality.handle(b.controller, event, Int(now)))
+        return out
+    end function
+
+    function advance(b as Object, now as Dynamic) as Object
+        out = catchUp(b, now)
+        out.Append(playback.bufferingQuality.advance(b.controller, Int(now)))
+        return out
+    end function
+
+    ' A wait whose silence limit passed before now became an outage at
+    ' that moment, ahead of any controller timer due after it: a wake can
+    ' come later than the limit, and the long stall it would otherwise
+    ' fire first is the outage's.
+    function catchUp(b as Object, now as Dynamic) as Object
+        if b.phase <> "waiting" or b.outage then return []
+        silence = silenceDeadline(b)
+        if silence = invalid or silence > now then return []
+        out = playback.bufferingQuality.advance(b.controller, Int(silence))
+        b.outage = true
+        out.Append(playback.bufferingQuality.handle(b.controller, { type: "transport_error_start" }, Int(silence)))
+        return out
+    end function
+
+    ' The next time advance has work, or invalid.
+    function nextWake(b as Object) as Dynamic
+        wake = playback.bufferingQuality.nextWake(b.controller)
+        if b.phase = "waiting" and not b.outage
+            silence = silenceDeadline(b)
+            if silence <> invalid and (wake = invalid or silence < wake) then wake = silence
+        end if
+        return wake
+    end function
+
+    function silenceDeadline(b as Object) as Dynamic
+        if b.current = invalid or not util.isNumber(b.lastMediaAt) then return invalid
+        if b.current.segmented then return b.lastMediaAt + OUTAGE_NO_DATA_SEGMENTED_MS
+        return b.lastMediaAt + OUTAGE_NO_DATA_MS
+    end function
+
+    ' A plan was adopted. controllerInitiated says it answers the
+    ' controller's own replan; picked, the viewer's quality pick, which
+    ' arrives first as quality_changed. quality is what the request asked
+    ' for, "auto" or a label.
+    function adopted(b as Object, plan as Object, quality as String, estimate as Dynamic, controllerInitiated as Boolean, picked as Boolean, now as Dynamic) as Object
+        out = []
+        if picked
+            b.pick = false
+            out.Append(feed(b, { type: "quality_changed" }, now))
+        end if
+        b.adoptions = b.adoptions + 1
+        delivered = deliveredKbps(plan)
+        ' bytes is a Double: a film's segments pass the 32-bit Integer.
+        b.current = { label: "a" + b.adoptions.ToStr(), estimate: estimate, deliveredKbps: delivered, segmented: isSegmented(plan), bytes: 0#, receivingMs: 0 }
+        b.phase = "idle"
+        b.cause = invalid
+        b.lastMediaAt = now
+        b.lastLevel = invalid
+        b.outage = false
+        out.Append(feed(b, { type: "plan_adopted", plan: controllerPlan(plan, quality, b.current.label), controllerInitiated: controllerInitiated }, now))
+        if b.reconnecting
+            b.outage = true
+            out.Append(feed(b, { type: "transport_error_start" }, now))
+        end if
+        return out
+    end function
+
+    ' The controller's view of a plan: the vectors' plan_adopted shape.
+    function controllerPlan(plan as Object, quality as String, label as String) as Object
+        out = { plan_id: label, delivered_kbps: 0, quality: quality, available_qualities: [], degradation_warnings: [] }
+        delivered = deliveredKbps(plan)
+        if util.isNumber(delivered) then out.delivered_kbps = delivered
+        if playback.values.isArray(plan.available_qualities)
+            for each entry in plan.available_qualities
+                if util.isObject(entry) and playback.values.isText(entry.label) then out.available_qualities.Push(entry)
+            end for
+        end if
+        if playback.values.isText(plan.active_quality) then out.active_quality = plan.active_quality
+        if playback.values.isArray(plan.degradation_warnings)
+            for each warning in plan.degradation_warnings
+                if util.isObject(warning) and playback.values.isText(warning.code)
+                    out.degradation_warnings.Push(warning.code)
+                else if playback.values.isText(warning)
+                    out.degradation_warnings.Push(warning)
+                end if
+            end for
+        end if
+        return out
+    end function
+
+    ' The bitrate a plan delivers: the encode's when it is one, else the
+    ' source's; invalid when it names neither.
+    function deliveredKbps(plan as Object) as Dynamic
+        for each part in [plan.effective_recipe, plan.source]
+            if util.isObject(part) and util.isNumber(part.bitrate_kbps) and part.bitrate_kbps > 0 then return Int(part.bitrate_kbps)
+        end for
+        return invalid
+    end function
+
+    function isSegmented(plan as Object) as Boolean
+        return util.isObject(plan.stream) and LCase(util.text(plan.stream.protocol)) = "hls"
+    end function
+
+    ' The node plays: its media arrives, though the node reports none while
+    ' it plays (a progressive plan has no segments to report).
+    function playing(b as Object, now as Dynamic) as Object
+        out = catchUp(b, now)
+        b.lastMediaAt = now
+        if b.outage and not b.reconnecting
+            b.outage = false
+            out.Append(feed(b, { type: "transport_error_end" }, now))
+        end if
+        if b.phase = "playing" then return out
+        b.phase = "playing"
+        b.cause = invalid
+        out.Append(feed(b, { type: "playing" }, now))
+        return out
+    end function
+
+    ' The node waits for media. cause is "seek", "reload" or invalid; a
+    ' wait whose cause changes (a reload of content that was stalling) is
+    ' told again.
+    function waiting(b as Object, cause as Dynamic, now as Dynamic) as Object
+        if b.phase = "waiting" and b.cause = cause then return []
+        ' The silence limit counts from the wait's start: media arrived
+        ' until then, as far as Roku shows.
+        if b.phase <> "waiting" then b.lastMediaAt = now
+        b.phase = "waiting"
+        b.cause = cause
+        event = { type: "waiting" }
+        if playback.values.isText(cause) then event.cause = cause
+        return feed(b, event, now)
+    end function
+
+    function paused(b as Object, now as Dynamic) as Object
+        if b.phase = "paused" then return []
+        b.phase = "paused"
+        b.cause = invalid
+        return feed(b, { type: "pause" }, now)
+    end function
+
+    ' The session sought locally.
+    function sought(b as Object, now as Dynamic) as Object
+        return feed(b, { type: "seek" }, now)
+    end function
+
+    ' {buffer, segmentBytes, segmentMs} from an input event: a buffer
+    ' reading, or a downloaded segment. Returns the outage's end when media
+    ' arrived during one.
+    function media(b as Object, event as Object, now as Dynamic) as Object
+        arrived = false
+        if util.isNumber(event.buffer)
+            if util.isNumber(b.lastLevel) and event.buffer > b.lastLevel then arrived = true
+            b.lastLevel = event.buffer
+        else
+            arrived = true
+        end if
+        if b.current <> invalid and util.isNumber(event.segmentBytes) and util.isNumber(event.segmentMs) and event.segmentMs >= MIN_RECEIVING_MS and event.segmentBytes > 0
+            b.current.bytes = b.current.bytes + event.segmentBytes
+            b.current.receivingMs = b.current.receivingMs + event.segmentMs
+            playback.bufferingQuality.setPlanThroughput(b.controller, throughputKbps(b))
+        end if
+        if not arrived then return []
+        out = catchUp(b, now)
+        b.lastMediaAt = now
+        if b.outage and not b.reconnecting
+            b.outage = false
+            out.Append(feed(b, { type: "transport_error_end" }, now))
+        end if
+        return out
+    end function
+
+    ' A reconnect began or ended (the session's outage).
+    function reconnect(b as Object, active as Boolean, now as Dynamic) as Object
+        if b.reconnecting = active then return []
+        b.reconnecting = active
+        if active
+            if b.outage then return []
+            b.outage = true
+            return feed(b, { type: "transport_error_start" }, now)
+        end if
+        return []
+    end function
+
+    ' The throughput the playing plan received, or invalid.
+    function throughputKbps(b as Object) as Dynamic
+        c = b.current
+        if c = invalid or c.receivingMs < MIN_RECEIVING_MS then return invalid
+        kbps = Int(c.bytes * 8# / c.receivingMs)
+        if kbps < MIN_KBPS then return invalid
+        if kbps > MAX_KBPS then kbps = MAX_KBPS
+        return kbps
+    end function
+
+    ' --- Requests -----------------------------------------------------------------
+
+    ' The buffering members a replan the session sends for its own reasons
+    ' carries: the kept step-down estimate on Auto, without a source.
+    sub addReplanFields(b as Object, fields as Object, quality as String)
+        if quality = "auto"
+            kept = playback.bufferingQuality.keptEstimate(b.controller)
+            if util.isNumber(kept) then fields.bandwidth_estimate_kbps = kept
+        end if
+        addLearnedLimit(b, fields)
+    end sub
+
+    ' learned_limit: a Restore's "clear" until a request carries it, else
+    ' "ignore" in never mode, so a limit another profile learned on this
+    ' device does not reach this one.
+    sub addLearnedLimit(b as Object, fields as Object)
+        if util.isString(fields.learned_limit) then return
+        if b.owedClear
+            fields.learned_limit = "clear"
+        else if b.mode = "never"
+            fields.learned_limit = "ignore"
+        end if
+    end sub
+
+    ' The request carrying the owed clear was sent.
+    sub sent(b as Object, fields as Object)
+        if fields.learned_limit = "clear" then b.owedClear = false
+    end sub
+
+    ' --- plan_summary -------------------------------------------------------------
+
+    ' The playing plan's plan_summary diagnostics, all strings, or invalid
+    ' when no plan has been adopted. Ends the adoption.
+    function finish(b as Object, now as Dynamic) as Dynamic
+        c = b.current
+        if c = invalid then return invalid
+        b.current = invalid
+        stats = playback.bufferingQuality.summary(b.controller, c.label, Int(now))
+        out = {}
+        for each key in stats
+            value = stats[key]
+            if util.isNumber(value)
+                out[key] = Int(value).ToStr()
+            else if playback.values.isText(value)
+                out[key] = value
+            end if
+        end for
+        if util.isNumber(c.estimate) then out.bandwidth_estimate_kbps = Int(c.estimate).ToStr()
+        if c.receivingMs >= MIN_RECEIVING_MS
+            kbps = Int(c.bytes * 8# / c.receivingMs)
+            if kbps >= MIN_KBPS
+                if kbps > MAX_KBPS then kbps = MAX_KBPS
+                out.throughput_kbps = kbps.ToStr()
+            end if
+        end if
+        return out
+    end function
+end namespace

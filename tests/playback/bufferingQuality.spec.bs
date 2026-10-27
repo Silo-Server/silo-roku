@@ -1,0 +1,523 @@
+namespace tests
+
+    @suite("playback buffering quality")
+    class PlaybackBufferingQualityTests extends rooibos.BaseTestSuite
+
+        ' The vendored conformance vectors (silo-server
+        ' docs/design/schemas/buffering-quality/v1/vectors.json, unchanged).
+        function vectors() as Object
+            return tests.devices.loadJson("pkg:/tests/fixtures/buffering-quality/vectors.json")
+        end function
+
+        ' Replays one case as the session drives the controller: timers fire
+        ' at nextWake, each event at its time, then the clock runs to until.
+        ' Returns "" when the outputs and buffering actions match, or what
+        ' differed. The vectors carry no throughput, so every plan's media is
+        ' measured below its delivered bitrate, which is the evidence a start
+        ' needs to lower (slow_start).
+        function replay(vector as Object, defaultMode as String, outputTypes as Object) as String
+            mode = defaultMode
+            if util.isString(vector.mode) then mode = vector.mode
+            state = playback.bufferingQuality.create(mode)
+            actual = []
+            for each event in vector.events
+                m.advanceTo(state, event.t, actual)
+                actual.Append(playback.bufferingQuality.handle(state, event, event.t))
+                if event.type = "plan_adopted" then playback.bufferingQuality.setPlanThroughput(state, 1)
+            end for
+            m.advanceTo(state, vector.until, actual)
+
+            got = []
+            for each output in actual
+                if util.contains(outputTypes, output.type) then got.Push(m.canon(output, output.copy))
+            end for
+            wanted = []
+            for each output in vector.expect
+                wanted.Push(m.canon(output, output.key))
+            end for
+            if got.Join(" | ") <> wanted.Join(" | ") then return "outputs" + Chr(10) + "  expected: " + wanted.Join(" | ") + Chr(10) + "  actual:   " + got.Join(" | ")
+
+            if not util.isObject(vector.buffering_action) then return ""
+            playback.bufferingQuality.handle(state, { type: "plan_ended" }, vector.until)
+            for each label in vector.buffering_action
+                action = playback.bufferingQuality.bufferingAction(state, label)
+                if action <> vector.buffering_action[label] then return "buffering_action for " + label + ": expected " + vector.buffering_action[label] + ", got " + action
+            end for
+            return ""
+        end function
+
+        sub advanceTo(state as Object, t as Integer, actual as Object)
+            wake = playback.bufferingQuality.nextWake(state)
+            while wake <> invalid and wake <= t
+                actual.Append(playback.bufferingQuality.advance(state, wake))
+                wake = playback.bufferingQuality.nextWake(state)
+            end while
+        end sub
+
+        ' An output as one comparable line: its time, type, notice key and
+        ' body fields in key order.
+        function canon(output as Object, key as Dynamic) as String
+            canonical = output.t.ToStr() + " " + output.type
+            if util.isString(key) then canonical = canonical + " " + key
+            if util.isObject(output.body)
+                names = output.body.Keys()
+                names.Sort()
+                fields = []
+                for each name in names
+                    fields.Push(name + "=" + FormatJson(output.body[name]))
+                end for
+                canonical = canonical + " {" + fields.Join(", ") + "}"
+            end if
+            return canonical
+        end function
+
+        ' The default menu, from 63000 kbps original down to 720p.
+        function menu() as Object
+            return [
+                { label: "original", bitrate_kbps: 63000 },
+                { label: "1080p-high", bitrate_kbps: 10000 },
+                { label: "1080p-medium", bitrate_kbps: 6000 },
+                { label: "720p-high", bitrate_kbps: 4000 }
+            ]
+        end function
+
+        function adopt(label as String, kbps as Integer, quality = "auto" as String) as Object
+            return { type: "plan_adopted", plan: { plan_id: label, delivered_kbps: kbps, quality: quality, available_qualities: m.menu() } }
+        end function
+
+        function feed(state as Object, eventType as String, t as Integer) as Object
+            return playback.bufferingQuality.handle(state, { type: eventType }, t)
+        end function
+
+        ' A title in mode whose plan p1 (Auto, 63000) is adopted at 0 and
+        ' waits for its first frame, its media measured below its bitrate.
+        function starting(mode = "always" as String) as Object
+            state = playback.bufferingQuality.create(mode)
+            playback.bufferingQuality.handle(state, m.adopt("p1", 63000), 0)
+            playback.bufferingQuality.setPlanThroughput(state, 1)
+            m.feed(state, "waiting", 0)
+            return state
+        end function
+
+        ' A title in always whose plan p1 (Auto, 63000) plays from 0.
+        function playingTitle() as Object
+            state = playback.bufferingQuality.create("always")
+            playback.bufferingQuality.handle(state, m.adopt("p1", 63000), 0)
+            m.feed(state, "playing", 0)
+            return state
+        end function
+
+        ' playingTitle, lowered by a long stall at 131000, its lower plan p2
+        ' (31600) adopted and playing at 134000 under the undo pill.
+        function lowered() as Object
+            state = m.playingTitle()
+            m.feed(state, "waiting", 125000)
+            playback.bufferingQuality.handle(state, m.adopt("p2", 31600), 134000)
+            m.feed(state, "playing", 134000)
+            return state
+        end function
+
+        function typesOf(outputs as Object) as Object
+            types = []
+            for each output in outputs
+                types.Push(output.type)
+            end for
+            return types
+        end function
+
+        function autoLowering(t as Integer, estimate as Integer) as Object
+            return { t: t, type: "replan", body: { operation: "quality_change", quality_preference: "auto", bandwidth_estimate_kbps: estimate, bandwidth_estimate_source: "observed_rebuffer" } }
+        end function
+
+        function refused(t as Integer) as Object
+            return [{ t: t, type: "deadline_refused" }]
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("conformance vectors")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("replays every controller case")
+        sub _()
+            vectors = m.vectors()
+            m.assertNotInvalid(vectors, "vectors.json did not load")
+            m.assertTrue(vectors.cases.Count() > 0, "vectors.json has no cases")
+            failures = []
+            for each vector in vectors.cases
+                problem = m.replay(vector, vectors.defaults.mode, vectors.output_types)
+                if problem <> "" then failures.Push(vector.name + ": " + problem)
+            end for
+            summaryLine = failures.Count().ToStr() + " of " + vectors.cases.Count().ToStr() + " cases failed"
+            m.assertEqual(failures.Count(), 0, summaryLine + Chr(10) + failures.Join(Chr(10) + Chr(10)))
+        end sub
+
+        @it("names a case whose outputs or actions differ")
+        sub _()
+            vectors = m.vectors()
+            vector = invalid
+            for each candidate in vectors.cases
+                if candidate.name = "undo" then vector = candidate
+            end for
+            m.assertNotInvalid(vector, "no undo case")
+            vector.expect[0].body.bandwidth_estimate_kbps = 44101
+            m.assertNotEqual(Instr(1, m.replay(vector, "always", vectors.output_types), "outputs"), 0, "a wrong estimate")
+            vector.expect[0].body.bandwidth_estimate_kbps = 44100
+            m.assertEqual(m.replay(vector, "always", vectors.output_types), "")
+            vector.buffering_action.p1 = "accepted"
+            m.assertNotEqual(Instr(1, m.replay(vector, "always", vectors.output_types), "buffering_action for p1"), 0, "a wrong action")
+        end sub
+
+        @it("uses the vectors' constants")
+        sub _()
+            constants = m.vectors().constants
+            m.assertEqual(playback.bufferingQuality.STARTUP_GRACE_MS, constants.STARTUP_GRACE_MS)
+            m.assertEqual(playback.bufferingQuality.STALL_MIN_MS, constants.STALL_MIN_MS)
+            m.assertEqual(playback.bufferingQuality.RENDERER_WAIT_BUFFER_MS, constants.RENDERER_WAIT_BUFFER_MS)
+            m.assertEqual(playback.bufferingQuality.STALLS_BEFORE_TRIGGER, constants.STALLS_BEFORE_TRIGGER)
+            m.assertEqual(playback.bufferingQuality.STALL_WINDOW_MS, constants.STALL_WINDOW_MS)
+            m.assertEqual(playback.bufferingQuality.LONG_STALL_MS, constants.LONG_STALL_MS)
+            m.assertEqual(playback.bufferingQuality.PROMPT_SECONDS, constants.PROMPT_SECONDS)
+            m.assertEqual(playback.bufferingQuality.PROMPT_MS, constants.PROMPT_SECONDS * 1000)
+            m.assertEqual(playback.bufferingQuality.REOFFER_MIN_MS, constants.REOFFER_MIN_MS)
+            m.assertEqual(playback.bufferingQuality.NO_LOWER_COOLDOWN_MS, constants.NO_LOWER_COOLDOWN_MS)
+            m.assertEqual(playback.bufferingQuality.REARM_AFTER_UNADOPTED_MS, constants.REARM_AFTER_UNADOPTED_MS)
+            m.assertEqual(playback.bufferingQuality.MIN_ESTIMATE_KBPS, constants.MIN_ESTIMATE_KBPS)
+            m.assertEqual(playback.bufferingQuality.modeOf("unknown"), m.vectors().defaults.mode)
+        end sub
+
+        @it("steps down by the exact integer floor of seven tenths")
+        sub _()
+            m.assertEqual(playback.bufferingQuality.stepDownEstimate(22120), 15484)
+            m.assertEqual(playback.bufferingQuality.stepDownEstimate(63000), 44100)
+            m.assertEqual(playback.bufferingQuality.stepDownEstimate(31600), 22120)
+            m.assertEqual(playback.bufferingQuality.stepDownEstimate(142), 99)
+            m.assertEqual(type(playback.bufferingQuality.stepDownEstimate(22120)), "Integer")
+            m.assertInvalid(playback.bufferingQuality.stepDownEstimate(0))
+            m.assertInvalid(playback.bufferingQuality.stepDownEstimate(invalid))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("missed start deadline")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("lowers a start whose media arrives below its bitrate, on Auto in always")
+        sub _()
+            state = m.starting()
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 9000), [m.autoLowering(9000, 44100)])
+            m.assertEqual(playback.bufferingQuality.keptEstimate(state), 44100)
+            m.assertEqual(playback.bufferingQuality.bufferingAction(state, "p1"), "lowered")
+        end sub
+
+        @it("refuses without evidence that the link is too slow")
+        sub _()
+            state = m.starting()
+            playback.bufferingQuality.setPlanThroughput(state, invalid)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 9000), m.refused(9000), "no measurement")
+            playback.bufferingQuality.setPlanThroughput(state, 63000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 9000), m.refused(9000), "media at the bitrate")
+            playback.bufferingQuality.setPlanThroughput(state, 62999)
+            m.assertEqual(m.typesOf(playback.bufferingQuality.startDeadlinePassed(state, 9000)), ["replan"])
+        end sub
+
+        @it("forgets the measurement when another plan is adopted")
+        sub _()
+            state = m.starting()
+            playback.bufferingQuality.handle(state, m.adopt("p2", 63000), 5000)
+            m.feed(state, "waiting", 5000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 9000), m.refused(9000))
+        end sub
+
+        @it("refuses in ask and never, and on a quality the viewer picked")
+        sub _()
+            for each mode in ["ask", "never"]
+                state = m.starting(mode)
+                m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 9000), m.refused(9000), mode)
+            end for
+            state = playback.bufferingQuality.create("always")
+            playback.bufferingQuality.handle(state, m.adopt("p1", 10000, "1080p-high"), 0)
+            playback.bufferingQuality.setPlanThroughput(state, 1)
+            m.feed(state, "waiting", 0)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 9000), m.refused(9000), "picked")
+        end sub
+
+        @it("refuses during an outage and until LONG_STALL_MS after it")
+        sub _()
+            state = m.starting()
+            m.feed(state, "transport_error_start", 1000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 5000), m.refused(5000), "in the outage")
+            m.feed(state, "transport_error_end", 6000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 11999), m.refused(11999), "just after it")
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 12000), [m.autoLowering(12000, 44100)])
+        end sub
+
+        @it("refuses a renderer wait")
+        sub _()
+            state = m.starting()
+            playback.bufferingQuality.handle(state, { type: "waiting", cause: "renderer" }, 2000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 9000), m.refused(9000))
+        end sub
+
+        @it("refuses a plan that has played")
+        sub _()
+            state = m.playingTitle()
+            playback.bufferingQuality.setPlanThroughput(state, 1)
+            m.feed(state, "waiting", 20000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 22000), m.refused(22000))
+        end sub
+
+        @it("refuses with nothing lower, a pick pending or a lowering pending")
+        sub _()
+            state = playback.bufferingQuality.create("always")
+            playback.bufferingQuality.handle(state, { type: "plan_adopted", plan: { plan_id: "p1", delivered_kbps: 63000, quality: "auto", available_qualities: [{ label: "original", bitrate_kbps: 63000 }] } }, 0)
+            playback.bufferingQuality.setPlanThroughput(state, 1)
+            m.feed(state, "waiting", 0)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 9000), m.refused(9000), "nothing lower")
+
+            state = m.starting()
+            m.feed(state, "pick_sent", 1000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 9000), m.refused(9000), "pick pending")
+
+            state = m.starting()
+            playback.bufferingQuality.startDeadlinePassed(state, 9000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 9500), m.refused(9500), "lowering pending")
+            m.feed(state, "replan_failed", 10000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 11000), m.refused(11000), "waiting out the rearm")
+        end sub
+
+        @it("refuses in the no-lower cooldown")
+        sub _()
+            state = m.starting()
+            playback.bufferingQuality.startDeadlinePassed(state, 9000)
+            outputs = playback.bufferingQuality.handle(state, m.adopt("p2", 63000), 10000)
+            m.assertEqual(outputs, [{ t: 10000, type: "notice", copy: "cant_lower" }])
+            playback.bufferingQuality.setPlanThroughput(state, 1)
+            m.feed(state, "waiting", 10000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 20000), m.refused(20000))
+        end sub
+
+        @it("refuses on a title answered at Auto, across a new attempt")
+        sub _()
+            state = m.lowered()
+            m.feed(state, "select_restore", 140000)
+            m.feed(state, "new_attempt", 150000)
+            playback.bufferingQuality.handle(state, m.adopt("p3", 63000), 151000)
+            playback.bufferingQuality.setPlanThroughput(state, 1)
+            m.feed(state, "waiting", 151000)
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 160000), m.refused(160000))
+        end sub
+
+        @it("falls back to the failure path when its lowering fails")
+        sub _()
+            state = m.starting()
+            playback.bufferingQuality.startDeadlinePassed(state, 9000)
+            m.assertEqual(m.feed(state, "replan_failed", 10000), m.refused(10000))
+            m.assertEqual(playback.bufferingQuality.bufferingAction(state, "p1"), "none")
+        end sub
+
+        @it("falls back to the failure path when its lowering is never adopted")
+        sub _()
+            state = m.starting()
+            playback.bufferingQuality.startDeadlinePassed(state, 9000)
+            ' The start's long stall comes due at 16000 and finds the lowering
+            ' in flight; the rearm at 69000 gives up on it.
+            m.assertEqual(playback.bufferingQuality.nextWake(state), 16000)
+            m.assertEqual(playback.bufferingQuality.advance(state, 68999), [])
+            m.assertEqual(playback.bufferingQuality.nextWake(state), 69000)
+            m.assertEqual(playback.bufferingQuality.advance(state, 69000), m.refused(69000))
+        end sub
+
+        @it("does not fall back once a plan is adopted")
+        sub _()
+            state = m.starting()
+            playback.bufferingQuality.startDeadlinePassed(state, 9000)
+            m.assertEqual(m.typesOf(playback.bufferingQuality.handle(state, m.adopt("p2", 31600), 10000)), ["undo_shown"])
+            outputs = m.feed(state, "replan_failed", 11000)
+            outputs.Append(playback.bufferingQuality.advance(state, 80000))
+            m.assertEqual(m.typesOf(outputs), ["pill_hidden"])
+        end sub
+
+        @it("lowers a replacement still loading after the attempt played")
+        sub _()
+            state = m.playingTitle()
+            playback.bufferingQuality.handle(state, { type: "plan_adopted", controllerInitiated: false, plan: m.adopt("p2", 63000).plan }, 30000)
+            playback.bufferingQuality.setPlanThroughput(state, 1)
+            playback.bufferingQuality.handle(state, { type: "waiting", cause: "reload" }, 30000)
+            m.assertEqual(playback.bufferingQuality.advance(state, 60000), [], "a reload's wait is no stall")
+            m.assertEqual(playback.bufferingQuality.startDeadlinePassed(state, 60000), [m.autoLowering(60000, 44100)])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("evidence before the attempt plays")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("does not lower a slow start without a measurement, nor count its wait at the first frame")
+        sub _()
+            state = playback.bufferingQuality.create("always")
+            playback.bufferingQuality.handle(state, m.adopt("p1", 63000), 0)
+            m.feed(state, "waiting", 0)
+            outputs = playback.bufferingQuality.advance(state, 14000)
+            outputs.Append(m.feed(state, "playing", 14000))
+            outputs.Append(m.feed(state, "waiting", 20000))
+            outputs.Append(m.feed(state, "playing", 21500))
+            m.assertEqual(outputs, [])
+            m.assertEqual(playback.bufferingQuality.summary(state, "p1", 21500).stall_count, 2, "the summary still counts both")
+        end sub
+
+        @it("needs no evidence once the attempt has played")
+        sub _()
+            state = m.playingTitle()
+            m.feed(state, "waiting", 125000)
+            m.assertEqual(playback.bufferingQuality.advance(state, 140000), [m.autoLowering(131000, 44100)])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("plan summary")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("counts played time and stalls, without the grace")
+        sub _()
+            state = m.playingTitle()
+            m.feed(state, "waiting", 5000)
+            m.feed(state, "playing", 12000)
+            m.feed(state, "waiting", 30000)
+            m.feed(state, "playing", 30500)
+            m.feed(state, "pause", 40000)
+            m.feed(state, "playing", 50000)
+            m.assertEqual(playback.bufferingQuality.summary(state, "p1", 60000), {
+                played_ms: 42500,
+                stall_count: 1,
+                stall_total_ms: 2500,
+                stall_longest_ms: 2000,
+                delivered_kbps: 63000,
+                buffering_mode: "always",
+                buffering_action: "none"
+            })
+        end sub
+
+        @it("counts a stall in progress when the plan ends, and keeps the ended plan's figures")
+        sub _()
+            state = m.playingTitle()
+            m.feed(state, "waiting", 30000)
+            playback.bufferingQuality.handle(state, { type: "plan_adopted", controllerInitiated: false, plan: m.adopt("p2", 63000).plan }, 34000)
+            expected = { played_ms: 30000, stall_count: 1, stall_total_ms: 4000, stall_longest_ms: 4000, delivered_kbps: 63000, buffering_mode: "always", buffering_action: "none" }
+            m.assertEqual(playback.bufferingQuality.summary(state, "p1", 34000), expected)
+            m.assertEqual(playback.bufferingQuality.summary(state, "p1", 90000), expected, "an ended plan's figures do not move")
+        end sub
+
+        @it("leaves out outage time, including the stall before the outage")
+        sub _()
+            state = m.playingTitle()
+            m.feed(state, "waiting", 30000)
+            m.feed(state, "transport_error_start", 32000)
+            m.feed(state, "transport_error_end", 40000)
+            m.feed(state, "playing", 41500)
+            figures = playback.bufferingQuality.summary(state, "p1", 41500)
+            m.assertEqual(figures.stall_count, 1)
+            m.assertEqual(figures.stall_total_ms, 1500)
+            m.assertEqual(figures.stall_longest_ms, 1500)
+        end sub
+
+        @it("times a stall a pause ends without counting it")
+        sub _()
+            state = m.playingTitle()
+            m.feed(state, "waiting", 30000)
+            m.feed(state, "pause", 33000)
+            figures = playback.bufferingQuality.summary(state, "p1", 40000)
+            m.assertEqual(figures.stall_count, 0)
+            m.assertEqual(figures.stall_total_ms, 3000)
+            m.assertEqual(figures.played_ms, 30000)
+        end sub
+
+        @it("reports the mode and the action, and omits a missing delivered bitrate")
+        sub _()
+            state = playback.bufferingQuality.create("never")
+            playback.bufferingQuality.handle(state, m.adopt("p1", 0), 0)
+            m.feed(state, "playing", 0)
+            m.feed(state, "waiting", 125000)
+            m.assertEqual(playback.bufferingQuality.advance(state, 132000), [], "never only reports")
+            figures = playback.bufferingQuality.summary(state, "p1", 132000)
+            m.assertEqual(figures.buffering_mode, "never")
+            m.assertEqual(figures.buffering_action, "ignored")
+            m.assertFalse(figures.DoesExist("delivered_kbps"))
+            m.assertInvalid(playback.bufferingQuality.summary(state, "p9", 132000))
+            m.assertEqual(playback.bufferingQuality.bufferingAction(state, "p9"), "none")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("pill and timers")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("describes the pill's countdown, frozen by a pause and hidden behind another pill")
+        sub _()
+            state = m.playingTitle()
+            m.feed(state, "waiting", 125000)
+            m.assertEqual(playback.bufferingQuality.nextWake(state), 131000)
+            m.assertInvalid(playback.bufferingQuality.pill(state, 125000))
+            playback.bufferingQuality.handle(state, m.adopt("p2", 31600), 134000)
+            m.feed(state, "playing", 134000)
+            m.assertEqual(playback.bufferingQuality.pill(state, 140000), { kind: "undo", remainingMs: 9000, visible: true, running: true })
+            m.feed(state, "pause", 140000)
+            m.assertEqual(playback.bufferingQuality.pill(state, 150000), { kind: "undo", remainingMs: 9000, visible: true, running: false })
+            m.feed(state, "playing", 150000)
+            m.assertEqual(m.feed(state, "pill_obscured", 152000), [{ t: 152000, type: "pill_hidden" }])
+            m.assertEqual(playback.bufferingQuality.pill(state, 155000), { kind: "undo", remainingMs: 7000, visible: false, running: false })
+            m.assertEqual(m.feed(state, "pill_unobscured", 155000), [{ t: 155000, type: "undo_shown" }])
+            m.assertEqual(playback.bufferingQuality.nextWake(state), 162000)
+            m.assertEqual(playback.bufferingQuality.advance(state, 162000), [{ t: 162000, type: "pill_hidden" }])
+            m.assertInvalid(playback.bufferingQuality.pill(state, 162000))
+        end sub
+
+        @it("hides the pill on Back and when the mode becomes never")
+        sub _()
+            state = m.lowered()
+            m.assertEqual(m.feed(state, "back", 140000), [{ t: 140000, type: "pill_hidden" }])
+            state = m.lowered()
+            playback.bufferingQuality.setMode(state, "never")
+            m.assertInvalid(playback.bufferingQuality.pill(state, 140000))
+            m.assertInvalid(playback.bufferingQuality.nextWake(state))
+        end sub
+
+        @it("fires timers due before an event first, in time order")
+        sub _()
+            state = m.lowered()
+            outputs = m.feed(state, "waiting", 200000)
+            outputs.Append(m.feed(state, "playing", 210000))
+            m.assertEqual(m.typesOf(outputs), ["pill_hidden", "replan"])
+            m.assertEqual(outputs[0].t, 149000)
+            m.assertEqual(outputs[1], m.autoLowering(206000, 22120))
+        end sub
+
+        @it("takes Select as the visible pill's primary action")
+        sub _()
+            state = m.lowered()
+            outputs = m.feed(state, "select", 140000)
+            m.assertEqual(outputs[1], { t: 140000, type: "replan", body: { operation: "quality_change", quality_preference: "auto", learned_limit: "clear" } })
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("kept estimate")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("keeps the estimate before a lowering that could not be sent")
+        sub _()
+            state = m.lowered()
+            m.feed(state, "back", 140000)
+            m.feed(state, "waiting", 200000)
+            playback.bufferingQuality.advance(state, 206000)
+            m.assertEqual(playback.bufferingQuality.keptEstimate(state), 22120)
+            m.feed(state, "replan_refused", 207000)
+            m.assertEqual(playback.bufferingQuality.keptEstimate(state), 44100)
+            outputs = playback.bufferingQuality.handle(state, { type: "client_replan", operation: "track_change" }, 208000)
+            m.assertEqual(outputs, [{ t: 208000, type: "replan", body: { operation: "track_change", quality_preference: "auto", bandwidth_estimate_kbps: 44100 } }])
+        end sub
+
+        @it("ignores a repeat adoption of the playing plan")
+        sub _()
+            state = m.lowered()
+            m.assertEqual(playback.bufferingQuality.handle(state, m.adopt("p2", 31600), 136000), [])
+            m.assertEqual(playback.bufferingQuality.pill(state, 136000).kind, "undo")
+        end sub
+
+    end class
+
+end namespace

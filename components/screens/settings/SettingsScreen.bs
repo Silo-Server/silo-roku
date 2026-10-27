@@ -9,6 +9,8 @@ import "pkg:/source/nav/client.bs"
 import "pkg:/source/nav/routes.bs"
 import "pkg:/source/onboarding/address.bs"
 import "pkg:/source/playback/themeMusic.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/playback/connection.bs"
 import "pkg:/source/settings/settings.bs"
 import "pkg:/source/util/i18n.bs"
 
@@ -51,6 +53,13 @@ sub init()
     m.pending = invalid
     m.readRequest = invalid
     m.rows = []
+    ' Each row's section, "" for none: the controls', then Connection's.
+    m.rowSections = []
+    ' Playback's Connection rows after the controls (connectionRows): ids
+    ' "connection.limit" and "connection.speed", from AppScene's
+    ' playbackConnection.
+    m.connectionRows = []
+    m.connection = invalid
     m.rail = []
     ' Whether the server offers theme music to the profile, which shows the
     ' theme music rows (components/audio/ThemeMusic's offered).
@@ -166,6 +175,12 @@ sub onShow(event as Object)
     m.released = false
     readIdentity()
     readThemeOffer()
+    scene = m.top.getScene()
+    m.connection = scene.playbackConnection
+    ' AppScene unsubscribes the screen's owner when it goes.
+    platform.subscribe(m.top.owner, [platform.topic.CONNECTION_STATUS], "onConnectionStatus")
+    ' The Connection rows read the connection again each visit.
+    scene.callFunc("connectionRefresh")
     ' A pending save that was never confirmed belongs to an earlier visit.
     m.pending = invalid
     if util.isObject(event.restore)
@@ -235,6 +250,93 @@ end sub
 function shows(control as Object) as Boolean
     if util.text(control.requires) = "themeMusic" then return m.themeOffered
     return true
+end function
+
+' AppScene's connection state changed: the Connection rows follow it.
+sub onConnectionStatus(event as Object)
+    m.connection = event.status
+    if m.category <> "playback" then return
+    if not sameConnectionRows()
+        at = m.at
+        showCategory()
+        m.at = at
+        clampFocus()
+    end if
+    paint()
+    describeFocus()
+end sub
+
+' The Connection rows Playback shows now (docs/buffering-quality.md
+' section 5.5): the learned limit with Reset, while one holds this
+' connection and the mode is not Never, then the connection speed with
+' Test speed, where the server offers the test.
+function connectionRows() as Object
+    out = []
+    c = m.connection
+    if not util.isObject(c) then return out
+    if util.isTrue(c.buffering) and util.isObject(c.connection) and util.isObject(c.connection.learned_limit) and bufferingMode() <> "never" then out.Push("connection.limit")
+    if util.isTrue(c.speed) then out.Push("connection.speed")
+    return out
+end function
+
+function sameConnectionRows() as Boolean
+    rows = connectionRows()
+    if rows.Count() <> m.connectionRows.Count() then return false
+    for i = 0 to rows.Count() - 1
+        if rows[i] <> m.connectionRows[i] then return false
+    end for
+    return true
+end function
+
+function bufferingMode() as String
+    if m.values = invalid then return "always"
+    item = m.values["playback.buffering_quality_mode"]
+    if item = invalid then return "always"
+    return util.text(item.value)
+end function
+
+' The row's title and value.
+sub paintConnectionRow(row as Object, id as String)
+    c = m.connection
+    if id = "connection.limit"
+        row.title.text = playback.connection.limitLine(c.connection.learned_limit, m.copy)
+        row.value.text = i18n.text("settings.connection.reset")
+    else
+        row.title.text = i18n.text("settings.control.connectionSpeed")
+        if util.isTrue(c.manualTest)
+            row.value.text = i18n.text("settings.connection.testing")
+        else
+            row.value.text = playback.connection.statusLine(c.connection, CreateObject("roDateTime").AsSeconds(), m.copy)
+        end if
+    end if
+end sub
+
+' The footer under a Connection row: what OK does, the budget, and the
+' last test's or reset's message.
+function connectionFooter(id as String) as String
+    c = m.connection
+    parts = []
+    message = invalid
+    if util.isObject(c) then message = c.message
+    if util.isObject(message)
+        kind = message.kind
+        if kind = "retry"
+            left = playback.values.number(message.untilEpoch, 0) - CreateObject("roDateTime").AsSeconds()
+            if left > 0 then parts.Push(playback.connection.retryText(left, m.copy))
+        else if kind = "stopPlayback" or kind = "measureFailed" or kind = "notSaved" or kind = "resetFailed"
+            parts.Push(i18n.text("settings.connection." + kind))
+        end if
+    end if
+    if id = "connection.limit"
+        parts.Push(i18n.text("settings.connection.resetHint"))
+    else
+        parts.Push(i18n.text("settings.connection.testHint"))
+        if util.isObject(c.connection) and not (bufferingMode() = "never" and util.isObject(c.connection.learned_limit))
+            budget = playback.connection.budgetLine(c.connection.auto_budget_kbps, m.copy)
+            if budget <> "" then parts.Push(budget)
+        end if
+    end if
+    return parts.Join(" ")
 end function
 
 function focusKey() as Object
@@ -319,6 +421,13 @@ sub onValues(event as Object)
     if enabled <> invalid and repeats <> invalid and player <> invalid then player.callFunc("settingChanged", { enabled: util.isTrue(enabled.value), loop: util.isTrue(repeats.value) })
     saved = m.pending <> invalid
     m.pending = invalid
+    ' A mode of Never hides the learned limit.
+    if m.category = "playback" and not sameConnectionRows()
+        at = m.at
+        showCategory()
+        m.at = at
+        clampFocus()
+    end if
     paint()
     if saved
         notice("settings.saved", false)
@@ -352,16 +461,28 @@ sub showCategory()
     group = m.top.findNode("rows")
     group.removeChildrenIndex(group.getChildCount(), 0)
     m.rows = []
+    m.rowSections = []
     m.shown = []
+    m.connectionRows = []
     for each control in m.controls
         if control.category = m.category and shows(control)
             row = makeRow(group, control.key, true)
             row.title.text = i18n.text("settings.control." + control.label)
             row.section.text = UCase(i18n.text("settings.section." + control.section))
             m.rows.Push(row)
+            m.rowSections.Push(control.section)
             m.shown.Push(control)
         end if
     end for
+    if m.category = "playback" and m.controls.Count() > 0
+        m.connectionRows = connectionRows()
+        for each id in m.connectionRows
+            row = makeRow(group, id, true)
+            row.section.text = UCase(i18n.text("settings.section.connection"))
+            m.rows.Push(row)
+            m.rowSections.Push("connection")
+        end for
+    end if
     if m.category = "server"
         row = makeRow(group, "server.address", false)
         row.title.text = i18n.text("settings.address")
@@ -370,6 +491,7 @@ sub showCategory()
         row = makeRow(group, "server.change", true)
         row.title.text = i18n.text("settings.changeServer")
         m.rows.Push(row)
+        m.rowSections.Append(["", ""])
     end if
     m.at = 0
     m.first = 0
@@ -413,7 +535,7 @@ sub paint()
     for i = 0 to m.rows.Count() - 1
         row = m.rows[i]
         section = ""
-        if i < m.shown.Count() then section = m.shown[i].section
+        if i < m.rowSections.Count() then section = m.rowSections[i]
         heading = section <> "" and section <> previous
         if i >= m.first
             if i > m.first and heading then y = y + 40
@@ -441,6 +563,8 @@ sub paint()
             control = m.shown[i]
             item = m.values[control.key]
             if item <> invalid then row.value.text = settings.valueLabel(control, item.value, m.copy)
+        else if i >= m.shown.Count() and i - m.shown.Count() < m.connectionRows.Count()
+            paintConnectionRow(row, m.connectionRows[i - m.shown.Count()])
         end if
     end for
     hint = ""
@@ -461,7 +585,7 @@ function lastVisible(first as Integer) as Integer
     last = first - 1
     for i = first to m.rows.Count() - 1
         section = ""
-        if i < m.shown.Count() then section = m.shown[i].section
+        if i < m.rowSections.Count() then section = m.rowSections[i]
         if i > first and section <> "" and section <> previous then y = y + 40
         if y + ROW_HEIGHT > PANE_HEIGHT then return last
         last = i
@@ -485,6 +609,11 @@ sub describeFocus()
         end if
     end if
     if m.category = "subtitles" then message = message + " " + i18n.text("settings.captionSystem")
+    connection = focusedConnectionRow()
+    if connection <> ""
+        m.top.findNode("footer").setFields({ text: connectionFooter(connection), color: theme.color.TEXT_TERTIARY })
+        return
+    end if
     m.top.findNode("footer").setFields({ text: i18n.text(key) + message, color: theme.color.TEXT_TERTIARY })
 end sub
 
@@ -564,6 +693,10 @@ function activate() as Boolean
     else if m.category = "server" and m.at = 1
         nav.push(nav.route.SETUP, { pushed: true })
         return true
+    else if focusedConnectionRow() = "connection.limit"
+        m.top.getScene().callFunc("connectionResetLimit")
+    else if focusedConnectionRow() = "connection.speed"
+        m.top.getScene().callFunc("connectionTestSpeed")
     else if m.failed
         retry()
     else if not m.busy and m.values <> invalid and m.at < m.shown.Count()
@@ -582,6 +715,14 @@ function activate() as Boolean
         return true
     end if
     return false
+end function
+
+' The Connection row with focus, or "".
+function focusedConnectionRow() as String
+    if not m.inPane or m.category <> "playback" then return ""
+    index = m.at - m.shown.Count()
+    if index < 0 or index >= m.connectionRows.Count() then return ""
+    return m.connectionRows[index]
 end function
 
 sub retry()

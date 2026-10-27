@@ -1,0 +1,98 @@
+import "pkg:/source/playback/speedTest.bs"
+import "pkg:/source/util/values.bs"
+
+' See SpeedTestTask.xml. The clock starts as the first chunk is asked for, so
+' that chunk's request time falls in window 0, which never counts; the gaps
+' between chunks count as time, so the test can only read low.
+const CHUNK_PATH = "tmp:/speedtest.bin"
+' A chunk still running this long after the test's limit is abandoned.
+const LIMIT_GRACE_MS = 2000
+
+sub init()
+    m.top.functionName = "measure"
+end sub
+
+sub measure()
+    request = m.top.request
+    if not util.isObject(request) then request = {}
+    m.top.result = transfer(util.text(request.url), util.text(request.mode), request.targetKbps)
+    DeleteFile(CHUNK_PATH)
+end sub
+
+function transfer(url as String, mode as String, targetKbps as Dynamic) as Object
+    if url = "" then return failed("unavailable", invalid)
+    port = CreateObject("roMessagePort")
+    m.top.observeField("cancel", port)
+    xfer = CreateObject("roUrlTransfer")
+    xfer.SetPort(port)
+    if LCase(Left(url, 6)) = "https:" then xfer.SetCertificatesFile("common:/certs/ca-bundle.crt")
+    xfer.RetainBodyOnError(false)
+    meter = playback.speedTest.create(mode, targetKbps)
+    total = playback.speedTest.requestBytes(mode)
+    limitMs = playback.speedTest.maxMs(mode)
+    clock = CreateObject("roTimespan")
+    sent = 0
+    chunk = playback.speedTest.FIRST_CHUNK_BYTES
+    while true
+        ' A cancel set before the observer existed sends no event: the flag
+        ' itself is read before each chunk, the first included.
+        if m.top.cancel then return failed("cancelled", invalid)
+        xfer.SetUrl(playback.speedTest.withSize(url, chunk))
+        startedAt = clock.TotalMilliseconds()
+        if not xfer.AsyncGetToFile(CHUNK_PATH) then return failed("network", invalid)
+        deadline = limitMs + LIMIT_GRACE_MS
+        if sent = 0 then deadline = playback.speedTest.FIRST_BYTE_DEADLINE_MS + limitMs
+        event = invalid
+        while event = invalid
+            msg = wait(100, port)
+            if type(msg) = "roUrlEvent" and msg.GetInt() = 1
+                event = msg
+            else if type(msg) = "roSGNodeEvent" and msg.getField() = "cancel"
+                xfer.AsyncCancel()
+                return failed("cancelled", invalid)
+            else if clock.TotalMilliseconds() > deadline
+                xfer.AsyncCancel()
+                ' Nothing in time at all, or a chunk that would not end: the
+                ' silence since the last chunk counts, window by window, up
+                ' to the test's limit, so a stalled link reads as one.
+                if sent = 0 then return failed("network", invalid)
+                playback.speedTest.advanceTo(meter, clock.TotalMilliseconds())
+                exit while
+            end if
+        end while
+        if event = invalid then exit while
+        endedAt = clock.TotalMilliseconds()
+        code = event.GetResponseCode()
+        if code = 429 then return failed("rate_limited", playback.speedTest.retryAfter(event.GetResponseHeaders()))
+        if code <> 200 then return failed(statusReason(code), invalid)
+        info = CreateObject("roFileSystem").Stat(CHUNK_PATH)
+        size = chunk
+        if util.isObject(info) and util.isNumber(info.size) then size = info.size
+        DeleteFile(CHUNK_PATH)
+        ' A chunk that ended short of its size failed mid-body.
+        if size < chunk then return failed("network", invalid)
+        playback.speedTest.spread(meter, startedAt, endedAt, size)
+        sent = sent + size
+        if playback.speedTest.advanceTo(meter, endedAt) then exit while
+        if sent >= total
+            playback.speedTest.ended(meter, endedAt)
+            exit while
+        end if
+        chunk = playback.speedTest.nextTimedChunk(size, endedAt - startedAt, total - sent, limitMs - endedAt)
+        if chunk <= 0 then exit while
+    end while
+    result = playback.speedTest.result(meter)
+    if result = invalid then return failed("nothing_measured", invalid)
+    out = { ok: true }
+    out.Append(result)
+    return out
+end function
+
+function statusReason(code as Integer) as String
+    if code > 0 then return "unavailable"
+    return "network"
+end function
+
+function failed(reason as String, waitSeconds as Dynamic) as Object
+    return { ok: false, reason: reason, retryAfter: waitSeconds }
+end function

@@ -1,0 +1,413 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/playback/connection.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/playback/speedTest.bs"
+import "pkg:/source/platform/topics.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' AppScene's connection checks (docs/buffering-quality.md section 5.4, the
+' shared spec's When to test). A check reads the playback capabilities and
+' GET /api/v2/playback/connection at once, so a start a few seconds later
+' already sends the reading; then, after QUIET_MS and only when automatic
+' tests are on, no current reading proves the link, nothing plays, and no
+' 429 holds tests on this server, it reads the connection again and runs
+' the quick test. A check runs at sign-in (a profile or server change too)
+' and when the network changes; Roku channels never run in the background,
+' so there is no foreground trigger. There is no periodic test.
+'
+' The test needs the probe's location (bandwidth_probe_location_v1): Roku
+' follows redirects with no app control and forwards the profile headers
+' (assumption A-14), so it never fetches the probe URL that may redirect,
+' only the credential-free URL the server names (SpeedTestTask).
+'
+' playbackConnection publishes what Settings shows: { identity, buffering,
+' speed, connection, maxAgeSeconds, targetKbps, transport, testing,
+' message, reading }. The player asks connectionEstimate() for a start's
+' estimate and reports playback with connectionMedia().
+const CONNECTION_OWNER = "connection"
+const CONNECTION_QUIET_MS = 5000
+' No automatic test runs this soon after a playback starts.
+const CONNECTION_AFTER_PLAYBACK_MS = 60000
+const CONNECTION_PATH = "/api/v2/playback/connection"
+const CONNECTION_CAPABILITIES_PATH = "/api/v2/playback/capabilities"
+const CONNECTION_LOCATION_PATH = "/api/v2/playback/bandwidth-probe/location"
+const CONNECTION_RESULTS_PATH = "/api/v2/playback/bandwidth-probe/results"
+const CONNECTION_BUFFERING_FEATURE = "buffering_quality_v1"
+const CONNECTION_SPEED_FEATURE = "connection_speed_v1"
+const CONNECTION_LOCATION_FEATURE = "bandwidth_probe_location_v1"
+
+sub connectionInit()
+    m.conn = {
+        identity: "",
+        server: "",
+        network: invalid,
+        ' { buffering, speed, location, automatic, targetKbps, maxAgeSeconds }
+        caps: invalid,
+        connection: invalid,
+        ' A result the server never answered for: kept for starts only.
+        unsent: invalid,
+        ' Each check's number: an answer to an older one is dropped.
+        generation: 0,
+        ' Server origin to the uptime (ms) automatic tests wait for (429).
+        holdUntil: {},
+        test: invalid,
+        ' Each test's number: an answer to a replaced test is dropped.
+        tests: 0,
+        testAfterRead: false,
+        ' This check ran its automatic test: a test that measured nothing or
+        ' could not be saved waits for the next check, never a re-read.
+        tested: false,
+        media: false,
+        mediaStartedAt: invalid,
+        message: invalid
+    }
+    m.connClock = CreateObject("roTimespan")
+    m.connTimer = CreateObject("roSGNode", "Timer")
+    m.connTimer.repeat = false
+    m.connTimer.duration = CONNECTION_QUIET_MS / 1000
+    m.connTimer.observeField("fire", "onConnectionQuiet")
+    connectionPublish()
+end sub
+
+' --- Triggers --------------------------------------------------------------------
+
+' From onApiSession: a new sign-in, profile, or server checks again, and a
+' result from before it is discarded.
+sub connectionSessionChanged()
+    identity = ""
+    view = m.apiSession
+    if view <> invalid and view.status = "signed_in" and view.profile <> invalid then identity = util.text(view.origin) + "|" + util.text(view.accountId) + "|" + util.text(view.profile.id)
+    if identity = m.conn.identity then return
+    connectionReset()
+    m.conn.identity = identity
+    if view <> invalid then m.conn.server = util.text(view.origin)
+    connectionCheck()
+end sub
+
+' From onPlatformEvent: the network came back or moved.
+sub connectionNetwork(event as Object)
+    previous = m.conn.network
+    m.conn.network = event
+    if not util.isTrue(event.up)
+        connectionCancelTest()
+        connectionPublish()
+        return
+    end if
+    if previous <> invalid and util.isTrue(previous.up) and previous.key = event.key then return
+    ' A reading belongs to the network it was taken on.
+    identity = m.conn.identity
+    connectionReset()
+    m.conn.identity = identity
+    connectionCheck()
+end sub
+
+sub connectionReset()
+    connectionCancelTest()
+    m.connTimer.control = "stop"
+    m.conn.generation = m.conn.generation + 1
+    m.conn.tested = false
+    m.conn.caps = invalid
+    m.conn.connection = invalid
+    m.conn.unsent = invalid
+    m.conn.message = invalid
+    m.conn.testAfterRead = false
+    connectionPublish()
+end sub
+
+' --- The check -----------------------------------------------------------------
+
+sub connectionCheck()
+    if m.conn.identity = "" or not connectionUp() then return
+    connectionSend({ path: CONNECTION_CAPABILITIES_PATH, auth: "profile" }, "onConnectionCapabilities")
+end sub
+
+function connectionUp() as Boolean
+    return m.conn.network = invalid or util.isTrue(m.conn.network.up)
+end function
+
+sub onConnectionCapabilities(event as Object)
+    result = connectionAnswer(event)
+    if result = invalid then return
+    body = result.body
+    if result.ok <> true or not util.isObject(body)
+        log.info("connection", "capabilities unread", { status: result.status })
+        return
+    end if
+    features = body.features
+    if not playback.values.isArray(features) then features = []
+    m.conn.caps = {
+        buffering: util.contains(features, CONNECTION_BUFFERING_FEATURE),
+        speed: util.contains(features, CONNECTION_SPEED_FEATURE) and util.text(body.bandwidth_probe_url) <> "",
+        location: util.contains(features, CONNECTION_LOCATION_FEATURE),
+        automatic: body.bandwidth_probe_automatic <> false,
+        targetKbps: body.bandwidth_probe_target_kbps,
+        maxAgeSeconds: body.bandwidth_probe_max_age_seconds
+    }
+    connectionRead()
+end sub
+
+' Reads the connection, if the server has it.
+sub connectionRead()
+    caps = m.conn.caps
+    if caps = invalid or not (caps.buffering or caps.speed)
+        connectionPublish()
+        return
+    end if
+    connectionSend({ path: CONNECTION_PATH, auth: "profile" }, "onConnectionRead")
+end sub
+
+sub onConnectionRead(event as Object)
+    result = connectionAnswer(event)
+    if result = invalid then return
+    ' A read that fails changes nothing held and runs no test.
+    if result.ok = true and util.isObject(result.body) then m.conn.connection = result.body
+    connectionPublish()
+    if result.ok <> true
+        m.conn.testAfterRead = false
+        return
+    end if
+    if m.conn.testAfterRead
+        m.conn.testAfterRead = false
+        if connectionTestDue() then connectionRunTest(playback.speedTest.QUICK, false)
+    else if connectionTestDue()
+        m.connTimer.control = "start"
+    end if
+end sub
+
+' The quiet time after a check: read again just before the test.
+sub onConnectionQuiet()
+    if not connectionTestDue() then return
+    m.conn.testAfterRead = true
+    connectionRead()
+end sub
+
+' Whether the automatic quick test is due now.
+function connectionTestDue() as Boolean
+    caps = m.conn.caps
+    if caps = invalid or not caps.speed or not caps.location or not caps.automatic then return false
+    if m.conn.tested or m.conn.test <> invalid or not connectionUp() or not connectionQuietFromMedia() or connectionHeld() then return false
+    return not playback.connection.provesLink(m.conn.connection, caps.targetKbps, caps.maxAgeSeconds, connectionEpoch())
+end function
+
+function connectionQuietFromMedia() as Boolean
+    if m.conn.media then return false
+    return m.conn.mediaStartedAt = invalid or m.connClock.TotalMilliseconds() - m.conn.mediaStartedAt >= CONNECTION_AFTER_PLAYBACK_MS
+end function
+
+function connectionHeld() as Boolean
+    until = m.conn.holdUntil[m.conn.server]
+    return util.isNumber(until) and m.connClock.TotalMilliseconds() < until
+end function
+
+' --- The test ------------------------------------------------------------------
+
+' mode is playback.speedTest's; manual is Test speed.
+sub connectionRunTest(mode as String, manual as Boolean)
+    m.conn.tests = m.conn.tests + 1
+    m.conn.test = { id: m.conn.tests, mode: mode, manual: manual, task: invalid, reported: invalid }
+    if not manual then m.conn.tested = true
+    m.conn.message = invalid
+    connectionPublish()
+    query = { size: playback.speedTest.requestBytes(mode) }
+    connectionSend({ path: CONNECTION_LOCATION_PATH, query: query, auth: "profile" }, "onConnectionLocation", m.conn.test.id)
+end sub
+
+sub onConnectionLocation(event as Object)
+    result = connectionAnswer(event)
+    test = connectionTestOf(event)
+    if result = invalid or test = invalid then return
+    url = ""
+    if result.ok = true and util.isObject(result.body) then url = util.text(result.body.url)
+    if url = ""
+        connectionTestEnded({ ok: false, reason: "unavailable" })
+        return
+    end if
+    caps = m.conn.caps
+    target = invalid
+    if caps <> invalid then target = caps.targetKbps
+    task = CreateObject("roSGNode", "SpeedTestTask")
+    task.request = { url: url, mode: test.mode, targetKbps: target }
+    task.observeField("result", "onConnectionMeasured")
+    test.task = task
+    task.control = "run"
+end sub
+
+sub onConnectionMeasured(event as Object)
+    test = m.conn.test
+    if test = invalid or test.task = invalid or not event.getRoSGNode().isSameNode(test.task) then return
+    connectionTestEnded(event.getData())
+end sub
+
+' The transfer answered: a result is reported, then the connection read
+' again; a 429 holds automatic tests on this server.
+sub connectionTestEnded(result as Object)
+    test = m.conn.test
+    if test = invalid then return
+    test.task = invalid
+    if util.isTrue(result.ok)
+        log.info("connection", "speed test", { mode: test.mode, kbps: result.kbps, lowerBound: result.lower_bound })
+        body = { kbps: result.kbps, bytes: result.bytes, duration_ms: result.duration_ms, transport: connectionTransport() }
+        if util.isTrue(result.lower_bound) then body.lower_bound = true
+        if test.manual then body.manual = true
+        test.reported = body
+        connectionSend({ method: "POST", path: CONNECTION_RESULTS_PATH, body: body, auth: "profile" }, "onConnectionReported", test.id)
+        return
+    end if
+    log.info("connection", "speed test measured nothing", { mode: test.mode, reason: result.reason })
+    if result.reason = "rate_limited"
+        waitMs = playback.values.number(result.retryAfter, 30) * 1000
+        m.conn.holdUntil[m.conn.server] = m.connClock.TotalMilliseconds() + waitMs
+        ' Settings counts down to untilEpoch, in the device's seconds.
+        if test.manual then m.conn.message = { kind: "retry", untilEpoch: connectionEpoch() + Int(waitMs / 1000) }
+    else if test.manual and result.reason <> "cancelled"
+        m.conn.message = { kind: "measureFailed" }
+    end if
+    m.conn.test = invalid
+    connectionPublish()
+end sub
+
+sub onConnectionReported(event as Object)
+    result = connectionAnswer(event)
+    test = connectionTestOf(event)
+    if result = invalid or test = invalid or test.reported = invalid then return
+    m.conn.test = invalid
+    if result.ok = true
+        m.conn.unsent = invalid
+    else if result.status = 0
+        ' Never answered: the result may serve starts, never a refused one.
+        m.conn.unsent = { kbps: test.reported.kbps, at: connectionEpoch() }
+        if test.manual then m.conn.message = { kind: "notSaved" }
+    else if test.manual
+        m.conn.message = { kind: "notSaved" }
+    end if
+    connectionRead()
+end sub
+
+sub connectionCancelTest()
+    test = m.conn.test
+    if test = invalid then return
+    m.conn.test = invalid
+    if test.task <> invalid
+        test.task.unobserveField("result")
+        test.task.cancel = true
+    end if
+    connectionPublish()
+end sub
+
+function connectionTransport() as String
+    if m.conn.network <> invalid and util.isString(m.conn.network.transport) then return m.conn.network.transport
+    return "other"
+end function
+
+' --- Interface functions ---------------------------------------------------------
+
+' callFunc("connectionEstimate"): the start's estimate for the signed-in
+' identity on this network, in kbps, or invalid.
+function connectionEstimate() as Dynamic
+    caps = m.conn.caps
+    if caps = invalid then return invalid
+    estimate = playback.connection.freshEstimate(m.conn.connection, caps.maxAgeSeconds, connectionEpoch())
+    unsent = m.conn.unsent
+    if unsent <> invalid and playback.connection.isCurrent(unsent.at, caps.maxAgeSeconds, connectionEpoch())
+        if estimate = invalid or unsent.kbps > estimate then estimate = unsent.kbps
+    end if
+    return estimate
+end function
+
+' callFunc("connectionMedia", active): playback started or ended. A test
+' running as playback starts measured nothing.
+sub connectionMedia(active as Boolean)
+    m.conn.media = active
+    if active
+        m.conn.mediaStartedAt = m.connClock.TotalMilliseconds()
+        connectionCancelTest()
+        m.connTimer.control = "stop"
+    end if
+end sub
+
+' callFunc("connectionRefresh"): Settings opened Playback, so read again.
+sub connectionRefresh()
+    if m.conn.caps = invalid
+        connectionCheck()
+    else
+        connectionRead()
+    end if
+end sub
+
+' callFunc("connectionTestSpeed"): Test speed, the accurate test, whenever
+' nothing plays; it replaces an automatic test and joins a running one.
+sub connectionTestSpeed()
+    caps = m.conn.caps
+    if caps = invalid or not caps.speed or not caps.location then return
+    if m.conn.media
+        m.conn.message = { kind: "stopPlayback" }
+        connectionPublish()
+        return
+    end if
+    test = m.conn.test
+    if test <> invalid and test.manual then return
+    connectionCancelTest()
+    connectionRunTest(playback.speedTest.ACCURATE, true)
+end sub
+
+' callFunc("connectionResetLimit"): Settings' Reset of a learned limit.
+sub connectionResetLimit()
+    connectionSend({ method: "DELETE", path: CONNECTION_PATH + "/learned-limit", auth: "profile" }, "onConnectionLimitReset")
+end sub
+
+sub onConnectionLimitReset(event as Object)
+    result = connectionAnswer(event)
+    if result = invalid then return
+    if result.ok <> true
+        m.conn.message = { kind: "resetFailed" }
+        connectionPublish()
+    else
+        m.conn.message = invalid
+    end if
+    connectionRead()
+end sub
+
+' --- Plumbing --------------------------------------------------------------------
+
+' Sends request under this check's generation, and for a test's request,
+' its number.
+sub connectionSend(request as Object, callback as String, testId = 0 as Integer)
+    handle = api.newHandle(CONNECTION_OWNER)
+    handle.addFields({ generation: m.conn.generation, testId: testId })
+    handle.observeField("status", callback)
+    apiSend(request, handle)
+end sub
+
+' The answer's result, or invalid for one from an older check.
+function connectionAnswer(event as Object) as Dynamic
+    handle = event.getRoSGNode()
+    if handle.generation <> m.conn.generation then return invalid
+    return api.resultOf(handle)
+end function
+
+' The running test a test's answer belongs to, or invalid when that test
+' was replaced or cancelled: Test speed replaces an automatic test whose
+' result may still be on its way.
+function connectionTestOf(event as Object) as Dynamic
+    test = m.conn.test
+    if test = invalid or event.getRoSGNode().testId <> test.id then return invalid
+    return test
+end function
+
+function connectionEpoch() as Integer
+    return CreateObject("roDateTime").AsSeconds()
+end function
+
+sub connectionPublish()
+    caps = m.conn.caps
+    out = { identity: m.conn.identity, buffering: false, speed: false, connection: m.conn.connection, maxAgeSeconds: invalid, targetKbps: invalid, transport: connectionTransport(), testing: m.conn.test <> invalid, manualTest: m.conn.test <> invalid and m.conn.test.manual, message: m.conn.message }
+    if caps <> invalid
+        out.buffering = caps.buffering
+        out.speed = caps.speed and caps.location
+        out.maxAgeSeconds = caps.maxAgeSeconds
+        out.targetKbps = caps.targetKbps
+    end if
+    m.top.playbackConnection = out
+    platformPublish({ type: platform.topic.CONNECTION_STATUS, status: out })
+end sub

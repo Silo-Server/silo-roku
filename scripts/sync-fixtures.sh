@@ -8,7 +8,8 @@
 # browse screens and the player's previews call (source/catalog/requests.bs,
 # source/playback/trickplay.bs); and the settings manifest's definitions for
 # the keys Settings edits (source/settings/settings.bs) with the option sets
-# they suggest from. The server checkout is only read with git; this
+# they suggest from; and the buffering-quality conformance vectors, byte for
+# byte (source/playback/bufferingQuality.bs, source/playback/speedTest.bs). The server checkout is only read with git; this
 # never checks out, fetches, or edits anything there. Writes
 # tests/fixtures/SOURCE; running it again at the same commit changes nothing.
 #
@@ -32,7 +33,9 @@ import sys
 REPOSITORY = "https://github.com/Silo-Server/silo-server"
 # Request bodies the client serializes; their $ref closure is kept.
 ROOTS = ["PlaybackStartBody", "PlaybackReplanBody", "PlaybackProgressBody", "PlaybackStopBody", "PlaybackRouteEventBody", "HistoryRemoveInputBody", "ThemePlaybackRequest",
-         "CreateShuffleRequest", "AdvanceShuffleRequest", "SkipShuffleItemRequest", "CatalogQueryGroup"]
+         "CreateShuffleRequest", "AdvanceShuffleRequest", "SkipShuffleItemRequest", "CatalogQueryGroup",
+         # The connection speed test: what the client reads and reports.
+         "PlaybackCapabilities", "PlaybackConnection", "PlaybackProbeResultsInputBody"]
 OPERATIONS = {
     "getPlaybackCapabilities", "startPlayback", "replanPlayback", "updatePlaybackProgress", "stopPlayback", "reportPlaybackRouteEvent",
     # Server setup, sign-in, and profiles (source/auth/).
@@ -56,11 +59,14 @@ CATALOG = {
     # Browse's filters (source/library/filters.bs) and Shuffle (source/playback/shuffle.bs).
     "getCatalogFilters", "getShuffleCapability", "createShuffle", "getShuffle", "advanceShuffle", "skipShuffleItem", "deleteShuffle",
 }
+# The connection state, its learned-limit reset, and the speed test
+# (source/playback/connection.bs, components/AppSceneConnection.bs).
+CATALOG |= {"getPlaybackConnection", "resetPlaybackLearnedLimit", "getPlaybackBandwidthProbe", "reportPlaybackBandwidthProbe"}
 OPERATIONS |= CATALOG
 # The keys Settings edits (settings.supportedControls).
 SETTINGS = [
     "ui.title_art", "playback.preferred_quality", "playback.max_bitrate_kbps", "playback.audio_language",
-    "playback.auto_play_next", "playback.intro_skip_mode", "playback.auto_skip_credits", "playback.auto_skip_recap",
+    "playback.auto_play_next", "playback.intro_skip_mode", "playback.auto_skip_credits", "playback.auto_skip_recap", "playback.buffering_quality_mode",
     "player.video_skip_back_seconds", "player.video_skip_forward_seconds",
     "playback.subtitle_language", "playback.subtitle_mode", "playback.show_forced_subtitles",
     "ui.theme_music_enabled", "ui.theme_music_loop",
@@ -72,6 +78,8 @@ FIXTURES = "contracts/api/v2/fixtures"
 SCHEMA_OUT = "openapi/playback-v3.json"
 OPERATIONS_OUT = "openapi/catalog-operations.json"
 FIXTURE_OUT = "v2"
+VECTORS = "docs/design/schemas/buffering-quality/v1/vectors.json"
+VECTORS_OUT = "buffering-quality/vectors.json"
 
 server, sha, out = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
 
@@ -160,6 +168,8 @@ write(out / MANIFEST_OUT, dump({
     "option_sets": {name: manifest["option_sets"][name] for name in sets},
 }))
 
+write(out / VECTORS_OUT, show(VECTORS))
+
 date = subprocess.run(["git", "-C", server, "show", "-s", "--format=%cI", sha], check=True, capture_output=True, text=True).stdout.strip()
 lines = [
     f"repository: {REPOSITORY}",
@@ -173,6 +183,7 @@ lines = [
 ]
 lines += [f"  {FIXTURES}/{body} -> tests/fixtures/{FIXTURE_OUT}/{body}" for body in bodies]
 lines.append(f"  {MANIFEST} -> tests/fixtures/{MANIFEST_OUT} (revision, option sets, and definitions of {', '.join(SETTINGS)})")
+lines.append(f"  {VECTORS} -> tests/fixtures/{VECTORS_OUT} (unchanged)")
 write(out / "SOURCE", ("\n".join(lines) + "\n").encode())
 print(f"synced {len(kept)} schemas, {len(operations)} catalog operations, and {len(entries)} fixtures from {sha}")
 PY

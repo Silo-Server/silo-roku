@@ -192,6 +192,8 @@ const LOG_TAG = "player"
 ' the plan to carry it (lateSubtitle).
 const SUBTITLE_TIMEOUT_MS = 120000
 const NOTICE_MS = 4000
+' The buffering controller's notices show for 5 s (the shared spec).
+const BUFFERING_NOTICE_MS = 5000
 ' The keys the controls reducer takes; the others pass on.
 const CONTROL_KEYS = "|back|OK|play|left|right|up|down|rewind|fastforward|replay|options|"
 ' Roku's caption mode that shows captions after a replay (plan section 6.10).
@@ -248,6 +250,9 @@ sub init()
     m.overlayFocus = m.overlay.findNode("keyFocus")
     m.skipButton = m.top.findNode("skipButton")
     m.segmentButton = m.top.findNode("segmentButton")
+    m.bufferingPill = m.top.findNode("bufferingPill")
+    ' Whether something covers the buffering card (bufferingCovered).
+    m.bufferingCovered = false
     m.optionsLayer = m.top.findNode("optionsLayer")
     m.upNextLayer = m.top.findNode("upNextLayer")
     m.preview = m.top.findNode("preview")
@@ -390,6 +395,7 @@ sub init()
     m.preferences = playback.preferences.defaults()
     m.preferencesRequested = false
     m.preferencesRead = false
+    m.bufferingMode = "always"
     ' Auto-play next for Up Next: the profile's until the viewer changes it
     ' in Options or on the panel, which writes it for this device.
     m.autoplayNext = m.preferences.autoPlayNext
@@ -454,7 +460,7 @@ sub init()
 end sub
 
 function newFlags() as Object
-    return { starting: false, stopping: false, reconnecting: false, progressPending: false, subtitlesLoading: false, notice: "" }
+    return { starting: false, stopping: false, reconnecting: false, progressPending: false, subtitlesLoading: false, notice: "", noticeTone: "warning" }
 end function
 
 function styled(id as String, style as String, color as String) as Object
@@ -505,6 +511,7 @@ end sub
 ' screen's owner (playback.worker.cancel).
 sub onRelease()
     m.released = true
+    m.top.getScene().callFunc("connectionMedia", false)
     if m.state <> invalid and not m.done
         if identityChanged()
             dispatch({ type: "identityChange" })
@@ -565,6 +572,21 @@ sub loadPreferences()
     if m.preferencesRequested then return
     m.preferencesRequested = true
     m.requests[api.send(playback.preferences.request(), handleFor("onPreferences"))] = "preferences"
+    m.requests[api.send(playback.preferences.bufferingRequest(), handleFor("onBufferingMode"))] = "bufferingMode"
+end sub
+
+' The profile's playback.buffering_quality_mode, which may answer after the
+' start: the session takes it when it comes. A server without the setting
+' leaves "always".
+sub onBufferingMode(event as Object)
+    handle = event.getRoSGNode()
+    takeRequest(handle)
+    result = api.resultOf(handle)
+    if result = invalid or result.ok <> true then return
+    mode = playback.preferences.bufferingMode(result.body)
+    if mode = invalid then return
+    m.bufferingMode = mode
+    if m.state <> invalid then dispatch({ type: "bufferingMode", mode: mode })
 end sub
 
 sub onPreferences(event as Object)
@@ -672,11 +694,18 @@ sub begin(intent as Object)
     ' A phone's launch may play as its own profile, borrowed for this
     ' player (AppScene fences the player's requests to it).
     m.identity = nav.player.identityOf(m.top.entry.params)
+    ' The connection's speed reading is this Roku's own: a borrowed
+    ' identity's start sends none.
+    estimate = invalid
+    if m.identity = invalid then estimate = m.top.getScene().callFunc("connectionEstimate")
+    ' No automatic speed test runs while a player is open, or for a minute
+    ' after it starts (AppSceneConnection.bs).
+    m.top.getScene().callFunc("connectionMedia", true)
     if m.identity = invalid
         view = api.session.current()
         m.identity = { server: view.origin, account: view.accountId, profile: view.profile.id }
     end if
-    m.state = playback.session.create({ identity: m.identity, loads: m.loads })
+    m.state = playback.session.create({ identity: m.identity, loads: m.loads, bufferingMode: m.bufferingMode })
     m.titlePlayed = false
     current = platform.current()
     m.captionMode = util.text(current.captionMode)
@@ -700,7 +729,7 @@ sub begin(intent as Object)
     ' The profile's quality and bitrate cap, as read before the start or the
     ' defaults (Auto, no cap); an Options choice replaces the quality for
     ' this title's session.
-    dispatch({ type: "play", intent: playIntent, quality: m.preferences.preferredQuality, bandwidthCapKbps: m.preferences.maxBitrateKbps, autoplay: nav.player.isAutoStart(m.wanted), catalogRuntime: intent.runtime, startPosition: startPosition })
+    dispatch({ type: "play", intent: playIntent, quality: m.preferences.preferredQuality, bandwidthCapKbps: m.preferences.maxBitrateKbps, autoplay: nav.player.isAutoStart(m.wanted), catalogRuntime: intent.runtime, startPosition: startPosition, estimate: estimate })
 end sub
 
 ' --- The reducer ----------------------------------------------------------------
@@ -773,6 +802,14 @@ sub execute(command as Object)
         end if
     else if t = "refused"
         refused(command.operation)
+    else if t = "bufferingPill"
+        showBufferingPill(command.pill)
+    else if t = "bufferingNotice"
+        if command.copy = "cant_lower"
+            notice(i18n.text("buffering.cantLower"), playback.player.NOTICE_INFO, BUFFERING_NOTICE_MS)
+        else
+            notice(i18n.text("buffering.lowered"), playback.player.NOTICE_INFO, BUFFERING_NOTICE_MS)
+        end if
     end if
     ' "subtitleShift" needs nothing more: every plan's sidecar is fetched and
     ' shifted for its own timeline offset when the plan loads.
@@ -1893,6 +1930,8 @@ sub showLocalError(copy as Object, retryable as Boolean, unreachable = false as 
     setControlRows([buttons], true, [copy.title, copy.message])
     m.errorPanel.visible = true
     m.errorVisible = true
+    ' The attempt is over; a new one brings its own card.
+    showBufferingPill(invalid)
     dispatchControls({ type: "hide" })
     applyFocus()
     refreshChrome()
@@ -2061,6 +2100,9 @@ sub dispatchControls(event as Object)
     m.controlEvents = []
     m.controlsBusy = false
     if m.closed then return
+    ' Once every queued flag is reduced: a panel a controls command opened
+    ' covers the buffering card too.
+    noteBufferingCover()
     if m.refocus
         m.refocus = false
         applyFocus()
@@ -2114,7 +2156,41 @@ sub executeControl(command as Object)
         exitPlayer()
     else if t = "replayCaptions"
         replayCaptions(command.active)
+    else if t = "bufferingSelect"
+        answer = "select_keep"
+        if command.button = "primary"
+            answer = "select_lower"
+            if m.bufferingPill.kind = "undo" then answer = "select_restore"
+        end if
+        dispatch({ type: "bufferingAnswer", answer: answer })
+    else if t = "bufferingBack"
+        dispatch({ type: "bufferingAnswer", answer: "back" })
     end if
+end sub
+
+' The buffering card the session's controller shows, or none: pill is
+' { kind, remainingMs, visible } (playback.bufferingQuality.pill), or
+' invalid.
+sub showBufferingPill(pill as Dynamic)
+    kind = ""
+    if util.isObject(pill) and util.isTrue(pill.visible) then kind = util.text(pill.kind)
+    if kind <> ""
+        m.bufferingPill.remainingMs = Int(playback.values.number(pill.remainingMs, 0))
+        m.bufferingPill.paused = m.video.state = "paused"
+    end if
+    if m.bufferingPill.kind = kind then return
+    m.bufferingPill.kind = kind
+    setOverlayFlags({ bufferingPill: kind })
+end sub
+
+' The buffering card waits, its timer held, while a skip pill, Up Next,
+' Options, or the error screen covers it (the controller's pill_obscured).
+sub noteBufferingCover()
+    c = m.controls
+    covered = c.skipButton or c.segmentButton or c.upNext or c.options or c.picker or m.errorVisible
+    if covered = m.bufferingCovered then return
+    m.bufferingCovered = covered
+    dispatch({ type: "bufferingObscured", obscured: covered })
 end sub
 
 sub onControlsTimer()
@@ -2409,6 +2485,13 @@ sub restyleSkipPills()
     m.segmentButton.raised = shown
     m.segmentButton.stacked = m.skipButton.visible
     m.segmentButton.highlighted = (idle and not c.skipButton) or (shown and c.focus = playback.controls.SKIP_SEGMENT)
+    ' The buffering card's capsule OK presses: the one the controls focus,
+    ' or with them hidden the one Left and Right chose.
+    lit = ""
+    if shown and c.focus = playback.controls.BUFFER_PRIMARY then lit = "primary"
+    if shown and c.focus = playback.controls.BUFFER_SECONDARY then lit = "secondary"
+    if idle and not c.skipButton and not c.segmentButton then lit = c.bufferFocus
+    if m.bufferingPill.lit <> lit then m.bufferingPill.lit = lit
 end sub
 
 ' The markers of the version a file belongs to, and the scrubber's bands.
@@ -2931,6 +3014,8 @@ sub clearSession()
     m.recap = invalid
     m.credits = invalid
     showSegment()
+    ' The next item's controller starts without a card.
+    showBufferingPill(invalid)
     m.progressTimer.control = "stop"
     m.panelTimer.control = "stop"
     replayCaptions(false)
@@ -3023,9 +3108,10 @@ end sub
 
 ' A notice shows for NOTICE_MS once nothing outranks it on the status
 ' line, whatever showed when it came (playback.player.noticeShows).
-sub notice(text as String)
+sub notice(text as String, tone = "warning" as String, durationMs = NOTICE_MS as Integer)
     m.flags.notice = text
-    m.noticeClock = playback.player.newNoticeClock(NOTICE_MS)
+    m.flags.noticeTone = tone
+    m.noticeClock = playback.player.newNoticeClock(durationMs)
 end sub
 
 ' The overlay's position, runtime, and play state, the status, the
@@ -3058,6 +3144,7 @@ sub refreshChrome()
     m.status.busy = status.busy
     if status.notice = invalid then m.status.notice = {} else m.status.notice = status.notice
     m.overlay.paused = paused
+    if m.bufferingPill.paused <> paused then m.bufferingPill.paused = paused
     m.overlay.position = position
     if runtime = invalid then m.overlay.runtime = 0 else m.overlay.runtime = runtime
     busy = seeking or buffering or m.flags.starting or m.flags.reconnecting

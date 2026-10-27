@@ -23,11 +23,13 @@ import "pkg:/source/playback/seek.bs"
 '   {type: "content", episode}: whether the title is an episode, for the
 '     Up Next button.
 '   {type: "preferences", skipBackSeconds, skipForwardSeconds}
-'   {type: "flags", skipButton, segmentButton, picker, upNext, options}: the
-'     overlays other components own; only the members given change. A
-'     skip pill that appears while the controls show takes focus, as tvOS's
-'     do, unless a seek is being chosen or a panel is open; one that goes
-'     while focused hands focus to the scrubber.
+'   {type: "flags", skipButton, segmentButton, bufferingPill, picker,
+'     upNext, options}: the overlays other components own; only the members
+'     given change. bufferingPill is "prompt", "undo", or "" for the
+'     buffering card (playback.buffering). A skip pill or card that appears
+'     while the controls show takes focus, as tvOS's do, unless a seek is
+'     being chosen or a panel is open; one that goes while focused hands
+'     focus to the scrubber.
 '   {type: "hide"}: hide them, drop a pending seek, and end Replay's
 '     caption span, as when an error screen or Up Next covers the player.
 '
@@ -43,6 +45,9 @@ import "pkg:/source/playback/seek.bs"
 '   {type: "openUpNext"}, {type: "activateSkip"}, {type: "activateSegment"},
 '   {type: "dismissSkip"}, {type: "closeOptions"}, {type: "exit"}: exit
 '     stops the session and leaves the player.
+'   {type: "bufferingSelect", button}: "primary" (Lower quality, Restore
+'     quality) or "secondary" (Keep quality) on the buffering card.
+'   {type: "bufferingBack"}: Back while the card shows.
 '   {type: "upNextBack"}: Back while Up Next shows, which is its Keep
 '     Watching (tvOS's onExitCommand).
 '   {type: "replayCaptions", active}: Replay's span starts or ends; in
@@ -76,6 +81,10 @@ namespace playback.controls
     ' Skip Intro, and the segment pill, Skip Recap or Skip Credits.
     const SKIP_INTRO = "skipIntro"
     const SKIP_SEGMENT = "skipSegment"
+    ' The buffering card's actions: Lower quality or Restore quality, and
+    ' the prompt's Keep quality.
+    const BUFFER_PRIMARY = "bufferPrimary"
+    const BUFFER_SECONDARY = "bufferSecondary"
     const LAST_TAB = "last"
 
     function create() as Object
@@ -93,6 +102,10 @@ namespace playback.controls
             busy: false,
             skipButton: false,
             segmentButton: false,
+            ' The buffering card, "prompt", "undo", or "", and the action
+            ' OK takes while the controls are hidden.
+            bufferingPill: "",
+            bufferFocus: "primary",
             picker: false,
             upNext: false,
             options: false,
@@ -207,6 +220,10 @@ namespace playback.controls
         end if
         if state.rate <> 0
             scanKey(state, key, now, out)
+        else if (key = "left" or key = "right") and not state.shown and state.bufferingPill = "prompt" and not state.skipButton and not state.segmentButton
+            ' With the controls hidden, Left and Right move between the
+            ' prompt's actions; on the undo card they skip.
+            if key = "left" then state.bufferFocus = "primary" else state.bufferFocus = "secondary"
         else if key = "left" or key = "right"
             if state.shown and state.focus <> SCRUBBER
                 moveFocus(state, key)
@@ -288,6 +305,8 @@ namespace playback.controls
                 out.Push({ type: "activateSkip" })
             else if state.segmentButton
                 out.Push({ type: "activateSegment" })
+            else if state.bufferingPill <> ""
+                out.Push({ type: "bufferingSelect", button: state.bufferFocus })
             else
                 reveal(state, firstFocus(state), now, out)
             end if
@@ -317,6 +336,10 @@ namespace playback.controls
             out.Push({ type: "activateSkip" })
         else if button = SKIP_SEGMENT
             out.Push({ type: "activateSegment" })
+        else if button = BUFFER_PRIMARY
+            out.Push({ type: "bufferingSelect", button: "primary" })
+        else if button = BUFFER_SECONDARY
+            out.Push({ type: "bufferingSelect", button: "secondary" })
         else if button = "close"
             out.Push({ type: "exit" })
         end if
@@ -326,11 +349,15 @@ namespace playback.controls
     ' Options is open only if the panel lost focus; it closes the panel, as
     ' the panel's own Back does, from its tabs or a list (picker). Only
     ' Skip Intro's pill takes Back: the segment pill stays through it, as
-    ' tvOS's segment pill stays through Menu (assumption AG-291).
+    ' tvOS's segment pill stays through Menu (assumption AG-291). The
+    ' buffering card takes Back before Skip Intro, as tvOS's does; it shows
+    ' only while no skip pill, Up Next, or Options covers it.
     sub back(state as Object, out as Object)
         if isScrubbing(state)
             cancel(state)
             cancelReplay(state, out)
+        else if state.bufferingPill <> "" and not state.options and not state.picker
+            out.Push({ type: "bufferingBack" })
         else if state.skipButton
             out.Push({ type: "dismissSkip" })
         else if state.upNext
@@ -344,8 +371,14 @@ namespace playback.controls
         end if
     end sub
 
-    ' Left and Right within the buttons; nothing on a skip pill.
+    ' Left and Right within the buttons, or between the prompt's actions;
+    ' nothing on a skip pill.
     sub moveFocus(state as Object, key as String)
+        if state.focus = BUFFER_PRIMARY or state.focus = BUFFER_SECONDARY
+            if state.bufferingPill <> "prompt" then return
+            if key = "left" then state.focus = BUFFER_PRIMARY else state.focus = BUFFER_SECONDARY
+            return
+        end if
         list = buttons(state.episode)
         if not util.contains(list, state.focus) then return
         index = 0
@@ -360,11 +393,14 @@ namespace playback.controls
     ' The buttons, then the scrubber, then the skip pills above it: Skip
     ' Intro, and the segment pill over it when both show.
     sub moveUp(state as Object)
+        if state.focus = BUFFER_PRIMARY or state.focus = BUFFER_SECONDARY then return
         if state.focus = SCRUBBER
             if state.skipButton
                 state.focus = SKIP_INTRO
             else if state.segmentButton
                 state.focus = SKIP_SEGMENT
+            else if state.bufferingPill <> ""
+                state.focus = BUFFER_PRIMARY
             end if
         else if state.focus = SKIP_INTRO
             if state.segmentButton then state.focus = SKIP_SEGMENT
@@ -374,7 +410,9 @@ namespace playback.controls
     end sub
 
     sub moveDown(state as Object)
-        if state.focus = SKIP_SEGMENT and state.skipButton
+        if state.focus = BUFFER_PRIMARY or state.focus = BUFFER_SECONDARY
+            state.focus = SCRUBBER
+        else if state.focus = SKIP_SEGMENT and state.skipButton
             state.focus = SKIP_INTRO
         else if state.focus = SKIP_SEGMENT or state.focus = SKIP_INTRO
             state.focus = SCRUBBER
@@ -388,6 +426,7 @@ namespace playback.controls
     function firstFocus(state as Object) as String
         if state.skipButton then return SKIP_INTRO
         if state.segmentButton then return SKIP_SEGMENT
+        if state.bufferingPill <> "" then return BUFFER_PRIMARY
         return SCRUBBER
     end function
 
@@ -406,6 +445,15 @@ namespace playback.controls
                 end if
             end if
         end for
+        if util.isString(event.bufferingPill) and event.bufferingPill <> state.bufferingPill
+            state.bufferingPill = event.bufferingPill
+            state.bufferFocus = "primary"
+            if event.bufferingPill <> ""
+                appeared = BUFFER_PRIMARY
+            else if state.focus = BUFFER_PRIMARY or state.focus = BUFFER_SECONDARY
+                state.focus = SCRUBBER
+            end if
+        end if
         for each name in ["picker", "upNext", "options"]
             if util.isBoolean(event[name]) then state[name] = event[name]
         end for

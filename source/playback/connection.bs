@@ -1,0 +1,221 @@
+import "pkg:/source/playback/speedTest.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' The connection reading and its Settings copy, pure: what
+' GET /api/v2/playback/connection holds (schema PlaybackConnection), whether
+' it is current and proves the link (the buffering-quality spec's When to
+' test), the estimate a playback start sends, and the words of Settings >
+' Playback's learned-limit and Connection rows as Apple and Android write
+' them (the spec's Settings). Times are epoch seconds; the server's are
+' RFC 3339 instants. Each copy function takes the strings table
+' (i18n.load) as copy, or reads the device locale's once per thread.
+namespace playback.connection
+
+    ' --- Readings -----------------------------------------------------------
+
+    ' Whether a reading taken at measuredAt (an RFC 3339 instant, or epoch
+    ' seconds) is current at nowSeconds: younger than maxAgeSeconds,
+    ' bandwidth_probe_max_age_seconds. Nothing is current until the client
+    ' knows that lifetime, nor without a readable time. The server's clock
+    ' can run ahead of this device's, so a reading from the future is age 0.
+    function isCurrent(measuredAt as Dynamic, maxAgeSeconds as Dynamic, nowSeconds as Dynamic) as Boolean
+        if not util.isNumber(maxAgeSeconds) or maxAgeSeconds <= 0 then return false
+        at = seconds(measuredAt)
+        if at <= 0 then return false
+        age = nowSeconds - at
+        if age < 0 then age = 0
+        return age < maxAgeSeconds
+    end function
+
+    ' Whether the connection's current reading proves the link, so no
+    ' automatic test is due: a current settled probe, or a current lower
+    ' bound (a quick test that reached its target, or a playback sample) at
+    ' least targetKbps. Without a target any current reading does: there is
+    ' nothing to measure against, and a failed target lookup must not send
+    ' every device holding a lower bound into a test. A reading outside
+    ' 100..1,000,000 kbps is not one a start could send, so it proves nothing.
+    function provesLink(connection as Dynamic, targetKbps as Dynamic, maxAgeSeconds as Dynamic, nowSeconds as Dynamic) as Boolean
+        if not util.isObject(connection) then return false
+        hasTarget = util.isNumber(targetKbps) and targetKbps > 0
+        probe = currentReading(connection.probe, maxAgeSeconds, nowSeconds)
+        if probe <> invalid and (not util.isTrue(probe.lower_bound) or not hasTarget or probe.kbps >= targetKbps) then return true
+        sample = currentReading(connection.playback_sample, maxAgeSeconds, nowSeconds)
+        return sample <> invalid and (not hasTarget or sample.kbps >= targetKbps)
+    end function
+
+    ' The reading a playback start sends as bandwidth_estimate_kbps: the
+    ' higher of the current probe and the current playback sample, else
+    ' invalid.
+    function freshEstimate(connection as Dynamic, maxAgeSeconds as Dynamic, nowSeconds as Dynamic) as Dynamic
+        if not util.isObject(connection) then return invalid
+        best = invalid
+        for each reading in [connection.probe, connection.playback_sample]
+            current = currentReading(reading, maxAgeSeconds, nowSeconds)
+            if current <> invalid and (best = invalid or current.kbps > best) then best = Int(current.kbps)
+        end for
+        return best
+    end function
+
+    ' reading (a probe or a playback sample) when it is current and within
+    ' the bounds a start can send, else invalid.
+    function currentReading(reading as Dynamic, maxAgeSeconds as Dynamic, nowSeconds as Dynamic) as Dynamic
+        if not util.isObject(reading) or not util.isNumber(reading.kbps) then return invalid
+        if reading.kbps < playback.speedTest.MIN_KBPS or reading.kbps > playback.speedTest.MAX_KBPS then return invalid
+        if not isCurrent(reading.measured_at, maxAgeSeconds, nowSeconds) then return invalid
+        return reading
+    end function
+
+    ' An RFC 3339 instant or epoch seconds as epoch seconds; 0 when unreadable.
+    function seconds(value as Dynamic) as Dynamic
+        if util.isNumber(value) then return value
+        return playback.values.epochSeconds(value)
+    end function
+
+    ' --- Copy ---------------------------------------------------------------
+
+    ' The Connection speed row: "48 Mbps · measured 3 minutes ago on Wi-Fi",
+    ' "Faster than 115 Mbps · measured …" for a lower bound, and without a
+    ' probe the playback sample, "Faster than 51 Mbps · seen during playback
+    ' 2 hours ago"; else "Not measured yet". The server returns its latest
+    ' probe and sample, current or not, and the row shows them either way. A
+    ' time it cannot read leaves the age out.
+    function statusLine(connection as Dynamic, nowSeconds as Dynamic, copy = invalid as Dynamic) as String
+        strings = words(copy)
+        probe = invalid
+        sample = invalid
+        if util.isObject(connection)
+            if util.isObject(connection.probe) and util.isNumber(connection.probe.kbps) then probe = connection.probe
+            if util.isObject(connection.playback_sample) and util.isNumber(connection.playback_sample.kbps) then sample = connection.playback_sample
+        end if
+        if probe <> invalid
+            values = { rate: rateText(probe.kbps, strings), network: transportName(probe.transport, strings) }
+            key = "settings.connection.measured"
+            if util.isTrue(probe.lower_bound) then key = "settings.connection.lowerBound"
+            return dated(strings, key, values, probe.measured_at, nowSeconds)
+        end if
+        if sample <> invalid
+            values = { rate: rateText(sample.kbps, strings) }
+            return dated(strings, "settings.connection.duringPlayback", values, sample.measured_at, nowSeconds)
+        end if
+        return i18n.lookup(strings, "settings.connection.notMeasured")
+    end function
+
+    ' key's text with values and the age of measuredAt, or key + "Undated"'s
+    ' without an age when the time is unreadable.
+    function dated(strings as Object, key as String, values as Object, measuredAt as Dynamic, nowSeconds as Dynamic) as String
+        at = seconds(measuredAt)
+        if at <= 0 then return i18n.format(i18n.lookup(strings, key + "Undated"), values)
+        values.age = ageText(nowSeconds - at, strings)
+        return i18n.format(i18n.lookup(strings, key), values)
+    end function
+
+    ' A rate as Settings shows it, rounded down so a lower bound or the
+    ' budget never overstates the link: kbps below 1 Mbps ("850 kbps"), one
+    ' decimal below 10 Mbps ("4.5 Mbps", "4 Mbps" for a whole one), whole
+    ' Mbps from 10 ("44 Mbps"), with no digit grouping ("1000 Mbps").
+    function rateText(kbps as Dynamic, copy = invalid as Dynamic) as String
+        strings = words(copy)
+        value = 0
+        if util.isNumber(kbps) and kbps > 0 then value = Int(kbps)
+        if value < 1000 then return i18n.format(i18n.lookup(strings, "settings.rate.kbps"), { rate: value.ToStr() })
+        if value < 10000
+            tenths = value \ 100
+            text = (tenths \ 10).ToStr()
+            if tenths mod 10 <> 0 then text = text + "." + (tenths mod 10).ToStr()
+        else
+            text = (value \ 1000).ToStr()
+        end if
+        return i18n.format(i18n.lookup(strings, "settings.rate.mbps"), { rate: text })
+    end function
+
+    ' How long ago, from an age in seconds: "just now" under a minute, then
+    ' whole minutes, hours and days, rounded down. A negative age (a server
+    ' clock ahead of this device's) is just now.
+    function ageText(ageSeconds as Dynamic, copy = invalid as Dynamic) as String
+        strings = words(copy)
+        minutes = 0
+        if util.isNumber(ageSeconds) and ageSeconds > 0 then minutes = Int(ageSeconds) \ 60
+        if minutes < 1 then return i18n.lookup(strings, "settings.connection.age.justNow")
+        if minutes < 60 then return counted(strings, "settings.connection.age.minutes", minutes)
+        if minutes < 24 * 60 then return counted(strings, "settings.connection.age.hours", minutes \ 60)
+        return counted(strings, "settings.connection.age.days", minutes \ (24 * 60))
+    end function
+
+    ' The network a probe ran on, from the contract's transport: "Wi-Fi",
+    ' "Ethernet", "cellular", or "this connection" for other and anything
+    ' unknown.
+    function transportName(transport as Dynamic, copy = invalid as Dynamic) as String
+        strings = words(copy)
+        name = util.text(transport)
+        if name <> "wifi" and name <> "ethernet" and name <> "cellular" then name = "other"
+        return i18n.lookup(strings, "settings.connection.transport." + name)
+    end function
+
+    ' The learned-limit row: "Limited to 44 Mbps after buffering on Oct 17",
+    ' the date of observed_at as a short month and day in the device's time
+    ' zone, or "Limited to 44 Mbps after buffering" when it is unreadable. ""
+    ' without a limit. zoneOffsetSeconds is the local time's offset from UTC,
+    ' the device's when invalid.
+    function limitLine(learnedLimit as Dynamic, copy = invalid as Dynamic, zoneOffsetSeconds = invalid as Dynamic) as String
+        if not util.isObject(learnedLimit) or not util.isNumber(learnedLimit.kbps) then return ""
+        strings = words(copy)
+        values = { rate: rateText(learnedLimit.kbps, strings) }
+        at = seconds(learnedLimit.observed_at)
+        if at <= 0 then return i18n.format(i18n.lookup(strings, "settings.learnedLimitUndated"), values)
+        values.date = monthDay(at, strings, zoneOffsetSeconds)
+        return i18n.format(i18n.lookup(strings, "settings.learnedLimit"), values)
+    end function
+
+    ' "Oct 17": the month abbreviation and day of epoch seconds at, in the
+    ' zone zoneOffsetSeconds from UTC (the device's when invalid).
+    ' roDateTime's date strings all carry the year, so the parts are joined
+    ' here.
+    function monthDay(at as Dynamic, copy = invalid as Dynamic, zoneOffsetSeconds = invalid as Dynamic) as String
+        strings = words(copy)
+        offset = zoneOffsetSeconds
+        if not util.isNumber(offset) then offset = localOffset()
+        moment = CreateObject("roDateTime")
+        moment.FromSeconds(at + offset)
+        month = i18n.lookup(strings, "settings.month." + moment.GetMonth().ToStr())
+        return i18n.format(i18n.lookup(strings, "settings.monthDay"), { month: month, day: moment.GetDayOfMonth() })
+    end function
+
+    ' The device's local time minus UTC, in seconds.
+    function localOffset() as Integer
+        moment = CreateObject("roDateTime")
+        utc = moment.AsSeconds()
+        moment.ToLocalTime()
+        return moment.AsSeconds() - utc
+    end function
+
+    ' The Auto budget line, from auto_budget_kbps: "Auto plays videos up to
+    ' 35 Mbps without converting them." "" without a budget.
+    function budgetLine(kbps as Dynamic, copy = invalid as Dynamic) as String
+        if not util.isNumber(kbps) then return ""
+        strings = words(copy)
+        return i18n.format(i18n.lookup(strings, "settings.connection.budget"), { rate: rateText(kbps, strings) })
+    end function
+
+    ' After a 429 from Test speed: "Try again in N seconds", "1 second" at
+    ' one. A wait under a second is a second, as the spec reads Retry-After.
+    function retryText(waitSeconds as Dynamic, copy = invalid as Dynamic) as String
+        count = 1
+        if util.isNumber(waitSeconds) and waitSeconds > 1 then count = Int(waitSeconds)
+        return counted(words(copy), "settings.connection.retry", count)
+    end function
+
+    ' key's ".one" text at a count of 1, else its ".other" text with {count}.
+    function counted(strings as Object, key as String, count as Integer) as String
+        if count = 1 then return i18n.lookup(strings, key + ".one")
+        return i18n.format(i18n.lookup(strings, key + ".other"), { count: count })
+    end function
+
+    ' copy when given, else the device locale's strings, read once per thread.
+    function words(copy as Dynamic) as Object
+        if util.isObject(copy) then return copy
+        if m.connectionStrings = invalid then m.connectionStrings = i18n.load(CreateObject("roDeviceInfo").GetCurrentLocale())
+        return m.connectionStrings
+    end function
+end namespace

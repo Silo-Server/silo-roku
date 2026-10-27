@@ -1,0 +1,1035 @@
+import "pkg:/source/util/values.bs"
+
+' Lowering quality when playback keeps buffering: the shared Silo controller
+' (silo-server docs/design/2026-10-17-buffering-quality.md, sections Terms,
+' Behaviour, Later replans after a lowering and Telemetry), ported from the
+' Android controller and replayed against the vendored vectors
+' (tests/fixtures/buffering-quality/vectors.json) by
+' tests/playback/bufferingQuality.spec.bs. A case that seems wrong is a spec
+' bug to fix on the server, never here alone.
+'
+' One state per title. It makes no requests, draws nothing and reads no
+' clock: every call takes the monotonic time in milliseconds, and the timers
+' it would run (the long stall, a suppression lifting, the rearm, the pill's
+' countdown) are times in the state that handle and advance fire in order.
+' The session wakes it at nextWake.
+'
+' Events are the vectors' event objects ({ type, ... }), plus a few the
+' vectors leave to each client: plan_ended (the playing plan stopped with no
+' successor), replan_refused (the controller's replan could not be sent at
+' all), select (Select at the player root: the visible pill's primary action)
+' and a plan_adopted's optional pickStillPending (a newer pick of the viewer's
+' still waits). Outputs are the vectors' outputs, with the notice's copy key
+' in copy, plus UI-only ones a vector replay ignores: pill_hidden whenever a
+' visible pill stops showing, and deadline_refused when a missed start
+' deadline must run the session's failure path.
+namespace playback.bufferingQuality
+    const STARTUP_GRACE_MS = 10000
+    const STALL_MIN_MS = 1000
+    const STALLS_BEFORE_TRIGGER = 2
+    const STALL_WINDOW_MS = 120000
+    const LONG_STALL_MS = 6000
+    const PROMPT_SECONDS = 15
+    const PROMPT_MS = 15000
+    const REOFFER_MIN_MS = 120000
+    const NO_LOWER_COOLDOWN_MS = 300000
+    const REARM_AFTER_UNADOPTED_MS = 60000
+    ' Documentation only: a wait that begins with more than this buffered is a
+    ' renderer wait. The session decides that and sends the renderer cause.
+    const RENDERER_WAIT_BUFFER_MS = 1000
+    ' The step-down estimate is floor(delivered x 7 / 10) in integer
+    ' arithmetic (stepDownEstimate): a floating-point 0.7 floors 22120 to
+    ' 15483 instead of 15484.
+    const STEP_DOWN_NUMERATOR = 7
+    const STEP_DOWN_DENOMINATOR = 10
+    ' The server accepts estimates from 100 kbps; a lower one means nothing
+    ' is lower.
+    const MIN_ESTIMATE_KBPS = 100
+    ' Plans whose summaries stay readable after they end, newest kept.
+    const KEPT_PLANS = 8
+
+    ' The state for one title. mode is "always", "ask" or "never"; anything
+    ' else runs the default, "always".
+    function create(mode as String) as Object
+        return {
+            mode: modeOf(mode),
+            ' The playing plan's measured throughput (setPlanThroughput).
+            throughputKbps: invalid,
+            ' A higher-priority pill is up, or the player cannot show pills.
+            obscured: false,
+            ' The viewer paused and has not resumed: pill timers freeze.
+            paused: false,
+            ' An outage owns any wait until it ends; outageEndedAt is when the
+            ' last one did.
+            outage: false,
+            outageEndedAt: invalid,
+            ' Why the player waits, while it does: "network", "renderer", ...
+            waitCause: invalid,
+            ' The viewer's quality pick is on its way.
+            pickPending: false,
+            ' The playing plan, and how many plans this title has adopted.
+            current: invalid,
+            adoptions: 0,
+            ' The latest adopted plan's quality, which the client's own
+            ' replans ask for.
+            quality: "auto",
+            ' Per title: the quality answered at (Keep or Restore), the
+            ' once-per-title notice, and the re-offer wait after a timeout.
+            answeredQuality: invalid,
+            cantLowerShown: false,
+            reofferNotBefore: invalid,
+            ' The replan this controller sent and waits to see adopted:
+            ' { kind, fromKbps, from, actionBefore, priorKept }, kind being
+            ' "automatic", "accepted" or "restore".
+            pending: invalid,
+            ' The latest Auto lowering's step-down estimate, until Restore, a
+            ' quality change or a new attempt.
+            kept: invalid,
+            ' The pill on screen, or the one waiting behind or hidden by a
+            ' higher-priority pill (deferredResumes when it was already shown
+            ' and comes back with its remaining time).
+            activePill: invalid,
+            deferredPill: invalid,
+            deferredResumes: false,
+            promptShownAt: 0,
+            pillRemainingMs: 0,
+            pillSince: invalid,
+            ' Pending timers by name ({ at, seq, ... }): longStall,
+            ' reevaluate, rearm and pill.
+            timers: {},
+            seq: 0,
+            ' Adopted plans by label, for summaries after they end.
+            plans: {},
+            planOrder: [],
+            out: invalid
+        }
+    end function
+
+    function modeOf(mode as Dynamic) as String
+        if util.isString(mode) and (mode = "ask" or mode = "never") then return mode
+        return "always"
+    end function
+
+    ' The effective playback.buffering_quality_mode. never takes any pill
+    ' down at once; the session redraws from pill().
+    sub setMode(state as Object, mode as String)
+        state.mode = modeOf(mode)
+        if state.mode = "never" then hidePill(state, invalid)
+    end sub
+
+    ' The playing plan's media throughput so far (plan_summary
+    ' throughput_kbps), or invalid when the session has none. Before any plan
+    ' of the attempt has played, a trigger or a missed start deadline lowers
+    ' only when it is below the plan's delivered bitrate. It belongs to the
+    ' playing plan: an adoption clears it, so set it after plan_adopted.
+    sub setPlanThroughput(state as Object, kbps as Dynamic)
+        if util.isNumber(kbps) then state.throughputKbps = kbps else state.throughputKbps = invalid
+    end sub
+
+    ' Fires the timers due at or before now, then applies event. Returns the
+    ' outputs in time order.
+    function handle(state as Object, event as Object, now as Integer) as Object
+        state.out = []
+        fireTimers(state, now)
+        apply(state, event, now)
+        fireTimers(state, now)
+        return takeOutputs(state)
+    end function
+
+    ' Fires the timers due at or before now; returns their outputs.
+    function advance(state as Object, now as Integer) as Object
+        state.out = []
+        fireTimers(state, now)
+        return takeOutputs(state)
+    end function
+
+    ' The earliest pending timer, in ms, or invalid when none is pending.
+    function nextWake(state as Object) as Dynamic
+        wake = invalid
+        for each name in state.timers
+            timer = state.timers[name]
+            if timer <> invalid and (wake = invalid or timer.at < wake) then wake = timer.at
+        end for
+        return wake
+    end function
+
+    ' The buffering pill to draw: invalid, or { kind ("prompt" or "undo"),
+    ' remainingMs, visible, running }. A pill that waits behind a
+    ' higher-priority one is not visible; a paused one is not running.
+    function pill(state as Object, now as Integer) as Dynamic
+        if state.activePill <> invalid
+            remaining = state.pillRemainingMs
+            timer = state.timers.pill
+            if timer <> invalid then remaining = larger(0, timer.at - now)
+            return { kind: state.activePill, remainingMs: remaining, visible: true, running: timer <> invalid }
+        end if
+        if state.deferredPill = invalid then return invalid
+        remaining = PROMPT_MS
+        if state.deferredResumes then remaining = state.pillRemainingMs
+        return { kind: state.deferredPill, remainingMs: remaining, visible: false, running: false }
+    end function
+
+    ' The kept step-down estimate the client's own Auto replans repeat, or
+    ' invalid.
+    function keptEstimate(state as Object) as Dynamic
+        return state.kept
+    end function
+
+    ' floor(kbps x 7 / 10), exactly, or invalid without a bitrate.
+    function stepDownEstimate(kbps as Dynamic) as Dynamic
+        if not util.isNumber(kbps) or kbps <= 0 then return invalid
+        return (Int(kbps) * STEP_DOWN_NUMERATOR) \ STEP_DOWN_DENOMINATOR
+    end function
+
+    ' The plan_summary buffering_action of the adoption planLabel: none,
+    ' ignored, lowered, restored, accepted, kept, timed_out or cant_lower.
+    function bufferingAction(state as Object, planLabel as String) as String
+        plan = state.plans.Lookup(planLabel)
+        if plan = invalid then return "none"
+        return plan.action
+    end function
+
+    ' The plan_summary stall figures of the adoption planLabel, or invalid for
+    ' a plan this state does not hold: played_ms, stall_count,
+    ' stall_total_ms, stall_longest_ms, delivered_kbps (omitted without one),
+    ' buffering_mode and buffering_action. A plan still playing is summarized
+    ' as if it ended at now; one that ended keeps the figures it ended with.
+    function summary(state as Object, planLabel as String, now as Integer) as Dynamic
+        plan = state.plans.Lookup(planLabel)
+        if plan = invalid then return invalid
+        if plan.final <> invalid
+            figures = {}
+            figures.Append(plan.final)
+            return figures
+        end if
+        return summaryOf(state, plan, now)
+    end function
+
+    ' The client's start deadline passed while the player waited for media,
+    ' before the playing plan (the attempt's first or a replacement) showed a
+    ' frame. On Auto in always, with evidence that its media arrived more
+    ' slowly than its delivered bitrate, it lowers as a long stall would and
+    ' returns the replan. Otherwise it returns deadline_refused and the
+    ' session runs its failure path: no evidence, ask or never, a picked
+    ' quality, a title answered at this quality, an outage in progress or
+    ' ended less than LONG_STALL_MS ago, a renderer wait, the no-lower
+    ' cooldown, a pick or a replan of ours in flight or waiting out its
+    ' rearm, or nothing lower. A lowering that then fails, or whose rearm
+    ' passes before a plan is adopted, emits deadline_refused too, while
+    ' the plan that missed its deadline is still current and unplayed.
+    function startDeadlinePassed(state as Object, now as Integer) as Object
+        state.out = []
+        fireTimers(state, now)
+        plan = state.current
+        lowering = invalid
+        if deadlineMayLower(state, now) then lowering = loweringFor(plan)
+        if lowering = invalid
+            emit(state, now, { type: "deadline_refused" })
+        else
+            hidePill(state, now)
+            plan.deadlineFailure = true
+            sendLowering(state, plan, lowering, "automatic", now)
+        end if
+        return takeOutputs(state)
+    end function
+
+    function deadlineMayLower(state as Object, now as Integer) as Boolean
+        plan = state.current
+        if plan = invalid or plan.firstPlayingAt <> invalid then return false
+        if state.pickPending or state.pending <> invalid or state.timers.rearm <> invalid then return false
+        if state.outage or state.waitCause = "renderer" then return false
+        if state.outageEndedAt <> invalid and now - state.outageEndedAt < LONG_STALL_MS then return false
+        if plan.cooldownUntil <> invalid and now < plan.cooldownUntil then return false
+        if plan.quality <> "auto" or state.mode <> "always" then return false
+        if isAnswered(state, plan) then return false
+        return slowLinkEvidence(state, plan)
+    end function
+
+    ' ---- Events -------------------------------------------------------------
+
+    sub apply(state as Object, event as Object, now as Integer)
+        kind = util.text(event.type)
+        if kind = "plan_adopted"
+            if util.isObject(event.plan) then planAdopted(state, event.plan, event.controllerInitiated <> false, util.isTrue(event.pickStillPending), now)
+        else if kind = "playing"
+            onPlaying(state, now)
+        else if kind = "waiting"
+            cause = util.text(event.cause)
+            if cause = "" then cause = "network"
+            onWaiting(state, cause, now)
+        else if kind = "pause"
+            onPause(state, now)
+        else if kind = "seek"
+            onSeek(state, now)
+        else if kind = "transport_error_start"
+            onOutageStart(state)
+        else if kind = "transport_error_end"
+            onOutageEnd(state, now)
+        else if kind = "replan_failed"
+            onReplanFailed(state, now)
+        else if kind = "replan_refused"
+            ' A lowering never sent leaves no kept estimate: the one before
+            ' it stands.
+            if state.pending <> invalid then state.kept = state.pending.priorKept
+            onReplanFailed(state, now)
+        else if kind = "select_lower"
+            selectLower(state, now)
+        else if kind = "select_keep"
+            selectKeep(state, now)
+        else if kind = "select_restore"
+            selectRestore(state, now)
+        else if kind = "select"
+            if state.activePill = "prompt"
+                selectLower(state, now)
+            else if state.activePill = "undo"
+                selectRestore(state, now)
+            end if
+        else if kind = "back"
+            back(state, now)
+        else if kind = "pill_obscured"
+            state.obscured = true
+            obscurePill(state, now)
+        else if kind = "pill_unobscured"
+            state.obscured = false
+            if state.deferredPill <> invalid then present(state, state.deferredPill, state.deferredResumes, now)
+        else if kind = "client_replan"
+            clientReplan(state, util.text(event.operation), now)
+        else if kind = "quality_changed"
+            qualityChanged(state, now)
+        else if kind = "pick_sent"
+            state.pickPending = true
+            hidePill(state, now)
+        else if kind = "pick_refused"
+            ' Nothing changes but the hidden pill. A long stall in progress
+            ' is evaluated at once; anything shorter waits for its end.
+            if state.pickPending
+                state.pickPending = false
+                undoEnded(state, now)
+            end if
+        else if kind = "new_attempt"
+            ' The answer, the once-per-title notice and the re-offer wait
+            ' belong to the title; the kept estimate belonged to the attempt.
+            dropPlan(state, now)
+            state.kept = invalid
+        else if kind = "plan_ended"
+            dropPlan(state, now)
+        end if
+    end sub
+
+    ' A new adoption became the playing plan. A repeat of the current label
+    ' is ignored. An adoption the controller did not request
+    ' (controllerInitiated false) drops a pending lowering with no notice or
+    ' cooldown; one that answers the controller's lowering shows its result.
+    sub planAdopted(state as Object, wire as Object, controllerInitiated as Boolean, pickStillPending as Boolean, now as Integer)
+        label = util.text(wire.plan_id)
+        if state.current <> invalid and state.current.id = label then return
+        ' An adopted plan starts with no outage: its transport is new.
+        state.outage = false
+        settled = state.pending
+        previous = state.current
+        dropPlan(state, now)
+        ' Only a replacement of a source that has played is a source reload;
+        ' an earlier one carries on the start's wait, under its grace.
+        reload = previous <> invalid and attemptStarted(previous)
+        plan = newPlan(state, wire, label, reload)
+        if previous <> invalid and not reload then plan.firstWaitingAt = previous.firstWaitingAt
+        state.current = plan
+        state.quality = plan.quality
+        state.throughputKbps = invalid
+        if pickStillPending
+            state.pickPending = true
+        else if not controllerInitiated
+            state.pickPending = false
+        end if
+
+        if settled = invalid or not controllerInitiated or settled.kind = "restore" then return
+        noLower = plan.reductionUnavailable or (plan.delivered <> invalid and settled.fromKbps <> invalid and plan.delivered >= settled.fromKbps)
+        ' The viewer's pick on its way replaces this plan: it shows nothing.
+        quiet = state.pickPending
+        if noLower
+            plan.action = "cant_lower"
+            plan.cooldownUntil = now + NO_LOWER_COOLDOWN_MS
+            if not quiet
+                state.cantLowerShown = true
+                emit(state, now, { type: "notice", copy: "cant_lower" })
+            end if
+        else if quiet
+            return
+        else if settled.kind = "automatic"
+            showPill(state, "undo", now)
+        else
+            emit(state, now, { type: "notice", copy: "lowered" })
+        end if
+    end sub
+
+    function newPlan(state as Object, wire as Object, label as String, reload as Boolean) as Object
+        state.adoptions = state.adoptions + 1
+        delivered = invalid
+        if util.isNumber(wire.delivered_kbps) and wire.delivered_kbps > 0 then delivered = Int(wire.delivered_kbps)
+        quality = util.text(wire.quality)
+        if quality = "" then quality = "auto"
+        rungs = []
+        if type(wire.available_qualities) = "roArray"
+            for each rung in wire.available_qualities
+                if util.isObject(rung) and util.isNumber(rung.bitrate_kbps) and rung.bitrate_kbps > 0
+                    rungs.Push({ label: util.text(rung.label), kbps: Int(rung.bitrate_kbps) })
+                end if
+            end for
+        end if
+        unavailable = false
+        if type(wire.degradation_warnings) = "roArray"
+            for each warning in wire.degradation_warnings
+                code = warning
+                if util.isObject(warning) then code = warning.code
+                if util.text(code) = "quality_reduction_unavailable" then unavailable = true
+            end for
+        end if
+        active = invalid
+        if util.isString(wire.active_quality) and wire.active_quality <> "" then active = wire.active_quality
+        plan = {
+            n: state.adoptions,
+            id: label,
+            delivered: delivered,
+            quality: quality,
+            rungs: rungs,
+            reductionUnavailable: unavailable,
+            activeQuality: active,
+            ' Replaced a plan after the attempt had played: its load is a
+            ' source reload, which only the start deadline can lower.
+            replacement: reload,
+            played: false,
+            ' The stall tracker, the web player's createStallTracker. It has
+            ' not played while firstPlayingAt is invalid; a history reset
+            ' sets it, so that the grace is over.
+            firstPlayingAt: invalid,
+            firstWaitingAt: invalid,
+            stallStartedAt: invalid,
+            stalled: false,
+            stallEnds: [],
+            longStallEndedAt: invalid,
+            action: "none",
+            cooldownUntil: invalid,
+            deadlineFailure: false,
+            ' The summary. statsStallStartedAt is the stall in progress for
+            ' the summary, which a history reset does not move.
+            playingSince: invalid,
+            playedMs: 0,
+            statsStallStartedAt: invalid,
+            stallCount: 0,
+            stallTotalMs: 0,
+            stallLongestMs: 0,
+            final: invalid
+        }
+        if state.plans.DoesExist(label)
+            for i = 0 to state.planOrder.Count() - 1
+                if state.planOrder[i] = label
+                    state.planOrder.Delete(i)
+                    exit for
+                end if
+            end for
+        end if
+        state.plans.AddReplace(label, plan)
+        state.planOrder.Push(label)
+        while state.planOrder.Count() > KEPT_PLANS
+            state.plans.Delete(state.planOrder.Shift())
+        end while
+        return plan
+    end function
+
+    ' A plan of the attempt, this one or one it replaced, has played.
+    function attemptStarted(plan as Object) as Boolean
+        return plan.replacement or plan.played
+    end function
+
+    ' Playback runs: the first frame, or a resume from waiting or pause.
+    sub onPlaying(state as Object, now as Integer)
+        state.paused = false
+        state.waitCause = invalid
+        plan = state.current
+        if plan = invalid then return
+        thawPill(state, now)
+        startWait = not attemptStarted(plan)
+        plan.played = true
+        if plan.playingSince = invalid then plan.playingSince = now
+        if plan.firstPlayingAt = invalid then plan.firstPlayingAt = now
+        plan.stalled = false
+        if plan.statsStallStartedAt <> invalid then recordStall(plan, now - plan.statsStallStartedAt, true)
+        plan.statsStallStartedAt = invalid
+        startedAt = plan.stallStartedAt
+        if startedAt <> invalid
+            clearStallTiming(state, plan)
+            duration = now - startedAt
+            if startWait and not slowLinkEvidence(state, plan)
+                ' A start wait counts only on evidence the link is too slow:
+                ' a version can fail to start for other reasons.
+            else if duration >= LONG_STALL_MS
+                plan.longStallEndedAt = now
+            else if duration >= STALL_MIN_MS
+                plan.stallEnds.Push(now)
+            end if
+        end if
+        evaluate(state, now)
+    end sub
+
+    ' The player waits. Only a network wait can be a stall. Until the plan
+    ' first plays, a reload or seek wait is the start's too; a replacement's
+    ' load is a source reload, however long. Any wait but a pause's means the
+    ' player is trying to play, so a pill frozen by a stop the viewer did not
+    ' make runs again.
+    sub onWaiting(state as Object, cause as String, now as Integer)
+        if cause <> "pause" then state.paused = false
+        state.waitCause = cause
+        plan = state.current
+        if plan = invalid then return
+        if not state.paused then thawPill(state, now)
+        stopPlayedClock(plan, now)
+        starting = plan.firstPlayingAt = invalid
+        if plan.replacement and starting
+            interrupt(state, plan, now)
+            return
+        end if
+        startWait = starting and (cause = "reload" or cause = "seek")
+        if cause <> "network" and not startWait
+            interrupt(state, plan, now)
+            return
+        end if
+        plan.stalled = true
+        if starting and plan.firstWaitingAt = invalid then plan.firstWaitingAt = now
+        if state.outage then return
+        startStallTiming(state, plan, now)
+    end sub
+
+    sub onPause(state as Object, now as Integer)
+        state.paused = true
+        state.waitCause = invalid
+        freezePill(state, now)
+        plan = state.current
+        if plan = invalid then return
+        stopPlayedClock(plan, now)
+        interrupt(state, plan, now)
+    end sub
+
+    ' A seek before the plan first plays leaves the start's wait running.
+    sub onSeek(state as Object, now as Integer)
+        plan = state.current
+        if plan = invalid or plan.firstPlayingAt = invalid then return
+        stopPlayedClock(plan, now)
+        interrupt(state, plan, now)
+    end sub
+
+    ' An outage owns any wait until it ends. The stall so far leaves the
+    ' trigger and the summary both.
+    sub onOutageStart(state as Object)
+        state.outage = true
+        plan = state.current
+        if plan = invalid or plan.stallStartedAt = invalid then return
+        clearStallTiming(state, plan)
+        plan.statsStallStartedAt = invalid
+    end sub
+
+    ' A wait still in progress is a stall again, timed from now.
+    sub onOutageEnd(state as Object, now as Integer)
+        state.outage = false
+        state.outageEndedAt = now
+        plan = state.current
+        if plan <> invalid and plan.stalled and plan.stallStartedAt = invalid then startStallTiming(state, plan, now)
+    end sub
+
+    ' The controller's replan failed or will never be adopted. The current
+    ' plan plays on and is watched again at the rearm, counted from the send.
+    sub onReplanFailed(state as Object, now as Integer)
+        failed = state.pending
+        ' A lowering made without asking that never took effect is not its
+        ' plan's action; the viewer's answers stand.
+        if failed <> invalid and failed.kind = "automatic" and failed.from <> invalid then failed.from.action = failed.actionBefore
+        state.pending = invalid
+        runDeadlineFailure(state, now)
+    end sub
+
+    ' A replan the client sends for its own reasons: the adopted plan's
+    ' quality and, on Auto, the kept estimate without a source, because it
+    ' repeats an earlier observation.
+    sub clientReplan(state as Object, operation as String, now as Integer)
+        body = { operation: operation, quality_preference: state.quality }
+        if state.quality = "auto" and state.kept <> invalid then body.bandwidth_estimate_kbps = state.kept
+        emit(state, now, { type: "replan", body: body })
+    end sub
+
+    ' A quality change the controller did not send, such as the viewer's
+    ' pick, ahead of its plan_adopted: any pill hides, history clears, the
+    ' answer, the re-offer wait, a pending lowering and the kept estimate go.
+    sub qualityChanged(state as Object, now as Integer)
+        state.pickPending = false
+        hidePill(state, now)
+        state.answeredQuality = invalid
+        state.reofferNotBefore = invalid
+        state.pending = invalid
+        state.kept = invalid
+        state.timers.rearm = invalid
+        if state.current <> invalid then resetTracker(state, state.current, now)
+    end sub
+
+    ' ---- Pill answers -------------------------------------------------------
+
+    sub selectLower(state as Object, now as Integer)
+        plan = state.current
+        if state.activePill <> "prompt" or plan = invalid then return
+        ' A prompt shows only for a plan with a lower rung.
+        lowering = loweringFor(plan)
+        if lowering = invalid then return
+        hidePill(state, now)
+        sendLowering(state, plan, lowering, "accepted", now)
+    end sub
+
+    sub selectKeep(state as Object, now as Integer)
+        plan = state.current
+        if state.activePill <> "prompt" or plan = invalid then return
+        hidePill(state, now)
+        state.answeredQuality = plan.quality
+        plan.action = "kept"
+    end sub
+
+    ' Restore quality: Auto with no estimate and the learned limit cleared.
+    ' The title is answered at Auto, and the kept estimate goes.
+    sub selectRestore(state as Object, now as Integer)
+        plan = state.current
+        if state.activePill <> "undo" or plan = invalid then return
+        hidePill(state, now)
+        plan.action = "restored"
+        state.answeredQuality = "auto"
+        state.kept = invalid
+        state.pending = { kind: "restore", fromKbps: invalid, from: invalid, actionBefore: "none", priorKept: invalid }
+        startRearm(state, now)
+        emit(state, now, { type: "replan", body: { operation: "quality_change", quality_preference: "auto", learned_limit: "clear" } })
+    end sub
+
+    ' Back on the prompt is Keep quality. On the undo pill it only hides it,
+    ' and its suppression ends as its timer's would.
+    sub back(state as Object, now as Integer)
+        if state.activePill = "prompt"
+            selectKeep(state, now)
+        else if state.activePill = "undo"
+            hidePill(state, now)
+            undoEnded(state, now)
+        end if
+    end sub
+
+    ' ---- Trigger ------------------------------------------------------------
+
+    sub evaluate(state as Object, now as Integer)
+        plan = state.current
+        if state.outage or state.pickPending or plan = invalid then return
+        if not shouldTrigger(plan, now) or isBusy(state) then return
+        ' A suppressed trigger leaves the history as it is.
+        if plan.cooldownUntil <> invalid and now < plan.cooldownUntil
+            suppressUntil(state, plan, plan.cooldownUntil)
+            return
+        end if
+        if isAnswered(state, plan) then return
+        if not attemptStarted(plan) and not slowLinkEvidence(state, plan) then return
+        if state.mode = "never"
+            plan.action = "ignored"
+            resetTracker(state, plan, now)
+            return
+        end if
+        lowering = loweringFor(plan)
+        if lowering = invalid
+            showCantLower(state, plan, now)
+            resetTracker(state, plan, now)
+            return
+        end if
+        if plan.quality = "auto" and state.mode = "always"
+            sendLowering(state, plan, lowering, "automatic", now)
+            return
+        end if
+        if state.reofferNotBefore <> invalid and now < state.reofferNotBefore
+            suppressUntil(state, plan, state.reofferNotBefore)
+            return
+        end if
+        showPill(state, "prompt", now)
+    end sub
+
+    ' Two counted stalls ended within the window, or one stall reached
+    ' LONG_STALL_MS, still in progress or ended within the window.
+    function shouldTrigger(plan as Object, now as Integer) as Boolean
+        if plan.longStallEndedAt <> invalid and now - plan.longStallEndedAt < STALL_WINDOW_MS then return true
+        if plan.stallStartedAt <> invalid and now - plan.stallStartedAt >= LONG_STALL_MS then return true
+        recent = []
+        for each ended in plan.stallEnds
+            if now - ended < STALL_WINDOW_MS then recent.Push(ended)
+        end for
+        plan.stallEnds = recent
+        return recent.Count() >= STALLS_BEFORE_TRIGGER
+    end function
+
+    ' Something of ours is in flight: a replan, the rearm wait after one, or
+    ' a pill showing, waiting or hidden behind a higher-priority pill.
+    function isBusy(state as Object) as Boolean
+        return state.pending <> invalid or state.timers.rearm <> invalid or state.activePill <> invalid or state.deferredPill <> invalid
+    end function
+
+    function isAnswered(state as Object, plan as Object) as Boolean
+        return state.answeredQuality <> invalid and state.answeredQuality = plan.quality
+    end function
+
+    ' The plan's media measurably arrived more slowly than its delivered
+    ' bitrate. No measurement, or one at or above the bitrate, is no
+    ' evidence: the plan may be failing for another reason.
+    function slowLinkEvidence(state as Object, plan as Object) as Boolean
+        return plan.delivered <> invalid and state.throughputKbps <> invalid and state.throughputKbps < plan.delivered
+    end function
+
+    ' A trigger held by a time-based rule while a stall is in progress looks
+    ' again when the rule lifts; otherwise the stall's end evaluates.
+    sub suppressUntil(state as Object, plan as Object, liftAt as Integer)
+        if plan.stallStartedAt = invalid then return
+        schedule(state, "reevaluate", liftAt, { n: plan.n })
+    end sub
+
+    ' The quality_change replan body that lowers plan one step, or invalid
+    ' when nothing is lower. The lower rung is the highest entry below the
+    ' lower of the bitrate of the rung the plan names in active_quality and
+    ' the delivered bitrate (the delivered bitrate alone when it names none).
+    ' Auto steps down by estimate, a picked quality to that rung's label.
+    function loweringFor(plan as Object) as Dynamic
+        ceiling = plan.delivered
+        if plan.activeQuality <> invalid
+            for each rung in plan.rungs
+                if rung.label = plan.activeQuality
+                    if ceiling = invalid or rung.kbps < ceiling then ceiling = rung.kbps
+                    exit for
+                end if
+            end for
+        end if
+        if ceiling = invalid then return invalid
+        lower = invalid
+        for each rung in plan.rungs
+            ' Equal bitrates resolve to the earlier entry, as on web.
+            if rung.label <> "auto" and rung.kbps < ceiling and (lower = invalid or rung.kbps > lower.kbps) then lower = rung
+        end for
+        if lower = invalid then return invalid
+        if plan.quality <> "auto" then return { operation: "quality_change", quality_preference: lower.label }
+        ' Auto without a delivered bitrate, or with an estimate under the
+        ' server's floor, has no lower rung.
+        estimate = stepDownEstimate(plan.delivered)
+        if estimate = invalid or estimate < MIN_ESTIMATE_KBPS then return invalid
+        return { operation: "quality_change", quality_preference: "auto", bandwidth_estimate_kbps: estimate, bandwidth_estimate_source: "observed_rebuffer" }
+    end function
+
+    ' Sends a lowering, kind "automatic" or "accepted". A lower result is
+    ' judged against the delivered bitrate of the plan it leaves, and its
+    ' estimate is kept for the client's later Auto replans.
+    sub sendLowering(state as Object, plan as Object, lowering as Object, kind as String, now as Integer)
+        state.pending = { kind: kind, fromKbps: plan.delivered, from: plan, actionBefore: plan.action, priorKept: state.kept }
+        if kind = "automatic" then plan.action = "lowered" else plan.action = "accepted"
+        if lowering.bandwidth_estimate_kbps <> invalid then state.kept = lowering.bandwidth_estimate_kbps
+        startRearm(state, now)
+        body = {}
+        body.Append(lowering)
+        emit(state, now, { type: "replan", body: body })
+    end sub
+
+    ' Can't lower quality for this video, once per title.
+    sub showCantLower(state as Object, plan as Object, now as Integer)
+        plan.action = "cant_lower"
+        if state.cantLowerShown then return
+        state.cantLowerShown = true
+        emit(state, now, { type: "notice", copy: "cant_lower" })
+    end sub
+
+    ' The rearm is timed from the send, whether or not the replan fails.
+    sub startRearm(state as Object, now as Integer)
+        schedule(state, "rearm", now + REARM_AFTER_UNADOPTED_MS, {})
+    end sub
+
+    ' A lowering sent for a missed start deadline came to nothing while that
+    ' plan is still current and has not played: the session's failure path
+    ' runs now. An adoption ends the plan, and this with it.
+    sub runDeadlineFailure(state as Object, now as Integer)
+        plan = state.current
+        if plan = invalid or not plan.deadlineFailure then return
+        plan.deadlineFailure = false
+        if plan.firstPlayingAt = invalid then emit(state, now, { type: "deadline_refused" })
+    end sub
+
+    ' ---- Stall tracker ------------------------------------------------------
+
+    ' Times the stall in progress, from the end of the grace at the earliest.
+    sub startStallTiming(state as Object, plan as Object, now as Integer)
+        startedAt = plan.stallStartedAt
+        if startedAt = invalid then startedAt = larger(now, graceEndsAt(plan, now))
+        plan.stallStartedAt = startedAt
+        if plan.statsStallStartedAt = invalid then plan.statsStallStartedAt = startedAt
+        if state.timers.longStall <> invalid then return
+        schedule(state, "longStall", startedAt + LONG_STALL_MS, { n: plan.n, startedAt: startedAt })
+    end sub
+
+    ' The grace runs from a wait before playback first runs, or else from
+    ' that first run; a frame after the wait does not move it.
+    function graceEndsAt(plan as Object, now as Integer) as Integer
+        anchor = now
+        if plan.firstWaitingAt <> invalid
+            anchor = plan.firstWaitingAt
+        else if plan.firstPlayingAt <> invalid
+            anchor = plan.firstPlayingAt
+        end if
+        return anchor + STARTUP_GRACE_MS
+    end function
+
+    ' Stops timing the current stall without ending it.
+    sub clearStallTiming(state as Object, plan as Object)
+        plan.stallStartedAt = invalid
+        state.timers.longStall = invalid
+        state.timers.reevaluate = invalid
+    end sub
+
+    ' A seek, pause, reload or renderer wait: the wait from here on is not
+    ' the network's. A stall in progress ends uncounted, its time kept for
+    ' the summary.
+    sub interrupt(state as Object, plan as Object, now as Integer)
+        plan.stalled = false
+        clearStallTiming(state, plan)
+        if plan.statsStallStartedAt <> invalid then recordStall(plan, now - plan.statsStallStartedAt, false)
+        plan.statsStallStartedAt = invalid
+    end sub
+
+    ' Clears the stall history with the grace over, and times a stall in
+    ' progress again from now: a prompt timeout, a rearm, a quality change,
+    ' never's report and can't lower.
+    sub resetTracker(state as Object, plan as Object, now as Integer)
+        plan.firstPlayingAt = now - STARTUP_GRACE_MS
+        plan.firstWaitingAt = invalid
+        plan.stallEnds = []
+        plan.longStallEndedAt = invalid
+        clearStallTiming(state, plan)
+        if plan.stalled and not state.outage then startStallTiming(state, plan, now)
+    end sub
+
+    ' ---- Summary ------------------------------------------------------------
+
+    sub stopPlayedClock(plan as Object, now as Integer)
+        if plan.playingSince <> invalid then plan.playedMs = plan.playedMs + larger(0, now - plan.playingSince)
+        plan.playingSince = invalid
+    end sub
+
+    ' Every stall's time counts in the total and the longest; a counted one
+    ' of STALL_MIN_MS or more in the count.
+    sub recordStall(plan as Object, durationMs as Integer, counted as Boolean)
+        if durationMs <= 0 then return
+        if counted and durationMs >= STALL_MIN_MS then plan.stallCount = plan.stallCount + 1
+        plan.stallTotalMs = plan.stallTotalMs + durationMs
+        plan.stallLongestMs = larger(plan.stallLongestMs, durationMs)
+    end sub
+
+    ' plan's figures as of now, leaving it as it is. A stall still in
+    ' progress counts as one that ended now, since a plan replaced mid-stall
+    ' is usually the one that stalled.
+    function summaryOf(state as Object, plan as Object, now as Integer) as Object
+        playing = 0
+        if plan.playingSince <> invalid then playing = larger(0, now - plan.playingSince)
+        stallMs = 0
+        if plan.statsStallStartedAt <> invalid then stallMs = larger(0, now - plan.statsStallStartedAt)
+        stallCount = plan.stallCount
+        if stallMs >= STALL_MIN_MS then stallCount = stallCount + 1
+        figures = {
+            played_ms: plan.playedMs + playing,
+            stall_count: stallCount,
+            stall_total_ms: plan.stallTotalMs + stallMs,
+            stall_longest_ms: larger(plan.stallLongestMs, stallMs),
+            buffering_mode: state.mode,
+            buffering_action: plan.action
+        }
+        if plan.delivered <> invalid then figures.delivered_kbps = plan.delivered
+        return figures
+    end function
+
+    ' The playing plan stops being the playing plan: its figures close, and
+    ' anything in flight for it, its pill and its timers go.
+    sub dropPlan(state as Object, now as Integer)
+        plan = state.current
+        if plan <> invalid then plan.final = summaryOf(state, plan, now)
+        state.current = invalid
+        state.pending = invalid
+        hidePill(state, now)
+        state.timers.longStall = invalid
+        state.timers.reevaluate = invalid
+        state.timers.rearm = invalid
+    end sub
+
+    ' ---- Pill ---------------------------------------------------------------
+
+    ' Offers a fresh pill now, or with its full timer once nothing hides it.
+    sub showPill(state as Object, kind as String, now as Integer)
+        if state.obscured
+            state.deferredPill = kind
+            state.deferredResumes = false
+            return
+        end if
+        present(state, kind, false, now)
+    end sub
+
+    ' Puts kind on screen. A fresh pill starts its full timer and, for the
+    ' prompt, the re-offer clock; a resumed one keeps both.
+    sub present(state as Object, kind as String, resume as Boolean, now as Integer)
+        state.deferredPill = invalid
+        state.deferredResumes = false
+        state.activePill = kind
+        if not resume
+            state.pillRemainingMs = PROMPT_MS
+            if kind = "prompt" then state.promptShownAt = now
+        end if
+        emit(state, now, { type: kind + "_shown" })
+        if not state.paused then startPillTimer(state, now)
+    end sub
+
+    ' A higher-priority pill arrived: the visible pill hides and keeps its
+    ' time left.
+    sub obscurePill(state as Object, now as Integer)
+        kind = state.activePill
+        if kind = invalid then return
+        stopPillTimer(state, now)
+        state.activePill = invalid
+        state.deferredPill = kind
+        state.deferredResumes = true
+        emit(state, now, { type: "pill_hidden" })
+    end sub
+
+    sub startPillTimer(state as Object, now as Integer)
+        if state.pillRemainingMs <= 0
+            pillTimedOut(state, now)
+            return
+        end if
+        state.pillSince = now
+        schedule(state, "pill", now + state.pillRemainingMs, {})
+    end sub
+
+    ' Stops a running pill timer, keeping the exact time left.
+    sub stopPillTimer(state as Object, now as Integer)
+        if state.timers.pill <> invalid and state.pillSince <> invalid
+            state.pillRemainingMs = state.pillRemainingMs - smaller(larger(0, now - state.pillSince), state.pillRemainingMs)
+        end if
+        state.timers.pill = invalid
+        state.pillSince = invalid
+    end sub
+
+    ' Pause: the pill stays up with its timer frozen.
+    sub freezePill(state as Object, now as Integer)
+        if state.timers.pill <> invalid then stopPillTimer(state, now)
+    end sub
+
+    sub thawPill(state as Object, now as Integer)
+        if state.activePill = invalid or state.timers.pill <> invalid then return
+        startPillTimer(state, now)
+    end sub
+
+    ' The undo pill's timeout only hides it. The prompt's withdraws without
+    ' an answer: history clears and a new prompt waits REOFFER_MIN_MS from
+    ' when this one first showed.
+    sub pillTimedOut(state as Object, now as Integer)
+        kind = state.activePill
+        if kind = invalid then return
+        hidePill(state, now)
+        if kind = "undo"
+            undoEnded(state, now)
+            return
+        end if
+        plan = state.current
+        if plan = invalid then return
+        plan.action = "timed_out"
+        state.reofferNotBefore = state.promptShownAt + REOFFER_MIN_MS
+        resetTracker(state, plan, now)
+    end sub
+
+    ' A suppression ended (the undo pill, a refused pick). A stall in
+    ' progress that has reached LONG_STALL_MS is evaluated at once; a
+    ' shorter one waits for its end.
+    sub undoEnded(state as Object, now as Integer)
+        plan = state.current
+        if plan = invalid or plan.stallStartedAt = invalid then return
+        if now - plan.stallStartedAt >= LONG_STALL_MS then evaluate(state, now)
+    end sub
+
+    ' Takes any pill down, visible, waiting or hidden, deciding nothing.
+    ' now is invalid when there is no time to report it at (setMode).
+    sub hidePill(state as Object, now as Dynamic)
+        if state.activePill <> invalid and now <> invalid then emit(state, now, { type: "pill_hidden" })
+        state.activePill = invalid
+        state.deferredPill = invalid
+        state.deferredResumes = false
+        state.pillRemainingMs = 0
+        state.pillSince = invalid
+        state.timers.pill = invalid
+    end sub
+
+    ' ---- Timers and outputs -------------------------------------------------
+
+    sub schedule(state as Object, name as String, at as Integer, timer as Object)
+        state.seq = state.seq + 1
+        timer.at = at
+        timer.seq = state.seq
+        state.timers[name] = timer
+    end sub
+
+    ' Fires every timer due at or before now, earliest first (in scheduling
+    ' order at the same time), each at its own time.
+    sub fireTimers(state as Object, now as Integer)
+        while true
+            due = invalid
+            dueName = ""
+            for each name in state.timers
+                timer = state.timers[name]
+                if timer <> invalid and timer.at <= now
+                    if due = invalid or timer.at < due.at or (timer.at = due.at and timer.seq < due.seq)
+                        due = timer
+                        dueName = name
+                    end if
+                end if
+            end for
+            if due = invalid then return
+            state.timers[dueName] = invalid
+            fire(state, dueName, due)
+        end while
+    end sub
+
+    sub fire(state as Object, name as String, timer as Object)
+        at = timer.at
+        plan = state.current
+        if name = "longStall" or name = "reevaluate"
+            ' Only for the stall it was set for, still in progress.
+            if plan = invalid or plan.n <> timer.n or plan.stallStartedAt = invalid then return
+            if name = "longStall" and plan.stallStartedAt <> timer.startedAt then return
+            evaluate(state, at)
+        else if name = "rearm"
+            state.pending = invalid
+            ' Before the reset, which treats the grace as over.
+            runDeadlineFailure(state, at)
+            if state.current <> invalid then resetTracker(state, state.current, at)
+        else if name = "pill"
+            state.pillRemainingMs = 0
+            state.pillSince = invalid
+            pillTimedOut(state, at)
+        end if
+    end sub
+
+    sub emit(state as Object, now as Integer, output as Object)
+        output.t = now
+        state.out.Push(output)
+    end sub
+
+    function takeOutputs(state as Object) as Object
+        outputs = state.out
+        state.out = invalid
+        return outputs
+    end function
+
+    function larger(a as Integer, b as Integer) as Integer
+        if a > b then return a
+        return b
+    end function
+
+    function smaller(a as Integer, b as Integer) as Integer
+        if a < b then return a
+        return b
+    end function
+
+end namespace

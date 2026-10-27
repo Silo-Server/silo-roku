@@ -1,0 +1,287 @@
+import "pkg:/source/util/values.bs"
+
+' The connection speed test's arithmetic, apart from any I/O: Connection
+' speed test > Measuring in the server repo's
+' docs/design/2026-10-17-buffering-quality.md, as Android's SpeedTestMeter
+' does it. tests/playback/speedTest.spec.bs replays the spec's probe_cases
+' against it.
+'
+' Times are milliseconds after the first byte of the response body. Bytes
+' count in the WINDOW_MS window they arrive in, and window 0, TCP ramp-up,
+' never counts. Feed arrivals to receive (or a whole chunk to spread), move
+' the clock with advanceTo so a window with no bytes still closes and counts
+' as 0, and report a clean end of the body with ended. Once stopAt is set the
+' test stops reading and later bytes are ignored. A link so fast that the
+' whole request arrives before any window after window 0 completes is
+' measured over the whole transfer instead.
+'
+' Byte counts are kept as Doubles: an accurate test reaches 1,000,000,000
+' bytes, and bytes * 8 passes the 32-bit Integer, while a Double holds every
+' count exactly and its division rounds correctly, so Int() of it is the
+' spec's floor.
+namespace playback.speedTest
+    const WINDOW_MS = 500
+    const MIN_KBPS = 100
+    const MAX_KBPS = 1000000
+    ' A test that has not had its first byte by now is abandoned.
+    const FIRST_BYTE_DEADLINE_MS = 10000
+
+    const QUICK = "quick"
+    const ACCURATE = "accurate"
+    const QUICK_BYTES = 100000000
+    const QUICK_MAX_MS = 3000
+    const QUICK_SETTLE_WINDOWS = 2
+    const ACCURATE_BYTES = 1000000000
+    const ACCURATE_MAX_MS = 10000
+    const ACCURATE_SETTLE_WINDOWS = 6
+
+    ' The chunk policy (nextChunkBytes). roUrlTransfer reports only that a
+    ' transfer completed, and its file appears only then, so the transport
+    ' downloads the probe as back-to-back chunks and spreads each over its
+    ' time. A chunk starts small, so a slow link still closes windows, and
+    ' doubles while it arrives faster than FAST_CHUNK_MS, so a fast link is
+    ' not measured on request overhead.
+    const FIRST_CHUNK_BYTES = 2000000
+    const MAX_CHUNK_BYTES = 16000000
+    const FAST_CHUNK_MS = 250
+    ' How long a chunk after the first is sized to take (nextTimedChunk).
+    const TARGET_CHUNK_MS = 1000
+
+    ' The size the test asks the probe for: size=100000000 for the quick
+    ' test, 1000000000 for the accurate one.
+    function requestBytes(mode as String) as Integer
+        if mode = ACCURATE then return ACCURATE_BYTES
+        return QUICK_BYTES
+    end function
+
+    ' How long after the first byte the test reads at most.
+    function maxMs(mode as String) as Integer
+        if mode = ACCURATE then return ACCURATE_MAX_MS
+        return QUICK_MAX_MS
+    end function
+
+    ' How many complete windows the settled rate is taken over.
+    function settleWindows(mode as String) as Integer
+        if mode = ACCURATE then return ACCURATE_SETTLE_WINDOWS
+        return QUICK_SETTLE_WINDOWS
+    end function
+
+    ' A meter for mode ("quick" or "accurate"; anything else is quick).
+    ' targetKbps is bandwidth_probe_target_kbps, or invalid when the server
+    ' has none; the accurate test ignores it, and without one the quick test
+    ' runs its full 3 seconds.
+    function create(mode as String, targetKbps as Dynamic) as Object
+        if mode <> ACCURATE then mode = QUICK
+        target = invalid
+        if mode = QUICK and util.isNumber(targetKbps) then target = Int(targetKbps)
+        return {
+            mode: mode,
+            target: target,
+            requestBytes: requestBytes(mode),
+            maxMs: maxMs(mode),
+            settleWindows: settleWindows(mode),
+            ' Bytes of each window closed so far, by window number.
+            closed: [],
+            openBytes: 0#,
+            totalBytes: 0#,
+            ' When the body ended, if it ended before the test stopped.
+            endMs: invalid,
+            ' Bytes of the window that reached the target, once one has.
+            targetWindowBytes: invalid,
+            stopAt: invalid
+        }
+    end function
+
+    ' Closes every window that ended by atMs. The quick test stops at the end
+    ' of the first window after window 0 that reaches the target; either test
+    ' stops at its limit. True once the test should stop reading.
+    function advanceTo(meter as Object, atMs as Dynamic) as Boolean
+        while meter.stopAt = invalid and (meter.closed.Count() + 1) * WINDOW_MS <= atMs
+            bytes = meter.openBytes
+            meter.closed.Push(bytes)
+            meter.openBytes = 0#
+            windowEnd = meter.closed.Count() * WINDOW_MS
+            if meter.closed.Count() > 1 and meter.target <> invalid and rate(bytes, WINDOW_MS) >= meter.target
+                meter.targetWindowBytes = bytes
+                meter.stopAt = windowEnd
+            else if windowEnd >= meter.maxMs
+                meter.stopAt = meter.maxMs
+            end if
+        end while
+        return meter.stopAt <> invalid
+    end function
+
+    ' bytes arrived atMs after the first byte. Ignored once the test stopped.
+    sub receive(meter as Object, atMs as Dynamic, bytes as Dynamic)
+        if advanceTo(meter, atMs) then return
+        meter.openBytes = meter.openBytes + bytes
+        meter.totalBytes = meter.totalBytes + bytes
+    end sub
+
+    ' A chunk of bytes that arrived between fromMs and toMs, as roUrlTransfer
+    ' reports one: only when it completes. Its bytes are spread evenly over
+    ' its time, each window it spans getting the share of the chunk's time it
+    ' covers, and the clock moves to toMs. The shares add up to bytes
+    ' exactly. A chunk with no time counts at toMs.
+    sub spread(meter as Object, fromMs as Dynamic, toMs as Dynamic, bytes as Dynamic)
+        start = Int(fromMs)
+        finish = Int(toMs)
+        if finish <= start
+            receive(meter, finish, bytes)
+            return
+        end if
+        total = 0# + bytes
+        span = finish - start
+        given = 0#
+        at = start
+        while at < finish
+            edge = (at \ WINDOW_MS + 1) * WINDOW_MS
+            if edge > finish then edge = finish
+            share = Int(total * (edge - start) / span) - given
+            receive(meter, at, share)
+            given = given + share
+            at = edge
+        end while
+        advanceTo(meter, finish)
+    end sub
+
+    ' The body ended cleanly atMs after the first byte; a window it cut short
+    ' does not count. A transfer that fails, or ends short of its
+    ' Content-Length, measured nothing: the caller drops the meter instead.
+    sub ended(meter as Object, atMs as Dynamic)
+        if advanceTo(meter, atMs) then return
+        meter.stopAt = atMs
+        meter.endMs = atMs
+    end sub
+
+    ' When the test stops reading, in ms after the first byte, or invalid
+    ' while it reads on.
+    function stopAt(meter as Object) as Dynamic
+        return meter.stopAt
+    end function
+
+    ' The target as a lower bound when a window reached it, else the settled
+    ' rate over the last complete windows after window 0, else the
+    ' whole-transfer average (wholeTransfer). { kbps, lower_bound, bytes,
+    ' duration_ms }, the fields of the probe result the client reports, with
+    ' bytes and duration_ms those of the windows the rate came from. Invalid
+    ' when the test measured nothing: no complete window after window 0 and a
+    ' transfer that did not deliver every byte it asked for, or a rate under
+    ' MIN_KBPS, a target under it included. A rate above MAX_KBPS is MAX_KBPS
+    ' as a lower bound.
+    function result(meter as Object) as Dynamic
+        if meter.targetWindowBytes <> invalid
+            if meter.target < MIN_KBPS then return invalid
+            kbps = meter.target
+            if kbps > MAX_KBPS then kbps = MAX_KBPS
+            return measured(kbps, true, meter.targetWindowBytes, WINDOW_MS)
+        end if
+        firstWindow = meter.closed.Count() - meter.settleWindows
+        if firstWindow < 1 then firstWindow = 1
+        windows = meter.closed.Count() - firstWindow
+        if windows <= 0 then return wholeTransfer(meter)
+        bytes = 0#
+        for index = firstWindow to meter.closed.Count() - 1
+            bytes = bytes + meter.closed[index]
+        end for
+        durationMs = windows * WINDOW_MS
+        kbps = rate(bytes, durationMs)
+        if kbps < MIN_KBPS then return invalid
+        if kbps > MAX_KBPS then return measured(MAX_KBPS, true, bytes, durationMs)
+        return measured(kbps, false, bytes, durationMs)
+    end function
+
+    ' Every requested byte arrived before any window after window 0
+    ' completed: floor(bytes * 8 / ms) from the first byte to the end of the
+    ' body, the ramp included, so it can only read low. Always a lower bound:
+    ' the target when a quick test's average reaches it, else the average up
+    ' to MAX_KBPS.
+    function wholeTransfer(meter as Object) as Dynamic
+        if meter.endMs = invalid or meter.totalBytes < meter.requestBytes then return invalid
+        durationMs = meter.endMs
+        if durationMs < 1 then durationMs = 1
+        kbps = rate(meter.totalBytes, durationMs)
+        if meter.target <> invalid and kbps >= meter.target then kbps = meter.target
+        if kbps > MAX_KBPS then kbps = MAX_KBPS
+        if kbps < MIN_KBPS then return invalid
+        return measured(kbps, true, meter.totalBytes, durationMs)
+    end function
+
+    function measured(kbps as Dynamic, lowerBound as Boolean, bytes as Dynamic, durationMs as Dynamic) as Object
+        return { kbps: Int(kbps), lower_bound: lowerBound, bytes: Int(bytes), duration_ms: Int(durationMs) }
+    end function
+
+    ' floor(bytes * 8 / ms): bits per millisecond is kbit/s. Above MAX_KBPS
+    ' it answers MAX_KBPS + 1, which every caller caps, so Int() never sees a
+    ' value past the Integer.
+    function rate(bytes as Dynamic, ms as Dynamic) as Integer
+        kbps = (0# + bytes) * 8 / ms
+        if kbps > MAX_KBPS then return MAX_KBPS + 1
+        return Int(kbps)
+    end function
+
+    ' The size of the next chunk to request: FIRST_CHUNK_BYTES for the first
+    ' (previousBytes invalid or 0), then the previous size, doubled when that
+    ' chunk took under FAST_CHUNK_MS, up to MAX_CHUNK_BYTES. Never more than
+    ' remainingBytes, what is left of the mode's requestBytes; 0 when nothing
+    ' is.
+    function nextChunkBytes(previousBytes as Dynamic, previousMs as Dynamic, remainingBytes as Dynamic) as Integer
+        size = FIRST_CHUNK_BYTES
+        if util.isNumber(previousBytes) and previousBytes > 0
+            size = Int(previousBytes)
+            if util.isNumber(previousMs) and previousMs < FAST_CHUNK_MS then size = size * 2
+        end if
+        if size > MAX_CHUNK_BYTES then size = MAX_CHUNK_BYTES
+        if not util.isNumber(remainingBytes) or remainingBytes <= 0 then return 0
+        if remainingBytes < size then size = Int(remainingBytes)
+        return size
+    end function
+
+    ' The next chunk: what arrives in TARGET_CHUNK_MS at the last chunk's
+    ' rate, at least the meter's policy (nextChunkBytes), cut to what
+    ' arrives by the limit, but never under the first chunk's size. Each
+    ' request costs about 200 ms on an Ultra 4850X (2 MB chunks on a link
+    ' that carries 160 Mbps took 375 ms each and read 35 Mbps, AG-391), so
+    ' a chunk is sized by time rather than doubled.
+    function nextTimedChunk(previousBytes as Integer, previousMs as Integer, remainingBytes as Dynamic, leftMs as Integer) as Integer
+        bytes = nextChunkBytes(previousBytes, previousMs, remainingBytes)
+        if bytes <= 0 or previousMs <= 0 then return bytes
+        target = Int(previousBytes * 1# * TARGET_CHUNK_MS / previousMs)
+        if target > MAX_CHUNK_BYTES then target = MAX_CHUNK_BYTES
+        if target > bytes then bytes = target
+        fits = Int(previousBytes * 1# * leftMs / previousMs)
+        if fits < FIRST_CHUNK_BYTES then fits = FIRST_CHUNK_BYTES
+        if fits < bytes then bytes = fits
+        if util.isNumber(remainingBytes) and bytes > remainingBytes then bytes = remainingBytes
+        return bytes
+    end function
+
+    ' url with its size query parameter set to bytes.
+    function withSize(url as String, bytes as Integer) as String
+        query = Instr(1, url, "?")
+        base = url
+        params = []
+        if query > 0
+            base = Left(url, query - 1)
+            for each part in Mid(url, query + 1).Split("&")
+                if part <> "" and LCase(Left(part, 5)) <> "size=" then params.Push(part)
+            end for
+        end if
+        params.Push("size=" + bytes.ToStr())
+        return base + "?" + params.Join("&")
+    end function
+
+    ' Retry-After in whole seconds: a missing or unreadable value counts as 30,
+    ' and anything under 1 as 1 (the shared spec's When to test).
+    function retryAfter(headers as Dynamic) as Integer
+        value = invalid
+        if util.isObject(headers) then value = headers["retry-after"]
+        if not util.isString(value) or value = "" then return 30
+        for i = 1 to Len(value)
+            if Instr(1, "0123456789", Mid(value, i, 1)) = 0 then return 30
+        end for
+        seconds = Val(value)
+        if seconds < 1 then return 1
+        return Int(seconds)
+    end function
+end namespace

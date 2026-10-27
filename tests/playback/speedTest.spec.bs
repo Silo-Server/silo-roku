@@ -1,0 +1,242 @@
+namespace tests
+
+    @suite("playback speed test")
+    class PlaybackSpeedTestTests extends rooibos.BaseTestSuite
+
+        function vectors() as Object
+            return tests.devices.loadJson("pkg:/tests/fixtures/buffering-quality/vectors.json")
+        end function
+
+        ' The meter's byte counts as Integers: { closed: bytes of each closed
+        ' window, open: the open window's, total }. The meter keeps Doubles.
+        function counts(meter as Object) as Object
+            closed = []
+            for each bytes in meter.closed
+                closed.Push(Int(bytes))
+            end for
+            return { closed: closed, open: Int(meter.openBytes), total: Int(meter.totalBytes) }
+        end function
+
+        ' Replays one probe case as probe_about describes: each chunk at its
+        ' time, then the clean end, or the test's limit when the case has
+        ' none. "" when it matches, else what differs.
+        function replay(probeCase as Object) as String
+            meter = playback.speedTest.create(probeCase.mode, probeCase.target_kbps)
+            for each chunk in probeCase.chunks
+                playback.speedTest.receive(meter, chunk[0], chunk[1])
+            end for
+            ' end and stop are reserved words, so those members are read by name.
+            if probeCase["end"] <> invalid
+                playback.speedTest.ended(meter, probeCase["end"])
+            else
+                playback.speedTest.advanceTo(meter, playback.speedTest.maxMs(probeCase.mode))
+            end if
+            got = playback.speedTest.result(meter)
+            expected = probeCase.expect
+            if expected = invalid
+                if got = invalid then return ""
+                return "expected no measurement, got " + FormatJson(got)
+            end if
+            if got = invalid then return "measured nothing, expected " + FormatJson(expected)
+            problems = []
+            for each field in ["kbps", "bytes", "duration_ms"]
+                if got[field] <> expected[field] then problems.Push(field + " " + got[field].ToStr() + " <> " + expected[field].ToStr())
+            end for
+            if got.lower_bound <> expected.lower_bound then problems.Push("lower_bound " + got.lower_bound.ToStr())
+            stopped = playback.speedTest.stopAt(meter)
+            if stopped = invalid or stopped <> expected["stop"] then problems.Push("stop " + util.text(stopped) + " <> " + util.text(expected["stop"]))
+            return problems.Join(", ")
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("probe vectors")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("matches the vendored probe constants")
+        sub _()
+            constants = m.vectors().probe_constants
+            m.assertEqual(playback.speedTest.WINDOW_MS, constants.PROBE_WINDOW_MS)
+            m.assertEqual(playback.speedTest.requestBytes("quick"), constants.QUICK_PROBE_BYTES)
+            m.assertEqual(playback.speedTest.maxMs("quick"), constants.QUICK_PROBE_MAX_MS)
+            m.assertEqual(playback.speedTest.settleWindows("quick"), constants.QUICK_SETTLE_WINDOWS)
+            m.assertEqual(playback.speedTest.requestBytes("accurate"), constants.ACCURATE_PROBE_BYTES)
+            m.assertEqual(playback.speedTest.maxMs("accurate"), constants.ACCURATE_PROBE_MAX_MS)
+            m.assertEqual(playback.speedTest.settleWindows("accurate"), constants.ACCURATE_SETTLE_WINDOWS)
+            m.assertEqual(playback.speedTest.FIRST_BYTE_DEADLINE_MS, constants.PROBE_FIRST_BYTE_DEADLINE_MS)
+            m.assertEqual(playback.speedTest.MIN_KBPS, constants.MIN_PROBE_KBPS)
+            m.assertEqual(playback.speedTest.MAX_KBPS, constants.MAX_PROBE_KBPS)
+        end sub
+
+        @it("replays every probe case")
+        sub _()
+            cases = m.vectors().probe_cases
+            m.assertEqual(cases.Count(), 13)
+            failures = []
+            for each probeCase in cases
+                problem = m.replay(probeCase)
+                if problem <> "" then failures.Push(probeCase.name + ": " + problem)
+            end for
+            m.assertEqual(failures.Count(), 0, failures.Count().ToStr() + " of " + cases.Count().ToStr() + " probe cases failed: " + failures.Join("; "))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("measuring")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("ignores bytes once it stops and says when it should stop")
+        sub _()
+            meter = playback.speedTest.create("quick", 115000)
+            playback.speedTest.receive(meter, 0, 5000000)
+            m.assertFalse(playback.speedTest.advanceTo(meter, 999))
+            playback.speedTest.receive(meter, 750, 7500000)
+            m.assertTrue(playback.speedTest.advanceTo(meter, 1000))
+            playback.speedTest.receive(meter, 1100, 50000000)
+            m.assertEqual(playback.speedTest.stopAt(meter), 1000)
+            m.assertEqual(playback.speedTest.result(meter), { kbps: 115000, lower_bound: true, bytes: 7500000, duration_ms: 500 })
+        end sub
+
+        @it("measures nothing under 100 kbps, a target under it included")
+        sub _()
+            slow = playback.speedTest.create("quick", invalid)
+            playback.speedTest.receive(slow, 0, 1000)
+            playback.speedTest.receive(slow, 600, 6000)
+            playback.speedTest.advanceTo(slow, 3000)
+            m.assertInvalid(playback.speedTest.result(slow))
+            lowTarget = playback.speedTest.create("quick", 50)
+            playback.speedTest.receive(lowTarget, 0, 10000)
+            playback.speedTest.receive(lowTarget, 600, 10000)
+            playback.speedTest.advanceTo(lowTarget, 3000)
+            m.assertEqual(playback.speedTest.stopAt(lowTarget), 1000)
+            m.assertInvalid(playback.speedTest.result(lowTarget))
+        end sub
+
+        @it("reports a rate above 1,000,000 kbps as 1,000,000, a lower bound")
+        sub _()
+            meter = playback.speedTest.create("accurate", invalid)
+            playback.speedTest.receive(meter, 0, 100000000)
+            playback.speedTest.receive(meter, 600, 200000000)
+            playback.speedTest.advanceTo(meter, 1000)
+            playback.speedTest.ended(meter, 1100)
+            m.assertEqual(playback.speedTest.result(meter), { kbps: 1000000, lower_bound: true, bytes: 200000000, duration_ms: 500 })
+        end sub
+
+        @it("measures nothing when the body ends short before a counted window")
+        sub _()
+            meter = playback.speedTest.create("quick", 115000)
+            playback.speedTest.receive(meter, 0, 90000000)
+            playback.speedTest.ended(meter, 600)
+            m.assertEqual(playback.speedTest.stopAt(meter), 600)
+            m.assertInvalid(playback.speedTest.result(meter))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("chunks")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("spreads a chunk over the windows it spans in proportion to its time")
+        sub _()
+            meter = playback.speedTest.create("accurate", invalid)
+            ' 300 ms in window 0, 500 in window 1, 200 in window 2.
+            playback.speedTest.spread(meter, 200, 1200, 10000000)
+            m.assertEqual(m.counts(meter), { closed: [3000000, 5000000], open: 2000000, total: 10000000 })
+        end sub
+
+        @it("hands out every byte of a chunk that does not divide evenly")
+        sub _()
+            meter = playback.speedTest.create("accurate", invalid)
+            playback.speedTest.spread(meter, 0, 700, 1000001)
+            m.assertEqual(m.counts(meter), { closed: [714286], open: 285715, total: 1000001 })
+        end sub
+
+        @it("closes the windows a chunk ends past, so silence after it counts")
+        sub _()
+            meter = playback.speedTest.create("quick", invalid)
+            playback.speedTest.spread(meter, 0, 1000, 5000000)
+            m.assertEqual(meter.closed.Count(), 2)
+            m.assertTrue(playback.speedTest.advanceTo(meter, 3000))
+            ' Windows 4 and 5 were silent.
+            m.assertInvalid(playback.speedTest.result(meter))
+        end sub
+
+        @it("counts a chunk with no time at its end")
+        sub _()
+            meter = playback.speedTest.create("quick", invalid)
+            playback.speedTest.spread(meter, 0, 0, 2000000)
+            playback.speedTest.spread(meter, 600, 600, 3000000)
+            m.assertEqual(m.counts(meter), { closed: [2000000], open: 3000000, total: 5000000 })
+        end sub
+
+        @it("stops mid-chunk once a window beats the target, dropping the rest")
+        sub _()
+            meter = playback.speedTest.create("quick", 115000)
+            playback.speedTest.spread(meter, 0, 2000, 40000000)
+            m.assertEqual(playback.speedTest.stopAt(meter), 1000)
+            m.assertEqual(m.counts(meter).total, 20000000)
+            m.assertEqual(playback.speedTest.result(meter), { kbps: 115000, lower_bound: true, bytes: 10000000, duration_ms: 500 })
+        end sub
+
+        @it("measures a steady link the same whole or in chunks")
+        sub _()
+            meter = playback.speedTest.create("quick", invalid)
+            ' 48 Mbps: 6000 bytes a millisecond, in chunks of 1.5 MB.
+            at = 0
+            while not playback.speedTest.advanceTo(meter, at)
+                playback.speedTest.spread(meter, at, at + 250, 1500000)
+                at = at + 250
+            end while
+            m.assertEqual(playback.speedTest.result(meter), { kbps: 48000, lower_bound: false, bytes: 6000000, duration_ms: 1000 })
+        end sub
+
+        @it("sizes chunks from 2 MB, doubling while one takes under 250 ms, up to 16 MB")
+        sub _()
+            left = 100000000
+            m.assertEqual(playback.speedTest.nextChunkBytes(invalid, invalid, left), 2000000)
+            m.assertEqual(playback.speedTest.nextChunkBytes(0, invalid, left), 2000000)
+            m.assertEqual(playback.speedTest.nextChunkBytes(2000000, 249, left), 4000000)
+            m.assertEqual(playback.speedTest.nextChunkBytes(2000000, 250, left), 2000000)
+            m.assertEqual(playback.speedTest.nextChunkBytes(4000000, 900, left), 4000000)
+            m.assertEqual(playback.speedTest.nextChunkBytes(8000000, 100, left), 16000000)
+            m.assertEqual(playback.speedTest.nextChunkBytes(16000000, 100, left), 16000000)
+        end sub
+
+        @it("never asks for more than is left of the mode's total")
+        sub _()
+            m.assertEqual(playback.speedTest.nextChunkBytes(16000000, 100, 3500000), 3500000)
+            m.assertEqual(playback.speedTest.nextChunkBytes(invalid, invalid, 1000000), 1000000)
+            m.assertEqual(playback.speedTest.nextChunkBytes(2000000, 100, 0), 0)
+            m.assertEqual(playback.speedTest.nextChunkBytes(2000000, 100, invalid), 0)
+        end sub
+
+        @describe("the transfer's helpers")
+
+        @it("sets the probe URL's size, keeping its token and other parameters")
+        sub _()
+            m.assertEqual(playback.speedTest.withSize("https://node.example/stream/bandwidth-probe/tok?size=100000000", 2000000), "https://node.example/stream/bandwidth-probe/tok?size=2000000")
+            m.assertEqual(playback.speedTest.withSize("http://10.0.0.2:8096/api/v2/playback/bandwidth-probe/signed/tok", 4000000), "http://10.0.0.2:8096/api/v2/playback/bandwidth-probe/signed/tok?size=4000000")
+            m.assertEqual(playback.speedTest.withSize("https://h/p?a=1&size=9&b=2", 16000000), "https://h/p?a=1&b=2&size=16000000")
+        end sub
+
+        @it("reads Retry-After as whole seconds, 30 when missing or unreadable, at least 1")
+        sub _()
+            m.assertEqual(playback.speedTest.retryAfter({ "retry-after": "12" }), 12)
+            m.assertEqual(playback.speedTest.retryAfter({ "retry-after": "0" }), 1)
+            m.assertEqual(playback.speedTest.retryAfter({ "retry-after": "Wed, 21 Oct 2026 07:28:00 GMT" }), 30)
+            m.assertEqual(playback.speedTest.retryAfter({}), 30)
+            m.assertEqual(playback.speedTest.retryAfter(invalid), 30)
+        end sub
+
+        @it("sizes the next chunk to take a second at the last chunk's rate, ending by the test's limit")
+        sub _()
+            ' 2 MB in 375 ms (the Ultra's 35 Mbps): a second is 5.33 MB.
+            m.assertEqual(playback.speedTest.nextTimedChunk(2000000, 375, 90000000, 2600), 5333333)
+            ' A fast link caps at 16 MB.
+            m.assertEqual(playback.speedTest.nextTimedChunk(4000000, 200, 90000000, 2800), 16000000)
+            ' 16 MB in 400 ms with 200 ms left fits 8 MB.
+            m.assertEqual(playback.speedTest.nextTimedChunk(16000000, 400, 50000000, 200), 8000000)
+            ' Never under the first chunk, never past what the mode asks for.
+            m.assertEqual(playback.speedTest.nextTimedChunk(2000000, 2000, 90000000, 100), 2000000)
+            m.assertEqual(playback.speedTest.nextTimedChunk(2000000, 100, 1500000, 2000), 1500000)
+            m.assertEqual(playback.speedTest.nextTimedChunk(2000000, 100, 0, 2000), 0)
+        end sub
+    end class
+end namespace

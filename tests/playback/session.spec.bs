@@ -835,7 +835,7 @@ namespace tests
             cmds = m.fill(state, env, from, [[1000, 6], [3700, 15], [4200, 23], [5200, 31], [11100, 42], [16300, 52], [19200, 61], [23600, 70], [27800, 74]])
             m.assertEqual(m.cmdsOf(cmds, "replan"), [])
             m.assertEqual(m.cmdsOf(cmds, "reopen"), [])
-            m.assertEqual(playback.session.nextWake(state, env.t), from + 47800, "20 s from the last reading that rose")
+            m.assertEqual(playback.recovery.stallDeadline(state.stall), from + 47800, "20 s from the last reading that rose")
             cmds = m.fill(state, env, from, [[36000, 88], [40000, 100]])
             env.t = from + 41000
             cmds.Append(m.player(state, env, "playing"))
@@ -1338,16 +1338,14 @@ namespace tests
                 m.player(state, env, "playing")
             end for
             m.assertEqual(state.plan.id, "plan-1")
-            ' A stall in the reload's first ten seconds is its start's; one
-            ' after that is the bandwidth's, and the second steps down.
+            ' A reload has no grace of its own (the plan's is long over):
+            ' once it has played, two stalls within two minutes step down.
             position = m.playOn(state, env, position, 5)
-            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 4000), "replan"), [])
-            m.player(state, env, "playing")
-            position = m.playOn(state, env, position, 10)
-            m.slowRebuffer(state, env, 1500)
+            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 1500), "replan"), [])
             m.player(state, env, "playing")
             position = m.playOn(state, env, position, 30)
-            replan = m.cmd(m.slowRebuffer(state, env, 1000), "replan")
+            m.slowRebuffer(state, env, 1000)
+            replan = m.cmd(m.player(state, env, "playing"), "replan")
             m.assertEqual(replan.members.operation, "quality_change")
             m.assertEqual(replan.members.bandwidth_estimate_kbps, 5600)
         end sub
@@ -1366,14 +1364,16 @@ namespace tests
             m.assertFalse(state.plan.loadAssigned)
             ' The headers, the sidecars, and the old node's stop take their
             ' time, and no Video event comes meanwhile.
-            m.assertInvalid(playback.session.nextWake(state, env.t), "no Auto wake")
             m.assertEqual(m.cmdsOf(m.wake(state, env, 6000), "replan"), [])
             m.assertEqual(m.cmdsOf(m.wake(state, env, 30000), "replan"), [])
             m.assign(state, env)
             m.player(state, env, "buffering")
             m.assertEqual(m.cmdsOf(m.wake(state, env, 7000), "replan"), [], "the reload's own start")
             m.assertEqual(m.cmdsOf(m.player(state, env, "playing"), "replan"), [])
-            m.assertEqual(state.auto.stalls, [])
+            ' The renewal's buffering left no stall: one more short one is
+            ' the first.
+            m.playOn(state, env, tests.dbl(60), 5)
+            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 1500), "replan"), [])
             m.assertEqual(state.plan.id, "plan-1")
         end sub
 
@@ -1391,9 +1391,10 @@ namespace tests
             m.assertEqual(m.cmdsOf(m.wake(state, env, 7000), "replan"), [])
             m.assign(state, env)
             m.player(state, env, "playing")
-            m.assertEqual(state.auto.stalls.Count(), 1, "the stall before the renewal")
+            ' The stall before the renewal counts; the renewal's does not.
             position = m.playOn(state, env, position, 11)
-            replan = m.cmd(m.slowRebuffer(state, env, 1000), "replan")
+            m.slowRebuffer(state, env, 1000)
+            replan = m.cmd(m.player(state, env, "playing"), "replan")
             m.assertEqual(replan.members.operation, "quality_change")
             m.assertEqual(replan.members.bandwidth_estimate_kbps, 5600)
         end sub
@@ -1422,7 +1423,7 @@ namespace tests
             m.assertEqual(m.cmdsOf(m.wake(state, env, 7000), "replan"), [])
             m.assign(state, env)
             m.player(state, env, "playing")
-            m.assertEqual(state.auto.stalls, [])
+            m.assertEqual(m.cmdsOf(m.player(state, env, "buffering"), "replan"), [])
         end sub
 
         @it("waits for paused content to play on before it renews the credential")
@@ -2626,7 +2627,10 @@ namespace tests
             from = env.t
             all.Append(m.fill(state, env, from, [[0, 2], [3000, 2], [5900, 2], [6000, 2], [12000, 2]]))
             m.assertEqual(m.cmdsOf(all, "replan"), [], "run 15 sent quality_change 5.9 s in")
-            m.assertEqual(playback.session.nextWake(state, env.t), from + 20000, "the stall clock's, not Auto's")
+            ' Nothing arrived for 4 s: an outage, which the controller never
+            ' counts, and the stall clock's failure path at 20 s.
+            all.Append(m.wake(state, env, from + 19999 - env.t))
+            m.assertEqual(m.cmdsOf(all, "replan"), [], "no step down in the outage")
             cmds = m.wake(state, env, from + 20000 - env.t)
             m.assertEqual(m.types(cmds), ["log", "reopen"], "the original's own failure path")
             m.assertEqual(cmds[0].fields, { kind: "stall", buffer: 2 })
@@ -2648,7 +2652,7 @@ namespace tests
             m.assertFalse(start.DoesExist("bandwidth_estimate_kbps"), "run 15's Retry carried 2,818 kbps")
         end sub
 
-        @it("steps down on a slow link whose rebuffer still fills, and keeps that estimate through a later outage and Retry")
+        @it("steps down on a slow link whose rebuffer still fills, keeps that estimate through a later outage, and drops it at Retry")
         sub _()
             env = tests.fakeEnv()
             state = m.playing(env, m.synthetic())
@@ -2666,12 +2670,13 @@ namespace tests
             all.Append(m.refuseUntilError(state, env, tests.transcodePlan("plan-2", "v3:k2", 2254), "playlist"))
             m.assertEqual(m.cmd(all, "error").reason, "connection_lost")
             for each kbps in m.estimates(all)
-                m.assertEqual(kbps, 2818)
+                m.assertEqual(kbps, 2818, "every reconnect repeats the kept estimate")
             end for
-            m.assertEqual(m.cmd(m.send(state, env, { type: "retry" }), "start").bandwidth_estimate_kbps, 2818)
+            ' A new attempt: the server's learned limit carries the slow link.
+            m.assertFalse(m.cmd(m.send(state, env, { type: "retry" }), "start").DoesExist("bandwidth_estimate_kbps"))
         end sub
 
-        @it("drops the estimate of a step down the outage began in: the reconnects and Retry carry the one playback confirmed before it")
+        @it("keeps the latest step down's estimate when an outage follows it: the reconnects carry it, and Retry carries none")
         sub _()
             env = tests.fakeEnv()
             state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
@@ -2691,29 +2696,9 @@ namespace tests
             all.Append(m.refuseUntilError(state, env, tests.transcodePlan("plan-3", "v3:k3", 3920), "playlist"))
             m.assertEqual(m.cmd(all, "error").reason, "connection_lost")
             for each kbps in m.estimates(all)
-                m.assertEqual(kbps, 7000, "not the estimate no media followed")
+                m.assertEqual(kbps, 3920, "the latest lowering's, as every client keeps it")
             end for
-            m.assertEqual(m.cmd(m.send(state, env, { type: "retry" }), "start").bandwidth_estimate_kbps, 7000)
-        end sub
-
-        @it("drops a step down's estimate when its plan gets nothing for 20 s, or the server goes unreachable before media arrives")
-        sub _()
-            env = tests.fakeEnv()
-            for each lost in ["stall", "offline"]
-                state = m.playing(env, m.synthetic())
-                m.playOn(state, env, tests.dbl(3), 17)
-                m.slowRebuffer(state, env, 6000)
-                m.assertEqual(playback.autoQuality.estimate(state.auto, env.t), 2818)
-                if lost = "stall"
-                    m.replanResult(state, env, "ok", tests.playable("s-1", tests.transcodePlan("plan-2", "v3:k2", 2254)))
-                    m.assign(state, env)
-                    m.player(state, env, "buffering")
-                    m.assertEqual(m.types(m.wake(state, env, 20000)), ["log", "reopen"])
-                else
-                    m.replanResult(state, env, "offline", invalid)
-                end if
-                m.assertInvalid(playback.autoQuality.estimate(state.auto, env.t), lost)
-            end for
+            m.assertFalse(m.cmd(m.send(state, env, { type: "retry" }), "start").DoesExist("bandwidth_estimate_kbps"))
         end sub
 
         '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -2746,13 +2731,14 @@ namespace tests
             env.t = env.t + 19000
             m.position(state, env, tests.dbl(19))
             env.t = env.t + 1000
-            m.assertEqual(m.slowRebuffer(state, env, 15000), [], "an explicit choice is never overridden")
+            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 15000), "replan"), [], "an explicit choice is never lowered without asking")
             m.player(state, env, "playing")
 
-            ' Auto again: the measured estimate still applies.
-            body = m.send(state, env, { type: "qualityChange", quality: "auto" })[0].members
+            ' Auto again: a quality change drops the kept estimate, and the
+            ' server plans under its learned limit instead.
+            body = m.cmd(m.send(state, env, { type: "qualityChange", quality: "auto" }), "replan").members
             m.assertEqual(body.quality_preference, "auto")
-            m.assertEqual(body.bandwidth_estimate_kbps, 7000)
+            m.assertFalse(body.DoesExist("bandwidth_estimate_kbps"))
         end sub
 
         ' The bandwidth_estimate_kbps of Auto's quality_change among cmds, or
@@ -2773,10 +2759,9 @@ namespace tests
             m.assertEqual(m.types(cmds), ["log"], "the viewer asked for nothing, so no notice says it was refused")
             m.assertEqual(cmds[0].fields, { operation: "quality_change", kind: "rejected" })
             m.assertEqual(state.plan.data.plan_id, "plan-1", "the plan playing stays")
-            m.assertInvalid(playback.autoQuality.estimate(state.auto, env.t), "no replan carries the refused estimate")
         end sub
 
-        @it("judges the plan again after the server refuses Auto's step down, asking again only once each longer hold ends")
+        @it("watches the plan again a minute after the server refuses Auto's step down")
         sub _()
             env = tests.fakeEnv()
             state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
@@ -2784,85 +2769,39 @@ namespace tests
             m.assertEqual(m.stepDownKbps(m.slowRebuffer(state, env, 6000)), 7000)
             m.replanResult(state, env, "rejected", invalid)
 
-            ' Playback recovers, and the link stalls again within five minutes.
+            ' Playback recovers, and the link stalls again within the minute.
+            m.player(state, env, "playing")
+            position = m.playOn(state, env, position, 30)
+            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "REARM_AFTER_UNADOPTED_MS")
             m.player(state, env, "playing")
             position = m.playOn(state, env, position, 60)
-            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "a refusal holds five minutes")
-            m.player(state, env, "playing")
-            position = m.playOn(state, env, position, 240)
-            m.assertEqual(m.stepDownKbps(m.slowRebuffer(state, env, 6000)), 7000, "the plan is judged again")
-
-            ' Refused again: the hold doubles.
-            m.replanResult(state, env, "rejected", invalid)
-            m.player(state, env, "playing")
-            position = m.playOn(state, env, position, 400)
-            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "ten minutes")
-            m.player(state, env, "playing")
-            m.playOn(state, env, position, 200)
-            m.assertEqual(m.stepDownKbps(m.slowRebuffer(state, env, 6000)), 7000)
+            m.assertEqual(m.stepDownKbps(m.slowRebuffer(state, env, 6000)), 7000, "the plan is watched again")
         end sub
 
-        @it("judges the plan again when a viewer's request replaces Auto's step down before it is sent")
-        sub _()
-            env = tests.fakeEnv()
-            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
-            m.playOn(state, env, tests.dbl(3), 17)
-            m.send(state, env, { type: "trackChange", tracks: { audio: { id: "file:42:audio:1", index: 1 } } })
-            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "the step down waits for the track change")
-            m.assertEqual(state.queued.op, "quality_change")
-            m.send(state, env, { type: "seekTo", position: 600 })
-            m.assertEqual(state.queued.op, "seek", "the viewer's seek replaces it")
-            m.replanResult(state, env, "rejected", invalid)
-            m.player(state, env, "playing")
-            m.playOn(state, env, tests.dbl(600), 20)
-            m.assertEqual(m.stepDownKbps(m.slowRebuffer(state, env, 6000)), 7000)
-        end sub
-
-        @it("drops Auto's refused estimate, and holds off, when the plan of a request ahead of the step down started before the refusal")
+        @it("never queues Auto's step down behind a replan in flight, and watches the plan again a minute later")
         sub _()
             env = tests.fakeEnv()
             state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
             position = m.playOn(state, env, tests.dbl(3), 17)
             m.send(state, env, { type: "trackChange", tracks: { audio: { id: "file:42:audio:1", index: 1 } } })
-            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "the step down waits for the track change")
-            m.assertEqual(m.stepDownKbps(m.replanResult(state, env, "ok", tests.playable("s-1", tests.transcodePlan("plan-2", "v3:k2", 5000)))), 7000, "the step down goes out once the track change's plan comes")
-            m.player(state, env, "playing")
+            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "the track change is in flight")
+            m.assertInvalid(state.queued, "the shared spec: the client does not queue it")
             m.replanResult(state, env, "rejected", invalid)
-            m.assertInvalid(playback.autoQuality.estimate(state.auto, env.t), "no replan carries the refused estimate")
-            m.playOn(state, env, position, 60)
-            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "a refusal holds five minutes")
-        end sub
-
-        @it("asks no second step down while the first waits for its answer, so its refusal still holds off")
-        sub _()
-            env = tests.fakeEnv()
-            state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
-            position = m.playOn(state, env, tests.dbl(3), 17)
-            m.send(state, env, { type: "trackChange", tracks: { audio: { id: "file:42:audio:1", index: 1 } } })
-            m.slowRebuffer(state, env, 6000)
-            m.assertEqual(m.stepDownKbps(m.replanResult(state, env, "ok", tests.playable("s-1", tests.transcodePlan("plan-2", "v3:k2", 5000)))), 7000)
             m.player(state, env, "playing")
-            m.replanResult(state, env, "retry", invalid)
-
-            ' The track change's plan stalls past its grace while the step
-            ' down waits to be sent again.
             position = m.playOn(state, env, position, 20)
-            m.slowRebuffer(state, env, 6000)
-            m.assertInvalid(state.queued, "one step down at a time")
-            m.replanResult(state, env, "rejected", invalid)
-            m.assertInvalid(playback.autoQuality.estimate(state.auto, env.t), "no replan carries the refused estimate")
+            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "REARM_AFTER_UNADOPTED_MS")
             m.player(state, env, "playing")
             m.playOn(state, env, position, 60)
-            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "a refusal holds five minutes")
+            m.assertEqual(m.stepDownKbps(m.slowRebuffer(state, env, 6000)), 7000)
         end sub
 
-        @it("drops Auto's step down, and its estimate, when the request ahead of it ends in an error")
+        @it("sends no step down when the request ahead of it ends in an error")
         sub _()
             env = tests.fakeEnv()
             state = m.playing(env, tests.transcodePlan("plan-1", "v3:k1", 10000))
             m.playOn(state, env, tests.dbl(3), 17)
             m.send(state, env, { type: "trackChange", tracks: { audio: { id: "file:42:audio:1", index: 1 } } })
-            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "the step down waits for the track change")
+            m.assertEqual(m.cmdsOf(m.slowRebuffer(state, env, 6000), "replan"), [], "the track change is in flight")
             m.assertNotInvalid(m.cmd(m.replanResult(state, env, "ok", tests.terminalDecision("adaptation_unavailable", true)), "error"))
             m.assertInvalid(state.queued)
             start = m.cmd(m.send(state, env, { type: "retry" }), "start")
