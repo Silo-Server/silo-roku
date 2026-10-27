@@ -333,11 +333,13 @@ functions, and set nodes.
   whose bottom corners follow the card's curve, and the detail rails clip at
   their inset; this is what lets the ambient wash run under the rows (spec
   section 5.5). Elsewhere a 9-patch frame painted in the background colour
-  rounds them, and the hero's bottom fade reaches full black at the top of the
-  row band so painted corners never sit over artwork. `MaskGroup` is not used
-  for cards (it does not clip on non-OpenGL devices). On the Ultra 4850X the
-  Effect path with the wash scrolls a poster row at a median of 50–54 fps
-  against 59.9 with the frame (AG-317).
+  rounds them, the hero's bottom fade reaches full black at the top of the
+  row band so painted corners never sit over artwork, and the rails keep the
+  default `clippingRect`: Roku OS 15.3.4 (TCL 55R625) draws nothing under a
+  Group whose `clippingRect` is set, even to that zero-size default.
+  `MaskGroup` is not used for cards (it does not clip on non-OpenGL devices).
+  On the Ultra 4850X the Effect path with the wash scrolls a poster row at a
+  median of 50–54 fps against 59.9 with the frame (AG-317).
 - **Artwork:** catalog requests pass `poster_width`/`backdrop_width`/`logo_width`
   for the card (the server stores posters at 1000/500/300 and backdrops at
   2560/1920/1280/300 px), and Posters also set load dimensions. Logos are fitted in
