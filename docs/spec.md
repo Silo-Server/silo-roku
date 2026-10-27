@@ -727,6 +727,9 @@ their existing HD/FHD assets.
     track the readout names, as tvOS does. The readout names that track
     ("Auto · English · EAC3 · 5.1": the server's effective track, else the
     default, else the first) or the one chosen ("Japanese · AAC · Stereo").
+    The effective track knows no device, so under Auto playback can start on
+    another track in its language that the Roku plays unconverted (section
+    9.7); the player's Audio tab names the track that plays.
   - Subtitles offers Auto ("Use your subtitle preferences"), Off ("Start
     without subtitles"), and each track in tvOS's order: the subtitle
     language the watch projection reports in effect
@@ -1612,7 +1615,7 @@ playback keys the existing TV apps honor:
 | Setting key | Roku behavior |
 | --- | --- |
 | `player.video_skip_back_seconds`, `player.video_skip_forward_seconds` | Left/Right and Replay skip step |
-| `playback.audio_language` | The client starts on the version's `effective_audio_track_index`, which the server resolves from this setting and the track the profile chose for the series or movie, and sends it as `audio_track_index`, its position, since the watch projection gives audio tracks no ID; without one, it picks the track in this language that the device plays best; a track chosen on the detail page comes first (below) |
+| `playback.audio_language` | Under Auto, against a server with per-codec channel ceilings, the start names no audio track, and the server resolves this setting and the track the profile chose for the series or movie, preferring a track in that language the device plays unconverted; against another server it names the version's `effective_audio_track_index`, else the track in this language the device plays best (section 9.7); a track chosen on the detail page is sent as `audio_track_index`, its position, since the watch projection gives audio tracks no ID (below) |
 | `playback.subtitle_mode`, `playback.subtitle_language`, `playback.show_forced_subtitles` | The client picks the initial subtitle track from the first plan's subtitle inventory (section 9.7) |
 | `playback.preferred_quality`, `playback.max_bitrate_kbps` | `quality_preference` and `bandwidth_cap_kbps` sent with start; the cap goes with every later start and replan too, and a quality chosen in Options replaces the preference for that title |
 | `playback.intro_skip_mode` | Skip button versus automatic skip (`playback.auto_skip_intro` is deprecated) |
@@ -2106,10 +2109,17 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   names Detail's audio pick by `audio_track_index`, which the start body
   accepts, for the version Detail read: the version chosen in its Versions
   menu, which the player then starts (`nav.player.pinnedFile`), or Auto's
-  when it is still the one the player chooses. Under Auto it names the
-  version's `effective_audio_track_index` from the watch projection, as
-  tvOS does, else the track the profile's audio language and the device's
-  codecs choose (section 8.5). The other kind keeps the
+  when it is still the one the player chooses. Under Auto, against a server
+  whose capabilities list `codec_channel_ceilings_v1`, it names no audio
+  track: the server resolves the profile's audio language and the series'
+  or movie's remembered track, then, unless that remembered track decides,
+  prefers a same-language main track this start's capabilities play
+  unconverted over one it would convert (an AC-3 or E-AC-3 track over a
+  TrueHD default), and the plan's `selected_tracks` names it. The version's
+  `effective_audio_track_index` knows no device, so the start does not echo
+  it, unlike tvOS (assumption AG-320). Against another server it names that
+  index, else the track the profile's audio language and the device's
+  codecs choose (section 8.5), so decision D-6 knows the track. The other kind keeps the
   plan's own `selected_tracks` member, since a `track_change` without a
   subtitle means subtitles off, or, while another `track_change` is in
   flight or waiting, the member that one asks for: an audio and a subtitle

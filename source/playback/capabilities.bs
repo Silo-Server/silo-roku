@@ -19,7 +19,8 @@ import "pkg:/source/util/values.bs"
 '   stereoAacRestart: true for the new attempt after a multichannel AAC plan,
 '   app: { version, build, channel },
 '   serverFeatures: the capabilities document's features (TS_COPY_FEATURE,
-'     DEFINE_FEATURE, REMUX_RENDITIONS_FEATURE, DV8_BASE_LAYER_IDS_FEATURE)
+'     DEFINE_FEATURE, REMUX_RENDITIONS_FEATURE, DV8_BASE_LAYER_IDS_FEATURE,
+'     CODEC_CHANNEL_CEILINGS_FEATURE)
 ' }
 ' A track is named by its id with its index, or by index alone when the
 ' watch projection gives no id; one with neither (codec and channels only)
@@ -52,6 +53,10 @@ namespace playback.capabilities
     ' is never claimed: ID 1 (HDR10) played in run 11; IDs 4 (HLG) and 2
     ' (SDR) have no fixture.
     const DV8_BASE_LAYER_IDS = [1]
+    ' A server advertising this honors a delivery's max_channels_by_codec, so
+    ' a device without multichannel AAC caps AAC alone at two channels and
+    ' needs no track-dependent ceiling (decision D-6) or restart.
+    const CODEC_CHANNEL_CEILINGS_FEATURE = "codec_channel_ceilings_v1"
 
     function startBody(probe as Object, request as Object) as Object
         parts = replanParts(probe, request)
@@ -289,7 +294,12 @@ namespace playback.capabilities
         if util.contains(request.serverFeatures, TS_COPY_FEATURE) then hls.features.Push(TS_COPY_FEATURE)
         if util.contains(request.serverFeatures, DEFINE_FEATURE) then hls.features.Push(DEFINE_FEATURE)
 
-        ceilings = stereoCeilings(probe, request, hls.audio_decode_codecs)
+        byCodec = not probe.audio.multichannelAac and codecCeilings(request.serverFeatures)
+        if byCodec
+            original.max_channels_by_codec = { aac: 2 }
+            hls.max_channels_by_codec = { aac: 2 }
+        end if
+        ceilings = stereoCeilings(probe, request, hls.audio_decode_codecs, byCodec)
         if ceilings.original then original.max_channels = 2
         if ceilings.hls then hls.max_channels = 2
 
@@ -298,6 +308,13 @@ namespace playback.capabilities
         progressive.supported_on_device = false
         progressive.failure_reason = "disabled_pending_seekable_transport"
         return { original_http: original, progressive: progressive, hls: hls }
+    end function
+
+    ' Whether the server honors max_channels_by_codec, and with it chooses
+    ' Auto's audio track for the start's capabilities (silo-server #3115 and
+    ' #3116 ship together).
+    function codecCeilings(serverFeatures as Dynamic) as Boolean
+        return util.contains(serverFeatures, CODEC_CHANNEL_CEILINGS_FEATURE)
     end function
 
     ' Every required DeliveryCapabilityV3 member. No passthrough, features,
@@ -323,16 +340,19 @@ namespace playback.capabilities
         return { embedded_text: false, sidecar_text: sidecar, ass_styling: false, embedded_bitmap: false, sidecar_bitmap: false, font_attachments: false }
     end function
 
-    ' Decision D-6, until server issue S-13: on a device without multichannel
-    ' AAC, a two-channel ceiling where the selected track would otherwise reach
-    ' it as multichannel AAC. A multichannel track that hls cannot copy is
-    ' converted there, and multichannel AAC is not offered as an original
-    ' either. The restart after a multichannel AAC plan caps hls whatever the
-    ' track. Unknown channel counts leave both off.
-    function stereoCeilings(probe as Object, request as Object, hlsAudio as Object) as Object
+    ' Decision D-6, for a server without CODEC_CHANNEL_CEILINGS_FEATURE: on a
+    ' device without multichannel AAC, a two-channel ceiling where the
+    ' selected track would otherwise reach it as multichannel AAC. A
+    ' multichannel track that hls cannot copy is converted there, and
+    ' multichannel AAC is not offered as an original either. The restart after
+    ' a multichannel AAC plan caps hls whatever the track. Unknown channel
+    ' counts, and a start that names no track, leave both off. byCodec (the
+    ' AAC-only ceiling already sent) leaves only the restart's.
+    function stereoCeilings(probe as Object, request as Object, hlsAudio as Object, byCodec as Boolean) as Object
         ceilings = { original: false, hls: false }
         if probe.audio.multichannelAac then return ceilings
         ceilings.hls = util.isTrue(request.stereoAacRestart)
+        if byCodec then return ceilings
         track = request.audioTrack
         if not util.isObject(track) or not util.isNumber(track.channels) then return ceilings
         if track.channels <= 2 then return ceilings

@@ -16,7 +16,7 @@
 # The commit defaults to the pin below; fetch it in the checkout first.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-pinned=3bc9e58c51970f261d41848ff411713894d53243
+pinned=2b88b1bbcf897621f25fbd8f3e97cbdd9e9838f7
 server=${1:?usage: scripts/sync-fixtures.sh <silo-server checkout> [commit]}
 commit=${2:-$pinned}
 

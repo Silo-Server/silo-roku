@@ -504,8 +504,12 @@ channel layouts, so it never earns a passthrough claim and does not need one: a
 codec in `codecs_audio` is copied as the original bitstream.
 
 - Always `aac` and `mp3`. `CanDecodeAudio({codec: "aac", ChCnt: 6})` decides the
-  AAC channel case. Interim policy until server issue S-13 adds a per-codec
-  channel ceiling, on a device that answers no:
+  AAC channel case. On a device that answers no, when the server's capabilities
+  list `codec_channel_ceilings_v1` (S-13), `original_http` and `hls` carry
+  `max_channels_by_codec: {"aac": 2}`: the server keeps every AAC conversion in
+  stereo and never copies multichannel AAC, while E-AC-3 and AC-3 keep their
+  channels, whatever the track. A server without the feature gets the interim
+  policy that follows:
   - Each start, and each replan that carries `client_playback_context`
     (`failure_recovery`, `track_change`, `quality_change`, `output_change`), sets
     `max_channels` from the track that request selects; a ceiling left over from
@@ -522,7 +526,7 @@ codec in `codecs_audio` is copied as the original bitstream.
     it: it stops that session and starts a new attempt with `hls.max_channels: 2`.
     (`failure_recovery` cannot do this, because plan attempt keys ignore the
     channel count, so the stereo variant counts as already failed.) The restart
-    costs one extra round trip on these devices until S-13 lands.
+    costs one extra round trip on these devices.
   - If H9 shows these devices downmix multichannel AAC after all, the interim
     policy is dropped.
 - `ac3`, `eac3` when `CanDecodeAudio` answers yes for the current output with
@@ -1165,7 +1169,7 @@ behaviour behind each was traced on `origin/main` on 2026-10-21.
 | S-4 | Publish a multivariant HLS master with `CODECS`, `VIDEO-RANGE`, and `SUPPLEMENTAL-CODECS`, optionally with demuxed audio as an `EXT-X-MEDIA:TYPE=AUDIO` rendition | Needed if H3 shows Roku will not enter HDR or DV mode from a bare media playlist; an alternative fix for H19 | High if H3 or H19 fail |
 | S-11 | Bound copy-remux segment bytes for clients with small media buffers (a client-declared limit, falling back to transcode); related to #1770 and #2515 | Needed if H8 shows over-envelope failures are not detectable | Blocking if H8 shows hangs |
 | S-1 | Convert tracks the client cannot decode (TrueHD, DTS-HD, DTS) to E-AC-3 5.1 instead of AAC on a video-copy remux when the HLS delivery lists `eac3`, including `platform_attested` clients, behind an opt-in client feature. Builds on the `audio_to_eac3@1` recipe in draft PR #2015 (issue #2010), which covers only client-decodable tracks with exact sink evidence | Surround for TrueHD and DTS-HD titles on every Roku with a Dolby sink | High |
-| S-13 | Capability-aware default audio selection (prefer a track the client can copy), and a per-codec channel ceiling so AAC 5.1 is not planned for clients that cannot decode it | Replaces the client-side track pick, the interim `max_channels: 2`, and the stop-and-restart round trip on devices without multichannel AAC | High |
+| S-13 | Capability-aware default audio selection (prefer a track the client can copy), and a per-codec channel ceiling so AAC 5.1 is not planned for clients that cannot decode it | Replaces the client-side track pick, the interim `max_channels: 2`, and the stop-and-restart round trip on devices without multichannel AAC. Implemented in silo-server #3115 and #3116 (assumption AG-320) | High |
 | S-18 | Bounded or streamed extraction of embedded text subtitles for source-preserving playback | Needed if H14 misses the 15 s target | Prerequisite for embedded text on originals and remuxes if H14 fails |
 | S-12 | Convert ASS/SSA to WebVTT for clients sending `ass_styling: false` with `compatible` fidelity | Removes client-side ASS conversion and shifting | Medium |
 | S-8 | Variant-aware DTS matching (core, HD MA, DTS:X) with a channel ceiling | Prerequisite for G9 | Medium |
@@ -1220,8 +1224,8 @@ records the answers and the assumptions made since.
 | Deep link when the last profile is a child | **Decided (D-4):** use the most recent non-child profile and play, as Roku's text reads; skip PIN-locked profiles until Roku rules on PIN prompts. The trade-off: a household whose adult profile has no PIN can reach adult titles through Roku search |
 | Trickplay when a server has none | **Decided (D-5):** the server provides trickplay; files without sheets show time only with an explanation; Roku is asked, but release does not wait |
 | App-rendered captions if native subtitle paths fail H14 | Open: do not adopt silently; decide with the H14 results, since it gives up Roku's caption styles |
-| Devices without multichannel AAC | **Decided (D-6):** interim stereo conversion until S-13: `max_channels: 2` when the selected track is converted or is multichannel AAC, and a stop-and-restart with the ceiling when a plan returns multichannel AAC (one extra round trip). Alternatives: an `output_change` replan (verified only in the planner, and the output has not changed), or making S-13 a beta blocker |
-| Server issues | Drafts only (assumption A-1): S-15, S-21, S-4, S-1, S-11, S-13, S-12; file when the maintainers agree. S-20 is merged (silo-server #3023, 2026-10-25) |
+| Devices without multichannel AAC | **Decided (D-6), superseded by S-13 where the server advertises `codec_channel_ceilings_v1` (AG-320):** interim stereo conversion: `max_channels: 2` when the selected track is converted or is multichannel AAC, and a stop-and-restart with the ceiling when a plan returns multichannel AAC (one extra round trip). Alternatives: an `output_change` replan (verified only in the planner, and the output has not changed), or making S-13 a beta blocker |
+| Server issues | Drafts only (assumption A-1): S-15, S-21, S-4, S-1, S-11, S-12 (S-13 is in review, AG-320); file when the maintainers agree. S-20 is merged (silo-server #3023, 2026-10-25) |
 | Prior community client (whitepeakcreative/silo-roku, AGPL-3.0-or-later) | Reuse lessons, not code |
 | Owners | Open (assumption A-7): Roku account, signing-key custody, `sca-cmd` mirror, reviewer server, device purchases, activated server dependencies (section 9.1) |
 
