@@ -1,0 +1,164 @@
+import "pkg:/source/catalog/art.bs"
+import "pkg:/source/catalog/detail.bs"
+import "pkg:/source/catalog/grid.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' A person's page (spec section 5.6), as tvOS's PersonDetailView builds it
+' (silo-apple Screens/People/PersonDetailView.swift): the person read, the
+' filmography's filters, its paged credits, the header's badges, and the
+' count line. Pure: request builders for api.send and the decisions the
+' page makes; nothing is sent here.
+namespace catalog.people
+    ' tvOS's PersonMediaFilter, in its order. Each names its label
+    ' (person.filter.<key> in locale/).
+    const ALL = "all"
+    const MOVIES = "movies"
+    const SERIES = "series"
+
+    function filters() as Object
+        return [ALL, MOVIES, SERIES]
+    end function
+
+    ' The catalog media type a filter reads. All reads movies and series
+    ' ("video"): tvOS sends no type there, which also lists a person's
+    ' audiobooks and books, and this client has no page for those.
+    function mediaType(filter as String) as String
+        if filter = MOVIES then return "movie"
+        if filter = SERIES then return "series"
+        return "video"
+    end function
+
+    ' GET /api/v2/catalog/people/{id}, mapped by catalog.people.person.
+    function personRequest(id as String) as Object
+        return catalog.request.read("/api/v2/catalog/people/" + catalog.request.segment(id), {}, { kind: catalog.kind.PERSON })
+    end function
+
+    ' The first page of the person's credits under filter, newest first, as
+    ' tvOS's personCredits query (source=person, sort -year), 40 cards a
+    ' page as Browse reads them (catalog.grid.PAGE_SIZE).
+    function creditsRequest(id as String, filter as String) as Object
+        query = { source: "person", person_id: id, type: mediaType(filter), sort: "-year", poster_width: catalog.art.POSTER_WIDTH }
+        return catalog.request.page(query, "", catalog.grid.PAGE_SIZE, catalog.kind.PAGE)
+    end function
+
+    ' One card of filter's credits, read only to learn whether there are
+    ' any (tvOS's catalogHasItems): Movies and Series show unless theirs
+    ' says none.
+    function availabilityRequest(id as String, filter as String) as Object
+        query = { source: "person", person_id: id, type: mediaType(filter) }
+        return catalog.request.page(query, "", 1, catalog.kind.SKIP)
+    end function
+
+    ' What an availability answer says: true when the filter has titles,
+    ' false when it has none, invalid when the read failed (the filter then
+    ' stays, as tvOS keeps it rather than hide titles over a network error).
+    function hasTitles(result as Dynamic) as Dynamic
+        if not util.isObject(result) or not util.isTrue(result.ok) or not util.isObject(result.body) then return invalid
+        body = result.body
+        size = 0
+        if util.isNumber(body.size) then size = body.size
+        total = 0
+        if util.isNumber(body.total) then total = body.total
+        return size > 0 or total > 0
+    end function
+
+    ' The filters to offer, given { movies, series } as hasTitles gave them
+    ' (a missing member counts as not yet known): All, then Movies and
+    ' Series unless known to be empty.
+    function offered(availability as Object) as Object
+        out = [ALL]
+        for each filter in [MOVIES, SERIES]
+            known = availability[filter]
+            if not util.isBoolean(known) or known then out.Push(filter)
+        end for
+        return out
+    end function
+
+    ' The person's display fields from catalog/people/{id} (ApiTask's map
+    ' step), or invalid without an ID and a name: { id, name, bio, photoUri,
+    ' birthDate, deathDate, birthplace }, every value a trimmed string.
+    function person(body as Object) as Dynamic
+        id = util.text(body.id)
+        name = util.text(body.name).Trim()
+        if id = "" or name = "" then return invalid
+        return {
+            id: id,
+            name: name,
+            bio: util.text(body.bio).Trim(),
+            photoUri: util.text(body.photo_url).Trim(),
+            birthDate: util.text(body.birth_date).Trim(),
+            deathDate: util.text(body.death_date).Trim(),
+            birthplace: util.text(body.birthplace).Trim()
+        }
+    end function
+
+    ' Up to two letters for a person without a photo: the first letters of
+    ' the first two words, uppercased, or "?" (tvOS's Person.initials).
+    function initials(name as String) as String
+        out = ""
+        for each word in name.Trim().Split(" ")
+            if Len(out) < 2 and word <> "" then out = out + Left(word, 1)
+        end for
+        if out = "" then return "?"
+        return UCase(out)
+    end function
+
+    ' The header's badges in tvOS's order: "Born <date>"; "Died <date>", or
+    ' without one "<age> years old" on today; the birthplace. Dates are
+    ' tvOS's medium style ("Apr 25, 1940"); one that does not parse shows
+    ' as given. copy is the strings table.
+    function badges(fields as Object, today as Object, copy as Object) as Object
+        out = []
+        born = displayDate(fields.birthDate)
+        if born <> "" then out.Push(i18n.format(i18n.lookup(copy, "person.born"), { date: born }))
+        died = displayDate(fields.deathDate)
+        if died <> ""
+            out.Push(i18n.format(i18n.lookup(copy, "person.died"), { date: died }))
+        else
+            age = ageOn(fields.birthDate, today)
+            if age >= 0 then out.Push(i18n.format(i18n.lookup(copy, "person.age"), { age: age }))
+        end if
+        if util.text(fields.birthplace) <> "" then out.Push(fields.birthplace)
+        return out
+    end function
+
+    function displayDate(value as Dynamic) as String
+        text = util.text(value).Trim()
+        if text = "" then return ""
+        shown = catalog.detail.dateText(text, "short-month-no-weekday")
+        if shown = "" then return text
+        return shown
+    end function
+
+    ' Whole years from a YYYY-MM-DD birth date to today (an roDateTime), or
+    ' -1 when the date does not parse or is in the future.
+    function ageOn(birthDate as Dynamic, today as Object) as Integer
+        text = util.text(birthDate)
+        if catalog.detail.dateText(text, "no-weekday") = "" then return -1
+        year = Val(Left(text, 4))
+        month = Val(Mid(text, 6, 2))
+        day = Val(Mid(text, 9, 2))
+        years = today.GetYear() - year
+        if today.GetMonth() < month or (today.GetMonth() = month and today.GetDayOfMonth() < day) then years = years - 1
+        if years < 0 then return -1
+        return years
+    end function
+
+    ' The count after Filmography (tvOS's personFilmographyCountLabel): the
+    ' server's total when it gives one, else the cards read so far with a
+    ' plus while more remain; "" before any.
+    function countText(total as Integer, seen as Integer, seenAll as Boolean, copy as Object) as String
+        count = total
+        more = false
+        if count < 0
+            if seen <= 0 then return ""
+            count = seen
+            more = not seenAll
+        end if
+        if more then return i18n.format(i18n.lookup(copy, "person.countMore"), { count: count })
+        if count = 1 then return i18n.lookup(copy, "person.countOne")
+        return i18n.format(i18n.lookup(copy, "person.countOther"), { count: count })
+    end function
+end namespace

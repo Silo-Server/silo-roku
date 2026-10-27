@@ -1,0 +1,414 @@
+namespace tests
+    ' The person page (spec section 5.6), on the test scene
+    ' (tests/helpers/scene.bs).
+    @suite("person screen")
+    class PersonScreenTests extends rooibos.BaseTestSuite
+        protected override sub afterEach()
+            for each child in m.top.getChildren(-1, 0)
+                if child.subtype() = "PersonScreenProbe" then m.top.removeChild(child)
+            end for
+        end sub
+
+        function opened(personId = "7" as String, restore = invalid as Dynamic) as Object
+            theme.install()
+            tests.scene.reset()
+            node = CreateObject("roSGNode", "PersonScreenProbe")
+            node.entry = { id: "person", route: nav.route.PERSON, params: { personId: personId } }
+            node.owner = "person-" + personId
+            m.top.appendChild(node)
+            node.visible = true
+            node.callFunc("onShow", { first: true, restore: restore, refresh: false })
+            return node
+        end function
+
+        ' The last /catalog read of the person's credits of mediaType (limit 40),
+        ' or of whether mediaType has any (limit 1).
+        function catalogRead(mediaType as String, limit as Integer) as Dynamic
+            entries = tests.scene.sent()
+            for i = entries.Count() - 1 to 0 step -1
+                request = entries[i].request
+                if request.path = "/api/v2/catalog" and request.query.type = mediaType and request.query.limit = limit then return entries[i]
+            end for
+            return invalid
+        end function
+
+        function person() as Object
+            return { id: "7", name: "Al Pacino", bio: "Actor", birth_date: "1940-04-25", birthplace: "New York", photo_url: "https://cdn.example/people/7.jpg" }
+        end function
+
+        ' A person with a two-line name, every badge, and seven lines of
+        ' biography: the tallest header.
+        function tallPerson() as Object
+            body = m.person()
+            body.name = "Maria Antonietta Giuseppina Alessandra Benedetta Costanza della Rovere-Montefeltro"
+            words = []
+            for i = 1 to 200
+                words.Push("biography")
+            end for
+            body.bio = words.Join(" ")
+            body.death_date = "2020-01-02"
+            return body
+        end function
+
+        ' The bottom edge of node, a child of the page, with the page at y
+        ' (boundingRect is in the page's space).
+        function bottom(node as Object, y as Integer) as Integer
+            rect = node.boundingRect()
+            return rect.y + rect.height + y
+        end function
+
+        function credits(count as Integer, total = -1 as Integer) as Object
+            body = { items: tests.catalogData.items(count), page: { has_more: false } }
+            if total >= 0 then body.total = total
+            return body
+        end function
+
+        sub refuse(entry as Object, status as Integer)
+            tests.scene.deliver(entry.handle, { requestId: "r1", ok: false, status: status, headers: {}, body: invalid, error: { kind: "http", status: status } }, "ok")
+        end sub
+
+        ' A page whose person and three credits are read.
+        function shown() as Object
+            node = m.opened()
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.person())
+            tests.scene.answer(m.catalogRead("video", 40), m.credits(3, 3))
+            return node
+        end function
+
+        @describe("opening")
+
+        @it("reads the person, whether Movies and Series have titles, and the credits at once")
+        sub _()
+            node = m.opened()
+            m.assertNotInvalid(tests.scene.last("/api/v2/catalog/people/7"))
+            credits = m.catalogRead("video", 40)
+            m.assertNotInvalid(credits, "All reads movies and series")
+            m.assertEqual([credits.request.query.source, credits.request.query.person_id, credits.request.query.sort], ["person", "7", "-year"])
+            m.assertNotInvalid(m.catalogRead("movie", 1))
+            m.assertNotInvalid(m.catalogRead("series", 1))
+            m.assertFalse(node.findNode("page").visible, "the page waits for the person")
+            m.assertTrue(node.findNode("spinner").running)
+            m.assertFalse(node.ready)
+        end sub
+
+        @it("shows the header and focuses the filter pills once the person is read")
+        sub _()
+            node = m.opened()
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.person())
+            m.assertTrue(node.findNode("page").visible)
+            m.assertTrue(node.ready)
+            m.assertEqual(node.findNode("name").text, "Al Pacino")
+            m.assertEqual(node.findNode("bio").text, "Actor")
+            m.assertEqual(node.findNode("photo").uri, "https://cdn.example/people/7.jpg")
+            ' Headless, the photo's load fails at once; on a device it loads.
+            node.findNode("photo").loadStatus = "ready"
+            m.assertFalse(node.findNode("initials").visible)
+            badges = []
+            for each child in node.findNode("badges").getChildren(-1, 0)
+                if child.subtype() = "Label" then badges.Push(child.text)
+            end for
+            m.assertEqual(badges.Count(), 3)
+            m.assertEqual([badges[0], badges[2]], ["Born Apr 25, 1940", "New York"])
+            m.assertEqual(node.findNode("heading").text, "Filmography")
+            filters = node.findNode("filters")
+            m.assertEqual(filters.labels.items, ["All", "Movies", "Series"])
+            m.assertEqual(filters.selected, 0)
+            m.assertTrue(filters.isInFocusChain())
+        end sub
+
+        @it("shows initials without a photo")
+        sub _()
+            node = m.opened()
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), { id: "7", name: "Al Pacino" })
+            m.assertTrue(node.findNode("initials").visible)
+            m.assertEqual(node.findNode("initials").text, "AP")
+            m.assertEqual(node.findNode("photo").uri, "")
+            m.assertFalse(node.findNode("badges").visible)
+        end sub
+
+        @it("draws tvOS's portrait outline and 84 px SemiBold initials")
+        sub _()
+            node = m.opened()
+            line = node.findNode("portraitLine")
+            m.assertEqual(line.uri, "pkg:/images/firstrun/rounded_12_line_$$RES$$.9.png")
+            m.assertEqual(line.opacity, 0.1)
+            m.assertEqual([line.width, line.height], [300.0, 450.0])
+            font = node.findNode("initials").font
+            m.assertEqual(font.size, 84)
+            m.assertEqual(font.uri, theme.fontUri(theme.fontWeight.SEMIBOLD))
+        end sub
+
+        @it("shows initials when the photo fails to load")
+        sub _()
+            node = m.opened()
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.person())
+            photo = node.findNode("photo")
+            initials = node.findNode("initials")
+            photo.loadStatus = "ready"
+            m.assertFalse(initials.visible)
+            photo.loadStatus = "failed"
+            m.assertTrue(initials.visible)
+            photo.loadStatus = "ready"
+            m.assertFalse(initials.visible)
+        end sub
+
+        @it("drops Movies or Series when the person has none")
+        sub _()
+            node = m.opened()
+            tests.scene.answer(m.catalogRead("movie", 1), { items: [], total: 0 })
+            m.assertEqual(node.findNode("filters").labels.items, ["All", "Series"])
+        end sub
+
+        @it("keeps the highlighted pill when Movies or Series drops out")
+        sub _()
+            node = m.shown()
+            filters = node.findNode("filters")
+            m.assertTrue(filters.isInFocusChain())
+            filters.callFunc("highlightPill", 2, false)
+            tests.scene.answer(m.catalogRead("series", 1), { items: [{ id: "s1" }], total: 1 })
+            m.assertEqual(filters.callFunc("highlightedPill"), 2, "an unchanged offer keeps the pills")
+            tests.scene.answer(m.catalogRead("movie", 1), { items: [], total: 0 })
+            m.assertEqual(filters.labels.items, ["All", "Series"])
+            m.assertEqual(filters.callFunc("highlightedPill"), 1, "the highlight stays on Series")
+            m.assertEqual(filters.selected, 0)
+        end sub
+
+        @it("falls back to All when the chosen filter drops out")
+        sub _()
+            node = m.shown()
+            filters = node.findNode("filters")
+            filters.chosen = 1
+            m.assertEqual(node.callFunc("focusKey").filter, "movies")
+            before = m.catalogRead("video", 40)
+            tests.scene.answer(m.catalogRead("movie", 1), { items: [], total: 0 })
+            m.assertEqual(filters.labels.items, ["All", "Series"])
+            m.assertEqual(filters.selected, 0)
+            m.assertEqual(node.callFunc("focusKey").filter, "all")
+            again = m.catalogRead("video", 40)
+            m.assertFalse(again.handle.isSameNode(before.handle), "All's titles are read again")
+        end sub
+
+        @it("counts the titles once the first page is read")
+        sub _()
+            node = m.shown()
+            m.assertEqual(node.findNode("count").text, "3 titles")
+            content = node.findNode("results").findNode("grid").content
+            m.assertEqual(content.getChildCount(), 3)
+        end sub
+
+        @describe("focus and filters")
+
+        @it("moves the page up as Down enters the grid, and back as Up leaves it")
+        sub _()
+            node = m.shown()
+            grid = node.findNode("results")
+            m.assertTrue(node.callFunc("pressKey", "down"))
+            m.assertTrue(grid.isInFocusChain())
+            offset = grid.translation[1] - theme.browse.GRID_TOP
+            m.assertTrue(offset > 0)
+            m.assertEqual(node.findNode("scrollTo").keyValue[1], [0, -offset])
+            m.assertTrue(node.callFunc("pressKey", "up"))
+            m.assertTrue(node.findNode("filters").isInFocusChain())
+            ' Headless, the move down never ran: Up stops it where it is.
+            m.assertEqual(node.findNode("scroll").control, "stop")
+            m.assertEqual(node.findNode("page").translation, [0, 0])
+        end sub
+
+        @it("reads a filter's credits when OK chooses its pill")
+        sub _()
+            node = m.shown()
+            filters = node.findNode("filters")
+            filters.chosen = 2
+            read = m.catalogRead("series", 40)
+            m.assertNotInvalid(read)
+            m.assertEqual(filters.selected, 2)
+            m.assertEqual(node.callFunc("focusKey").filter, "series")
+            m.assertEqual(node.findNode("count").text, "", "the count waits for the new page")
+            tests.scene.answer(read, m.credits(1))
+            m.assertEqual(node.findNode("count").text, "1 title")
+        end sub
+
+        @it("opens a title's detail page")
+        sub _()
+            node = m.shown()
+            grid = node.findNode("results")
+            grid.selectedItem = grid.findNode("grid").content.getChild(1)
+            m.assertEqual(tests.scene.nav()[0].route, nav.route.DETAIL)
+            m.assertEqual(tests.scene.nav()[0].params.itemId, "movie:m2")
+        end sub
+
+        @it("shows tvOS's empty state, and Down stays on the pills")
+        sub _()
+            node = m.opened()
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.person())
+            tests.scene.answer(m.catalogRead("video", 40), m.credits(0, 0))
+            status = node.findNode("gridStatus")
+            m.assertTrue(status.visible)
+            m.assertEqual([status.message, status.detail], ["No titles found", "There are no movies or series linked to this person yet."])
+            m.assertEqual(node.findNode("count").text, "0 titles")
+            m.assertEqual(status.centre[1], node.findNode("results").translation[1] + 210)
+            node.callFunc("pressKey", "down")
+            m.assertTrue(node.findNode("filters").isInFocusChain())
+        end sub
+
+        @it("keeps the empty state inside the action-safe area under a tall header")
+        sub _()
+            node = m.opened()
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.tallPerson())
+            tests.scene.answer(m.catalogRead("video", 40), m.credits(0, 0))
+            status = node.findNode("gridStatus")
+            m.assertTrue(status.visible)
+            m.assertTrue(node.findNode("filters").isInFocusChain(), "focus stays on the pills, so the page does not move")
+            m.assertEqual(node.findNode("page").translation, [0, 0])
+            m.assertTrue(m.bottom(status, 0) <= 1026, "the empty state ends above the action-safe line, not at " + m.bottom(status, 0).ToStr())
+            m.assertTrue(status.boundingRect().y >= m.bottom(node.findNode("filters"), 0), "and stays below the pills")
+            m.assertEqual(node.findNode("gridSpinner").centre[1], node.findNode("results").translation[1] + 210)
+        end sub
+
+        @it("offers Retry when the credits fail")
+        sub _()
+            node = m.opened()
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.person())
+            tests.scene.fail(m.catalogRead("video", 40))
+            status = node.findNode("gridStatus")
+            m.assertEqual(status.message, "Can't load this person's titles.")
+            node.callFunc("pressKey", "down")
+            m.assertTrue(status.isInFocusChain())
+            before = tests.scene.sent().Count()
+            status.activated = true
+            m.assertEqual(tests.scene.sent().Count(), before + 1)
+            m.assertTrue(node.findNode("filters").isInFocusChain())
+        end sub
+
+        @it("moves the titles error into view as Retry takes focus under a tall header")
+        sub _()
+            node = m.opened()
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.tallPerson())
+            tests.scene.fail(m.catalogRead("video", 40))
+            status = node.findNode("gridStatus")
+            filters = node.findNode("filters")
+            m.assertTrue(m.bottom(filters, 0) <= 1080, "the pills show under the tallest header")
+            m.assertTrue(m.bottom(status, 0) > 1080, "unmoved, Retry is below the screen ")
+            node.callFunc("pressKey", "down")
+            m.assertTrue(status.isInFocusChain())
+            moved = node.findNode("scrollTo").keyValue[1]
+            m.assertEqual(moved, [0, theme.browse.GRID_TOP - node.findNode("results").translation[1]], "the page moves as it does for the grid")
+            m.assertTrue(m.bottom(status, moved[1]) <= 1080, "Retry shows once the page moves")
+            m.assertTrue(status.boundingRect().y + moved[1] >= 0)
+            node.callFunc("pressKey", "up")
+            m.assertTrue(filters.isInFocusChain())
+            m.assertEqual(node.findNode("page").translation, [0, 0])
+        end sub
+
+        @describe("errors")
+
+        @it("says a missing person is not found, with Back")
+        sub _()
+            node = m.opened()
+            m.refuse(tests.scene.last("/api/v2/catalog/people/7"), 404)
+            status = node.findNode("status")
+            m.assertTrue(status.visible)
+            m.assertEqual([status.message, status.action], ["Person not found", "Back"])
+            m.assertFalse(node.findNode("page").visible)
+            status.activated = true
+            m.assertEqual(tests.scene.nav(), [{ op: "pop" }])
+        end sub
+
+        @it("retries a failed person read")
+        sub _()
+            node = m.opened()
+            tests.scene.fail(tests.scene.last("/api/v2/catalog/people/7"))
+            status = node.findNode("status")
+            m.assertEqual([status.message, status.action], ["Can't load this person.", "Retry"])
+            m.assertTrue(status.isInFocusChain())
+            first = tests.scene.last("/api/v2/catalog/people/7")
+            status.activated = true
+            again = tests.scene.last("/api/v2/catalog/people/7")
+            m.assertFalse(again.handle.isSameNode(first.handle))
+            tests.scene.answer(again, m.person())
+            m.assertTrue(node.findNode("page").visible)
+            m.assertFalse(status.visible)
+        end sub
+
+        @describe("answers out of order")
+
+        @it("drops the credits of a filter left before they arrive")
+        sub _()
+            node = m.opened()
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.person())
+            all = m.catalogRead("video", 40)
+            node.findNode("filters").chosen = 1
+            tests.scene.answer(all, m.credits(3, 3))
+            m.assertEqual(node.findNode("results").state, "loading", "All's late answer changes nothing")
+            m.assertEqual(node.findNode("count").text, "")
+            tests.scene.answer(m.catalogRead("movie", 40), m.credits(1, 1))
+            m.assertEqual(node.findNode("count").text, "1 title")
+        end sub
+
+        @it("drops the answers a retried page replaced")
+        sub _()
+            node = m.opened()
+            movies = m.catalogRead("movie", 1)
+            tests.scene.fail(tests.scene.last("/api/v2/catalog/people/7"))
+            node.findNode("status").activated = true
+            tests.scene.answer(movies, { items: [], total: 0 })
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.person())
+            m.assertEqual(node.findNode("filters").labels.items, ["All", "Movies", "Series"], "the first page's Movies answer is dropped")
+            tests.scene.answer(m.catalogRead("movie", 1), { items: [], total: 0 })
+            m.assertEqual(node.findNode("filters").labels.items, ["All", "Series"])
+        end sub
+
+        @it("leaves answers that land after it is released")
+        sub _()
+            node = m.opened()
+            node.callFunc("onRelease")
+            tests.scene.answer(m.catalogRead("movie", 1), { items: [], total: 0 })
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.person())
+            m.assertFalse(node.findNode("page").visible)
+            m.assertFalse(node.ready)
+            m.assertEqual(node.findNode("filters").labels.items, ["All", "Movies", "Series"])
+        end sub
+
+        @describe("coming back")
+
+        @it("gives back its photo while covered and shows it again")
+        sub _()
+            node = m.shown()
+            node.visible = false
+            node.callFunc("onHide")
+            m.assertEqual(node.findNode("photo").uri, "")
+            node.visible = true
+            node.callFunc("onShow", { first: false, restore: invalid, refresh: false })
+            m.assertEqual(node.findNode("photo").uri, "https://cdn.example/people/7.jpg")
+        end sub
+
+        @it("rebuilds into the grid when the person is read before the credits")
+        sub _()
+            rebuilt = m.opened("7", { zone: "grid", filter: "all", grid: invalid })
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.person())
+            m.assertTrue(rebuilt.findNode("filters").isInFocusChain(), "the pills hold focus until the grid has cards")
+            tests.scene.answer(m.catalogRead("video", 40), m.credits(3, 3))
+            m.assertTrue(rebuilt.findNode("results").isInFocusChain())
+            m.assertTrue(rebuilt.findNode("page").translation[1] < 0)
+        end sub
+
+        @it("rebuilds on its filter with focus back in the grid")
+        sub _()
+            node = m.shown()
+            node.findNode("filters").chosen = 1
+            tests.scene.answer(m.catalogRead("movie", 40), m.credits(3, 3))
+            node.callFunc("pressKey", "down")
+            key = node.callFunc("focusKey")
+            m.assertEqual([key.zone, key.filter], ["grid", "movies"])
+            m.top.removeChild(node)
+            rebuilt = m.opened("7", key)
+            read = m.catalogRead("movie", 40)
+            m.assertNotInvalid(read, "the rebuilt page reads its filter's credits")
+            tests.scene.answer(read, m.credits(3, 3))
+            tests.scene.answer(tests.scene.last("/api/v2/catalog/people/7"), m.person())
+            m.assertEqual(rebuilt.findNode("filters").selected, 1)
+            m.assertTrue(rebuilt.findNode("results").isInFocusChain())
+            m.assertTrue(rebuilt.findNode("page").translation[1] < 0, "a rebuilt page opens moved up, without animating")
+        end sub
+    end class
+end namespace

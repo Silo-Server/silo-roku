@@ -108,6 +108,8 @@ Browse:
 - search across movies, series, and episodes;
 - movie detail, and series detail with season and episode lists, cast, and
   recommendations;
+- a person page from the detail page's cast: biography and the person's
+  movies and series, filtered by All, Movies, or Series;
 - on the heroes, the detail page's credit line ("Directed by", "Starring")
   and the server's external ratings, Home's quality badges, and the
   profile's title-art preference (`ui.title_art`).
@@ -162,8 +164,6 @@ item is built, tvOS first where both have it (section 5.1).
 
 Planned:
 
-- full person pages with filmography (tvOS, Android TV), replacing the
-  first release's person panel (section 5.9);
 - trailers and extras in the detail page's Trailers & More rail (tvOS,
   Android TV); tvOS opens remote trailers in the YouTube app, which
   criterion 5.3 rules out on Roku, so remote trailers need another route;
@@ -936,12 +936,51 @@ their existing HD/FHD assets.
     900 ms after primary detail loading; placeholders are not focusable,
     and empty or failed responses remove the whole section. Up and Down
     move between available sections; late responses do not take focus.
-  - Selecting a person opens a panel containing their biography,
-    birth/death information, and up to 24 visible movie/series titles under
-    In Your Library. The biography displays at most six lines. Back returns
-    to the selected cast card. Person errors stay within the panel and
-    offer Retry for transient failures. Full person pages, pagination,
-    external links, and metadata-refresh controls remain deferred.
+  - OK on a cast card with a person ID opens the person's page; Back from
+    it returns to that card.
+- **Person page** (tvOS's `PersonDetailView`), a pushed page without the
+  bar.
+  - Header: a 300×450 portrait at (80, 48), radius 12 with a 1 px white
+    10% outline, on `#15171C` with the name's initials (up to two letters,
+    84 px SemiBold at 60%) when there is no photo or the photo fails to
+    load. The
+    text column starts 48 px right of it and 10 px lower: the name in
+    72 px Bold, up to two lines; 22 px below, the badges; 22 px below them,
+    the biography in 26 px Regular at 60%, up to seven lines, 920 px wide.
+  - Badges, in order: "Born Apr 25, 1940", then "Died Jul 1, 2004" or,
+    without a death date, "86 years old", then the birthplace. Each is 20 px
+    Regular text in a 36 px `#0E0F12` capsule with 16 px of padding, 12 px
+    apart. A date that does not parse shows as the server sent it.
+  - 48 px below the taller of the portrait and the text: "Filmography" in
+    36 px SemiBold, with the count 16 px after it in 22 px at 60% ("57
+    titles", "1 title", "0 titles"; "40+ titles" while the server gives no
+    total and more remain). 20 px below, the filter pills All, Movies, and
+    Series, drawn as the season pills; Movies and Series show unless a
+    one-card read finds the person has none of that type. A pill that
+    drops out leaves the highlight on the same filter; if it was the
+    chosen one, All is chosen and read. 28 px below the pills,
+    Browse's six-column grid of 260×390 posters, the person's credits
+    newest first, 40 a page.
+  - Focus opens on the selected pill. Left and Right move along the pills
+    and OK reads that filter's titles; resting on a pill does nothing.
+    Down enters the grid, and the page moves up in 0.25 s (at once on the
+    low tier) so the grid sits at Browse's place (y 332) with the pills
+    above it; Up from the grid's first row returns to the pills and the
+    page moves back. OK on a card opens its detail page. Back returns to
+    the detail page below.
+  - The page waits for the person read behind the spinner. A missing
+    person says "Person not found" with Back; another failure says "Can't
+    load this person." with Retry. A person without titles shows "No
+    titles found" / "There are no movies or series linked to this person
+    yet." in the grid's place; failed titles show "Can't load this
+    person's titles." with Retry, which Down reaches from the pills, and
+    the page moves up as it does for the grid, so Retry stays on screen
+    under the tallest header. Both centre 210 px below the grid's top
+    (tvOS's 420 px minimum height), except that under a tall header the
+    empty state, which takes no focus and so never moves the page, rises
+    to end at the action-safe line (y 1026).
+  - Returning to the page, or rebuilding it after memory pressure, keeps
+    the filter and the focused card.
 - **Details.**
   - The header "Details" is 36 px SemiBold, 14 px above the table.
   - The table is one column, up to 1400 px wide. Labels are 260 px wide,
@@ -1460,7 +1499,12 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Siri (tvOS) and the Google Assistant (Android TV) drive the system player's transport | Roku voice transport commands (`roInput.EnableTransportEvents`) take the remote's paths: "play" and "pause", "fast forward" and "rewind" start the speed ladder, "replay" is Replay, "rewind 30 seconds" or "forward 10 minutes" seeks, "start over" seeks to the start, "skip intro" presses Skip Intro, or else the Skip Recap or Skip Credits pill, "next" is Up Next's Play Now, and "stop" leaves the player. A seek or scan while Up Next shows closes it as Keep Watching does; after the end, "start over" and a seek replay the title as a new session. "Turn on captions" changes Roku's global caption mode, which the player already follows (spec 9.7) | Roku delivers voice commands to the app as transport events and expects an answer for each within 5 s (`source/playback/voice.bs`); criterion 4.11 does not require them below its threshold |
 | An On Deck item without a backdrop or still reads its detail for one, and is left out without | It shows as Home's Continue Watching card does, its poster standing in | A detail read per card is avoided; Home's cards make the same choice |
 | A screen-level error puts a headline for its cause ("Something went wrong", "Not found") over its message, with Try Again | Home, the libraries, detail, and the profile picker show their one-sentence message as the error's title, without a second line, and Search its own title over a line; the button reads Retry (Try again on the picker) | The client's error copy is one sentence per screen (`locale/`); a copy change of its own adds headlines by cause (assumption AG-285) |
-| Full person page | A person panel with six biography lines and up to 24 mixed movie/series titles | Keeps person navigation within detail-page scope and bounded memory |
+| The person page scrolls as one view: the header scrolls away as focus moves down the filmography grid | The page moves up once as focus enters the grid, so the grid sits at Browse's place (y 332) with the pills above it; the grid then keeps its focused row at the top (fixed focus), as Browse does | `MarkupGrid` has no header item; one move keeps the pills and the grid's two rows on screen (assumption AG-340) |
+| A person page reads 60 credits a page into a lazy grid, and All sends no media type, so a person's audiobooks and books list too | 40 a page into Browse's bounded grid (`catalog.grid`), holding at most the memory policy's pages; All sends `type=video` (movies and series) | One memory budget for every paged grid (plan section 4.8); this client has no audiobook or book pages to open |
+| A person whose biography, photo, or birth date is missing gets a provider refresh (`POST /api/v2/catalog/people/{id}/refresh`) and a "Loading metadata" capsule while the page polls the person every 3 s for up to two minutes | The person is read once; what the refresh finds shows the next time the page opens | The phase keeps server writes out of person pages; a plain person read already queues a refresh when one is due (`prefetch` in the contract) (assumption AG-341) |
+| The filter pills grow 1.06× with a 2 px outline when focused, rest at `#15171C` 55%, and are `#0E0F12` when selected | They are the season pills: white 5% at rest, white 20% selected, white with black text when focused, without an outline or a scale | Section 5.2's pill rule; one pill row component on detail and person pages |
+| A portrait photo that fails to load shows the image view's missing-art placeholder: the person's ThumbHash, or a symbol | The name's initials show, as they do without a photo | One fallback for both cases, as the profile avatars do; the page does not decode the person's photo ThumbHash (assumption AG-340) |
+| The person page is blank until the person is read; a failure shows the error's headline for its cause | A spinner shows until then; "Person not found" with Back, or "Can't load this person." with Retry | Section 5.8's loading state; the client's one-sentence error copy (assumption AG-285) |
 | Watchlist and Favorites are root pages under the top bar, which stays with the avatar; History is a pushed page | All three are pushed pages without the bar; Back returns to the page below with focus on the avatar | One page type for the three lists; the bar's selected tab has no state for a page that belongs to no tab |
 | Watchlist and Favorites read the whole list (up to 100 pages of 200) into an 8-column grid of 176 px posters; History reads `GET /api/v2/catalog?source=history` 60 at a time | Each list reads its own endpoint (`/api/v2/watchlist`, `/api/v2/favorites`, `/api/v2/history`) 40 at a time into Browse's six-column grid of 260×390 posters, holding at most the memory policy's pages | One bounded grid (`catalog.grid`) and its memory budget for every paged list (plan section 4.8); the contract's own list endpoints |
 | Watchlist's empty state says "Tap the bookmark icon on any item to add it here", Favorites' "Tap the heart icon on any item to add it here" | "Add titles from a detail page and they will appear here." and "Add favorites from a detail page and they will appear here." (the iOS words), with a Back button | A remote has no tap, and a page without the bar needs a way out from its empty state |
@@ -1728,9 +1772,11 @@ The first release consumes:
 - `GET /api/v2/catalog/items/{id}` for detail;
 - `GET /api/v2/recommendations/similar/{item_id}?limit=12` for detail
   recommendations;
-- `GET /api/v2/catalog/people/{id}` for person information;
-- `GET /api/v2/catalog?source=person&person_id={id}&type=video&limit=24`
-  for the person panel's library titles;
+- `GET /api/v2/catalog/people/{id}` for the person page's header;
+- `GET /api/v2/catalog?source=person&person_id={id}&type={video|movie|series}&sort=-year`,
+  40 cards a page with cursor pagination and the poster width, for the
+  person page's titles, and the same with `limit=1` and `type=movie` or
+  `series` for whether its Movies and Series pills show;
 - `GET /api/v2/catalog/series/{id}/seasons` and
   `GET /api/v2/catalog/series/{id}/seasons/{num}/episodes`;
 - `GET /api/v2/watch/{id}` for the playable projection, including

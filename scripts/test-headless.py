@@ -57,7 +57,7 @@ SHARDS = [
     ("detail-tracks", ["views/detailTracks.spec.bs", "auth", "control"]),
     ("views", ["views"]),
     ("player", ["player", "views/detailPersonal.spec.bs"]),
-    ("screens", ["home", "library", "personal", "search", "settings"]),
+    ("screens", ["home", "library", "people", "personal", "search", "settings"]),
 ]
 
 

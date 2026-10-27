@@ -28,9 +28,10 @@
 
 tvOS's first-run art (spec section 5.4, silo-apple b90a86ea; AG-222):
 
-  {capsule_{76,52},rounded_{16,40}}_line_{fhd,hd}.9.png
+  {capsule_{76,52},rounded_{16,40,12}}_line_{fhd,hd}.9.png
                           1 px outlines of the button, the TV-name chip, the
-                          field, and the card, as tvOS strokes them
+                          field, the card, and the person page's portrait,
+                          as tvOS strokes them
   rounded_16_ring3_{fhd,hd}.9.png
                           a field's 3 px error outline
   rounded_30_{fill,line}_{fhd,hd}.9.png
@@ -465,6 +466,7 @@ def images():
     yield from line_nine_patches("rounded_16", 16, hd(16), 1)
     yield from line_nine_patches("rounded_16", 16, hd(16), 3, suffix="ring3")
     yield from line_nine_patches("rounded_40", 40, hd(40), 1)
+    yield from line_nine_patches("rounded_12", 12, hd(12), 1)
     for name, radius in (("rounded_30", 30),):
         for res, r in (("fhd", radius), ("hd", hd(radius))):
             yield f"{name}_fill_{res}.9.png", nine_patch(shape_alpha(2 * r + STRETCH, 2 * r + STRETCH, r))

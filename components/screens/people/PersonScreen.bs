@@ -1,0 +1,517 @@
+import "pkg:/components/theme/browse.bs"
+import "pkg:/components/theme/detail.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/theme/people.bs"
+import "pkg:/components/views/pending.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/detail.bs"
+import "pkg:/source/catalog/grid.bs"
+import "pkg:/source/catalog/people.bs"
+import "pkg:/source/memory/policy.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/nav/textures.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/platform/topics.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/speech.bs"
+import "pkg:/source/util/values.bs"
+
+' Focus zones, top to bottom: the filter pills, then the grid or the grid's
+' error state (its Retry).
+const ZONE_FILTERS = "filters"
+const ZONE_GRID = "grid"
+const ZONE_STATUS = "status"
+
+sub init()
+    i18n.install()
+    m.top.findNode("background").color = theme.color.BACKGROUND
+    m.page = m.top.findNode("page")
+    m.portraitFill = m.top.findNode("portraitFill")
+    m.initials = m.top.findNode("initials")
+    m.photo = m.top.findNode("photo")
+    m.portraitFrame = m.top.findNode("portraitFrame")
+    width = theme.people.PORTRAIT_WIDTH
+    height = theme.people.PORTRAIT_HEIGHT
+    m.top.findNode("portrait").translation = [theme.browse.GRID_SIDE, theme.people.TOP]
+    m.portraitFill.setFields({ width: width, height: height, color: theme.people.PORTRAIT_FILL })
+    m.initials.setFields({ width: width, height: height, font: theme.font(theme.textStyle.PERSON_INITIALS), color: theme.color.TEXT_TERTIARY })
+    m.photo.setFields({ width: width, height: height, loadWidth: width, loadHeight: height })
+    m.photo.observeField("loadStatus", "showInitials")
+    ' Corners outside the 12 px radius, in the page's black (as cards), and
+    ' tvOS's 1 px outline over them.
+    m.portraitFrame.setFields({ uri: theme.art.CARD_FRAME, width: width, height: height })
+    m.top.findNode("portraitLine").setFields({ uri: theme.people.PORTRAIT_LINE, opacity: theme.people.PORTRAIT_LINE_OPACITY, width: width, height: height })
+    m.name = m.top.findNode("name")
+    m.name.setFields({ font: theme.font(theme.textStyle.PERSON_NAME), color: theme.color.TEXT, width: theme.people.TEXT_WIDTH, maxLines: theme.people.NAME_LINES })
+    m.badges = m.top.findNode("badges")
+    m.bio = m.top.findNode("bio")
+    m.bio.setFields({ font: theme.font(theme.textStyle.DETAIL_SYNOPSIS), color: theme.color.TEXT_TERTIARY, width: theme.people.BIO_WIDTH, maxLines: theme.people.BIO_LINES })
+    m.heading = m.top.findNode("heading")
+    m.heading.setFields({ text: i18n.text("person.filmography"), font: theme.font(theme.textStyle.SECTION_HEADER), color: theme.color.TEXT, height: theme.people.HEADING_HEIGHT })
+    m.count = m.top.findNode("count")
+    m.count.setFields({ font: theme.font(theme.textStyle.SEARCH_COUNT), color: theme.color.TEXT_TERTIARY, height: theme.people.HEADING_HEIGHT })
+    m.filters = m.top.findNode("filters")
+    m.filters.restChooses = false
+    m.filters.span = 1920 - 2 * theme.browse.GRID_SIDE
+    m.filters.observeField("chosen", "onFilterChosen")
+    m.grid = m.top.findNode("results")
+    m.grid.observeField("state", "onGridState")
+    m.grid.observeField("total", "showCount")
+    m.grid.observeField("seen", "showCount")
+    m.grid.observeField("seenAll", "showCount")
+    m.grid.observeField("selectedItem", "onSelected")
+    m.gridStatus = m.top.findNode("gridStatus")
+    m.gridStatus.observeField("activated", "onGridRetry")
+    m.gridSpinner = m.top.findNode("gridSpinner")
+    m.status = m.top.findNode("status")
+    m.status.observeField("activated", "onStatusAction")
+    m.spinner = m.top.findNode("spinner")
+    m.scroll = m.top.findNode("scroll")
+    m.scroll.duration = theme.people.SCROLL_SECONDS
+    m.scrollTo = m.top.findNode("scrollTo")
+    m.textures = nav.textures.create()
+    nav.textures.addView(m.textures, m.grid)
+    m.pending = []
+    m.personId = ""
+    ' catalog.people.person once read, else invalid.
+    m.person = invalid
+    m.filter = catalog.people.ALL
+    m.offered = catalog.people.filters()
+    ' Whether the pills have been built once, so a later build keeps the
+    ' highlighted one.
+    m.filtersBuilt = false
+    ' { movies, series }: catalog.people.hasTitles for each, once read.
+    m.availability = {}
+    m.zone = ZONE_FILTERS
+    ' The zone a rebuilt page opens on once it has content, until the
+    ' viewer moves.
+    m.wantedZone = ""
+    m.restoreGrid = invalid
+    m.lowTier = false
+    m.gridTop = 0
+    m.announced = false
+    ' Whether the page's error state retries (else it goes back).
+    m.statusRetries = false
+end sub
+
+' --- Screen hooks -----------------------------------------------------------
+
+sub onShow(event as Object)
+    if event.first
+        params = m.top.entry.params
+        if not util.isObject(params) then params = {}
+        m.personId = util.text(params.personId)
+        state = platform.current().memory
+        m.lowTier = state.tier = memory.tier.LOW
+        m.grid.owner = m.top.owner
+        m.grid.pages = state.gridPages
+        platform.subscribe(m.top.owner, [platform.topic.MEMORY_LEVEL], "onMemoryLevel")
+        restore = event.restore
+        if util.isObject(restore)
+            if util.contains(catalog.people.filters(), util.text(restore.filter)) then m.filter = restore.filter
+            if util.text(restore.zone) = ZONE_GRID then m.wantedZone = ZONE_GRID
+            m.restoreGrid = restore.grid
+        end if
+        loadPage()
+    else
+        nav.textures.restore(m.textures)
+        showPhoto()
+        if util.isObject(event.restore) and event.restore.grid <> invalid then m.grid.callFunc("restoreFocus", event.restore.grid)
+    end if
+    focusZone(m.zone)
+end sub
+
+sub onHide()
+    m.scroll.control = "stop"
+    m.photo.uri = ""
+end sub
+
+sub onPressure(_level as String)
+    nav.textures.detach(m.textures)
+end sub
+
+sub onRelease()
+    cancelPending()
+end sub
+
+' The filter, the zone, and the grid's card, so the page comes back, or is
+' rebuilt, the same way.
+function focusKey() as Dynamic
+    return { zone: m.zone, filter: m.filter, grid: m.grid.callFunc("focusKey") }
+end function
+
+function onMemoryLevel(event as Object) as Boolean
+    m.grid.pages = event.gridPages
+    return true
+end function
+
+' --- Loading ----------------------------------------------------------------
+
+' Reads the person, whether Movies and Series have titles, and the first
+' page of the chosen filter's credits, all at once, as tvOS does.
+sub loadPage()
+    cancelPending()
+    m.person = invalid
+    m.availability = {}
+    m.page.visible = false
+    m.status.visible = false
+    if m.personId = ""
+        showError("person.notFound", false)
+        return
+    end if
+    m.spinner.running = true
+    send(catalog.people.personRequest(m.personId), { kind: "person" })
+    for each filter in [catalog.people.MOVIES, catalog.people.SERIES]
+        send(catalog.people.availabilityRequest(m.personId, filter), { kind: "availability", filter: filter })
+    end for
+    showFilters()
+    loadCredits()
+end sub
+
+sub loadCredits()
+    m.grid.callFunc("load", { request: catalog.people.creditsRequest(m.personId, m.filter), lowTier: m.lowTier })
+    if m.restoreGrid <> invalid
+        m.grid.callFunc("restoreFocus", m.restoreGrid)
+        m.restoreGrid = invalid
+    end if
+end sub
+
+sub send(request as Object, entry as Object)
+    request.lane = "interactive"
+    sendPending(request, entry)
+end sub
+
+sub onResult(event as Object)
+    handle = event.getRoSGNode()
+    entry = takePending(handle)
+    if entry = invalid then return
+    result = api.resultOf(handle)
+    if result <> invalid then onAnswer(entry, result)
+end sub
+
+sub onAnswer(entry as Object, result as Object)
+    if entry.kind = "person"
+        onPerson(result)
+    else if entry.kind = "availability"
+        m.availability[entry.filter] = catalog.people.hasTitles(result)
+        showFilters()
+    end if
+end sub
+
+sub onPerson(result as Object)
+    m.spinner.running = false
+    if result.ok <> true or not util.isObject(result.body)
+        if result.status = 403 or result.status = 404
+            showError("person.notFound", false)
+        else
+            showError("person.error.load", true)
+        end if
+        return
+    end if
+    m.person = result.body
+    present()
+    m.page.visible = true
+    m.top.ready = true
+    if not m.top.visible then return
+    zone = m.zone
+    if m.wantedZone = ZONE_GRID and zoneTarget(ZONE_GRID) <> invalid
+        m.wantedZone = ""
+        zone = ZONE_GRID
+    end if
+    focusZone(zone, false)
+    announce()
+end sub
+
+' The audio guide says the name with the pill focus lands on, once.
+sub announce()
+    if m.announced or m.person = invalid or m.zone <> ZONE_FILTERS then return
+    m.announced = true
+    label = ""
+    at = m.filters.selected
+    if at >= 0 and at < m.offered.Count() then label = i18n.text("person.filter." + m.offered[at])
+    if m.audioGuide = invalid then m.audioGuide = CreateObject("roAudioGuide")
+    if m.audioGuide <> invalid then m.audioGuide.Say(util.speech.sentences([m.person.name, label]), true, false)
+end sub
+
+sub showError(key as String, retry as Boolean)
+    m.spinner.running = false
+    m.page.visible = false
+    m.status.kind = "error"
+    m.status.message = i18n.text(key)
+    m.status.detail = ""
+    m.status.action = ""
+    m.statusRetries = retry
+    if retry
+        m.status.action = i18n.text("states.retry")
+    else
+        m.status.kind = "empty"
+        m.status.action = i18n.text("common.back")
+    end if
+    m.status.visible = true
+    m.top.ready = true
+    if m.top.visible then focusZone(m.zone)
+end sub
+
+sub onStatusAction()
+    if m.statusRetries
+        loadPage()
+        focusZone(m.zone)
+    else
+        nav.pop()
+    end if
+end sub
+
+' --- Header -----------------------------------------------------------------
+
+sub present()
+    person = m.person
+    m.name.text = person.name
+    m.initials.text = catalog.people.initials(person.name)
+    showPhoto()
+    m.badges.removeChildrenIndex(m.badges.getChildCount(), 0)
+    x = 0
+    for each badge in catalog.people.badges(person, localToday(), m.global.strings)
+        fill = m.badges.createChild("Poster")
+        text = m.badges.createChild("Label")
+        text.setFields({ text: badge, font: theme.font(theme.textStyle.CARD_META), color: theme.color.TEXT, height: theme.people.BADGE_HEIGHT, horizAlign: "center", vertAlign: "center" })
+        width = Int(text.boundingRect().width + 0.999) + 2 * theme.people.BADGE_PADDING
+        text.setFields({ width: width, translation: [x, 0] })
+        fill.setFields({ uri: theme.firstRunArt.BADGE_FILL, blendColor: theme.people.BADGE_FILL, width: width, height: theme.people.BADGE_HEIGHT, translation: [x, 0] })
+        x = x + width + theme.people.BADGE_GAP
+    end for
+    m.bio.text = person.bio
+    arrange()
+end sub
+
+' Today on this device's clock, for the age badge.
+function localToday() as Object
+    now = CreateObject("roDateTime")
+    now.ToLocalTime()
+    return now
+end function
+
+' The photo shows only while the page does; a hidden page gives its
+' texture back (onHide).
+sub showPhoto()
+    uri = ""
+    if m.person <> invalid and m.top.visible then uri = m.person.photoUri
+    if m.photo.uri <> uri then m.photo.uri = uri
+    showInitials()
+end sub
+
+' The initials show without a photo and when the photo fails to load, as
+' ProfileAvatar's do.
+sub showInitials()
+    if m.person = invalid
+        m.initials.visible = false
+    else
+        m.initials.visible = m.person.photoUri = "" or m.photo.loadStatus = "failed"
+    end if
+end sub
+
+' Stacks the text column and the filmography below the header, as tvOS's
+' VStacks do (theme.people).
+sub arrange()
+    y = theme.people.TEXT_TOP
+    m.name.translation = [theme.people.TEXT_X, y]
+    y = y + measured(m.name) + theme.people.TEXT_GAP
+    m.badges.visible = m.badges.getChildCount() > 0
+    if m.badges.visible
+        m.badges.translation = [theme.people.TEXT_X, y]
+        y = y + theme.people.BADGE_HEIGHT + theme.people.TEXT_GAP
+    end if
+    m.bio.translation = [theme.people.TEXT_X, y]
+    if m.bio.text <> "" then y = y + measured(m.bio)
+    headerBottom = theme.people.TOP + theme.people.PORTRAIT_HEIGHT
+    if y > headerBottom then headerBottom = y
+    top = headerBottom + theme.people.SECTION_GAP
+    m.heading.translation = [theme.browse.GRID_SIDE, top]
+    m.count.translation = [theme.browse.GRID_SIDE + Int(m.heading.boundingRect().width) + theme.people.COUNT_GAP, top]
+    pillsTop = top + theme.people.HEADING_HEIGHT + theme.people.PILLS_GAP + theme.people.PILLS_ROOM
+    m.filters.translation = [theme.browse.GRID_SIDE, pillsTop]
+    m.gridTop = pillsTop + theme.detail.PILL_HEIGHT + theme.people.PILLS_ROOM + theme.people.GRID_GAP
+    m.grid.translation = [theme.browse.GRID_SIDE, m.gridTop]
+    m.gridSpinner.centre = [960, m.gridTop + theme.people.STATUS_DROP]
+    placeStatus()
+    scrollFor(m.zone, false)
+end sub
+
+' Centres the empty or error state STATUS_DROP below the grid's top. The
+' empty state takes no focus, so the page never moves for it: under a tall
+' header it rises until it ends at the action-safe line instead.
+sub placeStatus()
+    centre = [960, m.gridTop + theme.people.STATUS_DROP]
+    m.gridStatus.centre = centre
+    if m.gridStatus.kind <> "empty" then return
+    rect = m.gridStatus.boundingRect()
+    over = Int(rect.y + rect.height + 0.999) - theme.people.SAFE_BOTTOM
+    if over > 0 then m.gridStatus.centre = [centre[0], centre[1] - over]
+end sub
+
+function measured(label as Object) as Integer
+    return Int(label.boundingRect().height + 0.999)
+end function
+
+' --- Filmography -------------------------------------------------------------
+
+' The pills on offer (catalog.people.offered), the chosen one selected.
+' They are rebuilt only when the offer changes, and the highlight stays on
+' the same filter (else moves to the chosen one). A chosen filter that
+' drops out falls back to All and reads its titles.
+sub showFilters()
+    offered = catalog.people.offered(m.availability)
+    if m.filtersBuilt and offered.Join(",") = m.offered.Join(",") then return
+    highlighted = ""
+    if m.filtersBuilt
+        at = m.filters.callFunc("highlightedPill")
+        if at >= 0 and at < m.offered.Count() then highlighted = m.offered[at]
+    end if
+    m.offered = offered
+    m.filtersBuilt = true
+    dropped = not util.contains(offered, m.filter)
+    if dropped then m.filter = catalog.people.ALL
+    labels = []
+    selected = -1
+    keep = -1
+    for i = 0 to offered.Count() - 1
+        labels.Push(i18n.text("person.filter." + offered[i]))
+        if offered[i] = m.filter then selected = i
+        if offered[i] = highlighted then keep = i
+    end for
+    m.filters.selected = selected
+    m.filters.labels = { items: labels }
+    if highlighted <> ""
+        moved = keep < 0
+        if moved then keep = selected
+        m.filters.callFunc("highlightPill", keep, moved)
+    end if
+    if dropped then loadCredits()
+end sub
+
+sub onFilterChosen()
+    index = m.filters.chosen
+    if index < 0 or index >= m.offered.Count() then return
+    filter = m.offered[index]
+    if filter = m.filter then return
+    m.filter = filter
+    m.filters.selected = index
+    loadCredits()
+end sub
+
+sub onGridState()
+    state = m.grid.state
+    m.gridSpinner.running = state = "loading"
+    m.gridStatus.visible = state = "empty" or state = "error"
+    if state = "empty"
+        m.gridStatus.setFields({ kind: "empty", message: i18n.text("person.empty"), detail: i18n.text("person.emptyBody"), action: "" })
+    else if state = "error"
+        m.gridStatus.setFields({ kind: "error", message: i18n.text("person.error.titles"), detail: "", action: i18n.text("states.retry") })
+    end if
+    placeStatus()
+    showCount()
+    if not m.top.visible or not m.page.visible then return
+    if state = "ready" and m.wantedZone = ZONE_GRID
+        m.wantedZone = ""
+        focusZone(ZONE_GRID, false)
+    else if zoneTarget(m.zone) = invalid
+        focusZone(ZONE_FILTERS)
+    end if
+end sub
+
+sub showCount()
+    m.count.text = ""
+    ' An empty answer with a total counts "0 titles", as tvOS does.
+    state = m.grid.state
+    if state = "ready" or state = "empty" then m.count.text = catalog.people.countText(m.grid.total, m.grid.seen, m.grid.seenAll, m.global.strings)
+end sub
+
+sub onGridRetry()
+    loadCredits()
+    focusZone(ZONE_FILTERS)
+end sub
+
+sub onSelected(event as Object)
+    card = event.getData()
+    if card <> invalid and util.text(card.id) <> "" then nav.push(nav.route.DETAIL, catalog.detail.routeParams(card))
+end sub
+
+' --- Focus ------------------------------------------------------------------
+
+' The node a zone focuses, or invalid when it has none now.
+function zoneTarget(zone as String) as Dynamic
+    if zone = ZONE_FILTERS then return m.filters
+    if zone = ZONE_GRID and m.grid.state = "ready" then return m.grid
+    if zone = ZONE_STATUS and m.gridStatus.visible and m.gridStatus.action <> "" then return m.gridStatus
+    return invalid
+end function
+
+' Focuses zone, else the pills; before the person is read, the error's
+' button or the screen itself. animate false moves the page at once, as
+' when it first shows or is rebuilt.
+sub focusZone(zone as String, animate = true as Boolean)
+    if not m.top.visible
+        m.zone = zone
+        return
+    end if
+    if not m.page.visible
+        if m.status.visible and m.status.action <> ""
+            m.status.setFocus(true)
+            m.status.callFunc("announce")
+        else
+            focusScreen()
+        end if
+        return
+    end if
+    target = zoneTarget(zone)
+    if target = invalid
+        zone = ZONE_FILTERS
+        target = m.filters
+    end if
+    m.zone = zone
+    if not target.isInFocusChain() then target.setFocus(true)
+    if zone = ZONE_STATUS then m.gridStatus.callFunc("announce")
+    scrollFor(zone, animate)
+end sub
+
+' Moves the page up so the grid rests at Browse's place while it, or its
+' error's Retry, has focus (under a tall header Retry would sit below the
+' screen), and back down otherwise; animated unless on the low tier,
+' hidden, or not asked for.
+sub scrollFor(zone as String, animate as Boolean)
+    offset = 0
+    if zone <> ZONE_FILTERS and m.gridTop > theme.browse.GRID_TOP then offset = m.gridTop - theme.browse.GRID_TOP
+    target = [0, -offset]
+    ' A move still running toward the other place stops where it is.
+    m.scroll.control = "stop"
+    current = m.page.translation
+    if current[1] = target[1] then return
+    if m.lowTier or not animate or not m.top.visible
+        m.page.translation = target
+        return
+    end if
+    m.scrollTo.keyValue = [current, target]
+    m.scroll.control = "start"
+end sub
+
+' Down from the pills enters the grid (or its Retry); Up from the grid's
+' first row, or from Retry, returns to them. Back reaches AppScene, which
+' pops the page.
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    m.wantedZone = ""
+    if not m.page.visible then return false
+    if key = "down" and m.zone = ZONE_FILTERS
+        if zoneTarget(ZONE_GRID) <> invalid
+            focusZone(ZONE_GRID)
+        else if zoneTarget(ZONE_STATUS) <> invalid
+            focusZone(ZONE_STATUS)
+        end if
+        return true
+    end if
+    if key = "up" and (m.zone = ZONE_GRID or m.zone = ZONE_STATUS)
+        focusZone(ZONE_FILTERS)
+        return true
+    end if
+    return false
+end function
