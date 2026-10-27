@@ -450,6 +450,7 @@ sub init()
     m.released = false
     m.slowStops = 0
     m.lastStopMs = invalid
+    shuffleInitPlayer()
 end sub
 
 function newFlags() as Object
@@ -478,6 +479,9 @@ sub onShow(event as Object)
     if m.wanted <> invalid
         m.itemId = m.wanted.contentId
         m.startOver = m.wanted.startPositionRule = nav.player.START_OVER
+        ' A shuffle's first pick (components/player/PlayerShuffle.bs).
+        shuffled = nav.player.shuffleOf(m.wanted)
+        if shuffled <> invalid then shuffleBegin(shuffled)
     else if util.isObject(params)
         m.itemId = util.text(params.itemId)
         m.startOver = util.isTrue(params.startOver)
@@ -662,7 +666,7 @@ sub begin(intent as Object)
     m.recap = playback.skipRecap.create(m.preferences.autoSkipRecap, m.markers)
     m.credits = playback.skipCredits.create(m.preferences.autoSkipCredits, m.markers, intent.runtime, playback.skipCredits.carriedKey(carry))
     if not chained then carry = playback.upNext.newCarry()
-    m.upNext = playback.upNext.create({ promptSeconds: m.preferences.nextUpPromptSeconds, runtime: intent.runtime, lookup: intent.kind = "episode", autoPlayNext: m.autoplayNext, deviceAutoplay: CreateObject("roDeviceInfo").IsAutoplayEnabled(), carry: carry })
+    m.upNext = playback.upNext.create({ promptSeconds: m.preferences.nextUpPromptSeconds, runtime: intent.runtime, lookup: intent.kind = "episode" or isShuffling(), autoPlayNext: m.autoplayNext, deviceAutoplay: CreateObject("roDeviceInfo").IsAutoplayEnabled(), carry: carry, shuffle: isShuffling() })
     ' The Up Next button waits for the first plan (resolveNext).
     showUpNextButton(false)
     ' A phone's launch may play as its own profile, borrowed for this
@@ -1126,6 +1130,7 @@ sub onVideoState()
         logFormats("first frame")
         ' Playback accepts remote keys: a deep-link launch fires AppLaunchComplete.
         m.top.ready = true
+        shuffleFirstFrame()
     end if
     if videoState = "playing" and m.pauseLoad <> invalid and m.pauseLoad = load
         ' A plan adopted while the viewer had paused opens paused.
@@ -2096,7 +2101,7 @@ sub executeControl(command as Object)
     else if t = "openUpNext"
         openUpNext()
     else if t = "upNextBack"
-        runUpNext({ type: "back" })
+        upNextStay("back")
     else if t = "activateSkip"
         activateSkip()
     else if t = "activateSegment"
@@ -2553,12 +2558,16 @@ end sub
 ' skip has landed. The seek goes out first, so an automatic skip of those
 ' credits wins over it.
 sub viewerSeek(position as Dynamic, resume = false as Boolean)
+    ' A seek stays with this item, as Keep Watching does: a shuffle's
+    ' advance still out is given up first (upNextStay), which opens the
+    ' panel again for the seek to close or replay from.
+    shuffleAbandon()
     if m.upNext <> invalid and m.upNext.finished then return
     if upNextHolds()
         replayEnd(position)
         return
     end if
-    if m.upNext <> invalid and playback.upNext.isOpen(m.upNext) then runUpNext({ type: "keepWatching" })
+    if m.upNext <> invalid and playback.upNext.isOpen(m.upNext) then upNextStay("keepWatching")
     commitSeek(position, resume)
     runCredits({ type: "seek", seconds: position })
 end sub
@@ -2604,9 +2613,15 @@ end sub
 ' (playback.onDeck), both through ApiTask.
 sub resolveNext()
     if m.upNext = invalid then return
-    m.resolution = playback.nextEpisode.create(playback.nextEpisode.currentFromWatch(m.watch))
-    sendNext(playback.nextEpisode.start(m.resolution))
-    settleNext()
+    if isShuffling()
+        ' A shuffle replaces the series order: the server picks what
+        ' follows (tvOS's loadNextUpCandidate).
+        shuffleResolve()
+    else
+        m.resolution = playback.nextEpisode.create(playback.nextEpisode.currentFromWatch(m.watch))
+        sendNext(playback.nextEpisode.start(m.resolution))
+        settleNext()
+    end if
     m.onDeck = playback.onDeck.create({ itemId: m.itemId, seriesId: util.text(m.watch.series_id) }, isLowTier())
     sendOnDeck(playback.onDeck.start(m.onDeck))
     settleOnDeck()
@@ -2727,7 +2742,11 @@ sub showUpNext(command as Object)
     end if
     panel.seriesTitle = pickSeries(command.pick)
     panel.setFields(playback.upNext.panelFields(command))
+    shuffleChrome()
     if not opening then return
+    ' The announced pick may no longer play; the read replaces it (tvOS's
+    ' beginNextUpPostroll).
+    refreshShufflePick()
     panel.observeField("action", "onUpNextAction")
     panel.observeField("autoPlay", "onUpNextAutoPlay")
     panel.observeField("videoBox", "onUpNextBox")
@@ -2743,6 +2762,7 @@ end sub
 ' an On Deck episode's own, and none for a movie.
 function pickSeries(entry as Dynamic) as String
     if entry = invalid then return ""
+    if util.isTrue(entry.shuffle) then return util.text(entry.seriesTitle)
     if not entry.onDeck then return util.text(m.watch.series_title)
     card = entry.card
     if LCase(card.itemType) = "episode" then return card.caption
@@ -2774,11 +2794,29 @@ sub onUpNextAction()
     panel = m.upNextPanel
     if panel = invalid then return
     action = panel.action
-    if action = "pick"
+    if action = "pickAnother"
+        shufflePickAnother()
+    else if action = "stopShuffling"
+        shuffleStop()
+    else if action = "pick"
+        shuffleAbandon()
         runUpNext({ type: "pick", itemId: panel.picked })
+    else if action = "keepWatching" or action = "back"
+        upNextStay(action)
     else
         runUpNext({ type: action })
     end if
+end sub
+
+' Keep Watching or Back (action), however the viewer gives it: the
+' panel's buttons, the remote's Back key (upNextBack), or a voice scan
+' key. A shuffle's advance still out is given up first, so its answer
+' cannot start the next item (shuffleAbandon opens the panel again); the
+' reducer then closes it. A seek or replay from the phone or voice gives
+' the advance up the same way (viewerSeek, replayEnd).
+sub upNextStay(action as String)
+    shuffleAbandon()
+    runUpNext({ type: action })
 end sub
 
 ' The panel's toggle is Options' Auto-play next too.
@@ -2826,19 +2864,29 @@ end sub
 ' Play Now, the countdown, or an On Deck card: the session stops with its
 ' final position, as Back stops it (plan section 6.6), then the next item
 ' starts here.
+' A shuffle's pick plays once the server has advanced the shuffle
+' (shufflePlayNext, then startNextItem).
 sub advanceTo(command as Object)
-    log.info(LOG_TAG, "playing the next item", { auto: command.auto, chosen: command.chosen, onDeck: command.onDeck })
+    if shufflePlayNext(command) then return
+    startNextItem(command)
+end sub
+
+sub startNextItem(command as Object)
+    log.info(LOG_TAG, "playing the next item", { auto: command.auto, chosen: command.chosen, onDeck: command.onDeck, shuffle: util.isTrue(command.shufflePick) })
     closeUpNext()
     season = -1
     pick = m.upNext.next
     if pick <> invalid and pick.itemId = command.itemId and util.isNumber(pick.seasonNumber) then season = Int(pick.seasonNumber)
-    m.advance = { itemId: command.itemId, carry: command.carry, seasonNumber: season, auto: not command.chosen, replay: invalid, foreign: command.onDeck }
+    m.advance = { itemId: command.itemId, carry: command.carry, seasonNumber: season, auto: not command.chosen, replay: invalid, foreign: command.onDeck, shuffle: util.isTrue(command.shufflePick) }
     if not m.done then dispatch({ type: "back" })
     advanceWhenDone()
 end sub
 
 ' Keep Watching after the end: the same item again from seconds.
 sub replayEnd(seconds as Dynamic)
+    ' A replay stays with this item: a shuffle's advance still out is given
+    ' up, as Keep Watching gives it up (upNextStay).
+    shuffleAbandon()
     log.info(LOG_TAG, "replaying the end", { seconds: seconds })
     closeUpNext()
     m.advance = { itemId: m.itemId, carry: playback.upNext.replayCarry(m.upNext, playback.skipCredits.skippedKey(m.credits)), seasonNumber: playingSeason(), auto: false, replay: seconds, foreign: false }
@@ -2863,6 +2911,10 @@ sub advanceWhenDone()
     m.startOver = false
     if chosen.replay <> invalid
         m.wanted = nav.player.replay(chosen.itemId, chosen.replay, chosen.carry)
+    else if util.isTrue(chosen.shuffle)
+        ' Every pick plays from its beginning (tvOS's loadShufflePick).
+        m.wanted = nav.player.shufflePick(chosen.itemId, chosen.carry, chosen.auto)
+        m.startOver = true
     else
         m.wanted = nav.player.nextEpisode(chosen.itemId, chosen.carry, chosen.auto)
     end if

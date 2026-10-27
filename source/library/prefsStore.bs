@@ -1,0 +1,124 @@
+import "pkg:/source/library/filters.bs"
+import "pkg:/source/library/prefs.bs"
+import "pkg:/source/util/values.bs"
+
+' Browse's remembered sort and filters in the registry (source/library/
+' prefs.bs), as ApiTask carries out the page's operations on them: it
+' alone imports this file, which reads and writes JSON (AGENTS.md: JSON
+' in Tasks), so none of it runs on the render thread.
+namespace libraryPrefs
+    ' Carries out a loadRequest, saveRequest, or preserveRequest on store,
+    ' in the order they came. Gives the answer's body: for a read
+    ' { preserve, record }, record the saved selection checked and as
+    ' libraryFilters.saved gives it (libraryPrefs.loaded restores it), or
+    ' invalid; {} for a write that wrote; invalid for one that did not.
+    function carryOut(store as Object, op as Object) as Dynamic
+        if op.op = "load"
+            entryKey = util.text(op.key)
+            sort = op.sort
+            if not util.isObject(sort) or not util.isString(sort.field) then return invalid
+            selection = load(store, entryKey, { field: sort.field, descending: util.isTrue(sort.descending) })
+            record = invalid
+            if selection <> invalid then record = libraryFilters.saved(selection)
+            return { preserve: preserved(store, entryKey), record: record }
+        end if
+        if write(store, op) then return {}
+        return invalid
+    end function
+
+    ' Whether Preserve is on for the entry (on by default).
+    function preserved(store as Object, entryKey as String) as Boolean
+        if entryKey = "" then return true
+        return not store.Exists(entryKey + ".p") or store.Read(entryKey + ".p") <> "0"
+    end function
+
+    ' The saved selection, or invalid when Preserve is off or nothing is
+    ' saved; sort is Browse's default for a saved sort no longer offered.
+    function load(store as Object, entryKey as String, sort as Object) as Dynamic
+        if entryKey = "" or not preserved(store, entryKey) or not store.Exists(entryKey + ".s") then return invalid
+        return decode(store.Read(entryKey + ".s"), sort)
+    end function
+
+    ' Carries out a saveRequest or preserveRequest on store (ApiTask, the
+    ' registry's one writer, plan section 4.3). A selection too large to
+    ' save ("" text) leaves the entry's last one. Gives whether it wrote.
+    function write(store as Object, op as Object) as Boolean
+        entryKey = util.text(op.key)
+        if Left(entryKey, 1) <> "b" or Len(entryKey) < 2 then return false
+        text = encode(op.selection)
+        if op.op = "save"
+            if not preserved(store, entryKey) or text = "" then return false
+            store.Write(entryKey + ".s", text)
+        else if op.op = "preserve"
+            if util.isTrue(op.enabled)
+                if store.Exists(entryKey + ".p") then store.Delete(entryKey + ".p")
+                if text <> "" then store.Write(entryKey + ".s", text)
+            else
+                store.Write(entryKey + ".p", "0")
+                if store.Exists(entryKey + ".s") then store.Delete(entryKey + ".s")
+            end if
+        else
+            return false
+        end if
+        touch(store, entryKey)
+        return store.Flush()
+    end function
+
+    ' The entry goes first in the index; the oldest go while the section
+    ' is past its budget, the entry itself never.
+    sub touch(store as Object, entryKey as String)
+        keys = [entryKey]
+        for each other in indexOf(store)
+            if other <> entryKey then keys.Push(other)
+        end for
+        while keys.Count() > 1 and sizeOf(store, keys) > BUDGET_BYTES
+            gone = keys.Pop()
+            for each suffix in [".s", ".p"]
+                if store.Exists(gone + suffix) then store.Delete(gone + suffix)
+            end for
+        end while
+        store.Write(INDEX, keys.Join(","))
+    end sub
+
+    function indexOf(store as Object) as Object
+        out = []
+        if not store.Exists(INDEX) then return out
+        for each entryKey in store.Read(INDEX).Split(",")
+            if Left(entryKey, 1) = "b" and Len(entryKey) > 1 then out.Push(entryKey)
+        end for
+        return out
+    end function
+
+    ' The bytes the section's values take for keys and the index.
+    function sizeOf(store as Object, keys as Object) as Integer
+        total = Len(INDEX) + keys.Count() * 42
+        for each entryKey in keys
+            for each suffix in [".s", ".p"]
+                if store.Exists(entryKey + suffix) then total = total + Len(entryKey) + 2 + Len(store.Read(entryKey + suffix))
+            end for
+        end for
+        return total
+    end function
+    ' The saved text of a record (libraryFilters.saved), or "" when it is
+    ' not one or is past the bounds (libraryFilters.MAX_SAVED_*).
+    function encode(record as Dynamic) as String
+        if not util.isObject(record) or not util.isObject(record.values) then return ""
+        for each facet in record.values
+            list = record.values[facet]
+            if type(list) <> "roArray" or list.Count() > libraryFilters.MAX_SAVED_VALUES then return ""
+            for each value in list
+                if not util.isString(value) or Len(value) > libraryFilters.MAX_VALUE_CHARS then return ""
+            end for
+        end for
+        text = FormatJson(record)
+        if Len(text) > libraryFilters.MAX_SAVED_CHARS then return ""
+        return text
+    end function
+
+    ' A saved text back as a selection, or invalid when it is not one
+    ' (libraryFilters.restore says what is kept).
+    function decode(text as Dynamic, default as Object) as Dynamic
+        if not util.isString(text) or text = "" or Len(text) > libraryFilters.MAX_SAVED_CHARS then return invalid
+        return libraryFilters.restore(ParseJson(text), default)
+    end function
+end namespace

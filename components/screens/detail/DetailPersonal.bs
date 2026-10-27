@@ -1,4 +1,5 @@
 import "pkg:/components/views/personal.bs"
+import "pkg:/components/views/shuffle.bs"
 import "pkg:/source/catalog/actions.bs"
 import "pkg:/source/catalog/personal.bs"
 import "pkg:/source/platform/client.bs"
@@ -7,14 +8,16 @@ import "pkg:/source/util/i18n.bs"
 import "pkg:/source/util/values.bs"
 
 ' The detail page's Watchlist button and More menu (spec section 5.6, tvOS's
-' TVDetailActionRow and its More popover): add to or remove from the
-' Watchlist and Favorites when the server offers the lists, and mark the
-' movie, or the series, the season shown, or the episode Play plays,
-' watched or unwatched. Each change shows at once and goes back if the
+' TVDetailActionRow and its More popover): on a series Shuffle the season
+' shown and Shuffle Series when the server offers them, add to or remove
+' from the Watchlist and Favorites when the server offers the lists, and
+' mark the movie, or the series, the season shown, or the episode Play
+' plays, watched or unwatched. Each change shows at once and goes back if the
 ' server refuses it, with a notice (components/views/personal.bs). Part of
 ' DetailScreen.
 
 sub initPersonal()
+    shuffleInit()
     ' Whether the server offers Watchlist and Favorites: true or false once
     ' known (personalListsKnown), else invalid.
     m.lists = invalid
@@ -45,6 +48,17 @@ sub startPersonal()
     platform.subscribe(m.top.owner, [platform.topic.PERSONAL_CHANGE], "onPersonalChange")
     m.lists = personalListsKnown()
     if m.lists = invalid then send(catalog.personal.capabilityRequest(), { kind: "personalLists" })
+    ' More's Shuffle rows ask the server's capability (components/views/shuffle.bs).
+    shuffleRead()
+end sub
+
+' The capability arrived: More reads it when it next opens.
+sub shuffleCapabilityChanged()
+end sub
+
+' A press while a shuffle starts is ignored (shuffleStart); the menu
+' closed when the row was chosen.
+sub shuffleStarting(_starting as Boolean)
 end sub
 
 sub onPersonalListsRead(result as Object)
@@ -82,13 +96,13 @@ end sub
 ' The More menu under its button, in tvOS's order (catalog.personal.moreRows).
 sub openMore()
     if m.detail = invalid then return
-    items = []
-    for each row in catalog.personal.moreRows(moreState())
-        items.Push({ value: row.value, title: i18n.text(row.key), detail: "" })
-    end for
     ' What the menu offers, which its rows do even if a read changes the
     ' page while it is open.
     m.moreOffered = moreState()
+    items = []
+    for each row in catalog.personal.moreRows(m.moreOffered)
+        items.Push({ value: row.value, title: i18n.text(row.key, row.values), detail: "" })
+    end for
     m.pickerKey = catalog.action.MORE
     m.picker.setFields({ title: i18n.text("detail.more"), options: { items: items }, chosen: -1 })
     showPicker()
@@ -96,9 +110,16 @@ end sub
 
 ' What the More menu offers now (catalog.personal.moreRows' state).
 function moreState() as Object
-    state = { lists: util.isTrue(m.lists), series: m.series, isFavorite: m.detail.isFavorite, played: moviePlayed(), season: false, seasonPlayed: false, episode: false, episodePlayed: false }
+    state = { lists: util.isTrue(m.lists), series: m.series, isFavorite: m.detail.isFavorite, played: moviePlayed(), season: false, seasonPlayed: false, episode: false, episodePlayed: false, shuffleSeason: "", shuffleSeasonId: "", shuffleSeries: false }
     if not m.series then return state
     state.played = m.detail.played
+    state.shuffleSeries = catalog.more.shuffleSeries(shuffleSupports(playback.shuffle.SERIES), m.seasonRollups)
+    season = shuffleSeasonIndex()
+    if season >= 0
+        specials = season < m.seasonRollups.Count() and util.isObject(m.seasonRollups[season]) and util.isTrue(m.seasonRollups[season].specials)
+        state.shuffleSeason = catalog.series.seasonName(m.seasonNodes[season].title, m.seasonNodes[season].seasonNumber, specials, m.copy)
+        state.shuffleSeasonId = m.seasonNodes[season].id
+    end if
     if m.seasonIndex >= 0 and m.seasonIndex < m.seasonRollups.Count()
         state.season = true
         state.seasonPlayed = catalog.personal.seasonPlayed(m.seasonRollups[m.seasonIndex])
@@ -127,12 +148,29 @@ function activeEpisode() as Dynamic
     return card
 end function
 
+' The season shown when it can shuffle (catalog.more.shuffleSeason), else
+' -1: read, not loading, with two episodes that have a file.
+function shuffleSeasonIndex() as Integer
+    at = m.seasonIndex
+    if at < 0 or at >= m.pages.Count() or m.pages[at] = invalid then return -1
+    if not catalog.more.shuffleSeason(shuffleSupports(playback.shuffle.SEASON), m.pages[at].getChildren(-1, 0)) then return -1
+    return at
+end function
+
 ' A row does what it said when the menu opened (m.moreOffered), as a read
 ' landing meanwhile, such as the series' seasons after a mark, may have
-' turned the state it would read now.
+' turned the state it would read now: Shuffle <season> shuffles the
+' season it named.
 sub onMorePicked(value as Integer)
     if m.detail = invalid or m.moreOffered = invalid then return
     offered = m.moreOffered
+    if value = catalog.more.SHUFFLE_SEASON
+        if offered.shuffleSeasonId <> "" then shuffleStart(playback.shuffle.SEASON, offered.shuffleSeasonId)
+        return
+    else if value = catalog.more.SHUFFLE_SERIES
+        if offered.shuffleSeries then shuffleStart(playback.shuffle.SERIES, m.detail.id)
+        return
+    end if
     if value = catalog.more.FAVORITE
         if not util.isTrue(m.lists) then return
         requested = not offered.isFavorite

@@ -1,0 +1,279 @@
+import "pkg:/source/nav/player.bs"
+import "pkg:/source/playback/shuffle.bs"
+import "pkg:/source/playback/upNext.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' Stop shuffling's DELETE outlives the player, as the screens' does
+' (components/views/shuffle.bs).
+const SHUFFLE_PLAYER_OWNER = "shuffleState"
+const SHUFFLE_LOG_TAG = "player"
+
+' A shuffle in the player (spec section 5.7), as tvOS's PlayerViewModel
+' plays one (publishShuffleNextUp, refreshShufflePick, playNextShufflePick,
+' pickAnotherShufflePick, stopShuffling). The player entry's intent names
+' the shuffle (nav.player.shuffle); m.shuffle is its playback.shuffle state
+' for the whole player, every pick included. Up Next offers the shuffle's
+' pick in place of a next episode, through the same reducer
+' (playback.upNext with shuffle) and the same start of the next item
+' (advanceTo, advanceWhenDone): Play Now, the countdown, the phone's
+' play_next, and Play/Pause all reach shufflePlayNext from there.
+'
+' Requests and their order. One shuffle action is out at a time
+' (m.shuffleOp, { kind, handle }, kind "advance" or "skip"); a new one
+' cancels the one before and any re-read, and an answer counts only while
+' its handle is m.shuffleOp's. A re-read (m.shuffleRead) is dropped when an
+' action went out after it, so an older read never replaces what an
+' advance or Pick Another answered (tvOS checks !isAdvancingShuffle and
+' !isPickingAnotherShufflePick). Every answer is also checked against the
+' shuffle's ID. Keep Watching or Back while an advance is out, from the
+' panel, the remote's Back key, voice, or a phone's seek (upNextStay),
+' gives it up (its late answer must not switch playback); if the server advanced
+' anyway, the next Play Now names the same item and the server answers
+' the same pick. Stop shuffling's DELETE goes under its own owner, never
+' released, and is not awaited; the player's own requests go with its
+' owner when it closes, and the server deletes an abandoned shuffle.
+
+sub shuffleInitPlayer()
+    m.shuffle = invalid
+    m.shuffleOp = invalid
+    m.shuffleRead = invalid
+    m.shuffleNotice = ""
+    ' The playNext command an advance waits to carry out.
+    m.shufflePlayNext = invalid
+end sub
+
+' The player opened on a shuffle's first pick: its pages are not told
+' which episode played, as tvOS returns a shuffle to the page it started
+' from as it was.
+sub shuffleBegin(summary as Object)
+    m.shuffle = playback.shuffle.create(summary)
+    m.leftSeries = true
+end sub
+
+function isShuffling() as Boolean
+    return m.shuffle <> invalid
+end function
+
+' After the first plan: the pick goes to Up Next at once, and the
+' shuffle is read again, as tvOS's loadNextUpCandidate does.
+sub shuffleResolve()
+    publishShufflePick()
+    refreshShufflePick()
+end sub
+
+' The item reached its first frame: it counts as played, so advancing
+' names it (tvOS's markPlayed in handleAetherStartupMilestone).
+sub shuffleFirstFrame()
+    if m.shuffle = invalid then return
+    playback.shuffle.markPlayed(m.shuffle, m.itemId)
+    if m.shuffleOp = invalid then publishShufflePick()
+end sub
+
+' Up Next's entry for a pick (playback.upNext's), its card made here.
+function shuffleEntry(pick as Dynamic) as Dynamic
+    if pick = invalid then return invalid
+    card = CreateObject("roSGNode", "CardContent")
+    card.setFields(pick.card)
+    return { itemId: pick.itemId, card: card, onDeck: false, shuffle: true, seriesId: pick.seriesId, seriesTitle: pick.seriesTitle, seasonNumber: pick.seasonNumber }
+end function
+
+' Offers the shuffle's pick in Up Next when it changed: a different pick
+' gets a full countdown, the same one keeps its own (tvOS's
+' publishShuffleNextUp).
+sub publishShufflePick(force = false as Boolean)
+    if m.shuffle = invalid or m.upNext = invalid then return
+    pick = playback.shuffle.upNext(m.shuffle)
+    wanted = ""
+    if pick <> invalid then wanted = pick.itemId
+    shown = ""
+    if m.upNext.next <> invalid then shown = m.upNext.next.itemId
+    if force or wanted <> shown or m.upNext.nextLoading then runUpNext({ type: "next", next: shuffleEntry(pick), failed: false })
+    shuffleChrome()
+end sub
+
+' The panel's shuffle parts: the scope, whether Pick Another applies, an
+' advance out, and a failed action's line. busy is an advance only: while
+' Pick Another is out, Play Now still plays (shufflePlayNext replaces the
+' skip) and Pick Another stays lit, as tvOS's isStartingNextUp leaves out
+' isPickingAnotherShufflePick.
+sub shuffleChrome()
+    panel = m.upNextPanel
+    if panel = invalid then return
+    if m.shuffle = invalid
+        panel.shuffleLabel = ""
+        return
+    end if
+    busy = shuffleAdvancing()
+    panel.setFields({ shuffleLabel: m.shuffle.shuffle.label, canPickAnother: playback.shuffle.canPickAnother(m.shuffle), busy: busy, notice: m.shuffleNotice })
+end sub
+
+' GET the shuffle again; the server replaces a pick that can no longer
+' play, and 409 shows the finished state. One read at a time.
+sub refreshShufflePick()
+    if m.shuffle = invalid or m.shuffleOp <> invalid then return
+    if m.shuffleRead <> invalid then shuffleCancel(m.shuffleRead)
+    m.shuffleRead = shuffleRequest(playback.shuffle.readRequest(m.shuffle.shuffle.id), "onShuffleRead")
+end sub
+
+sub onShuffleRead(event as Object)
+    handle = event.getRoSGNode()
+    if m.shuffleRead = invalid or not m.shuffleRead.isSameNode(handle) or m.shuffle = invalid or m.closed then return
+    m.shuffleRead = invalid
+    if m.shuffleOp <> invalid then return
+    takeShuffleAnswer(api.resultOf(handle))
+    publishShufflePick()
+end sub
+
+' An answer's shuffle replaces the one kept (same ID only), or its status
+' tells the state that nothing can play (409). Gives whether it applied.
+function takeShuffleAnswer(result as Dynamic) as Boolean
+    if result = invalid then return false
+    if util.isTrue(result.ok) and util.isObject(result.body)
+        playback.shuffle.apply(m.shuffle, result.body)
+        return result.body.id = m.shuffle.shuffle.id
+    end if
+    status = 0
+    if util.isNumber(result.status) then status = Int(result.status)
+    playback.shuffle.failed(m.shuffle, status)
+    return false
+end function
+
+' Sends a shuffle request under the player's owner, its answer to callback.
+function shuffleRequest(request as Object, callback as String) as Object
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", callback)
+    api.send(request, handle)
+    return handle
+end function
+
+sub shuffleCancel(handle as Object)
+    api.cancel(handle)
+end sub
+
+' Stop shuffling's DELETE, which outlives the player and is not awaited.
+sub shuffleForget(id as String)
+    api.send(playback.shuffle.deleteRequest(id), api.newHandle(SHUFFLE_PLAYER_OWNER))
+end sub
+
+sub cancelShuffleOps()
+    if m.shuffleOp <> invalid then shuffleCancel(m.shuffleOp.handle)
+    if m.shuffleRead <> invalid then shuffleCancel(m.shuffleRead)
+    m.shuffleOp = invalid
+    m.shuffleRead = invalid
+    m.shufflePlayNext = invalid
+end sub
+
+' Up Next's playNext for a shuffle: the server moves past the item that
+' played, then the new current item plays from its beginning (tvOS's
+' playNextShufflePick). The panel stays, Play Now dimmed, until the
+' answer. Gives false when the command is not a shuffle's to carry out.
+function shufflePlayNext(command as Object) as Boolean
+    if m.shuffle = invalid then return false
+    ' An On Deck card leaves the shuffle; it is not stopped, so like an
+    ' abandoned one the server cleans it up (tvOS's playOnDeckItemNow).
+    if command.chosen
+        leaveShuffle()
+        return false
+    end if
+    cancelShuffleOps()
+    m.shuffleNotice = ""
+    m.shufflePlayNext = command
+    handle = shuffleRequest(playback.shuffle.advanceRequest(m.shuffle.shuffle.id, playback.shuffle.advanceFrom(m.shuffle)), "onShuffleAdvanced")
+    m.shuffleOp = { kind: "advance", handle: handle }
+    shuffleChrome()
+    return true
+end function
+
+sub onShuffleAdvanced(event as Object)
+    handle = event.getRoSGNode()
+    if m.shuffleOp = invalid or not m.shuffleOp.handle.isSameNode(handle) or m.shuffle = invalid or m.closed or m.leaving then return
+    command = m.shufflePlayNext
+    m.shuffleOp = invalid
+    m.shufflePlayNext = invalid
+    result = api.resultOf(handle)
+    if takeShuffleAnswer(result) and command <> invalid
+        command.itemId = m.shuffle.shuffle.current.itemId
+        command.shufflePick = true
+        startNextItem(command)
+        return
+    end if
+    ' tvOS stops the countdown and offers Play Now again, with a line
+    ' unless nothing can play.
+    status = 0
+    if result <> invalid and util.isNumber(result.status) then status = Int(result.status)
+    m.shuffleNotice = ""
+    if status <> 409 then m.shuffleNotice = i18n.text("upNext.shuffleContinueFailed")
+    log.info(SHUFFLE_LOG_TAG, "the shuffle could not advance", { status: status })
+    runUpNext({ type: "reopen", ended: m.videoEnded })
+    publishShufflePick(true)
+    shuffleChrome()
+end sub
+
+' Whether Play Now's advance is out.
+function shuffleAdvancing() as Boolean
+    return m.shuffleOp <> invalid and m.shuffleOp.kind = "advance"
+end function
+
+' Keep Watching or Back while an advance is out, from any of their paths
+' (upNextStay): staying on this item wins, so the advance is given up and
+' the panel takes the key.
+function shuffleAbandon() as Boolean
+    if not shuffleAdvancing() then return false
+    cancelShuffleOps()
+    runUpNext({ type: "reopen", ended: m.videoEnded })
+    publishShufflePick(true)
+    shuffleChrome()
+    return true
+end function
+
+' Pick Another: the server replaces the next item; no countdown runs
+' until it answers, and the countdown then starts over (tvOS's
+' pickAnotherShufflePick). A repeat press while it is out does nothing;
+' Play Now gives it up for an advance.
+sub shufflePickAnother()
+    if m.shuffle = invalid or not playback.shuffle.canPickAnother(m.shuffle) or m.shuffleOp <> invalid then return
+    cancelShuffleOps()
+    m.shuffleNotice = ""
+    handle = shuffleRequest(playback.shuffle.skipRequest(m.shuffle.shuffle.id, m.shuffle.shuffle.next.itemId), "onShuffleSkipped")
+    m.shuffleOp = { kind: "skip", handle: handle }
+    runUpNext({ type: "hold" })
+    shuffleChrome()
+end sub
+
+sub onShuffleSkipped(event as Object)
+    handle = event.getRoSGNode()
+    if m.shuffleOp = invalid or not m.shuffleOp.handle.isSameNode(handle) or m.shuffle = invalid or m.closed then return
+    m.shuffleOp = invalid
+    result = api.resultOf(handle)
+    if not takeShuffleAnswer(result)
+        status = 0
+        if result <> invalid and util.isNumber(result.status) then status = Int(result.status)
+        if status <> 409 then m.shuffleNotice = i18n.text("upNext.pickAnotherFailed")
+    end if
+    ' A new pick restarts the countdown as it arrives; the same one (the
+    ' only one left) restarts it here.
+    runUpNext({ type: "release" })
+    publishShufflePick()
+    shuffleChrome()
+end sub
+
+' Stop shuffling: the shuffle is deleted, not awaited, and the player
+' closes (tvOS's stopShuffling, then the caller's close).
+sub shuffleStop()
+    if m.shuffle = invalid then return
+    id = m.shuffle.shuffle.id
+    leaveShuffle()
+    shuffleForget(id)
+    log.info(SHUFFLE_LOG_TAG, "stopped shuffling", {})
+    exitPlayer()
+end sub
+
+sub leaveShuffle()
+    if m.shuffle = invalid then return
+    cancelShuffleOps()
+    m.shuffle = invalid
+    m.shuffleNotice = ""
+    shuffleChrome()
+end sub

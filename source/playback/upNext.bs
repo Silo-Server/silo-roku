@@ -99,6 +99,21 @@ import "pkg:/source/playback/values.bs"
 '                                    file; start is where the credits
 '                                    begin (source seconds)
 '   { type: "tick", now }            at nextWake
+'   { type: "hold", now }, { type: "release", now }
+'                                    a shuffle's Pick Another is out: no
+'                                    countdown runs until its answer
+'                                    (tvOS's isPickingAnotherShufflePick)
+'   { type: "reopen", ended, now }   a shuffle's advance failed or was
+'                                    given up after its playNext: the
+'                                    panel shows again, without a
+'                                    countdown (tvOS sets
+'                                    nextUpAutoplayCancelled), ended
+'                                    saying whether the video has ended
+'
+' A shuffle (create's shuffle) replaces the next episode with the server's
+' pick, which the player sends as "next"; On Deck still shows in the row
+' but never becomes the pick (tvOS's offerOnDeckItemIfNothingNext), so a
+' shuffle with nothing left shows Finished.
 namespace playback.upNext
     ' tvOS's nextUpCountdownDefaultSeconds.
     const END_COUNTDOWN_SECONDS = 10
@@ -122,13 +137,14 @@ namespace playback.upNext
     end function
 
     ' options: { promptSeconds, runtime, lookup, autoPlayNext,
-    ' deviceAutoplay, carry }. promptSeconds is the profile's
+    ' deviceAutoplay, carry, shuffle }. promptSeconds is the profile's
     ' playback.next_up_prompt_seconds; runtime (source seconds,
     ' playback.seek.runtime) may be invalid; lookup says a next-episode
     ' lookup runs (an episode), so "next" will come; autoPlayNext is the
     ' profile's playback.auto_play_next; deviceAutoplay is
     ' roDeviceInfo.IsAutoplayEnabled(); carry is newCarry() or a playNext's
-    ' or a replay's. On Deck always loads, so "onDeck" will come.
+    ' or a replay's; shuffle, that a shuffle's pick is the next item. On
+    ' Deck always loads, so "onDeck" will come.
     function create(options as Object) as Object
         carry = options.carry
         if not util.isObject(carry) then carry = newCarry()
@@ -168,6 +184,9 @@ namespace playback.upNext
             countdown: invalid,
             ' A playNext, replay, or exit went out; nothing follows it.
             finished: false,
+            ' A shuffle's picks, and a Pick Another out (hold).
+            shuffle: util.isTrue(options.shuffle),
+            held: false,
             ' The last show command as text, or invalid when closed.
             shown: invalid
         }
@@ -175,9 +194,13 @@ namespace playback.upNext
 
     function reduce(state as Object, event as Object) as Object
         out = []
-        if state.finished then return out
         now = event.now
         t = event.type
+        if t = "reopen"
+            reopen(state, util.isTrue(event.ended), out)
+            return out
+        end if
+        if state.finished then return out
         if t = "position"
             if util.isNumber(event.seconds) then state.position = event.seconds
             present(state, now, out)
@@ -208,6 +231,12 @@ namespace playback.upNext
             onCredits(state, event.start, now, out)
         else if t = "tick"
             onTick(state, now, out)
+        else if t = "hold"
+            state.held = true
+            state.countdown = invalid
+        else if t = "release"
+            state.held = false
+            startCountdown(state, now, out)
         end if
         publish(state, out)
         return out
@@ -346,7 +375,7 @@ namespace playback.upNext
 
     ' Auto-play is on, there is a pick, and nothing stopped the countdown.
     function counts(state as Object) as Boolean
-        return state.allowed and state.autoPlay and state.next <> invalid and not state.cancelled
+        return state.allowed and state.autoPlay and state.next <> invalid and not state.cancelled and not state.held
     end function
 
     ' tvOS's startNextUpCountdownIfNeeded: at the end and over skipped
@@ -405,7 +434,7 @@ namespace playback.upNext
     ' tvOS's offerOnDeckItemIfNothingNext: the first On Deck item becomes
     ' the pick when there is no next episode and the lookup did not fail.
     function offerOnDeck(state as Object, now as Dynamic, out as Object) as Boolean
-        if state.next <> invalid or state.nextLoading or state.nextFailed then return false
+        if state.shuffle or state.next <> invalid or state.nextLoading or state.nextFailed then return false
         items = carousel(state)
         if items.Count() = 0 then return false
         state.next = items[0]
@@ -511,6 +540,20 @@ namespace playback.upNext
                 return
             end if
         end for
+    end sub
+
+    ' A shuffle's playNext came to nothing: the panel opens again over the
+    ' item still playing, its countdown off.
+    sub reopen(state as Object, ended as Boolean, out as Object)
+        if not state.finished then return
+        state.finished = false
+        state.open = true
+        state.ended = ended
+        state.cancelled = true
+        state.held = false
+        state.countdown = invalid
+        state.shown = invalid
+        publish(state, out)
     end sub
 
     sub finish(state as Object, command as Object, out as Object)

@@ -1,0 +1,317 @@
+namespace tests
+
+    ' Browse's filters (source/library/filters.bs): the facets and values a
+    ' library offers, the selection and what it sends, and the panel's rows,
+    ' as tvOS's CatalogFilterState, CatalogFacets, CatalogQueryBuilder, and
+    ' TVBrowseFilterPanel build them.
+    @suite("library filters")
+    class LibraryFiltersTests extends rooibos.BaseTestSuite
+
+        function copy() as Object
+            return i18n.load("en_US")
+        end function
+
+        function vocab() as Object
+            return libraryFilters.vocabulary(tests.catalogData.fixture("get_catalog_filters_ok"))
+        end function
+
+        function fresh() as Object
+            return libraryFilters.empty(libraryTab.defaultSort())
+        end function
+
+        ' A selection of every kind the golden carries: two genres, a
+        ' rating, two decades, HDR and Dolby Vision, and Unwatched.
+        function golden() as Object
+            state = m.fresh()
+            for each value in ["Drama", "Crime"]
+                libraryFilters.toggle(state, libraryFilters.GENRE, value)
+            end for
+            libraryFilters.toggle(state, libraryFilters.CONTENT_RATING, "R")
+            libraryFilters.toggle(state, libraryFilters.DECADE, "2010")
+            libraryFilters.toggle(state, libraryFilters.DECADE, "1990")
+            libraryFilters.toggle(state, libraryFilters.DYNAMIC_RANGE, "dolby_vision")
+            libraryFilters.toggle(state, libraryFilters.DYNAMIC_RANGE, "hdr")
+            libraryFilters.toggle(state, libraryFilters.WATCH_STATUS, "unwatched")
+            return state
+        end function
+
+        function kinds(rows as Object) as Object
+            out = []
+            for each row in rows
+                out.Push(row.kind + ":" + row.key)
+            end for
+            return out
+        end function
+
+        @describe("facets and values")
+
+        @it("reads /catalog/filters into each facet's values, empty where the server sends none")
+        sub _()
+            vocab = m.vocab()
+            m.assertEqual(vocab.genre, ["Crime"])
+            m.assertEqual(vocab.resolution, ["2160p"])
+            m.assertEqual(vocab.subtitleLanguage, ["en"])
+            m.assertEqual(vocab.studio, [])
+            m.assertInvalid(libraryFilters.vocabulary({ studios: [] }), "no genres: not a CatalogFilters")
+            mapped = catalog.map.apply(catalog.request.filters("12"), tests.catalogData.ok(tests.catalogData.fixture("get_catalog_filters_ok")), tests.catalogData.words())
+            m.assertTrue(mapped.ok)
+            m.assertEqual(mapped.body.genre, ["Crime"])
+        end sub
+
+        @it("offers tvOS's facets in its order, those without values left out, and Type only for a mixed view")
+        sub _()
+            copy = m.copy()
+            m.assertEqual(libraryFilters.offered(m.vocab(), copy), ["genre", "decade", "watchStatus", "resolution", "dynamicRange", "subtitleLanguage"])
+            m.assertEqual(libraryFilters.offered(invalid, copy), ["decade", "watchStatus", "dynamicRange"], "before the values are read, the fixed ones")
+            m.assertEqual(libraryFilters.offered(invalid, copy, true)[0], "itemType")
+        end sub
+
+        @it("labels values as tvOS's chips do")
+        sub _()
+            copy = m.copy()
+            m.assertEqual(libraryFilters.optionPairs("decade", invalid, copy)[0], ["2020", "2020s"])
+            m.assertEqual(libraryFilters.optionPairs("decade", invalid, copy).Count(), 7)
+            m.assertEqual(libraryFilters.optionPairs("dynamicRange", invalid, copy), [["hdr", "HDR"], ["dolby_vision", "Dolby Vision"]])
+            m.assertEqual(libraryFilters.optionPairs("watchStatus", invalid, copy)[1], ["inProgress", "In Progress"])
+            m.assertEqual(libraryFilters.optionPairs("genre", m.vocab(), copy), [["Crime", "Crime"]])
+            m.assertEqual(libraryFilters.title("audioLanguage", copy), "Audio Language")
+        end sub
+
+        @describe("the selection")
+
+        @it("toggles values, one at most for Watch Status, and counts the facets holding any")
+        sub _()
+            state = m.fresh()
+            m.assertEqual(libraryFilters.activeCount(state), 0)
+            m.assertFalse(libraryFilters.canReset(state))
+            libraryFilters.toggle(state, "genre", "Drama")
+            libraryFilters.toggle(state, "genre", "Crime")
+            m.assertEqual(libraryFilters.selected(state, "genre"), ["Crime", "Drama"])
+            libraryFilters.toggle(state, "watchStatus", "watched")
+            libraryFilters.toggle(state, "watchStatus", "unwatched")
+            m.assertEqual(libraryFilters.selected(state, "watchStatus"), ["unwatched"], "the one held gives way")
+            libraryFilters.toggle(state, "dynamicRange", "hdr")
+            libraryFilters.toggle(state, "dynamicRange", "dolby_vision")
+            m.assertEqual(libraryFilters.activeCount(state), 3, "HDR and Dolby Vision count once")
+            libraryFilters.toggle(state, "watchStatus", "unwatched")
+            m.assertEqual(libraryFilters.activeCount(state), 2, "choosing the one held clears it")
+            libraryFilters.clear(state, "genre")
+            m.assertEqual(libraryFilters.activeCount(state), 1)
+        end sub
+
+        @it("resets every facet and Match but keeps the sort")
+        sub _()
+            state = libraryFilters.empty({ field: "year", descending: true })
+            libraryFilters.toggle(state, "genre", "Crime")
+            state.matchAll = false
+            m.assertTrue(libraryFilters.canReset(state))
+            libraryFilters.reset(state)
+            m.assertEqual([libraryFilters.activeCount(state), state.matchAll, state.sort.field], [0, true, "year"])
+            state.matchAll = false
+            m.assertTrue(libraryFilters.canReset(state), "Any alone can be reset")
+        end sub
+
+        @it("sums a facet's choice as Any, the value, or a count")
+        sub _()
+            copy = m.copy()
+            state = m.fresh()
+            m.assertEqual(libraryFilters.summary(state, "decade", copy), "Any")
+            libraryFilters.toggle(state, "decade", "1990")
+            m.assertEqual(libraryFilters.summary(state, "decade", copy), "1990s")
+            libraryFilters.toggle(state, "decade", "2000")
+            m.assertEqual(libraryFilters.summary(state, "decade", copy), "2 selected")
+        end sub
+
+        @it("tells selections apart by what they send, with no JSON on the render thread")
+        sub _()
+            a = m.fresh()
+            b = m.fresh()
+            libraryFilters.toggle(a, "genre", "Crime")
+            libraryFilters.toggle(a, "genre", "Drama")
+            libraryFilters.toggle(b, "genre", "Drama")
+            m.assertFalse(libraryFilters.same(a, b))
+            libraryFilters.toggle(b, "genre", "Crime")
+            m.assertTrue(libraryFilters.same(a, b), "values in any order")
+            b.matchAll = false
+            m.assertFalse(libraryFilters.same(a, b), "Match")
+            b.matchAll = true
+            b.sort = { field: "year", descending: true }
+            m.assertFalse(libraryFilters.same(a, b), "the sort")
+            libraryFilters.toggle(a, "studio", "A24")
+            b.sort = a.sort
+            m.assertFalse(libraryFilters.same(a, b), "another facet")
+        end sub
+
+        @it("edits a copy, so the page's selection stays until Done")
+        sub _()
+            state = m.fresh()
+            draft = libraryFilters.copyOf(state)
+            libraryFilters.toggle(draft, "genre", "Crime")
+            m.assertEqual(libraryFilters.activeCount(state), 0)
+            m.assertFalse(libraryFilters.same(state, draft))
+            m.assertTrue(libraryFilters.same(state, libraryFilters.copyOf(state)))
+        end sub
+
+        @describe("the Browse read")
+
+        @it("sends one group per facet, typed as the server compares them (GOLDEN catalog-groups/filters.json)")
+        sub _()
+            sent = libraryFilters.query(m.golden())
+            golden = tests.devices.loadJson("pkg:/tests/fixtures/golden/catalog-groups/filters.json")
+            text = FormatJson(sent.groups)
+            m.assertEqual(ParseJson(text), golden, "GOLDEN catalog-groups/filters.json " + text)
+            m.assertEqual(sent.match, "all")
+            state = m.fresh()
+            m.assertEqual(libraryFilters.query(state), { match: "all", groups: [] }, "no filters, no groups")
+            state.matchAll = false
+            m.assertEqual(libraryFilters.query(state).match, "any")
+        end sub
+
+        @it("adds match and groups to the Browse read, which listCatalogItems declares")
+        sub _()
+            operation = tests.catalogData.operations()["listCatalogItems"]
+            options = libraryTab.browseOptions("movies", { id: "12", type: "movies" }, libraryTab.defaultSort(), "B", m.golden())
+            request = tests.catalogData.sent(catalog.request.browse(options, "", catalog.grid.PAGE_SIZE, false))
+            m.assertEqual([request.query.match, request.query.name_prefix, request.query.type, request.query.sort], ["all", "B", "movie", "title"])
+            m.assertEqual(request.query.groups, { json: libraryFilters.query(m.golden()).groups }, "groups go as a value ApiTask serializes")
+            for each name in request.query
+                declared = operation.query[name]
+                m.assertNotInvalid(declared, "listCatalogItems has no query parameter " + name)
+                value = request.query[name]
+                if type(value) = "roAssociativeArray" then value = FormatJson(value.json)
+                m.assertTrue(tests.catalogData.fitsParameter(value, declared), name + "=" + FormatJson(value))
+            end for
+            m.assertTrue(Len(FormatJson(request.query.groups.json)) <= libraryFilters.MAX_GROUPS_CHARS)
+            m.assertTrue(Instr(1, api.request.url("https://silo.example", request), "&groups=" + api.request.escape(FormatJson(request.query.groups.json))) > 0, "ApiTask's URL carries the JSON")
+            bare = catalog.request.browse(libraryTab.browseOptions("movies", { id: "12", type: "movies" }, libraryTab.defaultSort(), ""), "", 40, false)
+            m.assertInvalid(bare.query.match, "without a selection the read is as before")
+        end sub
+
+        @it("reads the values and probes the library with the operations' declared parameters")
+        sub _()
+            operations = tests.catalogData.operations()
+            for each entry in [["getCatalogFilters", catalog.request.filters("12")], ["listCatalogItems", libraryFilters.probeRequest("12", "movie")]]
+                operation = operations[entry[0]]
+                request = tests.catalogData.sent(entry[1])
+                m.assertEqual([request.method, request.auth, request.path], [operation.method, "profile", operation.path], entry[0])
+                for each name in request.query
+                    m.assertTrue(tests.catalogData.fitsParameter(request.query[name], operation.query[name]), entry[0] + ": " + name)
+                end for
+            end for
+            probe = libraryFilters.probeRequest("12", "")
+            m.assertEqual(probe.query, { source: "query", library_id: "12", limit: 1, skip_total: true }, "no filters, letter, sort, or type")
+        end sub
+
+        @it("probes only with a filter or a letter, and keeps Clear filters unless the probe finds nothing")
+        sub _()
+            state = m.fresh()
+            m.assertFalse(libraryFilters.needsProbe(state, ""))
+            m.assertTrue(libraryFilters.needsProbe(state, "B"))
+            libraryFilters.toggle(state, "genre", "Crime")
+            m.assertTrue(libraryFilters.needsProbe(state, ""))
+            request = libraryFilters.probeRequest("12", "movie")
+            empty = catalog.map.apply(request, tests.catalogData.ok({ items: [], page: { has_more: false } }), tests.catalogData.words())
+            m.assertEqual(libraryFilters.emptyReason(empty), "library")
+            found = catalog.map.apply(request, tests.catalogData.ok(tests.catalogData.fixture("list_catalog_items_ok")), tests.catalogData.words())
+            m.assertEqual(libraryFilters.emptyReason(found), "filters")
+            m.assertEqual(libraryFilters.emptyReason({ ok: false, status: 500, body: invalid }), "filters", "a failed probe")
+            m.assertEqual(libraryFilters.emptyReason(invalid), "filters")
+        end sub
+
+        @describe("saving")
+
+        @it("saves the sort, Match, and values, and reads them back")
+        sub _()
+            state = m.golden()
+            state.sort = { field: "added_at", descending: true }
+            state.matchAll = false
+            text = libraryPrefs.encode(libraryFilters.saved(state))
+            back = libraryPrefs.decode(text, libraryTab.defaultSort())
+            m.assertTrue(libraryFilters.same(back, state))
+            m.assertTrue(libraryFilters.same(libraryFilters.restore(libraryFilters.saved(state), libraryTab.defaultSort()), state), "a focus key's record, without JSON")
+            m.assertEqual(back.sort, { field: "added_at", descending: true })
+            m.assertFalse(back.matchAll)
+        end sub
+
+        @it("drops what Browse no longer offers from a saved selection")
+        sub _()
+            text = FormatJson({ v: 1, sort: "-bitrate", match: "all", values: { genre: ["Crime", 7], decade: ["1890", "1990"], watchStatus: ["watched", "unwatched"], dynamicRange: ["sdr"], bogus: ["x"] } })
+            back = libraryPrefs.decode(text, libraryTab.defaultSort())
+            m.assertEqual(back.sort, libraryTab.defaultSort(), "an unknown sort")
+            m.assertEqual(libraryFilters.selected(back, "genre"), ["Crime"])
+            m.assertEqual(libraryFilters.selected(back, "decade"), ["1990"])
+            m.assertEqual(libraryFilters.selected(back, "watchStatus"), ["watched"], "one value")
+            m.assertEqual(libraryFilters.activeCount(back), 3)
+            for each bad in ["", "{", FormatJson({ v: 2 }), FormatJson([1])]
+                m.assertInvalid(libraryPrefs.decode(bad, libraryTab.defaultSort()), bad)
+            end for
+            for each bad in [invalid, "x", { v: 2 }, [1]]
+                m.assertInvalid(libraryFilters.restore(bad, libraryTab.defaultSort()), "a record that is not one")
+            end for
+        end sub
+
+        @it("does not save a selection past its bounds")
+        sub _()
+            state = m.fresh()
+            for i = 1 to libraryFilters.MAX_SAVED_VALUES + 1
+                libraryFilters.toggle(state, "studio", "Studio " + i.ToStr())
+            end for
+            m.assertEqual(libraryPrefs.encode(libraryFilters.saved(state)), "")
+            m.assertEqual(libraryFilters.query(state).groups.Count(), 1, "it is still sent")
+        end sub
+
+        @describe("the panel's rows (TVBrowseFilterPanel)")
+
+        @it("lists the facets, then MATCH and OPTIONS, with Reset dimmed until there is something to reset")
+        sub _()
+            copy = m.copy()
+            rows = libraryFilters.panel.rows(libraryFilters.panel.FILTERS, "", m.fresh(), m.vocab(), true, copy)
+            m.assertEqual(m.kinds(rows), ["facet:genre", "facet:decade", "facet:watchStatus", "facet:resolution", "facet:dynamicRange", "facet:subtitleLanguage", "header:", "matchAll:", "matchAny:", "header:", "preserve:", "reset:", "done:"])
+            m.assertEqual([rows[0].label, rows[0].detail, rows[0].chevron], ["Genre", "Any", "next"])
+            m.assertEqual([rows[6].label, rows[6].focusable], ["MATCH", false])
+            m.assertEqual([rows[7].label, rows[7].mark, rows[8].mark], ["All selected filters", "radioOn", "radioOff"])
+            m.assertEqual([rows[10].label, rows[10].mark], ["Preserve sort & filters", "boxOn"])
+            m.assertEqual([rows[11].label, rows[11].enabled, rows[11].focusable], ["Reset filters", false, false])
+            m.assertEqual([rows[12].label, rows[12].strong, rows[12].mark], ["Done", true, "check"])
+            m.assertEqual(libraryFilters.panel.moved(rows, 10, 1), 12, "Down from Preserve passes over Reset")
+            m.assertEqual(libraryFilters.panel.moved(rows, 7, -1), 5, "Up from Match passes over its header")
+            m.assertEqual(libraryFilters.panel.moved(rows, 12, 1), 12, "the last stays")
+            state = m.fresh()
+            libraryFilters.toggle(state, "genre", "Crime")
+            off = libraryFilters.panel.rows(libraryFilters.panel.FILTERS, "", state, m.vocab(), false, copy)
+            m.assertEqual([off[0].detail, off[10].mark, off[11].focusable], ["Crime", "boxOff", true])
+        end sub
+
+        @it("says so when the library offers no filter at all")
+        sub _()
+            copy = m.copy()
+            rows = libraryFilters.panel.rows(libraryFilters.panel.FILTERS, "", m.fresh(), invalid, true, copy)
+            m.assertEqual(rows[0].kind, "facet", "the fixed facets need no values")
+            m.assertEqual(libraryFilters.panel.opening(rows, libraryFilters.panel.FILTERS, ""), 0)
+        end sub
+
+        @it("lists a facet's values after All filters, with Clear while it holds one, and opens on the first chosen")
+        sub _()
+            copy = m.copy()
+            state = m.fresh()
+            rows = libraryFilters.panel.rows(libraryFilters.panel.VALUES, "decade", state, invalid, true, copy)
+            m.assertEqual([rows[0].kind, rows[0].label, rows[0].chevron], ["back", "All filters", "back"])
+            m.assertEqual(rows.Count(), 8)
+            m.assertEqual(libraryFilters.panel.opening(rows, libraryFilters.panel.VALUES, ""), 1, "the first value")
+            libraryFilters.toggle(state, "decade", "1990")
+            rows = libraryFilters.panel.rows(libraryFilters.panel.VALUES, "decade", state, invalid, true, copy)
+            m.assertEqual([rows[1].kind, rows[1].label], ["clear", "Clear Decade"])
+            at = libraryFilters.panel.opening(rows, libraryFilters.panel.VALUES, "")
+            m.assertEqual([rows[at].key, rows[at].mark], ["1990", "radioOn"])
+        end sub
+
+        @it("opens the filter list on the facet visited last, else the first, else Done")
+        sub _()
+            copy = m.copy()
+            rows = libraryFilters.panel.rows(libraryFilters.panel.FILTERS, "", m.fresh(), m.vocab(), true, copy)
+            m.assertEqual(rows[libraryFilters.panel.opening(rows, libraryFilters.panel.FILTERS, "resolution")].key, "resolution")
+            m.assertEqual(libraryFilters.panel.opening(rows, libraryFilters.panel.FILTERS, "studio"), 0)
+            m.assertEqual(libraryFilters.panel.find(rows, "done", ""), rows.Count() - 1)
+        end sub
+    end class
+end namespace

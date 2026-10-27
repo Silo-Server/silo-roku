@@ -15,9 +15,11 @@ namespace tests
         ' The Movies tab's page for user_libraries.json's library 12, shown
         ' for the first time in mode, in the test scene so focus can move;
         ' afterEach takes it out.
-        function opened(mode as String) as Object
+        function opened(mode as String, session = invalid as Dynamic) as Object
             theme.install()
             tests.scene.reset()
+            m.top.callFunc("sceneSession", session)
+            m.forgetShuffle()
             probe = CreateObject("roSGNode", "LibraryScreenProbe")
             probe.entry = { id: "library", route: nav.route.LIBRARY, params: libraryTab.routeParams("movies", { id: "12", type: "movies" }, mode) }
             probe.owner = "library-1"
@@ -48,6 +50,55 @@ namespace tests
         function browsed() as Object
             return tests.scene.last(catalog.request.browse({}, "", catalog.grid.PAGE_SIZE, false).path)
         end function
+
+        ' The last of the page's registry operations of op ("load", "save",
+        ' "preserve") sent to ApiTask, or invalid.
+        function prefsSent(op as String) as Dynamic
+            entries = tests.scene.sent()
+            for i = entries.Count() - 1 to 0 step -1
+                if entries[i].request.storage = libraryPrefs.OPERATION and entries[i].request.op = op then return entries[i]
+            end for
+            return invalid
+        end function
+
+        ' Answers the page's registry read as ApiTask would with body.
+        sub answerPrefs(entry as Object, body as Object)
+            tests.scene.deliver(entry.handle, { requestId: entry.request.requestId, ok: true, status: 0, headers: {}, body: body, error: invalid }, "ok")
+        end sub
+
+        ' A signed-in session with profile p1, so the page has an entry.
+        function profiled() as Object
+            return { origin: "https://silo.example", status: "signed_in", profile: { id: "p1" } }
+        end function
+
+        ' The last probe of the library (libraryFilters.probeRequest): the
+        ' last /catalog read of one item.
+        function probed() as Dynamic
+            entries = tests.scene.sent()
+            for i = entries.Count() - 1 to 0 step -1
+                query = entries[i].request.query
+                if entries[i].request.path = "/api/v2/catalog" and query.limit = 1 and util.isTrue(query.skip_total) then return entries[i]
+            end for
+            return invalid
+        end function
+
+        ' Forgets the shuffle capability, so the page reads it (the test
+        ' scene has no session, so the page's key is "").
+        sub forgetShuffle()
+            entry = { key: "none", value: invalid }
+            if m.global.hasField("shuffleCapability")
+                m.global.shuffleCapability = entry
+            else
+                m.global.addFields({ shuffleCapability: entry })
+            end if
+        end sub
+
+        ' Answers the page's capability read with the scope kinds offered.
+        sub answerShuffle(kinds as Object)
+            read = tests.scene.last(playback.shuffle.capabilityRequest().path)
+            m.assertNotInvalid(read, "the page reads the shuffle capability")
+            tests.scene.answer(read, { state: "available", allowed: true, scope_kinds: kinds, revision: "r1" })
+        end sub
 
         ' The page's child of subtype (the sort menu, a tab's library list), or
         ' invalid.
@@ -185,7 +236,8 @@ namespace tests
         sub _()
             probe = m.opened(libraryTab.mode.BROWSE)
             rail = probe.findNode("body").getChild(2)
-            m.assertTrue(probe.callFunc("pressKey", "right"))
+            m.assertTrue(probe.callFunc("pressKey", "right"), "Sort to Filter")
+            m.assertTrue(probe.callFunc("pressKey", "right"), "Filter to the rail")
             m.assertTrue(rail.isInFocusChain())
             rail.chosen = "B"
             m.assertEqual(rail.selected, "B")
@@ -194,6 +246,8 @@ namespace tests
             m.assertEqual(m.browsed().request.query.sort, "title", "the sort stays")
             tests.scene.answer(m.browsed(), { items: [], page: { next_cursor: invalid, has_more: false }, total: 0 })
             status = probe.findNode("status")
+            m.assertFalse(status.visible, "the probe says which empty state")
+            tests.scene.answer(m.probed(), tests.catalogData.fixture("list_catalog_items_ok"))
             m.assertEqual([status.visible, status.kind, status.message, status.action], [true, "empty", "No titles match your filters", "Clear filters"])
             m.assertTrue(probe.callFunc("pressKey", "left"))
             m.assertTrue(status.isInFocusChain(), "Clear filters, beside the rail")
@@ -225,6 +279,234 @@ namespace tests
             m.assertTrue(bar.isInFocusChain())
             m.assertEqual(bar.focused, mainShell.barItem.MOVIES)
             m.assertFalse(probe.callFunc("pressKey", "back"), "Back from the bar is AppScene's")
+        end sub
+
+        @describe("Filter (TVBrowseFilterUI)")
+
+        @it("puts Filter 16 px after Sort, reads the library's filter values, and opens the panel from it")
+        sub _()
+            probe = m.opened(libraryTab.mode.BROWSE)
+            body = probe.findNode("body")
+            pill = body.getChild(1)
+            filter = body.getChild(3)
+            m.assertEqual([filter.subtype(), filter.label, filter.badge, filter.active], ["SortPill", "Filter", 0, false])
+            m.assertEqual(filter.translation, [theme.browse.GRID_SIDE + pill.drawnWidth + theme.library.PILL_GAP, theme.library.PILL_TOP])
+            read = tests.scene.last(catalog.request.filters("12").path)
+            m.assertNotInvalid(read)
+            m.assertEqual(read.request.query, { library_id: "12" })
+            m.assertTrue(probe.callFunc("pressKey", "right"))
+            m.assertTrue(filter.isInFocusChain(), "Right from Sort")
+            filter.activated = true
+            panel = m.child(probe, "FilterPanel")
+            m.assertNotInvalid(panel)
+            m.assertTrue(panel.isInFocusChain())
+            m.assertEqual(panel.findNode("title").text, "Filters")
+            tests.scene.answer(read, tests.catalogData.fixture("get_catalog_filters_ok"))
+            m.assertEqual(panel.vocab.genre, ["Crime"], "a late answer reaches the open panel")
+        end sub
+
+        @it("reads the grid with the panel's choice, counts it on Filter, saves nothing without a profile, and goes back to Filter")
+        sub _()
+            probe = m.opened(libraryTab.mode.BROWSE)
+            filter = probe.findNode("body").getChild(3)
+            filter.activated = true
+            panel = m.child(probe, "FilterPanel")
+            draft = libraryFilters.copyOf(panel.selection)
+            libraryFilters.toggle(draft, "genre", "Crime")
+            libraryFilters.toggle(draft, "decade", "1990")
+            panel.applied = draft
+            m.assertInvalid(m.child(probe, "FilterPanel"))
+            m.assertTrue(filter.isInFocusChain())
+            query = m.browsed().request.query
+            m.assertEqual([query.match, query.sort, query.type], ["all", "title", "movie"])
+            m.assertEqual(query.groups, { json: libraryFilters.query(draft).groups })
+            m.assertEqual([filter.badge, filter.active, filter.spoken], [2, true, "Filter, 2 active"])
+            filter.activated = true
+            panel = m.child(probe, "FilterPanel")
+            m.assertEqual(libraryFilters.activeCount(panel.selection), 2, "the panel opens on the page's choice")
+            count = tests.scene.sent().Count()
+            panel.applied = libraryFilters.copyOf(panel.selection)
+            m.assertEqual(tests.scene.sent().Count(), count, "Done without a change reads nothing")
+        end sub
+
+        @it("tells an empty library from filters that match nothing, and Clear filters drops them all, keeping the sort")
+        sub _()
+            probe = m.opened(libraryTab.mode.BROWSE)
+            body = probe.findNode("body")
+            filter = body.getChild(3)
+            body.getChild(1).activated = true
+            m.child(probe, "SortMenu").chosen = "year"
+            filter.activated = true
+            panel = m.child(probe, "FilterPanel")
+            draft = libraryFilters.copyOf(panel.selection)
+            libraryFilters.toggle(draft, "watchStatus", "unwatched")
+            panel.applied = draft
+            empty = { items: [], page: { next_cursor: invalid, has_more: false }, total: 0 }
+            tests.scene.answer(m.browsed(), empty)
+            status = probe.findNode("status")
+            m.assertTrue(probe.findNode("spinner").running, "waiting for the probe")
+            probe1 = m.probed()
+            m.assertEqual(probe1.request.query, { source: "query", library_id: "12", limit: 1, skip_total: true, type: "movie" })
+            tests.scene.fail(probe1)
+            m.assertEqual([status.visible, status.message, status.action], [true, "No titles match your filters", "Clear filters"], "a failed probe keeps Clear filters")
+            status.activated = true
+            query = m.browsed().request.query
+            m.assertEqual([query.sort, query.groups], ["-year", invalid])
+            m.assertEqual(filter.badge, 0)
+            m.assertTrue(body.getChild(1).isInFocusChain(), "the Sort pill")
+            tests.scene.answer(m.browsed(), empty)
+            m.assertTrue(status.visible, "no filter and no letter: no probe")
+            m.assertEqual([status.message, status.action], ["This library is empty", ""])
+        end sub
+
+        @it("has ApiTask read the saved sort and filters, the grid waiting for them")
+        sub _()
+            probe = m.opened(libraryTab.mode.BROWSE, m.profiled())
+            read = m.prefsSent("load")
+            m.assertNotInvalid(read, "ApiTask reads the registry, not the render thread")
+            m.assertEqual(read.request.key, libraryPrefs.key("https://silo.example", "p1", "12"))
+            m.assertInvalid(m.browsed(), "the grid waits for the saved choice")
+            m.assertTrue(probe.findNode("spinner").running)
+            saved = libraryFilters.empty({ field: "year", descending: true })
+            libraryFilters.toggle(saved, "genre", "Crime")
+            m.answerPrefs(read, { preserve: true, record: libraryFilters.saved(saved) })
+            query = m.browsed().request.query
+            m.assertEqual([query.sort, query.groups], ["-year", { json: libraryFilters.query(saved).groups }])
+            m.assertEqual(probe.findNode("body").getChild(3).badge, 1)
+            count = tests.scene.sent().Count()
+            m.answerPrefs(read, { preserve: true, record: invalid })
+            m.assertEqual(tests.scene.sent().Count(), count, "an answer counts once")
+        end sub
+
+        @it("opens Filter pressed while the saved choice is read once it arrives, its draft the saved one")
+        sub _()
+            probe = m.opened(libraryTab.mode.BROWSE, m.profiled())
+            read = m.prefsSent("load")
+            filter = probe.findNode("body").getChild(3)
+            m.assertTrue(probe.callFunc("pressKey", "right"))
+            m.assertTrue(filter.isInFocusChain())
+            filter.activated = true
+            m.assertInvalid(m.child(probe, "FilterPanel"), "the panel waits for the saved choice")
+            saved = libraryFilters.empty(libraryTab.defaultSort())
+            libraryFilters.toggle(saved, "genre", "Crime")
+            m.answerPrefs(read, { preserve: true, record: libraryFilters.saved(saved) })
+            panel = m.child(probe, "FilterPanel")
+            m.assertNotInvalid(panel)
+            m.assertTrue(panel.isInFocusChain())
+            m.assertEqual(libraryFilters.selected(panel.selection, "genre"), ["Crime"])
+            count = tests.scene.sent().Count()
+            panel.applied = libraryFilters.copyOf(panel.selection)
+            m.assertEqual(tests.scene.sent().Count(), count, "Done without a change saves and reads nothing")
+        end sub
+
+        @it("keeps a sort chosen while the saved one is read, taking only Preserve from the answer")
+        sub _()
+            probe = m.opened(libraryTab.mode.BROWSE, m.profiled())
+            read = m.prefsSent("load")
+            body = probe.findNode("body")
+            body.getChild(1).activated = true
+            m.child(probe, "SortMenu").chosen = "year"
+            m.assertEqual(m.browsed().request.query.sort, "-year", "the viewer's choice reads at once")
+            m.assertNotInvalid(m.prefsSent("save"))
+            count = tests.scene.sent().Count()
+            saved = libraryFilters.empty(libraryTab.defaultSort())
+            libraryFilters.toggle(saved, "genre", "Crime")
+            m.answerPrefs(read, { preserve: false, record: libraryFilters.saved(saved) })
+            m.assertEqual(tests.scene.sent().Count(), count, "the older saved choice does not replace it")
+            m.assertEqual(body.getChild(3).badge, 0)
+            body.getChild(3).activated = true
+            m.assertFalse(m.child(probe, "FilterPanel").preserve, "Preserve as saved")
+        end sub
+
+        @it("drops a probe the next read replaced")
+        sub _()
+            probe = m.opened(libraryTab.mode.BROWSE)
+            rail = probe.findNode("body").getChild(2)
+            empty = { items: [], page: { next_cursor: invalid, has_more: false }, total: 0 }
+            rail.chosen = "Q"
+            tests.scene.answer(m.browsed(), empty)
+            stale = m.probed()
+            rail.chosen = "R"
+            tests.scene.answer(m.browsed(), empty)
+            current = m.probed()
+            m.assertFalse(current.handle.isSameNode(stale.handle))
+            tests.scene.answer(stale, empty)
+            status = probe.findNode("status")
+            m.assertFalse(status.visible, "the old probe says nothing about R")
+            tests.scene.answer(current, tests.catalogData.fixture("list_catalog_items_ok"))
+            m.assertEqual([status.visible, status.message], [true, "No titles match your filters"])
+        end sub
+
+        @it("gives the open panel the keys back when the page is shown again over it")
+        sub _()
+            probe = m.opened(libraryTab.mode.BROWSE)
+            filter = probe.findNode("body").getChild(3)
+            filter.activated = true
+            panel = m.child(probe, "FilterPanel")
+            ' A screen pushed over the open panel (the player of a shuffle
+            ' that started first) takes focus, then closes.
+            away = CreateObject("roSGNode", "Group")
+            m.top.appendChild(away)
+            away.setFocus(true)
+            probe.callFunc("onShow", { restore: invalid, first: false, refresh: false })
+            m.assertTrue(panel.isInFocusChain(), "the panel, not the Filter pill under it")
+            ' Focus left on the pill under the panel: a key gives the panel
+            ' focus back, so Back can close it.
+            filter.setFocus(true)
+            m.assertTrue(probe.callFunc("pressKey", "back"))
+            m.assertTrue(panel.isInFocusChain())
+            m.top.removeChild(away)
+        end sub
+
+        @describe("Shuffle (TVBrowseControlRow)")
+
+        @it("shows Shuffle after Filter once the server shuffles libraries, and plays the shuffle it starts")
+        sub _()
+            probe = m.opened(libraryTab.mode.BROWSE)
+            body = probe.findNode("body")
+            filter = body.getChild(3)
+            shuffle = body.getChild(4)
+            m.assertFalse(shuffle.visible, "until the server says it shuffles libraries")
+            m.answerShuffle(["library", "series"])
+            m.assertTrue(shuffle.visible)
+            m.assertEqual([shuffle.label, shuffle.translation], ["Shuffle", [filter.translation[0] + filter.drawnWidth + theme.library.PILL_GAP, theme.library.PILL_TOP]])
+            probe.callFunc("pressKey", "right")
+            probe.callFunc("pressKey", "right")
+            m.assertTrue(shuffle.isInFocusChain())
+            shuffle.activated = true
+            start = tests.scene.last("/api/v2/shuffles")
+            m.assertEqual([start.request.method, start.request.body], ["POST", { scope: { kind: "library", id: "12" } }])
+            m.assertEqual(shuffle.opacity, 0.6)
+            shuffle.activated = true
+            m.assertTrue(tests.scene.last("/api/v2/shuffles").handle.isSameNode(start.handle), "one start at a time")
+            body = { id: "s9", scope: { kind: "library", id: "12", title: "Movies" }, current: { content_id: "movie:heat-1995", type: "movie", title: "Heat" }, next: { content_id: "movie:ronin-1998", type: "movie", title: "Ronin" } }
+            tests.scene.answer(start, body)
+            m.assertEqual(shuffle.opacity, 1.0)
+            pushed = tests.scene.nav()
+            m.assertEqual([pushed[0].op, pushed[0].route], ["push", nav.route.PLAYER])
+            m.assertEqual([pushed[0].params.intent.contentId, pushed[0].params.intent.shuffle.id], ["movie:heat-1995", "s9"])
+        end sub
+
+        @it("hides Shuffle on a mixed library's tab and when the server does not shuffle libraries, and says why a start failed")
+        sub _()
+            probe = m.opened(libraryTab.mode.BROWSE)
+            m.answerShuffle(["series"])
+            m.assertFalse(probe.findNode("body").getChild(4).visible)
+            probe = CreateObject("roSGNode", "LibraryScreenProbe")
+            probe.entry = { id: "library", route: nav.route.LIBRARY, params: libraryTab.routeParams("movies", { id: "7", type: "mixed" }, libraryTab.mode.BROWSE) }
+            probe.owner = "library-2"
+            m.top.appendChild(probe)
+            probe.visible = true
+            probe.callFunc("onShow", { restore: invalid, first: true, refresh: false })
+            m.assertFalse(probe.findNode("body").getChild(4).visible, "a mixed library's Movies view")
+            probe = m.opened(libraryTab.mode.BROWSE)
+            m.answerShuffle(["library"])
+            shuffle = probe.findNode("body").getChild(4)
+            m.assertTrue(shuffle.visible)
+            shuffle.activated = true
+            tests.scene.refuse(tests.scene.last("/api/v2/shuffles"), 409)
+            m.assertEqual(tests.scene.notices(), ["Couldn't Shuffle. Nothing here can be played."])
+            m.assertEqual(tests.scene.nav().Count(), 0)
         end sub
     end class
 end namespace

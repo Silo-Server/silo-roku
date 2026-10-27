@@ -104,7 +104,8 @@ Browse:
 - Home built from the server's home sections, including the Continue Watching
   and Next Up rows the server provides;
 - Movies and Series library tabs, each with Recommended rows, a Browse
-  grid with sort and an alphabet rail, and read-only Collections pages;
+  grid with sort, filters, and an alphabet rail, and read-only Collections
+  pages;
 - search across movies, series, and episodes;
 - movie detail, and series detail with season and episode lists, cast, and
   recommendations;
@@ -144,6 +145,10 @@ Play:
   profile's recap and credits auto-skip (`playback.auto_skip_recap`,
   `playback.auto_skip_credits`);
 - Up Next near the end of every movie and episode, with autoplay and On Deck;
+- Shuffle of a library from Browse, and of a series or the season shown
+  from a series' More menu, when the server offers it
+  (`GET /api/v2/shuffles/capabilities`); Up Next offers the shuffle's
+  picks;
 - periodic and final progress reporting;
 - the profile's server-stored playback preferences (section 8.5).
 
@@ -169,9 +174,10 @@ item is built, tvOS first where both have it (section 5.1).
 
 Planned:
 
-- library filters and Shuffle (tvOS, Android TV);
-- Requests, Calendar, and the For You tab (tvOS, Android TV); Shuffle and
-  Requests show only when the server offers them;
+- Shuffle on a collection's page (tvOS, Android TV), when the server
+  offers it;
+- Requests, Calendar, and the For You tab (tvOS, Android TV); Requests show
+  only when the server offers them;
 - chapters, playback speed, and aspect in the player's Options (tvOS,
   Android TV);
 - a sleep timer in the video player (Android TV; tvOS sets one only in its
@@ -607,12 +613,16 @@ their existing HD/FHD assets.
   - On a mixed library, each section shows only the tab's type.
   - Within a session, a tab reopens the sub-page it last showed.
 - **Browse.**
-  - Page: the Sort pill at (80, 248), then the grid 32 px below it. The grid
-    has six columns of 260×390 posters, 40 px apart across and 60 px down.
+  - Page: the Sort pill at (80, 248), Filter 16 px after it and Shuffle 16
+    px after Filter (tvOS's `TVBrowseControlRow`), then the grid 32 px
+    below them. The grid has six columns of 260×390 posters, 40 px apart
+    across and 60 px down.
   - Captions: centred, 16 px below the poster, with the same two-line title
     and metadata treatment as Home. The vertical spacing includes both lines
     and their focus drop.
-  - Focus: entering Browse focuses Sort. Down goes to the first poster.
+  - Focus: entering Browse focuses Sort. Down from any pill goes to the
+    first poster, Up to the tab; Left and Right move along Sort, Filter,
+    and Shuffle, and Right from the last goes to the alphabet rail.
   - Sort pill: "Sort · Title A–Z", 24 px Medium, padding 22. At rest, a white
     7% fill and a 9% border. Focused, an `#EDEDED` fill with black text,
     scaled 1.04.
@@ -622,6 +632,65 @@ their existing HD/FHD assets.
     direction and arrow.
   - Sort options: Title, Date Added, Release Date, Year, Rating, Runtime, and
     Resolution. Choosing the active sort again reverses it.
+  - Filter pill: "Filter" in the Sort pill's style. While filters are set,
+    their number (facets with a value; HDR and Dolby Vision count once)
+    follows the label 10 px after it, 18 px Bold in a 26 px black 25%
+    capsule, and the pill rests at white 14% (tvOS's selected chrome).
+  - Filter panel (tvOS's `TVBrowseFilterPanel`): a centred 680×680 panel
+    over black 55%, in the menus' panel art with 22 px of padding. On top
+    the eyebrow (16 px SemiBold, letter-spaced, at 60%) and the title (34 px
+    SemiBold), then a divider with 12 px above and below. Rows are 56 px,
+    4 px apart, labels 24 px Regular 16 px in; a focused row fills
+    `#EDEDED`, radius 12, with black text and marks.
+    - The filter list ("FILTER BY" / "Filters"): the facets the library
+      offers, in tvOS's order, each with its value ("Any", the one chosen,
+      or "3 selected") at 68% and a chevron: Genre, Decade (2020s to
+      1960s), Watch Status (Unwatched, In Progress, Watched, Favorited,
+      Watchlist), Content Rating, Resolution, Dynamic Range (HDR, Dolby
+      Vision), Studio, Network, Country, Audio Language, Subtitle Language,
+      and Original Language. A facet whose values the server does not list
+      is left out; until `GET /api/v2/catalog/filters?library_id={id}`
+      answers, only Decade, Watch Status, and Dynamic Range show, and the
+      rest join the open panel as the answer lands. Then MATCH, "All
+      selected filters" and "Any selected filter" as radio rows; OPTIONS,
+      "Preserve sort & filters" (a box), "Reset filters" (dimmed and passed
+      over while nothing is set), and "Done".
+    - OK on a facet opens its values ("FILTER" / the facet's name): "All
+      filters", then "Clear <facet>" while it holds a value, then its
+      values, each with a radio mark, as the server lists them. OK toggles
+      a value; Watch Status holds one, the others any number. Left or Back
+      return to the filter list, on that facet.
+    - The panel edits a copy: Done, or Back from the filter list, sends a
+      changed choice, keeping the sort and letter, and focus returns to
+      Filter. Preserve takes effect at once. Reset filters clears every
+      facet and Match and moves to Done.
+  - Filters on the wire, as tvOS's `CatalogQueryBuilder` sends them: every
+    Browse read carries `match=all` or `any`, and with a filter `groups`,
+    the JSON of one group per facet, each value a rule and any of them
+    matching: `genre contains`; `studio`, `network`, `country`,
+    `content_rating`, `resolution`, `audio_language`, `subtitle_language`,
+    and `original_language is`; each decade a `year between [start,
+    start+9]` with numbers; HDR and Dolby Vision `hdr` and `dolby_vision is
+    true`; a watch status one rule (`watched is false` or `true`,
+    `in_progress`, `favorited`, or `in_watchlist is true`). Filters work
+    with the sort and the letter.
+  - Remembered, as tvOS's `BrowsePrefsStore`: the sort, the filters, and
+    Match for each server, profile, and library (a mixed library's Movies
+    and Series tabs apart) across launches while Preserve is on, which it
+    is until the viewer turns it off for that library; off forgets them.
+    The letter is not remembered. ApiTask reads and writes them, with
+    their JSON (assumption AG-382); Browse's first read waits for the saved
+    choice, and a sort or filter chosen before it arrives wins.
+  - Shuffle pill: "Shuffle", on a movie or series library (not a mixed
+    library's tab, whose shuffle would play both kinds) when
+    `GET /api/v2/shuffles/capabilities` answers `available`, not refused,
+    and lists `library`. OK sends `POST /api/v2/shuffles` with `{ scope: {
+    kind: "library", id } }`, then plays the shuffle's first pick from its
+    beginning in the player (section 5.7). While the start is out the pill
+    rests at 60% and a press does nothing; a refusal shows "Couldn't
+    Shuffle." with why ("Nothing here can be played." for 409, "This is no
+    longer available to shuffle." for 404, else "Couldn't start the
+    shuffle. Try again.") top centre for four seconds (5.9).
   - Paging: the next page loads when focus is within eight rows of the end
     (five rows while memory pressure keeps three pages, so a page read at one
     end does not drop rows the other end then reads again).
@@ -691,8 +760,12 @@ their existing HD/FHD assets.
   - Library: "{Library} is empty" / "Add media to this library on the server
     to see it here."
   - Browse: "This library is empty" / "There is nothing in this library yet."
-  - Browse with a letter that matches nothing: "No titles match your filters",
-    with Clear filters.
+  - Browse with filters or a letter that match nothing: the page first reads
+    one unfiltered item of the library (`limit=1`, `skip_total=true`, the
+    tab's type; tvOS's `BrowseEmptyReason`), the spinner showing meanwhile.
+    With none it says "This library is empty"; else, or when that read
+    fails, "No titles match your filters", with Clear filters, which clears
+    every filter and the letter, keeps the sort, and focuses Sort.
 
 ### 5.6 Search and detail
 
@@ -776,15 +849,27 @@ their existing HD/FHD assets.
     `PUT` or `DELETE /api/v2/watchlist/{id}`. It shows only when the server
     offers the lists (section 5.3).
   - More is a circle with three dots. OK opens its menu, the Versions
-    menu's popover with the title "MORE" and no check marks: Add to
-    Favorites or Remove from Favorites (only when the server offers the
-    lists), then on a movie Mark as Watched or Mark as Unwatched; on a
-    series Mark Series Watched or Unwatched, Mark Season Watched or
-    Unwatched for the season shown, and Mark Episode Watched or Unwatched
-    for the episode Play plays (5.9). The menu holds nothing else (5.9).
+    menu's popover with the title "MORE" and no check marks: on a series
+    first "Shuffle Season 2" (the season shown, named by its number even
+    when the server titles it, Specials by its title; once its episodes
+    are read, when two of them have a file and the server's shuffle
+    capability lists `season`) and "Shuffle Series" (when its seasons
+    count more than one episode and the capability lists `series`), as
+    tvOS's
+    `TVSeriesDetailView` leads with them; then Add to Favorites or Remove
+    from Favorites (only when the server offers the lists), then on a
+    movie Mark as Watched or Mark as Unwatched; on a series Mark Series
+    Watched or Unwatched, Mark Season Watched or Unwatched for the season
+    shown, and Mark Episode Watched or Unwatched for the episode Play plays
+    (5.9). The menu holds nothing else (5.9).
     Each row does what it said when the menu opened, even if a read that
     lands while it is open, such as the seasons read after a mark, turns
-    the state it names.
+    the state it names; Shuffle <season> shuffles the season it named.
+  - A Shuffle row starts a shuffle of the season (its content ID) or the
+    series as Browse's Shuffle pill does (section 5.5): one start at a
+    time, the first pick from its beginning, a refusal as a notice. The
+    page reads the shuffle capability when it opens unless a page before
+    it this session already did.
   - The flags come from the item's `user_state` (`in_watchlist`,
     `is_favorite`) and watched state (`user_data.played`, a season's counts
     of unplayed and watched episodes, an episode card's `played`). A change
@@ -1347,6 +1432,49 @@ Subtitles tab (criterion 4.8).
     then the row; Up from the row to the toggle, else the first button; Up
     from the toggle to Play Now.
   - The rest of the screen is black (5.9).
+- **Shuffle in the player**, as tvOS's `PlayerViewModel` plays one
+  (`PlayerShuffleState`). The player entry of a shuffle names it, and every
+  item it plays belongs to it until the viewer leaves the shuffle; each
+  plays from its beginning. In place of the next episode, Up Next offers
+  the shuffle's next item, through the same panel, countdown, and start
+  of the next item as any title; On Deck still shows in its row but never
+  becomes the pick, and OK on one of its cards leaves the shuffle (the
+  server deletes a shuffle left this way). After the first plan, and
+  each time the panel opens, the player reads the shuffle again
+  (`GET /api/v2/shuffles/{id}`): the server may replace a pick that can no
+  longer play, and 409 means nothing can, which shows "More To Watch" or
+  "Finished" with "Nothing else in this shuffle can play." An item counts
+  as played at its first frame.
+  - The panel adds, above the eyebrow, a 36 px white 10% capsule reading
+    "Shuffling Movies" ("Shuffling Severance · Season 1" for a season) at
+    78%; the eyebrow reads "UP NEXT AT RANDOM" with a pick and while one
+    loads ("Picking at random"); Pick Another, a 330 px pill (Keep
+    Watching's width, as on tvOS) 56 px after Play Now, the countdown ring
+    56 px after it; and Stop shuffling, the
+    toggle's style, 12 px after the toggle. A movie pick shows its release
+    date and runtime as an episode shows its air date and runtime.
+  - Play Now, the countdown, Play/Pause, and the phone's next-item command
+    first send `POST /api/v2/shuffles/{id}/advance` with the item that
+    played, then start the shuffle's new current item; Play Now and Pick
+    Another are dimmed and do nothing until it answers. A failed advance
+    leaves the panel open without a countdown and says "Couldn't continue
+    the shuffle." (nothing for 409). Keep Watching or Back while it is out,
+    from the panel or the remote's Back key, or a seek or scan from the
+    phone or voice, gives it up, and its late answer starts nothing.
+  - Pick Another (`POST /api/v2/shuffles/{id}/skip` with the pick shown)
+    stops the countdown until the answer, which starts it over with the
+    new pick; a failure says "Couldn't pick another." and keeps the pick.
+    While it is out, Pick Another stays lit and a repeat press does
+    nothing, and Play Now or Play/Pause still advances, giving it up (tvOS
+    disables Play Now only for an advance, `isStartingNextUp`).
+  - A failed action's line (white 70%) sits 12 px under Keep Watching and
+    Back, above the toggle, where tvOS puts `shuffleActionErrorText`.
+  - Stop shuffling sends `DELETE /api/v2/shuffles/{id}` without waiting and
+    closes the player. A shuffle's pages are not told which episode
+    played: Back returns to the page the shuffle started from as it was.
+  - One shuffle request is out at a time: an advance or Pick Another
+    replaces the one before and any read, and an answer counts only while
+    it is the one out and names the same shuffle.
 - **Resume.** The player never asks whether to resume. The detail page's
   Resume and Start Over buttons decide. Resume starts 7 seconds before the
   saved position, the default of the device-local
@@ -1514,10 +1642,14 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Library pages draw skeletons while they load | A centred 128 px spinner | One `Poster` instead of a placeholder per card on 512 MB devices |
 | On a mixed library, each Recommended section shows only the tab's type | Both tabs show every item of a mixed library's sections | Not built (AG-280): the server's section reads refuse a type, so the client would filter each section and refill it page by page, as tvOS does, which `BrowseRows`' loading and dropping of rows around focus does not yet support |
 | Collection groups appear as vertically stacked grids with uppercase headers | One group at a time, selected with a group pill and scrollable menu | Reuses the bounded Roku grid and keeps only one group's rendered cards active |
-| The Sort pill, with a swap icon, is the first item of the Browse grid and scrolls away with it | The pill stays above the grid, without the icon, and the grid keeps its focused row at the top (fixed focus) instead of scrolling the page | `MarkupGrid` has no full-width header item, and no icon art ships |
+| The Sort, Filter, and Shuffle pills, each with its icon, are the first item of the Browse grid and scroll away with it | The pills stay above the grid, without icons, and the grid keeps its focused row at the top (fixed focus) instead of scrolling the page | `MarkupGrid` has no full-width header item, and no icon art ships |
+| The filter panel's rows carry SF Symbols: chevrons, a cross on Clear, an arrow on Reset filters, and a check on Done | Its radio, box, and check marks are drawn art; the chevrons and Clear's cross are Inter's ‹, ›, and ×; Reset filters has no mark | No icon art ships for the rest, and the packaged Inter subset has those three glyphs (assumption AG-380) |
+| A filter set whose `groups` pass 32,768 characters goes to `POST /api/v2/catalog/query` | Every Browse read is a `GET` | A remote picks a value at a time; it takes hundreds of values to pass the limit (assumption AG-380) |
+| A shuffle that cannot start shows the alert "Couldn't Shuffle" with why | "Couldn't Shuffle." and why show top centre for four seconds | Roku's passive notice line needs no focus, as for a refused personal change (assumption AG-381) |
+| The Shuffle pill, Up Next's "Shuffling" badge, and Pick Another carry a shuffle symbol | Text only | No icon art ships for it |
 | The focused alphabet rail is a 96 px column the grid makes room for, its chips centred in it | The grid stays where it is under the rail, and the 38 px chips keep to the column's right edge (x 1850–1888), clear of the grid's last column | Reflowing the grid as focus enters the rail would lay out every card again |
 | Focus enters the rail at the letter nearest to where it was (the focus engine) | At the chosen letter, else All | Roku has no geometric focus engine; the chosen letter is where a viewer filtering by letter goes next |
-| A library tab opens the library chosen last, and Browse its last sort, across launches (tvOS and Android TV) | The library chosen last is remembered until the app closes; Browse opens sorted by Title, and keeps its sort and letter only while its page stays on the stack | The registry holds only the session and profiles (plan section 4.3) |
+| A library tab opens the library chosen last across launches (tvOS and Android TV) | The library chosen last is remembered until the app closes; Browse's sort and filters are remembered across launches, as on tvOS, and its letter only while its page stays on the stack | The session's registry section holds only the session and profiles (plan section 4.3); Browse's choices have a bounded section of their own (assumption AG-382) |
 | The Search keyboard is full screen, with a single row of results under it | A `DynamicMiniKeyboard` (a–z, 0–9, clear, space, delete, and voice) in a column on the left has focus when Search opens and stays on screen; the filter, count, and a grid of four 240×360 posters across fill a column to its right. Both columns start at y 232 | While a keyboard has focus, Roku OS draws a "Skip the remote. Use your phone." banner with a QR code over x 720–1920, y 0–203, and apps cannot turn it off; it covered the old top keyboard's text field (Ultra, OS 16.0.4). Roku draws `DynamicKeyboard` at its own size, which left room for most of one row of posters beneath it (AG-319) |
 | The keyboard's Search key runs the query and moves focus to the results (Android TV) | Play on the keyboard runs the query and moves focus to the results, or to the filter when there are none; from results still loading, focus goes to Retry if the search fails and back to the keyboard if nothing matches | Roku keyboards have no Search key |
 | While results load, Search shows only a spinner | The count line reads "Searching…" above the spinner | The audio guide reads it after the keyboard's own speech (plan section 4.9) |
@@ -1570,6 +1702,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Scrub previews come from the server's sprite sheets or, without them, from frames the player cuts from the stream | The server's sheets only; a title without them shows the time and "Previews aren't available for this title" | Roku apps cannot read frames from the `Video` node |
 | A sheet decodes at full size, and only the latest one stays decoded | A sheet decodes within 1600 px on each side (a default 300 px thumbnail at 160 px, drawn 320 px wide on the card and 480 px held); the sheet in use and the next one in the direction of travel stay loaded, the sheet in use alone on the low tier | Texture memory on 512 MB devices and sheet changes at 32× (plan sections 4.8 and 6.9; hardware test H20); the drawn size costs no texture |
 | The next episode's still fills the screen behind Up Next, dimmed, around the video | No still: the rest of the screen is black | Roku draws video beneath the UI, so a full-screen image would cover the shrunken video |
+| A shuffle's next pick that fails to start returns to Up Next with "Couldn't start the next pick. Try again or go back." | The player's failure screen shows, with Retry and Go Back, as for any next item | Roku starts the next item as a new session of the same player (assumption AG-100), whose failure screen serves every start (assumption AG-381) |
+| A shuffle plays every part of a multi-part item before moving on | A multi-part pick plays as its start plans it, from its beginning | The Roku player chains no parts on any start (assumption AG-381) |
 | The auto-play toggle shows with any pick | It is hidden, and nothing counts down, while Roku's autoplay setting is off | Plan section 6.10 (certification) |
 | Back on Finished (nothing to play) replays the end, as Keep Watching does | It leaves the player | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
 | Keep Watching after the end replays the last 10 s in the same session | It starts the item again 10 s before its end, as a new session | Roku's session has stopped by the time its video ends |
@@ -1587,7 +1721,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Watchlist's empty state says "Tap the bookmark icon on any item to add it here", Favorites' "Tap the heart icon on any item to add it here" | "Add titles from a detail page and they will appear here." and "Add favorites from a detail page and they will appear here." (the iOS words), with a Back button | A remote has no tap, and a page without the bar needs a way out from its empty state |
 | A card's context menu (press and hold) offers Mark as Watched, Favorites, and Watchlist; a Watchlist or Favorites page drops a card whose flag turns off. History offers no removal | Options (*) on a list page's card offers one row: Remove from Watchlist, Remove from Favorites, or Remove from History (`POST /api/v2/history/remove`, the card's item, which for a series covers its episodes) | Roku has no press and hold; the phase's scope is removal from the lists, including the server's History removal |
 | An episode card's context menu marks that episode watched or unwatched | More on a series page has Mark Episode Watched or Unwatched for the episode Play plays (the active one) | Roku's episode rail has no context menu; the action row already names that episode |
-| More also offers Find Trailers, Translate Description, Shuffle, Show Series Info, and Watch Party where they apply | Favorites and the watched rows only | Scope (sections 3.3 and 3.4); Find Trailers (`POST /api/v2/catalog/items/{id}/trailers/refresh`, offered by `GET /api/v2/capabilities/trailers`) fetches remote videos, which Roku leaves out (next row) |
+| More also offers Find Trailers, Translate Description, Show Series Info, and Watch Party where they apply | Shuffle, Favorites, and the watched rows only | Scope (sections 3.3 and 3.4); Find Trailers (`POST /api/v2/catalog/items/{id}/trailers/refresh`, offered by `GET /api/v2/capabilities/trailers`) fetches remote videos, which Roku leaves out (next row) |
 | Trailers & More also lists the item's remote trailers and clips (`videos`, YouTube only), captioned "YouTube" with YouTube's still, which open in the YouTube app; tvOS drops them when the app is not installed | Only the local extras, which play in Silo's player | Certification criterion 5.3 forbids opening another app, and the server gives a remote video only as its site and key (`ItemVideoInfo`), with no stream it hosts or relays (silo-server `3e2d306b2`; assumption AG-361) |
 | A theme fades in to 35% of the volume over 300 ms and fades out as it stops | It plays at the TV's volume and starts and stops at once | Roku's `Audio` node has no volume or gain field, only `mute` (AG-363) |
 | A theme pauses while the app is in the background and resumes on return | Pressing Home closes the app, and the theme with it | Roku keeps no app running in the background without Instant Resume, which this client does not use |
@@ -1595,7 +1729,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Play Theme Music and Loop Theme Music show whenever the server knows the settings, and Loop is disabled while Play is off | Both show only when `GET /api/v2/catalog/themes/capabilities` answers available, and Loop can be set while Play is off; each also offers Use profile setting | Section 3.3: Settings shows only what the client can use here, and Roku's Settings rows have no disabled state (assumption AG-364) |
 | Watchlist and Favorites always show (neither tvOS nor Android TV reads a capability) | They show only when `GET /api/v2/capabilities/personal-lists` answers `available` and `allowed`: the avatar rows, the Watchlist button, and More's Favorites row | The phase gates them on the server's capability (assumption AG-323); an older server without the document hides them |
 | A refused change shows the alert "Couldn't Update Item" / "Your change wasn't saved. Please try again."; an unanswered one is held until the viewer discards it | The change goes back and "Couldn't update item. Your change wasn't saved." shows top centre for four seconds; an unanswered write counts as refused and nothing is held | Roku's passive notice line needs no focus; no held-change list is kept (assumption AG-326) |
-| Filter and Shuffle; people, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
 
 ## 6. Application architecture
 
@@ -1846,8 +1980,12 @@ The first release consumes:
   pagination, and supported artwork widths. Only explicitly typed mixed-library
   views add `library_id` and `type=movie|series`; ordinary and untyped views
   preserve collection membership across libraries;
-- `GET /api/v2/catalog` for paginated browse, with `type`, `sort`, and
-  `name_prefix` for the alphabet rail;
+- `GET /api/v2/catalog` for paginated browse, with `type`, `sort`,
+  `name_prefix` for the alphabet rail, and `match` and `groups` for the
+  filters, and with `limit=1&skip_total=true` for whether a filtered
+  library that shows nothing is empty;
+- `GET /api/v2/catalog/filters?library_id={id}` for a library's filter
+  values;
 - `GET /api/v2/catalog` with `q` for search, using `type=video_with_episodes`
   when `GET /api/v2/catalog/search/capabilities` advertises it, and `video`
   otherwise;
@@ -1876,6 +2014,10 @@ The first release consumes:
   `/api/v2/favorites/{id}`; `POST /api/v2/history/remove` with one target;
 - `POST` and `DELETE /api/v2/watched/{id}` to mark a movie, episode,
   season, or series watched or unwatched;
+- `GET /api/v2/shuffles/capabilities` for whether and what Shuffle is
+  offered; `POST /api/v2/shuffles` to start one; `GET`, `DELETE`, and
+  `POST .../advance` and `.../skip` on `/api/v2/shuffles/{id}` in the
+  player (section 5.7);
 - `GET /api/v2/catalog/themes/capabilities` for whether theme music plays,
   and `POST /api/v2/catalog/items/{id}/themes/{theme_id}/playback` for a
   theme's grant, whose URL the Audio node plays (section 5.6).

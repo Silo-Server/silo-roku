@@ -1,0 +1,155 @@
+namespace tests
+
+    ' Shuffle (source/playback/shuffle.bs): its requests against the
+    ' contract, what ApiTask's map step makes of an answer, the capability,
+    ' and the player's shuffle state, as tvOS's APIv2Client+Shuffles,
+    ' ShuffleFeatureStore, and PlayerShuffleState have them.
+    @suite("playback shuffle")
+    class PlaybackShuffleTests extends rooibos.BaseTestSuite
+
+        ' A catalog item of the shuffle's: an episode or a movie.
+        function episode(n as Integer) as Object
+            return { content_id: "episode:severance-s01e0" + n.ToStr(), type: "episode", title: "Episode title " + n.ToStr(), series_id: "series:severance", series_title: "Severance", season_number: 1, episode_number: n, overview: "Mark is promoted.", runtime: 57, release_date: "2022-02-18", genres: [], keywords: [] }
+        end function
+
+        function movie() as Object
+            return { content_id: "movie:heat-1995", type: "movie", title: "Heat", overview: "A crew of thieves.", runtime: 170, release_date: "1995-12-15", genres: [], keywords: [] }
+        end function
+
+        function body(current as Object, nextItem as Object, scope = invalid as Dynamic) as Object
+            if scope = invalid then scope = { kind: "library", id: "12", title: "Movies" }
+            return { id: "s1", scope: scope, current: current, next: nextItem, created_at: "2026-10-27T01:00:00.000Z", updated_at: "2026-10-27T01:00:00.000Z" }
+        end function
+
+        ' What ApiTask posts for an answer to request.
+        function mapped(request as Object, body as Object) as Object
+            return catalog.map.apply(request, tests.catalogData.ok(body), tests.catalogData.words())
+        end function
+
+        ' Whether path fits an OpenAPI path template such as /a/{id}/b.
+        function fits(path as String, template as String) as Boolean
+            parts = path.Split("/")
+            pattern = template.Split("/")
+            if parts.Count() <> pattern.Count() then return false
+            for i = 0 to parts.Count() - 1
+                if Left(pattern[i], 1) = "{"
+                    if parts[i] = "" then return false
+                else if parts[i] <> pattern[i]
+                    return false
+                end if
+            end for
+            return true
+        end function
+
+        @describe("the server contract")
+
+        @it("sends each shuffle operation with its method and path, as the profile")
+        sub _()
+            operations = tests.catalogData.operations()
+            entries = [
+                ["getShuffleCapability", playback.shuffle.capabilityRequest()]
+                ["createShuffle", playback.shuffle.createRequest(playback.shuffle.SERIES, "series:severance")]
+                ["getShuffle", playback.shuffle.readRequest("s1")]
+                ["advanceShuffle", playback.shuffle.advanceRequest("s1", "movie:heat-1995")]
+                ["skipShuffleItem", playback.shuffle.skipRequest("s1", "episode:severance-s01e02")]
+                ["deleteShuffle", playback.shuffle.deleteRequest("s1")]
+            ]
+            for each entry in entries
+                operation = operations[entry[0]]
+                m.assertNotInvalid(operation, entry[0])
+                request = tests.catalogData.sent(entry[1])
+                m.assertNotInvalid(request, entry[0] + " cannot be sent")
+                m.assertEqual([request.method, request.auth], [operation.method, "profile"], entry[0])
+                m.assertTrue(m.fits(request.path, operation.path), request.path + " is not " + operation.path)
+                m.assertTrue(request.query.Count() = 0, entry[0] + " sends no query")
+            end for
+        end sub
+
+        @it("sends the golden bodies for a series shuffle, an advance, and Pick Another")
+        sub _()
+            for each entry in [["shuffle-create/series", playback.shuffle.createRequest("series", "series:severance")], ["shuffle-advance/movie", playback.shuffle.advanceRequest("s1", "movie:heat-1995")], ["shuffle-skip/episode", playback.shuffle.skipRequest("s1", "episode:severance-s01e02")]]
+                golden = tests.devices.loadJson("pkg:/tests/fixtures/golden/" + entry[0] + ".json")
+                m.assertEqual(entry[1].body, golden, "GOLDEN " + entry[0] + ".json " + FormatJson(entry[1].body))
+            end for
+        end sub
+
+        @describe("answers")
+
+        @it("offers a scope kind only while the server says available, not refused, and lists it")
+        sub _()
+            request = playback.shuffle.capabilityRequest()
+            known = m.mapped(request, { state: "available", allowed: true, scope_kinds: ["library", "series", "season"], revision: "r1" }).body
+            m.assertTrue(playback.shuffle.supports(known, "series"))
+            m.assertFalse(playback.shuffle.supports(known, "user_collection"))
+            for each body in [{ state: "available", allowed: false, scope_kinds: ["series"], revision: "r" }, { state: "disabled", allowed: true, scope_kinds: ["series"], revision: "r" }]
+                m.assertFalse(playback.shuffle.supports(m.mapped(request, body).body, "series"), FormatJson(body))
+            end for
+            m.assertFalse(playback.shuffle.supports(invalid, "series"), "before it is read")
+            m.assertFalse(m.mapped(request, { allowed: true }).ok, "no state")
+        end sub
+
+        @it("reads a shuffle's scope, current, and next, each with its Up Next card")
+        sub _()
+            body = m.body(m.episode(1), m.episode(2), { kind: "season", id: "season:severance-s01", title: "Season 1", parent_title: "Severance" })
+            result = m.mapped(playback.shuffle.readRequest("s1"), body)
+            m.assertTrue(result.ok)
+            shuffle = result.body
+            m.assertEqual([shuffle.id, shuffle.kind, shuffle.label], ["s1", "season", "Severance · Season 1"])
+            m.assertEqual([shuffle.current.itemId, shuffle.next.itemId], ["episode:severance-s01e01", "episode:severance-s01e02"])
+            pick = shuffle.next
+            m.assertEqual([pick.seriesTitle, pick.seasonNumber, pick.type], ["Severance", 1, "episode"])
+            card = pick.card
+            m.assertEqual([card.shape, card.title, card.episodeNum, card.synopsis], ["episode", "Episode title 2", 2, "Mark is promoted."])
+            m.assertEqual(card.captionDetail, catalog.cards.dateText("2022-02-18") + " · 57 min")
+            movie = m.mapped(playback.shuffle.createRequest("library", "12"), m.body(m.movie(), m.movie())).body
+            m.assertEqual([movie.label, movie.current.seriesTitle, movie.current.card.itemType], ["Movies", "", "movie"])
+            m.assertFalse(m.mapped(playback.shuffle.readRequest("s1"), { id: "s1", scope: { kind: "library", id: "12", title: "Movies" }, current: m.movie() }).ok, "no next")
+        end sub
+
+        @it("words a refused start as tvOS does")
+        sub _()
+            m.assertEqual(playback.shuffle.failureKey(409), "shuffle.nothingToPlay")
+            m.assertEqual(playback.shuffle.failureKey(404), "shuffle.notFound")
+            m.assertEqual(playback.shuffle.failureKey(0), "shuffle.failed")
+            m.assertEqual(playback.shuffle.failureKey(500), "shuffle.failed")
+        end sub
+
+        @describe("the player's shuffle (PlayerShuffleState)")
+
+        @it("offers the next pick, none when the scope has only the item playing, and none once nothing can play")
+        sub _()
+            words = tests.catalogData.words()
+            state = playback.shuffle.create(playback.shuffle.fromBody(m.body(m.episode(1), m.episode(2)), words))
+            m.assertEqual(playback.shuffle.upNext(state).itemId, "episode:severance-s01e02")
+            m.assertTrue(playback.shuffle.canPickAnother(state))
+            m.assertEqual(playback.shuffle.advanceFrom(state), "episode:severance-s01e01", "before anything played, the current item")
+            alone = playback.shuffle.create(playback.shuffle.fromBody(m.body(m.movie(), m.movie()), words))
+            m.assertInvalid(playback.shuffle.upNext(alone))
+            m.assertFalse(playback.shuffle.canPickAnother(alone))
+            playback.shuffle.failed(state, 500)
+            m.assertNotInvalid(playback.shuffle.upNext(state), "another failure keeps the pick")
+            playback.shuffle.failed(state, 409)
+            m.assertInvalid(playback.shuffle.upNext(state))
+            playback.shuffle.apply(state, playback.shuffle.fromBody(m.body(m.episode(1), m.episode(3)), words))
+            m.assertEqual(playback.shuffle.upNext(state).itemId, "episode:severance-s01e03", "a newer answer clears it")
+        end sub
+
+        @it("names what played when advancing, and offers an advanced current that has not played yet")
+        sub _()
+            words = tests.catalogData.words()
+            state = playback.shuffle.create(playback.shuffle.fromBody(m.body(m.episode(1), m.episode(2)), words))
+            playback.shuffle.markPlayed(state, "episode:severance-s01e01")
+            playback.shuffle.apply(state, playback.shuffle.fromBody(m.body(m.episode(2), m.episode(3)), words))
+            m.assertEqual(playback.shuffle.advanceFrom(state), "episode:severance-s01e01", "a retry names the same item")
+            m.assertEqual(playback.shuffle.upNext(state).itemId, "episode:severance-s01e02", "its load failed: it still plays next")
+            m.assertFalse(playback.shuffle.canPickAnother(state), "Pick Another replaces only the announced next")
+            playback.shuffle.markPlayed(state, "episode:severance-s01e02")
+            m.assertEqual(playback.shuffle.upNext(state).itemId, "episode:severance-s01e03")
+            m.assertTrue(playback.shuffle.canPickAnother(state))
+            other = playback.shuffle.fromBody(m.body(m.episode(4), m.episode(5)), words)
+            other.id = "s2"
+            playback.shuffle.apply(state, other)
+            m.assertEqual(state.shuffle.id, "s1", "another shuffle's answer is dropped")
+        end sub
+    end class
+end namespace

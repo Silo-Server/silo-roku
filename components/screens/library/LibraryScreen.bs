@@ -2,11 +2,14 @@ import "pkg:/components/screens/home/shell.bs"
 import "pkg:/components/theme/browse.bs"
 import "pkg:/components/theme/helpers.bs"
 import "pkg:/components/theme/library.bs"
+import "pkg:/components/views/shuffle.bs"
 import "pkg:/source/catalog/grid.bs"
 import "pkg:/source/catalog/requests.bs"
 import "pkg:/source/home/page.bs"
 import "pkg:/source/library/page.bs"
 import "pkg:/source/library/collections.bs"
+import "pkg:/source/library/filters.bs"
+import "pkg:/source/library/prefs.bs"
 import "pkg:/source/memory/policy.bs"
 import "pkg:/source/nav/client.bs"
 import "pkg:/source/nav/focus.bs"
@@ -15,6 +18,10 @@ import "pkg:/source/platform/client.bs"
 import "pkg:/source/platform/topics.bs"
 import "pkg:/source/util/i18n.bs"
 import "pkg:/source/util/values.bs"
+
+' Browse's saved choices go under an owner that is never released, so a
+' write the page sent lands after the page is gone.
+const PREFS_OWNER = "browsePrefs"
 
 sub init()
     shellInit()
@@ -34,9 +41,34 @@ sub init()
     m.mode = ""
     ' The libraryTab.zone focus is in, or goes to, in the content.
     m.zone = ""
-    ' Browse's sort and the rail's letter ("" for All).
+    ' Browse's sort and the rail's letter ("" for All), and its filters
+    ' (libraryFilters' selection; its sort is kept in m.sort).
     m.sort = libraryTab.defaultSort()
     m.letter = ""
+    m.filter = libraryFilters.empty(m.sort)
+    ' A rebuilt page's filters, which win over the saved ones.
+    m.filterRestored = false
+    ' The library's filter values once read (libraryFilters.vocabulary),
+    ' and the read while it is out.
+    m.vocab = invalid
+    m.vocabHandle = invalid
+    ' Preserve sort & filters for this library, and the registry entry
+    ' they are saved under (libraryPrefs); the entry's read while it is
+    ' out, whether the viewer changed the sort or filters, or Preserve,
+    ' since it went out, and whether the grid waits for it.
+    m.preserve = true
+    m.prefsKey = ""
+    m.prefsHandle = invalid
+    m.prefsChanged = false
+    m.preserveChanged = false
+    m.gridWaiting = false
+    ' Filter was pressed while the read could still change the selection.
+    m.panelWaiting = false
+    ' The probe that tells an empty library from filters that match
+    ' nothing, and why the grid is empty once known ("library" or
+    ' "filters"; "" while it is not).
+    m.probeHandle = invalid
+    m.emptyReason = ""
     ' A content focus key to restore once the library is known.
     m.pendingRestore = invalid
     ' Set when the player has closed, until the rows are read again.
@@ -48,7 +80,11 @@ sub init()
     m.grid = invalid
     m.pill = invalid
     m.rail = invalid
+    m.filterPill = invalid
+    m.shufflePill = invalid
     m.sortMenu = invalid
+    m.filterPanel = invalid
+    shuffleInit()
     m.collectionSections = []
     m.collectionGroup = 0
     m.collectionsHandle = invalid
@@ -95,7 +131,7 @@ function onMemoryLevel(event as Object) as Boolean
 end function
 
 function focusKey() as Dynamic
-    content = { zone: m.zone, sort: m.sort, letter: m.letter, group: m.collectionGroup, list: invalid }
+    content = { zone: m.zone, sort: m.sort, letter: m.letter, filter: libraryFilters.saved(m.filter), group: m.collectionGroup, list: invalid }
     if m.rows <> invalid then content.list = m.rows.callFunc("focusKey")
     if m.grid <> invalid then content.list = m.grid.callFunc("focusKey")
     return shellFocusKey(content)
@@ -109,6 +145,11 @@ sub readSaved(saved as Object)
     end if
     m.letter = util.text(saved.letter)
     if util.isNumber(saved.group) then m.collectionGroup = saved.group
+    restored = libraryFilters.restore(saved.filter, m.sort)
+    if restored <> invalid
+        m.filter = restored
+        m.filterRestored = true
+    end if
 end sub
 
 sub restoreContent(content as Object)
@@ -147,6 +188,7 @@ sub shellLibrariesKnown()
         m.library = resolved.library
         ' The empty state names the library once its name is known.
         if m.rows <> invalid and m.rows.state = "empty" then showRowsStatus()
+        showShufflePill()
     end if
 end sub
 
@@ -265,34 +307,74 @@ sub buildBrowse()
     end for
     m.rail.entries = entries
     m.rail.observeField("chosen", "onLetterChosen")
+    ' tvOS's Filter and Shuffle pills after Sort (placePills).
+    m.filterPill = m.body.createChild("SortPill")
+    m.filterPill.label = i18n.text("library.filterPill")
+    m.filterPill.observeField("activated", "openFilterPanel")
+    m.shufflePill = m.body.createChild("SortPill")
+    m.shufflePill.label = i18n.text("library.shufflePill")
+    m.shufflePill.spoken = m.shufflePill.label
+    m.shufflePill.visible = false
+    m.shufflePill.observeField("activated", "onShufflePill")
+    m.pill.observeField("drawnWidth", "placePills")
+    m.filterPill.observeField("drawnWidth", "placePills")
+    placePills()
+    loadPrefs()
+    showShufflePill()
+    shuffleRead()
+    readVocab()
     centre = [960, (theme.browse.GRID_TOP + 1080) \ 2]
     m.status.centre = centre
     m.spinner.centre = centre
     nav.textures.addView(m.textures, m.grid)
     platform.subscribe(m.top.owner, [platform.topic.MEMORY_LEVEL], "onMemoryLevel")
-    loadGrid()
+    ' The first read waits, spinning, for the saved sort and filters,
+    ' unless a rebuilt page brought its own.
+    if m.prefsHandle = invalid or m.filterRestored
+        loadGrid()
+    else
+        m.gridWaiting = true
+        m.spinner.running = true
+    end if
 end sub
 
-' Reads the grid from its first page for the sort and letter.
+' Reads the grid from its first page for the sort, letter, and filters.
 sub loadGrid()
+    m.gridWaiting = false
     name = i18n.text("catalog.sort." + libraryTab.sortKey(m.sort.field))
     direction = i18n.text("library.direction." + libraryTab.directionKey(m.sort))
     m.pill.label = i18n.text("library.sortPill", { name: name })
     m.pill.detail = direction
     m.pill.spoken = i18n.text("library.sortSpoken", { name: name, direction: direction })
+    count = libraryFilters.activeCount(m.filter)
+    m.filterPill.badge = count
+    m.filterPill.active = count > 0
+    m.filterPill.spoken = m.filterPill.label
+    if count > 0 then m.filterPill.spoken = i18n.text("library.filterSpoken", { count: count })
     m.rail.selected = m.letter
-    request = catalog.request.browse(libraryTab.browseOptions(m.kind, m.library, m.sort, m.letter), "", catalog.grid.PAGE_SIZE, m.lowTier)
+    cancelProbe()
+    m.emptyReason = ""
+    request = catalog.request.browse(libraryTab.browseOptions(m.kind, m.library, m.sort, m.letter, m.filter), "", catalog.grid.PAGE_SIZE, m.lowTier)
     m.grid.callFunc("load", { request: request, lowTier: m.lowTier })
 end sub
 
-' The spinner while the grid loads, then the grid, "This library is empty"
-' (or, for a letter, "No titles match your filters" with Clear filters), or
-' the error with Retry; focus in the content follows.
+' The spinner while the grid loads, then the grid, "This library is empty",
+' "No titles match your filters" with Clear filters, or the error with
+' Retry; focus in the content follows. An empty page with filters or a
+' letter waits, spinning, for the probe to say which (tvOS's
+' BrowseEmptyReason), so the wrong message never shows.
 sub onGridState()
     if m.mode = libraryTab.mode.COLLECTIONS then return
     state = m.grid.state
+    if state = "empty" and m.emptyReason = "" and not libraryFilters.needsProbe(m.filter, m.letter) then m.emptyReason = "library"
+    if state = "empty" and m.emptyReason = ""
+        m.status.visible = false
+        m.spinner.running = true
+        sendProbe()
+        return
+    end if
     m.spinner.running = state = "loading"
-    if state = "empty" and m.letter = ""
+    if state = "empty" and m.emptyReason = "library"
         showStatus("empty", i18n.text("library.empty"), i18n.text("library.emptyBody"), "")
     else if state = "empty"
         showStatus("empty", i18n.text("library.noMatches"), "", i18n.text("library.clearFilters"))
@@ -301,9 +383,46 @@ sub onGridState()
     else
         m.status.visible = false
     end if
-    if shellInContent() and m.zone <> libraryTab.zone.RAIL and m.zone <> libraryTab.zone.PILL then shellFocusContent()
+    if shellInContent() and m.zone <> libraryTab.zone.RAIL and not isPill(m.zone) then shellFocusContent()
     shellAnnounce(m.status)
     if state <> "loading" then m.top.ready = true
+end sub
+
+function isPill(zone as String) as Boolean
+    return zone = libraryTab.zone.PILL or zone = libraryTab.zone.FILTER or zone = libraryTab.zone.SHUFFLE
+end function
+
+' One probe at a time, for the read the grid shows: a newer read cancels
+' it (loadGrid), and its answer is dropped unless its handle is the one
+' out. A failed probe keeps Clear filters (libraryFilters.emptyReason).
+sub sendProbe()
+    if m.probeHandle <> invalid then return
+    m.probeHandle = api.newHandle(m.top.owner)
+    m.probeHandle.observeField("status", "onProbe")
+    api.send(libraryFilters.probeRequest(m.library.id, libraryTab.mediaType(m.kind, util.text(m.library.type))), m.probeHandle)
+end sub
+
+sub onProbe(event as Object)
+    handle = event.getRoSGNode()
+    if m.probeHandle = invalid or not m.probeHandle.isSameNode(handle) then return
+    m.probeHandle = invalid
+    m.emptyReason = libraryFilters.emptyReason(api.resultOf(handle))
+    if m.grid.state = "empty" then onGridState()
+end sub
+
+sub cancelProbe()
+    if m.probeHandle = invalid then return
+    api.cancel(m.probeHandle)
+    m.probeHandle = invalid
+end sub
+
+' Filter and Shuffle stand after Sort, PILL_GAP apart, as they move with
+' Sort's width.
+sub placePills()
+    if m.filterPill = invalid then return
+    x = theme.browse.GRID_SIDE + m.pill.drawnWidth + theme.library.PILL_GAP
+    m.filterPill.translation = [x, theme.library.PILL_TOP]
+    m.shufflePill.translation = [x + m.filterPill.drawnWidth + theme.library.PILL_GAP, theme.library.PILL_TOP]
 end sub
 
 sub openSortMenu()
@@ -339,6 +458,7 @@ sub onSortChosen()
     closeSortMenu()
     m.sort = chosen.sort
     m.letter = chosen.letter
+    savePrefs()
     loadGrid()
 end sub
 
@@ -349,6 +469,184 @@ sub closeSortMenu()
     m.sortMenu = invalid
     focusZone(libraryTab.zone.PILL)
     m.top.removeChild(menu)
+end sub
+
+' ---- Filters
+
+' The selection as tvOS saves it: the filters with Browse's sort.
+function currentSelection() as Object
+    out = libraryFilters.copyOf(m.filter)
+    out.sort = { field: m.sort.field, descending: m.sort.descending }
+    return out
+end function
+
+' The library's saved sort and filters, when Preserve is on for it and a
+' rebuilt page did not bring its own (tvOS's savedFilter). ApiTask reads
+' the registry and decodes them (libraryPrefs.loadRequest), so the
+' render thread does no JSON work. One read is out per entry; its
+' answer counts only while its handle is m.prefsHandle, and its
+' selection only while the viewer has not chosen a sort or filters
+' since it went out (savePrefs), its Preserve only while the viewer has
+' not toggled it, so the newer choice wins.
+sub loadPrefs()
+    session = api.session.current()
+    entryKey = ""
+    if session <> invalid and util.isObject(session.profile) then entryKey = libraryPrefs.key(util.text(session.origin), util.text(session.profile.id), m.library.id, libraryTab.prefsScope(m.kind, util.text(m.library.type)))
+    if m.prefsHandle <> invalid and entryKey = m.prefsKey then return
+    cancelPrefs()
+    m.prefsKey = entryKey
+    m.preserve = true
+    m.prefsChanged = false
+    m.preserveChanged = false
+    if entryKey = "" then return
+    m.prefsHandle = api.newHandle(m.top.owner)
+    m.prefsHandle.observeField("status", "onPrefs")
+    api.send(libraryPrefs.loadRequest(entryKey, libraryTab.defaultSort()), m.prefsHandle)
+end sub
+
+' The entry's Preserve, for the page and an open panel, and its saved
+' selection, read again into the grid; a failed read keeps Preserve on
+' and the selection the page has, as with nothing saved.
+sub onPrefs(event as Object)
+    handle = event.getRoSGNode()
+    if m.prefsHandle = invalid or not m.prefsHandle.isSameNode(handle) then return
+    m.prefsHandle = invalid
+    answer = libraryPrefs.loaded(api.resultOf(handle), libraryTab.defaultSort())
+    reload = m.gridWaiting
+    if answer <> invalid
+        if not m.preserveChanged then m.preserve = answer.preserve
+        if m.filterPanel <> invalid then m.filterPanel.preserve = m.preserve
+        if answer.selection <> invalid and not m.filterRestored and not m.prefsChanged
+            m.sort = answer.selection.sort
+            m.filter = answer.selection
+            reload = true
+        end if
+    end if
+    if reload and m.grid <> invalid then loadGrid()
+    if m.panelWaiting
+        m.panelWaiting = false
+        if m.filterPill <> invalid and m.filterPill.isInFocusChain() then openFilterPanel()
+    end if
+end sub
+
+sub cancelPrefs()
+    if m.prefsHandle = invalid then return
+    api.cancel(m.prefsHandle)
+    m.prefsHandle = invalid
+end sub
+
+' The library's choice saved by ApiTask, the registry's one writer; the
+' write outlives the page. Each viewer's change of sort or filters comes
+' here, so a read still out no longer replaces it.
+sub savePrefs()
+    m.prefsChanged = true
+    if m.prefsKey = "" then return
+    api.send(libraryPrefs.saveRequest(m.prefsKey, currentSelection()), api.newHandle(PREFS_OWNER))
+end sub
+
+' The library's filter values, read once for the page (tvOS's
+' FacetLoader). A read that fails is tried again when the panel opens.
+sub readVocab()
+    if m.vocab <> invalid or m.vocabHandle <> invalid then return
+    m.vocabHandle = api.newHandle(m.top.owner)
+    m.vocabHandle.observeField("status", "onVocab")
+    api.send(catalog.request.filters(m.library.id), m.vocabHandle)
+end sub
+
+sub onVocab(event as Object)
+    handle = event.getRoSGNode()
+    if m.vocabHandle = invalid or not m.vocabHandle.isSameNode(handle) then return
+    m.vocabHandle = invalid
+    result = api.resultOf(handle)
+    if result = invalid or not util.isTrue(result.ok) or not util.isObject(result.body) then return
+    m.vocab = result.body
+    if m.filterPanel <> invalid then m.filterPanel.vocab = m.vocab
+end sub
+
+' tvOS's TVBrowseFilterPanel over the page; the values it has, or none
+' yet, which a late read fills in. While the saved choice's read could
+' still replace the selection, the panel waits for it (onPrefs), so its
+' draft never starts from a selection the answer replaces; it opens then
+' if focus is still on Filter.
+sub openFilterPanel()
+    if m.filterPanel <> invalid then return
+    if m.prefsHandle <> invalid and not m.filterRestored and not m.prefsChanged
+        m.panelWaiting = true
+        return
+    end if
+    readVocab()
+    panel = m.top.createChild("FilterPanel")
+    vocab = m.vocab
+    if vocab = invalid then vocab = {}
+    panel.setFields({ vocab: vocab, preserve: m.preserve })
+    panel.selection = currentSelection()
+    panel.observeField("applied", "onFilterApplied")
+    panel.observeField("preserveToggled", "onPreserveToggled")
+    m.filterPanel = panel
+    panel.setFocus(true)
+end sub
+
+' Done, or Back from the filter list: a changed selection is saved and
+' read; focus goes back to the Filter pill (tvOS returns it to the row).
+sub onFilterApplied()
+    panel = m.filterPanel
+    if panel = invalid then return
+    applied = panel.applied
+    closeFilterPanel()
+    if not util.isObject(applied) or not util.isObject(applied.sort) then return
+    applied.sort = { field: m.sort.field, descending: m.sort.descending }
+    if libraryFilters.same(applied, currentSelection()) then return
+    m.filter = applied
+    savePrefs()
+    loadGrid()
+end sub
+
+' tvOS's preserveRow takes effect at once: off forgets the saved
+' selection, on saves the page's.
+sub onPreserveToggled()
+    if m.filterPanel = invalid then return
+    m.preserve = m.filterPanel.preserve
+    m.preserveChanged = true
+    if m.prefsKey <> "" then api.send(libraryPrefs.preserveRequest(m.prefsKey, m.preserve, currentSelection()), api.newHandle(PREFS_OWNER))
+end sub
+
+sub closeFilterPanel()
+    if m.filterPanel = invalid then return
+    panel = m.filterPanel
+    m.filterPanel = invalid
+    focusZone(libraryTab.zone.FILTER)
+    m.top.removeChild(panel)
+end sub
+
+' ---- Shuffle
+
+' tvOS's canShuffle: a movie or series library, not a mixed library's
+' view, when the server offers library shuffles.
+sub showShufflePill()
+    if m.shufflePill = invalid then return
+    shown = libraryTab.offersShuffle(util.text(m.library.type)) and shuffleSupports(playback.shuffle.LIBRARY)
+    if shown = m.shufflePill.visible then return
+    m.shufflePill.visible = shown
+    if not shown and m.zone = libraryTab.zone.SHUFFLE
+        m.zone = libraryTab.zone.FILTER
+        if shellInContent() then shellFocusContent()
+    end if
+end sub
+
+sub shuffleCapabilityChanged()
+    showShufflePill()
+end sub
+
+' The pill stays focusable while a shuffle starts (tvOS keeps it enabled,
+' at 60%, and ignores a repeat press).
+sub shuffleStarting(starting as Boolean)
+    if m.shufflePill = invalid then return
+    m.shufflePill.opacity = 1.0
+    if starting then m.shufflePill.opacity = 0.6
+end sub
+
+sub onShufflePill()
+    shuffleStart(playback.shuffle.LIBRARY, m.library.id)
 end sub
 
 ' The grid starts over on the letter; focus stays on the rail.
@@ -484,8 +782,9 @@ sub showStatus(kind as String, message as String, detail as String, action as St
     m.status.visible = true
 end sub
 
-' Retry, or Clear filters, which drops the letter and returns focus to the
-' Sort pill, as on tvOS.
+' Retry, or Clear filters, which drops the letter and every filter, keeps
+' the sort, and returns focus to the Sort pill, as tvOS's clearFilters
+' does.
 sub onStatusActivated()
     if m.mode = libraryTab.mode.COLLECTIONS
         loadCollections()
@@ -493,8 +792,12 @@ sub onStatusActivated()
     end if
     if m.rows <> invalid then loadRows()
     if m.grid = invalid then return
-    clearing = m.grid.state = "empty" and m.letter <> ""
-    if clearing then m.letter = ""
+    clearing = m.grid.state = "empty" and m.emptyReason = "filters"
+    if clearing
+        m.letter = ""
+        libraryFilters.reset(m.filter)
+        savePrefs()
+    end if
     loadGrid()
     if clearing then focusZone(libraryTab.zone.PILL)
 end sub
@@ -516,15 +819,21 @@ function zoneNode(zone as String) as Dynamic
     if zone = libraryTab.zone.ROWS and m.rows <> invalid and (m.rows.state = "ready" or m.rows.state = "loading") then return m.rows
     if zone = libraryTab.zone.GRID and m.grid <> invalid and (m.grid.state = "ready" or m.grid.state = "loading") then return m.grid
     if zone = libraryTab.zone.PILL then return m.pill
+    if zone = libraryTab.zone.FILTER and m.filterPill <> invalid then return m.filterPill
+    if zone = libraryTab.zone.SHUFFLE and m.shufflePill <> invalid and m.shufflePill.visible then return m.shufflePill
     if zone = libraryTab.zone.RAIL and m.rail <> invalid then return m.rail
     if zone = libraryTab.zone.STATUS and m.status.visible and m.status.action <> "" then return m.status
     return invalid
 end function
 
-' The node in the content that takes focus (the shell's hook): the zone
-' focus is in or was sent to, else the next in libraryTab.zoneOrder.
+' The node in the content that takes focus (the shell's hook): the filter
+' panel or sort menu while one is open, so a page shown again over one
+' (the player closing, say) gives it the keys back; else the zone focus is
+' in or was sent to, else the next in libraryTab.zoneOrder.
 function shellContent() as Dynamic
     if m.library = invalid then return invalid
+    if m.filterPanel <> invalid then return m.filterPanel
+    if m.sortMenu <> invalid then return m.sortMenu
     for each zone in libraryTab.zoneOrder(m.mode, m.zone)
         node = zoneNode(zone)
         if node <> invalid
@@ -552,15 +861,22 @@ sub shellToTop()
 end sub
 
 function pageState() as Object
-    return { mode: m.mode, gridItems: zoneNode(libraryTab.zone.GRID) <> invalid, rail: zoneNode(libraryTab.zone.RAIL) <> invalid, status: zoneNode(libraryTab.zone.STATUS) <> invalid }
+    return { mode: m.mode, gridItems: zoneNode(libraryTab.zone.GRID) <> invalid, rail: zoneNode(libraryTab.zone.RAIL) <> invalid, status: zoneNode(libraryTab.zone.STATUS) <> invalid, filter: zoneNode(libraryTab.zone.FILTER) <> invalid, shuffle: zoneNode(libraryTab.zone.SHUFFLE) <> invalid }
 end function
 
 ' Keys the content left unhandled move between its zones
 ' (libraryTab.nextZone); the bar's and the menus' go to the shell, and so
 ' does Back from anywhere in the content, the rail included (as on tvOS).
-' The sort menu keeps every key, and Back closes it.
+' The sort menu keeps every key, and Back closes it; the filter panel
+' keeps every key and closes itself. A key that reaches the page while
+' the panel is open but unfocused gives the panel focus back, so it can
+' never be left open with nothing able to close it.
 function onKeyEvent(key as String, press as Boolean) as Boolean
     if not press then return false
+    if m.filterPanel <> invalid
+        if not m.filterPanel.isInFocusChain() then m.filterPanel.setFocus(true)
+        return true
+    end if
     if m.sortMenu <> invalid
         if key = "back" then closeSortMenu()
         return true

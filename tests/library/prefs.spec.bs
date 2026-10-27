@@ -1,0 +1,112 @@
+namespace tests
+
+    ' Browse's remembered sort and filters (source/library/prefs.bs), as
+    ' tvOS's BrowsePrefsStore keeps them, in a registry section of the
+    ' test's own that each case empties.
+    @suite("library prefs")
+    class LibraryPrefsTests extends rooibos.BaseTestSuite
+
+        function store() as Object
+            return CreateObject("roRegistrySection", "silo.browse.test")
+        end function
+
+        protected override sub beforeEach()
+            store = m.store()
+            for each key in store.GetKeyList()
+                store.Delete(key)
+            end for
+            store.Flush()
+        end sub
+
+        function selection(genre as String) as Object
+            state = libraryFilters.empty({ field: "year", descending: true })
+            libraryFilters.toggle(state, "genre", genre)
+            return state
+        end function
+
+        @describe("BrowsePrefsStore")
+
+        @it("keys an entry by server, profile, library, and a mixed library's tab, naming none of them")
+        sub _()
+            key = libraryPrefs.key("https://media.example.com", "3", "12")
+            m.assertEqual(Left(key, 1), "b")
+            m.assertEqual(Len(key), 41)
+            m.assertEqual(Instr(1, key, "media"), 0)
+            m.assertEqual(key, libraryPrefs.key("https://media.example.com", "3", "12"))
+            for each other in [libraryPrefs.key("https://other.example.com", "3", "12"), libraryPrefs.key("https://media.example.com", "4", "12"), libraryPrefs.key("https://media.example.com", "3", "13"), libraryPrefs.key("https://media.example.com", "3", "12", "movie")]
+                m.assertNotEqual(other, key)
+            end for
+            m.assertEqual(libraryPrefs.key("https://media.example.com", "", "12"), "", "nothing is saved without a profile")
+        end sub
+
+        @it("saves and reads a library's sort and filters while Preserve is on, as it is by default")
+        sub _()
+            store = m.store()
+            key = libraryPrefs.key("https://media.example.com", "3", "12")
+            m.assertTrue(libraryPrefs.preserved(store, key))
+            m.assertInvalid(libraryPrefs.load(store, key, libraryTab.defaultSort()))
+            libraryPrefs.write(store, libraryPrefs.saveRequest(key, m.selection("Crime")))
+            back = libraryPrefs.load(store, key, libraryTab.defaultSort())
+            m.assertEqual(back.sort, { field: "year", descending: true })
+            m.assertEqual(libraryFilters.selected(back, "genre"), ["Crime"])
+            m.assertEqual(libraryPrefs.indexOf(store), [key])
+        end sub
+
+        @it("forgets the saved selection when Preserve goes off, and saves the page's when it comes back")
+        sub _()
+            store = m.store()
+            key = libraryPrefs.key("https://media.example.com", "3", "12")
+            libraryPrefs.write(store, libraryPrefs.saveRequest(key, m.selection("Crime")))
+            libraryPrefs.write(store, libraryPrefs.preserveRequest(key, false, m.selection("Crime")))
+            m.assertFalse(libraryPrefs.preserved(store, key))
+            m.assertInvalid(libraryPrefs.load(store, key, libraryTab.defaultSort()))
+            libraryPrefs.write(store, libraryPrefs.saveRequest(key, m.selection("Drama")))
+            m.assertFalse(store.Exists(key + ".s"), "nothing is saved while off")
+            libraryPrefs.write(store, libraryPrefs.preserveRequest(key, true, m.selection("Drama")))
+            m.assertTrue(libraryPrefs.preserved(store, key))
+            m.assertEqual(libraryFilters.selected(libraryPrefs.load(store, key, libraryTab.defaultSort()), "genre"), ["Drama"])
+        end sub
+
+        @it("reads an entry for the page in ApiTask, handing it the saved record, which the page restores without JSON")
+        sub _()
+            store = m.store()
+            key = libraryPrefs.key("https://media.example.com", "3", "12")
+            read = libraryPrefs.loadRequest(key, libraryTab.defaultSort())
+            m.assertEqual([read.storage, read.op, read.key], [libraryPrefs.OPERATION, "load", key])
+            m.assertEqual(libraryPrefs.carryOut(store, read), { preserve: true, record: invalid }, "nothing saved")
+            m.assertEqual(libraryPrefs.carryOut(store, libraryPrefs.saveRequest(key, m.selection("Crime"))), {}, "a write that wrote")
+            body = libraryPrefs.carryOut(store, read)
+            m.assertEqual(body, { preserve: true, record: libraryFilters.saved(m.selection("Crime")) })
+            back = libraryPrefs.loaded({ ok: true, status: 0, body: body }, libraryTab.defaultSort())
+            m.assertTrue(back.preserve)
+            m.assertEqual(back.selection.sort, { field: "year", descending: true })
+            m.assertEqual(libraryFilters.selected(back.selection, "genre"), ["Crime"])
+            libraryPrefs.carryOut(store, libraryPrefs.preserveRequest(key, false, m.selection("Crime")))
+            m.assertEqual(libraryPrefs.carryOut(store, read), { preserve: false, record: invalid })
+            m.assertInvalid(libraryPrefs.carryOut(store, libraryPrefs.saveRequest(key, m.selection("Drama"))), "a write Preserve refused")
+            m.assertInvalid(libraryPrefs.loaded({ ok: false, status: 0, body: invalid }, libraryTab.defaultSort()), "a failed read")
+            m.assertInvalid(libraryPrefs.loaded(invalid, libraryTab.defaultSort()))
+        end sub
+
+        @it("lets the entries used longest ago go once the section passes its budget")
+        sub _()
+            store = m.store()
+            big = libraryFilters.empty(libraryTab.defaultSort())
+            for i = 1 to 40
+                libraryFilters.toggle(big, "studio", "A studio with a long name " + i.ToStr())
+            end for
+            keys = []
+            for i = 1 to 12
+                key = libraryPrefs.key("https://media.example.com", "3", i.ToStr())
+                keys.Push(key)
+                libraryPrefs.write(store, libraryPrefs.saveRequest(key, big))
+            end for
+            index = libraryPrefs.indexOf(store)
+            m.assertEqual(index[0], keys[11], "the last saved first")
+            m.assertTrue(index.Count() < 12)
+            m.assertTrue(libraryPrefs.sizeOf(store, index) <= libraryPrefs.BUDGET_BYTES)
+            m.assertFalse(store.Exists(keys[0] + ".s"), "the oldest went")
+            m.assertNotInvalid(libraryPrefs.load(store, keys[11], libraryTab.defaultSort()))
+        end sub
+    end class
+end namespace

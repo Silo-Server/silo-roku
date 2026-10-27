@@ -1,0 +1,74 @@
+import "pkg:/source/library/filters.bs"
+import "pkg:/source/util/values.bs"
+
+' Browse's remembered sort and filters, as tvOS's BrowsePrefsStore keeps
+' them (spec section 5.5): per server, profile, and library, across
+' launches, while the panel's "Preserve sort & filters" is on, which it is
+' unless the viewer turns it off for that library; turning it off forgets
+' what was saved. The alphabet rail's letter is never saved.
+'
+' They live in their own registry section, SECTION, apart from the
+' session's (source/storage/registry.bs). ApiTask, the registry's one
+' writer (plan section 4.3), reads and writes it, and does the JSON work
+' (AGENTS.md: JSON in Tasks), in the order the page sends its operations
+' (loadRequest, saveRequest, preserveRequest; source/library/
+' prefsStore.bs carries them out). The page sends and gets plain
+' records: libraryFilters.saved's, and the read's answer (loaded). An
+' entry's key is a digest of the server origin, profile ID, and library
+' ID, so the section names no server; its values are "<key>.s", the
+' saved selection as JSON (libraryPrefs.encode), and "<key>.p", "0"
+' while Preserve is off. INDEX lists the keys, the one used last first;
+' past BUDGET_BYTES the oldest entries go (AG-382).
+namespace libraryPrefs
+    const SECTION = "silo.browse"
+    ' The ApiTask operation that writes it (api.send's storage member).
+    const OPERATION = "browsePrefs"
+    const INDEX = "index"
+    const BUDGET_BYTES = 8192
+
+    ' The entry key for a library of a server and profile, or "" when there
+    ' is no profile (tvOS saves nothing without one). scope is the media
+    ' type a mixed library's tab shows ("" otherwise), so its Movies and
+    ' Series views keep their own, as tvOS keys them.
+    function key(origin as String, profileId as String, libraryId as String, scope = "" as String) as String
+        if profileId = "" or libraryId = "" then return ""
+        name = origin + "|" + profileId + "|" + libraryId
+        if scope <> "" then name = name + "|type-" + scope
+        bytes = CreateObject("roByteArray")
+        bytes.FromAsciiString(name)
+        digest = CreateObject("roEVPDigest")
+        digest.Setup("sha1")
+        return "b" + LCase(digest.Process(bytes))
+    end function
+
+    ' ApiTask's read of a library's entry: whether Preserve is on, and the
+    ' saved selection (sort is Browse's default, for a saved sort no
+    ' longer offered); the answer's body is loaded's.
+    function loadRequest(entryKey as String, sort as Object) as Object
+        return { storage: OPERATION, op: "load", key: entryKey, sort: { field: sort.field, descending: sort.descending } }
+    end function
+
+    ' A read's answer (api.resultOf's) as { preserve, selection }:
+    ' selection a libraryFilters selection, from the saved record ApiTask
+    ' decoded (libraryFilters.restore, with sort Browse's default), or
+    ' invalid when Preserve is off or nothing is saved; invalid when the
+    ' read failed.
+    function loaded(result as Dynamic, sort as Object) as Dynamic
+        if not util.isObject(result) or not util.isTrue(result.ok) or not util.isObject(result.body) then return invalid
+        body = result.body
+        return { preserve: util.isTrue(body.preserve), selection: libraryFilters.restore(body.record, sort) }
+    end function
+
+    ' ApiTask's write of a library's choice, as libraryPrefs.write takes
+    ' it: the selection's record (libraryFilters.saved) while Preserve is
+    ' on (tvOS's saveState).
+    function saveRequest(entryKey as String, state as Object) as Object
+        return { storage: OPERATION, op: "save", key: entryKey, selection: libraryFilters.saved(state) }
+    end function
+
+    ' tvOS's setPreserveEnabled: off forgets the saved selection; on saves
+    ' state at once.
+    function preserveRequest(entryKey as String, enabled as Boolean, state as Object) as Object
+        return { storage: OPERATION, op: "preserve", key: entryKey, enabled: enabled, selection: libraryFilters.saved(state) }
+    end function
+end namespace

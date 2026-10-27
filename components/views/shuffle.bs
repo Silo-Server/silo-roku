@@ -1,0 +1,140 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/api/session.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/player.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/playback/shuffle.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Shuffle for the screens that offer it (render thread, spec sections 5.5
+' and 5.6): Browse's Shuffle pill and a series' More menu. One function
+' starts a shuffle from any of them (shuffleStart), as tvOS's
+' ShuffleLauncher does, and the player plays it through the same entry as
+' any title (nav.player.shuffle). The server's capability is kept in
+' m.global.shuffleCapability ({ key, value }) for the open server and
+' profile, read once for each (tvOS's ShuffleFeatureStore); a failed read
+' keeps what was known and is tried again by the next screen that needs it.
+'
+' A screen that imports this calls shuffleInit from init, and defines
+'
+'     shuffleCapabilityChanged()   the capability for this profile arrived
+'     shuffleStarting(starting)    a start went out (true) or settled
+'
+' Requests go under the screen's owner, so a screen released while a start
+' is out drops its answer; the server deletes an abandoned shuffle.
+
+' The owner of Stop shuffling's and an unwanted shuffle's DELETE, which
+' outlive the screen that sends them, as personal writes do.
+const SHUFFLE_OWNER = "shuffleState"
+
+sub shuffleInit()
+    m.shuffleHandle = invalid
+    m.shuffleCapabilityHandle = invalid
+end sub
+
+' The capability for the open server and profile (playback.shuffle
+' .capability's), or invalid before one is read.
+function shuffleKnown() as Dynamic
+    if not m.global.hasField("shuffleCapability") then return invalid
+    known = m.global.shuffleCapability
+    if not util.isObject(known) or util.text(known.key) <> shuffleKey() then return invalid
+    return known.value
+end function
+
+function shuffleSupports(kind as String) as Boolean
+    return playback.shuffle.supports(shuffleKnown(), kind)
+end function
+
+' Reads the capability unless it is known or a read is out.
+sub shuffleRead()
+    if shuffleKnown() <> invalid or m.shuffleCapabilityHandle <> invalid then return
+    m.shuffleCapabilityHandle = shuffleSend(playback.shuffle.capabilityRequest(), "onShuffleCapability")
+end sub
+
+' Sends request under the screen's owner, its answer to callback.
+function shuffleSend(request as Object, callback as String) as Object
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", callback)
+    api.send(request, handle)
+    return handle
+end function
+
+sub onShuffleCapability(event as Object)
+    handle = event.getRoSGNode()
+    if m.shuffleCapabilityHandle = invalid or not m.shuffleCapabilityHandle.isSameNode(handle) then return
+    m.shuffleCapabilityHandle = invalid
+    result = api.resultOf(handle)
+    if result = invalid or not util.isTrue(result.ok) or not util.isObject(result.body) then return
+    shuffleRemember(result.body)
+    shuffleCapabilityChanged()
+end sub
+
+sub shuffleRemember(value as Object)
+    entry = { key: shuffleKey(), value: value }
+    if m.global.hasField("shuffleCapability")
+        m.global.shuffleCapability = entry
+    else
+        m.global.addFields({ shuffleCapability: entry })
+    end if
+end sub
+
+function shuffleKey() as String
+    session = api.session.current()
+    if session = invalid then return ""
+    profileId = ""
+    if util.isObject(session.profile) then profileId = util.text(session.profile.id)
+    return playback.shuffle.capabilityKey(util.text(session.origin), profileId)
+end function
+
+' Starts a shuffle of the scope (kind, id) and, once the server has made
+' it, plays its first pick from its beginning. A press while one is
+' starting does nothing (tvOS's isStarting).
+sub shuffleStart(kind as String, id as String)
+    if m.shuffleHandle <> invalid or id = "" then return
+    m.shuffleHandle = shuffleSend(playback.shuffle.createRequest(kind, id), "onShuffleCreated")
+    shuffleStarting(true)
+end sub
+
+' The shuffle plays only if its screen is still the one shown; one that
+' lands under another screen is deleted, since nothing will play it. A
+' refusal says why, over every screen (tvOS's "Couldn't Shuffle" alert).
+sub onShuffleCreated(event as Object)
+    handle = event.getRoSGNode()
+    if m.shuffleHandle = invalid or not m.shuffleHandle.isSameNode(handle) then return
+    m.shuffleHandle = invalid
+    shuffleStarting(false)
+    result = api.resultOf(handle)
+    if result = invalid then return
+    if util.isTrue(result.ok) and util.isObject(result.body)
+        if not m.top.visible
+            shuffleDiscard(result.body.id)
+            return
+        end if
+        shufflePushPlayer({ intent: nav.player.shuffle(result.body) })
+        return
+    end if
+    status = 0
+    if util.isNumber(result.status) then status = Int(result.status)
+    shuffleNotice(i18n.text("shuffle.failedNotice", { title: i18n.text("shuffle.failedTitle"), message: i18n.text(playback.shuffle.failureKey(status)) }))
+end sub
+
+' The player plays the shuffle through the entry every title plays
+' through.
+sub shufflePushPlayer(params as Object)
+    nav.push(nav.route.PLAYER, params)
+end sub
+
+sub shuffleNotice(line as String)
+    m.top.getScene().callFunc("showNotice", line)
+end sub
+
+' Deletes a shuffle nothing will play, under an owner that outlives the
+' screen.
+sub shuffleDiscard(id as String)
+    api.send(playback.shuffle.deleteRequest(id), api.newHandle(SHUFFLE_OWNER))
+end sub
+
+function shuffleIsStarting() as Boolean
+    return m.shuffleHandle <> invalid
+end function

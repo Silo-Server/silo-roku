@@ -31,7 +31,8 @@ import sys
 
 REPOSITORY = "https://github.com/Silo-Server/silo-server"
 # Request bodies the client serializes; their $ref closure is kept.
-ROOTS = ["PlaybackStartBody", "PlaybackReplanBody", "PlaybackProgressBody", "PlaybackStopBody", "PlaybackRouteEventBody", "HistoryRemoveInputBody", "ThemePlaybackRequest"]
+ROOTS = ["PlaybackStartBody", "PlaybackReplanBody", "PlaybackProgressBody", "PlaybackStopBody", "PlaybackRouteEventBody", "HistoryRemoveInputBody", "ThemePlaybackRequest",
+         "CreateShuffleRequest", "AdvanceShuffleRequest", "SkipShuffleItemRequest", "CatalogQueryGroup"]
 OPERATIONS = {
     "getPlaybackCapabilities", "startPlayback", "replanPlayback", "updatePlaybackProgress", "stopPlayback", "reportPlaybackRouteEvent",
     # Server setup, sign-in, and profiles (source/auth/).
@@ -52,6 +53,8 @@ CATALOG = {
     "deleteFavorite", "listHistory", "removeHistoryEntries", "markWatched", "unmarkWatched",
     # Theme music on detail pages (source/playback/themeMusic.bs).
     "getThemeSongsCapability", "createThemeSongPlayback",
+    # Browse's filters (source/library/filters.bs) and Shuffle (source/playback/shuffle.bs).
+    "getCatalogFilters", "getShuffleCapability", "createShuffle", "getShuffle", "advanceShuffle", "skipShuffleItem", "deleteShuffle",
 }
 OPERATIONS |= CATALOG
 # The keys Settings edits (settings.supportedControls).

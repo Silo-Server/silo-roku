@@ -4,8 +4,8 @@ History page's removal body, against the server contract.
 
 Every tests/fixtures/golden/<kind>/*.json must be a valid body of its kind
 (GOLDEN below: start, replan, progress, stop, route-event, and
-history-remove and theme-playback, which are checked against their schemas
-only), checked three ways:
+history-remove, theme-playback, the shuffle bodies, and Browse's catalog
+groups, which are checked against their schemas only), checked three ways:
 
 1. The vendored schema subset (tests/fixtures/openapi/playback-v3.json, from
    scripts/sync-fixtures.sh): required members, additionalProperties, types,
@@ -56,6 +56,13 @@ GOLDEN = {
     "history-remove": "HistoryRemoveInputBody",
     # A theme's playback grant request (playback.themeMusic.grantRequest).
     "theme-playback": "ThemePlaybackRequest",
+    # Shuffle's writes (playback.shuffle's createRequest, advanceRequest, skipRequest).
+    "shuffle-create": "CreateShuffleRequest",
+    "shuffle-advance": "AdvanceShuffleRequest",
+    "shuffle-skip": "SkipShuffleItemRequest",
+    # Browse's filters as the groups parameter's JSON (libraryFilters.query):
+    # an array of the schema's groups.
+    "catalog-groups": "CatalogQueryGroup[]",
 }
 PLAYBACK = {"start", "replan", "progress", "stop", "route-event"}
 REQUESTS = {
@@ -65,6 +72,9 @@ REQUESTS = {
     "stopPlayback": "PlaybackStopBody",
     "reportPlaybackRouteEvent": "PlaybackRouteEventBody",
     "createThemeSongPlayback": "ThemePlaybackRequest",
+    "createShuffle": "CreateShuffleRequest",
+    "advanceShuffle": "AdvanceShuffleRequest",
+    "skipShuffleItem": "SkipShuffleItemRequest",
 }
 # Keywords the walker checks, and ones that only document a schema (format
 # adds nothing here: every int64 and double member also has a type).
@@ -368,9 +378,16 @@ def client_problems(body):
     return errors
 
 
+def root(name):
+    """The schema a GOLDEN name stands for: a component, or "X[]" for an array of X."""
+    if name.endswith("[]"):
+        return {"type": "array", "items": {"$ref": f"#/components/schemas/{name[:-2]}"}}
+    return {"$ref": f"#/components/schemas/{name}"}
+
+
 def problems(body, kind):
     errors = []
-    walk({"$ref": f"#/components/schemas/{GOLDEN[kind]}"}, body, kind, errors)
+    walk(root(GOLDEN[kind]), body, kind, errors)
     if errors or kind not in PLAYBACK:
         return errors
     if kind not in ("start", "replan"):

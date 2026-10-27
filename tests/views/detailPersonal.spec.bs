@@ -156,6 +156,84 @@ namespace tests
             m.assertEqual([writes[2].request.method, writes[2].request.path], ["POST", "/api/v2/watched/series:show"])
         end sub
 
+        @describe("Shuffle (TVSeriesDetailView)")
+
+        @it("leads a series' More with Shuffle Season and Shuffle Series when the server shuffles them, and plays the shuffle")
+        sub _()
+            m.global.shuffleCapability = { key: "", value: { available: true, kinds: ["series", "season"] } }
+            probe = m.opened({ itemId: "series:show" })
+            m.answer(probe, 0, m.series())
+            m.answer(probe, 1, { items: [{ content_id: "season:s1", season_number: 1, title: "", episode_count: 2, user_data: { unplayed_count: 2 } }, { content_id: "season:s2", season_number: 2, title: "", episode_count: 3, user_data: { unplayed_count: 3 } }] })
+            episodes = m.episodes(1, 2)
+            for each item in episodes.items
+                item.files = [{ file_id: "1", resolution: "1080p", hdr: false, file_size: 1 }]
+            end for
+            m.answer(probe, 2, episodes)
+            m.assertEqual(m.moreTitles(probe), ["Shuffle Season 1", "Shuffle Series", "Add to Favorites", "Mark Series Watched", "Mark Season Watched", "Mark Episode Watched"])
+            probe.findNode("picker").picked = catalog.more.SHUFFLE_SERIES
+            sent = probe.callFunc("shuffleRequests")
+            m.assertEqual(sent.Count(), 1)
+            m.assertEqual([sent[0].request.method, sent[0].request.path, sent[0].request.body], ["POST", "/api/v2/shuffles", { scope: { kind: "series", id: "series:show" } }])
+            probe.findNode("picker").picked = catalog.more.SHUFFLE_SERIES
+            m.assertEqual(probe.callFunc("shuffleRequests").Count(), 1, "a press while one starts does nothing")
+            body = { id: "s1", scope: { kind: "series", id: "series:show", title: "Show" }, current: { content_id: "episode:s2e1", type: "episode", title: "One", series_title: "Show", season_number: 2, episode_number: 1 }, next: { content_id: "episode:s1e2", type: "episode", title: "Two", series_title: "Show", season_number: 1, episode_number: 2 } }
+            result = catalog.map.apply(sent[0].request, tests.catalogData.ok(body), tests.catalogData.words())
+            sent[0].handle.result = result
+            sent[0].handle.status = "ok"
+            wanted = probe.pushedPlayer.intent
+            m.assertEqual([wanted.contentId, wanted.startPositionRule, wanted.shuffle.id, wanted.shuffle.label], ["episode:s2e1", nav.player.START_OVER, "s1", "Show"])
+        end sub
+
+        @it("shuffles the season More named when it opened, with a seasons read landing meanwhile")
+        sub _()
+            m.global.shuffleCapability = { key: "", value: { available: true, kinds: ["series", "season"] } }
+            probe = m.opened({ itemId: "series:show" })
+            m.answer(probe, 0, m.series())
+            m.answer(probe, 1, { items: [{ content_id: "season:s1", season_number: 1, title: "", episode_count: 2, user_data: { unplayed_count: 2 } }, { content_id: "season:s2", season_number: 2, title: "", episode_count: 3, user_data: { unplayed_count: 3 } }] })
+            episodes = m.episodes(1, 2)
+            for each item in episodes.items
+                item.files = [{ file_id: "1", resolution: "1080p", hdr: false, file_size: 1 }]
+            end for
+            m.answer(probe, 2, episodes)
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.EPISODE_WATCHED
+            probe.callFunc("landPersonal", 0, m.ok())
+            seasons = m.sentIndex(probe, "rollups", "/api/v2/catalog/series/series:show/seasons")
+            ' More opens before the seasons read lands.
+            m.assertEqual(m.moreTitles(probe)[0], "Shuffle Season 1")
+            m.answer(probe, seasons, { items: [{ content_id: "season:s9", season_number: 9, title: "", episode_count: 1, user_data: { unplayed_count: 1 } }] })
+            probe.findNode("picker").picked = catalog.more.SHUFFLE_SEASON
+            sent = probe.callFunc("shuffleRequests")
+            m.assertEqual(sent.Count(), 1)
+            m.assertEqual(sent[0].request.body, { scope: { kind: "season", id: "season:s1" } }, "the season the row named")
+        end sub
+
+        @it("offers no season shuffle for a season without two episodes that have a file, and says why a start was refused")
+        sub _()
+            m.global.shuffleCapability = { key: "", value: { available: true, kinds: ["series", "season"] } }
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            m.assertEqual(m.moreTitles(probe)[0], "Add to Favorites", "no file, no episode count: neither shuffle")
+            m.global.shuffleCapability = { key: "", value: { available: true, kinds: ["season"] } }
+            probe2 = m.opened({ itemId: "series:show" })
+            m.answer(probe2, 0, m.series())
+            m.answer(probe2, 1, { items: [{ content_id: "season:s1", season_number: 1, title: "", episode_count: 4 }] })
+            episodes = m.episodes(1, 2)
+            episodes.items[0].files = [{ file_id: "1", resolution: "1080p", hdr: false, file_size: 1 }]
+            episodes.items[1].files = [{ file_id: "2", resolution: "1080p", hdr: false, file_size: 1 }]
+            m.answer(probe2, 2, episodes)
+            m.assertEqual(m.moreTitles(probe2)[0], "Shuffle Season 1", "the server shuffles seasons only")
+            m.assertNotEqual(m.moreTitles(probe2)[1], "Shuffle Series")
+            probe2.findNode("picker").picked = catalog.more.SHUFFLE_SEASON
+            sent = probe2.callFunc("shuffleRequests")
+            m.assertEqual(sent[0].request.body, { scope: { kind: "season", id: "season:s1" } })
+            sent[0].handle.result = { requestId: "r", ok: false, status: 409, headers: {}, body: invalid, error: { kind: "http" } }
+            sent[0].handle.status = "error"
+            m.assertInvalid(probe2.pushedPlayer)
+            m.assertEqual(probe2.callFunc("noticeCount"), 1, "one notice")
+        end sub
+
         @it("reads the seasons again after an episode's mark, for More's season and series rows")
         sub _()
             probe = m.opened({ itemId: "series:show" })

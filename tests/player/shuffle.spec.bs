@@ -1,0 +1,167 @@
+namespace tests
+
+    ' A shuffle in the player (spec section 5.7), through a PlayerProbe:
+    ' Up Next offers the server's pick, Pick Another replaces it, Play Now
+    ' advances the shuffle before the pick plays from its beginning, and
+    ' answers that come late or out of order change nothing, as tvOS's
+    ' PlayerViewModel orders them.
+    @suite("player shuffle")
+    class PlayerShuffleTests extends tests.PlayerCaptionsSuite
+
+        protected override sub afterEach()
+            for each child in m.top.getChildren(-1, 0)
+                if child.subtype() = "PlayerProbe" then m.top.removeChild(child)
+            end for
+        end sub
+
+        ' A shuffle playing movie:a with movie:b next, in the test scene
+        ' (tests/components/TestScene), so leaving the player reaches it.
+        function shuffling() as Object
+            tests.scene.reset()
+            node = m.playingOff()
+            m.top.appendChild(node)
+            view = node.callFunc("probeShuffle", { current: "movie:a", next: "movie:b", done: true })
+            m.assertEqual(view.pick, "movie:b", "the shuffle's next item is Up Next's pick")
+            m.assertEqual([view.requests[0].method, view.requests[0].path], ["GET", "/api/v2/shuffles/s1"], "and the shuffle is read again")
+            return node
+        end function
+
+        @describe("Up Next's picks")
+
+        @it("offers the re-read's pick, and opens Up Next at random with Pick Another")
+        sub _()
+            node = m.shuffling()
+            view = node.callFunc("probeShuffleAnswer", { index: 0, current: "movie:a", next: "movie:c" })
+            m.assertEqual(view.pick, "movie:c")
+            view = node.callFunc("probeShuffleUpNext", { type: "open" })
+            m.assertTrue(view.open)
+            m.assertEqual([view.label, view.canPickAnother, view.busy], ["Movies", true, false])
+            m.assertEqual(view.requests.Count(), 2, "opening reads the shuffle again")
+        end sub
+
+        @it("replaces the pick with Pick Another, dropping a read that was out, and starts the countdown over")
+        sub _()
+            node = m.shuffling()
+            node.callFunc("probeShuffleUpNext", { type: "open" })
+            view = node.callFunc("probeShuffleUpNext", { action: "pickAnother" })
+            skip = view.requests[view.requests.Count() - 1]
+            m.assertEqual([skip.method, skip.path, skip.body], ["POST", "/api/v2/shuffles/s1/skip", { next_content_id: "movie:b" }])
+            m.assertTrue(view.requests[1].cancelled, "the read out before it")
+            m.assertFalse(view.busy, "Play Now still plays while Pick Another is out, as on tvOS")
+            view = node.callFunc("probeShuffleAnswer", { index: 1, current: "movie:a", next: "movie:z" })
+            m.assertEqual(view.pick, "movie:b", "a read answered after Pick Another went out is dropped")
+            view = node.callFunc("probeShuffleAnswer", { index: view.requests.Count() - 1, current: "movie:a", next: "movie:d" })
+            m.assertEqual([view.pick, view.busy], ["movie:d", false])
+        end sub
+
+        @it("gives up a Pick Another still out when Play Now advances the shuffle, as tvOS's playNextShufflePick")
+        sub _()
+            node = m.shuffling()
+            node.callFunc("probeFirstFrame")
+            node.callFunc("probeShuffleUpNext", { type: "open" })
+            view = node.callFunc("probeShuffleUpNext", { action: "pickAnother" })
+            skip = view.requests.Count() - 1
+            view = node.callFunc("probeShuffleUpNext", { action: "playNow" })
+            m.assertTrue(view.requests[skip].cancelled, "the skip is given up")
+            advance = view.requests[view.requests.Count() - 1]
+            m.assertEqual([advance.method, advance.path], ["POST", "/api/v2/shuffles/s1/advance"])
+            m.assertTrue(view.busy)
+            view = node.callFunc("probeShuffleAnswer", { index: skip, current: "movie:a", next: "movie:z" })
+            m.assertTrue(view.busy, "the skip's late answer changes nothing")
+            view = node.callFunc("probeShuffleAnswer", { index: view.requests.Count() - 1, current: "movie:b", next: "movie:e" })
+            m.assertEqual(view.itemId, "movie:b")
+        end sub
+
+        @it("advances the shuffle on Play Now from the item that played, then plays the new current item from its beginning")
+        sub _()
+            node = m.shuffling()
+            node.callFunc("probeFirstFrame")
+            node.callFunc("probeShuffleUpNext", { type: "open" })
+            view = node.callFunc("probeShuffleUpNext", { action: "playNow" })
+            advance = view.requests[view.requests.Count() - 1]
+            m.assertEqual([advance.method, advance.path, advance.body], ["POST", "/api/v2/shuffles/s1/advance", { from_content_id: "movie:a" }])
+            m.assertTrue(view.open, "the panel stays until the server answers")
+            m.assertTrue(view.busy)
+            view = node.callFunc("probeShuffleAnswer", { index: view.requests.Count() - 1, current: "movie:b", next: "movie:e" })
+            m.assertEqual(view.itemId, "movie:b")
+            m.assertEqual([view.wanted.contentId, view.wanted.startPositionRule, view.wanted.auto], ["movie:b", nav.player.START_OVER, true], "as Up Next's next item starts")
+            m.assertTrue(view.shuffling, "the shuffle goes on with the next item")
+        end sub
+
+        @it("opens the panel again, its countdown off, when the advance fails, and Keep Watching gives up one still out")
+        sub _()
+            node = m.shuffling()
+            node.callFunc("probeShuffleUpNext", { type: "open" })
+            view = node.callFunc("probeShuffleUpNext", { action: "playNow" })
+            view = node.callFunc("probeShuffleAnswer", { index: view.requests.Count() - 1, status: 500 })
+            m.assertTrue(view.open)
+            m.assertFalse(view.finished)
+            m.assertEqual([view.pick, view.notice, view.busy], ["movie:b", "Couldn't continue the shuffle.", false])
+            view = node.callFunc("probeShuffleUpNext", { action: "playNow" })
+            out = view.requests.Count() - 1
+            view = node.callFunc("probeShuffleUpNext", { action: "keepWatching" })
+            m.assertTrue(view.requests[out].cancelled, "staying on this item wins")
+            m.assertFalse(view.open)
+            view = node.callFunc("probeShuffleAnswer", { index: out, current: "movie:b", next: "movie:f" })
+            m.assertEqual(view.itemId, "movie:a", "a late answer does not switch playback")
+        end sub
+
+        @it("gives up an advance still out on the remote's Back key, a phone's seek, and a spoken one, as Keep Watching does")
+        sub _()
+            for each path in ["back", "seek", "voice"]
+                node = m.shuffling()
+                node.callFunc("probeFirstFrame")
+                node.callFunc("probeShuffleUpNext", { type: "open" })
+                view = node.callFunc("probeShuffleUpNext", { action: "playNow" })
+                out = view.requests.Count() - 1
+                m.assertTrue(view.busy, path)
+                if path = "back"
+                    ' The panel passes Back up; the controls make it upNextBack.
+                    m.assertTrue(node.callFunc("probeKey", "back", true).handled, path)
+                    node.callFunc("probeKey", "back", false)
+                else if path = "seek"
+                    m.assertTrue(node.callFunc("remoteCommand", { name: "seek", seconds: 30 }).ok, path)
+                else
+                    said = node.callFunc("voiceCommand", { type: "transport", id: "1", command: "seek", direction: "backward", duration: "10" }).status
+                    m.assertEqual(said, "success.seek-start", path)
+                end if
+                view = node.callFunc("probeShuffleView")
+                m.assertTrue(view.requests[out].cancelled, path + ": staying on this item wins")
+                m.assertFalse(view.open, path)
+                view = node.callFunc("probeShuffleAnswer", { index: out, current: "movie:b", next: "movie:f" })
+                m.assertEqual(view.itemId, "movie:a", path + ": a late answer does not switch playback")
+                m.top.removeChild(node)
+            end for
+        end sub
+
+        @it("tells a phone the pick, and the phone's next-item command advances the shuffle as Play Now does")
+        sub _()
+            node = m.shuffling()
+            state = node.callFunc("remoteState")
+            m.assertEqual([state.hasNextEpisode, state.nextEpisodeTitle], [true, "movie:b"])
+            outcome = node.callFunc("remoteCommand", { name: "play_next" })
+            m.assertTrue(outcome.ok)
+            view = node.callFunc("probeShuffleView")
+            advance = view.requests[view.requests.Count() - 1]
+            m.assertEqual([advance.method, advance.path], ["POST", "/api/v2/shuffles/s1/advance"])
+            m.assertFalse(node.callFunc("remoteState").hasNextEpisode, "Up Next has moved on")
+        end sub
+
+        @it("shows Finished when nothing in the shuffle can play any more")
+        sub _()
+            node = m.shuffling()
+            view = node.callFunc("probeShuffleAnswer", { index: 0, status: 409 })
+            m.assertEqual(view.pick, "")
+        end sub
+
+        @it("deletes the shuffle and leaves on Stop shuffling")
+        sub _()
+            node = m.shuffling()
+            node.callFunc("probeShuffleUpNext", { type: "open" })
+            view = node.callFunc("probeShuffleUpNext", { action: "stopShuffling" })
+            last = view.requests[view.requests.Count() - 1]
+            m.assertEqual([last.method, last.path], ["DELETE", "/api/v2/shuffles/s1"])
+            m.assertFalse(view.shuffling)
+        end sub
+    end class
+end namespace

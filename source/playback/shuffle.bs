@@ -1,0 +1,213 @@
+import "pkg:/source/catalog/cards.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Shuffle (spec sections 5.5 to 5.7), as tvOS ships it (silo-apple
+' APIv2Client+Shuffles, ShuffleFeatureStore, ShuffleLauncher,
+' PlayerShuffleState). The server picks every item and applies the
+' profile's limits; the client plays the shuffle's current item and
+' offers its next in Up Next. Pure: request builders for api.send, what
+' ApiTask's map step makes of an answer, the capability, and the player's
+' shuffle state; nothing is sent here.
+'
+' A shuffle as the client keeps it (fromBody) is
+'
+'     { id, kind, label, current: pick, next: pick }
+'
+' label names the scope ("Movies", "Breaking Bad · Season 2"); a pick is
+' { itemId, type, seriesId, seriesTitle, seasonNumber, card }, card the
+' fields of its Up Next CardContent (pickCard). next equals current when the
+' scope has one playable item.
+namespace playback.shuffle
+    ' catalog.map kinds: the capability ({ available, kinds }), and a
+    ' shuffle (fromBody).
+    const CAPABILITY_KIND = "shuffleCapability"
+    const KIND = "shuffle"
+    ' tvOS's ShuffleScopeKind, the ones Roku offers.
+    const LIBRARY = "library"
+    const SERIES = "series"
+    const SEASON = "season"
+
+    ' --- Requests ------------------------------------------------------------
+
+    function capabilityRequest() as Object
+        return catalog.request.read("/api/v2/shuffles/capabilities", {}, { kind: CAPABILITY_KIND })
+    end function
+
+    ' POST /api/v2/shuffles for the scope (scopeKind, id); 201 with the new
+    ' shuffle, 404 when the scope is not visible, 409 when nothing in it can
+    ' play. Sent once: a second send would start a second shuffle (the
+    ' contract's non_retryable), and ApiTask resends nothing.
+    function createRequest(scopeKind as String, id as String) as Object
+        return write("POST", "/api/v2/shuffles", { scope: { kind: scopeKind, id: id } })
+    end function
+
+    ' GET the shuffle again: the server may replace a next item that can no
+    ' longer play; 409 means nothing in the scope can play any more.
+    function readRequest(id as String) as Object
+        return catalog.request.read(path(id), {}, { kind: KIND })
+    end function
+
+    ' The next item becomes current, and another is picked to follow it.
+    ' It names the item that played, so a repeat changes nothing.
+    function advanceRequest(id as String, fromContentId as String) as Object
+        return write("POST", path(id) + "/advance", { from_content_id: fromContentId })
+    end function
+
+    ' Pick Another: the server replaces the next item it announced.
+    function skipRequest(id as String, nextContentId as String) as Object
+        return write("POST", path(id) + "/skip", { next_content_id: nextContentId })
+    end function
+
+    ' Stop shuffling; one already gone answers 204 too.
+    function deleteRequest(id as String) as Object
+        return { method: "DELETE", path: path(id), auth: "profile", lane: "interactive" }
+    end function
+
+    function write(method as String, target as String, body as Object) as Object
+        return { method: method, path: target, body: body, auth: "profile", lane: "interactive", map: { kind: KIND } }
+    end function
+
+    function path(id as String) as String
+        return "/api/v2/shuffles/" + catalog.request.segment(id)
+    end function
+
+    ' --- Answers ---------------------------------------------------------------
+
+    ' GET /api/v2/shuffles/capabilities as tvOS reads it: available when the
+    ' state is available and allowed is not false, with the scope kinds
+    ' createShuffle accepts. invalid when the body is not one.
+    function capability(body as Dynamic) as Dynamic
+        if not util.isObject(body) or not util.isString(body.state) then return invalid
+        kinds = []
+        if type(body.scope_kinds) = "roArray"
+            for each offered in body.scope_kinds
+                if util.isString(offered) then kinds.Push(offered)
+            end for
+        end if
+        return { available: body.state = "available" and not (util.isBoolean(body.allowed) and not body.allowed), kinds: kinds }
+    end function
+
+    ' Whether a capability (capability's, or invalid before one is read)
+    ' offers scopeKind (tvOS's supports).
+    function supports(known as Dynamic, scopeKind as String) as Boolean
+        if not util.isObject(known) or not util.isTrue(known.available) or type(known.kinds) <> "roArray" then return false
+        for each offered in known.kinds
+            if offered = scopeKind then return true
+        end for
+        return false
+    end function
+
+    ' The key m.global.shuffleCapability is kept under, as the personal
+    ' lists' (catalog.personal.capabilityKey).
+    function capabilityKey(origin as String, profileId as String) as String
+        return origin + "|" + profileId
+    end function
+
+    ' A Shuffle as the client keeps it, or invalid without an ID or a
+    ' playable current and next. copy is catalog.cards.words().
+    function fromBody(body as Dynamic, copy as Object) as Dynamic
+        if not util.isObject(body) or util.text(body.id) = "" or not util.isObject(body.scope) then return invalid
+        current = pick(body.current, copy)
+        nextPick = pick(body.next, copy)
+        if current = invalid or nextPick = invalid then return invalid
+        return { id: util.text(body.id), kind: util.text(body.scope.kind), label: scopeLabel(body.scope), current: current, next: nextPick }
+    end function
+
+    ' tvOS's scopeLabel: "Movies", or "Breaking Bad · Season 2" for a
+    ' season, whose series names it first.
+    function scopeLabel(scope as Object) as String
+        title = util.text(scope.title).Trim()
+        parent = util.text(scope.parent_title).Trim()
+        if parent <> "" then return parent + catalog.cards.SEPARATOR + title
+        return title
+    end function
+
+    function pick(item as Dynamic, copy as Object) as Dynamic
+        card = pickCard(item, copy)
+        if card = invalid then return invalid
+        isEpisode = LCase(util.text(item.type)) = "episode"
+        out = { itemId: card.id, type: util.text(item.type), seriesId: "", seriesTitle: "", seasonNumber: card.seasonNumber, card: card }
+        if isEpisode
+            out.seriesId = util.text(item.series_id)
+            out.seriesTitle = util.text(item.series_title).Trim()
+        end if
+        return out
+    end function
+
+    ' A pick's Up Next card (tvOS's PlayerNextUpEpisode(shufflePick:)): its
+    ' title, an episode's season and number, the overview, and its release
+    ' date and runtime as an episode card's second line, which Up Next shows
+    ' for a movie too.
+    function pickCard(item as Dynamic, copy as Object) as Dynamic
+        card = catalog.cards.fromItem(item, catalog.shape.LANDSCAPE, copy)
+        if card = invalid then return invalid
+        card.shape = catalog.shape.EPISODE
+        card.progress = -1.0
+        card.captionDetail = catalog.cards.join([catalog.cards.dateText(item.release_date), card.runtimeLabel])
+        if LCase(card.itemType) = "episode" and card.title.Trim() = "" and card.episodeNum >= 0 then card.title = i18n.format(copy.episodeOnly, { episode: card.episodeNum })
+        return card
+    end function
+
+    ' The strings key of a failure to start (tvOS's failureMessage), from
+    ' the answer's status.
+    function failureKey(status as Integer) as String
+        if status = 409 then return "shuffle.nothingToPlay"
+        if status = 404 then return "shuffle.notFound"
+        return "shuffle.failed"
+    end function
+
+    ' --- The player's shuffle (tvOS's PlayerShuffleState) ----------------------
+
+    ' played: the item that last reached its first frame, which advancing
+    ' names, so a retry after a lost answer or a failed load never skips an
+    ' item that did not play. exhausted: the server answered 409.
+    function create(shuffle as Object) as Object
+        return { shuffle: shuffle, played: "", exhausted: false }
+    end function
+
+    ' The pick that plays after the item on screen, or invalid for the
+    ' finished state: nothing can play, or the scope's one playable item
+    ' is the one that just played. Advanced, but its current not played
+    ' yet (its load failed): that is still what plays next.
+    function upNext(state as Dynamic) as Dynamic
+        if not util.isObject(state) or state.exhausted then return invalid
+        shuffle = state.shuffle
+        if state.played <> "" and shuffle.current.itemId <> state.played then return shuffle.current
+        if shuffle.next.itemId = shuffle.current.itemId then return invalid
+        return shuffle.next
+    end function
+
+    ' Pick Another replaces the server's next item, so it applies only
+    ' while that is the one on offer.
+    function canPickAnother(state as Dynamic) as Boolean
+        offered = upNext(state)
+        if offered = invalid then return false
+        return offered.itemId = state.shuffle.next.itemId and offered.itemId <> state.shuffle.current.itemId
+    end function
+
+    ' The item advancing names: what played, or before anything has, the
+    ' shuffle's current item.
+    function advanceFrom(state as Object) as String
+        if state.played <> "" then return state.played
+        return state.shuffle.current.itemId
+    end function
+
+    ' A newer answer for the same shuffle.
+    sub apply(state as Object, shuffle as Dynamic)
+        if not util.isObject(shuffle) or shuffle.id <> state.shuffle.id then return
+        state.shuffle = shuffle
+        state.exhausted = false
+    end sub
+
+    sub markPlayed(state as Object, itemId as String)
+        state.played = itemId
+    end sub
+
+    ' A failed read or write: only 409 changes anything. Otherwise the last
+    ' pick stays on offer, and advancing checks it on the server.
+    sub failed(state as Object, status as Integer)
+        if status = 409 then state.exhausted = true
+    end sub
+end namespace
