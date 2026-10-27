@@ -336,7 +336,9 @@ sends the idle state tvOS sends. Fields:
   the inventory's `track_id`;
 - `qualityOptions`, `activeQualityId`, and `isQualitySwitching` from the
   player's quality menu, `"auto"` included;
-- `hasNextEpisode` and `nextEpisodeTitle` from Up Next;
+- `hasNextEpisode` and `nextEpisodeTitle` from Up Next's pick: the next
+  episode, or On Deck's first item when nothing follows (as Play Now and
+  Roku's voice "next" use it);
 - `volume` 1 or 0 and `isMuted` (section 6.5);
 - `playbackSpeed` 1, `videoGravity` `"fit"`, `supportsVideoGravity`,
   `supportsSubtitleDelay`, and `supportsSubtitlePosition` false;
@@ -355,7 +357,7 @@ server. `overview` is left out to keep frames small.
 | `play`, `pause`, `play_pause` | The player's own play and pause |
 | `seek` | The player's seek path, as a committed scrub; under Up Next, Keep Watching first, and after the end a replay from there (spec section 5.7) |
 | `stop` | Closes the player as Back does, final progress included |
-| `play_next` | Up Next's next episode; `error command_failed` without one |
+| `play_next` | Up Next's Play Now on its pick; `error command_failed` without one |
 | `select_audio_track`, `select_subtitle_track` | The Options menu's track change (a replan where the plan needs one); `trackId` absent means subtitles off |
 | `set_quality` | The Options menu's quality change |
 | `set_muted` | The `Video` node's `mute` |
