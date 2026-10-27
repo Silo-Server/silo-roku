@@ -1,0 +1,389 @@
+import "pkg:/components/views/personal.bs"
+import "pkg:/source/catalog/actions.bs"
+import "pkg:/source/catalog/personal.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/platform/topics.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' The detail page's Watchlist button and More menu (spec section 5.6, tvOS's
+' TVDetailActionRow and its More popover): add to or remove from the
+' Watchlist and Favorites when the server offers the lists, and mark the
+' movie, or the series, the season shown, or the episode Play plays,
+' watched or unwatched. Each change shows at once and goes back if the
+' server refuses it, with a notice (components/views/personal.bs). Part of
+' DetailScreen.
+
+sub initPersonal()
+    ' Whether the server offers Watchlist and Favorites: true or false once
+    ' known (personalListsKnown), else invalid.
+    m.lists = invalid
+    ' Per change (personalKey): { pending, confirmed, applied, stale }, the
+    ' writes for it still out, what the server last confirmed (at first,
+    ' what the page showed before them), which a refused last write puts
+    ' back, and whether one of them was applied, or a read was held back
+    ' for them (heldBack), since what it moves was last read.
+    m.writes = {}
+    ' Watched writes applied so far, which a first read of the series'
+    ' seasons or of a season's episodes notes as it leaves (markedSince).
+    m.marks = 0
+    ' Changes other pages sent that landed while the item was being read
+    ' (onPersonalChange), which the item read may predate.
+    m.otherChanges = []
+end sub
+
+' On the page's first show: the capability as the shell under the page
+' read it (every page with the bar reads it as it starts), else read here,
+' as for a deep link's page over a Home not shown yet. The page does not
+' observe m.global (the global node would keep every released page alive,
+' and a shared field is never unobserved, implementation plan section
+' 4.2): it looks again each time it is shown (syncPersonalLists), and
+' takes its own read as it lands.
+sub startPersonal()
+    platform.subscribe(m.top.owner, [platform.topic.PERSONAL_CHANGE], "onPersonalChange")
+    m.lists = personalListsKnown()
+    if m.lists = invalid then send(catalog.personal.capabilityRequest(), { kind: "personalLists" })
+end sub
+
+sub onPersonalListsRead(result as Object)
+    personalListsRemember(result)
+    syncPersonalLists()
+end sub
+
+' Follows the capability as last read for the open server and profile.
+sub syncPersonalLists()
+    if m.released then return
+    known = personalListsKnown()
+    if known = invalid then return
+    if m.lists <> invalid and m.lists = known then return
+    m.lists = known
+    if m.detail <> invalid then updateActions()
+end sub
+
+' The action row's Watchlist and More (catalog.actions.row), once the item
+' is read.
+function personalButtons() as Dynamic
+    if m.detail = invalid then return invalid
+    return { watchlist: util.isTrue(m.lists), inWatchlist: m.detail.inWatchlist }
+end function
+
+sub toggleWatchlist()
+    if m.detail = invalid or not util.isTrue(m.lists) then return
+    requested = not m.detail.inWatchlist
+    m.detail.inWatchlist = requested
+    updateActions()
+    sendChange({ kind: catalog.personal.WATCHLIST, id: m.detail.id, value: requested }, not requested, catalog.personal.membership(catalog.personal.WATCHLIST, m.detail.id, requested))
+end sub
+
+' --- More --------------------------------------------------------------------
+
+' The More menu under its button, in tvOS's order (catalog.personal.moreRows).
+sub openMore()
+    if m.detail = invalid then return
+    items = []
+    for each row in catalog.personal.moreRows(moreState())
+        items.Push({ value: row.value, title: i18n.text(row.key), detail: "" })
+    end for
+    m.pickerKey = catalog.action.MORE
+    m.picker.setFields({ title: i18n.text("detail.more"), options: { items: items }, chosen: -1 })
+    showPicker()
+end sub
+
+' What the More menu offers now (catalog.personal.moreRows' state).
+function moreState() as Object
+    state = { lists: util.isTrue(m.lists), series: m.series, isFavorite: m.detail.isFavorite, played: moviePlayed(), season: false, seasonPlayed: false, episode: false, episodePlayed: false }
+    if not m.series then return state
+    state.played = m.detail.played
+    if m.seasonIndex >= 0 and m.seasonIndex < m.seasonRollups.Count()
+        state.season = true
+        state.seasonPlayed = catalog.personal.seasonPlayed(m.seasonRollups[m.seasonIndex])
+    end if
+    card = activeEpisode()
+    if card <> invalid
+        state.episode = true
+        state.episodePlayed = card.played
+    end if
+    return state
+end function
+
+' A movie's watched state: its watch state's once read (the player may
+' have finished it since the item was read), else the item's.
+function moviePlayed() as Boolean
+    watch = currentWatch()
+    if watch <> invalid and not m.series then return util.isTrue(watch.played)
+    return util.isTrue(m.detail.played)
+end function
+
+' The active episode's card while Play plays it, else invalid.
+function activeEpisode() as Dynamic
+    if m.target = invalid or not m.target.episode or m.activeIndex < 0 or m.activeIndex >= m.railItems.Count() then return invalid
+    card = m.railItems[m.activeIndex]
+    if card.id <> m.target.contentId then return invalid
+    return card
+end function
+
+sub onMorePicked(value as Integer)
+    if m.detail = invalid then return
+    if value = catalog.more.FAVORITE
+        if not util.isTrue(m.lists) then return
+        requested = not m.detail.isFavorite
+        m.detail.isFavorite = requested
+        sendChange({ kind: catalog.personal.FAVORITES, id: m.detail.id, value: requested }, not requested, catalog.personal.membership(catalog.personal.FAVORITES, m.detail.id, requested))
+    else if value = catalog.more.WATCHED
+        requested = not moreState().played
+        m.detail.played = requested
+        watch = currentWatch()
+        if watch <> invalid and not m.series then watch.played = requested
+        markWatched("item", m.detail.id, requested, -1, not requested)
+    else if value = catalog.more.SEASON_WATCHED
+        position = m.seasonIndex
+        if position < 0 or position >= m.seasonRollups.Count() then return
+        requested = not catalog.personal.seasonPlayed(m.seasonRollups[position])
+        previous = m.seasonRollups[position]
+        m.seasonRollups[position] = catalog.personal.markedRollup(previous, requested)
+        markWatched("season", m.seasonNodes[position].id, requested, position, previous, m.seasonRollups[position])
+    else if value = catalog.more.EPISODE_WATCHED
+        card = activeEpisode()
+        if card = invalid then return
+        requested = not card.played
+        card.played = requested
+        markWatched("episode", card.id, requested, positionOf(card.seasonNumber), not requested)
+    end if
+end sub
+
+' Sends a watched change for what (item, season, or episode) id, with the
+' season position it touches (-1 for none) and what the page showed before
+' it: a flag, or for a season its rollup, with shown the rollup after.
+sub markWatched(what as String, id as String, played as Boolean, position as Integer, before as Dynamic, shown = invalid as Dynamic)
+    ' item: the page's movie or series, for another page of it
+    ' (onPersonalChange).
+    change = { kind: "watched", what: what, id: id, item: m.detail.id, value: played, season: position, shown: shown }
+    sendChange(change, before, catalog.personal.watched(id, played))
+end sub
+
+' Sends a change's write, counting it among the writes out for the change;
+' before is what the page showed before it, the confirmed state when no
+' other write for the change is out.
+sub sendChange(change as Object, before as Dynamic, request as Object)
+    key = personalKey(change)
+    entry = m.writes[key]
+    if entry = invalid or entry.pending <= 0
+        entry = { pending: 0, confirmed: before, applied: false, stale: false }
+        m.writes[key] = entry
+    end if
+    entry.pending = entry.pending + 1
+    ' Not "change": every node has a built-in change field, which addFields
+    ' leaves in place.
+    sendPersonal(request, { personalChange: change }, "onPersonalWritten")
+end sub
+
+function personalKey(change as Object) as String
+    return change.kind + "|" + util.text(change.what) + "|" + change.id
+end function
+
+' Whether a write for the change (kind, what, id) is still out, so that a
+' read landing now keeps what the page shows for it: the read may predate
+' the write, or answer an earlier one. Marks the change for reading again
+' should its last write be refused.
+function heldBack(kind as String, what as String, id as String) as Boolean
+    entry = m.writes[personalKey({ kind: kind, what: what, id: id })]
+    if entry = invalid or entry.pending <= 0 then return false
+    entry.stale = true
+    return true
+end function
+
+' A movie's watch state as read keeps the watched flag the page shows while
+' a mark for it is out.
+sub keepPendingWatched(watch as Object)
+    if m.detail <> invalid and not m.series and heldBack("watched", "item", m.detail.id) then watch.played = m.detail.played
+end sub
+
+' Whether the page keeps an episode card's watched flag over a read's: a
+' mark for the episode, its season (position), or the series is out.
+function episodeHeldBack(id as String, position as Integer) as Boolean
+    if heldBack("watched", "episode", id) then return true
+    if position >= 0 and position < m.seasonNodes.Count() and heldBack("watched", "season", m.seasonNodes[position].id) then return true
+    return m.series and m.detail <> invalid and heldBack("watched", "item", m.detail.id)
+end function
+
+' A personal write landed (or not). A write a newer one replaced changes
+' nothing here: the newer one decides. Once the last write for a watched
+' change is applied, what it moves is read again; a failure puts the page
+' back and says so, and reads again what an earlier write applied or a
+' read held back.
+sub onPersonalWritten(event as Object)
+    handle = event.getRoSGNode()
+    result = api.resultOf(handle)
+    if result <> invalid then personalWritten(handle.personalChange, result)
+end sub
+
+sub personalWritten(change as Object, result as Object)
+    ' Its write outlived the page: the scene counted it, or said it failed.
+    if m.released then return
+    entry = m.writes[personalKey(change)]
+    last = true
+    if entry <> invalid
+        entry.pending = entry.pending - 1
+        last = entry.pending <= 0
+    end if
+    if result.ok <> true
+        if util.isObject(result.error) and util.text(result.error.reason) = "superseded" then return
+        ' A newer write still out decides what the page shows.
+        if last and entry <> invalid
+            revertPersonal(change, entry.confirmed)
+            if change.kind = "watched" and (entry.applied or entry.stale)
+                held = {}
+                held.Append(change)
+                held.value = entry.confirmed
+                afterWatched(held, entry.applied)
+            end if
+        end if
+        personalFailed()
+        return
+    end if
+    if entry <> invalid
+        if change.what = "season"
+            entry.confirmed = change.shown
+        else
+            entry.confirmed = change.value
+        end if
+        entry.applied = not last
+    end if
+    if change.kind = "watched" then m.marks = m.marks + 1
+    ' A newer write still out reads again once it lands.
+    if change.kind = "watched" and last then afterWatched(change, true)
+end sub
+
+' A personal change landed (PersonalWrites' event): one another page sent
+' for this item, such as a page of it the viewer left before its write
+' landed, may postdate what this page read. A Watchlist or Favorites change
+' shows as the server applied it, unless this page has a write of its own
+' for it out, which decides; a watched one reads again what it moves, as
+' playback does. One landing while the item is read waits for it.
+function onPersonalChange(event as Object) as Boolean
+    if m.released or util.text(event.sender) = m.top.owner or not util.isObject(event.change) then return true
+    if m.detail = invalid
+        m.otherChanges.Push(event.change)
+    else
+        otherChange(event.change)
+    end if
+    return true
+end function
+
+' The item has been read: the changes that landed meanwhile show.
+sub otherChangesSince()
+    changes = m.otherChanges
+    m.otherChanges = []
+    for each change in changes
+        otherChange(change)
+    end for
+end sub
+
+sub otherChange(change as Object)
+    if change.kind = catalog.personal.WATCHLIST or change.kind = catalog.personal.FAVORITES
+        if change.id <> m.detail.id or heldBack(change.kind, "", change.id) then return
+        if change.kind = catalog.personal.WATCHLIST
+            m.detail.inWatchlist = change.value
+        else
+            m.detail.isFavorite = change.value
+        end if
+        updateActions()
+        return
+    end if
+    if change.kind <> "watched" or util.text(change.item) <> m.detail.id then return
+    ' A first read out now may predate it (markedSince).
+    m.marks = m.marks + 1
+    if not m.series and change.what = "item" and not heldBack("watched", "item", m.detail.id) then m.detail.played = change.value
+    afterWatched({ kind: "watched", what: "item", id: m.detail.id, value: change.value }, false)
+end sub
+
+' Puts back what the server last confirmed for a refused change (value: a
+' flag, or a season's rollup), while the page still shows its item.
+sub revertPersonal(change as Object, value as Dynamic)
+    if m.detail = invalid then return
+    if change.kind = catalog.personal.WATCHLIST or change.kind = catalog.personal.FAVORITES
+        if m.detail.id <> change.id then return
+        if change.kind = catalog.personal.WATCHLIST
+            m.detail.inWatchlist = value
+            updateActions()
+        else
+            m.detail.isFavorite = value
+        end if
+        return
+    end if
+    if change.what = "item"
+        if m.detail.id <> change.id then return
+        m.detail.played = value
+        watch = currentWatch()
+        if watch <> invalid and not m.series then watch.played = value
+    else if change.what = "season"
+        if change.season >= 0 and change.season < m.seasonRollups.Count() and m.seasonNodes[change.season].id = change.id then m.seasonRollups[change.season] = value
+    else
+        at = catalog.series.indexOf(m.railItems, change.id)
+        if at >= 0 then m.railItems[at].played = value
+    end if
+end sub
+
+' After a watched change: the episodes it covers are read again for their
+' check marks and progress (a whole series' loaded seasons, else the
+' season touched); on a series its seasons too, for each season's counts
+' and whether the series counts as watched (tvOS's refreshWatchedSeason);
+' and the action row's target for Play or Resume, since the server clears
+' a resume point it marks. marked: the server applied change.value, which
+' a series' marked seasons show until their read lands.
+sub afterWatched(change as Object, marked as Boolean)
+    if m.detail = invalid then return
+    if m.series
+        if change.what = "item"
+            if m.detail.id <> change.id then return
+            for i = 0 to m.seasonRollups.Count() - 1
+                if marked then m.seasonRollups[i] = catalog.personal.markedRollup(m.seasonRollups[i], change.value)
+                if m.pages[i] <> invalid then refreshSeason(i)
+            end for
+        else if change.season >= 0 and change.season < m.pages.Count() and m.pages[change.season] <> invalid
+            refreshSeason(change.season)
+        end if
+        readRollups()
+    else if m.detail.id <> change.id
+        return
+    end if
+    if m.target <> invalid then loadWatch(m.target.contentId, false)
+end sub
+
+' A first read of the series' seasons or a season's episodes (entry) that
+' left before a watched write was applied may hold what the write changed,
+' and the reads after the write skip what was not read yet: it is read
+' again.
+sub markedSince(entry as Object)
+    if entry.marks = invalid or entry.marks = m.marks or m.detail = invalid or not m.series then return
+    if entry.kind = "seasons"
+        if m.seasonNodes.Count() > 0 then readRollups()
+    else if entry.season >= 0 and entry.season < m.pages.Count() and m.pages[entry.season] <> invalid
+        refreshSeason(entry.season)
+    end if
+end sub
+
+' Reads the series' seasons again (onRollups), replacing a read still out.
+sub readRollups()
+    cancelKind("rollups")
+    send(catalog.request.seasons(m.detail.id, m.libraryId), { kind: "rollups", tag: readTag("rollups") })
+end sub
+
+' The series' seasons read again after a watched change: each season's
+' counts, and the series' watched flag (catalog.personal.seriesPlayed), for
+' More's rows. A season with a write for it or the series still out, and
+' the series with one for it, keep what the page shows (heldBack); the
+' pills and the rail stay as they are.
+sub onRollups(entry as Object, result as Object)
+    if result.ok <> true or not readCurrent("rollups", entry.tag) or m.detail = invalid or not m.series or not util.isObject(result.body) or type(result.body.seasons) <> "roArray" then return
+    rollups = result.body.seasons
+    ' A number listed twice keeps the first, as catalog.series.ordered does.
+    seen = {}
+    for each rollup in rollups
+        key = rollup.seasonNumber.ToStr()
+        at = positionOf(rollup.seasonNumber)
+        if not seen.DoesExist(key) and at >= 0 and not heldBack("watched", "season", m.seasonNodes[at].id) and not heldBack("watched", "item", m.detail.id) then m.seasonRollups[at] = rollup
+        seen[key] = true
+    end for
+    if not heldBack("watched", "item", m.detail.id) then m.detail.played = catalog.personal.seriesPlayed(rollups)
+end sub

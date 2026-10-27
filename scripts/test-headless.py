@@ -49,15 +49,15 @@ KILL_AFTER = 10
 # a shard's specs create, so the specs that build players and detail pages
 # are spread out; the longest shards come first.
 SHARDS = [
-    ("catalog", ["catalog"]),
+    ("catalog", ["catalog", "views/detailPersonalBack.spec.bs"]),
     ("playback", ["playback"]),
     ("player-captions", ["player/captions.spec.bs"]),
     ("player-sidecars", ["player/captionSidecars.spec.bs", "api", "deeplink", "dev", "memory", "nav", "platform"]),
     ("detail", ["views/detailScreen.spec.bs", "onboarding", "storage", "theme", "util", "smoke.spec.bs"]),
     ("detail-tracks", ["views/detailTracks.spec.bs", "auth", "control"]),
     ("views", ["views"]),
-    ("player", ["player"]),
-    ("screens", ["home", "library", "search", "settings"]),
+    ("player", ["player", "views/detailPersonal.spec.bs"]),
+    ("screens", ["home", "library", "personal", "search", "settings"]),
 ]
 
 

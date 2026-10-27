@@ -1,0 +1,205 @@
+namespace tests
+
+    @suite("catalog personal lists")
+    class CatalogPersonalTests extends rooibos.BaseTestSuite
+
+        function copy() as Object
+            return i18n.load("en_US")
+        end function
+
+        ' Whether path fits an OpenAPI path template such as /a/{id}/b.
+        function fits(path as String, template as String) as Boolean
+            parts = path.Split("/")
+            pattern = template.Split("/")
+            if parts.Count() <> pattern.Count() then return false
+            for i = 0 to parts.Count() - 1
+                if Left(pattern[i], 1) = "{"
+                    if parts[i] = "" then return false
+                else if parts[i] <> pattern[i]
+                    return false
+                end if
+            end for
+            return true
+        end function
+
+        function rowKeys(rows as Object) as Object
+            out = []
+            for each row in rows
+                out.Push(row.key)
+            end for
+            return out
+        end function
+
+        @describe("the server contract (catalog-operations.json)")
+
+        @it("reads the capability and each list with the operations' methods, paths, and declared query parameters, as the profile")
+        sub _()
+            operations = tests.catalogData.operations()
+            first = catalog.personal.listRequest(catalog.personal.WATCHLIST, "", 40, false)
+            reads = [
+                ["getPersonalListCapability", catalog.personal.capabilityRequest()]
+                ["listWatchlist", first]
+                ["listWatchlist", catalog.request.continued(first, "eyJ2IjoxfQ", 200, catalog.kind.PAGE)]
+                ["listFavorites", catalog.personal.listRequest(catalog.personal.FAVORITES, "c2", 40, true)]
+                ["listHistory", catalog.personal.listRequest(catalog.personal.HISTORY, "", 40, false)]
+                ["listHistory", catalog.request.continued(catalog.personal.listRequest(catalog.personal.HISTORY, "", 40, false), "c9", 120, catalog.kind.SKIP)]
+            ]
+            for each entry in reads
+                operation = operations[entry[0]]
+                request = tests.catalogData.sent(entry[1])
+                m.assertNotInvalid(request, entry[0] + " cannot be sent")
+                m.assertEqual([request.method, request.auth], [operation.method, "profile"], entry[0])
+                m.assertTrue(m.fits(request.path, operation.path), request.path + " is not " + operation.path)
+                for each name in request.query
+                    declared = operation.query[name]
+                    m.assertNotInvalid(declared, entry[0] + " has no query parameter " + name)
+                    m.assertTrue(tests.catalogData.fitsParameter(request.query[name], declared), entry[0] + ": " + name + "=" + FormatJson(request.query[name]))
+                end for
+            end for
+        end sub
+
+        @it("adds, removes, and marks with the operations' methods and paths, each item's writes in one line")
+        sub _()
+            operations = tests.catalogData.operations()
+            writes = [
+                ["addToWatchlist", catalog.personal.membership(catalog.personal.WATCHLIST, "movie:heat-1995", true)]
+                ["deleteWatchlistEntry", catalog.personal.membership(catalog.personal.WATCHLIST, "movie:heat-1995", false)]
+                ["addFavorite", catalog.personal.membership(catalog.personal.FAVORITES, "series:severance", true)]
+                ["deleteFavorite", catalog.personal.membership(catalog.personal.FAVORITES, "series:severance", false)]
+                ["markWatched", catalog.personal.watched("season:severance-s01", true)]
+                ["unmarkWatched", catalog.personal.watched("episode:severance-s01e02", false)]
+                ["removeHistoryEntries", catalog.personal.removeHistory("series:severance")]
+            ]
+            for each entry in writes
+                operation = operations[entry[0]]
+                request = tests.catalogData.sent(entry[1])
+                m.assertNotInvalid(request, entry[0] + " cannot be sent")
+                m.assertEqual([request.method, request.auth, request.lane], [operation.method, "profile", "interactive"], entry[0])
+                m.assertTrue(m.fits(request.path, operation.path), request.path + " is not " + operation.path)
+                m.assertTrue(request.query = invalid or request.query.Count() = 0, entry[0] + " sends no query")
+                m.assertInvalid(request.map, entry[0] + " maps nothing")
+            end for
+            add = catalog.personal.membership(catalog.personal.WATCHLIST, "movie:heat-1995", true)
+            remove = catalog.personal.membership(catalog.personal.WATCHLIST, "movie:heat-1995", false)
+            m.assertEqual(add.path, "/api/v2/watchlist/movie:heat-1995")
+            m.assertEqual(add.orderKey, remove.orderKey, "a toggle's add and remove wait for each other")
+            m.assertEqual(catalog.personal.watched("movie:a", true).orderKey, catalog.personal.watched("movie:a", false).orderKey)
+            m.assertNotEqual(add.orderKey, catalog.personal.membership(catalog.personal.FAVORITES, "movie:heat-1995", true).orderKey)
+        end sub
+
+        @it("hides a card's watches with the golden HistoryRemoveInputBody")
+        sub _()
+            golden = tests.devices.loadJson("pkg:/tests/fixtures/golden/history-remove/series.json")
+            body = catalog.personal.removeHistory("series:severance").body
+            m.assertEqual(body, golden, "GOLDEN history-remove/series.json " + FormatJson(body))
+        end sub
+
+        @it("builds nothing for an unknown list or an empty ID")
+        sub _()
+            m.assertInvalid(catalog.personal.listRequest("collections", "", 40, false))
+            m.assertInvalid(catalog.personal.membership(catalog.personal.HISTORY, "movie:a", true))
+            m.assertInvalid(catalog.personal.membership(catalog.personal.WATCHLIST, "", true))
+            m.assertInvalid(catalog.personal.watched("", true))
+            m.assertInvalid(catalog.personal.removeHistory(""))
+        end sub
+
+        @describe("answers")
+
+        @it("offers Watchlist and Favorites only when the capability is available and allowed")
+        sub _()
+            request = catalog.personal.capabilityRequest()
+            mapped = catalog.map.apply(request, tests.catalogData.ok(tests.catalogData.fixture("get_personal_list_capability_ok")), tests.catalogData.words())
+            m.assertEqual(mapped.body, { available: true })
+            m.assertTrue(catalog.personal.availableFrom(mapped))
+            for each body in [{ state: "available", allowed: false }, { state: "not_configured", allowed: true }, { state: "disabled", allowed: true }]
+                m.assertFalse(catalog.personal.availableFrom(catalog.map.apply(request, tests.catalogData.ok(body), tests.catalogData.words())), FormatJson(body))
+            end for
+            m.assertFalse(catalog.map.apply(request, tests.catalogData.ok({ allowed: true }), tests.catalogData.words()).ok, "no state")
+            m.assertFalse(catalog.personal.availableFrom({ ok: false, status: 404, body: invalid }), "an older server without the document")
+            m.assertFalse(catalog.personal.availableFrom(invalid))
+        end sub
+
+        @it("maps each list's page to cards with its cursor, as a /catalog page")
+        sub _()
+            for each name in ["list_watchlist_ok", "list_favorites_ok", "list_history_ok"]
+                request = catalog.personal.listRequest(catalog.personal.WATCHLIST, "", 1, false)
+                result = catalog.map.apply(request, tests.catalogData.ok(tests.catalogData.fixture(name)), tests.catalogData.words())
+                m.assertTrue(result.ok, name)
+                m.assertEqual(result.content.getChildCount(), 1, name)
+                m.assertTrue(result.body.hasMore, name)
+                m.assertNotEqual(result.body.nextCursor, "", name)
+            end for
+            history = catalog.map.apply(catalog.personal.listRequest(catalog.personal.HISTORY, "", 1, false), tests.catalogData.ok(tests.catalogData.fixture("list_history_ok")), tests.catalogData.words())
+            m.assertEqual(history.content.getChild(0).id, "series:heat", "History's card is the series it watched")
+        end sub
+
+        @it("counts History's items as tvOS words them")
+        sub _()
+            copy = m.copy()
+            m.assertEqual(catalog.personal.countText(0, false, copy), "")
+            m.assertEqual(catalog.personal.countText(40, false, copy), "40+ items")
+            m.assertEqual(catalog.personal.countText(1, true, copy), "1 item")
+            m.assertEqual(catalog.personal.countText(523, true, copy), "523 items")
+        end sub
+
+        @describe("the More menu (spec section 5.6)")
+
+        @it("offers Favorites, then Mark as Watched, on a movie, in tvOS's words")
+        sub _()
+            rows = catalog.personal.moreRows({ lists: true, series: false, isFavorite: false, played: false })
+            m.assertEqual(m.rowKeys(rows), ["detail.more.addFavorite", "detail.more.markWatched"])
+            m.assertEqual([rows[0].value, rows[1].value], [catalog.more.FAVORITE, catalog.more.WATCHED])
+            rows = catalog.personal.moreRows({ lists: true, series: false, isFavorite: true, played: true })
+            m.assertEqual(m.rowKeys(rows), ["detail.more.removeFavorite", "detail.more.markUnwatched"])
+            copy = m.copy()
+            for each key in ["detail.more.addFavorite", "detail.more.removeFavorite", "detail.more.markWatched", "detail.more.markUnwatched"]
+                m.assertNotEqual(i18n.lookup(copy, key), key, key)
+            end for
+            m.assertEqual(i18n.lookup(copy, "detail.more.markUnwatched"), "Mark as Unwatched")
+        end sub
+
+        @it("leaves Favorites out when the server does not offer the lists")
+        sub _()
+            rows = catalog.personal.moreRows({ lists: false, series: false, isFavorite: true, played: false })
+            m.assertEqual(m.rowKeys(rows), ["detail.more.markWatched"])
+        end sub
+
+        @it("marks a series, the season shown, and the episode Play plays")
+        sub _()
+            rows = catalog.personal.moreRows({ lists: true, series: true, isFavorite: false, played: true, season: true, seasonPlayed: false, episode: true, episodePlayed: true })
+            m.assertEqual(m.rowKeys(rows), ["detail.more.addFavorite", "detail.more.markSeriesUnwatched", "detail.more.markSeasonWatched", "detail.more.markEpisodeUnwatched"])
+            m.assertEqual([rows[1].value, rows[2].value, rows[3].value], [catalog.more.WATCHED, catalog.more.SEASON_WATCHED, catalog.more.EPISODE_WATCHED])
+            rows = catalog.personal.moreRows({ lists: true, series: true, isFavorite: false, played: false, season: false, episode: false })
+            m.assertEqual(m.rowKeys(rows), ["detail.more.addFavorite", "detail.more.markSeriesWatched"])
+            copy = m.copy()
+            m.assertEqual(i18n.lookup(copy, "detail.more.markSeasonWatched"), "Mark Season Watched")
+            m.assertEqual(i18n.lookup(copy, "detail.more.markEpisodeUnwatched"), "Mark Episode Unwatched")
+        end sub
+
+        @it("counts a season watched when none of its episodes is unplayed, and marks its rollup either way")
+        sub _()
+            rollup = { seasonNumber: 1, specials: false, inProgress: true, watched: 3, unplayed: 2, episodes: 5 }
+            m.assertFalse(catalog.personal.seasonPlayed(rollup))
+            marked = catalog.personal.markedRollup(rollup, true)
+            m.assertEqual([marked.watched, marked.unplayed, marked.inProgress], [5, 0, false])
+            m.assertTrue(catalog.personal.seasonPlayed(marked))
+            m.assertEqual(rollup.watched, 3, "the rollup given is not changed")
+            cleared = catalog.personal.markedRollup(marked, false)
+            m.assertEqual([cleared.watched, cleared.unplayed], [0, 5])
+            m.assertFalse(catalog.personal.seasonPlayed(cleared))
+            m.assertFalse(catalog.personal.seasonPlayed({ seasonNumber: 2, watched: 0, unplayed: 0, episodes: 0 }), "a season without episodes")
+            m.assertFalse(catalog.personal.seasonPlayed(invalid))
+        end sub
+
+        @it("counts a series watched when every season with episodes is (tvOS's refreshWatchedSeason)")
+        sub _()
+            watched = { seasonNumber: 1, watched: 3, unplayed: 0, episodes: 3 }
+            empty = { seasonNumber: 2, watched: 0, unplayed: 0, episodes: 0 }
+            partial = { seasonNumber: 3, watched: 1, unplayed: 2, episodes: 3 }
+            m.assertTrue(catalog.personal.seriesPlayed([watched, empty]), "a season without episodes does not count")
+            m.assertFalse(catalog.personal.seriesPlayed([watched, partial]))
+            m.assertFalse(catalog.personal.seriesPlayed([empty]), "no season with episodes")
+            m.assertFalse(catalog.personal.seriesPlayed(invalid))
+        end sub
+    end class
+end namespace

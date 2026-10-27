@@ -1,0 +1,341 @@
+namespace tests
+
+    ' The detail page's Watchlist button and More menu (spec section 5.6),
+    ' on a DetailScreenProbe (tests/helpers/detailPersonal.bs).
+    @suite("detail personal lists")
+    class DetailPersonalTests extends tests.DetailPersonalSuite
+
+        @describe("Watchlist")
+
+        @it("ends a movie's row with Watchlist and More once the item is read, and toggles Watchlist at once")
+        sub _()
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.movie({}))
+            m.assertEqual(m.keys(probe), [catalog.action.PLAY, catalog.action.VERSION, catalog.action.AUDIO, catalog.action.SUBTITLES, catalog.action.WATCHLIST, catalog.action.MORE])
+            m.assertFalse(m.button(probe, catalog.action.WATCHLIST).active)
+            probe.findNode("actions").activated = catalog.action.WATCHLIST
+            m.assertTrue(m.button(probe, catalog.action.WATCHLIST).active, "the bookmark fills before the server answers")
+            writes = probe.callFunc("personalWrites")
+            m.assertEqual([writes[0].request.method, writes[0].request.path], ["PUT", "/api/v2/watchlist/movie:a"])
+            m.assertEqual(probe.callFunc("landPersonal", 0, m.ok()), 0)
+            m.assertTrue(m.button(probe, catalog.action.WATCHLIST).active)
+            probe.findNode("actions").activated = catalog.action.WATCHLIST
+            writes = probe.callFunc("personalWrites")
+            m.assertEqual([writes[1].request.method, writes[1].request.path], ["DELETE", "/api/v2/watchlist/movie:a"])
+        end sub
+
+        @it("puts Watchlist back and says so when the server refuses the change")
+        sub _()
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.movie({ in_watchlist: true }))
+            m.assertTrue(m.button(probe, catalog.action.WATCHLIST).active)
+            probe.findNode("actions").activated = catalog.action.WATCHLIST
+            m.assertFalse(m.button(probe, catalog.action.WATCHLIST).active)
+            m.assertEqual(probe.callFunc("landPersonal", 0, m.refused()), 1)
+            m.assertTrue(m.button(probe, catalog.action.WATCHLIST).active)
+        end sub
+
+        @it("puts back what the server last confirmed when the last of several writes is refused")
+        sub _()
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.movie({}))
+            for i = 1 to 3
+                probe.findNode("actions").activated = catalog.action.WATCHLIST
+            end for
+            m.assertTrue(m.button(probe, catalog.action.WATCHLIST).active)
+            ' The first PUT lands, the DELETE is replaced while it waits, and the last PUT fails.
+            m.assertEqual(probe.callFunc("landPersonal", 0, m.ok()), 0)
+            superseded = { requestId: "w", ok: false, status: 0, headers: {}, body: invalid, error: { kind: "cancelled", reason: "superseded" } }
+            m.assertEqual(probe.callFunc("landPersonal", 1, superseded), 0)
+            m.assertEqual(probe.callFunc("landPersonal", 2, m.refused()), 1)
+            m.assertTrue(m.button(probe, catalog.action.WATCHLIST).active, "the server holds the first PUT")
+        end sub
+
+        @it("leaves the page alone when a write is refused while a newer one is out")
+        sub _()
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.movie({}))
+            probe.findNode("actions").activated = catalog.action.WATCHLIST
+            probe.findNode("actions").activated = catalog.action.WATCHLIST
+            m.assertFalse(m.button(probe, catalog.action.WATCHLIST).active)
+            m.assertEqual(probe.callFunc("landPersonal", 0, m.refused()), 1)
+            m.assertFalse(m.button(probe, catalog.action.WATCHLIST).active, "the DELETE still out decides")
+            probe.callFunc("landPersonal", 1, m.refused())
+            m.assertFalse(m.button(probe, catalog.action.WATCHLIST).active, "nothing was confirmed: as read")
+        end sub
+
+        @it("tells list pages about a write that lands after the page closed")
+        sub _()
+            if not m.global.hasField("personalRevision") then m.global.addFields({ personalRevision: 0 })
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.movie({ in_watchlist: true }))
+            probe.findNode("actions").activated = catalog.action.WATCHLIST
+            probe.callFunc("release")
+            revision = m.global.personalRevision
+            m.assertEqual(probe.callFunc("landPersonal", 0, m.ok()), 0)
+            m.assertEqual(m.global.personalRevision, revision + 1)
+        end sub
+
+        @it("leaves Watchlist and Favorites out when the server does not offer the lists")
+        sub _()
+            m.global.personalLists = { key: "", available: false }
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.movie({}))
+            m.assertEqual(m.keys(probe), [catalog.action.PLAY, catalog.action.VERSION, catalog.action.AUDIO, catalog.action.SUBTITLES, catalog.action.MORE])
+            m.assertEqual(m.moreTitles(probe), ["Mark as Watched"])
+        end sub
+
+        @it("reads the capability itself when the shell has not, and follows later reads when shown again")
+        sub _()
+            m.global.personalLists = { key: "elsewhere", available: true }
+            probe = m.opened({ itemId: "movie:a" })
+            capability = m.sentIndex(probe, "personalLists", "/api/v2/capabilities/personal-lists")
+            m.assertTrue(capability >= 0, "another profile's answer is not used")
+            m.answer(probe, m.sentIndex(probe, "item", "/api/v2/catalog/items/movie:a"), m.movie({}))
+            m.assertInvalid(m.button(probe, catalog.action.WATCHLIST))
+            m.answer(probe, capability, tests.catalogData.fixture("get_personal_list_capability_ok"))
+            m.assertNotInvalid(m.button(probe, catalog.action.WATCHLIST))
+            m.assertEqual(m.global.personalLists, { key: "", available: true }, "kept for the next page")
+            m.global.personalLists = { key: "", available: false }
+            m.assertNotInvalid(m.button(probe, catalog.action.WATCHLIST), "the page does not observe the global node")
+            probe.callFunc("onShow", { first: false, restore: invalid, refresh: false, played: invalid })
+            m.assertInvalid(m.button(probe, catalog.action.WATCHLIST), "a later read is followed when the page shows again")
+        end sub
+
+        @describe("More")
+
+        @it("adds a movie to Favorites and marks it watched, then reads its watch state again")
+        sub _()
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.movie({}))
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark as Watched"])
+            probe.findNode("picker").picked = catalog.more.FAVORITE
+            writes = probe.callFunc("personalWrites")
+            m.assertEqual([writes[0].request.method, writes[0].request.path], ["PUT", "/api/v2/favorites/movie:a"])
+            m.assertEqual(m.moreTitles(probe), ["Remove from Favorites", "Mark as Watched"], "the menu shows the change at once")
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            writes = probe.callFunc("personalWrites")
+            m.assertEqual([writes[1].request.method, writes[1].request.path], ["POST", "/api/v2/watched/movie:a"])
+            reads = probe.callFunc("sent").Count()
+            probe.callFunc("landPersonal", 1, m.ok())
+            m.assertTrue(m.sentIndex(probe, "watch", "/api/v2/watch/movie:a") >= reads, "Play or Resume follows the server")
+            m.assertEqual(m.moreTitles(probe), ["Remove from Favorites", "Mark as Unwatched"])
+        end sub
+
+        @it("marks a watched movie unwatched, and puts it back when the server refuses")
+        sub _()
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.movie({ played: true, is_favorite: true }))
+            m.assertEqual(m.moreTitles(probe), ["Remove from Favorites", "Mark as Unwatched"])
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            writes = probe.callFunc("personalWrites")
+            m.assertEqual([writes[0].request.method, writes[0].request.path], ["DELETE", "/api/v2/watched/movie:a"])
+            m.assertEqual(probe.callFunc("landPersonal", 0, m.refused()), 1)
+            m.assertEqual(m.moreTitles(probe), ["Remove from Favorites", "Mark as Unwatched"])
+        end sub
+
+        @it("marks a series, the season shown, or the episode Play plays, and reads the episodes again")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1, 2], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark Series Watched", "Mark Season Watched", "Mark Episode Watched"])
+            probe.findNode("picker").picked = catalog.more.SEASON_WATCHED
+            writes = probe.callFunc("personalWrites")
+            m.assertEqual([writes[0].request.method, writes[0].request.path], ["POST", "/api/v2/watched/season:s1"])
+            m.assertEqual(m.moreTitles(probe)[2], "Mark Season Unwatched")
+            reads = probe.callFunc("sent").Count()
+            probe.callFunc("landPersonal", 0, m.ok())
+            m.assertTrue(m.sentIndex(probe, "refresh", m.episodesPath(1)) >= reads, "the season's check marks are read again")
+            probe.findNode("picker").picked = catalog.more.EPISODE_WATCHED
+            writes = probe.callFunc("personalWrites")
+            m.assertEqual([writes[1].request.method, writes[1].request.path], ["POST", "/api/v2/watched/episode:s1e2"])
+            m.assertEqual(m.moreTitles(probe)[3], "Mark Episode Unwatched")
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            writes = probe.callFunc("personalWrites")
+            m.assertEqual([writes[2].request.method, writes[2].request.path], ["POST", "/api/v2/watched/series:show"])
+        end sub
+
+        @it("reads the seasons again after an episode's mark, for More's season and series rows")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark Series Watched", "Mark Season Watched", "Mark Episode Watched"])
+            probe.findNode("picker").picked = catalog.more.EPISODE_WATCHED
+            reads = probe.callFunc("sent").Count()
+            probe.callFunc("landPersonal", 0, m.ok())
+            seasons = m.sentIndex(probe, "rollups", "/api/v2/catalog/series/series:show/seasons")
+            m.assertTrue(seasons >= reads, "the seasons are read again")
+            ' The episode was the season's last unwatched one.
+            m.answer(probe, seasons, { items: [{ content_id: "season:s1", season_number: 1, title: "", episode_count: 3, user_data: { watched_count: 3, unplayed_count: 0 } }] })
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark Series Unwatched", "Mark Season Unwatched", "Mark Episode Unwatched"])
+            ' And an episode marked unwatched again leaves both unwatched.
+            probe.findNode("picker").picked = catalog.more.EPISODE_WATCHED
+            probe.callFunc("landPersonal", 1, m.ok())
+            m.answer(probe, m.sentIndex(probe, "rollups", "/api/v2/catalog/series/series:show/seasons"), { items: [{ content_id: "season:s1", season_number: 1, title: "", episode_count: 3, user_data: { watched_count: 2, unplayed_count: 1 } }] })
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark Series Watched", "Mark Season Watched", "Mark Episode Watched"])
+        end sub
+
+        @it("keeps a newer watched change on a movie while a read after an earlier one lands")
+        sub _()
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.movie({}))
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            probe.callFunc("landPersonal", 0, m.ok())
+            read = m.sentIndex(probe, "watch", "/api/v2/watch/movie:a")
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            m.answer(probe, read, m.watched("movie:a", 0, true))
+            m.assertEqual(m.moreTitles(probe)[1], "Mark as Watched", "the DELETE still out decides")
+            probe.callFunc("landPersonal", 1, m.ok())
+            m.answer(probe, m.sentIndex(probe, "watch", "/api/v2/watch/movie:a"), m.watched("movie:a", 0, false))
+            m.assertEqual(m.moreTitles(probe)[1], "Mark as Watched")
+            ' Two more: the POST lands, and the DELETE after it is refused.
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            probe.callFunc("landPersonal", 2, m.ok())
+            m.assertEqual(m.moreTitles(probe)[1], "Mark as Watched")
+            reads = probe.callFunc("sent").Count()
+            probe.callFunc("landPersonal", 3, m.refused())
+            m.assertEqual(m.moreTitles(probe)[1], "Mark as Unwatched", "the server holds the POST")
+            m.assertTrue(m.sentIndex(probe, "watch", "/api/v2/watch/movie:a") >= reads, "and its watch state is read")
+        end sub
+
+        @it("keeps a newer episode or season change while the episodes read after an earlier one land")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            watched = m.episodes(1, 3)
+            for each episode in watched.items
+                episode.user_data = { played: true }
+            end for
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.EPISODE_WATCHED
+            probe.callFunc("landPersonal", 0, m.ok())
+            read = m.sentIndex(probe, "refresh", m.episodesPath(1))
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.EPISODE_WATCHED
+            m.answer(probe, read, watched)
+            m.assertEqual(m.moreTitles(probe)[3], "Mark Episode Watched", "the episode's DELETE still out decides")
+            probe.callFunc("landPersonal", 1, m.ok())
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.SEASON_WATCHED
+            probe.callFunc("landPersonal", 2, m.ok())
+            read = m.sentIndex(probe, "refresh", m.episodesPath(1))
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.SEASON_WATCHED
+            m.answer(probe, read, watched)
+            titles = m.moreTitles(probe)
+            m.assertEqual([titles[2], titles[3]], ["Mark Season Watched", "Mark Episode Watched"], "the season's DELETE still out decides")
+        end sub
+
+        @it("drops an episodes read that lands after a newer one for the same season")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            watched = m.episodes(1, 3)
+            for each episode in watched.items
+                episode.user_data = { played: true }
+            end for
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.EPISODE_WATCHED
+            probe.callFunc("landPersonal", 0, m.ok())
+            older = m.sentIndex(probe, "refresh", m.episodesPath(1))
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.EPISODE_WATCHED
+            probe.callFunc("landPersonal", 1, m.ok())
+            newer = m.sentIndex(probe, "refresh", m.episodesPath(1))
+            m.assertTrue(newer > older)
+            m.answer(probe, newer, m.episodes(1, 3))
+            m.answer(probe, older, watched)
+            m.assertEqual(m.moreTitles(probe)[3], "Mark Episode Watched", "the newer read decides")
+        end sub
+
+        @it("drops a watch state read after playback that lands after a newer read")
+        sub _()
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.movie({}))
+            probe.callFunc("markPlaying")
+            m.cover(probe)
+            m.returned(probe, { contentId: "movie:a", seasonNumber: -1 })
+            older = m.sentIndex(probe, "played", "/api/v2/watch/movie:a")
+            m.assertTrue(older >= 0)
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            probe.callFunc("landPersonal", 0, m.ok())
+            m.answer(probe, m.sentIndex(probe, "watch", "/api/v2/watch/movie:a"), m.watched("movie:a", 0, true))
+            m.answer(probe, older, m.watched("movie:a", 0, false))
+            m.assertEqual(m.moreTitles(probe)[1], "Mark as Unwatched", "the newer read decides")
+        end sub
+
+        @it("reads a season again whose first read left before a mark landed")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1, 2], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            probe.findNode("rail").focusedIndex = 2
+            neighbour = m.sentIndex(probe, "neighbour", m.episodesPath(2))
+            m.assertTrue(neighbour >= 0, "season 2 is read beside season 1")
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            probe.callFunc("landPersonal", 0, m.ok())
+            m.assertEqual(m.sentIndex(probe, "refresh", m.episodesPath(2)), -1, "season 2 is not held yet")
+            m.answer(probe, neighbour, m.episodes(2, 3))
+            m.assertTrue(m.sentIndex(probe, "refresh", m.episodesPath(2)) > neighbour, "its answer predates the mark: read again")
+        end sub
+
+        @it("reads the seasons again when their first read left before a mark landed")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.answer(probe, 0, m.series())
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark Series Watched"])
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            probe.callFunc("landPersonal", 0, m.ok())
+            watched = { items: [{ content_id: "season:s1", season_number: 1, title: "", episode_count: 3, user_data: { watched_count: 3, unplayed_count: 0 } }] }
+            m.answer(probe, m.sentIndex(probe, "rollups", "/api/v2/catalog/series/series:show/seasons"), watched)
+            reads = probe.callFunc("sent").Count()
+            m.answer(probe, 1, m.seasons([1]))
+            again = m.sentIndex(probe, "rollups", "/api/v2/catalog/series/series:show/seasons")
+            m.assertTrue(again >= reads, "its answer predates the mark: read again")
+            m.answer(probe, again, watched)
+            m.assertEqual(m.moreTitles(probe)[2], "Mark Season Unwatched")
+        end sub
+
+        @it("marks a series' seasons only once its last watched change lands")
+        sub _()
+            probe = m.opened({ itemId: "series:show" })
+            m.assertTrue(m.throughSeasons(probe, [1, 2], 1))
+            m.answer(probe, 2, m.episodes(1, 3))
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            m.moreTitles(probe)
+            probe.findNode("picker").picked = catalog.more.WATCHED
+            probe.callFunc("landPersonal", 0, m.ok())
+            titles = m.moreTitles(probe)
+            m.assertEqual([titles[1], titles[2]], ["Mark Series Watched", "Mark Season Watched"], "the DELETE still out decides")
+            probe.callFunc("landPersonal", 1, m.refused())
+            titles = m.moreTitles(probe)
+            m.assertEqual([titles[1], titles[2]], ["Mark Series Unwatched", "Mark Season Unwatched"], "the server holds the POST")
+        end sub
+
+        @it("reads the seasons again after playback, for More's season and series rows")
+        sub _()
+            probe = m.playedFrom("episode:s1e3", [1])
+            m.returned(probe, { contentId: "episode:s1e3", seasonNumber: 1, finished: true })
+            seasons = m.sentIndex(probe, "rollups", "/api/v2/catalog/series/series:show/seasons")
+            m.assertTrue(seasons >= 0, "the seasons are read again")
+            ' The episode played was the season's last unwatched one.
+            m.answer(probe, seasons, { items: [{ content_id: "season:s1", season_number: 1, title: "", episode_count: 4, user_data: { watched_count: 4, unplayed_count: 0 } }] })
+            titles = m.moreTitles(probe)
+            m.assertEqual([titles[1], titles[2]], ["Mark Series Unwatched", "Mark Season Unwatched"])
+            probe.callFunc("refreshAgain")
+            m.assertTrue(m.sentIndex(probe, "rollups", "/api/v2/catalog/series/series:show/seasons") > seasons, "and again with the second read")
+        end sub
+    end class
+end namespace

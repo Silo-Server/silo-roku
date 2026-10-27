@@ -16,7 +16,7 @@
 # The commit defaults to the pin below; fetch it in the checkout first.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-pinned=2b88b1bbcf897621f25fbd8f3e97cbdd9e9838f7
+pinned=bca55f764bc73c5cc73468df3777208350952bd1
 server=${1:?usage: scripts/sync-fixtures.sh <silo-server checkout> [commit]}
 commit=${2:-$pinned}
 
@@ -31,7 +31,7 @@ import sys
 
 REPOSITORY = "https://github.com/Silo-Server/silo-server"
 # Request bodies the client serializes; their $ref closure is kept.
-ROOTS = ["PlaybackStartBody", "PlaybackReplanBody", "PlaybackProgressBody", "PlaybackStopBody", "PlaybackRouteEventBody"]
+ROOTS = ["PlaybackStartBody", "PlaybackReplanBody", "PlaybackProgressBody", "PlaybackStopBody", "PlaybackRouteEventBody", "HistoryRemoveInputBody"]
 OPERATIONS = {
     "getPlaybackCapabilities", "startPlayback", "replanPlayback", "updatePlaybackProgress", "stopPlayback", "reportPlaybackRouteEvent",
     # Server setup, sign-in, and profiles (source/auth/).
@@ -47,6 +47,9 @@ CATALOG = {
     "getPerson", "listSimilar", "getLibraryCollections",
     # The detail page's remembered audio and subtitle tracks (catalog.request.savePreference).
     "getAudioPreference", "updateAudioPreference", "deleteAudioPreference", "updateSubtitlePreference", "deleteSubtitlePreference",
+    # Watchlist, Favorites, History, and watched state (source/catalog/personal.bs).
+    "getPersonalListCapability", "listWatchlist", "addToWatchlist", "deleteWatchlistEntry", "listFavorites", "addFavorite",
+    "deleteFavorite", "listHistory", "removeHistoryEntries", "markWatched", "unmarkWatched",
 }
 OPERATIONS |= CATALOG
 # The keys Settings edits (settings.supportedControls).

@@ -6,6 +6,11 @@
   versions.png   a rounded frame with two layers stacked behind it: Versions
   audio.png      a speaker with two sound waves: Audio
   subtitles.png  a rounded frame with two lines of text: Subtitles
+  bookmark.png   a bookmark's outline: Watchlist, not on the list
+  bookmark_fill.png
+                 the bookmark filled: Watchlist, on the list (tvOS's
+                 bookmark and bookmark.fill)
+  more.png       three dots in a row: More (tvOS's ellipsis)
   check.png      a bold check mark, 26 px: the choice in the Version, Audio
                  Tracks, and Subtitles menus (tvOS's 20 pt bold checkmark in
                  its 26 pt column)
@@ -152,6 +157,48 @@ def subtitles(size):
     return coverage(size, covered, GLYPH_SCALE)
 
 
+def bookmark_outline(size):
+    """A tall rectangle whose foot is cut by a V up to 0.66 of the height."""
+    left, right, top, bottom, notch = size * 0.24, size * 0.76, size * 0.10, size * 0.90, size * 0.66
+    cx = size / 2
+    edges = ((left, top, right, top), (right, top, right, bottom), (right, bottom, cx, notch),
+             (cx, notch, left, bottom), (left, bottom, left, top))
+
+    def covered(x, y):
+        return any(segment_distance(x, y, *edge) <= STROKE / 2 for edge in edges)
+    return coverage(size, covered, GLYPH_SCALE)
+
+
+def bookmark_fill(size):
+    """The bookmark's outline, filled."""
+    left, right, top, bottom, notch = size * 0.24, size * 0.76, size * 0.10, size * 0.90, size * 0.66
+    cx = size / 2
+    half = STROKE / 2
+    outline = bookmark_outline(size)
+    l, r, t, b = left - half, right + half, top - half, bottom + half
+
+    def covered(x, y):
+        if not (l <= x <= r and t <= y <= b):
+            return False
+        # Below the notch's V is outside: the V runs from the feet to the notch.
+        if y > notch:
+            depth = (y - notch) / (bottom - notch)
+            return abs(x - cx) >= depth * (cx - left) - half
+        return True
+    filled = coverage(size, covered, GLYPH_SCALE)
+    return [[a if a[3] >= f[3] else f for a, f in zip(row_a, row_f)] for row_a, row_f in zip(outline, filled)]
+
+
+def more(size):
+    """Three discs across the middle, as tvOS's ellipsis."""
+    radius = size * 0.085
+    centres = [(size * x, size / 2) for x in (0.20, 0.50, 0.80)]
+
+    def covered(x, y):
+        return any(math.hypot(x - cx, y - cy) <= radius for cx, cy in centres)
+    return coverage(size, covered, GLYPH_SCALE)
+
+
 def check(size):
     """SF Symbols' checkmark at its bold weight: a short stroke down to the
     foot and a long one up to the right, round-capped."""
@@ -200,6 +247,9 @@ def images():
     yield "versions.png", versions(GLYPH)
     yield "audio.png", audio(GLYPH)
     yield "subtitles.png", subtitles(GLYPH)
+    yield "bookmark.png", bookmark_outline(GLYPH)
+    yield "bookmark_fill.png", bookmark_fill(GLYPH)
+    yield "more.png", more(GLYPH)
     yield "check.png", check(CHECK)
     for radius in FILL_RADII:
         yield f"rounded_{radius}_fill_fhd.9.png", rounded_fill(radius)

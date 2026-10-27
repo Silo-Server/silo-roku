@@ -2,7 +2,8 @@
 # Rewrite tests/fixtures/golden/ from the bodies the serializer and the session
 # reducer produce now. Runs the headless tests and writes every
 # "GOLDEN <path> <body>" failure the playback contract spec
-# (tests/playback/contract.spec.bs) reports in
+# (tests/playback/contract.spec.bs) and the personal lists spec
+# (tests/catalog/personal.spec.bs) report in
 # reports/junit.xml. Goldens are the contract: review the diff, then run
 # npm run check:contract before committing.
 set -euo pipefail
@@ -24,7 +25,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 report, root = sys.argv[1], pathlib.Path(sys.argv[2]).resolve()
-line = re.compile(r"GOLDEN ((?:start|replan|progress|stop|route-event)/[a-z0-9-]+\.json) (\{.*\})$")
+line = re.compile(r"GOLDEN ((?:start|replan|progress|stop|route-event|history-remove)/[a-z0-9-]+\.json) (\{.*\})$")
 written = set()
 for node in ET.parse(report).iter():
     if node.tag not in ("failure", "error"):

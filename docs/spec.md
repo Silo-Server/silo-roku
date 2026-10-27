@@ -112,6 +112,17 @@ Browse:
   and the server's external ratings, Home's quality badges, and the
   profile's title-art preference (`ui.title_art`).
 
+Personal lists:
+
+- Watchlist, Favorites, and History pages, opened from the avatar menu;
+  Watchlist and Favorites show only when the server offers them
+  (`GET /api/v2/capabilities/personal-lists`);
+- the detail page's Watchlist button and More menu: add to or remove from
+  the Watchlist and Favorites, and mark a movie, a series, the season shown,
+  or the episode Play plays watched or unwatched;
+- Options (*) on a list page's card removes it from that list, or its
+  watches from History.
+
 Play:
 
 - play, resume, or start over from server watch state;
@@ -151,9 +162,6 @@ item is built, tvOS first where both have it (section 5.1).
 
 Planned:
 
-- Watchlist, Favorites, and History screens, with the add and remove
-  toggles and mark watched or unwatched (tvOS, Android TV); until then,
-  server rows that contain this data still display on Home;
 - full person pages with filmography (tvOS, Android TV), replacing the
   first release's person panel (section 5.9);
 - trailers and extras in the detail page's Trailers & More rail (tvOS,
@@ -305,9 +313,9 @@ describes the target and the code does not match it yet.
 The values below were read from silo-apple `b90a86ea` and silo-android
 `0545b85de` on 2026-10-23. When tvOS changes a first-release screen, this
 section changes with it. Screens outside the first-release scope are not
-described. Where a deferred control has a fixed place on tvOS (Watchlist and
-More in the detail action row; Collections in the library list; Trailers &
-More above Details), Roku leaves that place free. The card captions and
+described. Where a deferred control has a fixed place on tvOS (Collections
+in the library list; Trailers & More above Details), Roku leaves that place
+free. The card captions and
 detail cast and recommendations were checked against silo-apple `b514800f`
 on 2026-10-25.
 
@@ -386,9 +394,16 @@ their existing HD/FHD assets.
   - Panel: 460 px wide, top at 132, right edge at the right inset, padding 14.
   - Header: a 44 px avatar; the profile's name in 24 px SemiBold; the
     server's display name in uppercase, 14 px, letter-spaced, at 38%.
-  - Rows: Switch Profile, Settings, Switch Server, and Sign Out, 54 px tall (22 px
-    SemiBold, 16 px inset), 10 px apart. A focused row gets a white fill with
-    radius 14; resting labels are at 86%, and Sign Out is red at 90%.
+  - Rows: Switch Profile, Watchlist, Favorites, and History; then Settings;
+    then Switch Server and Sign Out. They are 54 px tall (22 px SemiBold,
+    16 px inset), 10 px apart. A focused row gets a white fill with radius
+    14; resting labels are at 86%, and Sign Out is red at 90%.
+  - Watchlist and Favorites show only when
+    `GET /api/v2/capabilities/personal-lists` answers `state` `available`
+    and `allowed` true for the profile. Each page with the bar reads it as
+    it starts; a failed read or an older server without the document leaves
+    them out. A menu open before the read lands is built again when it
+    does, keeping its highlighted row. History always shows.
   - A divider separates groups only.
   - Sign Out asks for confirmation (Sign Out / Cancel).
 - **Library list** (Movies or Series).
@@ -637,6 +652,35 @@ their existing HD/FHD assets.
     standard empty state or Retry.
   - These pages are read-only. Creating, editing, and deleting collections
     remain deferred.
+- **Watchlist, Favorites, and History.** The avatar menu's rows push one
+  page each, without the top bar (5.9).
+  - The list's name ("Watchlist", "Favorites", "History") at the
+    Collections page's place and size; History adds a count of the items
+    read so far, "40+ items" while more remain and "523 items" or "1 item"
+    once the end is read, as tvOS counts it.
+  - Browse's grid of 260×390 posters below it, newest first: the list's
+    own endpoint (`/api/v2/watchlist`, `/api/v2/favorites`,
+    `/api/v2/history`), 40 a page, held and paged as Browse is. History
+    lists one card per title, a series for its episodes' watches.
+  - OK on a card opens its detail page. Options (*) on a card opens a
+    one-row menu under the card's title: Remove from Watchlist, Remove from
+    Favorites, or Remove from History (5.9). OK sends the removal, and the
+    card leaves the grid once the server agrees, the cards after it moving
+    up; when the grid no longer holds the card (it is reading the list
+    again after a change elsewhere, a read that may predate the removal),
+    the page reads the list again instead. A refusal keeps the card and
+    shows the failure notice (section 5.6).
+  - Empty: "Watchlist is empty" / "Add titles from a detail page and they
+    will appear here."; "No favorites" / "Add favorites from a detail page
+    and they will appear here."; "No watch history" / "Items you watch will
+    appear here", each with a Back button. A failed first read shows the
+    Browse error with Retry.
+  - After a personal change anywhere in the app (a detail page's toggle,
+    including one that lands after its page closed), the page reads its
+    list again and returns focus to the card it was on: at once while it
+    shows, else when shown again. It also reads again when shown after the
+    player closes, since playback moves History's order and a card's
+    progress.
 - **Empty states.**
   - Home: "Nothing to watch yet" / "Add media to your libraries or start
     watching to see it here."
@@ -698,7 +742,8 @@ their existing HD/FHD assets.
     in a fixed 435 px block, so the row stays at y 557.
 - **Action row.** Play, or "Resume 1:02:03" ("Resume 12:34" under an hour), or
   for a series "Play S2:E3" or "Resume S1:E3", then Start Over when a resume
-  point exists, then Versions, Audio Tracks, and Subtitles. Resume appears
+  point exists, then Versions, Audio Tracks, and Subtitles, then Watchlist
+  and More once the item is read. Resume appears
   once the saved position passes 30 seconds and is more than 5 seconds from
   the end, whether or not the server counts the item played: the server
   zeroes the position when it marks an item played and keeps it played
@@ -719,6 +764,55 @@ their existing HD/FHD assets.
     open, and the menu follows the button during expansion.
   - Focus starts on Play; Left and Right move along the row. Play and Resume
     start where the watch state says (section 5.7); Start Over starts at 0.
+- **Watchlist and More.** As tvOS's `TVDetailActionRow` ends a movie or
+  series row. A series with nothing to play keeps the two.
+  - Watchlist is a circle with a bookmark, filled while the item is on the
+    list, labelled "Watchlist" when focused; the audio guide says "Add to
+    watchlist" or "Remove from watchlist". OK changes it at once and sends
+    `PUT` or `DELETE /api/v2/watchlist/{id}`. It shows only when the server
+    offers the lists (section 5.3).
+  - More is a circle with three dots. OK opens its menu, the Versions
+    menu's popover with the title "MORE" and no check marks: Add to
+    Favorites or Remove from Favorites (only when the server offers the
+    lists), then on a movie Mark as Watched or Mark as Unwatched; on a
+    series Mark Series Watched or Unwatched, Mark Season Watched or
+    Unwatched for the season shown, and Mark Episode Watched or Unwatched
+    for the episode Play plays (5.9). The menu holds nothing else (5.9).
+  - The flags come from the item's `user_state` (`in_watchlist`,
+    `is_favorite`) and watched state (`user_data.played`, a season's counts
+    of unplayed and watched episodes, an episode card's `played`). A change
+    shows at once and sends `PUT`/`DELETE /api/v2/favorites/{id}` or
+    `POST`/`DELETE /api/v2/watched/{id}`; the writes for one item and list
+    go one at a time, the latest replacing one still waiting.
+  - Once the last write for a watched change lands, the page reads the
+    touched episodes again (a series' loaded seasons, else the season) for
+    their check marks; on a series its seasons, for each season's counts
+    and whether the series counts as watched (every season with episodes
+    watched, as tvOS's `refreshWatchedSeason`), which More's Mark Season
+    and Mark Series rows follow; and the action row's target for Play or
+    Resume, since the server clears a resume point it marks. A series page
+    also reads its seasons again when the player closes over it, with the
+    watch state. A read that lands while a write is still out keeps what
+    the page shows for what that write covers: a movie's watched flag, an
+    episode card's flag under a mark for the episode, its season, or the
+    series, a season's counts under one for the season or the series. Of
+    two reads of the same thing (a watch state, a season's episodes, the
+    series' seasons), one that lands after a newer one is dropped, and a
+    first read of the seasons or of a season's episodes that left before a
+    watched change landed is read again.
+  - A refused change goes back to what the server last confirmed for it,
+    once no newer write for it is out, and the page reads again what it
+    covers when an earlier write was applied or a read was held back for
+    it. "Couldn't update item. Your change wasn't saved." shows top centre
+    over every screen for four seconds, drawn as a phone's connection
+    notice is (5.9).
+  - A write outlives its page: Back can take the page before the answer.
+    The scene hears every write land, so an applied one still makes the
+    list pages read again and a refused one still shows the notice. A page
+    open on the same item, such as the item opened again before the write
+    landed, shows a Watchlist or Favorites change as applied, unless a
+    write of its own for it is out, and reads again what a watched change
+    moves.
 - **Version, audio, and subtitles.** As tvOS ships them (D1; silo-apple
   `b90a86ea`, `TVPlaybackSelectorRow.swift` and `TVDetailHero.swift`; the
   design spec's squared selector row with an Edition selector was not
@@ -1286,7 +1380,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A focused card scales by one factor (a poster 1.14) about its centre | Each side grows by whole px, so the two axes differ slightly: a row's poster lifts to 202×302, Browse's to 286×428, Search's to 266×398, a landscape card to 432×240, a detail episode still to 388×216. The card scales about its top-left corner and moves back by that lift (a landscape card 36 and 20 px), so its left and top edges are whole px exactly | At a fractional edge Roku drew the art a pixel past the 9-patch frame that rounds the corners, a white line down a lifted card's right edge (hardware run 26). Scaled about its centre, a float's 1.2 put the first Continue Watching card's left edge at x 43.99998, and Roku drew its progress bar, a Rectangle, from x 43, a tick left of the frame's corner (runs 26 and 27) |
 | The detail Subtitles menu leads with the profile's subtitle language; the player's list with the watch projection's effective subtitle language | Both lead with the projection's `effective_subtitle_language`, so the detail menu and Options' Subtitles list the same tracks in the same order and words. Each lists its own source, as on tvOS: the detail menu the version's tracks, Options the plan's inventory, so a sidecar only the plan names shows only in Options | The two lists disagreed on hardware run 27: Options listed the server's order and hid titles the detail menu showed. A detail pick is an ordinal into the projection's list, so the detail menu cannot offer a track the projection does not name |
 | A subtitle's title shows unless it is a release name, a format, a flag, or its language | A title that is a subtitle file's name ("Heat (1995).en.srt") is dropped too, on the detail menu and in Options | The server gives an untitled sidecar its file's name as its title and its inventory label (hardware run 6) |
-| Avatar menu rows have an icon before the label | Labels without icons | No icon art ships for the menu |
+| Avatar menu rows, and the detail page's More menu rows, have an icon before the label | Labels without icons; More's rows keep the Versions menu's empty check column | No icon art ships for the menus; More reuses the Versions menu (section 5.6) |
 | The library list marks the current library with a check mark and gives each library and section an icon; the sort menu checks the current sort | The current library has the selected tab's white 14% fill, without icons; the current sort shows only its direction and arrow | The packaged Inter subset has no check mark, and no icon art ships |
 | Switching tabs cross-fades the page over 200 ms while the top bar stays | The new page appears at once | Each root page draws its own top bar (one root page alive, plan sections 4.5 and 4.7), so fading the page would blink the bar |
 | The hero's logo shows as soon as it is decoded | The logo loads once focus rests 150 ms on the card, with the backdrop; the text title shows until then | Decoding a logo for every card passed while scrolling churns texture memory on 512 MB devices |
@@ -1328,7 +1422,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The episode rail keeps the five seasons nearest the one shown, and reads the seasons either side in the background | It keeps three, and reads the next (or previous) season once focus is two cards from the rail's end | Implementation plan section 4.8 bounds the metadata and cards kept on 512 MB devices |
 | Resting on a season pill switches season after 70 ms | After 300 ms | A season not yet read is read when the viewer stops on it, and its cards replace the rail's; switching only where the viewer stops keeps requests and texture churn down on 512 MB devices |
 | While a series' episodes load, Play reads "Loading episodes…" and is disabled | Play plays the server's play target at once and names its episode when the episodes arrive | The server names the play target (section 8.3), so nothing has to wait |
-| More › Show Series Info (tvOS) or a Show capsule (Android TV) puts the series back in the hero | The hero keeps the last episode focused | Section 5.6 lists only season pills, and More is not in the first release |
+| More › Show Series Info (tvOS) or a Show capsule (Android TV) puts the series back in the hero | The hero keeps the last episode focused | More ships without Show Series Info (the "More also offers" row below; scope, sections 3.3 and 3.4), and section 5.6 lists only season pills |
 | Both apps hide episode spoilers per the profile's settings | Episode titles, stills, and synopses always show | Spoiler hiding is deferred (section 3.3, D10) |
 | The Details table has no Genres row | Genres is a row (Android TV) | The metadata line shows only the first two genres |
 | A detail page visited lately paints at once from a cache of 20 pages and refreshes quietly | Every visit reads the page again, painting the card's seed meanwhile | Implementation plan section 4.8 bounds the metadata kept on 512 MB devices |
@@ -1367,7 +1461,15 @@ Roku as it is, and the work package that builds the change deletes the row.
 | An On Deck item without a backdrop or still reads its detail for one, and is left out without | It shows as Home's Continue Watching card does, its poster standing in | A detail read per card is avoided; Home's cards make the same choice |
 | A screen-level error puts a headline for its cause ("Something went wrong", "Not found") over its message, with Try Again | Home, the libraries, detail, and the profile picker show their one-sentence message as the error's title, without a second line, and Search its own title over a line; the button reads Retry (Try again on the picker) | The client's error copy is one sentence per screen (`locale/`); a copy change of its own adds headlines by cause (assumption AG-285) |
 | Full person page | A person panel with six biography lines and up to 24 mixed movie/series titles | Keeps person navigation within detail-page scope and bounded memory |
-| Watchlist and More buttons; trailers; Filter and Shuffle; people, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watchlist, Favorites, and History in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; theme music; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| Watchlist and Favorites are root pages under the top bar, which stays with the avatar; History is a pushed page | All three are pushed pages without the bar; Back returns to the page below with focus on the avatar | One page type for the three lists; the bar's selected tab has no state for a page that belongs to no tab |
+| Watchlist and Favorites read the whole list (up to 100 pages of 200) into an 8-column grid of 176 px posters; History reads `GET /api/v2/catalog?source=history` 60 at a time | Each list reads its own endpoint (`/api/v2/watchlist`, `/api/v2/favorites`, `/api/v2/history`) 40 at a time into Browse's six-column grid of 260×390 posters, holding at most the memory policy's pages | One bounded grid (`catalog.grid`) and its memory budget for every paged list (plan section 4.8); the contract's own list endpoints |
+| Watchlist's empty state says "Tap the bookmark icon on any item to add it here", Favorites' "Tap the heart icon on any item to add it here" | "Add titles from a detail page and they will appear here." and "Add favorites from a detail page and they will appear here." (the iOS words), with a Back button | A remote has no tap, and a page without the bar needs a way out from its empty state |
+| A card's context menu (press and hold) offers Mark as Watched, Favorites, and Watchlist; a Watchlist or Favorites page drops a card whose flag turns off. History offers no removal | Options (*) on a list page's card offers one row: Remove from Watchlist, Remove from Favorites, or Remove from History (`POST /api/v2/history/remove`, the card's item, which for a series covers its episodes) | Roku has no press and hold; the phase's scope is removal from the lists, including the server's History removal |
+| An episode card's context menu marks that episode watched or unwatched | More on a series page has Mark Episode Watched or Unwatched for the episode Play plays (the active one) | Roku's episode rail has no context menu; the action row already names that episode |
+| More also offers Find Trailers, Translate Description, Shuffle, Show Series Info, and Watch Party where they apply | Favorites and the watched rows only | Scope (sections 3.3 and 3.4) |
+| Watchlist and Favorites always show (neither tvOS nor Android TV reads a capability) | They show only when `GET /api/v2/capabilities/personal-lists` answers `available` and `allowed`: the avatar rows, the Watchlist button, and More's Favorites row | The phase gates them on the server's capability (assumption AG-323); an older server without the document hides them |
+| A refused change shows the alert "Couldn't Update Item" / "Your change wasn't saved. Please try again."; an unanswered one is held until the viewer discards it | The change goes back and "Couldn't update item. Your change wasn't saved." shows top centre for four seconds; an unanswered write counts as refused and nothing is held | Roku's passive notice line needs no focus; no held-change list is kept (assumption AG-326) |
+| Trailers; Filter and Shuffle; people, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker; theme music; the buffering-quality pill and prompts | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
 
 ## 6. Application architecture
 
@@ -1637,7 +1739,15 @@ The first release consumes:
   `/api/v2/subtitle-prefs/{key}`, for the audio and subtitle tracks the
   profile chose on a detail page (section 8.5);
 - `GET /api/v2/settings/values/effective` for the profile's preferences;
-- `GET /api/v2/theme/branding` for server branding.
+- `GET /api/v2/theme/branding` for server branding;
+- `GET /api/v2/capabilities/personal-lists` for whether Watchlist and
+  Favorites show;
+- `GET /api/v2/watchlist`, `/api/v2/favorites`, and `/api/v2/history`, 40
+  cards a page with cursor pagination and the artwork widths, for the list
+  pages; `PUT` and `DELETE` on `/api/v2/watchlist/{id}` and
+  `/api/v2/favorites/{id}`; `POST /api/v2/history/remove` with one target;
+- `POST` and `DELETE /api/v2/watched/{id}` to mark a movie, episode,
+  season, or series watched or unwatched.
 
 ### 8.2 Loading rules
 

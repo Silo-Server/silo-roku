@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate the serializer's and session reducer's golden bodies against the
-server contract.
+"""Validate the serializer's and session reducer's golden bodies, and the
+History page's removal body, against the server contract.
 
 Every tests/fixtures/golden/<kind>/*.json must be a valid body of its kind
-(GOLDEN below: start, replan, progress, stop, route-event), checked three ways:
+(GOLDEN below: start, replan, progress, stop, route-event, and
+history-remove, which is checked against its schema only), checked three ways:
 
 1. The vendored schema subset (tests/fixtures/openapi/playback-v3.json, from
    scripts/sync-fixtures.sh): required members, additionalProperties, types,
@@ -49,7 +50,11 @@ GOLDEN = {
     "progress": "PlaybackProgressBody",
     "stop": "PlaybackStopBody",
     "route-event": "PlaybackRouteEventBody",
+    # The History page's removal (catalog.personal.removeHistory): the schema
+    # alone, as the server adds no rule beyond it.
+    "history-remove": "HistoryRemoveInputBody",
 }
+PLAYBACK = {"start", "replan", "progress", "stop", "route-event"}
 REQUESTS = {
     "startPlayback": "PlaybackStartBody",
     "replanPlayback": "PlaybackReplanBody",
@@ -362,7 +367,7 @@ def client_problems(body):
 def problems(body, kind):
     errors = []
     walk({"$ref": f"#/components/schemas/{GOLDEN[kind]}"}, body, kind, errors)
-    if errors:
+    if errors or kind not in PLAYBACK:
         return errors
     if kind not in ("start", "replan"):
         return [f"server: {e}" for e in session_problems(body, kind)]

@@ -1,0 +1,194 @@
+import "pkg:/source/catalog/art.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' The profile's personal lists (spec sections 5.3 and 5.6): the Watchlist,
+' Favorites, and History pages, the detail page's Watchlist and Favorites
+' toggles, and Mark as Watched or Unwatched. Pure: request builders for
+' api.send and the small decisions the screens make; nothing is sent here.
+namespace catalog.personal
+    ' The lists, as the avatar menu keys and the route's list param name
+    ' them; each is also its /api/v2 collection.
+    const WATCHLIST = "watchlist"
+    const FAVORITES = "favorites"
+    const HISTORY = "history"
+
+    ' GET /api/v2/capabilities/personal-lists, mapped to { available }
+    ' (catalog.personal.capability).
+    function capabilityRequest() as Object
+        return catalog.request.read("/api/v2/capabilities/personal-lists", {}, { kind: catalog.kind.PERSONAL_LISTS })
+    end function
+
+    ' The capability document as the client reads it: Watchlist and
+    ' Favorites show only when the server says the lists are available to
+    ' this profile. invalid when the body is not one.
+    function capability(body as Dynamic) as Dynamic
+        if not util.isObject(body) or not util.isString(body.state) then return invalid
+        return { available: body.state = "available" and util.isTrue(body.allowed) }
+    end function
+
+    ' Whether a read of the capability ({ ok, body }, api.resultOf) offers
+    ' the lists. A server without the document (404) or any failure leaves
+    ' them out, as an older server has neither the document nor the
+    ' membership reads.
+    function availableFrom(result as Dynamic) as Boolean
+        if not util.isObject(result) or not util.isTrue(result.ok) or not util.isObject(result.body) then return false
+        return util.isTrue(result.body.available)
+    end function
+
+    ' The key m.global.personalLists is kept under: the server and profile
+    ' it was read for, so another profile's answer is never used.
+    function capabilityKey(origin as String, profileId as String) as String
+        return origin + "|" + profileId
+    end function
+
+    ' One page of a list for a grid (catalog.grid, components/views/BrowseGrid):
+    ' newest first, cursor "" for the first page. The answers are catalog
+    ' cards, mapped as a /catalog page is (catalog.kind.PAGE).
+    function listRequest(list as String, cursor as String, limit as Integer, lowTier as Boolean) as Dynamic
+        if not isList(list) then return invalid
+        query = catalog.art.query(lowTier)
+        query.limit = limit
+        if cursor <> "" then query.cursor = cursor
+        return catalog.request.read("/api/v2/" + list, query, { kind: catalog.kind.PAGE })
+    end function
+
+    function isList(list as String) as Boolean
+        return list = WATCHLIST or list = FAVORITES or list = HISTORY
+    end function
+
+    ' Adds the item to the Watchlist or Favorites (PUT), or removes it
+    ' (DELETE). The writes for one list and item go one at a time, in the
+    ' order sent, a waiting one giving way to a newer one, so the last
+    ' toggle is what the server keeps (api.router.order).
+    function membership(list as String, id as String, included as Boolean) as Dynamic
+        if (list <> WATCHLIST and list <> FAVORITES) or id = "" then return invalid
+        return write(included, "PUT", "/api/v2/" + list + "/" + catalog.request.segment(id))
+    end function
+
+    ' Marks a movie, episode, season, or series watched (POST) or unwatched
+    ' (DELETE); a season or series covers its episodes.
+    function watched(id as String, played as Boolean) as Dynamic
+        if id = "" then return invalid
+        return write(played, "POST", "/api/v2/watched/" + catalog.request.segment(id))
+    end function
+
+    ' Hides an item's watches from the History page; a series or season
+    ' card covers its episodes.
+    function removeHistory(id as String) as Dynamic
+        if id = "" then return invalid
+        return { method: "POST", path: "/api/v2/history/remove", body: historyRemoveBody(id), auth: "profile", lane: "interactive" }
+    end function
+
+    ' HistoryRemoveInputBody for one card: the item itself (scope "item",
+    ' the server's default, left out).
+    function historyRemoveBody(id as String) as Object
+        return { targets: [{ content_id: id }] }
+    end function
+
+    function write(adding as Boolean, method as String, path as String) as Object
+        if not adding then method = "DELETE"
+        return { method: method, path: path, auth: "profile", lane: "interactive", orderKey: path }
+    end function
+
+    ' History's count line as tvOS words it: "1 item", "523 items" once
+    ' the end is read, else "40+ items"; "" before any. copy is the strings
+    ' table (i18n.load).
+    function countText(count as Integer, complete as Boolean, copy as Object) as String
+        if count <= 0 then return ""
+        if not complete then return i18n.format(i18n.lookup(copy, "personal.countMore"), { count: count })
+        if count = 1 then return i18n.lookup(copy, "personal.countOne")
+        return i18n.format(i18n.lookup(copy, "personal.countOther"), { count: count })
+    end function
+
+    ' The menu row that removes a card from its page (Options on a card):
+    ' the strings key of its label.
+    function removeLabelKey(list as String) as String
+        return "personal." + list + ".remove"
+    end function
+
+    ' --- The detail page's More menu (spec section 5.6) ---------------------
+
+    ' The More menu's rows, in tvOS's order (TVMovieDetailView,
+    ' TVSeriesDetailView): Add to or Remove from Favorites when the server
+    ' offers the lists, then Mark as Watched or Unwatched; a series names the
+    ' series, the season shown, and the episode the action row plays.
+    ' state: { lists, series, isFavorite, played, season, seasonPlayed,
+    ' episode, episodePlayed } where season and episode say whether there is
+    ' one. Labels are strings keys (catalog.personal.moreRows).
+    function moreRows(state as Object) as Object
+        out = []
+        if util.isTrue(state.lists)
+            key = "detail.more.addFavorite"
+            if util.isTrue(state.isFavorite) then key = "detail.more.removeFavorite"
+            out.Push({ value: catalog.more.FAVORITE, key: key })
+        end if
+        if util.isTrue(state.series)
+            out.Push({ value: catalog.more.WATCHED, key: watchedKey("Series", state.played) })
+            if util.isTrue(state.season) then out.Push({ value: catalog.more.SEASON_WATCHED, key: watchedKey("Season", state.seasonPlayed) })
+            if util.isTrue(state.episode) then out.Push({ value: catalog.more.EPISODE_WATCHED, key: watchedKey("Episode", state.episodePlayed) })
+        else
+            out.Push({ value: catalog.more.WATCHED, key: watchedKey("", state.played) })
+        end if
+        return out
+    end function
+
+    ' "detail.more.markWatched", or for a subject "detail.more.markSeriesUnwatched".
+    function watchedKey(subject as String, played as Dynamic) as String
+        state = "Watched"
+        if util.isTrue(played) then state = "Unwatched"
+        return "detail.more.mark" + subject + state
+    end function
+
+    ' Whether a season counts as watched for the menu (tvOS reads the
+    ' season's played flag): it has episodes and none is unplayed, from its
+    ' catalog.series.rollup.
+    function seasonPlayed(rollup as Dynamic) as Boolean
+        if not util.isObject(rollup) then return false
+        return rollup.unplayed = 0 and rollup.watched > 0
+    end function
+
+    ' Whether a series counts as watched from its seasons' rollups (tvOS's
+    ' refreshWatchedSeason): it has a season with episodes, and every such
+    ' season counts as watched (seasonPlayed).
+    function seriesPlayed(rollups as Dynamic) as Boolean
+        if type(rollups) <> "roArray" then return false
+        any = false
+        for each rollup in rollups
+            if util.isObject(rollup) and (rollup.episodes > 0 or rollup.watched + rollup.unplayed > 0)
+                if not seasonPlayed(rollup) then return false
+                any = true
+            end if
+        end for
+        return any
+    end function
+
+    ' A season's rollup after it was marked watched (played) or unwatched,
+    ' until its episodes are read again.
+    function markedRollup(rollup as Object, played as Boolean) as Object
+        out = {}
+        out.Append(rollup)
+        count = rollup.watched + rollup.unplayed
+        if rollup.episodes > count then count = rollup.episodes
+        if count < 1 then count = 1
+        if played
+            out.watched = count
+            out.unplayed = 0
+        else
+            out.watched = 0
+            out.unplayed = count
+        end if
+        out.inProgress = false
+        return out
+    end function
+end namespace
+
+' What a row of the detail page's More menu does: its picker value
+' (catalog.personal.moreRows).
+namespace catalog.more
+    const FAVORITE = 1
+    const WATCHED = 2
+    const SEASON_WATCHED = 3
+    const EPISODE_WATCHED = 4
+end namespace

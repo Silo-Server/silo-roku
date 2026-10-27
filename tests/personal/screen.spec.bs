@@ -1,0 +1,245 @@
+namespace tests
+    ' The Watchlist, Favorites, and History pages (spec section 5.3), on the
+    ' test scene (tests/helpers/scene.bs).
+    @suite("personal list screens")
+    class PersonalListScreenTests extends rooibos.BaseTestSuite
+        protected override sub beforeEach()
+            if not m.global.hasField("personalRevision") then m.global.addFields({ personalRevision: 0 })
+        end sub
+
+        protected override sub afterEach()
+            for each child in m.top.getChildren(-1, 0)
+                if child.subtype() = "PersonalListScreenProbe" then m.top.removeChild(child)
+            end for
+        end sub
+
+        function opened(list as String) as Object
+            theme.install()
+            tests.scene.reset()
+            node = CreateObject("roSGNode", "PersonalListScreenProbe")
+            node.entry = { id: "personal", route: nav.route.PERSONAL, params: { list: list } }
+            node.owner = "personal-" + list
+            m.top.appendChild(node)
+            node.visible = true
+            node.callFunc("onShow", { first: true, restore: invalid, refresh: false })
+            return node
+        end function
+
+        function page(count as Integer, more as Boolean) as Object
+            body = { items: tests.catalogData.items(count) }
+            body.page = { has_more: more }
+            if more then body.page.next_cursor = "eyJ2IjoxfQ"
+            return body
+        end function
+
+        function cards(node as Object) as Object
+            out = []
+            content = node.findNode("results").findNode("grid").content
+            for i = 0 to content.getChildCount() - 1
+                out.Push(content.getChild(i).id)
+            end for
+            return out
+        end function
+
+        @describe("opening")
+
+        @it("reads the list's first 40 cards, newest first, under its title")
+        sub _()
+            node = m.opened(catalog.personal.WATCHLIST)
+            read = tests.scene.last("/api/v2/watchlist")
+            m.assertNotInvalid(read, "reads /api/v2/watchlist")
+            m.assertEqual([read.request.query.limit, read.request.auth], [40, "profile"])
+            m.assertEqual(node.findNode("title").text, "Watchlist")
+            m.assertTrue(node.findNode("spinner").running)
+            tests.scene.answer(read, m.page(3, false))
+            m.assertEqual(m.cards(node), ["movie:m1", "movie:m2", "movie:m3"])
+            m.assertTrue(node.findNode("results").isInFocusChain())
+            m.assertEqual(node.findNode("count").text, "", "only History counts its items")
+        end sub
+
+        @it("counts History's items, with a plus while more remain")
+        sub _()
+            node = m.opened(catalog.personal.HISTORY)
+            m.assertEqual(node.findNode("title").text, "History")
+            tests.scene.answer(tests.scene.last("/api/v2/history"), m.page(40, true))
+            m.assertEqual(node.findNode("count").text, "40+ items")
+            node2 = m.opened(catalog.personal.HISTORY)
+            tests.scene.answer(tests.scene.last("/api/v2/history"), m.page(1, false))
+            m.assertEqual(node2.findNode("count").text, "1 item")
+        end sub
+
+        @it("drops History's plus once a later read reaches the end")
+        sub _()
+            node = m.opened(catalog.personal.HISTORY)
+            tests.scene.answer(tests.scene.last("/api/v2/history"), m.page(9, true))
+            m.assertEqual(node.findNode("count").text, "9+ items")
+            tests.scene.answer(tests.scene.last("/api/v2/history"), m.page(5, false))
+            m.assertEqual(node.findNode("count").text, "14 items")
+        end sub
+
+        @it("shows tvOS's empty state, whose button goes back")
+        sub _()
+            node = m.opened(catalog.personal.FAVORITES)
+            tests.scene.answer(tests.scene.last("/api/v2/favorites"), m.page(0, false))
+            status = node.findNode("status")
+            m.assertTrue(status.visible)
+            m.assertEqual([status.message, status.detail], ["No favorites", "Add favorites from a detail page and they will appear here."])
+            status.activated = true
+            m.assertEqual(tests.scene.nav(), [{ op: "pop" }])
+        end sub
+
+        @it("opens a card's detail page")
+        sub _()
+            node = m.opened(catalog.personal.WATCHLIST)
+            tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(2, false))
+            grid = node.findNode("results")
+            grid.selectedItem = grid.findNode("grid").content.getChild(1)
+            m.assertEqual(tests.scene.nav()[0].route, nav.route.DETAIL)
+            m.assertEqual(tests.scene.nav()[0].params.itemId, "movie:m2")
+        end sub
+
+        @describe("removing a card (Options)")
+
+        @it("removes the focused card from the Watchlist once the server agrees")
+        sub _()
+            node = m.opened(catalog.personal.WATCHLIST)
+            tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(3, false))
+            revision = m.global.personalRevision
+            m.assertTrue(node.callFunc("pressKey", "options"))
+            menu = node.findNode("menuLayer").getChild(0)
+            m.assertEqual(menu.options.items[0].title, "Remove from Watchlist")
+            menu.picked = 0
+            write = tests.scene.last("/api/v2/watchlist/movie:m1")
+            m.assertEqual([write.request.method, write.request.auth], ["DELETE", "profile"])
+            m.assertEqual(m.cards(node).Count(), 3, "the card stays until the server answers")
+            tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
+            m.assertEqual(m.cards(node), ["movie:m2", "movie:m3"])
+            m.assertEqual(m.global.personalRevision, revision + 1)
+        end sub
+
+        @it("keeps focus on its card when a card before it goes")
+        sub _()
+            node = m.opened(catalog.personal.WATCHLIST)
+            tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(3, false))
+            node.callFunc("pressKey", "options")
+            node.findNode("menuLayer").getChild(0).picked = 0
+            write = tests.scene.last("/api/v2/watchlist/movie:m1")
+            ' The viewer moves on to the third card before the server answers.
+            node.findNode("results").findNode("grid").itemFocused = 2
+            tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
+            m.assertEqual(m.cards(node), ["movie:m2", "movie:m3"])
+            m.assertEqual(node.findNode("results").callFunc("focusedCard").id, "movie:m3")
+        end sub
+
+        @it("hides a History card's watches, and keeps the card when the server refuses")
+        sub _()
+            node = m.opened(catalog.personal.HISTORY)
+            tests.scene.answer(tests.scene.last("/api/v2/history"), m.page(2, false))
+            node.callFunc("pressKey", "options")
+            menu = node.findNode("menuLayer").getChild(0)
+            m.assertEqual(menu.options.items[0].title, "Remove from History")
+            menu.picked = 0
+            write = tests.scene.last("/api/v2/history/remove")
+            m.assertEqual([write.request.method, write.request.body], ["POST", { targets: [{ content_id: "movie:m1" }] }])
+            tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: false, status: 500, headers: {}, body: invalid, error: { kind: "http", reason: "" } }, "error")
+            m.assertEqual(m.cards(node), ["movie:m1", "movie:m2"])
+            m.assertEqual(tests.scene.notices(), ["Couldn't update item. Your change wasn't saved."])
+        end sub
+
+        @it("reads the list again when shown after a change elsewhere")
+        sub _()
+            node = m.opened(catalog.personal.FAVORITES)
+            tests.scene.answer(tests.scene.last("/api/v2/favorites"), m.page(2, false))
+            reads = tests.scene.sent().Count()
+            node.callFunc("onShow", { first: false, restore: invalid, refresh: false })
+            m.assertEqual(tests.scene.sent().Count(), reads, "nothing changed")
+            m.global.personalRevision = m.global.personalRevision + 1
+            node.callFunc("onShow", { first: false, restore: invalid, refresh: false })
+            m.assertEqual(tests.scene.sent().Count(), reads + 1)
+            m.assertEqual(tests.scene.sent().Peek().request.path, "/api/v2/favorites")
+        end sub
+
+        @it("reads the list again when a change lands while it shows, and once shown if it was hidden")
+        sub _()
+            node = m.opened(catalog.personal.WATCHLIST)
+            tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(3, false))
+            node.findNode("results").findNode("grid").itemFocused = 1
+            reads = tests.scene.sent().Count()
+            ' A detail page's write that landed after the page was closed.
+            m.global.personalRevision = m.global.personalRevision + 1
+            m.top.callFunc("publishPersonalChange")
+            m.assertEqual(tests.scene.sent().Count(), reads + 1)
+            m.assertEqual(tests.scene.sent().Peek().request.path, "/api/v2/watchlist")
+            tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(2, false))
+            m.assertEqual(node.findNode("results").callFunc("focusedCard").id, "movie:m2", "focus stays on its card")
+            node.visible = false
+            node.callFunc("onHide")
+            m.global.personalRevision = m.global.personalRevision + 1
+            m.top.callFunc("publishPersonalChange")
+            m.assertEqual(tests.scene.sent().Count(), reads + 1, "a hidden page waits until it shows")
+            node.visible = true
+            node.callFunc("onShow", { first: false, restore: invalid, refresh: false })
+            m.assertEqual(tests.scene.sent().Count(), reads + 2)
+        end sub
+
+        @it("does not read the list again for its own removal")
+        sub _()
+            node = m.opened(catalog.personal.WATCHLIST)
+            tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(3, false))
+            node.callFunc("pressKey", "options")
+            node.findNode("menuLayer").getChild(0).picked = 0
+            write = tests.scene.last("/api/v2/watchlist/movie:m1")
+            reads = tests.scene.sent().Count()
+            tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
+            m.assertEqual(tests.scene.sent().Count(), reads)
+            m.assertEqual(m.cards(node), ["movie:m2", "movie:m3"])
+        end sub
+
+        @it("reads the list again when its removal lands while it reads the list again")
+        sub _()
+            node = m.opened(catalog.personal.WATCHLIST)
+            tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(3, false))
+            node.callFunc("pressKey", "options")
+            node.findNode("menuLayer").getChild(0).picked = 0
+            write = tests.scene.last("/api/v2/watchlist/movie:m1")
+            ' A change elsewhere lands first, and its read leaves before the server removes the card.
+            m.global.personalRevision = m.global.personalRevision + 1
+            m.top.callFunc("publishPersonalChange")
+            older = tests.scene.last("/api/v2/watchlist")
+            reads = tests.scene.sent().Count()
+            tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
+            m.assertEqual(tests.scene.sent().Count(), reads + 1, "the list is read again after the removal")
+            newer = tests.scene.last("/api/v2/watchlist")
+            tests.scene.answer(older, m.page(3, false))
+            m.assertEqual(m.cards(node), [], "the read from before the removal is dropped")
+            body = m.page(3, false)
+            body.items.Shift()
+            tests.scene.answer(newer, body)
+            m.assertEqual(m.cards(node), ["movie:m2", "movie:m3"])
+        end sub
+
+        @it("still tells other list pages about a removal that lands after the page closed")
+        sub _()
+            node = m.opened(catalog.personal.FAVORITES)
+            tests.scene.answer(tests.scene.last("/api/v2/favorites"), m.page(2, false))
+            node.callFunc("pressKey", "options")
+            node.findNode("menuLayer").getChild(0).picked = 0
+            write = tests.scene.last("/api/v2/favorites/movie:m1")
+            node.callFunc("onRelease")
+            revision = m.global.personalRevision
+            tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
+            m.assertEqual(m.global.personalRevision, revision + 1)
+            m.assertEqual(m.cards(node), ["movie:m1", "movie:m2"], "a released page is left alone")
+        end sub
+
+        @it("reads History again when the player has closed over it")
+        sub _()
+            node = m.opened(catalog.personal.HISTORY)
+            tests.scene.answer(tests.scene.last("/api/v2/history"), m.page(2, false))
+            reads = tests.scene.sent().Count()
+            node.callFunc("onShow", { first: false, restore: invalid, refresh: true })
+            m.assertEqual(tests.scene.sent().Count(), reads + 1)
+            m.assertEqual(tests.scene.sent().Peek().request.path, "/api/v2/history")
+        end sub
+    end class
+end namespace
