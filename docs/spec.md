@@ -1461,6 +1461,8 @@ Subtitles tab (criterion 4.8).
     the shuffle." (nothing for 409). Keep Watching or Back while it is out,
     from the panel or the remote's Back key, or a seek or scan from the
     phone or voice, gives it up, and its late answer starts nothing.
+    Auto-play next turned while it is out holds: the pick starts with the
+    viewer's choice, and a failed advance opens the panel with it.
   - Pick Another (`POST /api/v2/shuffles/{id}/skip` with the pick shown)
     stops the countdown until the answer, which starts it over with the
     new pick; a failure says "Couldn't pick another." and keeps the pick.
