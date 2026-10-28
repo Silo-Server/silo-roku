@@ -1,0 +1,270 @@
+import "pkg:/source/catalog/cards.bs"
+import "pkg:/source/catalog/detail.bs"
+import "pkg:/source/catalog/map.bs"
+import "pkg:/source/catalog/rows.bs"
+import "pkg:/source/catalog/summaries.bs"
+import "pkg:/source/requests/api.bs"
+import "pkg:/source/requests/cards.bs"
+import "pkg:/source/requests/state.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' ApiTask's map step for Requests answers (catalog.map.apply hands them
+' here; source/requests/api.bs names the kinds). On the Task thread, as
+' catalog.map does for the library: lists become CardContent and RowContent
+' trees, and the body a small summary.
+'
+'   kind            content                         body
+'   requestStatus   none                            mediaRequests.state.gate
+'   requestHub      root of RowContent rows         { rows }
+'   requestRecords  RowContent (a row, or a page)   { size } or a page's
+'   requestTitles   RowContent (a page)             catalog.summary.page
+'                                                   facts
+'   requestBrands   RowContent of brand cards       { size }
+'   requestDetail   RowContent of More like this    mediaRequests.map.detail
+'                   cards, when there are any
+'
+' Gives { summary, content }, or invalid for a body without the shape.
+namespace mediaRequests.map
+    ' Discover's title rows; studios, networks, and genres are brand rows.
+    const TITLE_TYPES = "|tmdb_chart|tmdb_discover|tmdb_list|mdblist|"
+    const BRAND_TYPES = "|studios|networks|genres|"
+    ' The row "Your requests" is, and the prefix of a brand row's ID.
+    const MINE_ROW = "requests:mine"
+    const BRAND_ROW = "brand:"
+    ' tvOS's "More like this" shows the server's recommendations; the page
+    ' holds this many.
+    const MAX_SIMILAR = 20
+
+    function isKind(kind as String) as Boolean
+        return Left(kind, 7) = "request"
+    end function
+
+    ' strings is the locale's table (catalog.map.strings), words its card
+    ' copy (catalog.cards.words). lowTier picks the smaller backdrops.
+    function apply(kind as String, body as Object, mapping as Object, strings as Object, words as Object) as Dynamic
+        lowTier = util.isTrue(mapping.lowTier)
+        if kind = mediaRequests.mapKind.STATUS
+            gate = mediaRequests.state.gate(body)
+            if gate = invalid then return invalid
+            return { summary: gate, content: invalid }
+        end if
+        if kind = mediaRequests.mapKind.HUB then return hub(body, mapping, strings, lowTier)
+        if kind = mediaRequests.mapKind.RECORDS then return records(body, mapping, strings, lowTier)
+        if kind = mediaRequests.mapKind.TITLES then return titles(body, mapping, strings, lowTier)
+        if kind = mediaRequests.mapKind.BRANDS then return brands(body, mapping)
+        if kind = mediaRequests.mapKind.DETAIL then return detail(body, strings, words, lowTier)
+        return invalid
+    end function
+
+    ' The Requests page as tvOS lays it out: "Your requests" first, a row
+    ' that loads its own cards (mediaRequests.request.mine), then the server's
+    ' Discover rows in row_order (spec section 5.11). A title row shows its
+    ' items entry, trimmed to catalog.rows.MAX_ITEMS, with a See all card
+    ' when the server or the trim left titles out; a row without an entry
+    ' or titles is left out. A brand row loads its cards
+    ' (mediaRequests.request.brands). Unknown types are skipped. A server without
+    ' row_order gets its items in order.
+    function hub(body as Object, mapping as Object, strings as Object, lowTier as Boolean) as Dynamic
+        if type(body.items) <> "roArray" then return invalid
+        sections = {}
+        for each section in body.items
+            if util.isObject(section) and util.text(section.key) <> "" then sections[section.key] = section
+        end for
+        order = body.row_order
+        if type(order) <> "roArray" or order.Count() = 0
+            order = []
+            for each section in body.items
+                if util.isObject(section) then order.Push({ key: util.text(section.key), type: "tmdb_chart", title: util.text(section.title) })
+            end for
+        end if
+        more = util.text(mapping.more)
+        root = CreateObject("roSGNode", "ContentNode")
+        mine = pendingRow(MINE_ROW, util.text(mapping.title), "poster", mediaRequests.request.mine(more, lowTier))
+        root.appendChild(mine)
+        for each ref in order
+            if root.getChildCount() >= catalog.rows.MAX_ROWS then exit for
+            if util.isObject(ref)
+                rowType = "|" + util.text(ref.type) + "|"
+                key = util.text(ref.key)
+                if Instr(1, TITLE_TYPES, rowType) > 0 and sections.DoesExist(key)
+                    section = sections[key]
+                    title = util.text(ref.title)
+                    if title = "" then title = util.text(section.title)
+                    node = titleRow(section, key, title, strings, lowTier)
+                    if node.getChildCount() > 0
+                        if seeAll(section, node.getChildCount()) then catalog.map.addMore(node, more)
+                        root.appendChild(node)
+                    end if
+                else if Instr(1, BRAND_TYPES, rowType) > 0
+                    root.appendChild(pendingRow(BRAND_ROW + key, util.text(ref.title), "landscape", mediaRequests.request.brands(key)))
+                end if
+            end if
+        end for
+        return { summary: { rows: root.getChildCount() }, content: root }
+    end function
+
+    ' Whether a row shows See all (tvOS's seeAll): the server has more
+    ' pages or more titles than it sent, or the row shows fewer than sent.
+    function seeAll(section as Object, shown as Integer) as Boolean
+        results = 0
+        if type(section.results) = "roArray" then results = section.results.Count()
+        if util.isNumber(section.total_pages) and section.total_pages > 1 then return true
+        if util.isNumber(section.total_results) and section.total_results > results then return true
+        return shown < results
+    end function
+
+    function titleRow(section as Object, key as String, title as String, strings as Object, lowTier as Boolean) as Object
+        node = CreateObject("roSGNode", "RowContent")
+        node.setFields({ id: key, title: title, shape: "poster", sectionType: "requestTitles" })
+        if type(section.results) <> "roArray" then return node
+        for each result in section.results
+            if node.getChildCount() >= catalog.rows.MAX_ITEMS then exit for
+            fields = mediaRequests.cards.fromResult(result, strings, lowTier)
+            if fields <> invalid then node.createChild("CardContent").setFields(fields)
+        end for
+        return node
+    end function
+
+    ' A row that holds placeholder cards until BrowseRows sends request,
+    ' its own items request (RowContent.itemsRequest).
+    function pendingRow(id as String, title as String, shape as String, request as Object) as Object
+        node = CreateObject("roSGNode", "RowContent")
+        node.setFields({ id: id, title: title, shape: shape, itemsRequest: request, sectionType: "requests" })
+        for i = 1 to catalog.rows.PLACEHOLDERS
+            node.createChild("CardContent").setFields({ id: "", shape: shape })
+        end for
+        return node
+    end function
+
+    ' A page of the account's requests. As a row (mapping.row), in tvOS's
+    ' order (mediaRequests.state.ordered) and trimmed, with a See all card that
+    ' opens them all when there are more; as a grid's page, newest first
+    ' with a placeholder for a record without a card, so positions follow
+    ' the cursor.
+    function records(body as Object, mapping as Object, strings as Object, lowTier as Boolean) as Dynamic
+        if type(body.items) <> "roArray" then return invalid
+        node = CreateObject("roSGNode", "RowContent")
+        node.shape = "poster"
+        if util.isTrue(mapping.row)
+            ordered = mediaRequests.state.ordered(body.items)
+            for each record in ordered
+                if node.getChildCount() >= catalog.rows.MAX_ITEMS then exit for
+                fields = mediaRequests.cards.fromRecord(record, strings, lowTier)
+                if fields <> invalid then node.createChild("CardContent").setFields(fields)
+            end for
+            ' See all opens the rest whenever there is more, even when no
+            ' request of this page is shown (all cancelled): it is the way
+            ' to My Requests.
+            hasMore = util.isObject(body.page) and util.isTrue(body.page.has_more)
+            if hasMore or node.getChildCount() < ordered.Count() then catalog.map.addMore(node, util.text(mapping.more))
+            return { summary: { size: node.getChildCount() }, content: node }
+        end if
+        if util.isTrue(mapping.skip) then return { summary: catalog.summary.page(body, body.items.Count()), content: invalid }
+        for each record in body.items
+            fields = mediaRequests.cards.fromRecord(record, strings, lowTier)
+            if fields = invalid then fields = { id: "", shape: "poster" }
+            node.createChild("CardContent").setFields(fields)
+        end for
+        return { summary: catalog.summary.page(body, node.getChildCount()), content: node }
+    end function
+
+    ' A page of titles (a Discover row's, a brand's, or search results),
+    ' paged by number: its next page is the cursor (mediaRequests.request
+    ' nextPage). Search leaves out titles the library has (hideAvailable).
+    ' The server's totals count titles before its own filters, so the page
+    ' gives none.
+    function titles(body as Object, mapping as Object, strings as Object, lowTier as Boolean) as Dynamic
+        if type(body.results) <> "roArray" then return invalid
+        nextValue = mediaRequests.request.nextPage(body)
+        cursor = ""
+        if nextValue > 0 then cursor = nextValue.ToStr()
+        node = invalid
+        size = 0
+        hide = util.isTrue(mapping.hideAvailable)
+        if not util.isTrue(mapping.skip) then node = CreateObject("roSGNode", "RowContent")
+        for each result in body.results
+            fields = mediaRequests.cards.fromResult(result, strings, lowTier)
+            if fields <> invalid and not (hide and util.text(result.availability) = "available")
+                size = size + 1
+                if node <> invalid then node.createChild("CardContent").setFields(fields)
+            end if
+        end for
+        if node <> invalid then node.shape = "poster"
+        ' A page whose titles were all left out is not the end
+        ' (catalog.grid readsPastEmpty).
+        return { summary: { size: size, total: -1, hasMore: cursor <> "", nextCursor: cursor, readsPastEmpty: true }, content: node }
+    end function
+
+    function brands(body as Object, mapping as Object) as Dynamic
+        if type(body.items) <> "roArray" then return invalid
+        node = CreateObject("roSGNode", "RowContent")
+        node.shape = "landscape"
+        kind = util.text(mapping.brand)
+        for each brand in body.items
+            if node.getChildCount() >= catalog.rows.MAX_ITEMS then exit for
+            fields = mediaRequests.cards.fromBrand(brand, kind)
+            if fields <> invalid then node.createChild("CardContent").setFields(fields)
+        end for
+        return { summary: { size: node.getChildCount() }, content: node }
+    end function
+
+    ' A RequestMediaDetail as the page reads it:
+    '   { mediaType, tmdbId, title, hero: { title, metadata, synopsis,
+    '     credit }, backdropUri, kind, request, libraryContentId, body }
+    ' with hero as DetailHero takes it (the content rating's chip, then
+    ' the year, seasons or runtime, and TMDB rating, then up to three
+    ' genres), kind its mediaRequests.state ofTitle, request its
+    ' RequestMediaState, and body mediaRequests.detail.createBody's. The
+    ' recommendations become the More like this cards.
+    function detail(body as Object, strings as Object, words as Object, lowTier as Boolean) as Dynamic
+        base = mediaRequests.cards.titleFields(body, strings, lowTier)
+        if base = invalid then return invalid
+        request = body.request
+        if not util.isObject(request) then request = { requestable: false }
+        items = [mediaRequests.cards.yearText(body.year)]
+        if base.mediaType = "series"
+            if util.isNumber(body.number_of_seasons) and body.number_of_seasons > 0
+                key = "seasonsOther"
+                if body.number_of_seasons = 1 then key = "seasonsOne"
+                items.Push(i18n.format(words[key], { count: Int(body.number_of_seasons) }))
+            end if
+        else
+            items.Push(catalog.cards.runtimeText(body.runtime, invalid, words))
+        end if
+        if util.isNumber(body.vote_average) and body.vote_average > 0 then items.Push(i18n.format(words.ratingTmdb, { value: mediaRequests.cards.rating(body.vote_average) }))
+        genres = []
+        if type(body.genres) = "roArray"
+            for each genre in body.genres
+                if genres.Count() < 3 and util.text(genre) <> "" then genres.Push(genre)
+            end for
+        end if
+        hero = { title: base.title, metadata: catalog.detail.line(util.text(body.content_rating), items, genres.Join(", ")), synopsis: util.text(body.overview), credit: credit(body, strings) }
+        summary = { mediaType: base.mediaType, tmdbId: base.tmdbId, title: base.title, hero: hero, backdropUri: base.backdropUri, kind: mediaRequests.state.ofTitle(body.availability, request), request: request, libraryContentId: util.text(body.library_content_id), body: mediaRequests.detail.createBody(body) }
+        content = invalid
+        if type(body.recommendations) = "roArray"
+            node = CreateObject("roSGNode", "RowContent")
+            node.shape = "poster"
+            for each result in body.recommendations
+                if node.getChildCount() >= MAX_SIMILAR then exit for
+                fields = mediaRequests.cards.fromResult(result, strings, lowTier)
+                if fields <> invalid then node.createChild("CardContent").setFields(fields)
+            end for
+            if node.getChildCount() > 0 then content = node
+        end if
+        return { summary: summary, content: content }
+    end function
+
+    ' "Directed by X" for a movie, "Created by A, B" for a series (its first
+    ' two creators), or "".
+    function credit(body as Object, strings as Object) as String
+        if util.text(body.director) <> "" then return i18n.format(i18n.lookup(strings, "detail.directedBy"), { names: body.director })
+        if type(body.creators) <> "roArray" then return ""
+        names = []
+        for each name in body.creators
+            if names.Count() < 2 and util.text(name) <> "" then names.Push(name)
+        end for
+        if names.Count() = 0 then return ""
+        return i18n.format(i18n.lookup(strings, "requests.createdBy"), { names: names.Join(", ") })
+    end function
+end namespace

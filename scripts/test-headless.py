@@ -62,6 +62,8 @@ SHARDS = [
     ("screens", ["library", "people", "personal", "search", "settings", "calendar"]),
     # Home's screens and the row page outgrew the screens shard's heap on CI.
     ("home", ["home"]),
+    # Requests' pure logic and screens (source/requests/, components/screens/requests/).
+    ("requests", ["requests"]),
 ]
 
 

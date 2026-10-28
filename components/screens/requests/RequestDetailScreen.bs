@@ -1,0 +1,626 @@
+import "pkg:/components/theme/detail.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/theme/requests.bs"
+import "pkg:/components/views/pending.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/detail.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/nav/textures.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/requests/api.bs"
+import "pkg:/source/requests/cards.bs"
+import "pkg:/source/requests/detail.bs"
+import "pkg:/source/requests/ui.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Focus zones, top to bottom.
+const ZONE_ACTIONS = "actions"
+const ZONE_SIMILAR = "similar"
+
+sub init()
+    m.top.findNode("background").color = theme.color.BACKGROUND
+    i18n.install()
+    m.copy = m.global.strings
+    m.page = m.top.findNode("page")
+    m.hero = m.top.findNode("hero")
+    m.hero.observeField("actionsTop", "layout")
+    m.actions = m.top.findNode("actions")
+    m.actions.observeField("activated", "onAction")
+    m.notice = m.top.findNode("notice")
+    m.notice.setFields({ font: theme.font(theme.textStyle.INFO_LINE), color: theme.color.TEXT_SECONDARY, width: 1400, height: 36, vertAlign: "center" })
+    m.strip = m.top.findNode("strip")
+    buildStrip()
+    m.similar = m.top.findNode("similar")
+    m.similar.heading = i18n.text("requests.moreLikeThis")
+    m.similar.observeField("chosen", "onSimilarChosen")
+    m.status = m.top.findNode("status")
+    m.status.observeField("activated", "onRetry")
+    m.scroll = m.top.findNode("scroll")
+    m.scrollTo = m.top.findNode("scrollTo")
+    m.textures = nav.textures.create()
+    nav.textures.addPoster(m.textures, m.hero.findNode("backdrop"))
+    m.pending = []
+    m.zone = ZONE_ACTIONS
+    m.lowTier = false
+    m.params = {}
+    ' mediaRequests.map.detail's summary once read, and the viewer's own request
+    ' for the title (a MediaRequest) once read.
+    m.detail = invalid
+    m.record = invalid
+    m.recordId = ""
+    ' A create or cancel in flight, and holds after an answer that left one
+    ' unsure: the button says "Not confirmed yet" and Cancel hides until a
+    ' read shows what the server has.
+    m.submitting = false
+    m.unconfirmed = false
+    m.cancelHeld = false
+    m.cancelling = false
+    m.following = false
+    m.similarContent = invalid
+    m.backdrop = ""
+    m.statusKey = ""
+end sub
+
+' --- Screen hooks -----------------------------------------------------------
+
+sub onShow(event as Object)
+    m.actions.active = true
+    if event.first
+        start(event.restore)
+    else
+        nav.textures.restore(m.textures)
+        if m.backdrop <> "" then m.hero.backdropUri = m.backdrop
+        m.similar.callFunc("attach")
+    end if
+    if m.status.visible
+        focusStatus()
+    else
+        focusZone(m.zone)
+    end if
+end sub
+
+sub onHide()
+    m.actions.active = false
+    nav.textures.hide(m.textures)
+end sub
+
+sub onPressure(_level as String)
+    m.similar.callFunc("detach")
+end sub
+
+sub onRelease()
+    m.actions.active = false
+    ' A create or cancel still out may already have reached the server:
+    ' the Requests tab reads its rows again when next shown.
+    for each entry in m.pending
+        if entry.kind = "create" or entry.kind = "cancel" then requestsUi.changed()
+    end for
+    cancelPending()
+end sub
+
+function focusKey() as Dynamic
+    return { zone: m.zone, button: m.actions.focusedKey, similar: m.similar.index, similarFirst: m.similar.firstVisible }
+end function
+
+' --- Loading ----------------------------------------------------------------
+
+sub start(restore as Dynamic)
+    params = m.top.entry.params
+    if util.isObject(params) then m.params = params
+    m.lowTier = util.text(platform.current().memory.tier) = "low"
+    m.hero.lowTier = m.lowTier
+    m.actions.lowTier = m.lowTier
+    m.similar.lowTier = m.lowTier
+    m.recordId = util.text(m.params.requestId)
+    if util.isObject(restore)
+        if util.text(restore.zone) <> "" then m.zone = restore.zone
+        if util.text(restore.button) <> "" then m.actions.focusedKey = restore.button
+        if util.isNumber(restore.similar) then m.similar.index = restore.similar
+        if util.isNumber(restore.similarFirst) then m.similar.firstVisible = restore.similarFirst
+    end if
+    seed = m.params.seed
+    if util.isObject(seed) and util.text(seed.title) <> ""
+        m.hero.content = { title: seed.title, metadata: catalog.detail.line("", [], util.text(seed.metadata)), synopsis: util.text(seed.synopsis) }
+        showBackdrop(util.text(seed.backdropUri))
+    else
+        m.hero.placeholders = true
+    end if
+    updateActions()
+    loadDetail()
+end sub
+
+sub loadDetail()
+    mediaType = util.text(m.params.mediaType)
+    tmdbId = m.params.tmdbId
+    if (mediaType <> "movie" and mediaType <> "series") or not util.isNumber(tmdbId)
+        showError("requests.error.missing", false)
+        return
+    end if
+    cancelKind("detail")
+    send(mediaRequests.request.detail(mediaType, Int(tmdbId), m.lowTier), { kind: "detail" })
+end sub
+
+' The viewer's own request for the title: the active one the title names
+' when this account made it, else the one the card was (an ended request,
+' which Request Again replaces).
+sub loadRecord()
+    id = m.recordId
+    if m.detail <> invalid and util.isObject(m.detail.request) and util.text(m.detail.request.request_id) <> "" then id = m.detail.request.request_id
+    if id = "" then return
+    cancelKind("record")
+    send(mediaRequests.request.record(id), { kind: "record", id: id })
+end sub
+
+sub send(request as Object, entry as Object)
+    if util.text(request.lane) = "" then request.lane = "interactive"
+    sendPending(request, entry)
+end sub
+
+sub cancelKind(kind as String)
+    for i = m.pending.Count() - 1 to 0 step -1
+        if m.pending[i].kind = kind
+            api.cancel(m.pending[i].handle)
+            m.pending.Delete(i)
+        end if
+    end for
+end sub
+
+sub onResult(event as Object)
+    handle = event.getRoSGNode()
+    entry = takePending(handle)
+    if entry = invalid then return
+    result = api.resultOf(handle)
+    if result = invalid then return
+    if entry.kind = "detail"
+        onDetail(result, handle.content)
+    else if entry.kind = "record"
+        onRecord(entry, result)
+    else if entry.kind = "create"
+        onCreated(result)
+    else if entry.kind = "cancel"
+        onCancelled(result)
+    else if entry.kind = "follow"
+        onFollowed(entry, result)
+    else if entry.kind = "status"
+        onStatus(result)
+    end if
+end sub
+
+sub onDetail(result as Object, content as Dynamic)
+    if result.ok <> true
+        if util.isObject(result.error) and util.text(result.error.kind) = "cancelled" then return
+        if mediaRequests.detail.reprobes(result) then reprobe()
+        if m.detail <> invalid then return
+        if result.status = 404 or result.status = 403
+            showError("requests.error.missing", false)
+        else
+            showError("browse.error.load", true)
+        end if
+        return
+    end if
+    m.detail = result.body
+    ' A read that shows the request releases an unsure create, as tvOS's
+    ' next load does.
+    if m.detail.kind <> "" then m.unconfirmed = false
+    m.hero.placeholders = false
+    m.hero.content = m.detail.hero
+    showBackdrop(m.detail.backdropUri)
+    showSimilar(content)
+    m.top.ready = true
+    updateActions()
+    ' The row has buttons now: focus goes to it (or to the zone the page
+    ' was left in), unless the viewer is already in More like this.
+    if m.top.visible and not m.status.visible and not m.similar.isInFocusChain() then focusZone(m.zone)
+    loadRecord()
+end sub
+
+sub onRecord(entry as Object, result as Object)
+    if result.ok <> true or not util.isObject(result.body) then return
+    record = result.body
+    ' Another title's request, or not this account's: not the viewer's.
+    if m.detail <> invalid and (util.text(record.media_type) <> m.detail.mediaType or util.text(record.tmdb_id) <> util.text(m.detail.tmdbId)) then return
+    m.record = record
+    m.recordId = entry.id
+    m.cancelHeld = false
+    updateActions()
+end sub
+
+sub showBackdrop(uri as String)
+    m.backdrop = uri
+    if m.top.visible then m.hero.backdropUri = uri
+end sub
+
+sub showSimilar(content as Dynamic)
+    m.similarContent = content
+    if content <> invalid then content.setFields({ lowTier: m.lowTier, captionStyle: "grid" })
+    m.similar.content = content
+    m.similar.visible = content <> invalid and content.getChildCount() > 0
+    layout()
+end sub
+
+' --- Actions ----------------------------------------------------------------
+
+' The title's kind, or while the title names no request the viewer's own
+' record's (an ended request), for the strip.
+function shownKind() as String
+    if m.detail = invalid then return ""
+    return m.detail.kind
+end function
+
+function viewModel() as Object
+    view = { loaded: m.detail <> invalid, submitting: m.submitting, unconfirmed: m.unconfirmed, record: m.record }
+    if m.detail <> invalid then view.Append({ kind: m.detail.kind, request: m.detail.request, libraryContentId: m.detail.libraryContentId })
+    return view
+end function
+
+sub updateActions()
+    if m.detail = invalid
+        m.actions.buttons = { items: [], primaryWidth: theme.detail.PLAY_WIDTH }
+        layout()
+        return
+    end if
+    primary = mediaRequests.detail.primary(viewModel(), m.copy)
+    m.primary = primary
+    items = [{ key: primary.action, label: primary.label, pill: true, glyph: primaryGlyph(primary), speech: primary.label }]
+    m.following = util.isTrue(m.detail.request.following)
+    if mediaRequests.detail.canFollow(requestsUi.followSupported(requestsUi.currentKey()), m.detail.kind, m.detail.request)
+        label = i18n.text("requests.action.notify")
+        glyph = theme.requestsArt.BELL
+        if m.following
+            label = i18n.text("requests.action.stopNotify")
+            glyph = theme.requestsArt.BELL_SLASH
+        end if
+        items.Push({ key: mediaRequests.action.NOTIFY, label: label, glyph: glyph })
+    end if
+    if mediaRequests.detail.canCancel(m.record, m.cancelHeld or m.cancelling) then items.Push({ key: mediaRequests.action.CANCEL, label: i18n.text("requests.action.cancel"), glyph: theme.requestsArt.XMARK })
+    m.actions.buttons = { items: items, primaryWidth: theme.detail.PLAY_WIDTH }
+    updateStrip()
+    layout()
+end sub
+
+function primaryGlyph(primary as Object) as String
+    action = primary.action
+    if action = mediaRequests.action.REQUEST or action = mediaRequests.action.REQUEST_AGAIN then return theme.requestsArt.PLUS
+    if action = mediaRequests.action.OPEN_IN_LIBRARY then return theme.requestsArt.OPEN
+    if action = mediaRequests.action.REQUESTING then return mediaRequests.cards.glyph(mediaRequests.kind.ON_THE_WAY)
+    kind = shownKind()
+    if kind = "" and m.record <> invalid then kind = mediaRequests.state.ofRecord(m.record)
+    return mediaRequests.cards.glyph(kind)
+end function
+
+sub onAction()
+    key = m.actions.activated
+    if key = mediaRequests.action.REQUEST or key = mediaRequests.action.REQUEST_AGAIN
+        create()
+    else if key = mediaRequests.action.OPEN_IN_LIBRARY
+        nav.push(nav.route.DETAIL, { itemId: m.detail.libraryContentId })
+    else if key = mediaRequests.action.NOTIFY
+        follow()
+    else if key = mediaRequests.action.CANCEL
+        cancelRequest()
+    end if
+end sub
+
+' One press requests the title (no seasons: the server picks every aired
+' season the library lacks). Never sent twice: the button says
+' Requesting… until the answer.
+sub create()
+    if m.submitting or m.detail = invalid or not util.isObject(m.detail.body) then return
+    m.submitting = true
+    showNotice("")
+    updateActions()
+    send(mediaRequests.request.create(m.detail.body), { kind: "create" })
+end sub
+
+sub onCreated(result as Object)
+    m.submitting = false
+    outcome = mediaRequests.detail.outcome(result, 201)
+    if outcome = "dropped" then return
+    if outcome = "ok"
+        if util.isObject(result.body) and util.text(result.body.id) <> ""
+            ' The button shows the request at once; the read below confirms it.
+            m.recordId = result.body.id
+            m.record = result.body
+            applied = mediaRequests.detail.afterCreate(result.body)
+            m.detail.kind = applied.kind
+            m.detail.request = applied.request
+        end if
+        requestsUi.changed()
+    else if outcome = "uncertain"
+        m.unconfirmed = true
+        showNotice(i18n.text("requests.notice.unconfirmedCreate"))
+        requestsUi.changed()
+    else
+        showNotice(mediaRequests.detail.failureMessage(result, "requests.error.create", m.copy))
+        if mediaRequests.detail.reprobes(result) then reprobe()
+    end if
+    updateActions()
+    loadDetail()
+end sub
+
+sub cancelRequest()
+    if m.cancelling or m.record = invalid then return
+    m.cancelling = true
+    showNotice("")
+    updateActions()
+    send(mediaRequests.request.cancel(util.text(m.record.id)), { kind: "cancel" })
+end sub
+
+sub onCancelled(result as Object)
+    m.cancelling = false
+    outcome = mediaRequests.detail.outcome(result, 200)
+    if outcome = "dropped" then return
+    if outcome = "ok"
+        if util.isObject(result.body) then m.record = result.body
+        requestsUi.changed()
+    else if outcome = "uncertain"
+        m.cancelHeld = true
+        showNotice(i18n.text("requests.notice.unconfirmedCancel"))
+        requestsUi.changed()
+    else
+        showNotice(mediaRequests.detail.failureMessage(result, "requests.error.cancel", m.copy))
+        if mediaRequests.detail.reprobes(result) then reprobe()
+    end if
+    updateActions()
+    loadDetail()
+end sub
+
+' Notify Me or Stop Notifying Me; the button changes once the server
+' answers, as tvOS's does.
+sub follow()
+    if m.detail = invalid then return
+    for each entry in m.pending
+        if entry.kind = "follow" then return
+    end for
+    wanted = not m.following
+    send(mediaRequests.request.follow(m.detail.mediaType, m.detail.tmdbId, wanted), { kind: "follow", wanted: wanted })
+end sub
+
+sub onFollowed(entry as Object, result as Object)
+    expected = 200
+    if not entry.wanted then expected = 204
+    outcome = mediaRequests.detail.outcome(result, expected)
+    if outcome = "dropped" then return
+    if outcome = "ok"
+        if entry.wanted and util.isObject(result.body) and util.isBoolean(result.body.requestable)
+            m.detail.request = result.body
+        else
+            m.detail.request.following = entry.wanted
+        end if
+        key = "requests.notice.unfollowed"
+        if entry.wanted then key = "requests.notice.following"
+        showNotice(i18n.text(key))
+        updateActions()
+        return
+    end if
+    if outcome = "definite" then showNotice(mediaRequests.detail.failureMessage(result, "requests.error.follow", m.copy))
+    if mediaRequests.detail.reprobes(result) then reprobe()
+    ' Unsure, or refused for a reason the title may explain: read it again.
+    loadDetail()
+end sub
+
+' Reads /requests/status again after a refusal that says the feature may
+' be off for this viewer; when it is, Requests closes onto Home, as tvOS
+' closes its Requests screens.
+sub reprobe()
+    cancelKind("status")
+    m.statusKey = requestsUi.currentKey()
+    send(mediaRequests.request.status(), { kind: "status" })
+end sub
+
+sub onStatus(result as Object)
+    requestsUi.remember(m.statusKey, result)
+    if requestsUi.resolved(m.statusKey) and not requestsUi.available(m.statusKey) then nav.switchTab(nav.route.HOME, {})
+end sub
+
+sub onSimilarChosen()
+    if m.similarContent = invalid then return
+    card = m.similarContent.getChild(m.similar.chosen)
+    if card = invalid then return
+    target = requestsUi.destination(card, m.lowTier)
+    if target <> invalid then nav.push(target.route, target.params)
+end sub
+
+' --- Status strip -------------------------------------------------------------
+
+' Three columns (STATUS, REQUESTED, QUALITY: label over value), then the
+' four-step track with its labels.
+sub buildStrip()
+    m.stripColumns = []
+    for each key in ["status", "requested", "quality"]
+        column = m.strip.createChild("Group")
+        label = column.createChild("Label")
+        label.setFields({ text: i18n.text("requests.strip." + key), font: theme.font(theme.textStyle.SELECTION_LABEL), color: theme.color.TEXT_TERTIARY, height: theme.requests.STRIP_LABEL_HEIGHT })
+        dot = column.createChild("Poster")
+        dot.setFields({ uri: theme.firstRunArt.AVATAR_DISC, width: theme.requests.DOT, height: theme.requests.DOT, translation: [0, theme.requests.STRIP_LABEL_HEIGHT + (theme.requests.STRIP_VALUE_HEIGHT - theme.requests.DOT) \ 2], visible: false })
+        value = column.createChild("Label")
+        value.setFields({ font: theme.font(theme.textStyle.SELECTION_VALUE), color: theme.color.TEXT, height: theme.requests.STRIP_VALUE_HEIGHT, vertAlign: "center", translation: [0, theme.requests.STRIP_LABEL_HEIGHT] })
+        m.stripColumns.Push({ group: column, dot: dot, value: value })
+    end for
+    m.track = m.strip.createChild("Group")
+    m.trackParts = []
+    width = (theme.requests.TRACK_WIDTH - 3 * theme.requests.TRACK_GAP) \ 4
+    x = 0
+    for each key in ["requested", "approved", "downloading", "library"]
+        bar = m.track.createChild("Rectangle")
+        bar.setFields({ width: width, height: theme.requests.TRACK_HEIGHT, translation: [x, 0] })
+        label = m.track.createChild("Label")
+        label.setFields({ text: i18n.text("requests.stage." + key), font: theme.font(theme.textStyle.SELECTION_LABEL), width: width, translation: [x, theme.requests.TRACK_LABEL_TOP] })
+        m.trackParts.Push({ bar: bar, label: label })
+        x = x + width + theme.requests.TRACK_GAP
+    end for
+end sub
+
+' Shown while a request is out and not yet in the library (tvOS shows it
+' from pending to failed): its stage, when the viewer's own request was
+' made, and the qualities it asks for.
+sub updateStrip()
+    kind = shownKind()
+    source = invalid
+    if m.detail <> invalid then source = m.detail.request
+    fromRecord = false
+    if m.record <> invalid
+        recordKind = mediaRequests.state.ofRecord(m.record)
+        if kind = "" or kind = recordKind
+            kind = recordKind
+            source = m.record
+            fromRecord = true
+        end if
+    end if
+    shown = kind = mediaRequests.kind.PENDING or kind = mediaRequests.kind.ON_THE_WAY or kind = mediaRequests.kind.DECLINED or kind = mediaRequests.kind.FAILED
+    m.strip.visible = shown
+    if not shown then return
+    tint = mediaRequests.state.tint(kind)
+    status = mediaRequests.state.longLabel(kind, source, m.copy)
+    if fromRecord then status = mediaRequests.cards.statusLine(kind, m.record, m.copy)
+    values = [status, "", ""]
+    if m.record <> invalid
+        values[1] = mediaRequests.detail.shortDate(m.record.created_at, m.copy)
+        values[2] = mediaRequests.state.qualities(m.record)
+    end if
+    x = 0
+    for i = 0 to 2
+        column = m.stripColumns[i]
+        column.group.visible = values[i] <> ""
+        column.dot.visible = i = 0
+        column.dot.blendColor = tint
+        indent = 0
+        if i = 0 then indent = theme.requests.DOT_SPACE
+        column.value.translation = [indent, theme.requests.STRIP_LABEL_HEIGHT]
+        column.value.text = values[i]
+        if column.group.visible
+            column.group.translation = [x, 0]
+            width = Int(column.value.boundingRect().width) + indent
+            if width < theme.requests.STRIP_COLUMN then width = theme.requests.STRIP_COLUMN
+            x = x + width + theme.requests.STRIP_GAP
+        end if
+    end for
+    m.track.translation = [0, theme.requests.STRIP_LABEL_HEIGHT + theme.requests.STRIP_VALUE_HEIGHT + theme.requests.STRIP_GAP \ 2]
+    reachedStep = mediaRequests.state.stage(kind, source).step
+    for i = 0 to 3
+        part = m.trackParts[i]
+        reached = i < reachedStep or reachedStep >= 4
+        current = i = reachedStep and reachedStep < 4
+        part.bar.color = theme.requests.TRACK_REST
+        part.label.color = theme.color.TEXT_TERTIARY
+        if reached
+            part.bar.color = theme.color.TEXT
+            part.label.color = theme.color.TEXT
+        else if current
+            part.bar.color = tint
+            part.label.color = theme.color.TEXT
+        end if
+    end for
+end sub
+
+' --- Layout and focus -----------------------------------------------------------
+
+sub showNotice(text as String)
+    m.notice.text = text
+    m.notice.visible = text <> ""
+    layout()
+end sub
+
+' The action row where the hero's text ends, the notice and strip under
+' it, and More like this below the hero or the strip, whichever is lower.
+sub layout()
+    inset = theme.size.DETAIL_SIDE_INSET
+    y = m.hero.actionsTop
+    m.actions.translation = [inset, y]
+    y = y + theme.detail.BUTTON + theme.requests.NOTICE_GAP
+    if m.notice.visible
+        m.notice.translation = [inset, y]
+        y = y + 36 + theme.requests.NOTICE_GAP
+    end if
+    if m.strip.visible
+        m.strip.translation = [inset, y]
+        y = y + theme.requests.STRIP_LABEL_HEIGHT + theme.requests.STRIP_VALUE_HEIGHT + theme.requests.STRIP_GAP \ 2 + theme.requests.TRACK_LABEL_TOP + 40
+    end if
+    top = theme.detail.HERO_HEIGHT
+    if y + theme.requests.STRIP_GAP > top then top = y + theme.requests.STRIP_GAP
+    m.similar.translation = [0, top]
+end sub
+
+function zones() as Object
+    out = []
+    buttons = m.actions.buttons
+    if util.isObject(buttons) and type(buttons.items) = "roArray" and buttons.items.Count() > 0 then out.Push(ZONE_ACTIONS)
+    if m.similar.visible then out.Push(ZONE_SIMILAR)
+    return out
+end function
+
+sub focusZone(zone as String)
+    available = zones()
+    if not m.top.visible then return
+    if available.Count() = 0
+        m.zone = zone
+        focusScreen()
+        return
+    end if
+    if not util.contains(available, zone) then zone = available[0]
+    m.zone = zone
+    offset = 0
+    if zone = ZONE_SIMILAR
+        m.similar.setFocus(true)
+        offset = m.similar.translation[1] - 180
+    else
+        m.actions.setFocus(true)
+    end if
+    scrollTo([0, -offset])
+end sub
+
+sub scrollTo(target as Object)
+    current = m.page.translation
+    if current[1] = target[1] then return
+    m.scroll.control = "stop"
+    if m.lowTier
+        m.page.translation = target
+        return
+    end if
+    m.scrollTo.keyValue = [current, target]
+    m.scroll.control = "start"
+end sub
+
+sub showError(key as String, retry as Boolean)
+    m.page.visible = false
+    m.status.message = i18n.text(key)
+    m.status.action = ""
+    if retry then m.status.action = i18n.text("states.retry")
+    m.status.visible = true
+    m.top.ready = true
+    focusStatus()
+end sub
+
+sub focusStatus()
+    if not m.top.visible then return
+    if m.status.action <> ""
+        m.status.setFocus(true)
+    else
+        focusScreen()
+    end if
+    m.status.callFunc("announce")
+end sub
+
+sub onRetry()
+    m.status.visible = false
+    m.page.visible = true
+    loadDetail()
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press or m.status.visible then return false
+    if key = "up" or key = "down"
+        available = zones()
+        at = -1
+        for i = 0 to available.Count() - 1
+            if available[i] = m.zone then at = i
+        end for
+        target = at + 1
+        if key = "up" then target = at - 1
+        if target >= 0 and target < available.Count() then focusZone(available[target])
+        return true
+    end if
+    return false
+end function

@@ -1,0 +1,140 @@
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/util/values.bs"
+
+' What ApiTask's map step builds from a Requests answer
+' (source/requests/map.bs). A request names one in map: { kind, ... }.
+namespace mediaRequests.mapKind
+    ' requests/status: mediaRequests.state.gate's { available, followSupported }.
+    const STATUS = "requestStatus"
+    ' requests/discover: the Requests page's rows (mediaRequests.map.hub).
+    const HUB = "requestHub"
+    ' requests/mine: request cards, one row or a grid page.
+    const RECORDS = "requestRecords"
+    ' A Discover row's page, a brand's browse page, or search results:
+    ' title cards, one row or a grid page.
+    const TITLES = "requestTitles"
+    ' requests/discover/{studios|networks|genres}: brand cards.
+    const BRANDS = "requestBrands"
+    ' requests/detail/{media_type}/{tmdb_id}: the page's fields and its
+    ' More like this cards.
+    const DETAIL = "requestDetail"
+end namespace
+
+' Request builders for Requests (spec sections 5.11 and 8.1). Each returns a
+' request for api.send; none sends anything. Every Requests operation is
+' profile-scoped. A grid's template (titlesPage, recordsPage) reads later
+' pages through catalog.request.continued: pageParam pages by number
+' (?page=N, the cursor being the page number), keepKind keeps the map kind
+' and marks a cursor-only read with map.skip.
+namespace mediaRequests.request
+    const PREFIX = "/api/v2/requests"
+    ' listMyRequests answers at most 50.
+    const MINE_LIMIT = 50
+    ' The furthest page the server pages a Discover row to.
+    const MAX_PAGE = 500
+
+    function status() as Object
+        return catalog.request.read(PREFIX + "/status", {}, { kind: mediaRequests.mapKind.STATUS })
+    end function
+
+    ' The Requests page: the Discover layout, with "Your requests" first
+    ' as a row that loads mine() (mediaRequests.map.hub). title names that row.
+    function hub(yourRequests as String, seeAll as String, lowTier = false as Boolean) as Object
+        return catalog.request.read(PREFIX + "/discover", {}, { kind: mediaRequests.mapKind.HUB, title: yourRequests, more: seeAll, lowTier: lowTier })
+    end function
+
+    ' The newest MINE_LIMIT requests of the account, as one row in tvOS's
+    ' order (mediaRequests.state.ordered); more labels the trailing card that
+    ' opens them all when there are more.
+    function mine(more as String, lowTier = false as Boolean) as Object
+        return catalog.request.read(PREFIX + "/mine", { limit: MINE_LIMIT }, { kind: mediaRequests.mapKind.RECORDS, row: true, more: more, lowTier: lowTier })
+    end function
+
+    ' A grid of all the account's requests, newest first (My Requests).
+    function recordsPage(lowTier = false as Boolean) as Object
+        out = catalog.request.read(PREFIX + "/mine", {}, { kind: mediaRequests.mapKind.RECORDS, keepKind: true, lowTier: lowTier })
+        out.maxLimit = MINE_LIMIT
+        return out
+    end function
+
+    ' A brand row's cards: kind "studios", "networks", or "genres".
+    function brands(kind as String) as Object
+        return catalog.request.read(PREFIX + "/discover/" + kind, {}, { kind: mediaRequests.mapKind.BRANDS, brand: kind })
+    end function
+
+    ' A Discover row's See all page (getDiscoverRow), from page 1.
+    function discoverRow(key as String, lowTier = false as Boolean) as Object
+        return titlesPage(PREFIX + "/discover/rows/" + catalog.request.segment(key), {}, false, lowTier)
+    end function
+
+    ' A brand's browse page: brand "studio", "network", or "genre". Studios
+    ' list movies and networks series; a genre is browsed for movies, the
+    ' web's default.
+    function browse(brand as String, slug as String, lowTier = false as Boolean) as Object
+        query = {}
+        if brand = "genre" then query.media_type = "movie"
+        return titlesPage(PREFIX + "/discover/browse/" + brand + "/" + catalog.request.segment(slug), query, false, lowTier)
+    end function
+
+    ' Titles the viewer can request for q, without those the library has
+    ' (tvOS's "Available to request").
+    function search(q as String, lowTier = false as Boolean) as Object
+        return titlesPage(PREFIX + "/search", { q: Left(q.Trim(), catalog.request.MAX_QUERY), media_type: "all" }, true, lowTier)
+    end function
+
+    function titlesPage(path as String, query as Object, hideAvailable as Boolean, lowTier as Boolean) as Object
+        out = catalog.request.read(path, query, { kind: mediaRequests.mapKind.TITLES, keepKind: true, hideAvailable: hideAvailable, lowTier: lowTier })
+        out.pageParam = true
+        return out
+    end function
+
+    function detail(mediaType as String, tmdbId as Integer, lowTier = false as Boolean) as Object
+        return catalog.request.read(PREFIX + "/detail/" + catalog.request.segment(mediaType) + "/" + tmdbId.ToStr(), {}, { kind: mediaRequests.mapKind.DETAIL, lowTier: lowTier })
+    end function
+
+    ' The viewer's own request (any profile of the account made it); the
+    ' answer's body is the MediaRequest, unmapped.
+    function record(id as String) as Object
+        return { path: PREFIX + "/" + catalog.request.segment(id), auth: "profile" }
+    end function
+
+    ' POST /api/v2/requests with mediaRequests.detail.createBody. Never sent
+    ' again after an uncertain answer (mediaRequests.detail.outcome).
+    function create(body as Object) as Object
+        return { method: "POST", path: PREFIX, body: body, auth: "profile", lane: "interactive" }
+    end function
+
+    ' Withdraws the viewer's pending request.
+    function cancel(id as String) as Object
+        return { method: "POST", path: PREFIX + "/" + catalog.request.segment(id) + "/cancel", body: {}, auth: "profile", lane: "interactive" }
+    end function
+
+    ' Notify Me (PUT) or Stop Notifying Me (DELETE). Both are idempotent;
+    ' toggles for one title go one at a time, the last one winning
+    ' (api.router.order).
+    function follow(mediaType as String, tmdbId as Integer, on as Boolean) as Object
+        path = PREFIX + "/follows/" + catalog.request.segment(mediaType) + "/" + tmdbId.ToStr()
+        out = { method: "DELETE", path: path, auth: "profile", lane: "interactive", orderKey: path }
+        if on then out.method = "PUT"
+        return out
+    end function
+
+    ' The page to read after a Discover row's or a browse page's page, or
+    ' 0 at the end: next_page when it moves on and stays within the pages
+    ' (it points past total_pages once a read reached the end), else the
+    ' next page while there is one, as tvOS's RequestDiscoverPaging and the
+    ' web read it.
+    function nextPage(body as Dynamic) as Integer
+        if not util.isObject(body) or not util.isNumber(body.page) or not util.isNumber(body.total_pages) then return 0
+        page = Int(body.page)
+        last = Int(body.total_pages)
+        if last > MAX_PAGE then last = MAX_PAGE
+        if util.isNumber(body.next_page)
+            nextValue = Int(body.next_page)
+            if nextValue > page and nextValue <= last then return nextValue
+            return 0
+        end if
+        if page < last then return page + 1
+        return 0
+    end function
+end namespace

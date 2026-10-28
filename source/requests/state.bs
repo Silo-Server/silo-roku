@@ -1,0 +1,218 @@
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' How a request shows to the viewer (spec section 5.11), as tvOS's
+' RequestDisplayState and RequestProgress decide it. Pure: the screens and
+' ApiTask's map step (source/requests/map.bs) read these with a strings
+' table (i18n.load) as copy.
+namespace mediaRequests.kind
+    ' Waiting for an admin.
+    const PENDING = "pending"
+    ' Approved, queued, downloading, partly in the library, or being added.
+    const ON_THE_WAY = "onTheWay"
+    const IN_LIBRARY = "inLibrary"
+    ' Needs the viewer: an admin declined it, or the download failed.
+    const DECLINED = "declined"
+    const FAILED = "failed"
+    ' Cancelled, or a title the viewer cannot request (with a reason).
+    const UNAVAILABLE = "unavailable"
+end namespace
+
+' The groups of "Your requests", in the order the row shows them.
+namespace mediaRequests.bucket
+    const IN_PROGRESS = "inProgress"
+    const NEEDS_YOU = "needsYou"
+    const AVAILABLE = "available"
+end namespace
+
+namespace mediaRequests.state
+    ' The server's user-facing request states (MediaRequest.state).
+    const KNOWN_STATES = "|pending|approved|processing|partially_available|available|declined|cancelled|failed|"
+    ' tvOS's status tints: amber, sky, emerald, rose, and a neutral grey.
+    const TINT_PENDING = "0xF59E0BFF"
+    const TINT_ON_THE_WAY = "0x38BDF8FF"
+    const TINT_IN_LIBRARY = "0x34D399FF"
+    const TINT_ATTENTION = "0xFB7185FF"
+    const TINT_NEUTRAL = "0xEDEDED99"
+
+    ' GET /api/v2/requests/status as the client reads it: Requests shows
+    ' only when the server has them on, this account may use them, and the
+    ' capability is available, as on tvOS and Android TV. A missing allowed
+    ' or state reads as unavailable. invalid when the body is not one.
+    function gate(body as Dynamic) as Dynamic
+        if not util.isObject(body) then return invalid
+        available = util.isTrue(body.requests_enabled) and util.isTrue(body.allowed) and util.text(body.state) = "available"
+        return { available: available, followSupported: available and util.isTrue(body.follow_supported) }
+    end function
+
+    ' A request record's kind (mediaRequests.kind): its state when the server
+    ' sent a known one, else its outcome, then its status, as tvOS reads
+    ' them; an unknown status is on its way.
+    function ofRecord(record as Dynamic) as String
+        if not util.isObject(record) then return mediaRequests.kind.UNAVAILABLE
+        state = util.text(record.state)
+        if Instr(1, KNOWN_STATES, "|" + state + "|") > 0 and state <> "" then return ofState(state)
+        outcome = util.text(record.outcome)
+        if outcome = "declined" then return mediaRequests.kind.DECLINED
+        if outcome = "failed" then return mediaRequests.kind.FAILED
+        if outcome = "cancelled" then return mediaRequests.kind.UNAVAILABLE
+        return ofStatus(util.text(record.status))
+    end function
+
+    function ofState(state as String) as String
+        if state = "pending" then return mediaRequests.kind.PENDING
+        if state = "available" then return mediaRequests.kind.IN_LIBRARY
+        if state = "declined" then return mediaRequests.kind.DECLINED
+        if state = "failed" then return mediaRequests.kind.FAILED
+        if state = "cancelled" then return mediaRequests.kind.UNAVAILABLE
+        return mediaRequests.kind.ON_THE_WAY
+    end function
+
+    function ofStatus(status as String) as String
+        if status = "pending" then return mediaRequests.kind.PENDING
+        if status = "completed" then return mediaRequests.kind.IN_LIBRARY
+        if status = "failed" then return mediaRequests.kind.FAILED
+        return mediaRequests.kind.ON_THE_WAY
+    end function
+
+    ' A discovered title's kind from its availability and request state
+    ' (RequestMediaResult or RequestMediaDetail): the request's known state,
+    ' else in the library, else the request's status; "" when the viewer
+    ' can request it (no badge, the Request button), else unavailable.
+    function ofTitle(availability as Dynamic, request as Dynamic) as String
+        if not util.isObject(request) then request = {}
+        state = util.text(request.state)
+        if state <> "" and Instr(1, KNOWN_STATES, "|" + state + "|") > 0 then return ofState(state)
+        if util.text(availability) = "available" then return mediaRequests.kind.IN_LIBRARY
+        if util.text(request.status) <> "" then return ofStatus(util.text(request.status))
+        if util.isTrue(request.requestable) then return ""
+        return mediaRequests.kind.UNAVAILABLE
+    end function
+
+    ' The group a record's kind falls in, or "" for a cancelled one, which
+    ' the row leaves out.
+    function bucketOf(kind as String) as String
+        if kind = mediaRequests.kind.PENDING or kind = mediaRequests.kind.ON_THE_WAY then return mediaRequests.bucket.IN_PROGRESS
+        if kind = mediaRequests.kind.DECLINED or kind = mediaRequests.kind.FAILED then return mediaRequests.bucket.NEEDS_YOU
+        if kind = mediaRequests.kind.IN_LIBRARY then return mediaRequests.bucket.AVAILABLE
+        return ""
+    end function
+
+    ' The records "Your requests" shows: in progress, then needing the
+    ' viewer, then in the library, newest created first within each, the
+    ' cancelled left out. Records are MediaRequest AAs.
+    function ordered(records as Dynamic) as Object
+        groups = { inProgress: [], needsYou: [], available: [] }
+        if type(records) <> "roArray" then return []
+        for each record in records
+            if util.isObject(record)
+                bucket = bucketOf(ofRecord(record))
+                if bucket <> "" then groups[bucket].Push({ record: record, created: util.text(record.created_at) })
+            end if
+        end for
+        out = []
+        for each bucket in [mediaRequests.bucket.IN_PROGRESS, mediaRequests.bucket.NEEDS_YOU, mediaRequests.bucket.AVAILABLE]
+            entries = groups[bucket]
+            ' RFC 3339 UTC instants with milliseconds sort as text.
+            entries.SortBy("created", "r")
+            for each entry in entries
+                out.Push(entry.record)
+            end for
+        end for
+        return out
+    end function
+
+    ' The stage a kind and request are at, as tvOS's RequestProgress names
+    ' it: { short, long, step }, the labels' strings keys under
+    ' requests.short. and requests.long., and step 0 to 4 on the track
+    ' Requested, Approved, Downloading, In your library (4 is all done;
+    ' -1 for none). record may be a MediaRequest, or a title's request state
+    ' ({ state, status }).
+    function stage(kind as String, record as Dynamic) as Object
+        if not util.isObject(record) then record = {}
+        state = util.text(record.state)
+        status = util.text(record.status)
+        if kind = mediaRequests.kind.PENDING then return { short: "pending", long: "pending", step: 1 }
+        if kind = mediaRequests.kind.IN_LIBRARY then return { short: "inLibrary", long: "inLibrary", step: 4 }
+        if kind = mediaRequests.kind.DECLINED then return { short: "declined", long: "declined", step: 1 }
+        if kind = mediaRequests.kind.FAILED then return { short: "failed", long: "failed", step: 2 }
+        if kind = mediaRequests.kind.ON_THE_WAY
+            if state = "partially_available" then return { short: "partly", long: "partly", step: 3 }
+            if status = "downloading" then return { short: "downloading", long: "downloading", step: 2 }
+            if status = "completed" then return { short: "adding", long: "adding", step: 3 }
+            if status = "approved" or status = "queued" then return { short: "queued", long: "queued", step: 2 }
+            return { short: "onTheWay", long: "onTheWay", step: 2 }
+        end if
+        return { short: "unavailable", long: "", step: -1 }
+    end function
+
+    ' A kind's short label ("Pending"), for a record card's caption.
+    function shortLabel(kind as String, record as Dynamic, copy as Object) as String
+        return i18n.lookup(copy, "requests.short." + stage(kind, record).short)
+    end function
+
+    ' A kind's long label ("Waiting for approval"), or for an unavailable
+    ' title its reason's copy.
+    function longLabel(kind as String, record as Dynamic, copy as Object, reason = "" as String) as String
+        key = stage(kind, record).long
+        if key = "" then return unavailableLabel(reason, copy)
+        return i18n.lookup(copy, "requests.long." + key)
+    end function
+
+    ' What a status reads as on the detail page's button, tvOS's
+    ' detailTitle: "Requested · Pending", "Declined · <reason>".
+    function detailTitle(kind as String, copy as Object, reason = "" as String) as String
+        if kind = mediaRequests.kind.UNAVAILABLE then return unavailableLabel(reason, copy)
+        title = i18n.lookup(copy, "requests.detailTitle." + kind)
+        if (kind = mediaRequests.kind.DECLINED or kind = mediaRequests.kind.FAILED) and reason <> ""
+            readable = reasonCopy(reason, copy)
+            if readable <> "" then title = title + " · " + readable
+        end if
+        return title
+    end function
+
+    function unavailableLabel(reason as String, copy as Object) as String
+        readable = reasonCopy(reason, copy)
+        if readable <> "" then return readable
+        return i18n.lookup(copy, "requests.detailTitle.unavailable")
+    end function
+
+    ' The copy for a reason token (RequestMediaState.reason, a problem
+    ' type): tvOS's RequestErrorCopy, else the token in words ("some_new"
+    ' gives "Some New"); "" for none.
+    function reasonCopy(token as String, copy as Object) as String
+        if token = "" then return ""
+        key = "requests.reason." + token
+        if token = "limit_reached" then key = "requests.reason.quota_exceeded"
+        if token = "requesting_blocked" then key = "requests.reason.blocked"
+        found = copy[key]
+        if util.isString(found) then return found
+        words = []
+        for each part in token.Split("_")
+            if part <> "" then words.Push(UCase(Left(part, 1)) + Mid(part, 2))
+        end for
+        return words.Join(" ")
+    end function
+
+    function tint(kind as String) as String
+        if kind = mediaRequests.kind.PENDING then return TINT_PENDING
+        if kind = mediaRequests.kind.ON_THE_WAY then return TINT_ON_THE_WAY
+        if kind = mediaRequests.kind.IN_LIBRARY then return TINT_IN_LIBRARY
+        if kind = mediaRequests.kind.DECLINED or kind = mediaRequests.kind.FAILED then return TINT_ATTENTION
+        return TINT_NEUTRAL
+    end function
+
+    ' The qualities a record's targets ask for, "1080p · 4K", or "".
+    function qualities(record as Dynamic) as String
+        if not util.isObject(record) or type(record.targets) <> "roArray" then return ""
+        out = []
+        for each target in record.targets
+            if util.isObject(target)
+                quality = util.text(target.quality)
+                if quality = "2160p" then quality = "4K"
+                if quality <> "" and not util.contains(out, quality) then out.Push(quality)
+            end if
+        end for
+        return out.Join(" · ")
+    end function
+end namespace

@@ -64,6 +64,11 @@ CATALOG = {
     "getCatalogFilters", "getShuffleCapability", "createShuffle", "getShuffle", "advanceShuffle", "skipShuffleItem", "deleteShuffle",
     # The For You and Calendar tabs (source/catalog/map.bs, source/calendar/page.bs).
     "getDiscover", "getCalendar",
+    # Requests (source/requests/api.bs).
+    "getRequestStatus", "listDiscoverSections", "getDiscoverRow", "listDiscoverStudios", "listDiscoverNetworks",
+    "listDiscoverGenres", "browseDiscoverStudio", "browseDiscoverNetwork", "browseDiscoverGenre", "searchRequestMedia",
+    "getRequestMediaDetail", "listMyRequests", "getRequest", "createRequest", "cancelRequest", "followRequestMedia",
+    "unfollowRequestMedia",
     # On-view description translation (source/catalog/translation.bs).
     "getMetadataAICapability", "translateCatalogItemDescription",
 }

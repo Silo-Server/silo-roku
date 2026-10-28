@@ -1,0 +1,516 @@
+namespace tests
+
+    ' Requests' pure logic (source/requests/): the gate, how requests and
+    ' titles show, the request page's decisions, the request builders
+    ' against the server's operations, and the map step's rows and pages,
+    ' on the vendored fixtures and bodies in the contract's shapes.
+    @suite("requests")
+    class RequestsTests extends rooibos.BaseTestSuite
+
+        function copy() as Object
+            return i18n.load("en_US")
+        end function
+
+        function record(id as String, state as String, extra = invalid as Dynamic) as Object
+            out = { id: id, media_type: "movie", tmdb_id: 100 + id.Len(), title: "Title " + id, year: 2020, status: "pending", outcome: "active", state: state, targets: [], created_at: "2026-09-24T12:00:00.000Z" }
+            if extra <> invalid then out.Append(extra)
+            return out
+        end function
+
+        function result(tmdbId as Integer, extra = invalid as Dynamic) as Object
+            out = { media_type: "movie", tmdb_id: tmdbId, title: "Movie " + tmdbId.ToStr(), year: 2001, overview: "About it.", poster_path: "/p" + tmdbId.ToStr() + ".jpg", backdrop_path: "/b.jpg", availability: "missing", in_watchlist: false, request: { requestable: true, following: false, requested_by_viewer: false } }
+            if extra <> invalid then out.Append(extra)
+            return out
+        end function
+
+        function section(key as String, count as Integer, totalPages = 1 as Integer) as Object
+            results = []
+            for i = 1 to count
+                results.Push(m.result(i))
+            end for
+            return { key: key, title: "Row " + key, page: 1, total_pages: totalPages, total_results: count, results: results }
+        end function
+
+        function mapped(request as Object, body as Dynamic) as Object
+            input = { requestId: "r1" }
+            input.Append(request)
+            return catalog.map.apply(input, tests.catalogData.ok(body), tests.catalogData.words())
+        end function
+
+        function fits(path as String, template as String) as Boolean
+            parts = path.Split("/")
+            pattern = template.Split("/")
+            if parts.Count() <> pattern.Count() then return false
+            for i = 0 to parts.Count() - 1
+                if Left(pattern[i], 1) = "{"
+                    if parts[i] = "" then return false
+                else if parts[i] <> pattern[i]
+                    return false
+                end if
+            end for
+            return true
+        end function
+
+        function ids(node as Object) as Object
+            out = []
+            for each child in node.getChildren(-1, 0)
+                out.Push(child.id)
+            end for
+            return out
+        end function
+
+        @describe("the gate (request_status_ok.json)")
+
+        @it("shows Requests only when the server has them on, allows this account, and is available")
+        sub _()
+            body = tests.catalogData.fixture("request_status_ok")
+            m.assertEqual(mediaRequests.state.gate(body), { available: true, followSupported: true })
+            for each change in [{ allowed: false }, { allowed: invalid }, { state: "disabled" }, { state: "not_configured" }, { requests_enabled: false }]
+                changed = {}
+                changed.Append(body)
+                changed.Append(change)
+                if change.DoesExist("allowed") and change.allowed = invalid then changed.Delete("allowed")
+                m.assertEqual(mediaRequests.state.gate(changed), { available: false, followSupported: false }, FormatJson(change))
+            end for
+            m.assertInvalid(mediaRequests.state.gate("no"))
+        end sub
+
+        @it("maps the status answer for the shell")
+        sub _()
+            out = m.mapped(mediaRequests.request.status(), tests.catalogData.fixture("request_status_ok"))
+            m.assertTrue(out.ok)
+            m.assertEqual(out.body, { available: true, followSupported: true })
+        end sub
+
+        @describe("display state (tvOS's RequestDisplayState)")
+
+        @it("reads a record's state first, then its outcome, then its status")
+        sub _()
+            m.assertEqual(mediaRequests.state.ofRecord({ state: "pending", status: "completed" }), mediaRequests.kind.PENDING)
+            m.assertEqual(mediaRequests.state.ofRecord({ state: "processing" }), mediaRequests.kind.ON_THE_WAY)
+            m.assertEqual(mediaRequests.state.ofRecord({ state: "partially_available" }), mediaRequests.kind.ON_THE_WAY)
+            m.assertEqual(mediaRequests.state.ofRecord({ state: "available" }), mediaRequests.kind.IN_LIBRARY)
+            m.assertEqual(mediaRequests.state.ofRecord({ state: "declined" }), mediaRequests.kind.DECLINED)
+            m.assertEqual(mediaRequests.state.ofRecord({ state: "cancelled" }), mediaRequests.kind.UNAVAILABLE)
+            m.assertEqual(mediaRequests.state.ofRecord({ state: "someday", outcome: "failed" }), mediaRequests.kind.FAILED)
+            m.assertEqual(mediaRequests.state.ofRecord({ outcome: "active", status: "completed" }), mediaRequests.kind.IN_LIBRARY)
+            m.assertEqual(mediaRequests.state.ofRecord({ outcome: "active", status: "mystery" }), mediaRequests.kind.ON_THE_WAY)
+        end sub
+
+        @it("reads a title's request state, then the library, then whether it can be requested")
+        sub _()
+            m.assertEqual(mediaRequests.state.ofTitle("missing", { requestable: true }), "")
+            m.assertEqual(mediaRequests.state.ofTitle("available", { requestable: false, reason: "already_available" }), mediaRequests.kind.IN_LIBRARY)
+            m.assertEqual(mediaRequests.state.ofTitle("available", { requestable: false, state: "processing" }), mediaRequests.kind.ON_THE_WAY)
+            m.assertEqual(mediaRequests.state.ofTitle("missing", { requestable: false, status: "pending" }), mediaRequests.kind.PENDING)
+            m.assertEqual(mediaRequests.state.ofTitle("missing", { requestable: false, reason: "quota_exceeded" }), mediaRequests.kind.UNAVAILABLE)
+        end sub
+
+        @it("orders Your requests in progress, needing the viewer, then in the library, newest first, without the cancelled")
+        sub _()
+            list = [
+                m.record("a", "available", { created_at: "2026-09-01T00:00:00.000Z" })
+                m.record("b", "pending", { created_at: "2026-09-02T00:00:00.000Z" })
+                m.record("c", "declined", { created_at: "2026-09-03T00:00:00.000Z" })
+                m.record("d", "cancelled", { created_at: "2026-09-04T00:00:00.000Z" })
+                m.record("e", "processing", { created_at: "2026-09-05T00:00:00.000Z" })
+            ]
+            out = []
+            for each entry in mediaRequests.state.ordered(list)
+                out.Push(entry.id)
+            end for
+            m.assertEqual(out, ["e", "b", "c", "a"])
+        end sub
+
+        @it("labels each stage in tvOS's words, with its place on the track")
+        sub _()
+            words = m.copy()
+            m.assertEqual(mediaRequests.state.longLabel(mediaRequests.kind.PENDING, {}, words), "Waiting for approval")
+            m.assertEqual(mediaRequests.state.shortLabel(mediaRequests.kind.ON_THE_WAY, { status: "downloading" }, words), "Downloading")
+            m.assertEqual(mediaRequests.state.longLabel(mediaRequests.kind.ON_THE_WAY, { status: "queued" }, words), "Queued for download")
+            m.assertEqual(mediaRequests.state.longLabel(mediaRequests.kind.ON_THE_WAY, { state: "partially_available" }, words), "Partly in your library")
+            m.assertEqual(mediaRequests.state.longLabel(mediaRequests.kind.ON_THE_WAY, { status: "completed" }, words), "Adding to your library")
+            m.assertEqual(mediaRequests.state.longLabel(mediaRequests.kind.FAILED, {}, words), "Request failed")
+            m.assertEqual(mediaRequests.state.longLabel(mediaRequests.kind.UNAVAILABLE, {}, words, "quota_exceeded"), "Request limit reached")
+            m.assertEqual(mediaRequests.state.stage(mediaRequests.kind.PENDING, {}).step, 1)
+            m.assertEqual(mediaRequests.state.stage(mediaRequests.kind.ON_THE_WAY, { status: "downloading" }).step, 2)
+            m.assertEqual(mediaRequests.state.stage(mediaRequests.kind.IN_LIBRARY, {}).step, 4)
+        end sub
+
+        @it("words reasons, known or not")
+        sub _()
+            words = m.copy()
+            m.assertEqual(mediaRequests.state.reasonCopy("already_requested", words), "Already requested")
+            m.assertEqual(mediaRequests.state.reasonCopy("limit_reached", words), "Request limit reached")
+            m.assertEqual(mediaRequests.state.reasonCopy("requesting_blocked", words), "You can't request media right now")
+            m.assertEqual(mediaRequests.state.reasonCopy("some_new_reason", words), "Some New Reason")
+            m.assertEqual(mediaRequests.state.reasonCopy("", words), "")
+            m.assertEqual(mediaRequests.state.detailTitle(mediaRequests.kind.DECLINED, words, "not_found"), "Declined · This title is no longer available")
+        end sub
+
+        @it("names the qualities a request asks for")
+        sub _()
+            m.assertEqual(mediaRequests.state.qualities({ targets: [{ quality: "1080p" }, { quality: "2160p" }, { quality: "1080p" }] }), "1080p · 4K")
+            m.assertEqual(mediaRequests.state.qualities({ targets: [] }), "")
+        end sub
+
+        @describe("the request page")
+
+        @it("offers Request, then Requesting…, then the status the server reports")
+        sub _()
+            words = m.copy()
+            m.assertEqual(mediaRequests.detail.primary({ loaded: false }, words).action, mediaRequests.action.LOADING)
+            view = { loaded: true, kind: "", request: { requestable: true }, libraryContentId: "", submitting: false, unconfirmed: false, record: invalid }
+            m.assertEqual(mediaRequests.detail.primary(view, words), { action: mediaRequests.action.REQUEST, label: "Request", tint: "" })
+            view.submitting = true
+            m.assertEqual(mediaRequests.detail.primary(view, words).label, "Requesting…")
+            view.submitting = false
+            view.unconfirmed = true
+            m.assertEqual(mediaRequests.detail.primary(view, words).label, "Not confirmed yet")
+            view.unconfirmed = false
+            view.kind = mediaRequests.kind.PENDING
+            view.request = { requestable: false, reason: "already_requested", state: "pending" }
+            pending = mediaRequests.detail.primary(view, words)
+            m.assertEqual([pending.action, pending.label, pending.tint], [mediaRequests.action.STATUS, "Requested · Pending", mediaRequests.state.TINT_PENDING])
+            view.kind = mediaRequests.kind.ON_THE_WAY
+            view.request = { requestable: false, state: "processing", status: "downloading" }
+            m.assertEqual(mediaRequests.detail.primary(view, words).label, "Downloading")
+            view.kind = mediaRequests.kind.UNAVAILABLE
+            view.request = { requestable: false, reason: "quota_exceeded" }
+            m.assertEqual(mediaRequests.detail.primary(view, words).label, "Request limit reached")
+        end sub
+
+        @it("opens the library item once the title is there, and offers Request Again after a declined request")
+        sub _()
+            words = m.copy()
+            view = { loaded: true, kind: mediaRequests.kind.IN_LIBRARY, request: { requestable: false, reason: "already_available" }, libraryContentId: "movie:heat-1995" }
+            m.assertEqual(mediaRequests.detail.primary(view, words).action, mediaRequests.action.OPEN_IN_LIBRARY)
+            view = { loaded: true, kind: "", request: { requestable: true }, libraryContentId: "", record: m.record("x", "declined", { outcome: "declined" }) }
+            m.assertEqual(mediaRequests.detail.primary(view, words), { action: mediaRequests.action.REQUEST_AGAIN, label: "Request Again", tint: "" })
+            ' The title lost the annotation, but the viewer's request is still out.
+            view.record = m.record("x", "pending")
+            m.assertEqual(mediaRequests.detail.primary(view, words).label, "Requested · Pending")
+        end sub
+
+        @it("shows a confirmed create's request at once, so Request cannot be pressed again before the read")
+        sub _()
+            words = m.copy()
+            applied = mediaRequests.detail.afterCreate(m.record("r9", "pending"))
+            m.assertEqual(applied.kind, mediaRequests.kind.PENDING)
+            m.assertEqual([applied.request.request_id, applied.request.requestable, applied.request.requested_by_viewer], ["r9", false, true])
+            view = { loaded: true, kind: applied.kind, request: applied.request, libraryContentId: "", submitting: false, unconfirmed: false, record: m.record("r9", "pending") }
+            primary = mediaRequests.detail.primary(view, words)
+            m.assertEqual([primary.action, primary.label], [mediaRequests.action.STATUS, "Requested · Pending"])
+            approved = mediaRequests.detail.afterCreate(m.record("r9", "approved", { status: "approved" }))
+            m.assertEqual(approved.kind, mediaRequests.kind.ON_THE_WAY)
+        end sub
+
+        @it("offers Notify Me only on another profile's open request, and Cancel only on the viewer's pending one")
+        sub _()
+            other = { requestable: false, reason: "already_requested", requested_by_viewer: false, following: false }
+            m.assertTrue(mediaRequests.detail.canFollow(true, mediaRequests.kind.PENDING, other))
+            m.assertTrue(mediaRequests.detail.canFollow(true, mediaRequests.kind.ON_THE_WAY, other))
+            m.assertFalse(mediaRequests.detail.canFollow(false, mediaRequests.kind.PENDING, other))
+            m.assertFalse(mediaRequests.detail.canFollow(true, mediaRequests.kind.IN_LIBRARY, other))
+            own = { requestable: false, reason: "already_requested", requested_by_viewer: true }
+            m.assertFalse(mediaRequests.detail.canFollow(true, mediaRequests.kind.PENDING, own))
+            m.assertFalse(mediaRequests.detail.canFollow(true, mediaRequests.kind.PENDING, { requestable: false, reason: "already_requested" }))
+            m.assertTrue(mediaRequests.detail.canCancel(m.record("a", "pending"), false))
+            m.assertFalse(mediaRequests.detail.canCancel(m.record("a", "pending"), true))
+            m.assertFalse(mediaRequests.detail.canCancel(m.record("a", "approved", { status: "approved" }), false))
+            m.assertFalse(mediaRequests.detail.canCancel(invalid, false))
+        end sub
+
+        @it("sends the title's identity and display fields, never seasons")
+        sub _()
+            detail = { media_type: "series", tmdb_id: 1399, title: "Game of Thrones", year: 2011, tvdb_id: 121361, imdb_id: "tt0944947", overview: "", poster_path: "/p.jpg", genres: [], seasons: [{ season_number: 1 }] }
+            m.assertEqual(mediaRequests.detail.createBody(detail), { media_type: "series", tmdb_id: 1399, title: "Game of Thrones", year: 2011, tvdb_id: 121361, imdb_id: "tt0944947", poster_path: "/p.jpg" })
+            m.assertInvalid(mediaRequests.detail.createBody({ media_type: "book", tmdb_id: 1, title: "x" }))
+            m.assertInvalid(mediaRequests.detail.createBody({ media_type: "movie", title: "x" }))
+        end sub
+
+        @it("never treats an unsure answer as a refusal (POST /requests is non-retryable)")
+        sub _()
+            ok = { ok: true, status: 201, error: invalid }
+            m.assertEqual(mediaRequests.detail.outcome(ok, 201), "ok")
+            m.assertEqual(mediaRequests.detail.outcome({ ok: true, status: 200, error: invalid }, 201), "uncertain")
+            for each kind in ["network", "timeout", "parse"]
+                m.assertEqual(mediaRequests.detail.outcome({ ok: false, status: 0, error: { kind: kind } }, 201), "uncertain", kind)
+            end for
+            m.assertEqual(mediaRequests.detail.outcome({ ok: false, status: 502, error: { kind: "http", problemType: invalid } }, 201), "uncertain")
+            m.assertEqual(mediaRequests.detail.outcome({ ok: false, status: 409, error: { kind: "http", problemType: "conflict" } }, 201), "definite")
+            m.assertEqual(mediaRequests.detail.outcome({ ok: false, status: 0, error: { kind: "identity_changed" } }, 201), "definite")
+            m.assertEqual(mediaRequests.detail.outcome({ ok: false, status: 0, error: { kind: "cancelled" } }, 201), "dropped")
+        end sub
+
+        @it("says why a request failed: the server's detail, or the client's copy")
+        sub _()
+            words = m.copy()
+            quota = { ok: false, status: 429, body: { type: "https://siloserver.org/problems/rate_limited", title: "Too many", status: 429, detail: "Request quota exceeded: 5 of 5 requests used in the last 7 days." }, error: { kind: "http", problemType: "rate_limited" } }
+            m.assertEqual(mediaRequests.detail.failureMessage(quota, "requests.error.create", words), "Request quota exceeded: 5 of 5 requests used in the last 7 days.")
+            invalidBody = { ok: false, status: 422, body: { detail: "bad" }, error: { kind: "http", problemType: "validation_failed" } }
+            m.assertEqual(mediaRequests.detail.failureMessage(invalidBody, "requests.error.create", words), "That request couldn't be submitted")
+            off = { ok: false, status: 409, body: { detail: "off" }, error: { kind: "http", problemType: "capability_disabled" } }
+            m.assertEqual(mediaRequests.detail.failureMessage(off, "requests.error.create", words), "Requests are turned off")
+            m.assertTrue(mediaRequests.detail.reprobes(off))
+            m.assertTrue(mediaRequests.detail.reprobes({ error: { problemType: "permission_denied" } }))
+            m.assertFalse(mediaRequests.detail.reprobes(quota))
+            m.assertEqual(mediaRequests.detail.failureMessage({ ok: false, status: 403, body: invalid, error: { kind: "http" } }, "requests.error.create", words), "You don't have permission to do this. Ask your server admin if you need access.")
+            m.assertEqual(mediaRequests.detail.failureMessage({ ok: false, status: 500, body: invalid, error: { kind: "http" } }, "requests.error.create", words), "Failed to submit request")
+        end sub
+
+        @describe("the server contract (catalog-operations.json)")
+
+        @it("sends each Requests operation with its method, path, and declared query parameters, as the profile")
+        sub _()
+            operations = tests.catalogData.operations()
+            row = mediaRequests.request.discoverRow("trending_movies")
+            reads = [
+                ["getRequestStatus", mediaRequests.request.status()]
+                ["listDiscoverSections", mediaRequests.request.hub("Your requests", "See all")]
+                ["listMyRequests", mediaRequests.request.mine("See all")]
+                ["listMyRequests", catalog.request.continued(mediaRequests.request.recordsPage(), "c1", 40, catalog.kind.PAGE)]
+                ["listMyRequests", catalog.request.continued(mediaRequests.request.recordsPage(), "c2", 200, catalog.kind.SKIP)]
+                ["listDiscoverStudios", mediaRequests.request.brands("studios")]
+                ["listDiscoverNetworks", mediaRequests.request.brands("networks")]
+                ["listDiscoverGenres", mediaRequests.request.brands("genres")]
+                ["getDiscoverRow", catalog.request.continued(row, "", 40, catalog.kind.PAGE)]
+                ["getDiscoverRow", catalog.request.continued(row, "3", 40, catalog.kind.PAGE)]
+                ["browseDiscoverStudio", catalog.request.continued(mediaRequests.request.browse("studio", "a24"), "", 40, catalog.kind.PAGE)]
+                ["browseDiscoverNetwork", catalog.request.continued(mediaRequests.request.browse("network", "hbo"), "2", 40, catalog.kind.PAGE)]
+                ["browseDiscoverGenre", catalog.request.continued(mediaRequests.request.browse("genre", "drama"), "", 40, catalog.kind.PAGE)]
+                ["searchRequestMedia", catalog.request.continued(mediaRequests.request.search("  heat "), "", 40, catalog.kind.PAGE)]
+                ["getRequestMediaDetail", mediaRequests.request.detail("movie", 949)]
+                ["getRequest", mediaRequests.request.record("r-1")]
+                ["createRequest", mediaRequests.request.create({ media_type: "movie", tmdb_id: 949, title: "Heat" })]
+                ["cancelRequest", mediaRequests.request.cancel("r-1")]
+                ["followRequestMedia", mediaRequests.request.follow("series", 1399, true)]
+                ["unfollowRequestMedia", mediaRequests.request.follow("series", 1399, false)]
+            ]
+            for each entry in reads
+                operation = operations[entry[0]]
+                m.assertNotInvalid(operation, entry[0] + " is not vendored")
+                request = tests.catalogData.sent(entry[1])
+                m.assertNotInvalid(request, entry[0] + " cannot be sent")
+                m.assertEqual([request.method, request.auth], [operation.method, "profile"], entry[0])
+                m.assertTrue(m.fits(request.path, operation.path), request.path + " is not " + operation.path)
+                for each name in request.query
+                    declared = operation.query[name]
+                    m.assertNotInvalid(declared, entry[0] + " has no query parameter " + name)
+                    m.assertTrue(tests.catalogData.fitsParameter(request.query[name], declared), entry[0] + ": " + name + "=" + FormatJson(request.query[name]))
+                end for
+            end for
+        end sub
+
+        @it("pages Discover rows, brands, and search by number, and caps My Requests at 50 a page")
+        sub _()
+            first = catalog.request.continued(mediaRequests.request.discoverRow("r_abc"), "", 40, catalog.kind.PAGE)
+            m.assertEqual(first.query, { page: 1 })
+            m.assertEqual(first.map.kind, mediaRequests.mapKind.TITLES)
+            m.assertFalse(first.map.skip)
+            later = catalog.request.continued(mediaRequests.request.discoverRow("r_abc"), "7", 40, catalog.kind.SKIP)
+            m.assertEqual(later.query, { page: 7 })
+            m.assertTrue(later.map.skip)
+            genre = catalog.request.continued(mediaRequests.request.browse("genre", "drama"), "", 40, catalog.kind.PAGE)
+            m.assertEqual(genre.query, { media_type: "movie", page: 1 })
+            mine = catalog.request.continued(mediaRequests.request.recordsPage(), "c", 200, catalog.kind.SKIP)
+            m.assertEqual(mine.query, { limit: 50, cursor: "c" })
+            m.assertEqual(mine.map.kind, mediaRequests.mapKind.RECORDS)
+            ' A library page keeps the grid's kind, as before.
+            library = catalog.request.continued(catalog.request.browse({}, "", 40, false), "x", 40, catalog.kind.SKIP)
+            m.assertEqual(library.map.kind, catalog.kind.SKIP)
+        end sub
+
+        @it("follows next_page within the row's pages, else the next page, as tvOS and the web do")
+        sub _()
+            m.assertEqual(mediaRequests.request.nextPage({ page: 1, total_pages: 5 }), 2)
+            m.assertEqual(mediaRequests.request.nextPage({ page: 5, total_pages: 5 }), 0)
+            m.assertEqual(mediaRequests.request.nextPage({ page: 1, total_pages: 9, next_page: 4 }), 4)
+            ' Past total_pages: a multi-page read reached the end.
+            m.assertEqual(mediaRequests.request.nextPage({ page: 3, total_pages: 4, next_page: 5 }), 0)
+            m.assertEqual(mediaRequests.request.nextPage({ page: 499, total_pages: 900 }), 500)
+            m.assertEqual(mediaRequests.request.nextPage({ page: 500, total_pages: 900 }), 0)
+            m.assertEqual(mediaRequests.request.nextPage({ results: [] }), 0)
+        end sub
+
+        @describe("the Requests page (mediaRequests.map.hub)")
+
+        @it("puts Your requests first, then the Discover rows in row_order, skipping unknown types and rows without titles")
+        sub _()
+            body = {
+                items: [m.section("popular_movies", 3), m.section("trending_movies", 2), m.section("r_empty", 0)],
+                row_order: [
+                    { key: "trending_movies", type: "tmdb_chart", title: "Trending Movies" }
+                    { key: "studios", type: "studios", title: "Studios" }
+                    { key: "r_gone", type: "mdblist", title: "Gone" }
+                    { key: "r_empty", type: "tmdb_list", title: "Empty" }
+                    { key: "popular_movies", type: "tmdb_chart", title: "Popular Movies" }
+                    { key: "x", type: "carousel_of_the_future", title: "Future" }
+                ]
+            }
+            out = m.mapped(mediaRequests.request.hub("Your requests", "See all"), body)
+            m.assertTrue(out.ok)
+            m.assertEqual(m.ids(out.content), [mediaRequests.map.MINE_ROW, "trending_movies", "brand:studios", "popular_movies"])
+            m.assertEqual(out.body, { rows: 4 })
+            mine = out.content.getChild(0)
+            m.assertEqual(mine.title, "Your requests")
+            m.assertEqual(mine.getChild(0).id, "")
+            m.assertEqual(mine.itemsRequest.path, "/api/v2/requests/mine")
+            m.assertEqual(mine.itemsRequest.map.more, "See all")
+            brand = out.content.getChild(2)
+            m.assertEqual([brand.title, brand.shape, brand.itemsRequest.path], ["Studios", "landscape", "/api/v2/requests/discover/studios"])
+            trending = out.content.getChild(1)
+            m.assertEqual(trending.title, "Trending Movies")
+            m.assertEqual(trending.getChildCount(), 2)
+            m.assertEqual(trending.getChild(0).id, "request:movie:1")
+        end sub
+
+        @it("ends a trimmed row in See all")
+        sub _()
+            body = { items: [m.section("a", 2, 3), m.section("b", 45), m.section("c", 4)], row_order: [{ key: "a", type: "tmdb_chart", title: "A" }, { key: "b", type: "tmdb_discover", title: "B" }, { key: "c", type: "mdblist", title: "C" }] }
+            out = m.mapped(mediaRequests.request.hub("Your requests", "See all"), body)
+            several = out.content.getChild(1)
+            m.assertEqual(several.getChildCount(), 3)
+            more = several.getChild(2)
+            m.assertEqual([more.id, more.itemType, more.title, more.audioGuideText], [catalog.cards.MORE_ID, catalog.cards.MORE, "See all", "See all, A"])
+            trimmed = out.content.getChild(2)
+            m.assertEqual(trimmed.getChildCount(), catalog.rows.MAX_ITEMS + 1)
+            whole = out.content.getChild(3)
+            m.assertEqual(whole.getChildCount(), 4)
+            m.assertNotEqual(whole.getChild(3).itemType, catalog.cards.MORE)
+        end sub
+
+        @it("reads a server without row_order in its items' order, and refuses a body without items")
+        sub _()
+            out = m.mapped(mediaRequests.request.hub("Your requests", "See all"), { items: [m.section("trending_movies", 1)] })
+            m.assertEqual(m.ids(out.content), [mediaRequests.map.MINE_ROW, "trending_movies"])
+            m.assertFalse(m.mapped(mediaRequests.request.hub("Y", "S"), { row_order: [] }).ok)
+        end sub
+
+        @describe("request and title cards")
+
+        @it("draws Your requests from list_my_requests_ok.json in tvOS's order with their status")
+        sub _()
+            out = m.mapped(mediaRequests.request.mine("See all"), tests.catalogData.fixture("list_my_requests_ok"))
+            m.assertTrue(out.ok)
+            row = out.content
+            m.assertTrue(row.getChildCount() > 0)
+            card = row.getChild(0)
+            m.assertEqual(card.itemType, mediaRequests.cards.REQUEST)
+            m.assertTrue(card.statusDot)
+            m.assertNotEqual(card.requestId, "")
+            m.assertEqual(card.artUri, "")
+            for each child in row.getChildren(-1, 0)
+                if child.itemType <> catalog.cards.MORE then m.assertNotEqual(child.captionDetail, "")
+            end for
+        end sub
+
+        @it("ends Your requests in See all when the account has more")
+        sub _()
+            body = { items: [m.record("a", "pending"), m.record("bb", "cancelled")], page: { has_more: true, next_cursor: "c" } }
+            out = m.mapped(mediaRequests.request.mine("See all"), body)
+            m.assertEqual(m.ids(out.content), [mediaRequests.cards.titleId("movie", 101), catalog.cards.MORE_ID])
+            card = out.content.getChild(0)
+            m.assertEqual([card.captionDetail, card.statusTint, card.requestState, card.requestId], ["Pending", mediaRequests.state.TINT_PENDING, mediaRequests.kind.PENDING, "a"])
+            m.assertEqual(card.audioGuideText, "Title a, 2020, Pending")
+            body.page.has_more = false
+            m.assertEqual(m.mapped(mediaRequests.request.mine("See all"), body).content.getChildCount(), 1)
+            ' A first page of only cancelled requests still leads to the rest.
+            cancelled = { items: [m.record("c1", "cancelled")], page: { has_more: true, next_cursor: "c" } }
+            m.assertEqual(m.ids(m.mapped(mediaRequests.request.mine("See all"), cancelled).content), [catalog.cards.MORE_ID])
+        end sub
+
+        @it("badges a discovered title by its request's state, and not one the viewer can request")
+        sub _()
+            words = m.copy()
+            open = mediaRequests.cards.fromResult(m.result(7), words)
+            m.assertEqual([util.text(open.statusGlyph), open.requestState, open.captionDetail, open.artUri], ["", "", "2001", "https://image.tmdb.org/t/p/w342/p7.jpg"])
+            pending = mediaRequests.cards.fromResult(m.result(8, { request: { requestable: false, reason: "already_requested", state: "pending", status: "pending", request_id: "r-9" } }), words)
+            m.assertEqual([pending.statusTint, pending.statusGlyph, pending.requestId], [mediaRequests.state.TINT_PENDING, "pkg:/images/detail/status_clock.png", "r-9"])
+            m.assertEqual(pending.badges, ["Waiting for approval"])
+            m.assertEqual(pending.audioGuideText, "Movie 8, 2001, Pending")
+            owned = mediaRequests.cards.fromResult(m.result(9, { availability: "available", library_content_id: "movie:x", request: { requestable: false, reason: "already_available" } }), words)
+            m.assertEqual([owned.requestState, owned.libraryItemId], [mediaRequests.kind.IN_LIBRARY, "movie:x"])
+            m.assertInvalid(mediaRequests.cards.fromResult({ media_type: "book", tmdb_id: 1, title: "x" }, words))
+            m.assertEqual(mediaRequests.cards.image("https://cdn.example/x.jpg", "w342"), "https://cdn.example/x.jpg")
+            m.assertEqual(mediaRequests.cards.image("x.jpg", "w342"), "")
+        end sub
+
+        @it("maps a page of titles with its next page as the cursor, leaving out titles the library has in search")
+        sub _()
+            body = { page: 2, total_pages: 4, total_results: 80, results: [m.result(1), m.result(2, { availability: "available" }), { media_type: "person", tmdb_id: 3, title: "x" }] }
+            out = m.mapped(catalog.request.continued(mediaRequests.request.discoverRow("a"), "2", 40, catalog.kind.PAGE), body)
+            m.assertEqual(out.body, { size: 2, total: -1, hasMore: true, nextCursor: "3", readsPastEmpty: true })
+            m.assertEqual(out.content.getChildCount(), 2)
+            searched = m.mapped(catalog.request.continued(mediaRequests.request.search("heat"), "", 40, catalog.kind.PAGE), body)
+            m.assertEqual(searched.body.size, 1)
+            body.page = 4
+            m.assertEqual(m.mapped(catalog.request.continued(mediaRequests.request.discoverRow("a"), "4", 40, catalog.kind.SKIP), body).body, { size: 2, total: -1, hasMore: false, nextCursor: "", readsPastEmpty: true })
+        end sub
+
+        @it("draws brands with their logo on their colour, or their name")
+        sub _()
+            body = { items: [{ slug: "a24", display_name: "A24", logo_url: "https://image.tmdb.org/t/p/w500/a24.png", gradient_from: "#112233" }, { slug: "drama", display_name: "Drama", logo_url: invalid }, { display_name: "No slug" }] }
+            out = m.mapped(mediaRequests.request.brands("genres"), body)
+            m.assertEqual(m.ids(out.content), ["brand:genre:a24", "brand:genre:drama"])
+            logo = out.content.getChild(0)
+            m.assertEqual([logo.artUri, logo.tileColor, logo.tileText, logo.shape], ["https://image.tmdb.org/t/p/w500/a24.png", "0x112233FF", "", "landscape"])
+            m.assertEqual(out.content.getChild(1).tileText, "Drama")
+            m.assertEqual(mediaRequests.cards.brandOf("brand:studio:warner-bros"), { brand: "studio", slug: "warner-bros" })
+            m.assertInvalid(mediaRequests.cards.brandOf("request:movie:1"))
+        end sub
+
+        @describe("the title (mediaRequests.map.detail)")
+
+        @it("reads the hero, the request state, the create body, and More like this")
+        sub _()
+            body = m.result(949, { title: "Heat", year: 1995, runtime: 170, content_rating: "R", genres: ["Crime", "Drama", "Thriller", "Action"], director: "Michael Mann", vote_average: 7.94, imdb_id: "tt0113277", production_companies: [], networks: [], cast: [], creators: [], seasons: [], recommendations: [m.result(1), m.result(2)] })
+            out = m.mapped(mediaRequests.request.detail("movie", 949), body)
+            m.assertTrue(out.ok)
+            summary = out.body
+            m.assertEqual([summary.mediaType, summary.tmdbId, summary.title, summary.kind], ["movie", 949, "Heat", ""])
+            m.assertEqual(summary.hero.metadata, { rating: "R", items: ["1995", "2h 50m", "TMDB 7.9"], tail: "Crime, Drama, Thriller" })
+            m.assertEqual(summary.hero.credit, "Directed by Michael Mann")
+            m.assertEqual(summary.body.tmdb_id, 949)
+            m.assertEqual(summary.backdropUri, "https://image.tmdb.org/t/p/w1280/b.jpg")
+            m.assertEqual(out.content.getChildCount(), 2)
+            series = m.mapped(mediaRequests.request.detail("series", 1399, true), m.result(1399, { media_type: "series", number_of_seasons: 8, creators: ["David Benioff", "D. B. Weiss", "Third"] }))
+            m.assertEqual(series.body.hero.metadata.items, ["2001", "8 Seasons"])
+            m.assertEqual(series.body.hero.credit, "Created by David Benioff, D. B. Weiss")
+            m.assertEqual(series.body.backdropUri, "https://image.tmdb.org/t/p/w780/b.jpg")
+            m.assertInvalid(series.content)
+        end sub
+
+        @describe("where cards open (requestsUi.destination)")
+
+        @it("opens a title's request page, a title in the library its library page, and a brand its titles")
+        sub _()
+            card = CreateObject("roSGNode", "CardContent")
+            card.setFields(mediaRequests.cards.fromResult(m.result(5), m.copy()))
+            target = requestsUi.destination(card)
+            m.assertEqual(target.route, nav.route.REQUEST_DETAIL)
+            m.assertEqual([target.params.mediaType, target.params.tmdbId, target.params.seed.title], ["movie", 5, "Movie 5"])
+            card.setFields({ requestState: mediaRequests.kind.IN_LIBRARY, libraryItemId: "movie:m5" })
+            m.assertEqual(requestsUi.destination(card), { route: nav.route.DETAIL, params: { itemId: "movie:m5" } })
+            brand = CreateObject("roSGNode", "CardContent")
+            brand.setFields(mediaRequests.cards.fromBrand({ slug: "hbo", display_name: "HBO" }, "networks"))
+            opened = requestsUi.destination(brand)
+            m.assertEqual([opened.route, opened.params.title, opened.params.request.path], [nav.route.ROW, "HBO", "/api/v2/requests/discover/browse/network/hbo"])
+            other = CreateObject("roSGNode", "CardContent")
+            other.setFields({ id: "movie:x", itemType: "movie" })
+            m.assertInvalid(requestsUi.destination(other))
+            ' The row page opens Requests' cards as the Requests tab does.
+            m.assertEqual(rowPage.destination(other, {}).route, nav.route.DETAIL)
+            requested = CreateObject("roSGNode", "CardContent")
+            requested.setFields(mediaRequests.cards.fromResult(m.result(6), m.copy()))
+            m.assertEqual(rowPage.destination(requested, {}).route, nav.route.REQUEST_DETAIL)
+        end sub
+
+        @it("adds Search's Request segment only while the server offers Requests")
+        sub _()
+            m.assertEqual(search.segments().Count(), 3)
+            all = search.segments(true)
+            m.assertEqual(all[3], [search.REQUESTS_SCOPE, "requests.searchScope"])
+        end sub
+    end class
+end namespace

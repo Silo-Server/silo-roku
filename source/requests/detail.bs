@@ -1,0 +1,170 @@
+import "pkg:/source/requests/state.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' The request detail page's decisions (spec section 5.11), as tvOS's
+' RequestDetailViewModel makes them. Pure: the page passes what it read
+' and what is in flight; copy is a strings table (i18n.load).
+namespace mediaRequests.action
+    const LOADING = "loading"
+    const REQUEST = "request"
+    const REQUEST_AGAIN = "requestAgain"
+    const REQUESTING = "requesting"
+    const OPEN_IN_LIBRARY = "openInLibrary"
+    ' A status the button only shows (not interactive).
+    const STATUS = "status"
+    ' The secondary buttons.
+    const NOTIFY = "notify"
+    const CANCEL = "cancel"
+end namespace
+
+namespace mediaRequests.detail
+    ' The primary button for view:
+    '   { loaded, kind, request, libraryContentId, submitting, unconfirmed,
+    '     record }
+    ' loaded says the title detail was read; kind is its mediaRequests.state
+    ' ofTitle; request its RequestMediaState; record the viewer's own request
+    ' for the title (a MediaRequest the page read), or invalid. Gives
+    ' { action, label, tint }, tint "" for an interactive button.
+    function primary(view as Object, copy as Object) as Object
+        if not util.isTrue(view.loaded) then return { action: mediaRequests.action.LOADING, label: "", tint: "" }
+        kind = util.text(view.kind)
+        request = view.request
+        if not util.isObject(request) then request = {}
+        if kind = mediaRequests.kind.IN_LIBRARY and util.text(view.libraryContentId) <> "" then return button(mediaRequests.action.OPEN_IN_LIBRARY, copy)
+        if util.isTrue(view.submitting) then return button(mediaRequests.action.REQUESTING, copy)
+        if util.isTrue(view.unconfirmed) then return status(mediaRequests.kind.UNAVAILABLE, i18n.lookup(copy, "requests.reason.request_unconfirmed"))
+        if kind <> "" then return status(kind, statusLabel(kind, request, copy))
+        record = view.record
+        recordKind = ""
+        if util.isObject(record) then recordKind = mediaRequests.state.ofRecord(record)
+        ' The title no longer names the viewer's active request.
+        if recordKind = mediaRequests.kind.PENDING or recordKind = mediaRequests.kind.ON_THE_WAY then return status(recordKind, statusLabel(recordKind, record, copy))
+        if recordKind = mediaRequests.kind.DECLINED or recordKind = mediaRequests.kind.FAILED then return button(mediaRequests.action.REQUEST_AGAIN, copy)
+        return button(mediaRequests.action.REQUEST, copy)
+    end function
+
+    ' A status's label: the stage's long label ("Queued for download") past
+    ' pending, else tvOS's detailTitle ("Requested · Pending").
+    function statusLabel(kind as String, request as Object, copy as Object) as String
+        reason = util.text(request.reason)
+        if kind = mediaRequests.kind.ON_THE_WAY then return mediaRequests.state.longLabel(kind, request, copy)
+        return mediaRequests.state.detailTitle(kind, copy, reason)
+    end function
+
+    function button(action as String, copy as Object) as Object
+        return { action: action, label: i18n.lookup(copy, "requests.action." + action), tint: "" }
+    end function
+
+    function status(kind as String, label as String) as Object
+        return { action: mediaRequests.action.STATUS, label: label, tint: mediaRequests.state.tint(kind) }
+    end function
+
+    ' The title's request state once the server confirmed the viewer's
+    ' create with record (a MediaRequest), applied at once so the button
+    ' shows the request, not Request again, while the title is read again:
+    ' { kind, request }.
+    function afterCreate(record as Object) as Object
+        request = { requestable: false, reason: "already_requested", request_id: util.text(record.id), state: util.text(record.state), status: util.text(record.status), requested_by_viewer: true, following: true }
+        return { kind: mediaRequests.state.ofRecord(record), request: request }
+    end function
+
+    ' Whether Cancel Request shows: the viewer's own record is pending, and
+    ' no cancel is in flight or waiting to be confirmed (holding).
+    function canCancel(record as Dynamic, holding as Boolean) as Boolean
+        if holding or not util.isObject(record) then return false
+        return mediaRequests.state.ofRecord(record) = mediaRequests.kind.PENDING and util.text(record.outcome) <> "cancelled"
+    end function
+
+    ' Whether Notify Me shows (tvOS canFollow): the server supports
+    ' following, another profile made the title's active request, and it is
+    ' still pending or on its way.
+    function canFollow(followSupported as Boolean, kind as String, request as Dynamic) as Boolean
+        if not followSupported or not util.isObject(request) then return false
+        if util.text(request.reason) <> "already_requested" then return false
+        if not util.isBoolean(request.requested_by_viewer) or request.requested_by_viewer then return false
+        return kind = mediaRequests.kind.PENDING or kind = mediaRequests.kind.ON_THE_WAY
+    end function
+
+    ' POST /api/v2/requests's body from a RequestMediaDetail: what the
+    ' server requires and the display fields it keeps, absent ones omitted.
+    ' No seasons: the server then requests every aired season the library
+    ' lacks, as tvOS and Android TV leave it to. invalid when the detail
+    ' cannot be requested (no media type, ID, or title).
+    function createBody(detail as Dynamic) as Dynamic
+        if not util.isObject(detail) then return invalid
+        mediaType = util.text(detail.media_type)
+        if (mediaType <> "movie" and mediaType <> "series") or not util.isNumber(detail.tmdb_id) or util.text(detail.title) = "" then return invalid
+        out = { media_type: mediaType, tmdb_id: detail.tmdb_id, title: detail.title }
+        for each name in ["imdb_id", "overview", "poster_path", "backdrop_path"]
+            if util.text(detail[name]) <> "" then out[name] = detail[name]
+        end for
+        for each name in ["tvdb_id", "year"]
+            if util.isNumber(detail[name]) and detail[name] > 0 then out[name] = detail[name]
+        end for
+        return out
+    end function
+
+    ' How a create, cancel, or follow ended (an api.resultOf envelope):
+    '   "ok"         the server did it
+    '   "definite"   the server refused it, or it was never sent
+    '   "uncertain"  it may have happened: never sent again (POST
+    '                /api/v2/requests is non-retryable); the page reads the
+    '                title again to find out, as tvOS does
+    '   "dropped"    cancelled because the page went away
+    ' expected is the success status (201, 200, or 204).
+    function outcome(result as Dynamic, expected as Integer) as String
+        if not util.isObject(result) then return "uncertain"
+        if util.isTrue(result.ok)
+            if result.status = expected then return "ok"
+            return "uncertain"
+        end if
+        error = result.error
+        if not util.isObject(error) then return "uncertain"
+        kind = util.text(error.kind)
+        if kind = "cancelled" then return "dropped"
+        if kind = "network" or kind = "timeout" or kind = "parse" or kind = "too_large" then return "uncertain"
+        if kind = "http"
+            code = result.status
+            if (code = 502 or code = 503 or code = 504) and util.text(error.problemType) = "" then return "uncertain"
+        end if
+        return "definite"
+    end function
+
+    ' The message for a refused create, cancel, or follow (tvOS's
+    ' RequestErrorCopy.message): validation and a capability that is off
+    ' have their own copy, any other problem the server's own detail, and
+    ' the rest the client's copy for its kind.
+    function failureMessage(result as Dynamic, fallbackKey as String, copy as Object) as String
+        if not util.isObject(result) or not util.isObject(result.error) then return i18n.lookup(copy, fallbackKey)
+        problem = util.text(result.error.problemType)
+        if problem = "validation_failed" then return i18n.lookup(copy, "requests.reason.validation_failed")
+        if Left(problem, 11) = "capability_" then return i18n.lookup(copy, "requests.reason.requests_disabled")
+        if problem <> "" and util.isObject(result.body)
+            detail = util.text(result.body.detail).Trim()
+            if detail <> "" then return detail
+        end if
+        kind = util.text(result.error.kind)
+        if kind = "network" or kind = "timeout" then return i18n.lookup(copy, "requests.error.network")
+        if result.status = 403 then return i18n.lookup(copy, "requests.error.permission")
+        return i18n.lookup(copy, fallbackKey)
+    end function
+
+    ' Whether a refusal means the feature may have changed for this viewer,
+    ' so the shell reads /requests/status again (tvOS re-probes on these).
+    function reprobes(result as Dynamic) as Boolean
+        if not util.isObject(result) or not util.isObject(result.error) then return false
+        problem = util.text(result.error.problemType)
+        return Left(problem, 11) = "capability_" or problem = "permission_denied"
+    end function
+
+    ' "Sep 24" for an RFC 3339 instant in the TV's time zone, or "".
+    function shortDate(instant as Dynamic, copy as Object) as String
+        if not util.isString(instant) or Len(instant) < 10 then return ""
+        clock = CreateObject("roDateTime")
+        clock.FromISO8601String(instant)
+        if clock.AsSeconds() <= 0 then return ""
+        clock.ToLocalTime()
+        return i18n.format(i18n.lookup(copy, "requests.date"), { month: i18n.lookup(copy, "requests.month." + clock.GetMonth().ToStr()), day: clock.GetDayOfMonth() })
+    end function
+end namespace

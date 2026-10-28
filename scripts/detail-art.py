@@ -20,6 +20,16 @@
                  its 26 pt column)
   film.png       a film frame with sprocket holes down both sides, 48 px:
                  a Trailers & More card without a still (tvOS's 48 pt film)
+  plus.png       a plus: Request on a request page (tvOS's plus)
+  bell.png       a bell: Notify Me (tvOS's bell)
+  bell_slash.png the bell struck through: Stop Notifying Me (bell.slash)
+  xmark.png      an X: Cancel Request (tvOS's xmark)
+  open.png       an arrow up and to the right: Open in Library
+                 (arrow.up.right)
+  status_{clock,arrow,check,alert}.png
+                 20 px: a request card's corner badge for pending, on the
+                 way, in the library, and needing the viewer (tvOS's clock,
+                 arrow.down, checkmark, and exclamationmark)
   rounded_{8,10,14}_fill_{fhd,hd}.9.png
                  rounded rectangles of radius 8, 10, and 14: the Details
                  table's focus fill, the season placeholders, and the menu
@@ -44,6 +54,8 @@ import zlib
 GLYPH = 34  # FHD px
 CHECK = 26  # FHD px
 FILM = 48  # FHD px
+STATUS = 20  # FHD px
+STATUS_STROKE = 2.6
 GLYPH_SCALE = 2  # intrinsic pixels per logical FHD pixel
 STROKE = 3.4
 STRETCH = 2  # a 9-patch's stretchable band between the corners, px
@@ -262,6 +274,117 @@ def film(size):
     return coverage(size, covered, GLYPH_SCALE)
 
 
+def plus(size):
+    """Two round-capped strokes crossing at the centre."""
+    half, reach = STROKE / 2, size * 0.32
+    c = size / 2
+
+    def covered(x, y):
+        return segment_distance(x, y, c - reach, c, c + reach, c) <= half or segment_distance(x, y, c, c - reach, c, c + reach) <= half
+    return coverage(size, covered, GLYPH_SCALE)
+
+
+def xmark(size):
+    """Two round-capped strokes crossing diagonally."""
+    half, reach = STROKE / 2, size * 0.25
+    c = size / 2
+
+    def covered(x, y):
+        return segment_distance(x, y, c - reach, c - reach, c + reach, c + reach) <= half or segment_distance(x, y, c - reach, c + reach, c + reach, c - reach) <= half
+    return coverage(size, covered, GLYPH_SCALE)
+
+
+def bell_shape(size):
+    """A filled bell: a dome over flaring sides, a rim, and a clapper."""
+    c = size / 2
+
+    def covered(x, y):
+        top, rim = size * 0.20, size * 0.70
+        if top <= y <= rim:
+            t = (y - top) / (rim - top)
+            half = size * (0.20 + 0.10 * t * t)
+            if y < size * 0.36:  # the dome
+                return math.hypot((x - c) / (size * 0.20), (y - size * 0.36) / (size * 0.16)) <= 1
+            return abs(x - c) <= half
+        if rim < y <= rim + size * 0.06:
+            return abs(x - c) <= size * 0.34
+        if math.hypot(x - c, y - size * 0.82) <= size * 0.07:
+            return True
+        return math.hypot(x - c, y - size * 0.17) <= size * 0.05
+    return covered
+
+
+def bell(size):
+    return coverage(size, bell_shape(size), GLYPH_SCALE)
+
+
+def bell_slash(size):
+    """The bell with a stroke from top left to bottom right, cut clear on
+    either side."""
+    shape = bell_shape(size)
+    a, b = (size * 0.14, size * 0.12), (size * 0.86, size * 0.90)
+
+    def covered(x, y):
+        d = segment_distance(x, y, *a, *b)
+        if d <= STROKE / 2:
+            return True
+        return d > STROKE * 1.2 and shape(x, y)
+    return coverage(size, covered, GLYPH_SCALE)
+
+
+def open_arrow(size):
+    """An arrow up and to the right: a diagonal and its two head strokes."""
+    half = STROKE / 2
+    tip = (size * 0.74, size * 0.26)
+
+    def covered(x, y):
+        return (segment_distance(x, y, size * 0.26, size * 0.74, *tip) <= half
+                or segment_distance(x, y, size * 0.38, size * 0.26, *tip) <= half
+                or segment_distance(x, y, size * 0.74, size * 0.62, *tip) <= half)
+    return coverage(size, covered, GLYPH_SCALE)
+
+
+def status_clock(size):
+    """A ring with hands at twelve and three."""
+    c, r, half = size / 2, size * 0.38, STATUS_STROKE / 2
+
+    def covered(x, y):
+        if abs(math.hypot(x - c, y - c) - r) <= half:
+            return True
+        return segment_distance(x, y, c, c, c, c - r * 0.6) <= half or segment_distance(x, y, c, c, c + r * 0.5, c) <= half
+    return coverage(size, covered, GLYPH_SCALE)
+
+
+def status_arrow(size):
+    """An arrow pointing down."""
+    half = STATUS_STROKE / 2
+    tip = (size / 2, size * 0.80)
+
+    def covered(x, y):
+        return (segment_distance(x, y, size / 2, size * 0.18, *tip) <= half
+                or segment_distance(x, y, size * 0.24, size * 0.54, *tip) <= half
+                or segment_distance(x, y, size * 0.76, size * 0.54, *tip) <= half)
+    return coverage(size, covered, GLYPH_SCALE)
+
+
+def status_check(size):
+    half = STATUS_STROKE / 2 + 0.2
+    points = ((size * 0.20, size * 0.52), (size * 0.41, size * 0.72), (size * 0.80, size * 0.30))
+
+    def covered(x, y):
+        return any(segment_distance(x, y, *a, *b) <= half for a, b in zip(points, points[1:]))
+    return coverage(size, covered, GLYPH_SCALE)
+
+
+def status_alert(size):
+    """An exclamation mark: a stroke and a dot."""
+    half = STATUS_STROKE / 2 + 0.2
+
+    def covered(x, y):
+        return segment_distance(x, y, size / 2, size * 0.18, size / 2, size * 0.58) <= half or math.hypot(x - size / 2, y - size * 0.80) <= half * 1.1
+    return coverage(size, covered, GLYPH_SCALE)
+
+
 def rounded_fill(radius):
     """A white rounded square of 2 * radius + STRETCH px as a 9-patch: the
     1 px border marks the middle STRETCH px to stretch and the whole image as
@@ -306,6 +429,15 @@ def images():
     yield "sparkles.png", sparkles(GLYPH)
     yield "check.png", check(CHECK)
     yield "film.png", film(FILM)
+    yield "plus.png", plus(GLYPH)
+    yield "bell.png", bell(GLYPH)
+    yield "bell_slash.png", bell_slash(GLYPH)
+    yield "xmark.png", xmark(GLYPH)
+    yield "open.png", open_arrow(GLYPH)
+    yield "status_clock.png", status_clock(STATUS)
+    yield "status_arrow.png", status_arrow(STATUS)
+    yield "status_check.png", status_check(STATUS)
+    yield "status_alert.png", status_alert(STATUS)
     for radius in FILL_RADII:
         yield f"rounded_{radius}_fill_fhd.9.png", rounded_fill(radius)
         yield f"rounded_{radius}_fill_hd.9.png", rounded_fill(round(radius * 2 / 3))

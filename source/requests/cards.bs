@@ -1,0 +1,204 @@
+import "pkg:/source/requests/detail.bs"
+import "pkg:/source/requests/state.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Requests answers to card fields (CardContent, as catalog.cards makes
+' them for the library): a title the viewer may request
+' (RequestMediaResult), one of their requests (MediaRequest), or a brand
+' (DiscoverBrand). Pure; ApiTask's map step sets them on nodes
+' (source/requests/map.bs). copy is a strings table (i18n.load).
+namespace mediaRequests.cards
+    ' Card itemTypes: a title or a request opens the request page (or its
+    ' library item, requestsUi.destination), a brand its browse page.
+    const REQUEST = "request"
+    const BRAND = "brand"
+    ' TMDB's image base, which every Silo client puts before the paths the
+    ' server sends (contract: "TMDB image path").
+    const IMAGE_BASE = "https://image.tmdb.org/t/p/"
+    const POSTER_SIZE = "w342"
+    const BACKDROP_SIZE = "w1280"
+    const LOW_BACKDROP_SIZE = "w780"
+    const MAX_SYNOPSIS = 300
+
+    ' A TMDB path as an image URL at size, an absolute http(s) URL as it
+    ' is, and anything else as "".
+    function image(path as Dynamic, size as String) as String
+        text = util.text(path)
+        lower = LCase(text)
+        if Left(lower, 8) = "https://" or Left(lower, 7) = "http://" then return text
+        if Left(text, 1) <> "/" then return ""
+        return IMAGE_BASE + size + text
+    end function
+
+    ' The card ID of a title: unique by media type and TMDB ID, as tvOS
+    ' keys them.
+    function titleId(mediaType as String, tmdbId as Integer) as String
+        return "request:" + mediaType + ":" + tmdbId.ToStr()
+    end function
+
+    ' A RequestMediaResult's card, or invalid without a known media type or
+    ' TMDB ID: the poster and year, and a corner badge for its request's
+    ' state.
+    function fromResult(result as Dynamic, copy as Object, lowTier = false as Boolean) as Dynamic
+        base = titleFields(result, copy, lowTier)
+        if base = invalid then return invalid
+        kind = mediaRequests.state.ofTitle(result.availability, result.request)
+        base.requestState = kind
+        if util.isObject(result.request) then base.requestId = util.text(result.request.request_id)
+        year = yearText(result.year)
+        base.captionDetail = year
+        spoken = [base.title]
+        if year <> "" then spoken.Push(year)
+        if kind <> "" and kind <> mediaRequests.kind.UNAVAILABLE
+            base.statusTint = mediaRequests.state.tint(kind)
+            base.statusGlyph = glyph(kind)
+            stageLabel = mediaRequests.state.shortLabel(kind, result.request, copy)
+            spoken.Push(stageLabel)
+            base.badges = [mediaRequests.state.longLabel(kind, result.request, copy)]
+        end if
+        base.audioGuideText = spoken.Join(", ")
+        if util.isNumber(result.vote_average) and result.vote_average > 0 then base.infoLine = joinLine([base.infoLine, i18n.format(i18n.lookup(copy, "catalog.ratingTmdb"), { value: rating(result.vote_average) })])
+        return base
+    end function
+
+    ' A MediaRequest's card: the poster, and under it a status dot and the
+    ' stage's short label; the hero says when it was requested.
+    function fromRecord(record as Dynamic, copy as Object, lowTier = false as Boolean) as Dynamic
+        base = titleFields(record, copy, lowTier)
+        if base = invalid then return invalid
+        kind = mediaRequests.state.ofRecord(record)
+        base.requestState = kind
+        base.requestId = util.text(record.id)
+        short = mediaRequests.state.shortLabel(kind, record, copy)
+        base.captionDetail = short
+        base.statusTint = mediaRequests.state.tint(kind)
+        base.statusDot = true
+        requested = mediaRequests.detail.shortDate(record.created_at, copy)
+        if requested <> "" then base.infoLine = joinLine([base.infoLine, i18n.format(i18n.lookup(copy, "requests.requestedOn"), { date: requested })])
+        base.badges = [statusLine(kind, record, copy)]
+        spoken = [base.title]
+        year = yearText(record.year)
+        if year <> "" then spoken.Push(year)
+        spoken.Push(short)
+        base.audioGuideText = spoken.Join(", ")
+        return base
+    end function
+
+    ' tvOS's RequestRowCopy.status: the long label, with the reason when it
+    ' needs the viewer ("Declined · <reason>") or the qualities while on
+    ' its way.
+    function statusLine(kind as String, record as Object, copy as Object) as String
+        long = mediaRequests.state.longLabel(kind, record, copy)
+        if kind = mediaRequests.kind.DECLINED or kind = mediaRequests.kind.FAILED
+            reason = util.text(record.outcome_reason).Trim()
+            if reason <> "" then return long + " · " + reason
+        end if
+        if kind = mediaRequests.kind.ON_THE_WAY
+            qualities = mediaRequests.state.qualities(record)
+            if Instr(1, qualities, " · ") > 0 then return long + " · " + qualities
+        end if
+        return long
+    end function
+
+    ' What a title and a request share: identity, poster, hero text.
+    function titleFields(item as Dynamic, copy as Object, lowTier as Boolean) as Dynamic
+        if not util.isObject(item) or not util.isNumber(item.tmdb_id) then return invalid
+        mediaType = util.text(item.media_type)
+        if mediaType <> "movie" and mediaType <> "series" then return invalid
+        title = util.text(item.title)
+        size = BACKDROP_SIZE
+        if lowTier then size = LOW_BACKDROP_SIZE
+        line = []
+        year = yearText(item.year)
+        if year <> "" then line.Push(year)
+        line.Push(i18n.lookup(copy, "requests.mediaType." + mediaType))
+        synopsis = util.text(item.overview)
+        if Len(synopsis) > MAX_SYNOPSIS then synopsis = Left(synopsis, MAX_SYNOPSIS - 1) + "…"
+        return {
+            id: titleId(mediaType, Int(item.tmdb_id)),
+            itemType: mediaRequests.cards.REQUEST,
+            shape: "poster",
+            title: title,
+            caption: title,
+            heroTitle: title,
+            artUri: image(item.poster_path, POSTER_SIZE),
+            backdropUri: image(item.backdrop_path, size),
+            infoLine: joinLine(line),
+            synopsis: synopsis,
+            mediaType: mediaType,
+            tmdbId: Int(item.tmdb_id),
+            libraryItemId: util.text(item.library_content_id)
+        }
+    end function
+
+    ' A DiscoverBrand's card in a brand row of kind ("studios", "networks",
+    ' or "genres"): its logo on its colour, else its name; invalid without
+    ' a slug. Its ID names the browse page (brandOf).
+    function fromBrand(entry as Dynamic, kind as String) as Dynamic
+        if not util.isObject(entry) or util.text(entry.slug) = "" then return invalid
+        name = util.text(entry.display_name)
+        logo = util.text(entry.logo_url)
+        lower = LCase(logo)
+        if Left(lower, 8) <> "https://" and Left(lower, 7) <> "http://" then logo = ""
+        out = { id: "brand:" + browseKind(kind) + ":" + entry.slug, itemType: mediaRequests.cards.BRAND, shape: "landscape", title: name, caption: name, artUri: logo, tileColor: color(entry.gradient_from), audioGuideText: name }
+        if logo = "" then out.tileText = name
+        return out
+    end function
+
+    ' The browse page a brand row's kind opens: "studio", "network", or
+    ' "genre".
+    function browseKind(kind as String) as String
+        if kind = "studios" then return "studio"
+        if kind = "networks" then return "network"
+        return "genre"
+    end function
+
+    ' A brand card's { brand, slug } from its ID, or invalid.
+    function brandOf(id as String) as Dynamic
+        parts = id.Split(":")
+        if parts.Count() < 3 or parts[0] <> "brand" then return invalid
+        slug = Mid(id, Len(parts[0]) + Len(parts[1]) + 3)
+        if slug = "" then return invalid
+        return { brand: parts[1], slug: slug }
+    end function
+
+    ' "#1A2B3C" as "0x1A2B3CFF", or "" for anything else.
+    function color(value as Dynamic) as String
+        text = util.text(value).Trim()
+        if Len(text) <> 7 or Left(text, 1) <> "#" then return ""
+        hex = UCase(Mid(text, 2))
+        for i = 1 to 6
+            if Instr(1, "0123456789ABCDEF", Mid(hex, i, 1)) = 0 then return ""
+        end for
+        return "0x" + hex + "FF"
+    end function
+
+    ' The corner badge's glyph for a kind (tvOS's clock, arrow.down,
+    ' checkmark, and exclamationmark).
+    function glyph(kind as String) as String
+        if kind = mediaRequests.kind.PENDING then return "pkg:/images/detail/status_clock.png"
+        if kind = mediaRequests.kind.ON_THE_WAY then return "pkg:/images/detail/status_arrow.png"
+        if kind = mediaRequests.kind.IN_LIBRARY then return "pkg:/images/detail/status_check.png"
+        return "pkg:/images/detail/status_alert.png"
+    end function
+
+    function yearText(year as Dynamic) as String
+        if util.isNumber(year) and year > 0 then return Int(year).ToStr()
+        return ""
+    end function
+
+    ' TMDB's average to one decimal place: 7.25 gives "7.3".
+    function rating(value as Dynamic) as String
+        tenths = Int(value * 10 + 0.5)
+        return (tenths \ 10).ToStr() + "." + (tenths mod 10).ToStr()
+    end function
+
+    function joinLine(parts as Object) as String
+        out = []
+        for each part in parts
+            if part <> "" then out.Push(part)
+        end for
+        return out.Join(" · ")
+    end function
+end namespace

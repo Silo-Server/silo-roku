@@ -1,0 +1,102 @@
+import "pkg:/source/api/session.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/requests/api.bs"
+import "pkg:/source/requests/cards.bs"
+import "pkg:/source/requests/state.bs"
+import "pkg:/source/util/values.bs"
+
+' Where Requests' cards open, and the gate as the screens keep it (spec
+' section 5.11). destination and detailParams are pure; the gate functions
+' read and write m.global on the render thread.
+namespace requestsUi
+    ' Where a card opens: { route, params }. A title already in the
+    ' library opens its library page, as tvOS's card does; any other title
+    ' or request its request page, seeded with the card's text and
+    ' backdrop so the page paints at once; a brand its browse page
+    ' (nav.route.ROW). invalid for any other card.
+    function destination(card as Object, lowTier = false as Boolean) as Dynamic
+        itemType = util.text(card.itemType)
+        if itemType = mediaRequests.cards.BRAND
+            brand = mediaRequests.cards.brandOf(util.text(card.id))
+            if brand = invalid then return invalid
+            return { route: nav.route.ROW, params: { title: util.text(card.title), request: mediaRequests.request.browse(brand.brand, brand.slug, lowTier) } }
+        end if
+        if itemType <> mediaRequests.cards.REQUEST then return invalid
+        if util.text(card.requestState) = mediaRequests.kind.IN_LIBRARY and util.text(card.libraryItemId) <> "" then return { route: nav.route.DETAIL, params: { itemId: card.libraryItemId } }
+        return { route: nav.route.REQUEST_DETAIL, params: detailParams(card) }
+    end function
+
+    ' The request page's params: { mediaType, tmdbId, requestId, seed },
+    ' requestId the viewer's own request when the card is one of theirs
+    ' (so an ended request offers Request Again).
+    function detailParams(card as Object) as Object
+        seed = { title: util.text(card.heroTitle), backdropUri: util.text(card.backdropUri), metadata: util.text(card.infoLine), synopsis: util.text(card.synopsis) }
+        if seed.title = "" then seed.title = util.text(card.title)
+        return { mediaType: util.text(card.mediaType), tmdbId: card.tmdbId, requestId: util.text(card.requestId), seed: seed }
+    end function
+
+    ' The key the gate is kept under: the server and profile it was read
+    ' for, so another profile's answer never shows its tab.
+    function gateKey(origin as String, profileId as String) as String
+        return origin + "|" + profileId
+    end function
+
+    ' The key of the session's server and profile, "" without one.
+    function currentKey() as String
+        session = api.session.current()
+        if session = invalid then return ""
+        profileId = ""
+        if util.isObject(session.profile) then profileId = util.text(session.profile.id)
+        return gateKey(util.text(session.origin), profileId)
+    end function
+
+    ' Whether Requests shows for key, from what m.global keeps; false until
+    ' the first answer for it.
+    function available(key as String) as Boolean
+        gate = storedGate(key)
+        return gate <> invalid and util.isTrue(gate.available)
+    end function
+
+    function followSupported(key as String) as Boolean
+        gate = storedGate(key)
+        return gate <> invalid and util.isTrue(gate.followSupported)
+    end function
+
+    ' Whether an answer for key was read, so a Requests page may close
+    ' when it says no (never before the first answer, as on tvOS).
+    function resolved(key as String) as Boolean
+        return storedGate(key) <> invalid
+    end function
+
+    function storedGate(key as String) as Dynamic
+        if not m.global.hasField("requestsGate") then return invalid
+        gate = m.global.requestsGate
+        if not util.isObject(gate) or util.text(gate.key) <> key then return invalid
+        return gate
+    end function
+
+    ' Keeps a status answer (api.resultOf of mediaRequests.request.status) for
+    ' key. A failed read keeps what was known, as tvOS's store does. Gives
+    ' whether anything changed.
+    function remember(key as String, result as Dynamic) as Boolean
+        if not util.isObject(result) or not util.isTrue(result.ok) or not util.isObject(result.body) then return false
+        before = storedGate(key)
+        gate = { key: key, available: util.isTrue(result.body.available), followSupported: util.isTrue(result.body.followSupported) }
+        if not m.global.hasField("requestsGate") then m.global.addFields({ requestsGate: {} })
+        m.global.requestsGate = gate
+        return before = invalid or before.available <> gate.available or before.followSupported <> gate.followSupported
+    end function
+
+    ' Counts the requests made, cancelled, or followed this session
+    ' (m.global.requestsRevision): the Requests page reads its rows again
+    ' when shown after one.
+    sub changed()
+        if not m.global.hasField("requestsRevision") then m.global.addFields({ requestsRevision: 0 })
+        m.global.requestsRevision = m.global.requestsRevision + 1
+    end sub
+
+    function revision() as Integer
+        if not m.global.hasField("requestsRevision") then return 0
+        return m.global.requestsRevision
+    end function
+end namespace

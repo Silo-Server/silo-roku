@@ -142,6 +142,17 @@ Browse:
   text, and Settings sets the profile's Metadata Language (sections 5.5,
   5.6, and 5.8.1).
 
+Requests, shown only when the server offers them to the profile
+(`GET /api/v2/requests/status`):
+
+- the Requests tab: the account's requests and the server's Discover rows,
+  in the admin's order, with See all and the studio, network, and genre
+  rows;
+- a title's request page: Request, Cancel Request, Notify Me, and the
+  request's status;
+- My Requests, and Search's Request segment for titles the library lacks
+  (section 5.11).
+
 Personal lists:
 
 - Watchlist, Favorites, and History pages, opened from the avatar menu;
@@ -204,7 +215,6 @@ item is built, tvOS first where both have it (section 5.1).
 
 Planned:
 
-- Requests (tvOS, Android TV), shown only when the server offers them;
 - a sleep timer in the video player (Android TV; tvOS sets one only in its
   audio player);
 - the marker on AI-translated subtitle tracks (Android TV);
@@ -402,14 +412,15 @@ their existing HD/FHD assets.
   and no background band. Left to right:
   - the Silo wordmark, 96 px wide;
   - then, centred on the screen, a 58 px Search circle, then Home, Movies,
-    Series, For You, and Calendar, 8 px apart;
+    Series, For You, Calendar, and Requests, 8 px apart;
   - the 58 px profile avatar, at the right inset.
 
   The avatar, here and in its menu's header, is drawn as on the profile
   picker (section 5.4). A library tab appears only when the profile can see a
   library of that type; For You and Calendar always appear, as on tvOS,
-  whose default menu ends with them (`TVPrimaryMenuProjection`). Opening
-  either from the bar starts in its content. The bar appears on root pages only: Search is a pushed
+  whose default menu ends with them (`TVPrimaryMenuProjection`). Requests
+  trails them while the server offers Requests to the profile (section
+  5.11). Opening any of them from the bar starts in its content. The bar appears on root pages only: Search is a pushed
   page without it (D3), and detail pages have none.
 - **Tabs** are capsules 56 px tall with 29 px side padding and 26 px labels:
   - focused: a pure white fill with black text;
@@ -2202,7 +2213,17 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A refused change shows the alert "Couldn't Update Item" / "Your change wasn't saved. Please try again."; an unanswered one is held until the viewer discards it | The change goes back and "Couldn't update item. Your change wasn't saved." shows top centre for four seconds; an unanswered write counts as refused and nothing is held | Roku's passive notice line needs no focus; no held-change list is kept (assumption AG-326) |
 | The connection speed test times one streamed download in 500 ms windows, following the probe's redirect without credentials | Back-to-back chunks, each timed whole and spread over the windows, which reads low by the gaps; only against a server with `bandwidth_probe_location_v1`, whose credential-free URL is fetched without the redirect | Roku shows no bytes inside a transfer, and forwards profile headers across a redirect (assumptions AG-391 and A-14) |
 | Buffering is told from a slow device by the buffered duration, and plan summaries survive the app's exit | No renderer waits; a progressive plan measures no throughput, so it lowers before its first frame only on its 20 s deadline's failure path; a plan the Home button ends sends no summary; no foreground check | Roku reports only a fill percentage and segment downloads, and gives a channel no exit callback or background state (AG-390, AG-391; Android TV keeps no exit journal either) |
-| People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; the marker on AI-translated subtitle tracks | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| Search lists "Available to request" under the library's results: the first 12 titles of the first page, while the query is longer than one character | A fourth segment, Request, searches titles to request page by page into the same grid | Search's results are an endless grid, so nothing below them would ever show; a segment is one press from the query (assumption AG-406) |
+| The Requests hub has no See all for Discover rows (`.requestDiscoverRow` draws nothing on tvOS; Android TV has it on phones only) | A trimmed Discover row ends in See all, which opens the whole row page by page | The server pages any row since #3193, and a trimmed row otherwise hides titles the admin chose (assumption AG-402) |
+| tvOS and Android TV skip the studio, network, and genre rows | They show as rows of brand cards, and a brand opens its titles (a genre's movies) | The contract has a client draw a brand row from its brand list; the web does (assumption AG-403) |
+| The hub reads every page of the account's requests, and fails whole if either read fails | "Your requests" reads the 50 newest, loads as its own row, and is left out when its read fails; See all opens the rest in My Requests | One page of 50 bounds the row's memory (plan section 4.8); one row's failure does not hide Discover (assumption AG-404) |
+| My Requests (`.mine`) groups the requests in rows by In progress, Needs you, and Available; tvOS reaches it only from iOS | A grid of every request, newest first, opened from See all on "Your requests" | A cursor-paged list cannot be grouped without reading it all; the row on the hub already groups the newest (assumption AG-405) |
+| A long press on one of the viewer's pending requests offers Cancel Request | Options (*) does | Roku has no press and hold (as the card menu, section 5.3) |
+| The first Discover row carries the eyebrow "DISCOVER" over its title | Each row shows its title alone | A `RowList` row has one label (assumption AG-409) |
+| The hero shows a request's stage on the four-step track, and the request page an eyebrow ("Not in your library", "Requested") | The hero shows the stage as its badge; the request page's status strip has the track; no eyebrow | The hero's badge line is the place for a short status; the library hero has no eyebrow (assumption AG-409) |
+| The request page finds the viewer's request among every page of `GET /api/v2/requests/mine` | It reads `GET /api/v2/requests/{id}`: the request the title names, or the one the opened card was | One small read in place of up to 100 pages; Request Again needs the ended request, which only a card of it names (assumption AG-407) |
+| Notify Me's notices end with a period (tvOS); Android TV says "Notify me when available" | tvOS's words | tvOS is the reference (section 5.1) |
+| People and the Audiobooks chip in search; Home row reordering; Watch Party in the avatar menu; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; the marker on AI-translated subtitle tracks | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
 | The description translation's status ("Translating…", "Translated by AI") follows the translate symbol | The words alone, under the detail synopsis and leading Home's meta line | No symbol art ships for it; the words carry the meaning |
 | Each Featured card on the marquee runs its own translation, so several can run while focus moves along the row | One at a time: resting on another Featured card stops the run before it starts the next, which may start again when its card shows again | Keeps the requests and timers a 1 GB Roku holds to one run; the server's on-view budget per account is small (5 a second, 30 a minute) |
 | A metadata language change drops every cached item, section, and grid, and Home re-reads its rows | Home reads its rows again when it next shows; library pages and pages under Settings keep their text until they are read again | Roku keeps no item cache; a library page reads its rows each time it opens |
@@ -2261,6 +2282,134 @@ at silo-apple `ec9278f8` (`RecommendationsView`, `CalendarView`).
   the filter, and the focused card; after the player closes the week is
   read again quietly. A new day or time zone reads the week again when the
   page shows.
+
+### 5.11 Requests
+
+Built from tvOS at silo-apple `791b1e0e` (`TVRequestsPage`,
+`RequestDetailView`, `RequestsFeatureStore`, `RequestMediaCard`,
+`RequestDisplayState`, `RequestProgress`, `RequestErrorCopy`), with Android
+TV at silo-android `bda6cbdd7` as the second reference, against the server's
+contract at silo-server `f133b241f` (the admin's Discover layout, #3193;
+cards that no longer request, #3094; `docs/architecture/media-requests.md`
+and `request-discover-rows.md`). The pure decisions are
+`source/requests/` (`state.bs`, `detail.bs`, `api.bs`, `cards.bs`,
+`map.bs`), with specs in `tests/requests/`.
+
+- **Gate.** Each page with the top bar reads `GET /api/v2/requests/status`
+  as it starts, as it reads the personal lists' capability, and keeps the
+  answer for the server and profile it was read for (`requestsUi`).
+  Requests shows only when `requests_enabled` is true, `allowed` is true,
+  and `state` is `available`; a missing `allowed` or `state` reads as off.
+  A failed read keeps what was known. Notify Me needs `follow_supported`
+  too. When an answer turns Requests off, the bar drops the tab and a
+  Requests page under it goes to Home; a request page whose action the
+  server refuses with `capability_*` or `permission_denied` reads the
+  status again and goes to Home if it is now off. Child profiles and
+  quotas are the server's: a profile it does not allow gets `allowed`
+  false, and a title over its rating ceiling is left out of every list.
+- **The Requests tab** (`RequestsScreen`, `nav.route.REQUESTS`), last of the
+  tabs, is a stack root drawn as For You is (section 5.10): the hero shows
+  the focused card (its title, year and media type, TMDB rating or when it
+  was requested, synopsis, and backdrop, with the request's status as the
+  hero's badge), over these rows:
+  - **Your requests**: the account's 50 newest requests
+    (`GET /api/v2/requests/mine?limit=50`), in tvOS's order: in progress
+    (pending, approved, queued, downloading, partly in the library), then
+    needing the viewer (declined, failed), then in the library, newest
+    first within each, without the cancelled. A card shows the poster and,
+    under the title, a dot in the state's colour and the stage
+    ("Pending", "Queued", "Downloading", "Partly in library", "Adding to
+    library", "In library", "Declined", "Failed"). The row ends in See
+    all, which opens My Requests, when the account has more. The row loads
+    on its own, so a failed read leaves it out rather than failing the
+    page; with no requests it is left out.
+  - **The Discover rows**, from `GET /api/v2/requests/discover`, in its
+    `row_order`. A title row (`tmdb_chart`, `tmdb_discover`, `tmdb_list`,
+    `mdblist`) shows its `items` entry, up to 40 cards; a row without an
+    entry or titles is left out. A card shows the poster (TMDB's `w342`)
+    with the title and year under it, and a corner badge while the title
+    has a request: a clock on amber (pending), an arrow on sky (on its
+    way), a check on emerald (in the library), or "!" on rose (declined or
+    failed). A row the server trimmed (`total_pages` over 1, or
+    `total_results` over its titles) ends in **See all**, which opens the
+    whole row (`GET /api/v2/requests/discover/rows/{key}?page=N`). A brand
+    row (`studios`, `networks`, `genres`) loads its cards from
+    `GET /api/v2/requests/discover/{studios|networks|genres}`: landscape
+    cards with the brand's logo on its colour, or its name; OK opens its
+    titles (`GET /api/v2/requests/discover/browse/{studio|network|genre}/{slug}`,
+    a genre's movies). An unknown row type is skipped. A server without
+    `row_order` gets its `items` in order.
+
+  OK on a title or request opens its request page, or its library page
+  when it is in the library and the server names the item
+  (`library_content_id`). Options (*) on one of the viewer's pending
+  requests offers Cancel Request (`POST /api/v2/requests/{id}/cancel`); a
+  refusal shows as the notice line. While the page has nothing else it
+  shows the spinner over "Loading Requests"; with no rows, "Nothing here
+  yet" / "Use Search to find a movie or series to request" with Refresh;
+  a failed read, the error with Retry. The rows are read again, focus
+  staying on the same card, when the page shows after a request was made,
+  cancelled, or confirmed elsewhere in the app.
+- **Row page** (section 5.5's row page, `RowScreen`, `nav.route.ROW`): See
+  all on a Discover row, a brand, and See all on "Your requests" (My
+  Requests) open it with the row's title, reading page by page as focus
+  nears the end. Discover rows and brands page by number: the row's
+  `next_page` when it moves on and stays within `total_pages` (at most
+  500), else the next page, reading past a page its filters emptied (three
+  in a row at most); My Requests pages by cursor, 40 at a time, newest
+  first. OK on a card opens it as on the Requests tab.
+- **Request page** (`RequestDetailScreen`, `nav.route.REQUEST_DETAIL`),
+  read from `GET /api/v2/requests/detail/{movie|series}/{tmdb_id}`: the
+  library detail page's hero (section 5.6) with the title, the content
+  rating's chip, year, seasons or runtime, TMDB rating, and up to three
+  genres, the synopsis, and "Directed by" or "Created by" (two creators).
+  The card's text and backdrop paint it before the read. Below it the
+  action row:
+  - the primary pill: **Request** (one press; no seasons, quality, or 4K
+    choice, so the server requests every aired season the library lacks
+    and the qualities its policy gives); **Request Again** after the
+    viewer's own request was declined or failed; **Requesting…** while the
+    request is out; **Open in Library** once the title is there; else the
+    status, which does nothing: "Requested · Pending", "Queued for
+    download", "Downloading", "Partly in your library", "Declined ·
+    <reason>", or why the title cannot be requested ("Request limit
+    reached", "You can't request media right now");
+  - **Notify Me** / **Stop Notifying Me** (`PUT` and `DELETE
+    /api/v2/requests/follows/{media_type}/{tmdb_id}`) when another
+    profile's request for the title is pending or on its way and the
+    server supports following; the line under the row then says "We'll
+    let you know when it's available." or "Notification turned off.";
+  - **Cancel Request** while the viewer's own request waits for approval.
+
+  The viewer's own request is read from `GET /api/v2/requests/{id}`: the
+  request the title names (`request_id`, given only to the account that
+  made it), or the one the card was. While a request is out and not in the
+  library, the status strip shows STATUS (a dot and the stage's long
+  label, with the reason or the qualities), REQUESTED ("Sep 24"), and
+  QUALITY ("1080p · 4K"), over the four-step track Requested, Approved,
+  Downloading, In your library. More like this lists the server's
+  recommendations. A refused action shows the server's own detail (a
+  quota's counts, a conflict), or the client's words for validation,
+  Requests turned off, a lost connection, or a refusal; it shows on the
+  line under the row. `POST /api/v2/requests` is never sent again after an
+  answer that leaves it unsure (a lost connection, a timeout, a gateway
+  error without a problem, an unexpected success status): the button says
+  "Not confirmed yet", the line says "We couldn't confirm the request.
+  Check My Requests before trying again.", and the title is read again; a
+  read that shows the request releases the hold. An unsure cancel hides
+  Cancel Request and says "We couldn't confirm the cancellation. Reopen My
+  Requests to check it.". A title the server no longer has, or one over
+  the profile's rating ceiling (404), shows "This title is no longer
+  available".
+- **Search** (section 5.6) adds a fourth segment, **Request**, while the
+  server offers Requests: it searches `GET /api/v2/requests/search?q=&media_type=all`
+  page by page, leaving out titles the library has, into the same grid.
+  OK opens the title's request page. With nothing found it says "No titles
+  to request match your search."
+- **Images.** The server sends TMDB image paths; the client puts TMDB's
+  image base before them (`https://image.tmdb.org/t/p/w342` for posters,
+  `w1280` for backdrops, `w780` on the low tier), as tvOS, Android TV, and
+  the web do. Brand logos come as full URLs.
 
 ## 6. Application architecture
 
@@ -2596,6 +2745,16 @@ The first release consumes:
 - `GET /api/v2/catalog/themes/capabilities` for whether theme music plays,
   and `POST /api/v2/catalog/items/{id}/themes/{theme_id}/playback` for a
   theme's grant, whose URL the Audio node plays (section 5.6);
+- for Requests (section 5.11): `GET /api/v2/requests/status`;
+  `GET /api/v2/requests/discover`, `.../discover/rows/{row_id}?page=`,
+  `.../discover/{studios|networks|genres}`, and
+  `.../discover/browse/{studio|network|genre}/{slug}?page=` (a genre with
+  `media_type=movie`); `GET /api/v2/requests/search?q=&media_type=all&page=`;
+  `GET /api/v2/requests/detail/{media_type}/{tmdb_id}`;
+  `GET /api/v2/requests/mine` (`limit` up to 50, cursor) and
+  `GET /api/v2/requests/{id}`; `POST /api/v2/requests`;
+  `POST /api/v2/requests/{id}/cancel`; and `PUT` and `DELETE
+  /api/v2/requests/follows/{media_type}/{tmdb_id}`;
 - `GET /api/v2/subtitles/providers/status` for whether Search Subtitles…
   shows, `POST /api/v2/subtitles/search` for one language of the playing
   file, and `POST /api/v2/subtitles/download` for the result chosen,
