@@ -1,0 +1,256 @@
+namespace tests
+
+    @suite("auth coordinator profile at launch")
+    class AuthCoordinatorLaunchTests extends rooibos.BaseTestSuite
+
+        function owner() as Object
+            return { id: "p-owner", name: "Laura", hasPin: true, isChild: false, avatarUrl: "" }
+        end function
+
+        ' Signed in, remembering p-owner with its PIN token, under behavior.
+        function remembering(behavior as String) as Object
+            record = tests.sessions.signedIn()
+            record.launchBehavior = behavior
+            record.profileId = "p-owner"
+            record.profileTokens = [{ id: "p-owner", token: "pvt_owner" }, { id: "p-kid", token: "pvt_kid" }]
+            return record
+        end function
+
+        function launch(loop as Object) as Object
+            return api.auth.coordinator.view(loop.session).launch
+        end function
+
+        @describe("first launch")
+
+        @it("starts a new device on Every Time with the offer due, and saves it")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.launchBehavior = ""
+            loop = tests.sessions.create(record)
+            saved = api.auth.coordinator.record(loop.session)
+            m.assertEqual([saved.launchBehavior, saved.launchOffer], [onboarding.launch.EVERY_TIME, true])
+            m.assertEqual(loop.registry.data.launch_behavior, "askEveryLaunch")
+            m.assertEqual(loop.registry.data.launch_offer, "1")
+            m.assertTrue(m.launch(loop).asks)
+        end sub
+
+        @it("keeps a device that already remembers a profile opening it, with no offer")
+        sub _()
+            record = m.remembering("")
+            loop = tests.sessions.create(record)
+            saved = api.auth.coordinator.record(loop.session)
+            m.assertEqual([saved.launchBehavior, saved.launchOffer], [onboarding.launch.AUTOMATIC, false])
+            m.assertFalse(m.launch(loop).asks)
+            m.assertEqual(saved.profileTokens.Count(), 2, "Automatic reopens a protected profile with its token")
+
+            ' A saved server's remembered profile counts too.
+            record = tests.sessions.signedOut()
+            record.launchBehavior = ""
+            record.servers = [{ origin: "https://other.example", name: "", accountId: "2", profileId: "p-9", accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileTokens: [], usedAt: 1 }]
+            loop = tests.sessions.create(record)
+            m.assertEqual(api.auth.coordinator.record(loop.session).launchBehavior, onboarding.launch.AUTOMATIC)
+        end sub
+
+        @describe("launch")
+
+        @it("asks every launch under Every Time, forgetting the profile tokens so a PIN is asked again")
+        sub _()
+            loop = tests.sessions.create(m.remembering(onboarding.launch.EVERY_TIME))
+            m.assertTrue(m.launch(loop).asks)
+            m.assertFalse(m.launch(loop).afterSignIn)
+            saved = api.auth.coordinator.record(loop.session)
+            m.assertEqual(saved.profileTokens, [])
+            m.assertEqual(saved.profileId, "p-owner", "still the picker's focus")
+            m.assertFalse(loop.registry.data.DoesExist("profile_tokens"))
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: m.owner(), viewer: true })
+            m.assertEqual(loop.delivered.r1.error.kind, "pin_required")
+        end sub
+
+        @it("asks once a timed choice's time away has run out, or the clock reads earlier than the last use")
+        sub _()
+            now = tests.sessions.NOW
+            cases = [
+                { behavior: onboarding.launch.AFTER_ONE_HOUR, usedAt: now - 3600, asks: true },
+                { behavior: onboarding.launch.AFTER_ONE_HOUR, usedAt: now - 3599, asks: false },
+                { behavior: onboarding.launch.AFTER_TWELVE_HOURS, usedAt: now - 43199, asks: false },
+                { behavior: onboarding.launch.AFTER_TWELVE_HOURS, usedAt: now - 43200, asks: true },
+                { behavior: onboarding.launch.AFTER_ONE_HOUR, usedAt: now + 60, asks: true },
+                { behavior: onboarding.launch.AFTER_ONE_HOUR, usedAt: 0, asks: false },
+                { behavior: onboarding.launch.AUTOMATIC, usedAt: now - 999999, asks: false }
+            ]
+            for each c in cases
+                record = m.remembering(c.behavior)
+                record.usedAt = c.usedAt
+                loop = tests.sessions.create(record)
+                m.assertEqual(m.launch(loop).asks, c.asks, c.behavior + " " + (now - c.usedAt).ToStr())
+                m.assertEqual(api.auth.coordinator.record(loop.session).profileTokens.Count() = 0, c.asks)
+            end for
+        end sub
+
+        @it("asks after a sign-in under Every Time, and says the viewer just signed in")
+        sub _()
+            for each behavior in [onboarding.launch.EVERY_TIME, onboarding.launch.AUTOMATIC]
+                record = tests.sessions.signedOut()
+                record.launchBehavior = behavior
+                record.accountId = "1"
+                record.profileId = "p-owner"
+                loop = tests.sessions.create(record)
+                tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+                tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("login_ok"))
+                m.assertEqual(m.launch(loop).asks, behavior = onboarding.launch.EVERY_TIME, behavior)
+                m.assertTrue(m.launch(loop).afterSignIn)
+                tests.sessions.send(loop, { requestId: "r2", session: "selectProfile", profile: { id: "p-owner", name: "Laura", hasPin: false }, viewer: true })
+                m.assertFalse(m.launch(loop).asks)
+                m.assertFalse(m.launch(loop).afterSignIn)
+            end for
+        end sub
+
+        @it("asks under Every Time when removing the current server moves to a saved one")
+        sub _()
+            for each behavior in [onboarding.launch.EVERY_TIME, onboarding.launch.AUTOMATIC]
+                record = m.remembering(onboarding.launch.AUTOMATIC)
+                record.servers = [{ origin: "https://other.example", name: "", accountId: "2", profileId: "p-9", accessToken: "acc2", refreshToken: "ref2", expiresAt: tests.sessions.NOW + 3600, refreshAt: tests.sessions.NOW + 1800, profileTokens: [{ id: "p-9", token: "pvt_9" }], usedAt: 1 }]
+                loop = tests.sessions.create(record)
+                tests.sessions.send(loop, { requestId: "b1", session: "profileLaunch", behavior: behavior })
+                tests.sessions.send(loop, { requestId: "f1", session: "forgetServer", origin: "https://silo.example" })
+                m.assertEqual(loop.delivered.f1.body, { origin: "https://other.example" })
+                saved = api.auth.coordinator.record(loop.session)
+                m.assertEqual(saved.profileId, "p-9")
+                everyTime = behavior = onboarding.launch.EVERY_TIME
+                m.assertEqual(m.launch(loop).asks, everyTime, behavior)
+                m.assertEqual(saved.profileTokens.Count() = 0, everyTime, "a PIN-locked profile asks for its PIN again")
+            end for
+        end sub
+
+        @it("keeps Profile Selection across a sign-out")
+        sub _()
+            loop = tests.sessions.create(m.remembering(onboarding.launch.AFTER_ONE_HOUR))
+            tests.sessions.send(loop, { requestId: "r1", session: "signOut" })
+            saved = loop.persisted.Peek()
+            m.assertEqual([saved.profileId, saved.launchBehavior], ["", onboarding.launch.AFTER_ONE_HOUR])
+            m.assertFalse(m.launch(loop).asks)
+        end sub
+
+        @describe("offer")
+
+        @it("offers the profile the viewer picks while the offer is due, never one a deep link opens")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.launchBehavior = onboarding.launch.EVERY_TIME
+            record.launchOffer = true
+            loop = tests.sessions.create(record)
+            kid = { id: "p-kid", name: "Kid", hasPin: false, isChild: true }
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: kid })
+            m.assertInvalid(m.launch(loop).offer, "a deep link")
+            tests.sessions.send(loop, { requestId: "r2", session: "selectProfile", profile: kid, viewer: true })
+            m.assertEqual(m.launch(loop).offer, { id: "p-kid", name: "Kid", hasPin: false, isChild: true, avatarUrl: "" }, "a child profile the viewer picked too, as tvOS")
+            m.assertEqual(api.auth.coordinator.record(loop.session).usedAt, tests.sessions.NOW)
+        end sub
+
+        @it("offers a profile opened with its PIN")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.launchBehavior = onboarding.launch.EVERY_TIME
+            record.launchOffer = true
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", session: "verifyPin", profile: m.owner(), pin: "1234", viewer: true })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("verify_profile_pin_ok"))
+            m.assertEqual(m.launch(loop).offer.id, "p-owner")
+        end sub
+
+        @it("makes Remember Automatic, leaves Every Time for Ask Every Time, and keeps the offer due when put away")
+        sub _()
+            for each answer in [true, false, invalid]
+                record = tests.sessions.signedIn()
+                record.launchBehavior = onboarding.launch.EVERY_TIME
+                record.launchOffer = true
+                loop = tests.sessions.create(record)
+                tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: { id: "p-a", name: "A" }, viewer: true })
+                tests.sessions.send(loop, { requestId: "r2", session: "answerOffer", remember: answer })
+                m.assertTrue(loop.delivered.r2.ok)
+                saved = api.auth.coordinator.record(loop.session)
+                m.assertInvalid(m.launch(loop).offer)
+                if answer = invalid
+                    m.assertEqual([saved.launchBehavior, saved.launchOffer], [onboarding.launch.EVERY_TIME, true])
+                else if answer
+                    m.assertEqual([saved.launchBehavior, saved.launchOffer], [onboarding.launch.AUTOMATIC, false])
+                    m.assertEqual(loop.registry.data.launch_behavior, "automatic")
+                    m.assertFalse(loop.registry.data.DoesExist("launch_offer"))
+                else
+                    m.assertEqual([saved.launchBehavior, saved.launchOffer], [onboarding.launch.EVERY_TIME, false])
+                end if
+            end for
+        end sub
+
+        @it("ignores an answer that arrives after the session ended")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.launchBehavior = onboarding.launch.EVERY_TIME
+            record.launchOffer = true
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: { id: "p-a", name: "A" }, viewer: true })
+            m.assertEqual(m.launch(loop).offer.id, "p-a")
+            tests.sessions.send(loop, { requestId: "r2", session: "signOut" })
+            m.assertInvalid(m.launch(loop).offer)
+            tests.sessions.send(loop, { requestId: "r3", session: "answerOffer", remember: true })
+            m.assertTrue(loop.delivered.r3.ok)
+            saved = api.auth.coordinator.record(loop.session)
+            m.assertEqual([saved.launchBehavior, saved.launchOffer], [onboarding.launch.EVERY_TIME, true])
+        end sub
+
+        @describe("Settings")
+
+        @it("saves Profile Selection, which answers the offer; a timed choice counts from now")
+        sub _()
+            record = m.remembering(onboarding.launch.AUTOMATIC)
+            record.launchOffer = true
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r0", session: "selectProfile", profile: m.owner() })
+            loop.now = loop.now + 100
+            tests.sessions.send(loop, { requestId: "r1", session: "profileLaunch", behavior: onboarding.launch.AFTER_ONE_HOUR })
+            m.assertEqual(loop.delivered.r1.body, { behavior: "afterOneHour" })
+            saved = api.auth.coordinator.record(loop.session)
+            m.assertEqual([saved.launchBehavior, saved.launchOffer, saved.usedAt], [onboarding.launch.AFTER_ONE_HOUR, false, loop.now])
+            tests.sessions.send(loop, { requestId: "r2", session: "profileLaunch", behavior: onboarding.launch.AUTOMATIC })
+            m.assertEqual(api.auth.coordinator.record(loop.session).usedAt, 0)
+            tests.sessions.send(loop, { requestId: "r3", session: "profileLaunch", behavior: "sometimes" })
+            m.assertEqual(loop.delivered.r3.error.kind, "invalid_request")
+            m.assertEqual(m.launch(loop).behavior, onboarding.launch.AUTOMATIC)
+        end sub
+
+        @describe("time away")
+
+        @it("stamps a timed choice's use at most every five minutes while a profile is open")
+        sub _()
+            loop = tests.sessions.create(m.remembering(onboarding.launch.AFTER_ONE_HOUR))
+            tests.sessions.send(loop, { requestId: "r0", session: "inUse" })
+            m.assertEqual(api.auth.coordinator.record(loop.session).usedAt, 0, "no profile open")
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: m.owner() })
+            persists = tests.sessions.count(loop, "persist")
+            loop.now = loop.now + 299
+            tests.sessions.send(loop, { requestId: "r2", session: "inUse" })
+            m.assertEqual(tests.sessions.count(loop, "persist"), persists)
+            loop.now = loop.now + 1
+            tests.sessions.send(loop, { requestId: "r3", session: "inUse" })
+            m.assertEqual(tests.sessions.count(loop, "persist"), persists + 1)
+            m.assertEqual(loop.registry.data.used_at, loop.now.ToStr())
+            m.assertTrue(loop.delivered.r3.ok)
+        end sub
+
+        @it("closes the open profile when Silo comes back after time away, and asks for its PIN again")
+        sub _()
+            loop = tests.sessions.create(m.remembering(onboarding.launch.AUTOMATIC))
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: m.owner() })
+            m.assertEqual(api.auth.coordinator.view(loop.session).profile.id, "p-owner")
+            tests.sessions.send(loop, { requestId: "r2", session: "requireSelection", profileId: "p-other" })
+            m.assertEqual(loop.delivered.r2.error.kind, "identity_changed")
+            tests.sessions.send(loop, { requestId: "r3", session: "requireSelection", profileId: "p-owner" })
+            m.assertTrue(loop.delivered.r3.ok)
+            view = api.auth.coordinator.view(loop.session)
+            m.assertInvalid(view.profile)
+            m.assertEqual(view.rememberedProfileId, "p-owner")
+            m.assertTrue(view.launch.asks)
+            m.assertEqual(api.auth.coordinator.record(loop.session).profileTokens, [])
+        end sub
+    end class
+end namespace

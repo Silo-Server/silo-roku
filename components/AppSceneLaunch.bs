@@ -1,0 +1,144 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/deeplink/route.bs"
+import "pkg:/source/nav/phase.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/nav/stack.bs"
+import "pkg:/source/onboarding/launch.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' AppScene's profile at launch (spec sections 5.4 and 7.3,
+' source/onboarding/launch.bs): "Open {name} automatically?" over the first
+' screen after a profile the viewer chose while the device's offer was due,
+' and the rule for Silo coming back after time away. The session
+' (source/auth/coordinator.bs) keeps the choice; this file only asks it.
+'
+' A tick every onboarding.launch.TICK_SECONDS stamps a timed choice's use
+' while a profile is open. Ticks further apart than a running app's mean
+' the device slept with Silo open (a Roku player's suspend); Silo then asks
+' who's watching when Profile Selection says so, after closing the player,
+' as tvOS does on a return from the background.
+
+' The owner of the requests sent here.
+const LAUNCH_OWNER = "launch"
+
+sub launchInit()
+    m.launchDialog = invalid
+    ' The profile ID of the offer on screen.
+    m.launchOfferShown = ""
+    m.launchLastTick = 0
+    m.launchClock = CreateObject("roDateTime")
+    m.launchTimer = m.top.findNode("launchTimer")
+    m.launchTimer.duration = onboarding.launch.TICK_SECONDS
+    m.launchTimer.observeField("fire", "onLaunchTick")
+    m.launchTimer.control = "start"
+end sub
+
+' Called by onApiSession after the screen host, and when a screen becomes
+' ready (AppSceneNav.bs). An offer the session no longer holds (it ended,
+' or another profile opened) goes away unanswered.
+sub launchSessionChanged()
+    if m.launchDialog <> invalid and launchOfferId() <> m.launchOfferShown then launchCloseOffer(invalid)
+    launchOfferCheck()
+end sub
+
+' The profile ID of the session's offer, or "" for none or outside Home.
+function launchOfferId() as String
+    session = m.apiSession
+    if session = invalid or m.navShell.phase <> nav.phase.MAIN or not util.isObject(session.launch) or not util.isObject(session.launch.offer) then return ""
+    return util.text(session.launch.offer.id)
+end function
+
+function launchNow() as Integer
+    m.launchClock.Mark()
+    return m.launchClock.AsSeconds()
+end function
+
+sub onLaunchTick()
+    launchTick()
+end sub
+
+' Also run for platform events that come as the device wakes (HDMI and
+' network), so a return is caught before the next tick.
+sub launchTick()
+    now = launchNow()
+    last = m.launchLastTick
+    m.launchLastTick = now
+    session = m.apiSession
+    if session = invalid or session.status <> "signed_in" or not util.isObject(session.profile) then return
+    launch = session.launch
+    behavior = ""
+    if util.isObject(launch) then behavior = util.text(launch.behavior)
+    if onboarding.launch.slept(last, now) and onboarding.launch.asksOnReturn(behavior, last, now)
+        launchAskAgain(session.profile.id, now - last)
+        return
+    end if
+    if onboarding.launch.isTimed(behavior) then apiSend({ session: "inUse" }, api.newHandle(LAUNCH_OWNER))
+end sub
+
+' Closes the player, so its stop goes with the profile's credentials, and
+' asks the session to close the profile (the playback worker waits for the
+' stop); the picker follows the new session.
+sub launchAskAgain(profileId as String, awaySeconds as Integer)
+    log.info("launch", "away", { seconds: awaySeconds })
+    launchCloseOffer(invalid)
+    top = nav.stack.topEntry(m.navStack)
+    while top <> invalid and top.route = nav.route.PLAYER and m.navStack.entries.Count() > 1
+        navPop()
+        top = nav.stack.topEntry(m.navStack)
+    end while
+    apiSend({ session: "requireSelection", profileId: profileId }, api.newHandle(LAUNCH_OWNER))
+end sub
+
+' Shows the offer once the session has one, the app is past the profile
+' step, no deep link is under way, and the first screen has rendered, so
+' Home's loading (and AppLaunchComplete) never waits for it.
+sub launchOfferCheck()
+    session = m.apiSession
+    if m.launchDialog <> invalid or session = invalid or not util.isObject(session.launch) then return
+    offer = session.launch.offer
+    if not util.isObject(offer) or m.navShell.phase <> nav.phase.MAIN or deeplink.route.busy(m.deepLink) or m.top.dialog <> invalid then return
+    top = nav.stack.topEntry(m.navStack)
+    if top = invalid or top.route = nav.route.PLAYER then return
+    screen = m.navScreens[top.id]
+    if screen = invalid or not screen.ready then return
+    name = util.text(offer.name)
+    dialog = CreateObject("roSGNode", "StandardMessageDialog")
+    dialog.title = i18n.text("launch.offer.title", { name: name })
+    dialog.message = [i18n.text("launch.offer.body")]
+    dialog.buttons = [i18n.text("launch.offer.remember"), i18n.text("launch.offer.ask")]
+    dialog.observeField("buttonSelected", "onLaunchOfferAnswered")
+    dialog.observeField("wasClosed", "onLaunchOfferAnswered")
+    m.launchDialog = dialog
+    m.launchOfferShown = util.text(offer.id)
+    m.top.dialog = dialog
+    log.info("launch", "offer")
+end sub
+
+' Remember, or Ask Every Time; Back is Ask Every Time, as Menu is on tvOS.
+' A deep link puts the offer away unanswered before it closes the dialog
+' (deepLinkClose), so a close that arrives here is the viewer's Back.
+sub onLaunchOfferAnswered()
+    dialog = m.launchDialog
+    if dialog = invalid then return
+    remember = false
+    if dialog.wasClosed <> true then remember = dialog.buttonSelected = 0
+    launchCloseOffer(remember)
+end sub
+
+' Closes the offer, if shown, and tells the session the answer (invalid
+' puts it away unanswered).
+sub launchCloseOffer(remember as Dynamic)
+    dialog = m.launchDialog
+    if dialog = invalid then return
+    m.launchDialog = invalid
+    dialog.unobserveField("buttonSelected")
+    dialog.unobserveField("wasClosed")
+    dialog.close = true
+    ' The screen under it keeps its own focus.
+    top = nav.stack.topEntry(m.navStack)
+    if top <> invalid and m.navScreens[top.id] <> invalid and not m.navScreens[top.id].isInFocusChain() then m.navScreens[top.id].setFocus(true)
+    log.info("launch", "offer answered", { remember: util.text(remember) })
+    apiSend({ session: "answerOffer", remember: remember }, api.newHandle(LAUNCH_OWNER))
+end sub

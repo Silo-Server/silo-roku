@@ -7,6 +7,7 @@ import "pkg:/source/auth/headers.bs"
 import "pkg:/source/auth/problems.bs"
 import "pkg:/source/auth/profiles.bs"
 import "pkg:/source/auth/server.bs"
+import "pkg:/source/onboarding/launch.bs"
 import "pkg:/source/storage/registry.bs"
 import "pkg:/source/util/values.bs"
 
@@ -34,8 +35,14 @@ import "pkg:/source/util/values.bs"
 '   { session: "server", address, allowHttp }  check and store a server
 '   { session: "signIn", username, password }
 '   { session: "signOut" }
-'   { session: "selectProfile", profile }
-'   { session: "verifyPin", profile, pin }
+'   { session: "selectProfile", profile, viewer }
+'   { session: "verifyPin", profile, pin, viewer }
+'   { session: "profileLaunch", behavior }  Profile Selection (onboarding.launch)
+'   { session: "answerOffer", remember }  the answer to "Open {name}
+'     automatically?"; remember invalid only puts the offer away
+'   { session: "inUse" }            a profile is still open on screen
+'   { session: "requireSelection", profileId }  Silo came back after time
+'     away that asks who's watching (onboarding.launch.asksOnReturn)
 '   { session: "checkOrigin" }      check the configured origin again
 '   { session: "nameServer", origin, name }  remember a saved server's name
 '   { session: "forgetServer", origin }  remove a saved server (forgetServer)
@@ -68,6 +75,17 @@ import "pkg:/source/util/values.bs"
 ' sets in every build), reports another origin, or does not serve /api/v2,
 ' they fail with that refusal, which the session view reports until the
 ' viewer asks for another check or changes servers.
+'
+' Profile at launch (spec section 7.3, onboarding.launch): launchAsks says
+' the remembered profile does not reopen on its own, but waits for the
+' viewer to choose. It is set at launch by Profile Selection, after a
+' sign-in or a change of server under Every Time, and when Silo comes back
+' after time away (requireSelection); each time, the stored profile tokens
+' are forgotten, so a PIN-locked profile asks for its PIN again, as tvOS
+' forgets its profile token. A choice clears it. afterSignIn says no
+' profile has been chosen since the viewer signed in, when a single profile
+' without a PIN still opens on its own. offer is the profile the viewer
+' chose while the device's offer was due, until the offer is answered.
 '
 ' Saved servers: changing the server keeps the one it leaves, with its
 ' session, in saved.servers (storage), and a server already saved comes back
@@ -110,13 +128,31 @@ namespace api.auth.coordinator
     ' "checking" | "verified" | "refused", problem, url, requestId } for the
     ' base URL url.
     function create(saved as Object, facts as Object, allowUnconfirmedOrigin = false as Boolean) as Object
-        return { saved: saved, facts: facts, verified: {}, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, companion: invalid, companionAttempt: 0, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
+        return { saved: saved, facts: facts, verified: {}, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, companion: invalid, companionAttempt: 0, launchAsks: false, afterSignIn: false, offer: invalid, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
     end function
 
     ' The decisions to carry out once, at launch, before the first publish:
-    ' the check of a stored server's origin.
-    function start(state as Object) as Object
-        return confirmOrigin(state, false)
+    ' Profile Selection's starting choice on a device with none, whether this
+    ' launch asks who's watching (onboarding.launch.asksAtLaunch), and the
+    ' check of a stored server's origin. now is wall-clock seconds.
+    function start(state as Object, now = 0 as Integer) as Object
+        decisions = []
+        saved = state.saved
+        if not onboarding.launch.isBehavior(saved.launchBehavior)
+            remembered = saved.profileId <> ""
+            for each server in saved.servers
+                if server.profileId <> "" then remembered = true
+            end for
+            first = onboarding.launch.settle(remembered)
+            saved.launchBehavior = first.behavior
+            saved.launchOffer = first.offer
+            decisions.Push(persist())
+        end if
+        if saved.accessToken <> "" and onboarding.launch.asksAtLaunch(saved.launchBehavior, saved.usedAt, now)
+            if askWhoIsWatching(state) and decisions.Count() = 0 then decisions.Push(persist())
+        end if
+        decisions.Append(confirmOrigin(state, false))
+        return decisions
     end function
 
     ' What screens may know (api.session.current()):
@@ -130,7 +166,9 @@ namespace api.auth.coordinator
     '     reason: "" | "expired" | "signed_out" | "server_changed",
     '     deviceId, borrowed: invalid | { profileId, accountId,
     '     sessionExpiresAt }, borrowedReason: "" | "expired",
-    '     serverName, servers: [{ origin, name, current, signedIn }] }
+    '     serverName, servers: [{ origin, name, current, signedIn }],
+    '     launch: { behavior, asks, afterSignIn, offer: invalid | { id, name,
+    '       hasPin, isChild, avatarUrl } } }
     ' reason says why the last session ended. deviceId is the installation ID
     ' (X-Silo-Device-Id), which the SiloControl receiver advertises. verification names the open
     ' profile whose token the server refused: it needs its PIN again, and
@@ -139,6 +177,9 @@ namespace api.auth.coordinator
     ' originProblem says why it was refused. serverName is the configured
     ' server's name, "" until known; servers lists it (current) and the saved
     ' servers, most recently used first, name "" for one not yet known.
+    ' launch is Profile at launch: Profile Selection, whether the remembered
+    ' profile waits for the viewer (launchAsks), afterSignIn, and the profile
+    ' to offer as the one this device opens automatically.
     function view(state as Object) as Object
         status = "signed_in"
         if state.saved.origin = ""
@@ -149,7 +190,7 @@ namespace api.auth.coordinator
         active = invalid
         if state.profile <> invalid and state.verification = invalid then active = profileView(state.profile)
         check = currentOriginCheck(state)
-        return { status: status, origin: state.saved.origin, accountId: state.saved.accountId, rememberedProfileId: state.saved.profileId, profile: active, verification: state.verification, originStatus: check.status, originProblem: check.problem, reason: state.reason, deviceId: state.saved.deviceId, borrowed: borrowedView(state), borrowedReason: state.borrowedReason, serverName: state.saved.serverName, servers: serversView(state) }
+        return { status: status, origin: state.saved.origin, accountId: state.saved.accountId, rememberedProfileId: state.saved.profileId, profile: active, verification: state.verification, originStatus: check.status, originProblem: check.problem, reason: state.reason, deviceId: state.saved.deviceId, borrowed: borrowedView(state), borrowedReason: state.borrowedReason, serverName: state.saved.serverName, servers: serversView(state), launch: { behavior: state.saved.launchBehavior, asks: state.launchAsks, afterSignIn: state.afterSignIn, offer: state.offer } }
     end function
 
     function serversView(state as Object) as Object
@@ -196,8 +237,12 @@ namespace api.auth.coordinator
         if op = "server" then return checkServer(state, input)
         if op = "signIn" then return signIn(state, input)
         if op = "signOut" then return signOut(state, input, now)
-        if op = "selectProfile" then return selectProfile(state, input)
+        if op = "selectProfile" then return selectProfile(state, input, now)
         if op = "verifyPin" then return verifyPin(state, input)
+        if op = "profileLaunch" then return profileLaunch(state, input, now)
+        if op = "answerOffer" then return answerOffer(state, input)
+        if op = "inUse" then return inUse(state, input, now)
+        if op = "requireSelection" then return requireSelection(state, input)
         if op = "checkOrigin" then return checkOrigin(state, input)
         if op = "nameServer" then return nameServer(state, input)
         if op = "forgetServer" then return forgetServer(state, input, now)
@@ -315,7 +360,7 @@ namespace api.auth.coordinator
         if op.kind = "login" then return loggedIn(state, request, op, result, now)
         if op.kind = "server" then return serverChecked(state, request, op, result, now)
         if op.kind = "origin" then return originChecked(state, request, op, result)
-        if op.kind = "pin" then return pinChecked(state, request, op, result)
+        if op.kind = "pin" then return pinChecked(state, request, op, result, now)
         if op.kind = "handoffCapability" then return handoffCapable(state, op, result)
         if op.kind = "handoffStart" then return handoffStarted(state, op, result)
         if op.kind = "handoffPoll" then return handoffPolled(state, op, result)
@@ -386,8 +431,9 @@ namespace api.auth.coordinator
     ' Chooses a profile from the account's list. A PIN-locked profile without a
     ' token from this session answers pin_required; the screen then asks for
     ' the PIN (verifyPin). A profile whose token the server refused counts as
-    ' PIN-locked whatever the screen says about it.
-    function selectProfile(state as Object, input as Object) as Object
+    ' PIN-locked whatever the screen says about it. viewer says the viewer
+    ' chose it on the picker, which a deep link does not.
+    function selectProfile(state as Object, input as Object, now as Integer) as Object
         if state.saved.accessToken = "" then return [reply(api.response.failure(input, "signed_out"))]
         chosen = profileInput(input.profile)
         if chosen = invalid then return [reply(api.response.failure(input, "invalid_request"))]
@@ -396,6 +442,7 @@ namespace api.auth.coordinator
         state.profile = chosen
         state.verification = invalid
         state.saved.profileId = chosen.id
+        chose(state, chosen, util.isTrue(input.viewer), now)
         return [persist(), publish(), reply(succeeded(input, { profile: profileView(chosen) }))]
     end function
 
@@ -405,7 +452,7 @@ namespace api.auth.coordinator
         if state.saved.accessToken = "" then return [reply(api.response.failure(input, "signed_out"))]
         chosen = profileInput(input.profile)
         if chosen = invalid or not nonEmpty(input.pin) then return [reply(api.response.failure(input, "invalid_request"))]
-        request = build(state, input, { method: "POST", path: api.auth.profiles.verifyPath(chosen.id), body: { pin: input.pin }, auth: "account", timeoutMs: PIN_TIMEOUT_MS }, { kind: "pin", origin: state.saved.origin, profile: chosen, epoch: state.epoch })
+        request = build(state, input, { method: "POST", path: api.auth.profiles.verifyPath(chosen.id), body: { pin: input.pin }, auth: "account", timeoutMs: PIN_TIMEOUT_MS }, { kind: "pin", origin: state.saved.origin, profile: chosen, epoch: state.epoch, viewer: util.isTrue(input.viewer) })
         return submitConfidential(state, request)
     end function
 
@@ -558,6 +605,8 @@ namespace api.auth.coordinator
             end if
             state.saved.origin = nextOrigin
             restoreServer(state, nextServer)
+            ' The server it falls back to follows the launch rule too.
+            if nextServer <> invalid and state.saved.launchBehavior = onboarding.launch.EVERY_TIME then askWhoIsWatching(state)
             state.originCheck = originState("unverified", "", nextOrigin)
             decisions.Append(setOriginHold(state, false))
             ' The sign-out goes after the change cancels every request.
@@ -594,6 +643,8 @@ namespace api.auth.coordinator
         decisions = endSession(state, "server_changed")
         state.saved.origin = origin
         restoreServer(state, restoring)
+        ' tvOS resolves the launch rule again for the server it changes to.
+        if state.saved.launchBehavior = onboarding.launch.EVERY_TIME then askWhoIsWatching(state)
         return decisions
     end function
 
@@ -782,13 +833,14 @@ namespace api.auth.coordinator
         if accountId <> state.saved.accountId then state.saved.profileId = ""
         state.saved.accountId = accountId
         setTokens(state, tokens, now)
+        signedIn(state)
         account = { id: accountId, username: util.text(user.username), role: util.text(user.role), passwordChangeRequired: util.isTrue(user.password_change_required) }
         answer = succeeded(request, { account: account }, result.status)
         decisions.Append([persist(), publish(), reply(answer)])
         return decisions
     end function
 
-    function pinChecked(state as Object, request as Object, op as Object, result as Object) as Object
+    function pinChecked(state as Object, request as Object, op as Object, result as Object, now as Integer) as Object
         outcome = api.auth.profiles.pinOutcome(result)
         answer = withoutBody(result)
         answer.body = { outcome: outcome.outcome, retryAfterSeconds: outcome.retryAfterSeconds }
@@ -809,6 +861,7 @@ namespace api.auth.coordinator
         state.profile = op.profile
         state.verification = invalid
         state.saved.profileId = op.profile.id
+        chose(state, op.profile, op.viewer = true, now)
         answer.body.profile = profileView(op.profile)
         return [persist(), publish(), reply(answer)]
     end function
@@ -956,6 +1009,9 @@ namespace api.auth.coordinator
         end if
         state.profile = invalid
         state.verification = invalid
+        state.launchAsks = false
+        state.afterSignIn = false
+        state.offer = invalid
         state.proofs = {}
         state.generation = state.generation + 1
         state.epoch = state.epoch + 1
@@ -1057,6 +1113,95 @@ namespace api.auth.coordinator
 
     function profileView(profile as Object) as Object
         return { id: profile.id, name: profile.name, hasPin: profile.hasPin, isChild: profile.isChild, avatarUrl: profile.avatarUrl }
+    end function
+
+    ' ---- Profile at launch
+
+    ' A profile was chosen: nothing waits for the viewer any more, the use
+    ' is stamped, and a choice the viewer made while the device's offer was
+    ' due is offered as the one to open automatically.
+    sub chose(state as Object, profile as Object, viewer as Boolean, now as Integer)
+        state.launchAsks = false
+        state.afterSignIn = false
+        if now > 0 then state.saved.usedAt = now
+        if viewer and state.saved.launchOffer then state.offer = profileView(profile)
+    end sub
+
+    ' A sign-in, with a password or a phone (companion sign-in): tvOS opens a
+    ' single profile without a PIN after one, and Every Time asks for the
+    ' rest.
+    sub signedIn(state as Object)
+        state.afterSignIn = true
+        if state.saved.launchBehavior = onboarding.launch.EVERY_TIME then askWhoIsWatching(state)
+    end sub
+
+    ' The remembered profile waits for the viewer, and every stored profile
+    ' token is forgotten, so a PIN-locked profile asks for its PIN again.
+    ' Gives whether the tokens changed.
+    function askWhoIsWatching(state as Object) as Boolean
+        state.launchAsks = true
+        if state.saved.profileTokens.Count() = 0 then return false
+        state.saved.profileTokens = []
+        state.proofs = {}
+        return true
+    end function
+
+    ' Settings' Profile Selection. Choosing answers the offer; Automatic
+    ' keeps no time away, and a timed choice counts from now.
+    function profileLaunch(state as Object, input as Object, now as Integer) as Object
+        behavior = util.text(input.behavior)
+        if not onboarding.launch.isBehavior(behavior) then return [reply(api.response.failure(input, "invalid_request"))]
+        saved = state.saved
+        saved.launchBehavior = behavior
+        saved.launchOffer = false
+        state.offer = invalid
+        if behavior = onboarding.launch.AUTOMATIC
+            saved.usedAt = 0
+        else if state.profile <> invalid and now > 0
+            saved.usedAt = now
+        end if
+        return [persist(), publish(), reply(succeeded(input, { behavior: behavior }))]
+    end function
+
+    ' "Open {name} automatically?": Remember makes Profile Selection
+    ' Automatic, Ask Every Time leaves it, and either way the offer is
+    ' answered. remember invalid (the offer was closed for a deep link)
+    ' puts it away, due again at the next choice. An answer that arrives after
+    ' the offer went (the session ended) changes nothing.
+    function answerOffer(state as Object, input as Object) as Object
+        if state.offer = invalid then return [reply(succeeded(input, {}))]
+        state.offer = invalid
+        if util.isBoolean(input.remember) and state.saved.launchOffer
+            state.saved.launchOffer = false
+            if input.remember
+                state.saved.launchBehavior = onboarding.launch.AUTOMATIC
+                state.saved.usedAt = 0
+            end if
+            return [persist(), publish(), reply(succeeded(input, {}))]
+        end if
+        return [publish(), reply(succeeded(input, {}))]
+    end function
+
+    ' A profile is still open: a timed choice stamps the use, at most every
+    ' onboarding.launch.USE_STAMP_SECONDS.
+    function inUse(state as Object, input as Object, now as Integer) as Object
+        saved = state.saved
+        if state.profile = invalid or not onboarding.launch.isTimed(saved.launchBehavior) or not onboarding.launch.stampDue(saved.usedAt, now) then return [reply(succeeded(input, {}))]
+        saved.usedAt = now
+        return [persist(), reply(succeeded(input, {}))]
+    end function
+
+    ' Silo came back after time away that asks who's watching: the open
+    ' profile, if it is still profileId, closes, and the remembered one
+    ' waits for the viewer, as tvOS closes it on such a return.
+    function requireSelection(state as Object, input as Object) as Object
+        active = state.profile
+        if active = invalid or active.id <> util.text(input.profileId) or state.saved.accessToken = "" then return [reply(api.response.failure(input, "identity_changed"))]
+        state.profile = invalid
+        state.verification = invalid
+        state.offer = invalid
+        askWhoIsWatching(state)
+        return [persist(), publish(), reply(succeeded(input, {}))]
     end function
 
     ' ---- Building requests and envelopes
