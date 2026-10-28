@@ -1,0 +1,241 @@
+import "pkg:/components/theme/helpers.bs"
+
+namespace tests
+
+    ' The Explore all card and the row page (spec section 5.5), headless
+    ' through the test scene: Home asks whether its rows can be short, ends
+    ' each row with the card, and opens the row's page, which pages the
+    ' section and says when the row is gone.
+    @suite("explore all")
+    class ExploreAllTests extends rooibos.BaseTestSuite
+
+        protected override sub afterEach()
+            for each child in m.top.getChildren(-1, 0)
+                if child.subtype() = "HomeScreenProbe" or child.subtype() = "RowScreen" or child.subtype() = "RowScreenProbe" then m.top.removeChild(child)
+            end for
+        end sub
+
+        ' Home shown for the first time, the server's capability not yet
+        ' known unless known says it ({ max }).
+        function home(known = invalid as Dynamic) as Object
+            if m.global.hasField("personalLatest") then m.global.personalLatest = {}
+            theme.install()
+            tests.scene.reset()
+            if known = invalid
+                m.global.sectionItemLimit = {}
+            else
+                m.global.sectionItemLimit = { "origin:": known.max }
+            end if
+            probe = CreateObject("roSGNode", "HomeScreenProbe")
+            probe.entry = { id: "home", route: nav.route.HOME, params: {} }
+            probe.owner = "home-1"
+            m.top.appendChild(probe)
+            probe.visible = true
+            probe.callFunc("onShow", { restore: invalid, first: true, refresh: false })
+            return probe
+        end function
+
+        function sectionsRead() as Dynamic
+            return tests.scene.last(catalog.request.homeSections(false).path)
+        end function
+
+        function body(count as Integer) as Object
+            return { sections: [{ id: "trending", section_type: "trending", title: "Trending", featured: false, item_limit: 100, total_count: 80, is_custom: false, customized: false, items: tests.catalogData.items(count) }] }
+        end function
+
+        @describe("asking for short rows")
+
+        @it("reads the capability first, then asks a server that offers it for 20 cards a row")
+        sub _()
+            m.home()
+            m.assertInvalid(m.sectionsRead(), "the rows wait for the capability")
+            capability = tests.scene.last(catalog.rowLimit.capabilityRequest().path)
+            m.assertNotInvalid(capability)
+            tests.scene.answer(capability, tests.catalogData.fixture("get_home_capabilities_ok"))
+            read = m.sectionsRead()
+            m.assertEqual(read.request.query.item_limit, 20)
+            m.assertTrue(read.request.map.exploreAll)
+            m.assertEqual(m.global.sectionItemLimit["origin:"], 100)
+        end sub
+
+        @it("asks a server without it for whole rows, and remembers that for the session")
+        sub _()
+            m.home()
+            tests.scene.answer(tests.scene.last(catalog.rowLimit.capabilityRequest().path), { state: "available", allowed: true })
+            m.assertAANotHasKey(m.sectionsRead().request.query, "item_limit")
+            m.home({ max: 0 })
+            m.assertInvalid(tests.scene.last(catalog.rowLimit.capabilityRequest().path), "known for this server")
+            m.assertAANotHasKey(m.sectionsRead().request.query, "item_limit")
+        end sub
+
+        @it("reads the rows without item_limit when the capability read fails")
+        sub _()
+            m.home()
+            tests.scene.refuse(tests.scene.last(catalog.rowLimit.capabilityRequest().path), 404)
+            m.assertAANotHasKey(m.sectionsRead().request.query, "item_limit")
+            m.assertEqual(m.global.sectionItemLimit["origin:"], 0)
+        end sub
+
+        @it("reads again without item_limit when the server refuses it as unknown")
+        sub _()
+            probe = m.home({ max: 100 })
+            first = m.sectionsRead()
+            m.assertEqual(first.request.query.item_limit, 20)
+            problem = { type: "https://siloserver.org/docs/api/v2/problems/validation_failed", status: 422, errors: [{ location: "query.item_limit", code: "unknown_parameter" }] }
+            tests.scene.deliver(first.handle, { requestId: "r1", ok: false, status: 422, headers: {}, body: problem, error: { kind: "http", status: 422 } }, "error")
+            again = m.sectionsRead()
+            m.assertFalse(again.handle.isSameNode(first.handle))
+            m.assertAANotHasKey(again.request.query, "item_limit")
+            m.assertEqual(probe.findNode("rows").state, "loading", "no error shows")
+            tests.scene.answer(again, m.body(3))
+            m.assertEqual(probe.findNode("rows").state, "ready")
+        end sub
+
+        @describe("the card")
+
+        @it("ends a row with Explore all, keeps the hero on the last card, and opens the row's page")
+        sub _()
+            probe = m.home({ max: 0 })
+            tests.scene.answer(m.sectionsRead(), m.body(25))
+            rows = probe.findNode("rows")
+            row = rows.findNode("list").content.getChild(0)
+            m.assertEqual(row.getChildCount(), 21)
+            m.assertEqual(row.getChild(20).itemType, catalog.cards.MORE)
+            ' Focus on the card leaves the hero on the card before it.
+            list = rows.findNode("list")
+            list.rowItemFocused = [0, 19]
+            m.assertEqual(rows.focusedItem.id, "movie:m20")
+            list.rowItemFocused = [0, 20]
+            m.assertEqual(rows.focusedItem.id, "movie:m20")
+            m.assertInvalid(rows.callFunc("focusedCard"), "the card has no Options menu")
+            m.assertEqual(rows.callFunc("focusKey").item, catalog.cards.MORE_ID)
+            list.rowItemSelected = [0, 20]
+            pushed = tests.scene.nav()
+            m.assertEqual(pushed.Count(), 1)
+            m.assertEqual(pushed[0].route, nav.route.ROW)
+            m.assertEqual(pushed[0].params, rowPage.sectionParams("home", row, "", false))
+        end sub
+
+        @describe("the row page")
+
+        function page(params = invalid as Dynamic, component = "RowScreen" as String) as Object
+            theme.install()
+            tests.scene.reset()
+            row = CreateObject("roSGNode", "RowContent")
+            row.setFields({ id: "trending", title: "Trending" })
+            if params = invalid then params = rowPage.sectionParams("home", row, "", false)
+            node = CreateObject("roSGNode", component)
+            node.entry = { id: "row", route: nav.route.ROW, params: params }
+            node.owner = "row-1"
+            m.top.appendChild(node)
+            node.visible = true
+            node.callFunc("onShow", { first: true, restore: invalid, refresh: false })
+            return node
+        end function
+
+        function pageRead() as Dynamic
+            return tests.scene.last("/api/v2/catalog")
+        end function
+
+        @it("pages the section with its cursor, titles it, counts it, and opens a card")
+        sub _()
+            node = m.page()
+            read = m.pageRead().request
+            m.assertEqual([read.query.source, read.query.scope, read.query.section_id, read.query.limit], ["section", "home", "trending", 40])
+            m.assertEqual(node.findNode("title").text, "Trending")
+            tests.scene.answer(m.pageRead(), { items: tests.catalogData.items(40), total: 41, page: { has_more: true, next_cursor: "c2" } })
+            m.assertEqual(node.findNode("count").text, "41 items")
+            m.assertEqual(m.pageRead().request.query.cursor, "c2")
+            grid = node.findNode("results")
+            card = grid.findNode("grid").content.getChild(3)
+            grid.selectedItem = card
+            m.assertEqual(tests.scene.nav(), [{ op: "push", route: nav.route.DETAIL, params: homeFeed.detailParams(card) }])
+        end sub
+
+        @it("counts a row the server cannot count once the whole row is read")
+        sub _()
+            node = m.page()
+            tests.scene.answer(m.pageRead(), { items: tests.catalogData.items(3), total: 200, total_exact: false, page: { has_more: false } })
+            m.assertEqual(node.findNode("count").text, "3 items")
+        end sub
+
+        @it("reads the row again after playback, back to the card that was focused")
+        sub _()
+            node = m.page()
+            tests.scene.answer(m.pageRead(), { items: tests.catalogData.items(5), total: 5, page: { has_more: false } })
+            first = m.pageRead()
+            key = nav.focus.newKey("grid", "movie:m3", 0, 2)
+            node.callFunc("onHide")
+            ' Back from detail without playback keeps what was read.
+            node.callFunc("onShow", { first: false, restore: key, refresh: false })
+            m.assertTrue(m.pageRead().handle.isSameNode(first.handle))
+            node.callFunc("onHide")
+            node.callFunc("onShow", { first: false, restore: key, refresh: true })
+            again = m.pageRead()
+            m.assertFalse(again.handle.isSameNode(first.handle))
+            m.assertAANotHasKey(again.request.query, "cursor")
+            ' Continue Watching moved the title just played first.
+            items = tests.catalogData.items(5)
+            items.Unshift(items.Pop())
+            tests.scene.answer(again, { items: items, total: 5, page: { has_more: false } })
+            m.assertEqual(node.callFunc("focusKey").item, "movie:m3")
+        end sub
+
+        @it("reads the row again once a change from a card's Options menu lands")
+        sub _()
+            node = m.page(invalid, "RowScreenProbe")
+            items = []
+            for n = 1 to 5
+                items.Push(tests.catalogData.item(n, { user_state: { played: false, is_favorite: false, in_watchlist: false } }))
+            end for
+            tests.scene.answer(m.pageRead(), { items: items, total: 5, page: { has_more: false } })
+            m.assertTrue(node.callFunc("pressKey", "options"), "Options opens the card's menu")
+            menu = node.findNode("menuLayer").getChild(0)
+            for each item in menu.options.items
+                if item.title = "Mark as Watched"
+                    menu.picked = item.value
+                    menu.closed = true
+                end if
+            end for
+            write = tests.scene.last("/api/v2/watched/movie:m1")
+            m.assertNotInvalid(write)
+            reads = tests.scene.sent().Count()
+            tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
+            m.assertTrue(tests.scene.sent().Count() > reads, "the row is read again once the server agrees")
+            again = tests.scene.sent()[reads]
+            m.assertEqual([again.request.path, again.request.query.section_id], ["/api/v2/catalog", "trending"])
+            m.assertAANotHasKey(again.request.query, "cursor")
+            ' Continue Watching dropped the title marked watched.
+            left = tests.catalogData.items(5)
+            left.Shift()
+            tests.scene.answer(again, { items: left, total: 4, page: { has_more: false } })
+            m.assertEqual(node.findNode("count").text, "4 items")
+        end sub
+
+        @it("says a removed or hidden row is unavailable, with Back")
+        sub _()
+            node = m.page()
+            tests.scene.refuse(m.pageRead(), 404)
+            status = node.findNode("status")
+            m.assertTrue(status.visible)
+            m.assertEqual([status.message, status.detail, status.action], ["Row unavailable", "This row is no longer available.", "Back"])
+            m.assertTrue(status.isInFocusChain())
+            status.activated = true
+            m.assertEqual(tests.scene.nav()[0].op, "pop")
+        end sub
+
+        @it("offers Retry on another failure, and says an empty row has nothing")
+        sub _()
+            node = m.page()
+            tests.scene.fail(m.pageRead())
+            status = node.findNode("status")
+            m.assertEqual(status.action, "Retry")
+            first = m.pageRead()
+            status.activated = true
+            m.assertFalse(m.pageRead().handle.isSameNode(first.handle))
+            tests.scene.answer(m.pageRead(), { items: [], total: 0, page: { has_more: false } })
+            m.assertEqual([status.message, status.action], ["Nothing here yet", "Back"])
+            m.assertEqual(node.findNode("count").text, "")
+        end sub
+    end class
+end namespace

@@ -8,6 +8,7 @@ import "pkg:/source/catalog/people.bs"
 import "pkg:/source/catalog/personal.bs"
 import "pkg:/source/catalog/requests.bs"
 import "pkg:/source/catalog/rows.bs"
+import "pkg:/source/catalog/rowLimit.bs"
 import "pkg:/source/catalog/selection.bs"
 import "pkg:/source/catalog/series.bs"
 import "pkg:/source/catalog/translation.bs"
@@ -56,7 +57,11 @@ import "pkg:/source/util/values.bs"
 '
 ' map options besides kind: shape, the card shape of a row or page whose
 ' answer does not say (default poster); skipFeatured, true to leave a rows
-' answer's featured sections out (a library's Recommended);
+' answer's featured sections out (a library's Recommended); exploreAll, true
+' on a rows or row answer for Home's and a library's rows, which then stop
+' at catalog.rowLimit.CARDS cards and end with an Explore all card (addMore);
+' exactTotal, true on a page whose total shows only when exact (a row page:
+' a section listed past 200 items answers total_exact false);
 ' today, offsetSeconds, and clock24, a calendar answer's day and clock
 ' (calendarPage.request);
 ' fileId and baseUrl, the file a trickplay manifest must be for and the base
@@ -81,8 +86,9 @@ namespace catalog.map
         if shape = "" then shape = catalog.shape.POSTER
         summary = invalid
         content = invalid
+        exploreAll = util.isTrue(mapping.exploreAll)
         if kind = catalog.kind.ROWS
-            content = rowsTree(body, copy, util.isTrue(mapping.skipFeatured))
+            content = rowsTree(body, copy, util.isTrue(mapping.skipFeatured), exploreAll)
             if content <> invalid then summary = { rows: content.getChildCount() }
         else if kind = catalog.kind.RECOMMENDATIONS
             content = recommendationRows(body, copy)
@@ -91,16 +97,21 @@ namespace catalog.map
             content = calendarPage.rowsTree(body, strings(), mapping)
             if content <> invalid then summary = { rows: content.getChildCount() }
         else if kind = catalog.kind.ROW
-            content = row(body, shape, copy)
+            if exploreAll
+                content = row(body, shape, copy, catalog.rowLimit.CARDS)
+                if content <> invalid and content.getChildCount() > 0 then addMore(content, util.text(copy.exploreAll), copy)
+            else
+                content = row(body, shape, copy)
+            end if
             if content <> invalid then summary = catalog.summary.page(body, content.getChildCount())
         else if kind = catalog.kind.SUPPORTING
             content = supporting(body, pageLimit(request), copy)
             if content <> invalid then summary = { size: content.getChildCount() }
         else if kind = catalog.kind.PAGE
             content = page(body, pageLimit(request), shape, copy)
-            if content <> invalid then summary = catalog.summary.page(body, content.getChildCount())
+            if content <> invalid then summary = inexactTotal(catalog.summary.page(body, content.getChildCount()), body, mapping)
         else if kind = catalog.kind.SKIP
-            if type(body.items) = "roArray" then summary = catalog.summary.page(body, body.items.Count())
+            if type(body.items) = "roArray" then summary = inexactTotal(catalog.summary.page(body, body.items.Count()), body, mapping)
         else if kind = catalog.kind.SEASONS or kind = catalog.kind.EPISODES
             content = list(body, kind, copy)
             if content <> invalid then summary = { size: content.getChildCount() }
@@ -121,6 +132,14 @@ namespace catalog.map
         return result
     end function
 
+    ' A page summary without its total when the request counts only exact
+    ' totals (exactTotal) and the server's is an estimate (total_exact false),
+    ' whether the page's cards were mapped or only its cursor read (skip).
+    function inexactTotal(summary as Object, body as Object, mapping as Object) as Object
+        if util.isTrue(mapping.exactTotal) and body.total_exact = false then summary.total = -1
+        return summary
+    end function
+
     function document(kind as String, body as Object, _copy as Object, origin = "" as String) as Dynamic
         if kind = catalog.kind.COLLECTIONS then return libraryCollections.fromResponse(body, strings(), origin)
         if kind = "settingsContract" then return settings.contract(body, strings())
@@ -135,6 +154,7 @@ namespace catalog.map
         if kind = catalog.kind.FILTERS then return libraryFilters.vocabulary(body)
         if kind = playback.shuffle.CAPABILITY_KIND then return playback.shuffle.capability(body)
         if kind = playback.themeMusic.CAPABILITY_KIND then return playback.themeMusic.capability(body)
+        if kind = catalog.rowLimit.CAPABILITY_KIND then return catalog.rowLimit.capability(body)
         if kind = playback.themeMusic.GRANT_KIND then return playback.themeMusic.grant(body, origin)
         if kind = playback.themeMusic.SEASON_KIND then return playback.themeMusic.seasonOf(body)
         if kind = catalog.translation.CAPABILITY_KIND then return catalog.translation.capability(body)
@@ -152,14 +172,19 @@ namespace catalog.map
     ' SectionCollection: up to catalog.rows.MAX_ROWS rows in server order.
     ' A section without items whose total_count is positive comes with
     ' placeholder cards, to load later; an empty one is left out, and with
-    ' skipFeatured so is a featured one.
-    function rowsTree(body as Object, copy as Object, skipFeatured = false as Boolean) as Dynamic
+    ' skipFeatured so is a featured one. With exploreAll a row holds at most
+    ' catalog.rowLimit.CARDS cards and ends with an Explore all card; a
+    ' pending row gets its card when its items load.
+    function rowsTree(body as Object, copy as Object, skipFeatured = false as Boolean, exploreAll = false as Boolean) as Dynamic
+        bound = catalog.rows.MAX_ITEMS
+        if exploreAll then bound = catalog.rowLimit.CARDS
         if type(body.sections) <> "roArray" then return invalid
         root = CreateObject("roSGNode", "ContentNode")
         for each section in body.sections
             if root.getChildCount() >= catalog.rows.MAX_ROWS then exit for
             if util.isObject(section) and util.text(section.id) <> "" and not (skipFeatured and util.isTrue(section.featured))
-                node = row(section, catalog.shape.POSTER, copy)
+                node = row(section, catalog.shape.POSTER, copy, bound)
+                if exploreAll and node <> invalid and node.getChildCount() > 0 then addMore(node, util.text(copy.exploreAll), copy)
                 if node <> invalid and node.getChildCount() = 0 and node.totalCount > 0 then addPlaceholders(node, catalog.rows.PLACEHOLDERS)
                 if node <> invalid and node.getChildCount() > 0 then root.appendChild(node)
             end if
@@ -314,6 +339,14 @@ namespace catalog.map
         node.setFields(fields)
         return node
     end function
+
+    ' Ends a row with its Explore all card (catalog.cards.moreCard), labelled
+    ' copy.exploreAll, which opens the row's full page; Requests' Discover
+    ' rows end with a See all card the same way, with their own label.
+    sub addMore(node as Object, label as String, copy = invalid as Dynamic)
+        if copy = invalid then copy = words()
+        card(node, catalog.cards.moreCard(label, node.title, node.shape, copy))
+    end sub
 
     ' Cards with no ID or art that hold a row's place until its items load.
     sub addPlaceholders(node as Object, count as Integer)

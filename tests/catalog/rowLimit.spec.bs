@@ -1,0 +1,165 @@
+namespace tests
+
+    ' Home's and a library's rows end at 20 cards with an Explore all card
+    ' (spec section 5.5), asking for short rows from a server that offers
+    ' them (tvOS SectionRowLimit, Android TV SectionRowLimits).
+    @suite("catalog row limit")
+    class CatalogRowLimitTests extends rooibos.BaseTestSuite
+
+        function mapped(kind as String, body as Dynamic, extra = invalid as Dynamic) as Object
+            mapping = { kind: kind }
+            if extra <> invalid then mapping.Append(extra)
+            return catalog.map.apply({ requestId: "r1", map: mapping }, tests.catalogData.ok(body), tests.catalogData.words())
+        end function
+
+        function section(id as String, sectionType as String, count as Integer) as Object
+            return { id: id, section_type: sectionType, title: "Row " + id, featured: false, item_limit: 100, total_count: count, is_custom: false, customized: false, items: tests.catalogData.items(count) }
+        end function
+
+        @describe("the capability (get_home_capabilities_ok.json)")
+
+        @it("reads section_item_limit_max, and none when absent")
+        sub _()
+            result = m.mapped(catalog.rowLimit.CAPABILITY_KIND, tests.catalogData.fixture("get_home_capabilities_ok"))
+            m.assertTrue(result.ok)
+            m.assertEqual(result.body, { max: 100 })
+            m.assertEqual(catalog.rowLimit.capability({ state: "available", allowed: true }), { max: 0 })
+            m.assertEqual(catalog.rowLimit.capability({ section_item_limit_max: -3 }), { max: 0 })
+            m.assertInvalid(catalog.rowLimit.capability("no"))
+        end sub
+
+        @it("asks for at most 20 cards, and nothing from a server without the parameter")
+        sub _()
+            m.assertEqual(catalog.rowLimit.itemLimit(100), 20)
+            m.assertEqual(catalog.rowLimit.itemLimit(12), 12)
+            m.assertEqual(catalog.rowLimit.itemLimit(0), 0)
+        end sub
+
+        @it("sends item_limit only when given one, and always caps the rows")
+        sub _()
+            home = catalog.rowLimit.capped(catalog.request.homeSections(false), 20)
+            m.assertEqual(home.query.item_limit, 20)
+            m.assertTrue(home.map.exploreAll)
+            library = catalog.rowLimit.capped(catalog.request.librarySections("12", false), 0)
+            m.assertAANotHasKey(library.query, "item_limit")
+            m.assertTrue(library.map.exploreAll)
+            m.assertTrue(library.map.skipFeatured)
+            row = catalog.rowLimit.cappedRow(catalog.request.homeSectionItems("trending", false))
+            m.assertAANotHasKey(row.query, "item_limit")
+            m.assertTrue(row.map.exploreAll)
+        end sub
+
+        @it("knows a server that refused item_limit as unknown, and nothing else")
+        sub _()
+            problem = { type: "https://siloserver.org/docs/api/v2/problems/validation_failed", status: 422, errors: [{ location: "query.item_limit", code: "unknown_parameter" }] }
+            m.assertTrue(catalog.rowLimit.refused({ ok: false, status: 422, body: problem }))
+            range = tests.catalogData.fixture("list_home_sections_item_limit_out_of_range")
+            m.assertFalse(catalog.rowLimit.refused({ ok: false, status: 422, body: range }), "out of range is not unknown")
+            m.assertFalse(catalog.rowLimit.refused({ ok: false, status: 400, body: problem }))
+            m.assertFalse(catalog.rowLimit.refused({ ok: true, status: 200, body: problem }))
+            m.assertFalse(catalog.rowLimit.refused({ ok: false, status: 422, body: invalid }))
+        end sub
+
+        @describe("capped rows")
+
+        @it("cuts each row to 20 cards and ends it with an Explore all card shaped like the row")
+        sub _()
+            body = { sections: [m.section("cw", "continue_watching", 30), m.section("added", "recently_added", 3)] }
+            result = m.mapped(catalog.kind.ROWS, body, { exploreAll: true })
+            landscape = result.content.getChild(0)
+            m.assertEqual(landscape.getChildCount(), catalog.rowLimit.CARDS + 1)
+            more = landscape.getChild(catalog.rowLimit.CARDS)
+            m.assertEqual(more.itemType, catalog.cards.MORE)
+            m.assertEqual(more.id, catalog.cards.MORE_ID)
+            m.assertEqual(more.title, "Explore all")
+            m.assertEqual(more.shape, catalog.shape.LANDSCAPE)
+            m.assertEqual(more.audioGuideText, "Explore all, Row cw")
+            m.assertEqual(more.artUri, "")
+            ' A short row ends with one too: Home drops titles other rows show.
+            posters = result.content.getChild(1)
+            m.assertEqual(posters.getChildCount(), 4)
+            m.assertEqual(posters.getChild(3).shape, catalog.shape.POSTER)
+            m.assertEqual(posters.getChild(3).itemType, catalog.cards.MORE)
+        end sub
+
+        @it("adds no card to a pending row until its items load, then caps them")
+        sub _()
+            pending = m.section("p", "trending", 0)
+            pending.total_count = 50
+            result = m.mapped(catalog.kind.ROWS, { sections: [pending] }, { exploreAll: true })
+            row = result.content.getChild(0)
+            m.assertEqual(row.getChildCount(), catalog.rows.PLACEHOLDERS)
+            for each card in row.getChildren(-1, 0)
+                m.assertEqual(card.id, "")
+            end for
+            items = m.mapped(catalog.kind.ROW, m.section("p", "trending", 45), { exploreAll: true })
+            m.assertEqual(items.content.getChildCount(), catalog.rowLimit.CARDS + 1)
+            m.assertEqual(items.content.getChild(catalog.rowLimit.CARDS).itemType, catalog.cards.MORE)
+            m.assertEqual(items.body.size, catalog.rowLimit.CARDS + 1)
+        end sub
+
+        @it("leaves rows without the option as they were: For You, the Calendar, and On Deck")
+        sub _()
+            result = m.mapped(catalog.kind.ROWS, { sections: [m.section("a", "trending", 45)] })
+            row = result.content.getChild(0)
+            m.assertEqual(row.getChildCount(), catalog.rows.MAX_ITEMS)
+            m.assertNotEqual(row.getChild(row.getChildCount() - 1).itemType, catalog.cards.MORE)
+            items = m.mapped(catalog.kind.ROW, m.section("a", "trending", 3))
+            m.assertEqual(items.content.getChildCount(), 3)
+        end sub
+
+        @it("ends another row with its own label, as Requests' See all")
+        sub _()
+            node = CreateObject("roSGNode", "RowContent")
+            node.setFields({ title: "Trending Movies", shape: catalog.shape.POSTER })
+            catalog.map.addMore(node, "See all", tests.catalogData.words())
+            m.assertEqual(node.getChild(0).title, "See all")
+            m.assertEqual(node.getChild(0).audioGuideText, "See all, Trending Movies")
+        end sub
+
+        @describe("the row page (rowPage)")
+
+        @it("pages Home's row through /catalog with the home scope, and a library's with its library")
+        sub _()
+            row = CreateObject("roSGNode", "RowContent")
+            row.setFields({ id: "next_up", title: "Next Up" })
+            home = rowPage.sectionParams("home", row, "", false)
+            m.assertEqual(home.title, "Next Up")
+            m.assertEqual(home.request.path, "/api/v2/catalog")
+            m.assertEqual([home.request.query.source, home.request.query.scope, home.request.query.section_id], ["section", "home", "next_up"])
+            m.assertAANotHasKeys(home.request.query, ["library_id", "cursor"])
+            m.assertEqual(home.request.map, { kind: catalog.kind.PAGE, exactTotal: true })
+            library = rowPage.sectionParams("library", row, "12", true)
+            m.assertEqual([library.request.query.scope, library.request.query.library_id], ["library", "12"])
+            ' Later pages keep the scope and the exact-total rule.
+            later = catalog.request.continued(library.request, "c2", 40, catalog.kind.PAGE)
+            m.assertEqual([later.query.source, later.query.section_id, later.query.cursor, later.query.limit], ["section", "next_up", "c2", 40])
+            m.assertTrue(later.map.exactTotal)
+        end sub
+
+        @it("counts a row page only when the server's total is exact")
+        sub _()
+            body = tests.catalogData.fixture("list_catalog_items_ok")
+            m.assertEqual(m.mapped(catalog.kind.PAGE, body, { exactTotal: true }).body.total, 3)
+            body.total_exact = false
+            m.assertEqual(m.mapped(catalog.kind.PAGE, body, { exactTotal: true }).body.total, -1)
+            m.assertEqual(m.mapped(catalog.kind.PAGE, body).body.total, 3, "other pages keep the estimate")
+            ' A page read only for its cursor, as the grid reads past pages it
+            ' dropped, drops the estimate too.
+            m.assertEqual(m.mapped(catalog.kind.SKIP, body, { exactTotal: true }).body.total, -1)
+            m.assertEqual(m.mapped(catalog.kind.SKIP, body).body.total, 3)
+            m.assertEqual(rowPage.count(3, 0, false), 3)
+            m.assertEqual(rowPage.count(-1, 40, false), -1)
+            m.assertEqual(rowPage.count(-1, 57, true), 57)
+        end sub
+
+        @it("opens a card's detail page, an episode on its series")
+        sub _()
+            card = CreateObject("roSGNode", "CardContent")
+            card.setFields({ id: "episode:e1", itemType: "episode", seriesId: "series:s", seasonNumber: 1 })
+            target = rowPage.destination(card, {})
+            m.assertEqual(target.route, nav.route.DETAIL)
+            m.assertEqual(target.params, homeFeed.detailParams(card))
+        end sub
+    end class
+end namespace

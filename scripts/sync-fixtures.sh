@@ -17,7 +17,7 @@
 # The commit defaults to the pin below; fetch it in the checkout first.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-pinned=bca55f764bc73c5cc73468df3777208350952bd1
+pinned=f133b241f3526604aedb0791b39e65dac6edc18a
 server=${1:?usage: scripts/sync-fixtures.sh <silo-server checkout> [commit]}
 commit=${2:-$pinned}
 
@@ -72,6 +72,8 @@ CATALOG = {
 CATALOG |= {"getPlaybackConnection", "resetPlaybackLearnedLimit", "getPlaybackBandwidthProbe", "reportPlaybackBandwidthProbe"}
 # The player's subtitle search and download (source/playback/subtitleSearch.bs).
 CATALOG |= {"getSubtitleProviderStatus", "searchSubtitles", "downloadSubtitle"}
+# Whether Home and library section reads take item_limit (source/catalog/rowLimit.bs).
+CATALOG |= {"getHomeCapabilities"}
 OPERATIONS |= CATALOG
 # The keys Settings edits (settings.supportedControls).
 SETTINGS = [

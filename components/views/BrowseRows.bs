@@ -3,9 +3,11 @@ import "pkg:/components/theme/helpers.bs"
 import "pkg:/components/views/pending.bs"
 import "pkg:/components/views/spoilers.bs"
 import "pkg:/source/api/client.bs"
+import "pkg:/source/api/session.bs"
 import "pkg:/source/catalog/cards.bs"
 import "pkg:/source/catalog/requests.bs"
 import "pkg:/source/catalog/rows.bs"
+import "pkg:/source/catalog/rowLimit.bs"
 import "pkg:/source/nav/focus.bs"
 import "pkg:/source/platform/client.bs"
 import "pkg:/source/util/log.bs"
@@ -26,6 +28,9 @@ sub init()
     m.restoreTimer.observeField("fire", "onRestoreTimeout")
     m.jumpTimer = m.top.findNode("jumpTimer")
     m.jumpTimer.observeField("fire", "onJumpTimer")
+    m.capabilityTimer = m.top.findNode("capabilityTimer")
+    m.capabilityTimer.duration = catalog.rowLimit.CAPABILITY_WAIT_SECONDS
+    m.capabilityTimer.observeField("fire", "onCapabilityTimeout")
     m.clock = CreateObject("roDateTime")
     m.source = {}
     m.lowTier = false
@@ -35,7 +40,8 @@ sub init()
     ' Whether the list shows m.content: detach() takes it away under memory
     ' pressure, and answers arriving meanwhile change only m.content.
     m.attached = true
-    ' Requests sent: { handle, kind: "layout" | "row", key, refresh, layout }.
+    ' Requests sent: { handle, kind: "layout" | "row" | "capability", key,
+    ' refresh, layout, quiet, limit }.
     m.pending = []
     ' Counts the layouts applied; a row answer for an earlier one is dropped.
     m.layout = 0
@@ -73,6 +79,7 @@ end sub
 
 function load(source as Object) as Boolean
     cancelPending()
+    m.capabilityTimer.control = "stop"
     m.source = source
     m.lowTier = util.isTrue(source.lowTier)
     ' The low tier marks focus with the list's 9-patch ring (plan section 4.6).
@@ -80,14 +87,91 @@ function load(source as Object) as Boolean
     if m.lowTier then m.list.focusBitmapUri = theme.art.FOCUS_RING
     m.wholeRefreshed = false
     m.top.state = "loading"
-    send(layoutRequest(), { kind: "layout", quiet: false }, "interactive")
+    ' Home's and a library's first rows wait for the server to say whether
+    ' they can be short, once per server.
+    if not wholeRows() and knownItemLimit() = invalid
+        send(catalog.rowLimit.capabilityRequest(), { kind: "capability" }, "interactive")
+        m.capabilityTimer.control = "start"
+        return true
+    end if
+    sendLayout(false)
     return true
 end function
 
 function refresh() as Boolean
     if m.content = invalid or m.top.state <> "ready" then return load(m.source)
-    send(layoutRequest(), { kind: "layout", quiet: true }, "interactive")
+    sendLayout(true)
     return true
+end function
+
+sub sendLayout(quiet as Boolean)
+    limit = 0
+    if not wholeRows() then limit = itemLimit()
+    send(layoutRequest(limit), { kind: "layout", quiet: quiet, limit: limit }, "interactive")
+end sub
+
+' The item_limit the open server takes (catalog.rowLimit.itemLimit), or
+' invalid before it has said: m.global.sectionItemLimit holds each
+' server's answer for the session ({ sessionOrigin(): max }, 0 for none).
+function knownItemLimit() as Dynamic
+    if not m.global.hasField("sectionItemLimit") then return invalid
+    known = m.global.sectionItemLimit
+    origin = sessionOrigin()
+    if not util.isObject(known) or not known.DoesExist(origin) then return invalid
+    return catalog.rowLimit.itemLimit(known[origin])
+end function
+
+function itemLimit() as Integer
+    limit = knownItemLimit()
+    if limit = invalid then return 0
+    return limit
+end function
+
+sub rememberItemLimit(max as Integer)
+    if not m.global.hasField("sectionItemLimit") then m.global.addFields({ sectionItemLimit: {} })
+    known = m.global.sectionItemLimit
+    known[sessionOrigin()] = max
+    m.global.sectionItemLimit = known
+end sub
+
+' The open server's key in m.global.sectionItemLimit: its origin, after a
+' prefix, since a field's AA drops an empty key.
+function sessionOrigin() as String
+    session = api.session.current()
+    origin = ""
+    if util.isObject(session) then origin = util.text(session.origin)
+    return "origin:" + origin
+end function
+
+' The capability answered: a failure counts as no item_limit, as Android
+' TV's does. The rows go out with what it said.
+sub onCapability(result as Object)
+    m.capabilityTimer.control = "stop"
+    max = 0
+    if result.ok and util.isObject(result.body) and util.isNumber(result.body.max) then max = result.body.max
+    rememberItemLimit(max)
+    sendLayout(false)
+end sub
+
+' The capability took too long: these rows go out without item_limit, and
+' the server counts as offering none this session, as on Android TV.
+sub onCapabilityTimeout()
+    if not capabilityPending() then return
+    for i = m.pending.Count() - 1 to 0 step -1
+        if m.pending[i].kind = "capability"
+            api.cancel(m.pending[i].handle)
+            m.pending.Delete(i)
+        end if
+    end for
+    rememberItemLimit(0)
+    sendLayout(false)
+end sub
+
+function capabilityPending() as Boolean
+    for each entry in m.pending
+        if entry.kind = "capability" then return true
+    end for
+    return false
 end function
 
 ' Whether the rows come whole from load's request.
@@ -103,15 +187,15 @@ sub refreshWhole()
     refresh()
 end sub
 
-function layoutRequest() as Object
+function layoutRequest(limit as Integer) as Object
     if wholeRows()
         ' send adds to the request, so each read gets its own copy.
         request = {}
         request.Append(m.source.request)
         return request
     end if
-    if m.source.surface = "library" then return catalog.request.librarySections(util.text(m.source.libraryId), m.lowTier)
-    return catalog.request.homeSections(m.lowTier)
+    if m.source.surface = "library" then return catalog.rowLimit.capped(catalog.request.librarySections(util.text(m.source.libraryId), m.lowTier), limit)
+    return catalog.rowLimit.capped(catalog.request.homeSections(m.lowTier), limit)
 end function
 
 sub send(request as Object, entry as Object, lane as String)
@@ -125,7 +209,16 @@ sub onResult(event as Object)
     entry = takePending(handle)
     if entry = invalid then return
     result = api.resultOf(handle)
-    if entry.kind = "layout"
+    if entry.kind = "capability"
+        onCapability(result)
+    else if entry.kind = "layout"
+        ' A server that stopped taking item_limit after offering it is
+        ' read again without it, and offers none this session.
+        if entry.limit > 0 and catalog.rowLimit.refused(result)
+            rememberItemLimit(0)
+            sendLayout(entry.quiet)
+            return
+        end if
         onLayout(result, handle.content, entry.quiet)
     else
         onRow(entry, result, handle.content)
@@ -276,17 +369,29 @@ end sub
 ' so its last report names the card now at the old place.
 sub showFocused()
     if m.jump <> invalid and not m.list.hasFocus()
-        m.top.focusedItem = cardAt(m.jump.row, m.jump.item)
+        card = cardAt(m.jump.row, m.jump.item)
     else
-        m.top.focusedItem = cardAt(m.focusRow, m.focusItem)
+        card = cardAt(m.focusRow, m.focusItem)
     end if
+    ' An Explore all card leaves the hero on the card it showed, as tvOS's
+    ' marquee keeps the last card it previewed.
+    if isMore(card) then return
+    m.top.focusedItem = card
 end sub
+
+function isMore(card as Dynamic) as Boolean
+    return card <> invalid and card.itemType = catalog.cards.MORE
+end function
 
 sub onItemSelected()
     selected = m.list.rowItemSelected
     if type(selected) <> "roArray" or selected.Count() < 2 then return
     card = cardAt(selected[0], selected[1])
-    if card <> invalid and card.id <> "" then m.top.selectedItem = card
+    if isMore(card)
+        m.top.moreSelected = m.content.getChild(selected[0])
+    else if card <> invalid and card.id <> ""
+        m.top.selectedItem = card
+    end if
 end sub
 
 ' The card the focused list reports focused and its row's section type,
@@ -294,7 +399,7 @@ end sub
 function focusedCard() as Dynamic
     if m.content = invalid or not m.attached or not m.list.hasFocus() then return invalid
     card = cardAt(m.focusRow, m.focusItem)
-    if card = invalid or card.id = "" then return invalid
+    if card = invalid or card.id = "" or isMore(card) then return invalid
     return { card: card, sectionType: m.content.getChild(m.focusRow).sectionType }
 end function
 
@@ -333,6 +438,7 @@ sub loadRow(index as Integer, refreshArt as Boolean)
     else
         request = catalog.request.homeSectionItems(record.key, m.lowTier)
     end if
+    request = catalog.rowLimit.cappedRow(request)
     send(request, { kind: "row", key: record.key, refresh: refreshArt, layout: m.layout }, lane)
 end sub
 

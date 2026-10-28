@@ -109,6 +109,9 @@ Browse:
 
 - Home built from the server's home sections, including the Continue Watching
   and Next Up rows the server provides;
+- Home and library rows of at most 20 cards, each ending with an Explore all
+  card that opens the row's full, paged page (section 5.5; added at the
+  owner's request on 2026-10-28, after tvOS and Android TV);
 - Movies and Series library tabs, each with Recommended rows, a Browse
   grid with sort, filters, and an alphabet rail, and read-only Collections
   pages;
@@ -761,6 +764,55 @@ their existing HD/FHD assets.
     check, 12 px from the top right; 14 px on landscape cards).
   - OK on any card opens the detail page; from Continue Watching, the detail
     page opens with that episode selected.
+  - Explore all (tvOS's `SectionExploreAllCard`, silo-apple `a65867ef`; Android
+    TV's `TvExploreAllCard`): Home's and a library's Recommended rows show at
+    most 20 cards, and every row with cards ends with an Explore all card,
+    even a row that shows all it has, since Home drops titles another row
+    already shows. The card is the row's only way to its page; row titles
+    take no focus. It has the row's card shape (a 176×264 poster, or a
+    360×200 landscape card in a landscape row) and lifts like the cards
+    beside it, on the raised surface (`#15171C`) with no artwork and no
+    caption: tvOS's mark, a 30 px arrow on a 66 px white 12% disc, centred
+    18 px above "Explore all" in the focused card title style at `#EDEDED`.
+    The audio guide says "Explore all, {row title}". Focus on it leaves the
+    hero on the card it showed; Options (*) on it does nothing. OK opens the
+    row's page; Back returns focus to the card. A row loaded later (5.8)
+    gets its card with its items. For You and the Calendar have no card.
+  - Short rows: when `GET /api/v2/home/capabilities` reports
+    `section_item_limit_max`, the Home and library section reads carry
+    `item_limit` of 20 (or that maximum, if lower), so the server sends no
+    more cards than a row shows. The answer is read once per server for the
+    session before Home's or a library's first rows; a read that fails or
+    takes over 3 seconds counts as none, as on Android TV. A section read
+    the server refuses with 422 for the unknown `item_limit` parameter is
+    read again without it, and that server gets none for the session. The
+    client cuts each row to 20 cards either way; a section's own items read
+    (`.../sections/{id}/items`) takes no `item_limit`.
+- **Row page** (tvOS's `SectionCatalogView`). Pushed from a row's Explore
+  all card, without the top bar.
+  - The row's title at (80, 88) in the collection page's title style, its
+    count at y 184 ("1 item", "57 items") once known: the server's `total`
+    when exact (not `total_exact: false`, which a row listed past 200 items
+    answers), else the cards read once the whole row has been.
+  - The library Browse grid from `theme.browse.GRID_TOP`: six columns of
+    260×390 posters with centred captions, paged 40 at a time with the
+    server's cursor and held as Browse holds its pages. The cards are the
+    row's, in its order: `GET /api/v2/catalog?source=section&section_id=
+    {id}&scope=home`, or `scope=library&library_id={id}` for a library's
+    row. OK opens a card's detail page as the row does; Options (*) opens
+    its menu (section 5.6); once the server takes a change from that menu,
+    the page reads the row again, which may have lost the card (a Watchlist
+    row, or Continue Watching after Mark as Watched). Shown again after the
+    player closes, or after a personal change elsewhere, the page reads the
+    row again and returns to the card that was focused, as Home and the
+    list pages do.
+  - States: a spinner while the first page loads; "Nothing here yet" /
+    "This row does not have any items right now." with Back; "Row
+    unavailable" / "This row is no longer available." with Back when the
+    server answers 404 (the row was removed or hidden, or its library is no
+    longer accessible); the Browse error with Retry otherwise.
+  - Requests' Discover rows open the same page with their own request (their
+    "See all" card is this card with that label).
 - **Library landing.**
   - A library tab opens on Recommended: the same feed as Home, built from the
     library's sections without its featured ones.
@@ -2039,7 +2091,13 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Continue Watching's header has an icon | Text only | No icon art ships, and `RowList` row labels are text |
 | A card without artwork shows its ThumbHash, or brand glows with a film or TV icon | The brand glows without an icon | Decoding a ThumbHash image costs CPU per card on low-cost hardware, and an icon would add a node to every card |
 | The hero backdrop decodes at the size it is shown | On the low tier it decodes at 819×504 and is stretched to 1229×756, on Home and detail pages alike | Plan section 4.6: texture memory on low-memory devices |
-| Home and a library's Recommended show every nonempty section the server returns, each with the items it sends | At most 20 rows with cards, 40 cards each; later sections and items do not show | Implementation plan section 4.8 bounds the metadata the rows keep, as well as their textures, on 512 MB devices |
+| Home and a library's Recommended show every nonempty section the server returns, each with at most 20 cards and an Explore all card | At most 20 rows with cards; later sections do not show. Rows hold 20 cards and the Explore all card, as on tvOS; For You and Calendar rows hold 40 cards | Implementation plan section 4.8 bounds the metadata the rows keep, as well as their textures, on 512 MB devices |
+| The row page reads 60 cards a page | 40, as Browse | Implementation plan section 4.8, as Browse (AG-631) |
+| The Explore all card has a 0.5 px white 8% outline | No outline | Half a pixel does not draw at 1080p, and the card's frame already rounds its corners (AG-632) |
+| A server's `section_item_limit_max` is remembered across launches, so the first Home read asks for short rows | Read once per server each session, before the first rows, as Android TV does | No registry write for a value one request finds; the first rows wait at most 3 seconds for it (AG-633) |
+| The row page's empty and unavailable states have no button; Menu goes back | They have Back | A Roku state view needs a focus target, as the collection page's empty state has (AG-634) |
+| A mixed library's Movies or Series view keeps its type on the row page, reading on until six new cards match | Both types show, as on the rows | The rows do not narrow a mixed library's sections yet (AG-280), and the page shows what the row shows (AG-635) |
+| The row page keeps the pages it read when it shows again | It reads the row again after playback or a personal change | Continue Watching and Next Up move with playback, and Home and the list pages read again then too (AG-637) |
 | Search reads 60 results a page and Browse 100 | 40 each | Implementation plan section 4.8 bounds the metadata kept on 512 MB devices |
 | Home re-reads its sections whenever it is shown again, except from detail, and on the server's push events | Home re-reads its sections quietly 3 seconds after it is next shown once the player has closed | The first release has no push channel; plan section 4.5 ties the refresh to playback |
 | A failed Home shows the server's message, or "Failed to load home sections" | The message every browse page uses for a failed load, with Retry | Section 5.8; the client's copy lives in `locale/` |
@@ -2477,6 +2535,12 @@ The first release consumes:
 - `GET /api/v2/library/{id}/sections` and
   `GET /api/v2/library/{id}/sections/{section_id}/items` for a library's
   Recommended rows;
+- `GET /api/v2/home/capabilities` for `section_item_limit_max`, and then
+  `item_limit=20` on `GET /api/v2/home/sections` and
+  `GET /api/v2/library/{id}/sections` (section 5.5);
+- `GET /api/v2/catalog?source=section&section_id={id}&scope=home`, or
+  `scope=library&library_id={id}`, 40 cards a page with cursor pagination
+  and the poster width, for a row's page;
 - `GET /api/v2/library/{id}/collections` for the library's collection index;
 - `GET /api/v2/catalog?source=library_collection&collection_id={id}` or
   `source=user_collection` for collection titles, with `limit=40`, cursor

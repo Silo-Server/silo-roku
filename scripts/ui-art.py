@@ -144,6 +144,7 @@ PANEL_BOTTOM = ((0x14, 0x15, 0x19), 0.95, 0.05)
 PANEL_BAND = 64  # gradient rows that stretch
 TAB = 56  # capsule height, FHD px
 CHECK_DISC = 40
+EXPLORE = (66, 30, 0.12)  # Explore all disc and arrow, FHD px, and the disc's alpha (tvOS SectionExploreAllCard)
 ROW_RADII = (14, 12)  # menu row fills: library and avatar rows, flyout sections
 BUTTON = (14, (WHITE, 0.07), (WHITE, 0.09))  # radius, fill, border (siloChromeResting*)
 DIALOG = (30, ((0x15, 0x17, 0x1C), 1.0), (WHITE, 0.09))  # radius, fill, border
@@ -434,6 +435,35 @@ def check_disc(size):
     return rows
 
 
+def explore_all(size, arrow, disc_alpha):
+    """tvOS's Explore all mark: SF arrow.right at `arrow` px semibold, white,
+    on a white disc at disc_alpha (siloOnSurface 12%)."""
+    half_stroke = arrow * 0.06
+    c = size / 2
+    tip = (c + arrow / 2 - half_stroke, c)
+    shaft = ((c - arrow / 2 + half_stroke, c), tip)
+    head = arrow * 0.38
+    wings = (((tip[0] - head, c - head), tip), ((tip[0] - head, c + head), tip))
+
+    def segment_distance(x, y, a, b):
+        (ax, ay), (bx, by) = a, b
+        t = max(0.0, min(1.0, ((x - ax) * (bx - ax) + (y - ay) * (by - ay)) / ((bx - ax) ** 2 + (by - ay) ** 2)))
+        return ((x - ax - t * (bx - ax)) ** 2 + (y - ay - t * (by - ay)) ** 2) ** 0.5
+
+    def on_arrow(x, y, size):
+        return min(segment_distance(x, y, a, b) for a, b in (shaft,) + wings) <= half_stroke
+
+    def on_disc(x, y, size):
+        return (x - c) ** 2 + (y - c) ** 2 <= c ** 2
+    disc = coverage(size, on_disc, scale=GLYPH_SCALE)
+    mark = coverage(size, on_arrow, scale=GLYPH_SCALE)
+    rows = []
+    for d_line, m_line in zip(disc, mark):
+        # The arrow over the disc: alpha composites, the colour stays white.
+        rows.append([WHITE + (round(m + d * disc_alpha * (1 - m / 255)),) for d, m in zip(d_line, m_line)])
+    return rows
+
+
 def png(rows):
     def chunk(tag, data):
         return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
@@ -475,6 +505,7 @@ def images():
     for radius, height in ((CARD_RADIUS, 4), (STILL_RADIUS, 6)):
         yield f"progress_{radius}_{height}.9.png", progress_track(radius, height)
     yield "check_disc.png", check_disc(CHECK_DISC)
+    yield "explore_all.png", explore_all(*EXPLORE)
     yield "circle_ring_3.png", circle_ring(CIRCLE, AVATAR_RING)
     yield "cast_shadow.png", cast_shadow()
     for res, scale in (("fhd", lambda px: px), ("hd", hd)):

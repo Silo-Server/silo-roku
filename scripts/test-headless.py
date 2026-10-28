@@ -59,7 +59,9 @@ SHARDS = [
     ("views", ["views"]),
     ("player", ["player"]),
     ("player-remote", ["player/shuffle.spec.bs", "player/remote.spec.bs", "player/voice.spec.bs"]),
-    ("screens", ["home", "library", "people", "personal", "search", "settings", "calendar"]),
+    ("screens", ["library", "people", "personal", "search", "settings", "calendar"]),
+    # Home's screens and the row page outgrew the screens shard's heap on CI.
+    ("home", ["home"]),
 ]
 
 

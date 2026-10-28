@@ -1,0 +1,173 @@
+import "pkg:/components/views/cardMenu.bs"
+import "pkg:/components/views/personal.bs"
+import "pkg:/components/theme/browse.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/source/catalog/rowPage.bs"
+import "pkg:/source/memory/policy.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/textures.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/platform/topics.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+sub init()
+    m.grid = m.top.findNode("results")
+    m.menuLayer = m.top.findNode("menuLayer")
+    cardMenuInit()
+    m.grid.translation = [theme.browse.GRID_SIDE, theme.browse.GRID_TOP]
+    m.grid.observeField("state", "onState")
+    m.grid.observeField("total", "onCount")
+    m.grid.observeField("seenAll", "onCount")
+    m.grid.observeField("selectedItem", "onSelected")
+    m.title = m.top.findNode("title")
+    m.title.font = theme.font(theme.textStyle.EMPTY_TITLE)
+    m.title.color = theme.color.TEXT
+    m.count = m.top.findNode("count")
+    m.count.font = theme.font(theme.textStyle.SEARCH_COUNT)
+    m.count.color = theme.color.TEXT_TERTIARY
+    m.status = m.top.findNode("status")
+    m.status.centre = [960, (theme.browse.GRID_TOP + 1080) \ 2]
+    m.status.observeField("activated", "onStatusActivated")
+    m.spinner = m.top.findNode("spinner")
+    m.spinner.centre = m.status.centre
+    m.textures = nav.textures.create()
+    nav.textures.addView(m.textures, m.grid)
+    ' personalRevision() when the row was last read.
+    m.revision = 0
+end sub
+
+sub onShow(event as Object)
+    if event.first
+        m.params = m.top.entry.params
+        m.title.text = util.text(m.params.title)
+        state = platform.current().memory
+        m.lowTier = state.tier = memory.tier.LOW
+        m.grid.owner = m.top.owner
+        m.grid.pages = state.gridPages
+        platform.subscribe(m.top.owner, [platform.topic.MEMORY_LEVEL], "onMemoryLevel")
+        loadRow(event.restore)
+    else
+        nav.textures.restore(m.textures)
+        if util.isTrue(event.refresh) or personalRevision() <> m.revision
+            ' Playback since (Continue Watching's order, a card's progress,
+            ' Next Up's episode), or a change elsewhere (the Watchlist), may
+            ' have moved this row, as on Home: read it again, back to the
+            ' card that was focused.
+            loadRow(event.restore)
+        else if event.restore <> invalid
+            m.grid.callFunc("restoreFocus", event.restore)
+        end if
+    end if
+    focusContent()
+end sub
+
+sub loadRow(restore = invalid as Dynamic)
+    m.revision = personalRevision()
+    ' The grid adds to the request it pages, so it gets its own copy.
+    request = {}
+    if util.isObject(m.params.request) then request.Append(m.params.request)
+    m.grid.callFunc("load", { request: request, lowTier: m.lowTier })
+    if restore <> invalid then m.grid.callFunc("restoreFocus", restore)
+end sub
+
+' The spinner while the first page loads, then the grid, or tvOS's empty,
+' unavailable (the server answers 404 for a row removed, hidden, or no
+' longer accessible), or error state. Back works throughout: the screen
+' keeps focus while nothing else can take it.
+sub onState()
+    state = m.grid.state
+    m.spinner.running = state = "loading"
+    m.status.visible = state = "empty" or state = "error"
+    if state = "empty"
+        showStatus("empty", i18n.text("rowPage.empty"), i18n.text("rowPage.emptyBody"), i18n.text("common.back"))
+    else if state = "error" and m.grid.errorStatus = 404
+        showStatus("empty", i18n.text("rowPage.unavailable"), i18n.text("rowPage.unavailableBody"), i18n.text("common.back"))
+    else if state = "error"
+        showStatus("error", i18n.text("browse.error.load"), "", i18n.text("states.retry"))
+    end if
+    if state <> "loading" then m.top.ready = true
+    if m.top.visible then focusContent()
+end sub
+
+sub showStatus(kind as String, message as String, detail as String, action as String)
+    m.count.text = ""
+    m.status.kind = kind
+    m.status.message = message
+    m.status.detail = detail
+    m.status.action = action
+end sub
+
+' tvOS's count: the server's total when exact, else the cards read once the
+' whole row has been.
+sub onCount()
+    m.count.text = ""
+    if m.status.visible then return
+    count = rowPage.count(m.grid.total, m.grid.seen, m.grid.seenAll)
+    if count = 1 then m.count.text = i18n.text("rowPage.itemOne")
+    if count > 1 then m.count.text = i18n.text("rowPage.itemOther", { count: count })
+end sub
+
+sub focusContent()
+    if m.status.visible
+        m.status.setFocus(true)
+    else
+        m.grid.setFocus(true)
+    end if
+end sub
+
+' Retry reads the row again; the empty and unavailable states' Back leaves.
+sub onStatusActivated()
+    if m.grid.state = "error" and m.grid.errorStatus <> 404
+        loadRow(focusKey())
+    else
+        nav.pop()
+    end if
+end sub
+
+sub onSelected(event as Object)
+    card = event.getData()
+    if card = invalid then return
+    target = rowPage.destination(card, m.params)
+    nav.push(target.route, target.params)
+end sub
+
+function focusKey() as Dynamic
+    return m.grid.callFunc("focusKey")
+end function
+
+sub onHide()
+    nav.textures.hide(m.textures)
+end sub
+
+sub onPressure(_level as String)
+    nav.textures.detach(m.textures)
+end sub
+
+function onMemoryLevel(event as Object) as Boolean
+    m.grid.pages = event.gridPages
+    return true
+end function
+
+' Options on a focused card opens its menu (components/views/cardMenu.bs).
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press or key <> "options" or cardMenuShown() or m.grid.state <> "ready" or not m.grid.isInFocusChain() then return false
+    return cardMenuOpen(m.grid.callFunc("focusedCard"), { sectionType: "", home: false }, m.grid)
+end function
+
+function backContext() as Object
+    return { overlay: cardMenuShown(), zone: nav.zone.NONE }
+end function
+
+function onBack(action as String) as Boolean
+    if action = nav.action.CLOSE_OVERLAY then cardMenuClose()
+    return true
+end function
+
+' A change from a card's menu can move the row itself (a Watchlist or
+' Favorites row loses the card, Continue Watching a title marked watched),
+' so the row is read again, back to the focused card, as Home reads its
+' rows again.
+sub cardMenuApplied(_card as Object, _value as Integer)
+    loadRow(focusKey())
+end sub
