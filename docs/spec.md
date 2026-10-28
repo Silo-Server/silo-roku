@@ -122,7 +122,10 @@ Browse:
   profile's title-art preference (`ui.title_art`);
 - the For You tab, with the server's recommendation rows, and the Calendar
   tab, with a week of releases and airings for the profile's followed,
-  trending, or all titles (section 5.10).
+  trending, or all titles (section 5.10);
+- episode spoiler hiding: the profile's settings blur an unwatched
+  episode's still and hide its description, where the server's settings
+  contract serves them (section 5.6).
 
 Personal lists:
 
@@ -185,7 +188,6 @@ Planned:
   Android TV);
 - a sleep timer in the video player (Android TV; tvOS sets one only in its
   audio player);
-- episode spoiler hiding (tvOS, Android TV);
 - the marker on AI-translated subtitle tracks (Android TV);
 - subtitle search and download (tvOS, Android TV);
 - profile creation (tvOS, Android TV) and editing (Android TV).
@@ -1200,6 +1202,56 @@ their existing HD/FHD assets.
   the same rule applies to the last episode played, and the page switches to
   that episode's season if the chain crossed into another.
 
+**Episode spoiler hiding.** Two profile settings, as tvOS
+(`EpisodeSpoilers`, `EpisodeSpoilerPreferences`) and Android TV apply
+them: `catalog.hide_unwatched_episode_images` ("Blur unwatched episode
+images") and `catalog.hide_unwatched_episode_overviews` ("Hide unwatched
+episode descriptions"). Both default to off and roam with the profile
+(section 8.5). The server never changes catalog answers for them; the
+client hides, and only an episode's own still and description. Series and
+season artwork and overviews always show.
+
+- **Unwatched.** An episode with no watch state, or one neither played,
+  in progress (`is_in_progress`), nor at a saved position
+  (`position_seconds` > 0). An in-progress episode shows everything. A card
+  marked watched since it was read (its Options menu, or the detail page)
+  shows its still when it is next drawn, and one marked unwatched hides it
+  again, as tvOS's played override does.
+- **Which picture.** The provenance the server gives for the picture
+  shown: `still_is_episode_still` on an episode row's still,
+  `poster_is_episode_still` on a poster card, and on a landscape card
+  `backdrop_is_episode_still`, or the poster's when the backdrop falls back
+  to it. `false` is never hidden; `true` or an absent field is hidden, as
+  the server asks for unknown sources.
+- **Cards.** The series page's episode rail, Home and library rows
+  (Continue Watching, Next Up, and episode posters), Browse and list grids,
+  Search results, and Up Next's On Deck cards blur a hidden still in
+  place: the card, its frame, check disc, progress bar, and caption stay
+  as they are (tvOS blurs at radius 24; section 5.9 for Roku's blur).
+- **Home hero.** For a card whose hero backdrop is the episode's own
+  picture, the hero shows no backdrop and no wash, as tvOS's marquee drops
+  it; an episode card with its series' backdrop (`series_backdrop_url`)
+  keeps that. A hidden description leaves the synopsis empty; the series
+  title and the "S1 E3 · Title" line stay.
+- **Series hero.** The backdrop is always the series', so only the
+  description hides: the synopsis line reads the episode title alone, not
+  "Title · overview".
+- **Up Next.** The pick's overview is left out; the series title,
+  "S1:E2" and title, and air date and runtime stay.
+- **Settings.** Playback's Spoilers section, after Episodes (section
+  5.8.1).
+- **When it applies.** Each page with the top bar (Home, a library tab,
+  For You, Calendar) reads the settings when it starts: first
+  `GET /api/v2/settings/contract/capabilities`, and only where that is
+  available at manifest revision 17 or later with batched effective reads,
+  `GET /api/v2/settings/values/effective` for the two keys, on their own
+  so an older server's 422 cannot fail another read. A server without them
+  hides nothing, and Settings shows no rows for them. A failed read keeps the
+  profile's last answer this session. Settings applies what it reads and
+  saves at once: the rows, grid, and hero beneath it draw their episode
+  cards again. Before a profile's first answer in a session nothing is
+  hidden (section 5.9).
+
 ### 5.7 Player
 
 The player's chrome follows tvOS (D9), keeping Roku's caption modes in the
@@ -1611,7 +1663,12 @@ seven-row scrolling window.
 - Playback: Resolution, Maximum Bitrate, Lower Quality When Buffering
   (where the server's contract lists `playback.buffering_quality_mode`),
   Audio Language, Auto-Play Next Episode, Skip Intros, Skip Credits,
-  Auto-Skip Recaps, Skip Back, and Skip Forward; then a Connection section,
+  Auto-Skip Recaps, then, under Spoilers where the server's contract lists
+  them, "Blur unwatched episode images" and "Hide unwatched episode
+  descriptions" (profile scope; the focused row's footer gives tvOS's
+  description and "Applies to episodes you have not started, on every
+  device that uses this profile."), Skip Back, and Skip Forward; then a
+  Connection section,
   where the server has it: the learned limit ("Limited to 44 Mbps after
   buffering on Oct 17") with Reset, hidden in Never, and Connection Speed
   ("48 Mbps · measured 3 minutes ago on Ethernet"), where OK runs Test speed
@@ -1739,7 +1796,10 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Resting on a season pill switches season after 70 ms | After 300 ms | A season not yet read is read when the viewer stops on it, and its cards replace the rail's; switching only where the viewer stops keeps requests and texture churn down on 512 MB devices |
 | While a series' episodes load, Play reads "Loading episodes…" and is disabled | Play plays the server's play target at once and names its episode when the episodes arrive | The server names the play target (section 8.3), so nothing has to wait |
 | More › Show Series Info (tvOS) or a Show capsule (Android TV) puts the series back in the hero | The hero keeps the last episode focused | More ships without Show Series Info (the "More also offers" row below; scope, sections 3.3 and 3.4), and section 5.6 lists only season pills |
-| Both apps hide episode spoilers per the profile's settings | Episode titles, stills, and synopses always show | Spoiler hiding is deferred (section 3.3, D10) |
+| A hidden episode still is blurred at radius 24 (Android TV: a blur over a 256 px decode, or the ThumbHash alone before Android 12) | The still decodes at most 16 px wide (catalog.spoilers.blurSize) and is stretched to the card, which Roku's renderer smooths into a blur of about the same strength | SceneGraph has no blur, the server's image API has no blurred variant, and a ThumbHash drawn as a picture would need a decoded file per card on a Task; the small decode also costs less texture memory than the sharp card (AG-462) |
+| The spoiler settings the server last confirmed are cached per server and profile across launches, so a cold start hides at once | Kept only for the session: a cold start hides nothing until the shell's read answers (two small requests, usually before Home's rows); returning to a profile read earlier in the session applies its answer at once | Roku's 32 KB registry is already split between the session, saved servers, and Browse's preferences (AG-465) |
+| The spoiler settings refresh on return to the foreground | They refresh when a page with the top bar starts, and when Settings reads or saves them | A Roku channel is not resumed from the background (AG-466) |
+| The series hero hides an episode's description only when both its rail row and its playback detail say it is unwatched | The rail card's watch state decides | The page reads an episode's watch detail only once focus rests on it (section 5.6); the rail card is the state on screen |
 | The Details table has no Genres row | Genres is a row (Android TV) | The metadata line shows only the first two genres |
 | A detail page visited lately paints at once from a cache of 20 pages and refreshes quietly | Every visit reads the page again, painting the card's seed meanwhile | Implementation plan section 4.8 bounds the metadata kept on 512 MB devices |
 | Rewind and fast-forward skip (Android TV) | Rewind and fast-forward drive the rate ladder | Roku remote convention |
@@ -1799,7 +1859,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A refused change shows the alert "Couldn't Update Item" / "Your change wasn't saved. Please try again."; an unanswered one is held until the viewer discards it | The change goes back and "Couldn't update item. Your change wasn't saved." shows top centre for four seconds; an unanswered write counts as refused and nothing is held | Roku's passive notice line needs no focus; no held-change list is kept (assumption AG-326) |
 | The connection speed test times one streamed download in 500 ms windows, following the probe's redirect without credentials | Back-to-back chunks, each timed whole and spread over the windows, which reads low by the gaps; only against a server with `bandwidth_probe_location_v1`, whose credential-free URL is fetched without the redirect | Roku shows no bytes inside a transfer, and forwards profile headers across a redirect (assumptions AG-391 and A-14) |
 | Buffering is told from a slow device by the buffered duration, and plan summaries survive the app's exit | No renderer waits; a progressive plan measures no throughput, so it lowers before its first frame only on its 20 s deadline's failure path; a plan the Home button ends sends no summary; no foreground check | Roku reports only a fill percentage and segment downloads, and gives a channel no exit callback or background state (AG-390, AG-391; Android TV keeps no exit journal either) |
-| People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; the AI-translation marker | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
 
 ### 5.10 For You and Calendar
 
@@ -2141,6 +2201,8 @@ The first release consumes:
   `/api/v2/subtitle-prefs/{key}`, for the audio and subtitle tracks the
   profile chose on a detail page (section 8.5);
 - `GET /api/v2/settings/values/effective` for the profile's preferences;
+- `GET /api/v2/settings/contract/capabilities` for whether the server
+  serves the episode spoiler settings (section 5.6);
 - `GET /api/v2/theme/branding` for server branding;
 - `GET /api/v2/capabilities/personal-lists` for whether Watchlist and
   Favorites show;
@@ -2202,6 +2264,7 @@ playback keys the existing TV apps honor:
 | `ui.title_art` | Off shows the text title instead of the title logo on Home and detail heroes (sections 5.5 and 5.6); the top bar's shell reads it when Home or a library page starts, and the detail page uses that read |
 | `playback.auto_play_next` | Up Next countdown and autoplay; the player's toggle (Up Next's and Options') writes it for this device (`profile_device`), as tvOS does |
 | `playback.next_up_prompt_seconds` | How long before the end Up Next opens, and what its countdown counts from (0 to 120 s; 0 opens it only at the end) |
+| `catalog.hide_unwatched_episode_images`, `catalog.hide_unwatched_episode_overviews` | Blur an unwatched episode's still and hide its description (section 5.6); read on their own when a page with the top bar starts, where the settings contract serves them (revision 17), and written by Settings for the profile (`profile`, the only scope the manifest allows) |
 | `ui.theme_music_enabled`, `ui.theme_music_loop` | Whether detail pages play their theme music, and whether it repeats (section 5.6); the theme player reads them when a page needs them, and Settings writes them for this device (`profile_device`), as tvOS does |
 
 Start has no language member, so language preferences are applied by choosing
@@ -2212,8 +2275,9 @@ Subtitle appearance is left to Roku's system caption settings (section 9.7).
 Settings writes supported preferences through `PUT /api/v2/settings/values/{key}`
 with a typed `{ "value": ... }` body and an explicit `scope` query. Playback
 and subtitle controls use `profile_device`, with “Use profile setting” sending
-`DELETE` at that scope. Title art and video skip intervals use `profile`, as
-required by their resolution order or allowed scopes. The screen explains
+`DELETE` at that scope. Title art, video skip intervals, and the spoiler
+settings use `profile`, as required by their resolution order or allowed
+scopes. The screen explains
 which scope a change affects. It reads the server contract first and offers
 only supported remote definitions; after each write it rereads effective
 values, showing policy constraints rather than treating the write receipt as

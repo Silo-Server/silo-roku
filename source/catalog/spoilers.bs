@@ -1,0 +1,159 @@
+import "pkg:/source/util/values.bs"
+
+' Episode spoiler hiding (spec section 5.6), as tvOS's EpisodeSpoilers and
+' EpisodeSpoilerPreferences: the profile's two settings blur an unwatched
+' episode's own still and hide its description. Pure.
+'
+' The server never changes catalog answers for them, so a card carries what
+' does not depend on the profile (catalog.cards sets spoilerArt,
+' spoilerBackdrop, and spoilerText on CardContent): whether the episode had
+' not been started (no progress) when it was read, and whether the picture
+' shown is the episode's own still. Played is left to the card's played
+' field, which a mark since the read changes either way, as tvOS's
+' playedOverride: where it is drawn, an unplayed card hides what the
+' settings ask for. Series and season artwork and overviews are never
+' hidden.
+namespace catalog.spoilers
+    const IMAGES_KEY = "catalog.hide_unwatched_episode_images"
+    const OVERVIEWS_KEY = "catalog.hide_unwatched_episode_overviews"
+    ' The settings manifest revision that introduced both keys.
+    const MANIFEST_REVISION = 17
+    ' A hidden still decodes at most this many px wide and is stretched to
+    ' its frame: Roku has no blur, and the stretch smooths it as tvOS's
+    ' 24 pt blur does a card's still (AG-462).
+    const BLUR_WIDTH = 16
+
+    ' Both settings off: what applies before the profile's answer and on a
+    ' server without them, as tvOS's EpisodeSpoilerSettings.off.
+    function off() as Object
+        return { images: false, overviews: false }
+    end function
+
+    ' Whether an episode counts as unwatched (the web's isEpisodeUnwatched,
+    ' tvOS's EpisodeWatchState): no watch state, or not played, not in
+    ' progress, and no saved position.
+    function unwatched(played as Dynamic, inProgress as Dynamic, position as Dynamic) as Boolean
+        if util.isTrue(played) or util.isTrue(inProgress) then return false
+        return not (util.isNumber(position) and position > 0)
+    end function
+
+    ' Whether a picture may be an episode's own still: its provenance flag
+    ' (poster_is_episode_still, backdrop_is_episode_still,
+    ' still_is_episode_still) is true, or absent, which the server says to
+    ' protect as one.
+    function maybeStill(provenance as Dynamic) as Boolean
+        return not (util.isBoolean(provenance) and not provenance)
+    end function
+
+    ' The spoiler fields of a catalog card for item (a CatalogItem):
+    ' { spoilerArt, spoilerBackdrop, spoilerText }. art and backdrop are
+    ' the card's picture and its hero's, each "poster", "backdrop",
+    ' "series" (the series backdrop), or "" for none.
+    function itemFlags(item as Object, art as String, backdrop as String) as Object
+        flags = { spoilerArt: false, spoilerBackdrop: false, spoilerText: false }
+        if LCase(util.text(item.type)) <> "episode" then return flags
+        state = item.user_state
+        inProgress = invalid
+        if util.isObject(state) then inProgress = state.is_in_progress
+        if not unwatched(false, inProgress, item.position_seconds) then return flags
+        flags.spoilerText = true
+        flags.spoilerArt = pictureFlag(item, art)
+        flags.spoilerBackdrop = pictureFlag(item, backdrop)
+        return flags
+    end function
+
+    function pictureFlag(item as Object, source as String) as Boolean
+        if source = "poster" then return maybeStill(item.poster_is_episode_still)
+        if source = "backdrop" then return maybeStill(item.backdrop_is_episode_still)
+        return false
+    end function
+
+    ' The spoiler fields of an episode row's card (an Episode): its still
+    ' is both its picture and its hero's.
+    function episodeFlags(episode as Object) as Object
+        state = episode.user_data
+        if not util.isObject(state) then state = {}
+        hidden = unwatched(false, state.is_in_progress, state.position_seconds)
+        still = hidden and util.text(episode.still_url) <> "" and maybeStill(episode.still_is_episode_still)
+        return { spoilerArt: still, spoilerBackdrop: still, spoilerText: hidden }
+    end function
+
+    ' Whether card (a CardContent, or an AA with its played and spoiler
+    ' fields) hides its picture (spoilerArt), its hero's backdrop
+    ' (spoilerBackdrop), or its description, under settings ({ images,
+    ' overviews }).
+    function hidesArt(card as Dynamic, prefs as Dynamic) as Boolean
+        return hidesField(card, prefs, "images", "spoilerArt")
+    end function
+
+    function hidesBackdrop(card as Dynamic, prefs as Dynamic) as Boolean
+        return hidesField(card, prefs, "images", "spoilerBackdrop")
+    end function
+
+    function hidesOverview(card as Dynamic, prefs as Dynamic) as Boolean
+        return hidesField(card, prefs, "overviews", "spoilerText")
+    end function
+
+    function hidesField(card as Dynamic, prefs as Dynamic, setting as String, field as String) as Boolean
+        if card = invalid or not util.isObject(prefs) or not util.isTrue(prefs[setting]) then return false
+        return util.isTrue(card[field]) and not util.isTrue(card.played)
+    end function
+
+    ' The decode size of a hidden picture drawn at width x height: at most
+    ' BLUR_WIDTH px wide, in its proportions, at least 2 px each way.
+    function blurSize(width as Integer, height as Integer) as Object
+        if width <= 0 or height <= 0 then return [BLUR_WIDTH, BLUR_WIDTH]
+        w = BLUR_WIDTH
+        if width < w then w = width
+        h = Int(height * w / width + 0.5)
+        if h < 2 then h = 2
+        if w < 2 then w = 2
+        return [w, h]
+    end function
+
+    ' Whether the settings contract serves both keys
+    ' (SettingsContractCapabilities), as tvOS's EpisodeSpoilerContract
+    ' asks: available, at manifest revision 17 or later, with the batched
+    ' effective read.
+    function supported(capabilities as Dynamic) as Boolean
+        if not util.isObject(capabilities) then return false
+        if util.text(capabilities.state) <> "available" then return false
+        if capabilities.DoesExist("allowed") and not util.isTrue(capabilities.allowed) then return false
+        if not util.isTrue(capabilities.supports_batched_effective) then return false
+        return util.isNumber(capabilities.manifest_revision) and capabilities.manifest_revision >= MANIFEST_REVISION
+    end function
+
+    function capabilitiesRequest() as Object
+        return { path: "/api/v2/settings/contract/capabilities", auth: "profile" }
+    end function
+
+    function valuesRequest() as Object
+        return { path: "/api/v2/settings/values/effective", query: { keys: [IMAGES_KEY, OVERVIEWS_KEY] }, auth: "profile" }
+    end function
+
+    ' The settings from an EffectiveSettingCollection, or from Settings'
+    ' values by key (settings.values): only a true boolean turns one on.
+    function parse(body as Dynamic) as Object
+        out = off()
+        if not util.isObject(body) then return out
+        items = body
+        if type(body.items) = "roArray"
+            items = {}
+            for each item in body.items
+                if util.isObject(item) and util.isString(item.key) then items[item.key] = item
+            end for
+        end if
+        out.images = flagOf(items[IMAGES_KEY])
+        out.overviews = flagOf(items[OVERVIEWS_KEY])
+        return out
+    end function
+
+    function flagOf(item as Dynamic) as Boolean
+        return util.isObject(item) and util.isBoolean(item.value) and item.value
+    end function
+
+    ' Whether a Settings values map carries the two keys.
+    function inValues(values as Dynamic) as Boolean
+        return util.isObject(values) and util.isObject(values[IMAGES_KEY]) and util.isObject(values[OVERVIEWS_KEY])
+    end function
+end namespace

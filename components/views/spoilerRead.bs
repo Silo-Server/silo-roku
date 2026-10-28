@@ -1,0 +1,101 @@
+import "pkg:/components/views/spoilers.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/api/session.bs"
+import "pkg:/source/catalog/spoilers.bs"
+import "pkg:/source/util/values.bs"
+
+' Reading and publishing the open profile's episode spoiler settings
+' (components/views/spoilers.bs keeps them), for the shell and Settings.
+
+function spoilerKey() as String
+    session = api.session.current()
+    if session = invalid then return ""
+    profileId = ""
+    if util.isObject(session.profile) then profileId = util.text(session.profile.id)
+    if profileId = "" then return ""
+    return util.text(session.origin) + "|" + profileId
+end function
+
+' Records settings ({ images, overviews }, or invalid for a server without
+' them) for key, the open profile's unless given, and makes them the ones
+' that apply.
+sub spoilerPublish(prefs as Dynamic, key = invalid as Dynamic)
+    if key = invalid then key = spoilerKey()
+    if key = "" then return
+    known = {}
+    if m.global.hasField("episodeSpoilersKnown") then known = m.global.episodeSpoilersKnown
+    if prefs = invalid
+        known.Delete(key)
+    else
+        known[key] = { images: util.isTrue(prefs.images), overviews: util.isTrue(prefs.overviews) }
+    end if
+    if m.global.hasField("episodeSpoilersKnown")
+        m.global.episodeSpoilersKnown = known
+    else
+        m.global.addFields({ episodeSpoilersKnown: known })
+    end if
+    spoilerApply(key, known[key])
+end sub
+
+' Makes value (or off, when invalid) the settings that apply, for key.
+sub spoilerApply(key as String, value as Dynamic)
+    if not util.isObject(value) then value = catalog.spoilers.off()
+    state = { revision: 0, key: "", images: false, overviews: false }
+    if m.global.hasField("episodeSpoilers") then state = m.global.episodeSpoilers
+    if state.key = key and state.images = value.images and state.overviews = value.overviews then return
+    updated = { revision: state.revision + 1, key: key, images: value.images, overviews: value.overviews }
+    if m.global.hasField("episodeSpoilers")
+        m.global.episodeSpoilers = updated
+    else
+        m.global.addFields({ episodeSpoilers: updated })
+    end if
+end sub
+
+' Reads the open profile's settings: the settings contract's capabilities,
+' then, where it serves both keys, their effective values. Until it
+' answers, the profile's last answer this session applies (none for
+' another profile's). A failed read keeps it; a server without the
+' settings forgets it. A change published while the read is out
+' (Settings) wins over its answer.
+sub spoilerRead()
+    key = spoilerKey()
+    known = invalid
+    if key <> "" and m.global.hasField("episodeSpoilersKnown") then known = m.global.episodeSpoilersKnown[key]
+    spoilerApply(key, known)
+    m.spoilerReading = { key: key, revision: spoilerRevision() }
+    if key = "" then return
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", "onSpoilerCapabilities")
+    api.send(catalog.spoilers.capabilitiesRequest(), handle)
+end sub
+
+sub onSpoilerCapabilities(event as Object)
+    result = api.resultOf(event.getRoSGNode())
+    reading = m.spoilerReading
+    if not util.isObject(reading) or not spoilerReadCurrent(reading) or not util.isObject(result) then return
+    if not util.isTrue(result.ok)
+        ' An older server has no settings contract.
+        if util.isNumber(result.status) and result.status = 404 then spoilerPublish(invalid, reading.key)
+        return
+    end if
+    if not catalog.spoilers.supported(result.body)
+        spoilerPublish(invalid, reading.key)
+        return
+    end if
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", "onSpoilerValues")
+    api.send(catalog.spoilers.valuesRequest(), handle)
+end sub
+
+sub onSpoilerValues(event as Object)
+    result = api.resultOf(event.getRoSGNode())
+    reading = m.spoilerReading
+    if not util.isObject(reading) or not spoilerReadCurrent(reading) or not util.isObject(result) then return
+    if util.isTrue(result.ok) then spoilerPublish(catalog.spoilers.parse(result.body), reading.key)
+end sub
+
+function spoilerReadCurrent(reading as Object) as Boolean
+    if not m.global.hasField("episodeSpoilers") then return true
+    state = m.global.episodeSpoilers
+    return reading.key = state.key and reading.revision = state.revision
+end function
