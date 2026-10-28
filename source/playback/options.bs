@@ -4,6 +4,7 @@ import "pkg:/source/playback/values.bs"
 import "pkg:/source/playback/media.bs"
 import "pkg:/source/playback/sidecars.bs"
 import "pkg:/source/playback/tracks.bs"
+import "pkg:/source/playback/chapters.bs"
 import "pkg:/source/catalog/pickers.bs"
 
 ' The player's Options panel (spec section 5.7) and the track, quality, and
@@ -29,6 +30,10 @@ import "pkg:/source/catalog/pickers.bs"
 '   modelType: roDeviceInfo.GetModelType(), "TV" on a Roku TV
 '   autoplay: whether Up Next plays on by itself (session-local)
 '   episode: whether the title is an episode, which shows Auto-play next
+'   chapters: the playing version's chapters (playback.chapters), [] for
+'     none, which leaves the Chapters tab out
+'   position: the playing position in source seconds, for the chapter
+'     Info and Chapters mark
 '   info: { series, title, tag, year, runtime, overview } for Info
 '   stats: playback.player.statsColumns
 '   contentTracks: the ready sidecars of the content playing the current
@@ -68,6 +73,12 @@ namespace playback.options
     const OUTCOME_AUTOPLAY = "autoplay"
     const OUTCOME_REVERT = "revert"
 
+    ' Chapters (assumptions AG-430 to AG-432): the tab, its rows, and the
+    ' seek a row asks for.
+    const TAB_CHAPTERS = "chapters"
+    const KIND_CHAPTER = "chapter"
+    const OUTCOME_SEEK = "seek"
+
     const QUALITY_AUTO = "auto"
     ' Retired spellings of "play the source", which Auto now does (Android
     ' TV's videoQualityPreference).
@@ -97,6 +108,10 @@ namespace playback.options
         for each key in ["title", "stream", "playback", "sync", "tracks", "options", "channels", "codec", "route", "audio", "subtitles", "file", "switching", "external", "none"]
             out[key] = i18n.lookup(strings, "player.hud." + key)
         end for
+
+        for each key in ["tabChapters", "chapter", "chapterNumbered", "chapters", "playing"]
+            out[key] = i18n.lookup(strings, "options." + key)
+        end for
         return out
     end function
 
@@ -123,6 +138,7 @@ namespace playback.options
         ]
         if trackList(state.version).Count() > 0 then tabs.Push({ key: TAB_AUDIO, label: copy.tabAudio, columns: audioColumns(state, copy) })
         tabs.Push({ key: TAB_SUBTITLES, label: copy.tabSubtitles, columns: subtitleColumns(state, copy) })
+        if playback.values.isArray(state.chapters) and state.chapters.Count() > 0 then tabs.Push({ key: TAB_CHAPTERS, label: copy.tabChapters, columns: chapterColumns(state, copy) })
         return { tabs: tabs }
     end function
 
@@ -147,7 +163,8 @@ namespace playback.options
     end function
 
     ' Info: TITLE (the series, title, tag, year and runtime, and overview)
-    ' and STREAM (badges, then Route, Audio, Subtitles, and Roku's File row:
+    ' and STREAM (badges, then Route, Audio, Subtitles, the chapter playing
+    ' once the first has begun, as tvOS shows it, and Roku's File row:
     ' container, the plan's bitrate, and size). The bitrate is the plan's
     ' source.bitrate_kbps: the version's is documented in bits per second
     ' but filled in kilobits (run 6 showed 4,162 for a 4.2 Mbps file;
@@ -183,6 +200,8 @@ namespace playback.options
         if entry <> invalid then subtitleValue = subtitleLine(entry, copy)
         if entry <> invalid and unshown(state) then subtitleValue = subtitleValue + " · " + copy.notShowing
         stream.Push(pairItem(copy.subtitles, subtitleValue))
+        chapter = currentChapter(state)
+        if chapter >= 0 then stream.Push(pairItem(copy.chapter, chapterTitle(state.chapters[chapter], chapter, copy)))
         if util.isObject(version)
             kbps = invalid
             if util.isObject(state.plan) and util.isObject(state.plan.source) then kbps = state.plan.source.bitrate_kbps
@@ -494,6 +513,55 @@ namespace playback.options
         return value
     end function
 
+    ' --- Chapters -----------------------------------------------------------------
+
+    ' The chapter playing (playback.chapters.at) at state.position, the
+    ' player's position in source seconds, or -1.
+    function currentChapter(state as Object) as Integer
+        if not playback.values.isArray(state.chapters) then return -1
+        return playback.chapters.at(state.chapters, state.position)
+    end function
+
+    ' A chapter's title, else "Chapter 3" by its place in the list, as
+    ' tvOS's Chapters pane numbers an untitled one.
+    function chapterTitle(chapter as Object, position as Integer, copy as Object) as String
+        if chapter.title <> "" then return chapter.title
+        return i18n.format(copy.chapterNumbered, { number: position + 1 })
+    end function
+
+    ' Chapters: CHAPTERS, a row for each chapter (tvOS's ChaptersPane): its
+    ' number ("01"), title, and start time; the one playing is checked,
+    ' which the row marks with tvOS's play glyph. A row's value is its
+    ' place in the list.
+    function chapterColumns(state as Object, copy as Object) as Object
+        rows = []
+        current = currentChapter(state)
+        for i = 0 to state.chapters.Count() - 1
+            chapter = state.chapters[i]
+            number = Right("0" + (i + 1).ToStr(), 2)
+            if i >= 99 then number = (i + 1).ToStr()
+            title = chapterTitle(chapter, i, copy)
+            begins = playback.media.clock(chapter.start)
+            row = entryRow(KIND_CHAPTER, i, title, number, i = current, copy)
+            row.style = "chapter"
+            row.trailing = begins
+            spoken = [title, begins]
+            if i = current then spoken.Push(copy.playing)
+            row.speech = join(spoken, ", ")
+            rows.Push(row)
+        end for
+        return [column(copy.chapters, rows, [])]
+    end function
+
+    ' A chapter row asks for a seek to its start, even to the chapter
+    ' playing, which tvOS restarts too; the player closes Options, as
+    ' tvOS's HUD dismisses.
+    function chooseChapter(state as Object, value as Dynamic) as Object
+        if not util.isNumber(value) or not playback.values.isArray(state.chapters) then return { kind: OUTCOME_NONE }
+        if value < 0 or value >= state.chapters.Count() then return { kind: OUTCOME_NONE }
+        return { kind: OUTCOME_SEEK, seconds: state.chapters[Int(value)].start }
+    end function
+
     ' --- Choices ----------------------------------------------------------------
 
     ' What a row's choice ({ kind, value }) does, as one outcome:
@@ -506,6 +574,7 @@ namespace playback.options
     '     only, since the client writes no settings (spec section 8.5).
     function choose(state as Object, choice as Object) as Object
         kind = util.text(choice.kind)
+        if kind = KIND_CHAPTER then return chooseChapter(state, choice.value)
         if kind = KIND_QUALITY then return chooseQuality(state, util.text(choice.value))
         if kind = KIND_AUDIO then return chooseAudio(state, choice.value)
         if kind = KIND_SUBTITLE then return chooseSubtitle(state, util.text(choice.value))

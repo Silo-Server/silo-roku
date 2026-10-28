@@ -362,7 +362,7 @@ server. `overview` is left out to keep frames small.
 | `set_quality` | The Options menu's quality change |
 | `set_muted` | The `Video` node's `mute` |
 | `set_volume` | 0 mutes, anything above 0 unmutes; Roku cannot set a level |
-| `set_playback_speed`, `set_video_gravity`, `set_subtitle_sync_ms`, `set_subtitle_position` | `error command_failed` "Not available on Roku" |
+| `set_playback_speed`, `set_video_gravity`, `set_subtitle_sync_ms`, `set_subtitle_position` | `error command_failed` "Not available on Roku"; Roku's `Video` node has no supported playback rate or scaling (spec section 5.9, assumptions AG-433 and AG-434) |
 | `set_hdr_enabled` | Ignored, as on the other TVs |
 
 `volume_mute_only` in the Roku's hello tells phones that understand it to

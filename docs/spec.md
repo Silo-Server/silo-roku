@@ -147,6 +147,9 @@ Play:
 - direct play, HLS remux, and HLS transcode, as protocol v3 plans them;
 - play/pause, skip, the rate ladder, scrubbing, Replay, and stop;
 - seek-preview thumbnails (trickplay) from the server's sprite sheets;
+- chapters from the watch projection: a Chapters tab in Options that seeks
+  to a chapter, the chapter playing in Info, and ticks on the scrubber
+  (section 5.7);
 - audio, subtitle, and quality selection through replan;
 - Skip Intro, Skip Recap, and Skip Credits using server markers, with the
   profile's recap and credits auto-skip (`playback.auto_skip_recap`,
@@ -183,8 +186,6 @@ item is built, tvOS first where both have it (section 5.1).
 Planned:
 
 - Requests (tvOS, Android TV), shown only when the server offers them;
-- chapters, playback speed, and aspect in the player's Options (tvOS,
-  Android TV);
 - a sleep timer in the video player (Android TV; tvOS sets one only in its
   audio player);
 - the marker on AI-translated subtitle tracks (Android TV);
@@ -232,6 +233,8 @@ supported settings are available there (section 5.8.1).
 - library creation, scanning, metadata editing, or user management;
 - Watch Together;
 - plugin administration surfaces;
+- playback speed and the Aspect choice in the player's Options (tvOS,
+  Android TV), which Roku has no supported way to draw (section 5.9);
 - live TV, OTA/DVB tuners, IPTV, EPG/XMLTV, DVR, `.strm`, or arbitrary remote
   stream playback.
 
@@ -1289,7 +1292,10 @@ Subtitles tab (criterion 4.8).
   - Scrubber: 7 px tall, 12 px while scrubbing, white at 24% (35% focused,
     48% scrubbing) with the played part white. A 30 px knob shows while the
     scrubber is focused, or 42 px with an 8 px white 55% ring while
-    scrubbing. Intro, recap, and credits ranges are bands (5.9).
+    scrubbing. Intro, recap, and credits ranges are bands (5.9). Each
+    chapter start after the first is a tick, as tvOS draws it: 3 px wide
+    (4 px while scrubbing), 14 px taller than the track, white 85%, over
+    the played part.
   - Time row: elapsed on the left and "−12:34" on the right, both white,
     28 px SemiBold with monospaced digits. While the viewer scrubs or the rate
     ladder runs, both follow the position being chosen and change with it;
@@ -1346,14 +1352,16 @@ Subtitles tab (criterion 4.8).
   - Panel: 14 px below the tabs, 1100×380, padding 28/22, radius 28, filled
     `#1A1A1A` at 88%, with a 1 px white 14% stroke.
   - Tabs shown: Info, Stats, Video, Audio (when the version lists audio
-    tracks), and Subtitles (always on Roku; 5.9). When an update drops the
+    tracks), Subtitles (always on Roku; 5.9), and Chapters (when the
+    playing version has chapters, as on both TV apps). When an update drops the
     tab shown, the tab that takes its place (else the last) shows.
   - Columns: each tab is laid out in columns 48 px apart, each under a 14 px
     SemiBold uppercase header at 50%.
     - Info: TITLE (series, title, "S1 · E2", "2024 · 1h 42m", overview,
       which takes the whole lines left, the last ending in an ellipsis) and
       STREAM (resolution, HDR, codec, and audio badges, then Route, Audio,
-      and Subtitles rows).
+      and Subtitles rows, and Chapter, the chapter playing, once the first
+      has begun).
     - Stats: two columns of the plan's and player's non-secret state.
     - Video: PLAYBACK and SYNC.
       - PLAYBACK holds the Quality row, shown only when the plan offers a
@@ -1383,6 +1391,14 @@ Subtitles tab (criterion 4.8).
       first (tvOS's `SubtitleDisplayOrder`). A track only the plan lists (a
       sidecar the projection does not name) takes its language's place
       here and is not in the detail menu, as on tvOS.
+    - Chapters: CHAPTERS, a row for each chapter of the playing version
+      (the watch projection's `chapters`, section 8.1): its number ("01")
+      in a 44 px column at 55%, its title (an untitled one "Chapter 2", by
+      its place), and its start time ("12:05") at the right at 65%, with a
+      play glyph 10 px before the time on the chapter playing, the last
+      whose start has passed. Focus enters on that row. OK seeks to the
+      chapter's start, the one playing included, and closes Options so
+      the seek shows, as tvOS's HUD dismisses.
   - Rows:
     - A track row has its language first in 22 px Medium, then a second line
       of title · format · Default · Forced · SDH in 17 px at 55%. It is about
@@ -1402,8 +1418,8 @@ Subtitles tab (criterion 4.8).
     column on the row last focused there; Left and Right move between
     columns; Up from a column's top returns to the tabs. Back closes the
     picker first, then the panel, at the first press, wherever focus is.
-  - After a pick, the panel stays open with focus on the row, as in both
-    apps, whether the new plan switches in place or reloads the title, and
+  - After a pick other than a chapter, the panel stays open with focus on
+    the row, as in both apps, whether the new plan switches in place or reloads the title, and
     the panel keeps focus across the reload.
 - **Remote keys.**
 
@@ -1830,10 +1846,10 @@ Roku as it is, and the work package that builds the change deletes the row.
 | An item that Skip Credits finished, or that closes with Next Up open in its window, reports its runtime as the final position | The stop's final sample is the position playing (section 9.5) | The session reducer reports only the Video node's position; whether the server then counts the item watched follows its own rule, not checked here (assumption AG-321) |
 | Focused pills grow (Play Now 1.085×, Keep Watching and Back 1.06×, Skip Recap and Skip Credits 1.025×, the failure screen's buttons 1.055×) | They change fill and width only | Section 5.2's pill rule: only the Sort pill, first-run buttons, fields, and Skip Intro scale; the owner's call is open (audit U3, assumption AG-265) |
 | The failure screen shows one message at the top of the safe area, as coded | A 30 px title over the message, the stack centred on the screen | Roku's failure copy is a title and a message (`playback.player.errorCopy`), as its other errors are; centred, the stack stays clear of overscan (assumption AG-266) |
-| Info's STREAM column lists Route, Audio, Subtitles, and the chapter; Stats shows buffer, network, and engine figures; Info and Stats page with Down and Up | STREAM adds a File row (container, the plan's bitrate, size) and Route names the plan's delivery; Stats shows the plan's source and the `Video` node's state; the panes do not take focus, and the overview takes the whole lines left, the last ending in an ellipsis | Roku's player reports neither tvOS's buffer and network figures nor an engine name; the device runs read the file facts; with the overview clamped both panes fit the 380 px panel |
+| Info's STREAM column lists Route, Audio, Subtitles, and the chapter; Stats shows buffer, network, and engine figures; Info and Stats page with Down and Up | STREAM adds a File row (container, the plan's bitrate, size) after the chapter, and Route names the plan's delivery; Stats shows the plan's source and the `Video` node's state; the panes do not take focus, and the overview takes the whole lines left, the last ending in an ellipsis | Roku's player reports neither tvOS's buffer and network figures nor an engine name; the device runs read the file facts; with the overview clamped both panes fit the 380 px panel |
 | The HUD's lists scroll natively and end on part of a row at the panel's edge; the Quality picker centres the checked row and shows about four and a quarter rows | Columns and the Quality picker show whole rows only, a column scrolling a row's top to its own and the picker a row at a time; the picker opens with the checked row second of its four where the list allows | Hardware run 26: a row or line cut at the panel's edge read as a fault (decision AG-292 (1); assumptions AG-294, AG-295) |
 | Subtitles draw under the controls: the controls and their gradient cover a cue while they show | Roku's captions are hidden while the controls show (not over Options or Up Next), and return as they hide; content within 3 s of its first frame is left as it is | Roku draws captions above the UI at a place of its own, so a cue crossed the scrubber and the time row (hardware run 26). The node's own `suppressCaptions`, which Roku documents for UI drawn where captions are, hides them without touching the caption mode or the subtitle selected (assumption AG-293) |
-| The Video tab always has rows (Speed, Aspect) | Without a choice of quality its PLAYBACK column shows the quality as a line, and a movie's Video tab has no rows | Speed and Aspect are not in the first release (section 3.3) |
+| The Video tab always has rows: Speed (0.75× to 2×) and Aspect (Fit, Fill, Stretch), kept in `player.playback_speed` and `player.video_gravity` | No Speed or Aspect rows: video plays at 1× and fits the screen, as Roku draws it. Without a choice of quality the PLAYBACK column shows the quality as a line, and a movie's Video tab has no rows. A phone's `set_playback_speed` and `set_video_gravity` are refused ([`silocontrol.md`](silocontrol.md) section 6.5) | Roku documents no playback-rate control and no scaling or cropping for the `Video` node (developer documentation and Roku OS 12.0–15.3 release notes, read 2026-10-28). Its one rate field, `playbackSpeed`, is undocumented: Roku switched it off for every app in 2024 and says not every device can play at other speeds, and other channels report models that stop at 2× (assumption AG-433). The node keeps the picture's shape inside its rectangle, so Stretch cannot be drawn; Fill would rest on a node larger than the screen, which nobody has shown to crop on hardware and which screenshots cannot show, since they never capture the video plane (assumption AG-434) |
 | Options' Subtitles tab shows only with tracks or a subtitle tool | Stats and Subtitles always show | A fixed set of tabs keeps Left and Right predictable while the player's stats arrive, and Subtitles holds Roku's caption modes even for a title without subtitle tracks (criterion 4.8) |
 | Options' Subtitles tab has TRACKS and OPTIONS columns | Its second column is CAPTIONS: Off, On, On replay, and On mute (Roku TVs only), Roku's global caption mode; while a subtitle is burned into the video, or captions Off set one aside, only Off and On, and Off asks the server for the stream without it. On mute is checked whether Options or Roku's own menu set it, and stays checked as the TV is muted and unmuted | Criterion 4.8 (plan section 6.10); burned-in pixels cannot follow a caption mode |
 | The remote's Menu or Settings key opens the player's options (Android TV) | Options opens from the controls' Options button and from Down with the controls hidden; on a Roku TV, `*` during playback opens Roku's own menu, whose Accessibility entry holds the caption setting | Roku TVs take `*` during full-screen playback whatever has focus (hardware run 6, assumption AG-117); Roku remotes have no Menu key |
@@ -1842,7 +1858,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A subtitle the profile's preferences choose shows at once | It is selected, and shows while Roku's caption mode is on | Roku's caption mode governs captions (criterion 4.8), and the client does not turn it on at load |
 | A sign that an SRT cue places at the top with an override tag (`{\an8}`) shows at the top (Android TV, whose Media3 SubRip decoder reads the tag) | It shows at the bottom, without the tag | Roku documents no placement for SRT cues and prints override tags as text (hardware run 16, Roku drawing an MKV's own track), with no documented way to hide them; the client removes the tags from SRT sidecars and never lets Roku draw a container's track itself (section 9.7) |
 | One intro, credits, recap, and preview per file (Android TV) | Every `marker_segments` range, each skipped or drawn on its own | Section 9.8; the server's collection replaces the single markers |
-| The scrubber has rounded ends, a buffered range, chapter ticks, and one band, the intro's, in cyan | A square track with the played range and the intro (tvOS's cyan), recap, and credits bands | Chapters are not in the first release; sections 5.7 and 9.8 name three bands; the ladder's 100 ms tick only moves `Rectangle`s |
+| The scrubber has rounded ends, a buffered range, chapter ticks, and one band, the intro's, in cyan | A square track with the played range, the chapter ticks, and the intro (tvOS's cyan), recap, and credits bands | Sections 5.7 and 9.8 name three bands; the ladder's 100 ms tick only moves `Rectangle`s |
+| A chapter row's number is 20 pt rounded SemiBold and its time 20 pt; the playing chapter's glyph is SF Symbols' `play.fill` | Both 22 px SemiBold, the setting value's style; the player's own play glyph, 18 px | Roku ships no rounded face, and the panel's existing styles keep the font set small (assumption AG-432) |
 | Holding Left or Right on the focused scrubber starts a fixed-rate auto-seek; OK there commits a scrub and then toggles play/pause | The same 300 ms hold and rate ladder as with the controls hidden; OK commits, or toggles when nothing is pending | Section 5.7's key table; Roku documents no key repeats for a held key |
 | No Replay key | Replay skips back by the skip-back value clamped to 10–25 s, with "Instant replay" captions for the replayed span once its seek commits; a Replay that Back cancels, or whose merged seek lands past where it was pressed, shows none | Certification criteria 4.8 and 4.9 (implementation plan section 6.10) |
 | Scrub previews come from the server's sprite sheets or, without them, from frames the player cuts from the stream | The server's sheets only; a title without them shows the time and "Previews aren't available for this title" | Roku apps cannot read frames from the `Video` node |
@@ -1877,7 +1894,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A refused change shows the alert "Couldn't Update Item" / "Your change wasn't saved. Please try again."; an unanswered one is held until the viewer discards it | The change goes back and "Couldn't update item. Your change wasn't saved." shows top centre for four seconds; an unanswered write counts as refused and nothing is held | Roku's passive notice line needs no focus; no held-change list is kept (assumption AG-326) |
 | The connection speed test times one streamed download in 500 ms windows, following the probe's redirect without credentials | Back-to-back chunks, each timed whole and spread over the windows, which reads low by the gaps; only against a server with `bandwidth_probe_location_v1`, whose credential-free URL is fetched without the redirect | Roku shows no bytes inside a transfer, and forwards profile headers across a redirect (assumptions AG-391 and A-14) |
 | Buffering is told from a slow device by the buffered duration, and plan summaries survive the app's exit | No renderer waits; a progressive plan measures no throughput, so it lowers before its first frame only on its 20 s deadline's failure path; a plan the Home button ends sends no summary; no foreground check | Roku reports only a fill percentage and segment downloads, and gives a channel no exit callback or background state (AG-390, AG-391; Android TV keeps no exit journal either) |
-| People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; the AI-translation marker | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; the AI-translation marker | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
 
 ### 5.10 For You and Calendar
 
@@ -2214,7 +2231,7 @@ The first release consumes:
 - `GET /api/v2/catalog/series/{id}/seasons` and
   `GET /api/v2/catalog/series/{id}/seasons/{num}/episodes`;
 - `GET /api/v2/watch/{id}` for the playable projection, including
-  `marker_segments`;
+  `marker_segments` and each version's `chapters`;
 - `GET /api/v2/audio-prefs/{key}`, and `PUT` and `DELETE` on it and on
   `/api/v2/subtitle-prefs/{key}`, for the audio and subtitle tracks the
   profile chose on a detail page (section 8.5);

@@ -1,0 +1,155 @@
+namespace tests
+
+    @suite("playback chapters")
+    class PlaybackChaptersTests extends rooibos.BaseTestSuite
+
+        function chapter(index as Integer, title as String, first as Dynamic, last as Dynamic) as Object
+            return { index: index, title: title, start_seconds: first, end_seconds: last, source: "embedded" }
+        end function
+
+        ' Three chapters of a 3,000 s film; the middle one untitled.
+        function list() as Object
+            return playback.chapters.fromVersion({ chapters: [m.chapter(0, "Opening", 0, 600), m.chapter(1, "", 600, 1500.5), m.chapter(2, "The Heist", 1500.5, 3000)] })
+        end function
+
+        ' Compared as JSON: brs-node boxes Doubles as Floats by how they pass
+        ' through calls (tests.viaJson).
+        sub same(actual as Dynamic, expected as Dynamic)
+            m.assertEqual(tests.viaJson(actual), tests.viaJson(expected))
+        end sub
+
+        function copy() as Object
+            return playback.options.words(i18n.load("en_US"))
+        end function
+
+        function state(overrides = {} as Object) as Object
+            out = { plan: invalid, version: invalid, quality: "auto", switching: false, captionMode: "Off", modelType: "STB", autoplay: true, episode: false, info: { title: "Heat", year: 1995 }, stats: [], contentTracks: invalid, chapters: m.list(), position: 0 }
+            out.Append(overrides)
+            return out
+        end function
+
+        function tab(model as Object, key as String) as Dynamic
+            for each entry in model.tabs
+                if entry.key = key then return entry
+            end for
+            return invalid
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("fromVersion")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("reads a WatchFileVersion's chapters in seconds (get_watch_state_ok.json)")
+        sub _()
+            detail = tests.catalogData.fixture("get_watch_state_ok")
+            m.same(playback.chapters.fromVersion(detail.versions[0]), [{ index: 1, title: "Opening", start: 0, end: 300 }])
+        end sub
+
+        @it("gives none for a version without chapters, as the server omits the key")
+        sub _()
+            m.same(playback.chapters.fromVersion({ file_id: "1" }), [])
+            m.same(playback.chapters.fromVersion({ chapters: "x" }), [])
+            m.same(playback.chapters.fromVersion(invalid), [])
+        end sub
+
+        @it("drops chapters without a range and sorts by start")
+        sub _()
+            chapters = [m.chapter(2, "C", 900, 1200), m.chapter(0, "A", 0, 300), m.chapter(5, "Empty", 400, 400), m.chapter(6, "Negative", -5, 10), { index: 7, title: "No end", start_seconds: 10 }, "x", m.chapter(1, "  B  ", 300, 900)]
+            m.same(playback.chapters.fromVersion({ chapters: chapters }), [{ index: 0, title: "A", start: 0, end: 300 }, { index: 1, title: "B", start: 300, end: 900 }, { index: 2, title: "C", start: 900, end: 1200 }])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("at")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("is the last chapter begun, as tvOS and Android TV find it")
+        sub _()
+            chapters = m.list()
+            m.assertEqual(playback.chapters.at(chapters, 0), 0)
+            m.assertEqual(playback.chapters.at(chapters, 599.9), 0)
+            m.assertEqual(playback.chapters.at(chapters, 600), 1)
+            m.assertEqual(playback.chapters.at(chapters, 1500.5), 2)
+            m.assertEqual(playback.chapters.at(chapters, 5000), 2)
+        end sub
+
+        @it("is -1 before the first chapter, without chapters, or without a position")
+        sub _()
+            late = playback.chapters.fromVersion({ chapters: [m.chapter(0, "A", 30, 60)] })
+            m.assertEqual(playback.chapters.at(late, 10), -1)
+            m.assertEqual(playback.chapters.at([], 10), -1)
+            m.assertEqual(playback.chapters.at(m.list(), invalid), -1)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("ticks")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("places a tick at each start after the first, as a fraction of the runtime")
+        sub _()
+            ticks = playback.chapters.ticks(m.list(), 3000)
+            m.assertEqual(ticks.Count(), 2)
+            m.assertTrue(Abs(ticks[0] - 0.2) < 0.0001)
+            m.assertTrue(Abs(ticks[1] - 0.5001667) < 0.0001)
+        end sub
+
+        @it("draws none without a runtime, and none at or past the end")
+        sub _()
+            m.same(playback.chapters.ticks(m.list(), invalid), [])
+            m.same(playback.chapters.ticks(m.list(), 0), [])
+            m.assertEqual(playback.chapters.ticks(m.list(), 1000).Count(), 1)
+            m.same(playback.chapters.ticks(playback.chapters.fromVersion({ chapters: [m.chapter(0, "A", 1, 60)] }), 3000), [])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("Options")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("adds Chapters as the last tab only when the version has chapters")
+        sub _()
+            model = playback.options.model(m.state(), m.copy())
+            last = model.tabs[model.tabs.Count() - 1]
+            m.assertEqual(last.key, "chapters")
+            m.assertEqual(last.label, "Chapters")
+            m.assertEqual(last.columns[0].title, "Chapters")
+            m.assertInvalid(m.tab(playback.options.model(m.state({ chapters: [] }), m.copy()), "chapters"))
+            m.assertInvalid(m.tab(playback.options.model(m.state({ chapters: invalid }), m.copy()), "chapters"))
+        end sub
+
+        @it("lists each chapter's number, title, and start, naming an untitled one by its place")
+        sub _()
+            rows = m.tab(playback.options.model(m.state({ position: 700 }), m.copy()), "chapters").columns[0].rows
+            out = []
+            for each row in rows
+                out.Push([row.style, row.detail, row.label, row.trailing, row.checked, row.value])
+            end for
+            m.assertEqual(out, [["chapter", "01", "Opening", "0:00", false, 0], ["chapter", "02", "Chapter 2", "10:00", true, 1], ["chapter", "03", "The Heist", "25:00", false, 2]])
+            m.assertEqual(rows[1].speech, "Chapter 2, 10:00, playing")
+            m.assertEqual(rows[0].speech, "Opening, 0:00")
+        end sub
+
+        @it("shows the chapter playing last in Info's STREAM, not before the first begins")
+        sub _()
+            items = m.tab(playback.options.model(m.state({ position: 1600 }), m.copy()), "info").columns[1].items
+            last = items[items.Count() - 1]
+            m.assertEqual([last.label, last.value], ["Chapter", "The Heist"])
+            late = playback.chapters.fromVersion({ chapters: [m.chapter(0, "A", 30, 60)] })
+            for each item in m.tab(playback.options.model(m.state({ chapters: late, position: 10 }), m.copy()), "info").columns[1].items
+                m.assertNotEqual(item.label, "Chapter")
+            end for
+        end sub
+
+        @it("seeks to a chosen chapter's start, the playing one included")
+        sub _()
+            m.same(playback.options.choose(m.state({ position: 700 }), { kind: "chapter", value: 2 }), { kind: "seek", seconds: 1500.5 })
+            m.same(playback.options.choose(m.state({ position: 700 }), { kind: "chapter", value: 1 }), { kind: "seek", seconds: 600 })
+        end sub
+
+        @it("does nothing for a chapter the list does not hold")
+        sub _()
+            m.assertEqual(playback.options.choose(m.state(), { kind: "chapter", value: 3 }).kind, "none")
+            m.assertEqual(playback.options.choose(m.state(), { kind: "chapter", value: -1 }).kind, "none")
+            m.assertEqual(playback.options.choose(m.state(), { kind: "chapter", value: "1" }).kind, "none")
+            m.assertEqual(playback.options.choose(m.state({ chapters: [] }), { kind: "chapter", value: 0 }).kind, "none")
+        end sub
+    end class
+end namespace
