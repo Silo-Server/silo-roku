@@ -1,0 +1,170 @@
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/util/values.bs"
+
+' On-view description translation (spec section 5.6, tvOS's
+' DescriptionTranslationCoordinator and CardDescriptionTranslation). A
+' detail page, an episode row, or a Home card that reports
+' pending_translation_language is missing its description in the profile's
+' metadata language; the client asks the server to translate it into
+' exactly that language and then reads the page again until the language
+' is no longer reported, as the server has no job read for viewers. The
+' server's capability says whether this happens on its own (auto), behind
+' a Translate Description action (button), or not at all (off).
+namespace catalog.translation
+    ' The capability document's map kind (catalog.map.document).
+    const CAPABILITY_KIND = "metadataAI"
+    ' The capability's on_view modes; anything else reads as OFF.
+    const OFF = "off"
+    const BUTTON = "button"
+    const AUTO = "auto"
+    ' A run's phases. A finished run is no run; a failed one stays so the
+    ' page can offer the action again.
+    const TRANSLATING = "translating"
+    const FAILED = "failed"
+    ' What a description area shows about its translation
+    ' (DetailHero.synopsisStatus, Hero's meta line).
+    const STATUS_TRANSLATING = "translating"
+    const STATUS_TRANSLATED = "translated"
+    ' What a run does next (next).
+    const NEXT_WAIT = "wait"
+    const NEXT_READ = "read"
+    const NEXT_DONE = "done"
+    const NEXT_FAIL = "fail"
+    ' tvOS's CardDescriptionTranslation: how long focus rests on a Featured
+    ' card before its translation starts.
+    const DWELL_SECONDS = 1.5
+    ' The profile's metadata language (Settings, spec section 5.8.1): the
+    ' language the server returns descriptions in and translates into.
+    const LANGUAGE_KEY = "catalog.metadata_language"
+
+    ' tvOS's re-read schedule in seconds: the text usually lands in the
+    ' first passes; the sum (45 s) is the cap after which the run fails.
+    function schedule() as Object
+        return [1, 2, 2, 3, 3, 4, 5, 5, 5, 5, 5, 5]
+    end function
+
+    function capabilityRequest() as Object
+        return catalog.request.read("/api/v2/capabilities/metadata-ai", {}, { kind: CAPABILITY_KIND })
+    end function
+
+    ' The capability document as the client reads it: { enabled, onView },
+    ' enabled only when the state is available and the profile allowed, and
+    ' onView OFF unless enabled. invalid when the body is not one.
+    function capability(body as Dynamic) as Dynamic
+        if not util.isObject(body) or not util.isString(body.state) then return invalid
+        enabled = body.state = "available" and util.isTrue(body.allowed)
+        mode = OFF
+        if enabled then mode = modeOf(body.on_view)
+        return { enabled: enabled, onView: mode }
+    end function
+
+    ' The on_view string as a mode; an unknown one (the field is open) is OFF.
+    function modeOf(value as Dynamic) as String
+        mode = LCase(util.text(value))
+        if mode = BUTTON or mode = AUTO then return mode
+        return OFF
+    end function
+
+    ' What a read of the capability ({ ok, body }, api.resultOf) offers: a
+    ' server without the document (404) or any failure offers nothing.
+    function availableFrom(result as Dynamic) as Object
+        none = { enabled: false, onView: OFF }
+        if not util.isObject(result) or not util.isTrue(result.ok) or not util.isObject(result.body) then return none
+        body = result.body
+        if util.isString(body.onView) then return { enabled: util.isTrue(body.enabled), onView: modeOf(body.onView) }
+        read = capability(body)
+        if read = invalid then return none
+        return read
+    end function
+
+    ' Asks for the descriptions of contentId (an item, season, or episode)
+    ' in language, the pending_translation_language its read reported. The
+    ' operation coalesces, so a repeat while a job runs gets that job back.
+    function translateRequest(contentId as String, language as String) as Object
+        return { method: "POST", path: "/api/v2/catalog/items/" + catalog.request.segment(contentId) + "/translate-description", body: { target_language: language }, auth: "profile", lane: "interactive" }
+    end function
+
+    ' Whether the 202 job is one that will not land: the server may hand back
+    ' a recently failed job without starting new work.
+    function jobFailed(body as Dynamic) as Boolean
+        if not util.isObject(body) then return true
+        state = LCase(util.text(body.status))
+        return state = "failed" or state = "canceled" or state = "cancelled"
+    end function
+
+    ' The language an item, episode, or card read is missing, "" for none.
+    function pendingOf(item as Dynamic) as String
+        if not util.isObject(item) then return ""
+        return util.text(item.pending_translation_language).Trim()
+    end function
+
+    ' Whether the overview shown was machine-translated: the "Translated by
+    ' AI" label goes with the overview alone (a tagline may be AI text over
+    ' a provider overview).
+    function overviewTranslated(fields as Dynamic) as Boolean
+        return util.contains(fields, "overview")
+    end function
+
+    ' The key a run and an automatic start are known by.
+    function key(contentId as String, language as String) as String
+        return contentId + "|" + language
+    end function
+
+    ' A new run of contentId into language, waiting for its POST.
+    function newRun(contentId as String, language as String, automatic as Boolean) as Object
+        return { contentId: contentId, language: language, key: key(contentId, language), phase: TRANSLATING, step: 0, automatic: automatic, final: false }
+    end function
+
+    ' What run does after event, and the wait in seconds before a read:
+    ' event "posted" (the POST answered: ok, and whether its job failed),
+    ' or "read" (a read answered: ok, and whether the language cleared).
+    ' A refused POST (422: nothing left, as another surface's job finished;
+    ' 429: rate limited) is read once, and is done only if the text is
+    ' there. Updates run.step and run.final.
+    function stepAfter(attempt as Object, event as String, ok as Boolean, flag as Boolean) as Object
+        waits = schedule()
+        if event = "posted"
+            if ok and not flag
+                attempt.step = 0
+                return { action: NEXT_WAIT, seconds: waits[0] }
+            end if
+            if ok then return { action: NEXT_FAIL, seconds: 0 }
+            attempt.final = true
+            return { action: NEXT_READ, seconds: 0 }
+        end if
+        if ok and flag then return { action: NEXT_DONE, seconds: 0 }
+        if attempt.final then return { action: NEXT_FAIL, seconds: 0 }
+        attempt.step = attempt.step + 1
+        if attempt.step >= waits.Count() then return { action: NEXT_FAIL, seconds: 0 }
+        return { action: NEXT_WAIT, seconds: waits[attempt.step] }
+    end function
+
+    ' The status a description area shows: a running translation wins over
+    ' the label, as the text is still the original until it lands. shown
+    ' says the description shows at all.
+    function status(running as Boolean, machineTranslated as Boolean, shown as Boolean) as String
+        if not shown then return ""
+        if running then return STATUS_TRANSLATING
+        if machineTranslated then return STATUS_TRANSLATED
+        return ""
+    end function
+
+    ' Whether a page offers Translate Description: a missing language, no run
+    ' for it, and the button mode or, in auto, a run that failed.
+    function offers(mode as String, pending as String, attempt as Dynamic) as Boolean
+        if mode = OFF or pending = "" then return false
+        if util.isObject(attempt) and attempt.phase = TRANSLATING then return false
+        if mode = BUTTON then return true
+        return util.isObject(attempt) and attempt.phase = FAILED and attempt.language = pending
+    end function
+
+    ' The language a season's episode cards are missing, "" for none: one is
+    ' enough, as the season's job translates all its episodes.
+    function seasonPending(cards as Object) as String
+        for each card in cards
+            language = util.text(card.pendingLanguage)
+            if language <> "" then return language
+        end for
+        return ""
+    end function
+end namespace

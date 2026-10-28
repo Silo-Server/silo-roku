@@ -1,0 +1,235 @@
+namespace tests
+
+    ' The detail page's on-view description translation (spec section 5.6,
+    ' components/screens/detail/DetailTranslation.bs) on a DetailScreenProbe
+    ' whose server offers the lists (tests/helpers/detailPersonal.bs).
+    @suite("detail description translation")
+    class DetailTranslationTests extends tests.DetailPersonalSuite
+
+        function pending(overview as String) as Object
+            out = m.movie({})
+            out.overview = overview
+            out.pending_translation_language = "de"
+            return out
+        end function
+
+        function translated() as Object
+            out = m.movie({})
+            out.overview = "Ein Film."
+            out.machine_translated_fields = ["overview"]
+            return out
+        end function
+
+        function postIndex(probe as Object, id as String) as Integer
+            return m.sentIndex(probe, "translate", "/api/v2/catalog/items/" + id + "/translate-description")
+        end function
+
+        function job(status as String) as Object
+            out = tests.catalogData.fixture("translate_catalog_item_description_ok")
+            out.status = status
+            return out
+        end function
+
+        function status(probe as Object) as String
+            return probe.findNode("hero").synopsisStatus
+        end function
+
+        @describe("auto mode")
+
+        @it("translates a movie's description once, reads it again on the schedule, and shows the AI text")
+        sub _()
+            m.translationMode("auto")
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.pending("A film."))
+            at = m.postIndex(probe, "movie:a")
+            m.assertTrue(at > 0, "the page asks for the translation")
+            post = probe.callFunc("sent")[at].request
+            m.assertEqual([post.method, post.body], ["POST", { target_language: "de" }])
+            m.assertEqual(m.status(probe), "translating")
+            m.assertEqual(probe.findNode("synopsisLabel").opacity, 0.5)
+            m.assertTrue(probe.callFunc("deliver", at, tests.catalogData.ok(m.job("pending")), invalid))
+            wait = probe.callFunc("translateTick", "item")
+            m.assertEqual([wait.control, Int(wait.duration)], ["start", 1])
+            read = m.sentIndex(probe, "translateRead", "/api/v2/catalog/items/movie:a")
+            m.assertTrue(read > at, "the wait ends in a read of the item")
+            m.answer(probe, read, m.pending("A film."))
+            wait = probe.callFunc("translateTick", "item")
+            m.assertEqual(Int(wait.duration), 2, "still missing: the next wait")
+            m.answer(probe, m.sentIndex(probe, "translateRead", "/api/v2/catalog/items/movie:a"), m.translated())
+            m.assertEqual(probe.callFunc("inspect").hero.synopsis, "Ein Film.")
+            m.assertEqual(m.status(probe), "translated")
+            m.assertEqual(probe.findNode("statusLabel").text, "Translated by AI")
+            m.assertEqual(probe.findNode("synopsisLabel").opacity, 1.0)
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark as Watched"])
+        end sub
+
+        @it("does not ask again for the same item when the page shows again, unless the player stopped its run")
+        sub _()
+            m.translationMode("auto")
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.pending("A film."))
+            first = m.postIndex(probe, "movie:a")
+            m.cover(probe)
+            m.assertEqual(m.status(probe), "")
+            m.assertFalse(probe.callFunc("deliver", first, tests.catalogData.ok(m.job("pending")), invalid), "leaving cancels the request")
+            probe.visible = true
+            probe.callFunc("onShow", { restore: invalid, first: false, refresh: false })
+            second = m.postIndex(probe, "movie:a")
+            m.assertTrue(second > first, "a run the page stopped starts again")
+            m.assertTrue(probe.callFunc("deliver", second, tests.catalogData.ok(m.job("failed")), invalid))
+            probe.visible = false
+            probe.callFunc("onHide")
+            probe.visible = true
+            probe.callFunc("onShow", { restore: invalid, first: false, refresh: false })
+            m.assertEqual(m.postIndex(probe, "movie:a"), second, "a failed run does not start on its own")
+        end sub
+
+        @it("offers Translate Description after a run fails, and runs it again from More")
+        sub _()
+            m.translationMode("auto")
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.pending("A film."))
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark as Watched"], "not while it runs")
+            probe.findNode("picker").closed = true
+            at = m.postIndex(probe, "movie:a")
+            probe.callFunc("deliver", at, tests.catalogData.ok(m.job("failed")), invalid)
+            m.assertEqual(m.status(probe), "")
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark as Watched", "Translate Description"])
+            probe.findNode("picker").picked = catalog.more.TRANSLATE
+            m.assertTrue(m.postIndex(probe, "movie:a") > at)
+            m.assertEqual(m.status(probe), "translating")
+        end sub
+
+        @it("reads once after a refused request, and is done when the text is already there")
+        sub _()
+            m.translationMode("auto")
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.pending("A film."))
+            at = m.postIndex(probe, "movie:a")
+            m.assertTrue(m.failed(probe, at, 422))
+            read = m.sentIndex(probe, "translateRead", "/api/v2/catalog/items/movie:a")
+            m.assertTrue(read > at)
+            m.answer(probe, read, m.translated())
+            m.assertEqual(m.status(probe), "translated")
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark as Watched"])
+        end sub
+
+        @it("translates the season shown when its episodes miss their descriptions")
+        sub _()
+            m.translationMode("auto")
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e1", seasonNumber: 1 })
+            m.assertTrue(m.throughSeasons(probe, [1, 2], 1))
+            episodes = m.episodes(1, 2)
+            for each episode in episodes.items
+                episode.overview = "English."
+                episode.pending_translation_language = "fr"
+            end for
+            m.answer(probe, 2, episodes)
+            at = m.postIndex(probe, "season:s1")
+            m.assertTrue(at > 2, "the season's job covers its episodes")
+            m.assertEqual(probe.callFunc("sent")[at].request.body, { target_language: "fr" })
+            m.assertEqual(m.status(probe), "translating")
+            probe.callFunc("deliver", at, tests.catalogData.ok(m.job("running")), invalid)
+            probe.callFunc("translateTick", "season")
+            read = m.sentIndex(probe, "translateRead", m.episodesPath(1))
+            m.assertTrue(read > at)
+            for each episode in episodes.items
+                episode.overview = "Français."
+                episode.Delete("pending_translation_language")
+                episode.machine_translated_fields = ["overview"]
+            end for
+            m.answer(probe, read, episodes)
+            m.assertEqual(probe.callFunc("inspect").hero.synopsis, "Episode 1 · Français.")
+            m.assertEqual(m.status(probe), "translated")
+        end sub
+
+        @it("moves to the season shown when the viewer switches while a season translates")
+        sub _()
+            m.translationMode("auto")
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e1", seasonNumber: 1 })
+            m.assertTrue(m.throughSeasons(probe, [1, 2], 1))
+            m.answer(probe, 2, m.missing(1))
+            first = m.postIndex(probe, "season:s1")
+            m.assertTrue(first > 2)
+            probe.findNode("seasons").chosen = 1
+            at = m.sentIndex(probe, "episodes", m.episodesPath(2))
+            m.assertTrue(at > first, "the page reads season 2")
+            m.answer(probe, at, m.missing(2))
+            second = m.postIndex(probe, "season:s2")
+            m.assertTrue(second > at, "season 2's job starts at once")
+            m.assertFalse(probe.callFunc("deliver", first, tests.catalogData.ok(m.job("running")), invalid), "season 1's request was cancelled")
+            m.assertEqual(m.status(probe), "translating")
+        end sub
+
+        @it("still offers a failed season's translation after the viewer visits another season")
+        sub _()
+            m.translationMode("auto")
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e1", seasonNumber: 1 })
+            m.assertTrue(m.throughSeasons(probe, [1, 2], 1))
+            m.answer(probe, 2, m.missing(1))
+            probe.callFunc("deliver", m.postIndex(probe, "season:s1"), tests.catalogData.ok(m.job("failed")), invalid)
+            probe.findNode("seasons").chosen = 1
+            m.answer(probe, m.sentIndex(probe, "episodes", m.episodesPath(2)), m.missing(2))
+            probe.callFunc("deliver", m.postIndex(probe, "season:s2"), tests.catalogData.ok(m.job("failed")), invalid)
+            probe.findNode("seasons").chosen = 0
+            m.assertEqual(m.moreTitles(probe)[m.moreTitles(probe).Count() - 1], "Translate Description")
+            probe.findNode("picker").picked = catalog.more.TRANSLATE
+            m.assertTrue(m.postIndex(probe, "season:s1") > m.postIndex(probe, "season:s2"), "season 1 runs again")
+        end sub
+
+        @it("labels no description that spoiler hiding withholds")
+        sub _()
+            if not m.global.hasField("episodeSpoilers") then m.global.addFields({ episodeSpoilers: {} })
+            saved = m.global.episodeSpoilers
+            m.global.episodeSpoilers = { revision: 1, key: "", images: false, overviews: true }
+            probe = m.opened({ itemId: "series:show", episodeId: "episode:s1e1", seasonNumber: 1 })
+            m.assertTrue(m.throughSeasons(probe, [1], 1))
+            episodes = m.episodes(1, 2)
+            for each episode in episodes.items
+                episode.overview = "Auf Deutsch."
+                episode.machine_translated_fields = ["overview"]
+            end for
+            m.answer(probe, 2, episodes)
+            m.assertEqual(probe.callFunc("inspect").hero.synopsis, "Episode 1")
+            m.assertEqual(m.status(probe), "", "the withheld text carries no AI label")
+            m.global.episodeSpoilers = { revision: 2, key: "", images: false, overviews: false }
+            probe.callFunc("focusEpisode", 1)
+            m.assertEqual(m.status(probe), "translated", "shown again, it is labelled")
+            m.global.episodeSpoilers = saved
+        end sub
+
+        ' A season's episodes, each missing its French description.
+        function missing(season as Integer) as Object
+            episodes = m.episodes(season, 2)
+            for each episode in episodes.items
+                episode.overview = "English."
+                episode.pending_translation_language = "fr"
+            end for
+            return episodes
+        end function
+
+        @describe("button and off modes")
+
+        @it("offers Translate Description in button mode and starts nothing on its own")
+        sub _()
+            m.translationMode("button")
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.pending("A film."))
+            m.assertEqual(m.postIndex(probe, "movie:a"), -1)
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark as Watched", "Translate Description"])
+            probe.findNode("picker").picked = catalog.more.TRANSLATE
+            m.assertTrue(m.postIndex(probe, "movie:a") > 0)
+        end sub
+
+        @it("offers nothing when the server does not translate, but still labels AI text")
+        sub _()
+            probe = m.opened({ itemId: "movie:a" })
+            m.answer(probe, 0, m.pending("A film."))
+            m.assertEqual(m.postIndex(probe, "movie:a"), -1)
+            m.assertEqual(m.moreTitles(probe), ["Add to Favorites", "Mark as Watched"])
+            probe2 = m.opened({ itemId: "movie:a" })
+            m.answer(probe2, 0, m.translated())
+            m.assertEqual(m.status(probe2), "translated")
+        end sub
+    end class
+end namespace

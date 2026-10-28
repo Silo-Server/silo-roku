@@ -64,6 +64,8 @@ CATALOG = {
     "getCatalogFilters", "getShuffleCapability", "createShuffle", "getShuffle", "advanceShuffle", "skipShuffleItem", "deleteShuffle",
     # The For You and Calendar tabs (source/catalog/map.bs, source/calendar/page.bs).
     "getDiscover", "getCalendar",
+    # On-view description translation (source/catalog/translation.bs).
+    "getMetadataAICapability", "translateCatalogItemDescription",
 }
 # The connection state, its learned-limit reset, and the speed test
 # (source/playback/connection.bs, components/AppSceneConnection.bs).
@@ -78,6 +80,7 @@ SETTINGS = [
     "player.video_skip_back_seconds", "player.video_skip_forward_seconds",
     "catalog.hide_unwatched_episode_images", "catalog.hide_unwatched_episode_overviews",
     "playback.subtitle_language", "playback.subtitle_mode", "playback.show_forced_subtitles",
+    "catalog.metadata_language",
     "ui.theme_music_enabled", "ui.theme_music_loop",
 ]
 MANIFEST = "contracts/settings/v1/manifest.json"

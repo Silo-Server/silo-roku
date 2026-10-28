@@ -1,0 +1,187 @@
+import "pkg:/source/catalog/translation.bs"
+
+namespace tests
+
+    @suite("catalog description translation")
+    class CatalogTranslationTests extends rooibos.BaseTestSuite
+
+        @describe("the server contract (catalog-operations.json and v2 fixtures)")
+
+        @it("reads the capability and asks for a translation with the operations' methods and paths, as the profile")
+        sub _()
+            operations = tests.catalogData.operations()
+            read = tests.catalogData.sent(catalog.translation.capabilityRequest())
+            m.assertEqual([read.method, read.path, read.auth], [operations.getMetadataAICapability.method, operations.getMetadataAICapability.path, "profile"])
+            m.assertEqual(read.query, {})
+            post = tests.catalogData.sent(catalog.translation.translateRequest("movie:heat-1995", "de"))
+            operation = operations.translateCatalogItemDescription
+            m.assertEqual([post.method, post.auth], [operation.method, "profile"])
+            m.assertEqual(post.path, "/api/v2/catalog/items/movie:heat-1995/translate-description")
+            m.assertEqual(post.body, { target_language: "de" })
+            m.assertEqual(operation.query, {})
+        end sub
+
+        @it("escapes the content ID in the path, keeping its colon")
+        sub _()
+            post = catalog.translation.translateRequest("series:a b/c", "pt-BR")
+            m.assertEqual(post.path, "/api/v2/catalog/items/series:a%20b%2Fc/translate-description")
+            m.assertEqual(post.body.target_language, "pt-BR")
+        end sub
+
+        @it("reads the fixture capability as enabled in button mode")
+        sub _()
+            body = tests.catalogData.fixture("get_metadata_ai_capability_ok")
+            m.assertEqual(catalog.translation.capability(body), { enabled: true, onView: "button" })
+            m.assertEqual(catalog.translation.availableFrom(tests.catalogData.ok(body)), { enabled: true, onView: "button" })
+        end sub
+
+        @it("reads the fixture job as one that will land")
+        sub _()
+            job = tests.catalogData.fixture("translate_catalog_item_description_ok")
+            m.assertFalse(catalog.translation.jobFailed(job))
+        end sub
+
+        @describe("the capability")
+
+        @it("is off unless available and allowed, and reads unknown modes as off")
+        sub _()
+            m.assertEqual(catalog.translation.capability({ state: "available", allowed: false, on_view: "auto" }), { enabled: false, onView: "off" })
+            m.assertEqual(catalog.translation.capability({ state: "not_configured", allowed: false, on_view: "off" }), { enabled: false, onView: "off" })
+            m.assertEqual(catalog.translation.capability({ state: "available", allowed: true, on_view: "AUTO" }), { enabled: true, onView: "auto" })
+            m.assertEqual(catalog.translation.capability({ state: "available", allowed: true, on_view: "sometimes" }), { enabled: true, onView: "off" })
+            m.assertInvalid(catalog.translation.capability({}))
+            m.assertInvalid(catalog.translation.capability(invalid))
+        end sub
+
+        @it("offers nothing on a failed or missing read, and takes a mapped body as it is")
+        sub _()
+            off = { enabled: false, onView: "off" }
+            m.assertEqual(catalog.translation.availableFrom({ ok: false, status: 404, body: invalid }), off)
+            m.assertEqual(catalog.translation.availableFrom(invalid), off)
+            m.assertEqual(catalog.translation.availableFrom(tests.catalogData.ok({ nonsense: true })), off)
+            m.assertEqual(catalog.translation.availableFrom(tests.catalogData.ok({ enabled: true, onView: "auto" })), { enabled: true, onView: "auto" })
+        end sub
+
+        @describe("jobs and runs")
+
+        @it("treats a failed or canceled job as one that will not land")
+        sub _()
+            for each status in ["failed", "canceled", "cancelled", "FAILED"]
+                m.assertTrue(catalog.translation.jobFailed({ status: status }), status)
+            end for
+            for each status in ["pending", "running", "completed"]
+                m.assertFalse(catalog.translation.jobFailed({ status: status }), status)
+            end for
+            m.assertTrue(catalog.translation.jobFailed(invalid))
+        end sub
+
+        @it("waits on tvOS's schedule after an accepted job and is done once the language clears")
+        sub _()
+            attempt = catalog.translation.newRun("movie:a", "de", true)
+            m.assertEqual(attempt.key, "movie:a|de")
+            m.assertEqual(attempt.phase, catalog.translation.TRANSLATING)
+            m.assertEqual(catalog.translation.stepAfter(attempt, "posted", true, false), { action: "wait", seconds: 1 })
+            m.assertEqual(catalog.translation.stepAfter(attempt, "read", true, false), { action: "wait", seconds: 2 })
+            m.assertEqual(catalog.translation.stepAfter(attempt, "read", false, false), { action: "wait", seconds: 2 })
+            m.assertEqual(catalog.translation.stepAfter(attempt, "read", true, true), { action: "done", seconds: 0 })
+        end sub
+
+        @it("fails once the 45 s schedule runs out")
+        sub _()
+            attempt = catalog.translation.newRun("movie:a", "de", false)
+            decision = catalog.translation.stepAfter(attempt, "posted", true, false)
+            total = decision.seconds
+            reads = 0
+            while decision.action = "wait"
+                decision = catalog.translation.stepAfter(attempt, "read", true, false)
+                reads = reads + 1
+                if decision.action = "wait" then total = total + decision.seconds
+            end while
+            m.assertEqual(decision.action, "fail")
+            m.assertEqual(reads, 12)
+            m.assertEqual(total, 45)
+        end sub
+
+        @it("fails a job the server hands back failed, and reads a refused one once")
+        sub _()
+            attempt = catalog.translation.newRun("movie:a", "de", false)
+            m.assertEqual(catalog.translation.stepAfter(attempt, "posted", true, true).action, "fail")
+            refused = catalog.translation.newRun("movie:a", "de", false)
+            m.assertEqual(catalog.translation.stepAfter(refused, "posted", false, false), { action: "read", seconds: 0 })
+            m.assertEqual(catalog.translation.stepAfter(refused, "read", true, false).action, "fail")
+            landed = catalog.translation.newRun("movie:a", "de", false)
+            catalog.translation.stepAfter(landed, "posted", false, false)
+            m.assertEqual(catalog.translation.stepAfter(landed, "read", true, true).action, "done")
+        end sub
+
+        @describe("what the page shows and offers")
+
+        @it("labels a running translation over AI text, and nothing for a withheld description")
+        sub _()
+            m.assertEqual(catalog.translation.status(true, true, true), "translating")
+            m.assertEqual(catalog.translation.status(false, true, true), "translated")
+            m.assertEqual(catalog.translation.status(false, false, true), "")
+            m.assertEqual(catalog.translation.status(true, true, false), "")
+        end sub
+
+        @it("offers the action in button mode, and in auto only after its run failed")
+        sub _()
+            failed = catalog.translation.newRun("movie:a", "de", true)
+            failed.phase = catalog.translation.FAILED
+            running = catalog.translation.newRun("movie:a", "de", false)
+            m.assertTrue(catalog.translation.offers("button", "de", invalid))
+            m.assertTrue(catalog.translation.offers("button", "de", failed))
+            m.assertFalse(catalog.translation.offers("button", "de", running))
+            m.assertFalse(catalog.translation.offers("button", "", invalid))
+            m.assertFalse(catalog.translation.offers("auto", "de", invalid))
+            m.assertTrue(catalog.translation.offers("auto", "de", failed))
+            m.assertFalse(catalog.translation.offers("auto", "fr", failed))
+            m.assertFalse(catalog.translation.offers("off", "de", failed))
+        end sub
+
+        @it("takes a season's missing language from any of its episode cards")
+        sub _()
+            m.assertEqual(catalog.translation.seasonPending([{ pendingLanguage: "" }, { pendingLanguage: "de" }]), "de")
+            m.assertEqual(catalog.translation.seasonPending([{ pendingLanguage: "" }]), "")
+            m.assertEqual(catalog.translation.seasonPending([]), "")
+        end sub
+
+        @describe("mapping")
+
+        @it("puts the missing language and the AI mark on cards, episode rows, and the detail page")
+        sub _()
+            copy = tests.catalogData.words()
+            item = tests.catalogData.item(1, { overview: "Ein Film.", pending_translation_language: " de ", machine_translated_fields: ["tagline"] })
+            card = catalog.cards.fromItem(item, catalog.shape.POSTER, copy)
+            m.assertEqual([card.pendingLanguage, card.machineTranslated], ["de", false])
+            item.machine_translated_fields = ["overview", "tagline"]
+            item.Delete("pending_translation_language")
+            card = catalog.cards.fromItem(item, catalog.shape.POSTER, copy)
+            m.assertEqual([card.pendingLanguage, card.machineTranslated], ["", true])
+            episode = catalog.cards.fromEpisode({ content_id: "episode:e1", season_number: 1, episode_number: 2, title: "E", overview: "o", pending_translation_language: "pt-BR" }, copy)
+            m.assertEqual([episode.pendingLanguage, episode.machineTranslated], ["pt-BR", false])
+            detail = catalog.detail.fromItem({ content_id: "movie:m1", type: "movie", title: "M", overview: "x", pending_translation_language: "de", machine_translated_fields: ["overview"] }, copy)
+            m.assertEqual([detail.pendingLanguage, detail.machineTranslated], ["de", true])
+        end sub
+
+        @it("marks a featured section's row")
+        sub _()
+            body = { id: "s1", title: "Featured", section_type: "featured", featured: true, items: [tests.catalogData.item(1)] }
+            row = catalog.map.row(body, catalog.shape.POSTER, tests.catalogData.words())
+            m.assertTrue(row.featured)
+            body.Delete("featured")
+            m.assertFalse(catalog.map.row(body, catalog.shape.POSTER, tests.catalogData.words()).featured)
+        end sub
+
+        @it("puts Translate Description last in More, only when offered")
+        sub _()
+            state = { lists: true, series: false, isFavorite: false, played: false, translate: true }
+            rows = catalog.personal.moreRows(state)
+            m.assertEqual(rows[rows.Count() - 1], { value: catalog.more.TRANSLATE, key: "detail.more.translate" })
+            state.translate = false
+            for each row in catalog.personal.moreRows(state)
+                m.assertNotEqual(row.value, catalog.more.TRANSLATE)
+            end for
+        end sub
+    end class
+end namespace

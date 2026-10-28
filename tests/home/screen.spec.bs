@@ -14,6 +14,8 @@ namespace tests
         ' move; afterEach takes it out.
         function opened() as Object
             if m.global.hasField("personalLatest") then m.global.personalLatest = {}
+            ' Home reads the description translation's capability itself.
+            if m.global.hasField("metadataAI") then m.global.metadataAI = { key: "another profile" }
             theme.install()
             tests.scene.reset()
             probe = CreateObject("roSGNode", "HomeScreenProbe")
@@ -59,10 +61,10 @@ namespace tests
 
         @describe("opening (spec section 5.5)")
 
-        @it("asks for the home sections, the libraries, the settings, the branding, and the personal lists' capability, spinning over the rows' band")
+        @it("asks for the home sections, the libraries, the settings, the branding, and the personal lists' and description translation's capabilities, spinning over the rows' band")
         sub _()
             probe = m.opened()
-            m.assertEqual(tests.scene.paths(), [catalog.request.libraries().path, mainShell.settingsRequest().path, catalog.request.branding().path, catalog.personal.capabilityRequest().path, catalog.request.homeSections(false).path])
+            m.assertEqual(tests.scene.paths(), [catalog.request.libraries().path, mainShell.settingsRequest().path, catalog.request.branding().path, catalog.personal.capabilityRequest().path, catalog.request.homeSections(false).path, catalog.translation.capabilityRequest().path])
             rows = probe.findNode("rows")
             m.assertEqual(rows.translation, [0, theme.browse.BAND_TOP])
             m.assertEqual(rows.state, "loading")
@@ -138,9 +140,96 @@ namespace tests
             rows.focusedItem = placeholder
             m.assertTrue(hero.content.isSameNode(second), "a placeholder")
             again = CreateObject("roSGNode", "CardContent")
-            again.id = second.id
+            again.setFields({ id: second.id, synopsis: second.synopsis })
             rows.focusedItem = again
             m.assertTrue(hero.content.isSameNode(second), "the same card read again")
+            ' Read again in another metadata language: the hero takes the new text.
+            german = CreateObject("roSGNode", "CardContent")
+            german.setFields({ id: second.id, synopsis: "Auf Deutsch.", machineTranslated: true })
+            rows.focusedItem = german
+            m.assertTrue(hero.content.isSameNode(german), "the card read again with another description")
+            m.assertEqual(hero.findNode("synopsis").text, "Auf Deutsch.")
+        end sub
+
+        @describe("description translation in the hero (spec section 5.5)")
+
+        @it("translates a Featured card's description once focus rests on it, and shows the AI text")
+        sub _()
+            body = m.sections()
+            body.sections[0].featured = true
+            first = body.sections[0].items[0]
+            first.overview = "A heist."
+            first.pending_translation_language = "de"
+            probe = m.withRows(body)
+            hero = probe.findNode("hero")
+            capability = tests.scene.last(catalog.translation.capabilityRequest().path)
+            m.assertNotInvalid(capability)
+            tests.scene.answer(capability, { revision: "r", state: "available", allowed: true, on_view: "auto" })
+            m.assertTrue(probe.callFunc("heroTick"), "focus rests on the card")
+            post = tests.scene.last("/api/v2/catalog/items/" + first.content_id + "/translate-description")
+            m.assertNotInvalid(post)
+            m.assertEqual(post.request.body, { target_language: "de" })
+            m.assertEqual(hero.translatingId, first.content_id)
+            m.assertEqual(Left(hero.findNode("info").text, 12), "Translating…")
+            tests.scene.answer(post, tests.catalogData.fixture("translate_catalog_item_description_ok"))
+            m.assertTrue(probe.callFunc("heroTick"), "the wait before the read")
+            read = tests.scene.last(catalog.request.item(first.content_id, "", false).path)
+            m.assertNotInvalid(read)
+            tests.scene.answer(read, { content_id: first.content_id, type: "movie", title: first.title, overview: "Ein Raub.", machine_translated_fields: ["overview"] })
+            m.assertEqual(hero.translatingId, "")
+            m.assertEqual(hero.findNode("synopsis").text, "Ein Raub.")
+            m.assertEqual(Left(hero.findNode("info").text, 16), "Translated by AI")
+            m.assertFalse(probe.callFunc("heroTick"), "nothing more runs")
+        end sub
+
+        @it("keeps a landed translation on the row's card when the rows were read again during the run")
+        sub _()
+            body = m.sections()
+            body.sections[0].featured = true
+            first = body.sections[0].items[0]
+            first.overview = "A heist."
+            first.pending_translation_language = "de"
+            probe = m.withRows(body)
+            tests.scene.answer(tests.scene.last(catalog.translation.capabilityRequest().path), { revision: "r", state: "available", allowed: true, on_view: "auto" })
+            m.assertTrue(probe.callFunc("heroTick"))
+            post = tests.scene.last("/api/v2/catalog/items/" + first.content_id + "/translate-description")
+            ' A card menu's change reads the rows again: new card nodes, same text.
+            probe.callFunc("refreshRows")
+            tests.scene.answer(tests.scene.last(catalog.request.homeSections(false).path), body)
+            tests.scene.answer(post, tests.catalogData.fixture("translate_catalog_item_description_ok"))
+            m.assertTrue(probe.callFunc("heroTick"))
+            tests.scene.answer(tests.scene.last(catalog.request.item(first.content_id, "", false).path), { content_id: first.content_id, type: "movie", title: first.title, overview: "Ein Raub.", machine_translated_fields: ["overview"] })
+            card = probe.findNode("rows").findNode("list").content.getChild(0).getChild(0)
+            m.assertEqual([card.id, card.synopsis, card.machineTranslated, card.pendingLanguage], [first.content_id, "Ein Raub.", true, ""])
+        end sub
+
+        @it("starts a Featured card's translation again when Home shows again after leaving it waiting")
+        sub _()
+            body = m.sections()
+            body.sections[0].featured = true
+            body.sections[0].items[0].pending_translation_language = "de"
+            probe = m.withRows(body)
+            tests.scene.answer(tests.scene.last(catalog.translation.capabilityRequest().path), { revision: "r", state: "available", allowed: true, on_view: "auto" })
+            probe.visible = false
+            probe.callFunc("onHide")
+            m.assertFalse(probe.callFunc("heroTick"), "hiding stops the wait")
+            probe.visible = true
+            probe.callFunc("onShow", { restore: invalid, first: false, refresh: false })
+            m.assertTrue(probe.callFunc("heroTick"), "the wait starts again for the card shown")
+            m.assertNotInvalid(tests.scene.last("/api/v2/catalog/items/" + body.sections[0].items[0].content_id + "/translate-description"))
+        end sub
+
+        @it("leaves cards outside Featured sections, and the button mode, to the detail page")
+        sub _()
+            body = m.sections()
+            body.sections[0].items[0].pending_translation_language = "de"
+            probe = m.withRows(body)
+            tests.scene.answer(tests.scene.last(catalog.translation.capabilityRequest().path), { revision: "r", state: "available", allowed: true, on_view: "auto" })
+            m.assertFalse(probe.callFunc("heroTick"))
+            body.sections[0].featured = true
+            probe = m.withRows(body)
+            tests.scene.answer(tests.scene.last(catalog.translation.capabilityRequest().path), { revision: "r", state: "available", allowed: true, on_view: "button" })
+            m.assertFalse(probe.callFunc("heroTick"))
         end sub
 
         @it("opens a card's detail page")

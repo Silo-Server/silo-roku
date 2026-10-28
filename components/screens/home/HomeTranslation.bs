@@ -1,0 +1,170 @@
+import "pkg:/components/views/metadataAI.bs"
+import "pkg:/components/views/spoilers.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/cards.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/catalog/translation.bs"
+import "pkg:/source/util/values.bs"
+
+' On-view description translation in Home's hero (spec section 5.5, tvOS's
+' CardDescriptionTranslation): in the server's auto mode, a Featured card
+' whose description is missing in the profile's metadata language
+' translates once per item and language after focus rests on it for
+' catalog.translation.DWELL_SECONDS. Its item is read again on the
+' schedule until the language clears; the text then goes on the card, which
+' the hero shows. The hero says "Translating…" meanwhile (Hero.translatingId)
+' and "Translated by AI" over AI text on any card. One translation runs at a
+' time: resting on another Featured card stops it. Part of HomeScreen.
+
+sub initHeroTranslation()
+    ' The run (catalog.translation.newRun with its number and card), or invalid.
+    m.heroRun = invalid
+    m.heroRuns = 0
+    ' The keys automatic runs started for.
+    m.heroAuto = {}
+    m.heroDwell = m.top.createChild("Timer")
+    m.heroDwell.duration = catalog.translation.DWELL_SECONDS
+    m.heroDwell.observeField("fire", "onHeroDwell")
+    m.heroWait = m.top.createChild("Timer")
+    m.heroWait.observeField("fire", "onHeroWait")
+end sub
+
+' On Home's first show: the capability for the open profile, unless known.
+sub startHeroTranslation()
+    if metadataAIKnown() <> invalid then return
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", "onHeroCapability")
+    api.send(catalog.translation.capabilityRequest(), handle)
+end sub
+
+sub onHeroCapability(event as Object)
+    metadataAIRemember(api.resultOf(event.getRoSGNode()))
+    heroTranslationFocus(m.heroCard)
+end sub
+
+' The hero shows card: its status, and the wait before a Featured card's
+' translation starts.
+sub heroTranslationFocus(card as Dynamic)
+    m.heroDwell.control = "stop"
+    shownRun()
+    if heroTranslates(card) then m.heroDwell.control = "start"
+end sub
+
+' Shows the run's status when the hero shows its card.
+sub shownRun()
+    id = ""
+    if m.heroRun <> invalid and m.heroCard <> invalid and m.heroCard.id = m.heroRun.contentId then id = m.heroRun.contentId
+    if m.hero.translatingId <> id then m.hero.translatingId = id
+end sub
+
+' Whether card starts a translation when focus rests on it: auto mode, a
+' Featured section's card, a missing language, and no run for it yet.
+function heroTranslates(card as Dynamic) as Boolean
+    if card = invalid or card.id = "" or util.text(card.pendingLanguage) = "" then return false
+    ' tvOS starts none for a description withheld as a spoiler.
+    if catalog.spoilers.hidesOverview(card, spoilerSettings()) then return false
+    if metadataAIMode() <> catalog.translation.AUTO then return false
+    row = card.getParent()
+    if row = invalid or not row.hasField("featured") or not row.featured then return false
+    return not m.heroAuto.DoesExist(catalog.translation.key(card.id, card.pendingLanguage))
+end function
+
+sub onHeroDwell()
+    card = m.heroCard
+    if not m.top.visible or not heroTranslates(card) then return
+    stopHeroRun()
+    attempt = catalog.translation.newRun(card.id, card.pendingLanguage, true)
+    m.heroRuns = m.heroRuns + 1
+    attempt.number = m.heroRuns
+    attempt.card = card
+    m.heroRun = attempt
+    m.heroAuto[attempt.key] = true
+    heroSend(catalog.translation.translateRequest(attempt.contentId, attempt.language), "onHeroPosted")
+    shownRun()
+end sub
+
+sub heroSend(request as Object, callback as String)
+    handle = api.newHandle(m.top.owner)
+    handle.addFields({ attempt: m.heroRun.number })
+    handle.observeField("status", callback)
+    api.send(request, handle)
+end sub
+
+' The run an answer is for, while it still runs.
+function heroRunOf(handle as Object) as Dynamic
+    if m.heroRun = invalid or m.heroRun.number <> handle.attempt then return invalid
+    return m.heroRun
+end function
+
+sub onHeroPosted(event as Object)
+    handle = event.getRoSGNode()
+    attempt = heroRunOf(handle)
+    if attempt = invalid then return
+    result = api.resultOf(handle)
+    heroAdvance(catalog.translation.stepAfter(attempt, "posted", result.ok = true, catalog.translation.jobFailed(result.body)))
+end sub
+
+sub onHeroWait()
+    if m.heroRun <> invalid then heroRead()
+end sub
+
+sub heroRead()
+    heroSend(catalog.request.item(m.heroRun.contentId, "", m.hero.lowTier), "onHeroRead")
+end sub
+
+' A read of the card's item: once its language clears, its text goes on the
+' card, and on the hero if it shows the card.
+sub onHeroRead(event as Object)
+    handle = event.getRoSGNode()
+    attempt = heroRunOf(handle)
+    if attempt = invalid then return
+    result = api.resultOf(handle)
+    ok = result.ok = true and util.isObject(result.body)
+    cleared = ok and util.text(result.body.pendingLanguage) = ""
+    if cleared then heroLand(attempt, { synopsis: catalog.cards.synopsis(result.body.synopsis), machineTranslated: util.isTrue(result.body.machineTranslated), pendingLanguage: "" })
+    heroAdvance(catalog.translation.stepAfter(attempt, "read", ok, cleared))
+end sub
+
+' Puts the landed text on the run's card and on every card of the item the
+' rows hold now: rows read again during the run (a card menu's change)
+' hold new nodes, which would otherwise bring the old text back.
+sub heroLand(attempt as Object, fields as Object)
+    attempt.card.setFields(fields)
+    if m.heroCard <> invalid and m.heroCard.id = attempt.contentId then m.heroCard.setFields(fields)
+    content = m.list.content
+    if content = invalid then return
+    for each row in content.getChildren(-1, 0)
+        for each card in row.getChildren(-1, 0)
+            if card.id = attempt.contentId and util.text(card.pendingLanguage) = attempt.language then card.setFields(fields)
+        end for
+    end for
+end sub
+
+sub heroAdvance(decision as Object)
+    if decision.action = catalog.translation.NEXT_WAIT
+        m.heroWait.duration = decision.seconds
+        m.heroWait.control = "start"
+    else if decision.action = catalog.translation.NEXT_READ
+        heroRead()
+    else
+        ' Done or failed: a failed card does not start again on Home; its
+        ' detail page offers the action.
+        m.heroRun = invalid
+        m.hero.translatingId = ""
+    end if
+end sub
+
+' Stops the run; an automatic one may start again when its card shows.
+sub stopHeroRun()
+    m.heroWait.control = "stop"
+    if m.heroRun = invalid then return
+    m.heroAuto.Delete(m.heroRun.key)
+    m.heroRun = invalid
+    shownRun()
+end sub
+
+' Home goes under another screen: the wait and the run stop.
+sub hideHeroTranslation()
+    m.heroDwell.control = "stop"
+    stopHeroRun()
+end sub

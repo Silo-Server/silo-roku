@@ -1,0 +1,277 @@
+import "pkg:/components/views/metadataAI.bs"
+import "pkg:/components/views/spoilers.bs"
+import "pkg:/source/catalog/translation.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/util/values.bs"
+
+' On-view description translation on the detail page (spec section 5.6,
+' tvOS's ItemDetailViewModel+DescriptionTranslation): a page can be missing
+' its own description in the profile's metadata language (the item's
+' pendingLanguage) and, on a series, the selected season's episode
+' descriptions (an episode card's pendingLanguage), whose season job
+' translates them all. In the server's auto mode each starts once per item
+' and language while the page shows; in button mode, and after a failed
+' run, More offers Translate Description. A run asks the server, then reads
+' the item or the season's episodes again on catalog.translation's schedule
+' until the language clears, putting the new text on the page; the hero says
+' "Translating…" meanwhile and "Translated by AI" over AI text
+' (DetailHero.synopsisStatus). Part of DetailScreen.
+
+const SLOT_ITEM = "item"
+const SLOT_SEASON = "season"
+
+sub initTranslation()
+    ' Each slot's run (catalog.translation.newRun, with its number and,
+    ' for the season, its seasonNumber), or invalid; a failed run stays.
+    m.runs = { item: invalid, season: invalid }
+    m.runCount = 0
+    ' The keys automatic runs started for, so a page shown again or a read
+    ' that still reports the language does not start another job.
+    m.autoKeys = {}
+    ' The keys whose last run failed, so More still offers them after the
+    ' slot's run moved on to another season.
+    m.failedKeys = {}
+    m.translateTimers = {}
+    for each slot in [SLOT_ITEM, SLOT_SEASON]
+        timer = m.top.createChild("Timer")
+        timer.id = "translate." + slot
+        timer.observeField("fire", "onTranslateTimer")
+        m.translateTimers[slot] = timer
+    end for
+end sub
+
+' On the page's first show: the capability as another screen read it for
+' the open profile, else read here.
+sub startTranslation()
+    if metadataAIKnown() = invalid then send(catalog.translation.capabilityRequest(), { kind: "metadataAI" })
+end sub
+
+sub onMetadataAI(result as Object)
+    metadataAIRemember(result)
+    translationChanged()
+end sub
+
+' What the page is missing now: { item, season }, each { contentId,
+' language } (the season's with its seasonNumber) or invalid.
+function translationTargets() as Object
+    out = { item: invalid, season: invalid }
+    if m.detail = invalid then return out
+    if util.text(m.detail.pendingLanguage) <> "" then out.item = { contentId: m.detail.id, language: m.detail.pendingLanguage, seasonNumber: -1 }
+    at = m.seasonIndex
+    if m.series and at >= 0 and at < m.pages.Count() and m.pages[at] <> invalid
+        language = catalog.translation.seasonPending(m.pages[at].getChildren(-1, 0))
+        if language <> "" then out.season = { contentId: m.seasonNodes[at].id, language: language, seasonNumber: m.seasonNodes[at].seasonNumber }
+    end if
+    return out
+end function
+
+' The page's item, season, or the server's mode changed: in auto mode each
+' missing translation starts once per item and language.
+sub translationChanged()
+    if m.released then return
+    if metadataAIMode() = catalog.translation.AUTO and m.top.visible
+        targets = translationTargets()
+        for each slot in [SLOT_ITEM, SLOT_SEASON]
+            target = targets[slot]
+            if target <> invalid and not m.autoKeys.DoesExist(catalog.translation.key(target.contentId, target.language)) then startTranslationRun(slot, target, true)
+        end for
+    end if
+    paintTranslation()
+end sub
+
+function translating(slot as String) as Boolean
+    attempt = m.runs[slot]
+    return attempt <> invalid and attempt.phase = catalog.translation.TRANSLATING
+end function
+
+' Whether More offers Translate Description: nothing running, and a
+' missing translation in button mode or, in auto, one whose run failed.
+function translationOffered() as Boolean
+    if translating(SLOT_ITEM) or translating(SLOT_SEASON) then return false
+    mode = metadataAIMode()
+    targets = translationTargets()
+    for each slot in [SLOT_ITEM, SLOT_SEASON]
+        target = targets[slot]
+        if target <> invalid
+            key = catalog.translation.key(target.contentId, target.language)
+            attempt = m.runs[slot]
+            if attempt <> invalid and attempt.key <> key then attempt = invalid
+            if attempt = invalid and m.failedKeys.DoesExist(key) then attempt = { phase: catalog.translation.FAILED, language: target.language }
+            if catalog.translation.offers(mode, target.language, attempt) then return true
+        end if
+    end for
+    return false
+end function
+
+' More's Translate Description: every missing translation, again after a
+' failure.
+sub translateDescriptions()
+    if metadataAIMode() = catalog.translation.OFF then return
+    targets = translationTargets()
+    for each slot in [SLOT_ITEM, SLOT_SEASON]
+        if targets[slot] <> invalid then startTranslationRun(slot, targets[slot], false)
+    end for
+end sub
+
+' Starts a run in slot unless one is running there for the same item and
+' language; one for another (the season shown changed) stops for it.
+sub startTranslationRun(slot as String, target as Object, automatic as Boolean)
+    if translating(slot)
+        if m.runs[slot].key = catalog.translation.key(target.contentId, target.language) then return
+        stopTranslationRun(slot)
+    end if
+    attempt = catalog.translation.newRun(target.contentId, target.language, automatic)
+    m.runCount = m.runCount + 1
+    attempt.number = m.runCount
+    attempt.seasonNumber = target.seasonNumber
+    m.runs[slot] = attempt
+    m.failedKeys.Delete(attempt.key)
+    if automatic then m.autoKeys[attempt.key] = true
+    send(catalog.translation.translateRequest(attempt.contentId, attempt.language), { kind: "translate", slot: slot, attempt: attempt.number })
+    paintTranslation()
+end sub
+
+' The run an answer is for, while it is still the slot's and running.
+function currentRun(entry as Object) as Dynamic
+    attempt = m.runs[entry.slot]
+    if attempt = invalid or attempt.number <> entry.attempt or attempt.phase <> catalog.translation.TRANSLATING then return invalid
+    return attempt
+end function
+
+sub onTranslatePosted(entry as Object, result as Object)
+    attempt = currentRun(entry)
+    if attempt = invalid then return
+    advance(entry.slot, catalog.translation.stepAfter(attempt, "posted", result.ok = true, catalog.translation.jobFailed(result.body)))
+end sub
+
+sub onTranslateTimer(event as Object)
+    slot = event.getRoSGNode().id.Mid(Len("translate."))
+    if translating(slot) then readTranslation(slot)
+end sub
+
+' Reads what the run translates again: the item, or the season's episodes.
+sub readTranslation(slot as String)
+    attempt = m.runs[slot]
+    entry = { kind: "translateRead", slot: slot, attempt: attempt.number }
+    if slot = SLOT_ITEM
+        send(catalog.request.item(attempt.contentId, m.libraryId, m.lowTier), entry)
+    else
+        send(catalog.request.episodes(m.detail.id, attempt.seasonNumber, m.libraryId), entry)
+    end if
+end sub
+
+' A read landed: its text goes on the page, and the run ends once the
+' language is no longer missing.
+sub onTranslateRead(entry as Object, result as Object, content as Dynamic)
+    attempt = currentRun(entry)
+    if attempt = invalid then return
+    ok = result.ok = true and util.isObject(result.body)
+    cleared = false
+    if ok and entry.slot = SLOT_ITEM
+        cleared = applyItemTranslation(result.body)
+    else if ok and content <> invalid
+        cleared = applySeasonTranslation(attempt.seasonNumber, content)
+    else
+        ok = false
+    end if
+    advance(entry.slot, catalog.translation.stepAfter(attempt, "read", ok, cleared))
+end sub
+
+' The item's description fields from a read of it (catalog.detail.fromItem);
+' true when it no longer misses a language.
+function applyItemTranslation(read as Object) as Boolean
+    if m.detail = invalid or read.id <> m.detail.id then return true
+    m.detail.synopsis = read.synopsis
+    m.detail.tagline = read.tagline
+    m.detail.machineTranslated = read.machineTranslated
+    m.detail.pendingLanguage = read.pendingLanguage
+    if not m.describing then showSeriesText()
+    return read.pendingLanguage = ""
+end function
+
+' The season's episode descriptions from a read of its episodes onto the
+' cards the page keeps; true when none misses a language.
+function applySeasonTranslation(seasonNumber as Integer, content as Object) as Boolean
+    fresh = content.getChildren(-1, 0)
+    position = positionOf(seasonNumber)
+    if position >= 0 and m.pages[position] <> invalid
+        episodes = m.pages[position].getChildren(-1, 0)
+        for each card in fresh
+            at = catalog.series.indexOf(episodes, card.id)
+            if at >= 0 then episodes[at].setFields({ synopsis: card.synopsis, machineTranslated: card.machineTranslated, pendingLanguage: card.pendingLanguage })
+        end for
+        if m.describing and m.activeIndex >= 0 and m.activeIndex < m.railItems.Count() then describeEpisode(m.railItems[m.activeIndex])
+    end if
+    return catalog.translation.seasonPending(fresh) = ""
+end function
+
+sub advance(slot as String, decision as Object)
+    attempt = m.runs[slot]
+    if decision.action = catalog.translation.NEXT_WAIT
+        timer = m.translateTimers[slot]
+        timer.duration = decision.seconds
+        timer.control = "start"
+        return
+    else if decision.action = catalog.translation.NEXT_READ
+        readTranslation(slot)
+        return
+    else if decision.action = catalog.translation.NEXT_DONE
+        m.runs[slot] = invalid
+    else
+        attempt.phase = catalog.translation.FAILED
+        m.failedKeys[attempt.key] = true
+    end if
+    ' The slot is free: what the page shows now may still miss a language.
+    translationChanged()
+end sub
+
+' The page goes (hidden under the player, or released): runs stop, and an
+' automatic one may start again when the page shows (tvOS's cancel on
+' disappear). A failed run stays, so More still offers it.
+sub cancelTranslation()
+    for each slot in [SLOT_ITEM, SLOT_SEASON]
+        stopTranslationRun(slot)
+    end for
+    paintTranslation()
+end sub
+
+' Stops slot's run while it runs, with its wait and requests; an automatic
+' one may start again.
+sub stopTranslationRun(slot as String)
+    m.translateTimers[slot].control = "stop"
+    attempt = m.runs[slot]
+    if attempt = invalid or attempt.phase <> catalog.translation.TRANSLATING then return
+    m.autoKeys.Delete(attempt.key)
+    m.runs[slot] = invalid
+    cancelTranslationRequests(slot)
+end sub
+
+' Cancels slot's translation requests still out.
+sub cancelTranslationRequests(slot as String)
+    for i = m.pending.Count() - 1 to 0 step -1
+        entry = m.pending[i]
+        if (entry.kind = "translate" or entry.kind = "translateRead") and entry.slot = slot
+            api.cancel(entry.handle)
+            m.pending.Delete(i)
+        end if
+    end for
+end sub
+
+' The hero's status under the description it shows: the active episode's
+' while it describes one, else the item's. An episode description withheld
+' as a spoiler (catalog.spoilers) shows no status.
+sub paintTranslation()
+    if m.detail = invalid then return
+    status = ""
+    if m.describing
+        if m.activeIndex >= 0 and m.activeIndex < m.railItems.Count()
+            card = m.railItems[m.activeIndex]
+            busy = translating(SLOT_SEASON) and util.text(card.pendingLanguage) <> ""
+            hidden = catalog.spoilers.hidesOverview(card, spoilerSettings())
+            status = catalog.translation.status(busy, card.machineTranslated, card.synopsis <> "" and not hidden)
+        end if
+    else
+        status = catalog.translation.status(translating(SLOT_ITEM), util.isTrue(m.detail.machineTranslated), m.detail.synopsis <> "")
+    end if
+    if m.hero.synopsisStatus <> status then m.hero.synopsisStatus = status
+end sub

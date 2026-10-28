@@ -129,6 +129,13 @@ Browse:
 - episode spoiler hiding: the profile's settings blur an unwatched
   episode's still and hide its description, where the server's settings
   contract serves them (section 5.6).
+- AI description translation, added at the owner's request on 2026-10-28:
+  when the server translates descriptions for the profile
+  (`GET /api/v2/capabilities/metadata-ai`), a description missing in the
+  profile's metadata language is translated on view or from the detail
+  page's More menu (Translate Description), "Translated by AI" marks AI
+  text, and Settings sets the profile's Metadata Language (sections 5.5,
+  5.6, and 5.8.1).
 
 Personal lists:
 
@@ -660,6 +667,19 @@ their existing HD/FHD assets.
   - tvOS's line for the air date and top three cast is deferred (section 3.3).
   - Text follows focus at once. The backdrop changes after focus rests 150 ms,
     with a 0.24 s cross-fade; the first backdrop appears without a fade.
+  - Description translation (tvOS's `CardDescriptionTranslation`): section
+    cards carry `pending_translation_language` when their description is
+    missing in the profile's metadata language. In the server's `auto`
+    on-view mode, a card of a featured section (`featured`) translates once
+    per item and language after focus rests on it for 1.5 s: the hero sends
+    `POST /api/v2/catalog/items/{id}/translate-description` with that
+    language and reads the item again on the detail page's schedule (5.6)
+    until the language clears, then shows its text. Meanwhile the meta line
+    leads with "Translating…" and the synopsis dims to 50%; over AI text
+    (`machine_translated_fields` holds `overview`) it leads with
+    "Translated by AI", on any card. Other rows, and the `button` mode,
+    leave the action to the detail page, as the marquee takes no focus.
+    One translation runs at a time (5.9).
   - With focus in the top bar, the hero keeps the last focused card: after the
     rows are read again, the same card wherever it moved.
 - **Rows.**
@@ -965,7 +985,8 @@ their existing HD/FHD assets.
     movie Mark as Watched or Mark as Unwatched; on a series Mark Series
     Watched or Unwatched, Mark Season Watched or Unwatched for the season
     shown, and Mark Episode Watched or Unwatched for the episode Play plays
-    (5.9). The menu holds nothing else (5.9).
+    (5.9); last, Translate Description, while the page offers it
+    (Description translation, below). The menu holds nothing else (5.9).
     Each row does what it said when the menu opened, even if a read that
     lands while it is open, such as the seasons read after a mark, turns
     the state it names; Shuffle <season> shuffles the season it named.
@@ -1010,6 +1031,43 @@ their existing HD/FHD assets.
     write of its own for it is out, and reads again what a watched change
     moves. While its own write is out, the other page's applied change
     becomes what a refusal of that write puts back.
+- **Description translation.** As tvOS's
+  `ItemDetailViewModel+DescriptionTranslation` and
+  `DescriptionTranslationCoordinator`, gated on
+  `GET /api/v2/capabilities/metadata-ai` (`state` `available` and
+  `allowed`; its `on_view` mode `off`, `button`, or `auto`, anything else
+  read as `off`), read once per server and profile in a session by Home,
+  the detail page, or Settings, whichever opens first.
+  - A page can miss up to two translations in the profile's metadata
+    language: its own description (the item's
+    `pending_translation_language`) and, on a series, the season shown's
+    episode descriptions (any of its episode rows'
+    `pending_translation_language`), which the season's job translates
+    together.
+  - In `auto` mode each starts once per item and language while the page
+    shows. In `button` mode, and after a run fails in `auto`, More offers
+    Translate Description, which starts every missing one. Neither shows
+    while a run is under way, or when the server answers `off`.
+  - A run sends `POST /api/v2/catalog/items/{id}/translate-description`
+    (the item's or the season's content ID) with
+    `{ "target_language": <the reported language> }`. The server has no job
+    read for viewers, so the page reads the item, or the season's episodes,
+    again after 1, 2, 2, 3, 3, 4, 5, 5, 5, 5, 5, and 5 seconds until the
+    language no longer shows, and puts the new overview, tagline, and AI
+    mark on the page. After 45 s, or a 202 job already `failed` or
+    `canceled`, the run fails. A refused request (422 when nothing is left
+    to translate, 429 when rate limited) is read once and ends well if the
+    text is there.
+  - The hero says what happens under the synopsis, 6 px below it in 22 px
+    Regular at 70%, taking its line from the synopsis: "Translating…" with
+    the synopsis at 50% while the run for the description shown is under
+    way, "Translated by AI" when `machine_translated_fields` holds
+    `overview`. An episode the hero describes follows its season's run and
+    its own row's fields. A failure says nothing; More offers the action
+    again.
+  - The player over the page, or Back, stops a run; an automatic one starts
+    again when the page shows. A failed run does not start again on its own.
+
 - **Version, audio, and subtitles.** As tvOS ships them (D1; silo-apple
   `b90a86ea`, `TVPlaybackSelectorRow.swift` and `TVDetailHero.swift`; the
   design spec's squared selector row with an Edition selector was not
@@ -1829,7 +1887,15 @@ seven-row scrolling window.
   429, and a failed test, save, or reset (`docs/buffering-quality.md`
   section 5.5).
 - Subtitles: Language, Behavior, and Show Forced Subtitles. A footer points
-  to Roku's caption visibility and appearance controls.
+  to Roku's caption visibility and appearance controls. Then, under
+  Metadata, Metadata Language (`catalog.metadata_language`, written for
+  the profile), when the server translates descriptions for it
+  (`GET /api/v2/capabilities/metadata-ai`, `available` and `allowed`), as
+  tvOS shows its METADATA section. The options are "Library default" (no
+  value) and the contract's suggested languages; its footer says
+  "Translates descriptions and taglines into your preferred language when
+  available. Titles are never translated." After a change Home reads its
+  rows again the next time it shows.
 - Server: the connected server address and Change Server (section 5.4's
   saved servers when another is saved); app version is
   always visible in the rail. No server administration controls.
@@ -2011,7 +2077,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Watchlist's empty state says "Tap the bookmark icon on any item to add it here", Favorites' "Tap the heart icon on any item to add it here" | "Add titles from a detail page and they will appear here." and "Add favorites from a detail page and they will appear here." (the iOS words), with a Back button | A remote has no tap, and a page without the bar needs a way out from its empty state |
 | A card's context menu (press and hold) offers Play or Resume on Continue Watching, Mark as Watched, Favorites, and Watchlist, and on Home Remove from Continue Watching or Next Up; a Watchlist or Favorites page drops a card whose flag turns off. History offers no removal | Options (*) on a focused card opens the same menu, in the same order, on Home, the library tabs, Browse, collections, Search, person pages, More Like This, and the Watchlist, Favorites, and History pages (`source/catalog/cardMenu.bs`); Favorites and Watchlist show only when the server offers the lists. History adds Remove from History (`POST /api/v2/history/remove`, the card's item, which for a series covers its episodes). A change shows on the card at once and goes back with the notice if refused; Home and Recommended read their rows again after one. A card read before another page's change takes the change when its menu opens | Roku has no press and hold: a list consumes OK on press. `*` is Roku's options key. Development builds keep `*` on Home's bar for the diagnostic screen |
 | An episode card's context menu marks that episode watched or unwatched | More on a series page has Mark Episode Watched or Unwatched for the episode Play plays (the active one) | Roku's episode rail has no context menu; the action row already names that episode |
-| More also offers Find Trailers, Translate Description, Show Series Info, and Watch Party where they apply | Shuffle, Favorites, and the watched rows only | Scope (sections 3.3 and 3.4); Find Trailers (`POST /api/v2/catalog/items/{id}/trailers/refresh`, offered by `GET /api/v2/capabilities/trailers`) fetches remote videos, which Roku leaves out (next row) |
+| More also offers Find Trailers, Show Series Info, and Watch Party where they apply | Shuffle, Favorites, the watched rows, and Translate Description while the page offers it (section 5.6) | Scope (sections 3.3 and 3.4); Find Trailers (`POST /api/v2/catalog/items/{id}/trailers/refresh`, offered by `GET /api/v2/capabilities/trailers`) fetches remote videos, which Roku leaves out (next row) |
 | Trailers & More also lists the item's remote trailers and clips (`videos`, YouTube only), captioned "YouTube" with YouTube's still, which open in the YouTube app; tvOS drops them when the app is not installed | Only the local extras, which play in Silo's player | Certification criterion 5.3 forbids opening another app, and the server gives a remote video only as its site and key (`ItemVideoInfo`), with no stream it hosts or relays (silo-server `3e2d306b2`; assumption AG-361) |
 | A theme fades in to 35% of the volume over 300 ms and fades out as it stops | It plays at the TV's volume and starts and stops at once | Roku's `Audio` node has no volume or gain field, only `mute` (AG-363) |
 | A theme pauses while the app is in the background and resumes on return | Pressing Home closes the app, and the theme with it | Roku keeps no app running in the background without Instant Resume, which this client does not use |
@@ -2021,7 +2087,11 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A refused change shows the alert "Couldn't Update Item" / "Your change wasn't saved. Please try again."; an unanswered one is held until the viewer discards it | The change goes back and "Couldn't update item. Your change wasn't saved." shows top centre for four seconds; an unanswered write counts as refused and nothing is held | Roku's passive notice line needs no focus; no held-change list is kept (assumption AG-326) |
 | The connection speed test times one streamed download in 500 ms windows, following the probe's redirect without credentials | Back-to-back chunks, each timed whole and spread over the windows, which reads low by the gaps; only against a server with `bandwidth_probe_location_v1`, whose credential-free URL is fetched without the redirect | Roku shows no bytes inside a transfer, and forwards profile headers across a redirect (assumptions AG-391 and A-14) |
 | Buffering is told from a slow device by the buffered duration, and plan summaries survive the app's exit | No renderer waits; a progressive plan measures no throughput, so it lowers before its first frame only on its 20 s deadline's failure path; a plan the Home button ends sends no summary; no foreground check | Roku reports only a fill percentage and segment downloads, and gives a channel no exit callback or background state (AG-390, AG-391; Android TV keeps no exit journal either) |
-| People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; the AI-translation marker | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; the marker on AI-translated subtitle tracks | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| The description translation's status ("Translating…", "Translated by AI") follows the translate symbol | The words alone, under the detail synopsis and leading Home's meta line | No symbol art ships for it; the words carry the meaning |
+| Each Featured card on the marquee runs its own translation, so several can run while focus moves along the row | One at a time: resting on another Featured card stops the run before it starts the next, which may start again when its card shows again | Keeps the requests and timers a 1 GB Roku holds to one run; the server's on-view budget per account is small (5 a second, 30 a minute) |
+| A metadata language change drops every cached item, section, and grid, and Home re-reads its rows | Home reads its rows again when it next shows; library pages and pages under Settings keep their text until they are read again | Roku keeps no item cache; a library page reads its rows each time it opens |
+| The AI capability is read again on every foreground and session refresh | Read once per server and profile in a session, by the first of Home, the detail page, or Settings | A Roku channel has no foreground event short of a relaunch, which reads it again (assumption AG-603) |
 
 ### 5.10 For You and Calendar
 
@@ -2392,7 +2462,11 @@ The first release consumes:
 - `GET /api/v2/subtitles/providers/status` for whether Search Subtitles…
   shows, `POST /api/v2/subtitles/search` for one language of the playing
   file, and `POST /api/v2/subtitles/download` for the result chosen,
-  sent once (section 5.7).
+  sent once (section 5.7);
+- `GET /api/v2/capabilities/metadata-ai` for whether and how descriptions
+  translate, and `POST /api/v2/catalog/items/{id}/translate-description`
+  to translate an item's, a season's, or an episode's descriptions into
+  the language its read reported missing (sections 5.5 and 5.6).
 
 ### 8.2 Loading rules
 
@@ -2438,6 +2512,7 @@ playback keys the existing TV apps honor:
 | `playback.next_up_prompt_seconds` | How long before the end Up Next opens, and what its countdown counts from (0 to 120 s; 0 opens it only at the end) |
 | `catalog.hide_unwatched_episode_images`, `catalog.hide_unwatched_episode_overviews` | Blur an unwatched episode's still and hide its description (section 5.6); read on their own when a page with the top bar starts, where the settings contract serves them (revision 17), and written by Settings for the profile (`profile`, the only scope the manifest allows) |
 | `ui.theme_music_enabled`, `ui.theme_music_loop` | Whether detail pages play their theme music, and whether it repeats (section 5.6); the theme player reads them when a page needs them, and Settings writes them for this device (`profile_device`), as tvOS does |
+| `catalog.metadata_language` | The language the server returns descriptions and taglines in, and reports missing for translation (sections 5.5 and 5.6); Settings reads it for its Metadata Language row and writes it for the profile (section 5.8.1); nothing else in the client uses it |
 
 Profile Selection (section 5.4) is not a server setting: as on tvOS and
 Android TV, it is this device's alone and lives in the registry.
@@ -2450,9 +2525,9 @@ Subtitle appearance is left to Roku's system caption settings (section 9.7).
 Settings writes supported preferences through `PUT /api/v2/settings/values/{key}`
 with a typed `{ "value": ... }` body and an explicit `scope` query. Playback
 and subtitle controls use `profile_device`, with “Use profile setting” sending
-`DELETE` at that scope. Title art, video skip intervals, and the spoiler
-settings use `profile`, as required by their resolution order or allowed
-scopes. The screen explains
+`DELETE` at that scope. Title art, video skip intervals, the spoiler
+settings, and the metadata language use `profile`, as required by their
+resolution order or allowed scopes. The screen explains
 which scope a change affects. It reads the server contract first and offers
 only supported remote definitions; after each write it rereads effective
 values, showing policy constraints rather than treating the write receipt as
