@@ -5,6 +5,8 @@ namespace tests
     class PersonalListScreenTests extends rooibos.BaseTestSuite
         protected override sub beforeEach()
             if not m.global.hasField("personalRevision") then m.global.addFields({ personalRevision: 0 })
+            ' Each test's cards start as the server sent them.
+            if m.global.hasField("personalLatest") then m.global.personalLatest = {}
         end sub
 
         protected override sub afterEach()
@@ -16,6 +18,7 @@ namespace tests
         function opened(list as String) as Object
             theme.install()
             tests.scene.reset()
+            m.list = list
             node = CreateObject("roSGNode", "PersonalListScreenProbe")
             node.entry = { id: "personal", route: nav.route.PERSONAL, params: { list: list } }
             node.owner = "personal-" + list
@@ -26,11 +29,40 @@ namespace tests
         end function
 
         function page(count as Integer, more as Boolean) as Object
-            body = { items: tests.catalogData.items(count) }
+            ' Cards with the viewer's flags, as the server sends them to a
+            ' profile: each is on the list the page shows.
+            items = []
+            for n = 1 to count
+                items.Push(tests.catalogData.item(n, { user_state: { played: false, is_favorite: m.list = catalog.personal.FAVORITES, in_watchlist: m.list = catalog.personal.WATCHLIST, not_interested: false } }))
+            end for
+            body = { items: items }
             body.page = { has_more: more }
             if more then body.page.next_cursor = "eyJ2IjoxfQ"
             return body
         end function
+
+        ' The open card menu's row titles.
+        function rowTitles(node as Object) as Object
+            out = []
+            for each item in node.findNode("menuLayer").getChild(0).options.items
+                out.Push(item.title)
+            end for
+            return out
+        end function
+
+        ' Chooses the open card menu's row titled title.
+        sub choose(node as Object, title as String)
+            menu = node.findNode("menuLayer").getChild(0)
+            for each item in menu.options.items
+                if item.title = title
+                    ' As OK does: the row is picked, and the menu closes.
+                    menu.picked = item.value
+                    menu.closed = true
+                    return
+                end if
+            end for
+            m.fail("no menu row " + title)
+        end sub
 
         function cards(node as Object) as Object
             out = []
@@ -106,9 +138,8 @@ namespace tests
             tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(3, false))
             revision = m.global.personalRevision
             m.assertTrue(node.callFunc("pressKey", "options"))
-            menu = node.findNode("menuLayer").getChild(0)
-            m.assertEqual(menu.options.items[0].title, "Remove from Watchlist")
-            menu.picked = 0
+            m.assertEqual(m.rowTitles(node), ["Mark as Watched", "Add to Favorites", "Remove from Watchlist"])
+            m.choose(node, "Remove from Watchlist")
             write = tests.scene.last("/api/v2/watchlist/movie:m1")
             m.assertEqual([write.request.method, write.request.auth], ["DELETE", "profile"])
             m.assertEqual(m.cards(node).Count(), 3, "the card stays until the server answers")
@@ -117,12 +148,60 @@ namespace tests
             m.assertEqual(m.global.personalRevision, revision + 1)
         end sub
 
+        @it("keeps a card whose mark or other list changes, showing the change at once")
+        sub _()
+            node = m.opened(catalog.personal.WATCHLIST)
+            tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(2, false))
+            card = node.findNode("results").findNode("grid").content.getChild(0)
+            node.callFunc("pressKey", "options")
+            m.choose(node, "Add to Favorites")
+            m.assertTrue(card.isFavorite)
+            write = tests.scene.last("/api/v2/favorites/movie:m1")
+            m.assertEqual(write.request.method, "PUT")
+            tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
+            m.assertEqual(m.cards(node), ["movie:m1", "movie:m2"])
+            node.callFunc("pressKey", "options")
+            m.assertEqual(m.rowTitles(node), ["Mark as Watched", "Remove from Favorites", "Remove from Watchlist"])
+        end sub
+
+        @it("offers to undo a toggle still out, over the change the server applied before it")
+        sub _()
+            node = m.opened(catalog.personal.WATCHLIST)
+            tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(2, false))
+            node.callFunc("pressKey", "options")
+            m.choose(node, "Add to Favorites")
+            added = tests.scene.last("/api/v2/favorites/movie:m1")
+            tests.scene.deliver(added.handle, { requestId: added.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
+            node.callFunc("pressKey", "options")
+            m.choose(node, "Remove from Favorites")
+            ' The removal is still out when the menu opens again.
+            node.callFunc("pressKey", "options")
+            m.assertEqual(m.rowTitles(node)[1], "Add to Favorites")
+        end sub
+
+        @it("drops a card whose add-back is refused after its removal landed")
+        sub _()
+            node = m.opened(catalog.personal.FAVORITES)
+            tests.scene.answer(tests.scene.last("/api/v2/favorites"), m.page(2, false))
+            node.callFunc("pressKey", "options")
+            m.choose(node, "Remove from Favorites")
+            removal = tests.scene.last("/api/v2/favorites/movie:m1")
+            node.callFunc("pressKey", "options")
+            m.choose(node, "Add to Favorites")
+            tests.scene.deliver(removal.handle, { requestId: removal.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
+            m.assertEqual(m.cards(node), ["movie:m1", "movie:m2"], "the add-back is still out")
+            addBack = tests.scene.last("/api/v2/favorites/movie:m1")
+            m.assertEqual(addBack.request.method, "PUT")
+            tests.scene.refuse(addBack, 500)
+            m.assertEqual(m.cards(node), ["movie:m2"])
+        end sub
+
         @it("keeps focus on its card when a card before it goes")
         sub _()
             node = m.opened(catalog.personal.WATCHLIST)
             tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(3, false))
             node.callFunc("pressKey", "options")
-            node.findNode("menuLayer").getChild(0).picked = 0
+            m.choose(node, "Remove from Watchlist")
             write = tests.scene.last("/api/v2/watchlist/movie:m1")
             ' The viewer moves on to the third card before the server answers.
             node.findNode("results").findNode("grid").itemFocused = 2
@@ -136,9 +215,9 @@ namespace tests
             node = m.opened(catalog.personal.HISTORY)
             tests.scene.answer(tests.scene.last("/api/v2/history"), m.page(2, false))
             node.callFunc("pressKey", "options")
-            menu = node.findNode("menuLayer").getChild(0)
-            m.assertEqual(menu.options.items[0].title, "Remove from History")
-            menu.picked = 0
+            titles = m.rowTitles(node)
+            m.assertEqual([titles[0], titles.Peek()], ["Mark as Watched", "Remove from History"])
+            m.choose(node, "Remove from History")
             write = tests.scene.last("/api/v2/history/remove")
             m.assertEqual([write.request.method, write.request.body], ["POST", { targets: [{ content_id: "movie:m1" }] }])
             tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: false, status: 500, headers: {}, body: invalid, error: { kind: "http", reason: "" } }, "error")
@@ -187,7 +266,7 @@ namespace tests
             node = m.opened(catalog.personal.WATCHLIST)
             tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(3, false))
             node.callFunc("pressKey", "options")
-            node.findNode("menuLayer").getChild(0).picked = 0
+            m.choose(node, "Remove from Watchlist")
             write = tests.scene.last("/api/v2/watchlist/movie:m1")
             reads = tests.scene.sent().Count()
             tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
@@ -200,7 +279,7 @@ namespace tests
             node = m.opened(catalog.personal.WATCHLIST)
             tests.scene.answer(tests.scene.last("/api/v2/watchlist"), m.page(3, false))
             node.callFunc("pressKey", "options")
-            node.findNode("menuLayer").getChild(0).picked = 0
+            m.choose(node, "Remove from Watchlist")
             write = tests.scene.last("/api/v2/watchlist/movie:m1")
             ' A change elsewhere lands first, and its read leaves before the server removes the card.
             m.global.personalRevision = m.global.personalRevision + 1
@@ -223,7 +302,7 @@ namespace tests
             node = m.opened(catalog.personal.FAVORITES)
             tests.scene.answer(tests.scene.last("/api/v2/favorites"), m.page(2, false))
             node.callFunc("pressKey", "options")
-            node.findNode("menuLayer").getChild(0).picked = 0
+            m.choose(node, "Remove from Favorites")
             write = tests.scene.last("/api/v2/favorites/movie:m1")
             node.callFunc("onRelease")
             revision = m.global.personalRevision

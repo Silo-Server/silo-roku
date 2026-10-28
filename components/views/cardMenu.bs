@@ -1,0 +1,155 @@
+import "pkg:/components/views/personal.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/cardMenu.bs"
+import "pkg:/source/catalog/personal.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/player.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' A card's Options menu for screens (render thread, spec section 5.3): tvOS's
+' card context menu, which Roku has no press and hold for, opened with
+' Options (*) on the focused card (catalog.cardMenu has its rows). A toggle
+' shows on the card at once (its check disc for Mark as Watched) and goes
+' back if the server refuses it, with the notice (components/views/
+' personal.bs). The screen has a Group m.menuLayer for the menu, calls
+' cardMenuInit from init, cardMenuOpen on Options, and cardMenuClose for
+' Back while cardMenuShown, and defines cardMenuApplied(card, value),
+' which hears each change the server applied while the screen is there
+' (m.released not true), such as a dismissal or removal to take the card
+' off, and a refused flag change once the card is back to what the server
+' confirmed.
+
+sub cardMenuInit()
+    m.cardMenu = invalid
+    ' Per card flag ("<id>|<field>"): { pending, confirmed }, the writes
+    ' for it still out and what the server last confirmed (at first, what
+    ' the card showed before them), which a refused last write puts back.
+    m.cardWrites = {}
+end sub
+
+function cardMenuShown() as Boolean
+    return m.cardMenu <> invalid
+end function
+
+' Opens the menu for card (a CardContent) where place (catalog.cardMenu.rows)
+' says it is; focus returns to returnTo when it closes. False when the card
+' has no rows, so the key goes on.
+function cardMenuOpen(card as Dynamic, place as Object, returnTo as Object) as Boolean
+    if m.cardMenu <> invalid or card = invalid or card.id = "" then return false
+    cardMenuCatchUp(card)
+    menuPlace = {}
+    menuPlace.Append(place)
+    if menuPlace.lists = invalid then menuPlace.lists = util.isTrue(personalListsKnown())
+    rows = catalog.cardMenu.rows(card, menuPlace)
+    if rows.Count() = 0 then return false
+    items = []
+    for each row in rows
+        items.Push({ value: row.value, title: i18n.text(row.key), detail: "" })
+    end for
+    picker = m.menuLayer.createChild("TrackPicker")
+    title = card.heroTitle
+    if title = "" then title = card.title
+    picker.setFields({ title: title, centered: true, options: { items: items }, chosen: -1 })
+    picker.observeField("picked", "onCardMenuPicked")
+    picker.observeField("closed", "onCardMenuClosed")
+    m.cardMenu = { picker: picker, card: card, returnTo: returnTo }
+    picker.callFunc("open")
+    return true
+end function
+
+sub onCardMenuPicked(event as Object)
+    if m.cardMenu = invalid then return
+    card = m.cardMenu.card
+    value = event.getData()
+    id = card.id
+    if value = catalog.cardMenu.PLAY
+        target = catalog.cardMenu.playTarget(card)
+        if target <> "" then nav.push(nav.route.PLAYER, { intent: nav.player.intent(target, nav.player.RESUME) })
+    else if value = catalog.cardMenu.WATCHED
+        requested = not card.played
+        cardMenuToggle(card, value, "played", requested, catalog.personal.watched(id, requested), { kind: "watched", what: "item", id: id, item: id, value: requested })
+    else if value = catalog.cardMenu.FAVORITE
+        requested = not card.isFavorite
+        cardMenuToggle(card, value, "isFavorite", requested, catalog.personal.membership(catalog.personal.FAVORITES, id, requested), { kind: catalog.personal.FAVORITES, id: id, value: requested })
+    else if value = catalog.cardMenu.WATCHLIST
+        requested = not card.inWatchlist
+        cardMenuToggle(card, value, "inWatchlist", requested, catalog.personal.membership(catalog.personal.WATCHLIST, id, requested), { kind: catalog.personal.WATCHLIST, id: id, value: requested })
+    else if value = catalog.cardMenu.DISMISS
+        request = catalog.cardMenu.dismissRequest(card)
+        if request <> invalid then sendPersonal(request, { cardMenuCard: card, cardMenuValue: value }, "onCardMenuWritten")
+    else if value = catalog.cardMenu.REMOVE_HISTORY
+        sendPersonal(catalog.personal.removeHistory(id), { cardMenuCard: card, cardMenuValue: value, personalChange: { kind: catalog.personal.HISTORY, id: id, value: false } }, "onCardMenuWritten")
+    end if
+end sub
+
+' Shows the change on the card and sends it, counting it among the writes
+' out for the card's flag.
+sub cardMenuToggle(card as Object, value as Integer, field as String, requested as Boolean, request as Dynamic, change as Object)
+    if request = invalid then return
+    key = card.id + "|" + field
+    entry = m.cardWrites[key]
+    if entry = invalid or entry.pending <= 0
+        entry = { pending: 0, confirmed: card.getField(field) }
+        m.cardWrites[key] = entry
+    end if
+    entry.pending = entry.pending + 1
+    card.setField(field, requested)
+    sendPersonal(request, { cardMenuCard: card, cardMenuValue: value, cardMenuField: field, cardMenuSent: requested, personalChange: change }, "onCardMenuWritten")
+end sub
+
+' The server answered. A write a newer one for the same flag replaced
+' decides nothing (that one does). A refusal says so, and once no write
+' for the flag is out, puts back what the server last confirmed, which
+' the screen hears too (a list page drops a card no longer on its list);
+' the screen hears what was applied.
+sub onCardMenuWritten(event as Object)
+    handle = event.getRoSGNode()
+    result = api.resultOf(handle)
+    if result = invalid or util.isTrue(m.released) then return
+    entry = invalid
+    if handle.hasField("cardMenuField")
+        entry = m.cardWrites[handle.cardMenuCard.id + "|" + handle.cardMenuField]
+        if entry <> invalid
+            entry.pending = entry.pending - 1
+            if result.ok = true then entry.confirmed = handle.cardMenuSent
+        end if
+    end if
+    if result.ok <> true
+        if util.isObject(result.error) and util.text(result.error.reason) = "superseded" then return
+        personalFailed()
+        if entry = invalid or entry.pending > 0 then return
+        handle.cardMenuCard.setField(handle.cardMenuField, entry.confirmed)
+        cardMenuApplied(handle.cardMenuCard, handle.cardMenuValue)
+        return
+    end if
+    cardMenuApplied(handle.cardMenuCard, handle.cardMenuValue)
+end sub
+
+sub onCardMenuClosed()
+    cardMenuClose()
+end sub
+
+sub cardMenuClose()
+    if m.cardMenu = invalid then return
+    shown = m.cardMenu
+    m.cardMenu = invalid
+    m.menuLayer.removeChild(shown.picker)
+    if m.top.visible and shown.returnTo <> invalid then shown.returnTo.setFocus(true)
+end sub
+
+' A card read before a change another page made since (a detail page's
+' toggle) takes it, so the menu offers what the server now has
+' (personalLatest). A card read after the change keeps what the server
+' sent, which may be newer still (playback, a season's mark), and a flag
+' with a write of this page's out keeps what that write shows.
+sub cardMenuCatchUp(card as Object)
+    latest = personalLatest(card.id)
+    if latest = invalid then return
+    for each field in ["played", "isFavorite", "inWatchlist"]
+        pending = m.cardWrites[card.id + "|" + field]
+        if pending <> invalid and pending.pending > 0 then continue for
+        if latest.DoesExist(field) and card.readRevision < latest[field + "At"] then card.setField(field, latest[field])
+    end for
+end sub

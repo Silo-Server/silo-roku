@@ -13,6 +13,7 @@ namespace tests
         ' Home shown for the first time, in the test scene so focus can
         ' move; afterEach takes it out.
         function opened() as Object
+            if m.global.hasField("personalLatest") then m.global.personalLatest = {}
             theme.install()
             tests.scene.reset()
             probe = CreateObject("roSGNode", "HomeScreenProbe")
@@ -201,6 +202,126 @@ namespace tests
             m.assertTrue(probe.findNode("bar").isInFocusChain())
             m.assertTrue(probe.callFunc("pressKey", "down"))
             m.assertTrue(probe.findNode("status").isInFocusChain())
+        end sub
+
+        @describe("a card's Options menu (tvOS's card context menu)")
+
+        ' Home with its rows, the server offering Watchlist and Favorites,
+        ' and Options pressed on the first card (Continue Watching's Heat).
+        function menuOpened() as Object
+            probe = m.withRows(m.sections())
+            tests.scene.answer(tests.scene.last("/api/v2/capabilities/personal-lists"), { state: "available", allowed: true })
+            m.assertTrue(probe.callFunc("pressKey", "options"), "Options opens the menu")
+            return probe
+        end function
+
+        function rowTitles(probe as Object) as Object
+            out = []
+            for each item in probe.findNode("menuLayer").getChild(0).options.items
+                out.Push(item.title)
+            end for
+            return out
+        end function
+
+        sub choose(probe as Object, title as String)
+            menu = probe.findNode("menuLayer").getChild(0)
+            for each item in menu.options.items
+                if item.title = title
+                    ' As OK does: the row is picked, and the menu closes.
+                    menu.picked = item.value
+                    menu.closed = true
+                    return
+                end if
+            end for
+            m.fail("no menu row " + title)
+        end sub
+
+        function heat(probe as Object) as Object
+            return probe.findNode("rows").findNode("list").content.getChild(0).getChild(0)
+        end function
+
+        @it("offers Resume, the watched mark, both lists, and Remove from Continue Watching on a started card")
+        sub _()
+            probe = m.menuOpened()
+            m.assertEqual(m.rowTitles(probe), ["Resume", "Mark as Watched", "Add to Favorites", "Remove from Watchlist", "Remove from Continue Watching"])
+            m.assertTrue(probe.findNode("menuLayer").getChild(0).isInFocusChain())
+            m.assertTrue(probe.callFunc("backContext").overlay, "Back closes the menu first")
+            probe.callFunc("onBack", nav.action.CLOSE_OVERLAY)
+            m.assertEqual(probe.findNode("menuLayer").getChildCount(), 0)
+            m.assertTrue(probe.findNode("rows").isInFocusChain(), "focus returns to the card")
+        end sub
+
+        @it("resumes the card in the player")
+        sub _()
+            probe = m.menuOpened()
+            m.choose(probe, "Resume")
+            m.assertEqual(tests.scene.nav().Peek(), { op: "push", route: nav.route.PLAYER, params: { intent: nav.player.intent("movie:heat-1995", nav.player.RESUME) } })
+        end sub
+
+        @it("dismisses the card from Continue Watching, then reads the rows again")
+        sub _()
+            probe = m.menuOpened()
+            m.choose(probe, "Remove from Continue Watching")
+            write = tests.scene.last("/api/v2/home/dismissals/continue_watching/movie:heat-1995")
+            m.assertNotInvalid(write)
+            m.assertEqual([write.request.method, write.request.body, write.request.auth], ["PUT", { progress_updated_at: "2026-01-02T03:04:05.000Z" }, "profile"])
+            reads = tests.scene.sent().Count()
+            tests.scene.deliver(write.handle, { requestId: write.request.requestId, ok: true, status: 204, headers: {}, body: invalid, error: invalid }, "ok")
+            m.assertTrue(tests.scene.sent().Count() > reads, "the rows are read again")
+            m.assertEqual(tests.scene.sent()[reads].request.path, catalog.request.homeSections(false).path)
+        end sub
+
+        @it("marks the card watched at once, and puts it back with the notice when the server refuses")
+        sub _()
+            probe = m.menuOpened()
+            m.choose(probe, "Mark as Watched")
+            m.assertTrue(m.heat(probe).played, "the check shows at once")
+            write = tests.scene.last("/api/v2/watched/movie:heat-1995")
+            m.assertEqual(write.request.method, "POST")
+            tests.scene.refuse(write, 500)
+            m.assertFalse(m.heat(probe).played)
+            m.assertEqual(tests.scene.notices(), ["Couldn't update item. Your change wasn't saved."])
+        end sub
+
+        @it("offers what another page changed since the card was read")
+        sub _()
+            probe = m.withRows(m.sections())
+            tests.scene.answer(tests.scene.last("/api/v2/capabilities/personal-lists"), { state: "available", allowed: true })
+            ' A detail page took Heat off the Watchlist after the rows were read.
+            m.global.personalRevision = m.global.personalRevision + 1
+            probe.callFunc("rememberChange", { kind: catalog.personal.WATCHLIST, id: "movie:heat-1995", value: false })
+            probe.callFunc("pressKey", "options")
+            m.assertEqual(m.rowTitles(probe)[3], "Add to Watchlist")
+            m.assertFalse(m.heat(probe).inWatchlist)
+        end sub
+
+        @it("keeps what the server sent for a card read after the change")
+        sub _()
+            probe = m.opened()
+            m.global.personalRevision = m.global.personalRevision + 1
+            probe.callFunc("rememberChange", { kind: catalog.personal.WATCHLIST, id: "movie:heat-1995", value: false })
+            ' Heat went back on the Watchlist elsewhere (another device), and the rows read it so.
+            tests.scene.answer(tests.scene.last(catalog.request.homeSections(false).path), m.sections())
+            tests.scene.answer(tests.scene.last("/api/v2/capabilities/personal-lists"), { state: "available", allowed: true })
+            probe.callFunc("pressKey", "options")
+            m.assertEqual(m.rowTitles(probe)[3], "Remove from Watchlist")
+            m.assertTrue(m.heat(probe).inWatchlist)
+        end sub
+
+        @it("puts back what the server confirmed when two toggles of a flag are both refused")
+        sub _()
+            probe = m.menuOpened()
+            m.choose(probe, "Add to Favorites")
+            first = tests.scene.last("/api/v2/favorites/movie:heat-1995")
+            probe.callFunc("pressKey", "options")
+            m.choose(probe, "Remove from Favorites")
+            m.assertFalse(m.heat(probe).isFavorite)
+            tests.scene.refuse(first, 500)
+            m.assertFalse(m.heat(probe).isFavorite, "the later write still decides")
+            second = tests.scene.last("/api/v2/favorites/movie:heat-1995")
+            m.assertEqual(second.request.method, "DELETE")
+            tests.scene.refuse(second, 500)
+            m.assertFalse(m.heat(probe).isFavorite, "Heat was never a favorite")
         end sub
     end class
 end namespace

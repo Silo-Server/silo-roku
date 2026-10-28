@@ -54,6 +54,8 @@ CATALOG = {
     # Watchlist, Favorites, History, and watched state (source/catalog/personal.bs).
     "getPersonalListCapability", "listWatchlist", "addToWatchlist", "deleteWatchlistEntry", "listFavorites", "addFavorite",
     "deleteFavorite", "listHistory", "removeHistoryEntries", "markWatched", "unmarkWatched",
+    # A Home card's Remove from Continue Watching or Next Up (source/catalog/cardMenu.bs).
+    "dismissHomeItem",
     # Theme music on detail pages (source/playback/themeMusic.bs).
     "getThemeSongsCapability", "createThemeSongPlayback",
     # Browse's filters (source/library/filters.bs) and Shuffle (source/playback/shuffle.bs).
