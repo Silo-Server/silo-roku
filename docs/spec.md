@@ -152,8 +152,9 @@ Play:
   profile's recap and credits auto-skip (`playback.auto_skip_recap`,
   `playback.auto_skip_credits`);
 - Up Next near the end of every movie and episode, with autoplay and On Deck;
-- Shuffle of a library from Browse, and of a series or the season shown
-  from a series' More menu, when the server offers it
+- Shuffle of a library from Browse, of a collection from its page, and of
+  a series or the season shown from a series' More menu, when the server
+  offers it
   (`GET /api/v2/shuffles/capabilities`); Up Next offers the shuffle's
   picks;
 - periodic and final progress reporting;
@@ -181,8 +182,6 @@ item is built, tvOS first where both have it (section 5.1).
 
 Planned:
 
-- Shuffle on a collection's page (tvOS, Android TV), when the server
-  offers it;
 - Requests (tvOS, Android TV), shown only when the server offers them;
 - chapters, playback speed, and aspect in the player's Options (tvOS,
   Android TV);
@@ -761,6 +760,24 @@ their existing HD/FHD assets.
     collection members; only a typed mixed-library view narrows membership.
     Empty and failed reads use the
     standard empty state or Retry.
+  - Shuffle on a collection's page, as tvOS's
+    `LibraryCollectionDetailView` and `CollectionDetailView` and Android
+    TV's `TvLibraryCollectionDetailScreen` offer it: Browse's Shuffle pill
+    at (80, 248), where Browse has Sort, between the count and the grid.
+    It shows once the grid has items, when the shuffle capability lists
+    the collection's kind (`library_collection` for a server collection,
+    `user_collection` for a personal one), and never on a mixed library's
+    Movies or Series view of a collection, since a shuffle carries no media
+    type and would play both. Up from the grid's first row reaches it and
+    Down returns to the grid; Back from the shuffle's player lands on it
+    again. OK sends `POST /api/v2/shuffles` with `{ scope: { kind, id } }`
+    (the collection's ID) and plays the first pick as Browse's pill does,
+    with the same 60% while it starts and the same notices for 409 and
+    404. The server draws from the collection's visible movies, every
+    episode of its series, and any episodes it holds, so a mixed
+    collection shuffles movies and episodes together; Up Next, Pick
+    Another, and Stop shuffling work as for any shuffle (section 5.7),
+    with the collection's title as the scope.
   - These pages are read-only. Creating, editing, and deleting collections
     remain deferred.
 - **Watchlist, Favorites, and History.** The avatar menu's rows, and For
@@ -1768,6 +1785,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | On a mixed library, each Recommended section shows only the tab's type | Both tabs show every item of a mixed library's sections | Not built (AG-280): the server's section reads refuse a type, so the client would filter each section and refill it page by page, as tvOS does, which `BrowseRows`' loading and dropping of rows around focus does not yet support |
 | Collection groups appear as vertically stacked grids with uppercase headers | One grid of every group's collections in order, without headers | The owner's choice (2026-10-28): no toggle between groups; Roku's bounded grid has no section headers |
 | The Sort, Filter, and Shuffle pills, each with its icon, are the first item of the Browse grid and scroll away with it | The pills stay above the grid, without icons, and the grid keeps its focused row at the top (fixed focus) instead of scrolling the page | `MarkupGrid` has no full-width header item, and no icon art ships |
+| A collection's Shuffle button, with its shuffle icon, stands beside the item count above the grid | The Shuffle pill, without an icon, has the place Browse's Sort pill has, and the count stays on its own line under the title | Section 5.5; the collection page's title and count already sit where tvOS's large title does, and no icon art ships (AG-550) |
 | The filter panel's rows carry SF Symbols: chevrons, a cross on Clear, an arrow on Reset filters, and a check on Done | Its radio, box, and check marks are drawn art; the chevrons and Clear's cross are Inter's ‹, ›, and ×; Reset filters has no mark | No icon art ships for the rest, and the packaged Inter subset has those three glyphs (assumption AG-380) |
 | A filter set whose `groups` pass 32,768 characters goes to `POST /api/v2/catalog/query` | Every Browse read is a `GET` | A remote picks a value at a time; it takes hundreds of values to pass the limit (assumption AG-380) |
 | A shuffle that cannot start shows the alert "Couldn't Shuffle" with why | "Couldn't Shuffle." and why show top centre for four seconds | Roku's passive notice line needs no focus, as for a refused personal change (assumption AG-381) |
@@ -2213,7 +2231,8 @@ The first release consumes:
 - `POST` and `DELETE /api/v2/watched/{id}` to mark a movie, episode,
   season, or series watched or unwatched;
 - `GET /api/v2/shuffles/capabilities` for whether and what Shuffle is
-  offered; `POST /api/v2/shuffles` to start one; `GET`, `DELETE`, and
+  offered; `POST /api/v2/shuffles` to start one (scope `library`,
+  `series`, `season`, `library_collection`, or `user_collection`); `GET`, `DELETE`, and
   `POST .../advance` and `.../skip` on `/api/v2/shuffles/{id}` in the
   player (section 5.7);
 - `GET /api/v2/recommendations/discover` for the For You tab's rows, and

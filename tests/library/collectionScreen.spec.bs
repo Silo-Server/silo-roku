@@ -4,12 +4,13 @@ namespace tests
         protected override sub beforeEach()
             m.savedModes = m.global.libraryMode
             if not util.isObject(m.savedModes) then m.savedModes = {}
+            m.forgetShuffle()
         end sub
 
         protected override sub afterEach()
             if m.global.hasField("libraryMode") then m.global.libraryMode = m.savedModes
             for each child in m.top.getChildren(-1, 0)
-                if child.subtype() = "LibraryScreenProbe" or child.subtype() = "CollectionScreen" then m.top.removeChild(child)
+                if child.subtype() = "LibraryScreenProbe" or child.subtype() = "CollectionScreen" or child.subtype() = "CollectionScreenProbe" then m.top.removeChild(child)
             end for
         end sub
 
@@ -36,6 +37,37 @@ namespace tests
             node = CreateObject("roSGNode", "CollectionScreen")
             node.entry = { id: "collection", route: nav.route.COLLECTION, params: { collectionId: "opaque:id/a", collectionKind: "user_collections", title: "Collection title", libraryId: "12", mediaType: "movie" } }
             node.owner = "collection-items"
+            m.top.appendChild(node)
+            node.visible = true
+            node.callFunc("onShow", { first: true, restore: restore, refresh: false })
+            return node
+        end function
+
+        ' Forgets the shuffle capability, so the page reads it (the test
+        ' scene has no session, so the page's key is "").
+        sub forgetShuffle()
+            entry = { key: "none", value: invalid }
+            if m.global.hasField("shuffleCapability")
+                m.global.shuffleCapability = entry
+            else
+                m.global.addFields({ shuffleCapability: entry })
+            end if
+        end sub
+
+        sub answerShuffle(kinds as Object)
+            read = tests.scene.last(playback.shuffle.capabilityRequest().path)
+            m.assertNotInvalid(read, "the page reads the shuffle capability")
+            tests.scene.answer(read, { state: "available", allowed: true, scope_kinds: kinds, revision: "r1" })
+        end sub
+
+        ' A collection's page that can take keys, for params' collection.
+        function openedProbe(kind as String, mediaType as String, restore = invalid as Dynamic) as Object
+            theme.install()
+            tests.scene.reset()
+            m.forgetShuffle()
+            node = CreateObject("roSGNode", "CollectionScreenProbe")
+            node.entry = { id: "collection", route: nav.route.COLLECTION, params: { collectionId: "opaque:id/a", collectionKind: kind, title: "Heists", libraryId: "12", mediaType: mediaType } }
+            node.owner = "collection-shuffle"
             m.top.appendChild(node)
             node.visible = true
             node.callFunc("onShow", { first: true, restore: restore, refresh: false })
@@ -220,6 +252,77 @@ namespace tests
             m.assertTrue(status.isInFocusChain())
             status.activated = true
             m.assertEqual(tests.scene.nav()[0].op, "pop")
+        end sub
+
+        @describe("Shuffle (tvOS's LibraryCollectionDetailView)")
+
+        @it("shows Shuffle above a collection's cards once the server shuffles collections, and plays the shuffle it starts")
+        sub _()
+            node = m.openedProbe("regular", "")
+            pill = node.findNode("shuffle")
+            m.answerShuffle(["library", "library_collection"])
+            m.assertFalse(pill.visible, "until the cards arrive")
+            tests.scene.answer(m.catalogRead(), { items: tests.catalogData.items(3), page: { has_more: false } })
+            m.assertTrue(pill.visible)
+            m.assertEqual([pill.label, pill.translation], ["Shuffle", [theme.browse.GRID_SIDE, theme.library.PILL_TOP]])
+            grid = node.findNode("results")
+            m.assertTrue(grid.isInFocusChain(), "the cards keep focus")
+            m.assertTrue(node.callFunc("pressKey", "up"))
+            m.assertTrue(pill.isInFocusChain())
+            pill.activated = true
+            start = tests.scene.last("/api/v2/shuffles")
+            m.assertEqual([start.request.method, start.request.body], ["POST", { scope: { kind: "library_collection", id: "opaque:id/a" } }])
+            m.assertEqual(pill.opacity, 0.6)
+            pill.activated = true
+            m.assertTrue(tests.scene.last("/api/v2/shuffles").handle.isSameNode(start.handle), "one start at a time")
+            body = { id: "s9", scope: { kind: "library_collection", id: "opaque:id/a", title: "Heists" }, current: { content_id: "movie:heat-1995", type: "movie", title: "Heat" }, next: { content_id: "episode:e1", type: "episode", title: "Pilot", series_id: "series:s", series_title: "Leverage", season_number: 1, episode_number: 1 } }
+            tests.scene.answer(start, body)
+            m.assertEqual(pill.opacity, 1.0)
+            pushed = tests.scene.nav()
+            m.assertEqual([pushed[0].op, pushed[0].route, pushed[0].params.intent.contentId, pushed[0].params.intent.shuffle.id], ["push", nav.route.PLAYER, "movie:heat-1995", "s9"])
+            saved = node.callFunc("focusKey")
+            node.callFunc("onShow", { first: false, restore: saved, refresh: false })
+            m.assertTrue(pill.isInFocusChain(), "back from the player on Shuffle")
+            m.assertTrue(node.callFunc("pressKey", "down"))
+            m.assertTrue(grid.isInFocusChain())
+            m.assertFalse(node.callFunc("pressKey", "down"), "the grid's own keys stay its own")
+        end sub
+
+        @it("shuffles a personal collection as a user collection and comes back to Shuffle on a rebuilt page")
+        sub _()
+            saved = nav.focus.newKey("shuffle", "", 0, 0)
+            node = m.openedProbe("user_collections", "", saved)
+            m.answerShuffle(["user_collection"])
+            tests.scene.answer(m.catalogRead(), { items: tests.catalogData.items(2), page: { has_more: false } })
+            pill = node.findNode("shuffle")
+            m.assertTrue(pill.isInFocusChain())
+            pill.activated = true
+            m.assertEqual(tests.scene.last("/api/v2/shuffles").request.body, { scope: { kind: "user_collection", id: "opaque:id/a" } })
+        end sub
+
+        @it("offers no Shuffle for a kind the server does not shuffle, a mixed library's typed view, or an empty collection, and says why a start failed")
+        sub _()
+            node = m.openedProbe("user_collections", "")
+            m.answerShuffle(["library_collection"])
+            tests.scene.answer(m.catalogRead(), { items: tests.catalogData.items(2), page: { has_more: false } })
+            m.assertFalse(node.findNode("shuffle").visible, "user collections not offered")
+            m.assertFalse(node.callFunc("pressKey", "up"))
+            node = m.openedProbe("regular", "movie")
+            m.answerShuffle(["library_collection", "user_collection"])
+            tests.scene.answer(m.catalogRead(), { items: tests.catalogData.items(2), page: { has_more: false } })
+            m.assertFalse(node.findNode("shuffle").visible, "a mixed library's Movies view")
+            node = m.openedProbe("regular", "")
+            m.answerShuffle(["library_collection"])
+            tests.scene.answer(m.catalogRead(), { items: [], page: { has_more: false } })
+            m.assertFalse(node.findNode("shuffle").visible, "an empty collection")
+            node = m.openedProbe("regular", "")
+            m.answerShuffle(["library_collection"])
+            tests.scene.answer(m.catalogRead(), { items: tests.catalogData.items(2), page: { has_more: false } })
+            pill = node.findNode("shuffle")
+            pill.activated = true
+            tests.scene.refuse(tests.scene.last("/api/v2/shuffles"), 409)
+            m.assertEqual(tests.scene.notices(), ["Couldn't Shuffle. Nothing here can be played."])
+            m.assertEqual(tests.scene.nav().Count(), 0)
         end sub
 
         @it("bounds local collection card nodes and can restore across dropped pages without HTTP")
