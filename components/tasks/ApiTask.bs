@@ -87,7 +87,7 @@ sub serve()
         ' Due playback jobs, expiries, and session operations that waited.
         runWorker(playback.worker.tick(m.worker, workerEnv()))
         ' A record the registry refused is saved again when its retry is due.
-        if storage.retryDue(m.store, workerMs()) then persist()
+        if storage.retryDue(m.store, workerMs()) or storage.retryDue(m.serversStore, workerMs()) then persist()
     end while
 end sub
 
@@ -99,9 +99,11 @@ end sub
 ' set, so AppScene sends the field sets it kept until now. Every build sends
 ' credentials, with a warning, to a server that does not report its origin.
 sub startSession()
-    record = storage.decode(storage.encode(m.top.snapshot))
+    snapshot = m.top.snapshot
+    record = storage.decode(storage.encode(snapshot), storage.encodeServers(snapshot.servers))
     m.top.snapshot = {}
     m.store = storage.writer(CreateObject("roRegistrySection", storage.SECTION_NAME))
+    m.serversStore = storage.writer(CreateObject("roRegistrySection", storage.SERVERS_SECTION), storage.SERVERS_KEYS)
     info = CreateObject("roDeviceInfo")
     generated = record.deviceId = ""
     if generated then record.deviceId = LCase(info.GetRandomUUID())
@@ -150,8 +152,10 @@ function waitMs() as Integer
     end if
     wake = playback.worker.nextWake(m.worker)
     if wake <> invalid and (remaining = invalid or wake - workerMs() < remaining) then remaining = wake - workerMs()
-    retry = storage.retryIn(m.store, workerMs())
-    if retry <> invalid and (remaining = invalid or retry < remaining) then remaining = retry
+    for each store in [m.store, m.serversStore]
+        retry = storage.retryIn(store, workerMs())
+        if retry <> invalid and (remaining = invalid or retry < remaining) then remaining = retry
+    end for
     if remaining = invalid then return 0
     if remaining < 1 then remaining = 1
     if remaining > SIZE_CHECK_MS and not m.transfers.IsEmpty() then remaining = SIZE_CHECK_MS
@@ -257,7 +261,7 @@ sub configure(config as Dynamic)
             if base = invalid
                 log.warn("api", "ignored an invalid baseUrl")
             else
-                apply(api.auth.coordinator.useServer(m.session, base))
+                apply(api.auth.coordinator.useServer(m.session, base, nowSeconds()))
             end if
         #else
             log.warn("api", "ignored baseUrl; servers change through the session's server check")
@@ -581,12 +585,17 @@ sub clearBodyFiles()
     end for
 end sub
 
-' Writes and flushes the session's record; the only registry write. When the
-' registry refuses it, the session goes on from memory and the loop saves the
-' record again later (storage.save), until a save succeeds.
+' Writes and flushes the session's record, and the saved servers' section;
+' the only registry writes. Each writes only the keys that changed. When the
+' registry refuses one, the session goes on from memory and the loop saves
+' the record again later (storage.save), until a save succeeds.
 sub persist()
-    if not storage.save(m.store, storage.encode(api.auth.coordinator.record(m.session)), workerMs())
+    record = api.auth.coordinator.record(m.session)
+    if not storage.save(m.store, storage.encode(record), workerMs())
         log.warn("storage", "registry write failed; retrying", { retryMs: m.store.delay })
+    end if
+    if not storage.save(m.serversStore, storage.encodeServers(record.servers), workerMs())
+        log.warn("storage", "saved servers write failed; retrying", { retryMs: m.serversStore.delay })
     end if
 end sub
 

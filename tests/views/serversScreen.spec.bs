@@ -1,0 +1,257 @@
+import "pkg:/components/theme/helpers.bs"
+
+namespace tests
+
+    ' The saved servers list (components/screens/setup/ServersScreen) in
+    ' the test scene, with the session it reads set there.
+    @suite("saved servers screen")
+    class ServersScreenTests extends rooibos.BaseTestSuite
+
+        protected override sub afterEach()
+            tests.scene.reset()
+            m.top.dialog = invalid
+            for each child in m.top.getChildren(-1, 0)
+                if Right(child.subtype(), 5) = "Probe" then m.top.removeChild(child)
+            end for
+        end sub
+
+        ' The screen over a session whose servers are servers, shown.
+        function open(servers as Object) as Object
+            tests.scene.reset()
+            theme.install()
+            current = ""
+            for each server in servers
+                if server.current then current = server.origin
+            end for
+            m.top.callFunc("sceneSession", { status: "signed_in", origin: current, servers: servers })
+            screen = CreateObject("roSGNode", "ServersScreenProbe")
+            m.top.appendChild(screen)
+            screen.entry = { id: "e1", route: nav.route.SERVERS, params: { pushed: true } }
+            screen.owner = "screen.1"
+            screen.visible = true
+            screen.callFunc("onShow", { restore: invalid, first: true, refresh: false, played: invalid })
+            return screen
+        end function
+
+        function server(origin as String, name as String, current = false as Boolean, signedIn = true as Boolean) as Object
+            return { origin: origin, name: name, current: current, signedIn: signedIn }
+        end function
+
+        function three() as Object
+            return [m.server("https://home.example", "Home", true), m.server("https://cabin.example", "Cabin"), m.server("http://nas.local:8096", "NAS", false, false)]
+        end function
+
+        ' The requests sent for session operation op.
+        function sessionOps(op as String) as Object
+            out = []
+            for each entry in tests.scene.sent()
+                if util.text(entry.request.session) = op then out.Push(entry)
+            end for
+            return out
+        end function
+
+        @describe("rows")
+
+        @it("lists the current server first with its badge, and highlights it")
+        sub _()
+            screen = m.open(m.three())
+            cards = screen.callFunc("probeCards")
+            m.assertEqual(cards.Count(), 3)
+            m.assertEqual([cards[0].name, cards[0].address, cards[0].badge], ["Home", "https://home.example", i18n.text("servers.badge.current")])
+            m.assertEqual(cards[1].badge, "")
+            m.assertEqual(cards[2].badge, i18n.text("servers.badge.signedOut"))
+            m.assertTrue(cards[0].highlighted)
+            m.assertEqual(cards[0].width, 760)
+            m.assertTrue(screen.prompting)
+
+            ' Down moves to the next server, Right to its Remove.
+            screen.callFunc("probeKey", "down")
+            m.assertTrue(cards[1].highlighted)
+            screen.callFunc("probeKey", "right")
+            m.assertEqual(screen.callFunc("probeFocus"), { row: 1, col: 1, first: 0 })
+        end sub
+
+        @it("names a server without one by its host, and asks its public branding for the name")
+        sub _()
+            screen = m.open([m.server("https://home.example", "Home", true), m.server("https://media.example.com:8443", "")])
+            m.assertEqual(screen.callFunc("probeCards")[1].name, "media.example.com:8443")
+            asked = invalid
+            for each entry in tests.scene.sent()
+                if util.text(entry.request.url) = "https://media.example.com:8443/api/v2/theme/branding" then asked = entry
+            end for
+            m.assertNotInvalid(asked)
+            m.assertEqual(asked.request.auth, "none")
+            tests.scene.deliver(asked.handle, { requestId: asked.request.requestId, ok: true, status: 200, headers: {}, body: { serverName: "Media" }, error: invalid }, "ok")
+            m.assertEqual(screen.callFunc("probeCards")[1].name, "Media")
+            named = m.sessionOps("nameServer")
+            m.assertEqual(named.Count(), 1)
+            m.assertEqual([named[0].request.origin, named[0].request.name], ["https://media.example.com:8443", "Media"])
+        end sub
+
+        @it("scrolls past four servers, keeping the column")
+        sub _()
+            servers = [m.server("https://s0.example", "S0", true)]
+            for i = 1 to 5
+                servers.Push(m.server("https://s" + i.ToStr() + ".example", "S" + i.ToStr()))
+            end for
+            screen = m.open(servers)
+            cards = screen.callFunc("probeCards")
+            m.assertFalse(cards[4].visible)
+            screen.callFunc("probeKey", "right")
+            for i = 1 to 4
+                screen.callFunc("probeKey", "down")
+            end for
+            m.assertEqual(screen.callFunc("probeFocus"), { row: 3, col: 1, first: 1 })
+            m.assertTrue(cards[4].visible)
+            m.assertFalse(cards[0].visible)
+            screen.callFunc("probeKey", "down")
+            screen.callFunc("probeKey", "down")
+            m.assertEqual(screen.callFunc("probeFocus"), { row: 4, col: 0, first: 2 }, "past the last server: Add server")
+            screen.callFunc("probeKey", "up")
+            m.assertEqual(screen.callFunc("probeFocus"), { row: 3, col: 0, first: 2 })
+        end sub
+
+        @describe("switching")
+
+        @it("goes back when the current server is chosen")
+        sub _()
+            screen = m.open(m.three())
+            screen.callFunc("probeKey", "OK")
+            m.assertEqual(m.sessionOps("server").Count(), 0)
+            m.assertEqual(tests.scene.nav().Peek().op, "pop")
+        end sub
+
+        @it("checks a saved server as setup checks an address, saying Connecting on its row")
+        sub _()
+            screen = m.open(m.three())
+            screen.callFunc("probeKey", "down")
+            screen.callFunc("probeKey", "down")
+            screen.callFunc("probeKey", "OK")
+            sent = m.sessionOps("server")
+            m.assertEqual(sent.Count(), 1)
+            m.assertEqual([sent[0].request.address, sent[0].request.allowHttp], ["http://nas.local:8096", true])
+            m.assertEqual(screen.callFunc("probeCards")[2].badge, i18n.text("servers.connecting"))
+            ' Keys wait for the answer; Back stops the check.
+            m.assertTrue(screen.callFunc("probeKey", "up"))
+            m.assertEqual(screen.callFunc("probeFocus").row, 2)
+            screen.callFunc("probeKey", "back")
+            m.assertEqual(m.top.callFunc("sceneLog").cancelled, [sent[0].request.requestId])
+            m.assertEqual(screen.callFunc("probeCards")[2].badge, i18n.text("servers.badge.signedOut"))
+        end sub
+
+        @it("says a saved server could not be reached, and stays")
+        sub _()
+            screen = m.open(m.three())
+            screen.callFunc("probeKey", "down")
+            screen.callFunc("probeKey", "OK")
+            sent = m.sessionOps("server")[0]
+            m.assertEqual([sent.request.address, sent.request.allowHttp], ["https://cabin.example", false])
+            tests.scene.deliver(sent.handle, api.response.failure(sent.request, "unreachable"), "error")
+            m.assertEqual(screen.callFunc("probeError"), i18n.text("servers.error.unreachable", { server: "Cabin" }))
+            m.assertEqual(screen.callFunc("probeCards")[1].badge, "")
+            m.assertEqual(tests.scene.nav().Count(), 0)
+        end sub
+
+        @it("shows server update required for a saved server too old to sign in")
+        sub _()
+            screen = m.open(m.three())
+            screen.callFunc("probeKey", "down")
+            screen.callFunc("probeKey", "OK")
+            sent = m.sessionOps("server")[0]
+            tests.scene.deliver(sent.handle, api.response.failure(sent.request, "server_update_required"), "error")
+            pushed = tests.scene.nav().Peek()
+            m.assertEqual([pushed.op, pushed.route], ["push", nav.route.UPDATE_REQUIRED])
+            m.assertEqual([pushed.params.problem, pushed.params.host], ["server_update_required", "cabin.example"])
+        end sub
+
+        @describe("adding and removing")
+
+        @it("adds a server through server entry")
+        sub _()
+            screen = m.open(m.three())
+            for i = 1 to 3
+                screen.callFunc("probeKey", "down")
+            end for
+            screen.callFunc("probeKey", "OK")
+            pushed = tests.scene.nav().Peek()
+            m.assertEqual([pushed.op, pushed.route, pushed.params], ["push", nav.route.SETUP, { pushed: true }])
+        end sub
+
+        @it("asks before removing a saved server, then shows what is left")
+        sub _()
+            screen = m.open(m.three())
+            screen.callFunc("probeKey", "down")
+            screen.callFunc("probeKey", "right")
+            screen.callFunc("probeKey", "OK")
+            dialog = screen.callFunc("probeDialog")
+            m.assertNotInvalid(dialog)
+            m.assertEqual(dialog.title, i18n.text("servers.remove.title", { server: "Cabin" }))
+            m.assertEqual(dialog.message, [i18n.text("servers.remove.body")])
+            dialog.buttonSelected = 0
+            sent = m.sessionOps("forgetServer")
+            m.assertEqual(sent.Count(), 1)
+            m.assertEqual(sent[0].request.origin, "https://cabin.example")
+            tests.scene.deliver(sent[0].handle, { requestId: sent[0].request.requestId, ok: true, status: 0, headers: {}, body: { origin: "https://home.example" }, error: invalid }, "ok")
+            rows = screen.callFunc("probeRows")
+            m.assertEqual(rows.Count(), 2)
+            m.assertEqual(rows[1].origin, "http://nas.local:8096")
+            m.assertEqual(screen.callFunc("probeFocus"), { row: 1, col: 0, first: 0 })
+        end sub
+
+        @it("keeps a server whose removal failed, and says so")
+        sub _()
+            screen = m.open(m.three())
+            screen.callFunc("probeKey", "down")
+            screen.callFunc("probeKey", "right")
+            screen.callFunc("probeKey", "OK")
+            screen.callFunc("probeDialog").buttonSelected = 0
+            sent = m.sessionOps("forgetServer")[0]
+            tests.scene.deliver(sent.handle, api.response.failure(sent.request, "invalid_request"), "error")
+            m.assertEqual(screen.callFunc("probeRows").Count(), 3)
+            m.assertEqual(screen.callFunc("probeError"), i18n.text("servers.error.remove", { server: "Cabin" }))
+            m.assertEqual(screen.callFunc("probeFocus"), { row: 1, col: 0, first: 0 })
+        end sub
+
+        @it("darkens a highlighted row's badge so it stays readable")
+        sub _()
+            screen = m.open(m.three())
+            card = screen.callFunc("probeCards")[0]
+            fill = card.findNode("badgeFill")
+            m.assertTrue(card.highlighted)
+            m.assertEqual(fill.opacity, 0.85)
+            screen.callFunc("probeKey", "down")
+            m.assertEqual(fill.opacity, 0.45)
+        end sub
+
+        @it("says which server takes the current one's place, and removes on Options too")
+        sub _()
+            screen = m.open(m.three())
+            screen.callFunc("probeKey", "options")
+            dialog = screen.callFunc("probeDialog")
+            m.assertEqual(dialog.message, [i18n.text("servers.remove.currentBody", { server: "Home", next: "Cabin" })])
+            dialog.buttonSelected = 1
+            m.assertEqual(m.sessionOps("forgetServer").Count(), 0)
+        end sub
+
+        @describe("Change server")
+
+        @it("opens the saved servers only when another server is saved")
+        sub _()
+            m.assertEqual(onboarding.servers.changeRoute(invalid), nav.route.SETUP)
+            m.assertEqual(onboarding.servers.changeRoute({ servers: [m.server("https://home.example", "", true)] }), nav.route.SETUP)
+            m.assertEqual(onboarding.servers.changeRoute({ servers: m.three() }), nav.route.SERVERS)
+        end sub
+
+        @it("keeps a window of rows only as far as focus needs")
+        @params(0, 0, 3, 0)
+        @params(0, 4, 8, 1)
+        @params(3, 2, 8, 2)
+        @params(4, 7, 8, 4)
+        @params(6, 7, 6, 2)
+        sub _(first as Integer, focused as Integer, count as Integer, expected as Integer)
+            m.assertEqual(onboarding.servers.windowStart(first, focused, count), expected)
+        end sub
+
+    end class
+
+end namespace

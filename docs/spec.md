@@ -91,7 +91,8 @@ and watch it.
 
 Account and setup:
 
-- one Silo server, entered as a URL;
+- Silo servers entered as URLs, several saved at once, each keeping its
+  sign-in, with Change server switching between them (section 5.4);
 - on-device password sign-in for local accounts and password-based sign-in
   providers such as LDAP;
 - profile picker, profile PIN entry, and child-profile restrictions;
@@ -187,7 +188,6 @@ Planned:
 - episode spoiler hiding (tvOS, Android TV);
 - the marker on AI-translated subtitle tracks (Android TV);
 - subtitle search and download (tvOS, Android TV);
-- multiple saved Silo servers, with Switch Server (tvOS, Android TV);
 - profile creation (tvOS, Android TV) and editing (Android TV).
 
 Not decided yet, and deferred until the owner chooses:
@@ -246,7 +246,7 @@ The first implementation uses:
 - `roDeviceInfo` capability probes, especially `CanDecodeVideo()` and
   `CanDecodeAudio()`, rather than model lookup tables;
 - `roRegistrySection` for the active server, installation ID, last profile,
-  and tokens;
+  and tokens, and a second section for the other saved servers and theirs;
 - Roku voice keyboards for every username, password, and PIN field, as
   certification criterion 4.12 requires;
 - an FHD (1920×1080) layout. Roku scales it for HD devices, which include the
@@ -495,6 +495,28 @@ their existing HD/FHD assets.
   chips `https://`, `http://`, and `.com` (Android TV's; 5.9), a note line,
   then Connect and Back. An address without a scheme tries HTTPS, then HTTP.
   Before using plain HTTP, the client asks "Connect without encryption?".
+- **Saved servers.** Change server (sign-in, the picker, the message
+  screens, Settings, and the avatar menu's Switch Server) opens this list
+  when another server is saved, and server address entry otherwise. Message
+  screen layout with no card: "Choose a server", "Switch to a saved server,
+  or add another.", then one row per server, then Add server and Back.
+  - Rows: the server card at 760 px, its badge at the right edge: CURRENT
+    for the server in use, first; then the others, most recently used first,
+    SIGNED OUT on one without a kept session. The name is the server's own
+    (theme/branding's `server_name`, read once for a server without one),
+    else its host. Rows are 16 px apart, four at a time; more scroll.
+  - Focus starts on the current server. A focused row is `#EDEDED` with
+    black text, scaled 1.03. A compact plain Remove sits 22 px right of each
+    row; Options (*) on a row removes it too.
+  - OK on the current server goes back. On another, its row says
+    CONNECTING… while `system/info` checks it as address entry checks a
+    typed address (Back stops it); the app then starts over on that server
+    with the sign-in it kept, so its remembered profile reopens. A server
+    that does not answer shows "Couldn't reach {server}…" under the list;
+    one too old shows "Server update required".
+  - Remove asks "Remove {server}?" (Remove / Cancel). Removing the current
+    server signs it out and switches to the most recently used saved
+    server, which the dialog names, or to address entry when none is left.
 - **Sign-in.**
   - A server card sits above the headline: an 80 px mark (the server's
     initial), the name in 34 px Bold, the address in 23 px at 40%, and a
@@ -1598,7 +1620,8 @@ seven-row scrolling window.
   section 5.5).
 - Subtitles: Language, Behavior, and Show Forced Subtitles. A footer points
   to Roku's caption visibility and appearance controls.
-- Server: the connected server address and Change Server; app version is
+- Server: the connected server address and Change Server (section 5.4's
+  saved servers when another is saved); app version is
   always visible in the rail. No server administration controls.
 
 Platform differences: Roku exposes only controls already consumed by its
@@ -1647,11 +1670,13 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The brand light changes stage for sign-in and for the profiles, and takes the server's accent or the colour of the profile being opened or PIN-checked | Setup, sign-in, and messages share one mesh, the picker and PIN another, without a server's or profile's colour | Each stage or colour would be another packaged image of about 60–80 KB |
 | The card beside a text form says "Type on your phone" (a keyboard on nearby iPhones and iPads) | It says "Use your phone": open Silo on a phone to sign the Roku in, or type with the remote or the Roku mobile app's keyboard (D6) | tvOS's phone keyboard has no Roku counterpart; companion sign-in takes its place |
 | Fields lead with an icon (globe, person, lock), inline errors with an exclamation mark, and Show/Hide is an eye; the server badge, the TV's chip, and the picker's buttons carry icons | Text only; Show/Hide is a text button as wide as its longer label | No icon art ships for them |
-| The server card names the server (its branding or system name) over its host, and its mark can be the server's logo | The host over the server's URL, and the host's initial on the warm tile; over setup, the update screen's card shows the host just checked | The session keeps only the server's origin (section 7.1), and server branding is not read |
+| The server card names the server (its branding or system name) over its host, and its mark can be the server's logo | The server's `server_name` once Home or the saved servers list has read its branding, else the host, over the server's URL, and the name's initial on the warm tile; over setup, the update screen's card shows the host just checked | The logo would be one more image per first-run screen; the name is kept with the saved server (section 7.2) |
 | "This server isn't ready" marks its server card with a server glyph on a dark tile | The host's initial on the warm tile, as on sign-in | No icon art ships for it |
 | First-run headlines and the picker's title are set 2 px and 1.6 px tighter than the font | Inter at its own spacing | Roku `Label` has no letter-spacing field |
 | Compact buttons (the picker's buttons, PIN's Cancel, the address chips) are 57 px tall | 56 px, the top bar's tab capsule | Even heights scale to HD without half pixels, and the art is shared |
-| Sign Out's confirmation also offers "Sign Out & Remove Server" | Sign out and Cancel, in the avatar menu and on the picker alike | Roku keeps one server: Change server replaces it, and several saved servers are deferred (section 3.3) |
+| Sign Out's confirmation also offers "Sign Out & Remove Server" | Sign out and Cancel, in the avatar menu and on the picker alike; servers are removed from the saved servers list (section 5.4) | One place removes a server, and it names the server that takes its place |
+| Manage Servers has a trash button beside each server | A compact plain Remove beside each row, and Options (*) on the row | Roku has no trash icon art; Options is the remote's usual way to act on an item |
+| Change Server always opens the server list | It opens the saved servers only when another server is saved, otherwise address entry | A list holding only the current server would add a step before typing a new address |
 | The picker loads behind the wordmark, a spinner, and "Loading profiles…" on black | The 128 px spinner over the brand light | One spinner serves loading the list and reopening the last profile, so the screen does not change between them |
 | A list that fails to load shows the error with Try Again only | The error with Try again, and Change server and Sign out pinned below | An account the server refuses (a password that must change) has no Try again; the buttons are its only way out |
 | A profile that fails to open leaves the picker as it was | The account line shows the error in `#FF6961` until the next choice | Without it, OK on a profile would seem to do nothing |
@@ -2007,6 +2032,18 @@ The server and sign-in screens' card then says "Use your phone" beside the
 remote and Roku mobile app keyboard help. When a password sign-in and a
 companion approval overlap, the first to finish keeps the session: the
 other's tokens are dropped, and an open device login is withdrawn.
+
+Saved servers: changing the server keeps the one left behind, with its
+tokens, profile tokens, account, and remembered profile, in a second
+registry section (`silo.servers`, 8 KB, at most seven servers besides the
+current one). Switching back restores that sign-in after `system/info`
+confirms the origin again, with no new login. Past the section's budget,
+the least recently used servers lose their tokens first (they stay saved,
+signed out), then go. Credentials go only to the configured server; a
+saved server's are sent nowhere until it is current again. Removing a
+saved server ends its session on that server only when this run confirmed
+its origin; otherwise its tokens are just forgotten here. The three
+registry sections together stay within Roku's 32 KB.
 
 An app update must not force the viewer to sign in again (criterion 4.1).
 Registry layout changes migrate stored sessions instead of discarding them.

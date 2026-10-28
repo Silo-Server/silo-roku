@@ -86,8 +86,10 @@ objects with `type` and `v: 1`:
   `cancel` `idle_timeout` and is closed.
 - `serverResult.error` is one of `auth_failed`, `denied`, `expired`,
   `unreachable`, `identity_mismatch`, `update_required`.
-- A Roku keeps one server. Phones push one server to it (their chooser is
-  single-select for a Roku). A push after a sign-in in the same session,
+- A Roku saves several servers, one current. Phones push one server to it
+  (their chooser is single-select for a Roku); signing in makes it the
+  current one, and the server it leaves stays saved with its sign-in
+  ([`spec.md`](spec.md) section 7.2). A push after a sign-in in the same session,
   the phone's or a password one, gets `serverResult failed auth_failed`. A push while one is in flight replaces
   it, as on the other TVs.
 - Unknown types are ignored; a frame that is not JSON, or larger than the

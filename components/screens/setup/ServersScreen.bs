@@ -1,0 +1,361 @@
+import "pkg:/components/screens/firstRun.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/onboarding/address.bs"
+import "pkg:/source/onboarding/servers.bs"
+
+' Rows 760 px wide (the form's width), 16 px apart, with Remove 22 px to
+' their right; the error 16 px under the list, the buttons 40 px under it.
+const ROW_GAP = 16
+const REMOVE_GAP = 22
+const ROW_HEIGHT = 128
+
+sub init()
+    m.layout = m.top.findNode("layout")
+    m.layout.headline = i18n.text("servers.headline")
+    m.layout.body = i18n.text("servers.body")
+    m.form = m.top.findNode("form")
+    m.list = m.top.findNode("list")
+    m.errorLabel = styleFormLabel(m.top.findNode("error"), theme.textStyle.FIELD_ERROR, theme.color.ERROR)
+    m.buttonRow = m.top.findNode("buttons")
+    m.add = styleButton(m.top.findNode("add"), i18n.text("servers.add"))
+    m.back = styleButton(m.top.findNode("back"), i18n.text("common.back"), true)
+    placeInRow([m.add, m.back], BUTTON_GAP)
+    m.removeHeight = 0
+    ' { origin, name, address, current, signedIn } per server
+    ' (onboarding.servers.rows), and each one's card and Remove.
+    m.rows = []
+    m.cards = []
+    m.removes = []
+    ' The first row shown (onboarding.servers.windowStart).
+    m.first = 0
+    m.errorText = ""
+    ' The origin a switch is checking, or "".
+    m.switching = ""
+    m.request = invalid
+    m.dialog = invalid
+    m.removing = invalid
+    ' Origins whose name was asked of their server in this screen.
+    m.named = {}
+end sub
+
+sub onShow(event as Object)
+    if event.first then rebuild(0)
+    m.layout.callFunc("showMesh", true)
+    m.top.prompting = true
+    focusScreen()
+    setControlRows(controlRowsNow(), true, [m.layout.headline])
+end sub
+
+' Another screen covers this one: a switch stops as Back stops it.
+sub onHide()
+    if m.request <> invalid then stopSwitch()
+    closeDialog()
+    m.top.prompting = false
+    m.layout.callFunc("showMesh", false)
+end sub
+
+sub onRelease()
+    m.top.prompting = false
+    closeDialog()
+end sub
+
+' Reads the session's servers again, without the origin removed, whose
+' removal the session may not have published yet, and keeps the window on
+' row focus (clamped to the list).
+sub rebuild(focus as Integer, removed = "" as String)
+    m.rows = []
+    for each row in onboarding.servers.rows(api.session.current())
+        if row.origin <> removed then m.rows.Push(row)
+    end for
+    m.list.removeChildrenIndex(m.list.getChildCount(), 0)
+    m.cards = []
+    m.removes = []
+    for each row in m.rows
+        card = m.list.createChild("ServerCard")
+        card.setFields({ width: FORM_WIDTH, name: row.name, address: row.address })
+        m.cards.Push(card)
+        remove = m.list.createChild("CapsuleButton")
+        remove.setFields({ variant: "compact", plain: true, text: i18n.text("servers.remove") })
+        m.removes.Push(remove)
+        askName(row)
+    end for
+    if m.removes.Count() > 0 then m.removeHeight = Int(m.removes[0].localBoundingRect().height)
+    if focus >= m.rows.Count() then focus = m.rows.Count() - 1
+    if focus < 0 then focus = 0
+    m.first = onboarding.servers.windowStart(m.first, focus, m.rows.Count())
+    refresh()
+end sub
+
+' Each card's badge and audio text, the rows in the window, and the column.
+sub refresh()
+    for i = 0 to m.rows.Count() - 1
+        row = m.rows[i]
+        card = m.cards[i]
+        key = onboarding.servers.badge(row)
+        if row.origin = m.switching then key = "servers.connecting"
+        badge = ""
+        if key <> "" then badge = i18n.text(key)
+        card.setFields({ name: row.name, badge: badge, warning: false, audioText: rowAudio(row, badge) })
+        m.removes[i].audioText = i18n.text("servers.removeAudio", { server: row.name })
+        shown = i >= m.first and i < m.first + onboarding.servers.VISIBLE_ROWS
+        card.visible = shown
+        m.removes[i].visible = shown
+        y = (i - m.first) * (ROW_HEIGHT + ROW_GAP)
+        card.translation = [0, y]
+        m.removes[i].translation = [FORM_WIDTH + REMOVE_GAP, y + (ROW_HEIGHT - m.removeHeight) \ 2]
+    end for
+    count = m.rows.Count() - m.first
+    if count > onboarding.servers.VISIBLE_ROWS then count = onboarding.servers.VISIBLE_ROWS
+    listHeight = count * ROW_HEIGHT
+    if count > 1 then listHeight = listHeight + (count - 1) * ROW_GAP
+    m.errorLabel.text = m.errorText
+    m.errorLabel.visible = m.errorText <> ""
+    parts = [[m.list, listHeight, 0]]
+    if m.errorLabel.visible then parts.Push([m.errorLabel, labelHeight(m.errorLabel), ERROR_GAP])
+    parts.Push([m.buttonRow, theme.firstRun.BUTTON_HEIGHT, BUTTONS_GAP])
+    arrangeColumn(m.layout, invalid, 0, m.form, FORM_GAP, stackForm(parts))
+end sub
+
+function rowAudio(row as Object, badge as String) as String
+    values = { server: row.name, address: onboarding.address.hostOf(row.address), badge: badge }
+    if badge = "" then return i18n.text("servers.rowAudio", values)
+    return i18n.text("servers.rowAudioBadge", values)
+end function
+
+' The rows in the window, each a card and its Remove, then the buttons,
+' which Up and Down enter at Add server.
+function controlRowsNow() as Object
+    rows = []
+    for i = m.first to m.first + onboarding.servers.VISIBLE_ROWS - 1
+        if i < m.rows.Count() then rows.Push([m.cards[i], m.removes[i]])
+    end for
+    m.controlEnterFirst = [rows.Count()]
+    rows.Push([m.add, m.back])
+    return rows
+end function
+
+' The server row of the highlighted control, or -1.
+function highlightedRow() as Integer
+    control = highlightedControl()
+    if control = invalid then return -1
+    for i = 0 to m.rows.Count() - 1
+        if control.isSameNode(m.cards[i]) or control.isSameNode(m.removes[i]) then return i
+    end for
+    return -1
+end function
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if m.request <> invalid
+        ' Back stops the switch; nothing else acts until it answers.
+        if key = "back" then stopSwitch()
+        return true
+    end if
+    if (key = "up" or key = "down") and scroll(key) then return true
+    if moveHighlight(key) then return true
+    if key = "OK"
+        activate(highlightedControl())
+        return true
+    end if
+    ' Options removes the highlighted server, as Remove does.
+    if key = "options"
+        index = highlightedRow()
+        if index >= 0 then confirmRemove(index)
+        return true
+    end if
+    return false
+end function
+
+' Up or Down past the window's edge moves it one row, keeping the column.
+function scroll(key as String) as Boolean
+    index = highlightedRow()
+    if index < 0 then return false
+    target = index - 1
+    if key = "down" then target = index + 1
+    if target < 0 or target >= m.rows.Count() then return false
+    if target >= m.first and target < m.first + onboarding.servers.VISIBLE_ROWS then return false
+    col = m.controlAt.col
+    m.first = onboarding.servers.windowStart(m.first, target, m.rows.Count())
+    refresh()
+    setControlRows(controlRowsNow(), false)
+    highlightAt({ row: target - m.first, col: col })
+    return true
+end function
+
+sub activate(control as Dynamic)
+    if control = invalid then return
+    if control.isSameNode(m.add)
+        nav.push(nav.route.SETUP, { pushed: true })
+        return
+    end if
+    if control.isSameNode(m.back)
+        nav.pop()
+        return
+    end if
+    for i = 0 to m.rows.Count() - 1
+        if control.isSameNode(m.cards[i])
+            choose(i)
+            return
+        else if control.isSameNode(m.removes[i])
+            confirmRemove(i)
+            return
+        end if
+    end for
+end sub
+
+' The current server goes back to where Change server was chosen; another
+' is checked as server entry checks a typed address, and AppScene starts
+' over for it with the session it kept.
+sub choose(index as Integer)
+    row = m.rows[index]
+    if row.current
+        nav.pop()
+        return
+    end if
+    m.errorText = ""
+    m.switching = row.origin
+    send("onSwitched")
+    api.session.useSavedServer(row.origin, m.request)
+    refresh()
+end sub
+
+sub stopSwitch()
+    dropRequest()
+    m.switching = ""
+    refresh()
+end sub
+
+sub onSwitched(event as Object)
+    result = takeResult(event)
+    if result = invalid then return
+    origin = m.switching
+    m.switching = ""
+    if result.ok
+        ' A new server resets the stack; the same one changes nothing.
+        if not util.isTrue(result.body.changed) then nav.pop()
+        return
+    end if
+    kind = ""
+    if result.error <> invalid then kind = result.error.kind
+    nextStep = onboarding.servers.afterFailure(kind)
+    host = onboarding.address.hostOf(origin)
+    if nextStep.step = onboarding.address.UPDATE_REQUIRED
+        refresh()
+        nav.push(nav.route.UPDATE_REQUIRED, { pushed: true, problem: nextStep.problem, host: host })
+        return
+    end if
+    if nextStep.step = onboarding.address.SHOW_ERROR then m.errorText = i18n.text(nextStep.error, { server: nameOf(origin) })
+    refresh()
+    speak(m.errorText, false)
+end sub
+
+function nameOf(origin as String) as String
+    for each row in m.rows
+        if row.origin = origin then return row.name
+    end for
+    return onboarding.address.hostOf(origin)
+end function
+
+' "Remove …?", as tvOS asks. Removing the current server also signs it
+' out, and says which server takes its place.
+sub confirmRemove(index as Integer)
+    row = m.rows[index]
+    body = i18n.text("servers.remove.body")
+    if row.current
+        body = i18n.text("servers.remove.lastBody", { server: row.name })
+        for each other in m.rows
+            if not other.current
+                body = i18n.text("servers.remove.currentBody", { server: row.name, next: other.name })
+                exit for
+            end if
+        end for
+    end if
+    dialog = CreateObject("roSGNode", "StandardMessageDialog")
+    dialog.title = i18n.text("servers.remove.title", { server: row.name })
+    dialog.message = [body]
+    dialog.buttons = [i18n.text("servers.remove.confirm"), i18n.text("common.cancel")]
+    dialog.observeField("buttonSelected", "onRemoveAnswered")
+    dialog.observeField("wasClosed", "onRemoveAnswered")
+    m.dialog = dialog
+    m.removing = { origin: row.origin, index: index }
+    m.top.getScene().dialog = dialog
+end sub
+
+sub onRemoveAnswered()
+    if m.dialog = invalid then return
+    agreed = m.dialog.wasClosed <> true and m.dialog.buttonSelected = 0
+    removing = m.removing
+    closeDialog()
+    focusScreen()
+    if not agreed or removing = invalid then return
+    m.errorText = ""
+    send("onRemoved")
+    m.request.addFields({ index: removing.index, origin: removing.origin })
+    api.session.forgetServer(removing.origin, m.request)
+end sub
+
+' A saved server went: the list shows what is left, the highlight on the
+' row that took its place. Removing the current server resets the stack.
+' A removal that failed keeps the row and says so under the list.
+sub onRemoved(event as Object)
+    handle = event.getRoSGNode()
+    index = handle.index
+    origin = handle.origin
+    result = takeResult(event)
+    if result = invalid then return
+    if not result.ok
+        m.errorText = i18n.text("servers.error.remove", { server: nameOf(origin) })
+        origin = ""
+    end if
+    rebuild(index, origin)
+    setControlRows(controlRowsNow(), false)
+    if m.rows.Count() = 0
+        highlightControl(m.add)
+    else
+        highlightAt({ row: index - m.first, col: 0 })
+        if highlightedControl() = invalid then highlightAt({ row: m.rows.Count() - 1 - m.first, col: 0 })
+    end if
+    speak(m.errorText, false)
+end sub
+
+sub closeDialog()
+    m.removing = invalid
+    if m.dialog = invalid then return
+    m.dialog.unobserveField("buttonSelected")
+    m.dialog.unobserveField("wasClosed")
+    m.dialog.close = true
+    m.dialog = invalid
+end sub
+
+' A saved server without a name yet is asked for its public branding once;
+' its server_name names the row and is remembered.
+sub askName(row as Object)
+    if m.named.DoesExist(row.origin) then return
+    session = api.session.current()
+    if session = invalid then return
+    for each server in session.servers
+        if server.origin = row.origin and util.text(server.name) <> "" then return
+    end for
+    m.named[row.origin] = true
+    request = catalog.request.branding()
+    request.url = row.origin + "/api/v2/theme/branding"
+    handle = api.newHandle(m.top.owner)
+    handle.addFields({ origin: row.origin })
+    handle.observeField("status", "onBranding")
+    api.send(request, handle)
+end sub
+
+sub onBranding(event as Object)
+    handle = event.getRoSGNode()
+    result = api.resultOf(handle)
+    if not result.ok or not util.isObject(result.body) then return
+    name = util.text(result.body.serverName).Trim()
+    if name = "" then return
+    origin = handle.origin
+    api.session.nameServer(origin, name, api.newHandle(m.top.owner))
+    for i = 0 to m.rows.Count() - 1
+        if m.rows[i].origin = origin then m.rows[i].name = name
+    end for
+    refresh()
+end sub

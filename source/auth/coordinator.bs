@@ -37,6 +37,8 @@ import "pkg:/source/util/values.bs"
 '   { session: "selectProfile", profile }
 '   { session: "verifyPin", profile, pin }
 '   { session: "checkOrigin" }      check the configured origin again
+'   { session: "nameServer", origin, name }  remember a saved server's name
+'   { session: "forgetServer", origin }  remove a saved server (forgetServer)
 '   { session: "mediaHeaders", url, generation, refresh }  (mediaHeaders)
 '   { session: "companionServer" | "companionStart" | "companionPoll" |
 '     "companionCancel" }  companion sign-in (source/auth/companion.bs)
@@ -66,6 +68,13 @@ import "pkg:/source/util/values.bs"
 ' sets in every build), reports another origin, or does not serve /api/v2,
 ' they fail with that refusal, which the session view reports until the
 ' viewer asks for another check or changes servers.
+'
+' Saved servers: changing the server keeps the one it leaves, with its
+' session, in saved.servers (storage), and a server already saved comes back
+' with the session it kept, so switching back needs no new sign-in. Only the
+' configured server's credentials are ever sent, but for the sign-out of a
+' server being removed (forgetServer), which goes only to an origin
+' system/info confirmed in this run (verified).
 namespace api.auth.coordinator
     ' A refresh starts this long before expiry, or halfway through a shorter
     ' token lifetime, while the token still works.
@@ -101,7 +110,7 @@ namespace api.auth.coordinator
     ' "checking" | "verified" | "refused", problem, url, requestId } for the
     ' base URL url.
     function create(saved as Object, facts as Object, allowUnconfirmedOrigin = false as Boolean) as Object
-        return { saved: saved, facts: facts, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, companion: invalid, companionAttempt: 0, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
+        return { saved: saved, facts: facts, verified: {}, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, companion: invalid, companionAttempt: 0, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
     end function
 
     ' The decisions to carry out once, at launch, before the first publish:
@@ -120,13 +129,16 @@ namespace api.auth.coordinator
     '       "server_update_required",
     '     reason: "" | "expired" | "signed_out" | "server_changed",
     '     deviceId, borrowed: invalid | { profileId, accountId,
-    '     sessionExpiresAt }, borrowedReason: "" | "expired" }
+    '     sessionExpiresAt }, borrowedReason: "" | "expired",
+    '     serverName, servers: [{ origin, name, current, signedIn }] }
     ' reason says why the last session ended. deviceId is the installation ID
     ' (X-Silo-Device-Id), which the SiloControl receiver advertises. verification names the open
     ' profile whose token the server refused: it needs its PIN again, and
     ' until then no profile shows as open, so the app returns to the profile
     ' step (spec section 7.3). originStatus is the configured origin's check;
-    ' originProblem says why it was refused.
+    ' originProblem says why it was refused. serverName is the configured
+    ' server's name, "" until known; servers lists it (current) and the saved
+    ' servers, most recently used first, name "" for one not yet known.
     function view(state as Object) as Object
         status = "signed_in"
         if state.saved.origin = ""
@@ -137,7 +149,16 @@ namespace api.auth.coordinator
         active = invalid
         if state.profile <> invalid and state.verification = invalid then active = profileView(state.profile)
         check = currentOriginCheck(state)
-        return { status: status, origin: state.saved.origin, accountId: state.saved.accountId, rememberedProfileId: state.saved.profileId, profile: active, verification: state.verification, originStatus: check.status, originProblem: check.problem, reason: state.reason, deviceId: state.saved.deviceId, borrowed: borrowedView(state), borrowedReason: state.borrowedReason }
+        return { status: status, origin: state.saved.origin, accountId: state.saved.accountId, rememberedProfileId: state.saved.profileId, profile: active, verification: state.verification, originStatus: check.status, originProblem: check.problem, reason: state.reason, deviceId: state.saved.deviceId, borrowed: borrowedView(state), borrowedReason: state.borrowedReason, serverName: state.saved.serverName, servers: serversView(state) }
+    end function
+
+    function serversView(state as Object) as Object
+        out = []
+        if state.saved.origin <> "" then out.Push({ origin: state.saved.origin, name: state.saved.serverName, current: true, signedIn: state.saved.accessToken <> "" })
+        for each server in state.saved.servers
+            out.Push({ origin: server.origin, name: server.name, current: false, signedIn: server.accessToken <> "" })
+        end for
+        return out
     end function
 
     ' The record to persist.
@@ -178,6 +199,8 @@ namespace api.auth.coordinator
         if op = "selectProfile" then return selectProfile(state, input)
         if op = "verifyPin" then return verifyPin(state, input)
         if op = "checkOrigin" then return checkOrigin(state, input)
+        if op = "nameServer" then return nameServer(state, input)
+        if op = "forgetServer" then return forgetServer(state, input, now)
         if op = "mediaHeaders" then return mediaHeaders(state, input, now)
         if op = "handoffStart" then return handoffStart(state, input)
         if op = "handoffPoll" then return handoffPoll(state, input)
@@ -242,7 +265,7 @@ namespace api.auth.coordinator
         sensitive = request.auth <> "none" or (op <> invalid and op.kind <> "server" and op.kind <> "origin")
         if sensitive and not sameOrigin then return { headers: {}, error: "invalid_request" }
         if request.auth <> "none" and state.saved.accessToken = "" then return { headers: {}, error: "signed_out" }
-        if sensitive and not originConfirmed(state, expected) then return { headers: {}, error: originError(state) }
+        if sensitive and not originConfirmed(state, expected) and not leaving(state, op) then return { headers: {}, error: originError(state) }
         out = {}
         if sameOrigin then out.Append(api.auth.headers.identity(state.facts, sensitive))
         if sameOrigin and Left(util.text(request.path), 17) = "/api/v2/settings/" then out["X-Silo-Client-Family"] = "tv"
@@ -290,7 +313,7 @@ namespace api.auth.coordinator
         state.ops.Delete(request.requestId)
         if op.kind = "refresh" then return refreshed(state, request, op, result, now)
         if op.kind = "login" then return loggedIn(state, request, op, result, now)
-        if op.kind = "server" then return serverChecked(state, request, op, result)
+        if op.kind = "server" then return serverChecked(state, request, op, result, now)
         if op.kind = "origin" then return originChecked(state, request, op, result)
         if op.kind = "pin" then return pinChecked(state, request, op, result)
         if op.kind = "handoffCapability" then return handoffCapable(state, op, result)
@@ -312,12 +335,11 @@ namespace api.auth.coordinator
     ' Debug builds' apiConfigure({ baseUrl }): use a server without the setup
     ' check, ending the session when it changes.
     ' Its origin is checked before the first credential goes there.
-    function useServer(state as Object, origin as String) as Object
+    function useServer(state as Object, origin as String, now = 0 as Integer) as Object
         if origin = state.saved.origin then return []
         ' A companion withdrawal goes after the change cancels every request.
         withdraw = endCompanion(state)
-        decisions = endSession(state, "server_changed")
-        state.saved.origin = origin
+        decisions = switchServer(state, origin, now)
         state.originCheck = originState("unverified", "", origin)
         decisions.Append(setOriginHold(state, false))
         decisions.Append([{ kind: "server", origin: origin }, persist(), publish()])
@@ -493,6 +515,139 @@ namespace api.auth.coordinator
         return [persist(), reply(succeeded(input, { key: key }))]
     end function
 
+    ' ---- Saved servers
+
+    ' Remembers origin's name (theme/branding's server_name), for the
+    ' configured server or a saved one. Answers { changed }.
+    function nameServer(state as Object, input as Object) as Object
+        origin = util.text(input.origin)
+        name = util.text(input.name).Trim()
+        if origin = "" or not storage.fits(name, storage.MAX_NAME_BYTES) then return [reply(api.response.failure(input, "invalid_request"))]
+        target = invalid
+        if origin = state.saved.origin
+            target = state.saved
+            if target.serverName = name then return [reply(succeeded(input, { changed: false }))]
+            target.serverName = name
+        else
+            index = savedIndex(state, origin)
+            if index < 0 then return [reply(api.response.failure(input, "invalid_request"))]
+            target = state.saved.servers[index]
+            if target.name = name then return [reply(succeeded(input, { changed: false }))]
+            target.name = name
+        end if
+        return [persist(), publish(), reply(succeeded(input, { changed: true }))]
+    end function
+
+    ' Removes a saved server and its session from this device. A saved
+    ' server just goes; the configured one is signed out, as signOut does,
+    ' and the most recently used saved server takes its place with its
+    ' session, or none does (status no_server). Each removed session is
+    ' ended on its server when this run confirmed that origin (leaving),
+    ' and otherwise only forgotten here.
+    function forgetServer(state as Object, input as Object, now as Integer) as Object
+        origin = util.text(input.origin)
+        if origin <> "" and origin = state.saved.origin
+            removed = currentSession(state, now)
+            withdraw = endCompanion(state)
+            decisions = endSession(state, "signed_out")
+            nextServer = invalid
+            nextOrigin = ""
+            if state.saved.servers.Count() > 0
+                nextServer = state.saved.servers.Shift()
+                nextOrigin = nextServer.origin
+            end if
+            state.saved.origin = nextOrigin
+            restoreServer(state, nextServer)
+            state.originCheck = originState("unverified", "", nextOrigin)
+            decisions.Append(setOriginHold(state, false))
+            ' The sign-out goes after the change cancels every request.
+            decisions.Append([{ kind: "server", origin: nextOrigin }, persist(), publish(), reply(succeeded(input, { origin: nextOrigin }))])
+            decisions.Append(withdraw)
+            decisions.Append(endRemoteSession(state, removed, now))
+            return decisions
+        end if
+        index = savedIndex(state, origin)
+        if index < 0 then return [reply(api.response.failure(input, "invalid_request"))]
+        removed = state.saved.servers[index]
+        state.saved.servers.Delete(index)
+        decisions = [persist(), publish(), reply(succeeded(input, { origin: state.saved.origin }))]
+        decisions.Append(endRemoteSession(state, removed, now))
+        return decisions
+    end function
+
+    ' Makes origin the configured server: the one it replaces goes first in
+    ' the saved servers with its session, and origin's saved session, if it
+    ' has one, comes back. The session ends as a server change ends it
+    ' (endSession). Gives endSession's decisions.
+    function switchServer(state as Object, origin as String, now as Integer) as Object
+        restoring = invalid
+        kept = []
+        if state.saved.origin <> "" then kept.Push(currentSession(state, now))
+        for each server in state.saved.servers
+            if server.origin = origin
+                restoring = server
+            else if kept.Count() < storage.MAX_SAVED_SERVERS
+                kept.Push(server)
+            end if
+        end for
+        state.saved.servers = kept
+        decisions = endSession(state, "server_changed")
+        state.saved.origin = origin
+        restoreServer(state, restoring)
+        return decisions
+    end function
+
+    ' The configured server and its session as a saved server.
+    function currentSession(state as Object, now as Integer) as Object
+        saved = state.saved
+        tokens = []
+        tokens.Append(saved.profileTokens)
+        return { origin: saved.origin, name: saved.serverName, accountId: saved.accountId, profileId: saved.profileId, accessToken: saved.accessToken, refreshToken: saved.refreshToken, expiresAt: saved.expiresAt, refreshAt: saved.refreshAt, profileTokens: tokens, usedAt: now }
+    end function
+
+    ' Makes a saved server's name, account, profile, and session the
+    ' configured server's, after endSession; invalid, a server never saved,
+    ' has none of them.
+    sub restoreServer(state as Object, server as Dynamic)
+        state.saved.serverName = ""
+        if server = invalid then return
+        state.saved.serverName = server.name
+        state.saved.accountId = server.accountId
+        state.saved.profileId = server.profileId
+        if server.accessToken = "" or server.refreshToken = "" then return
+        state.saved.accessToken = server.accessToken
+        state.saved.refreshToken = server.refreshToken
+        state.saved.expiresAt = server.expiresAt
+        state.saved.refreshAt = server.refreshAt
+        state.saved.profileTokens = server.profileTokens
+    end sub
+
+    function savedIndex(state as Object, origin as String) as Integer
+        servers = state.saved.servers
+        for i = 0 to servers.Count() - 1
+            if servers[i].origin = origin then return i
+        end for
+        return -1
+    end function
+
+    ' Ends a removed server's session on that server, as signOut does: with
+    ' its access token, or after a refresh when that has expired. Only to an
+    ' origin this run confirmed (leaving); otherwise nothing is sent.
+    function endRemoteSession(state as Object, server as Object, now as Integer) as Object
+        if server.accessToken = "" or server.origin = "" or state.verified[server.origin] <> true then return []
+        if server.expiresAt > 0 and now >= server.expiresAt - EXPIRY_MARGIN_SECONDS and server.refreshToken <> ""
+            return [submit(build(state, { owner: "" }, { method: "POST", url: server.origin + REFRESH_PATH, body: { refresh_token: server.refreshToken }, timeoutMs: LOGOUT_TIMEOUT_MS }, { kind: "logoutRefresh", origin: server.origin }))]
+        end if
+        return [submit(logoutRequest(state, server.origin, server.accessToken))]
+    end function
+
+    ' Whether op ends a session on a server other than the configured one
+    ' whose origin system/info confirmed in this run (forgetServer).
+    function leaving(state as Object, op as Dynamic) as Boolean
+        if op = invalid or (op.kind <> "logout" and op.kind <> "logoutRefresh") then return false
+        return util.isString(op.origin) and op.origin <> state.saved.origin and state.verified[op.origin] = true
+    end function
+
     ' ---- The configured origin
 
     ' Starts the check of the configured origin unless it is confirmed, being
@@ -518,6 +673,7 @@ namespace api.auth.coordinator
     function originSettled(state as Object, base as String, check as Object) as Object
         if check.ok
             state.originCheck = originState("verified", "", base)
+            state.verified[base] = true
         else if check.error = "unreachable" or check.error = "cancelled"
             state.originCheck = originState("unverified", "", base)
         else
@@ -577,7 +733,7 @@ namespace api.auth.coordinator
     ' ---- Results of requests built here
 
     ' A check of the configured server itself also settles its origin.
-    function serverChecked(state as Object, request as Object, op as Object, result as Object) as Object
+    function serverChecked(state as Object, request as Object, op as Object, result as Object, now as Integer) as Object
         check = api.auth.server.checkInfo(result, op.origin, state.allowUnconfirmedOrigin)
         changed = op.origin <> state.saved.origin
         if not check.ok
@@ -594,8 +750,7 @@ namespace api.auth.coordinator
         if changed
             ' A companion withdrawal goes after the change cancels every request.
             withdraw = endCompanion(state)
-            decisions = endSession(state, "server_changed")
-            state.saved.origin = op.origin
+            decisions = switchServer(state, op.origin, now)
             decisions.Append([{ kind: "server", origin: op.origin }, persist()])
             decisions.Append(withdraw)
         end if
@@ -927,7 +1082,7 @@ namespace api.auth.coordinator
     end function
 
     function logoutRequest(state as Object, origin as String, accessToken as String) as Object
-        return build(state, { owner: "" }, { method: "POST", path: LOGOUT_PATH, timeoutMs: LOGOUT_TIMEOUT_MS }, { kind: "logout", origin: origin, accessToken: accessToken })
+        return build(state, { owner: "" }, { method: "POST", url: origin + LOGOUT_PATH, timeoutMs: LOGOUT_TIMEOUT_MS }, { kind: "logout", origin: origin, accessToken: accessToken })
     end function
 
     ' A successful envelope; status 0 for an operation answered without HTTP.

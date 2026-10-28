@@ -19,10 +19,32 @@ import "pkg:/source/util/values.bs"
 '   pairingKey     the SiloControl receiver's pairing key as 32 hex digits,
 '                  or "" while Require Pairing is off (docs/silocontrol.md
 '                  section 9.4); kept across sign-outs
+'   serverName     the configured server's name (theme/branding's
+'                  server_name), or "" until it is known
+'   servers        the other saved servers, most recently used first, each
+'                  { origin, name, accountId, profileId, accessToken,
+'                  refreshToken, expiresAt, refreshAt, profileTokens, usedAt }
+'                  with its session kept as the configured server's is;
+'                  usedAt is when it stopped being the configured server, in
+'                  wall-clock seconds. They live in their own section
+'                  (SERVERS_SECTION), so the configured server's never shrinks
+'                  for them
 ' Each value is stored as a string under its KEYS name. A value over its byte
 ' bound is not stored, which keeps the section under BUDGET_BYTES.
 namespace storage
     const SECTION_NAME = "silo"
+    ' The other saved servers, as one JSON list under SERVERS_KEY, kept to
+    ' SERVERS_BUDGET_BYTES: past it, the oldest servers' sessions go first
+    ' (they stay saved, signed out), then the oldest servers. With
+    ' BUDGET_BYTES and Browse's section (libraryPrefs.BUDGET_BYTES) it
+    ' keeps to Roku's 32 KB.
+    const SERVERS_SECTION = "silo.servers"
+    const SERVERS_KEY = "list"
+    const SERVERS_KEYS = "list"
+    const SERVERS_BUDGET_BYTES = 8192
+    ' Saved servers besides the configured one.
+    const MAX_SAVED_SERVERS = 7
+    const MAX_NAME_BYTES = 128
     ' Layout version. Later layouts add keys and never change what an existing
     ' key means, so a newer section's known keys still read. A change that
     ' cannot keep to that bumps VERSION and teaches decode() the older layout,
@@ -46,16 +68,18 @@ namespace storage
     const MAX_RETRY_MS = 60000
     ' Every key this module writes; write() never touches others, such as keys
     ' a newer layout added.
-    const KEYS = "schema|origin|device|account|access_token|refresh_token|expires_at|refresh_at|profile|profile_tokens|pairing_key"
+    const KEYS = "schema|origin|device|account|access_token|refresh_token|expires_at|refresh_at|profile|profile_tokens|pairing_key|server_name"
 
     ' The record of a fresh install.
     function empty() as Object
-        return { version: VERSION, origin: "", deviceId: "", accountId: "", accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileId: "", profileTokens: [], pairingKey: "" }
+        return { version: VERSION, origin: "", deviceId: "", accountId: "", accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileId: "", profileTokens: [], pairingKey: "", serverName: "", servers: [] }
     end function
 
-    ' Reads the section and decodes it (Main, before the scene starts).
-    function load(section as Object) as Object
-        return decode(read(section))
+    ' Reads the sections and decodes them (Main, before the scene starts).
+    function load(section as Object, serversSection = invalid as Dynamic) as Object
+        serversRaw = {}
+        if serversSection <> invalid then serversRaw = read(serversSection)
+        return decode(read(section), serversRaw)
     end function
 
     ' The section's values by key.
@@ -70,7 +94,8 @@ namespace storage
     ' The record a raw section holds. A newer section keeps its version, and
     ' its known keys read as they do at VERSION. Values that do not validate
     ' are dropped one by one; tokens survive only as a pair, with their server.
-    function decode(raw as Object) as Object
+    ' serversRaw is the saved servers' section.
+    function decode(raw as Object, serversRaw = {} as Object) as Object
         record = empty()
         record.version = versionOf(raw)
         if record.version < VERSION then record.version = VERSION
@@ -80,11 +105,13 @@ namespace storage
         if isPairingKey(raw.pairing_key) then record.pairingKey = raw.pairing_key
         record.accountId = boundedText(raw.account, MAX_ID_BYTES)
         record.profileId = boundedText(raw.profile, MAX_ID_BYTES)
+        record.servers = decodeServers(serversRaw[SERVERS_KEY], record.origin)
         if record.origin = ""
             record.accountId = ""
             record.profileId = ""
             return record
         end if
+        record.serverName = boundedText(raw.server_name, MAX_NAME_BYTES)
         access = boundedText(raw.access_token, MAX_TOKEN_BYTES)
         refresh = boundedText(raw.refresh_token, MAX_TOKEN_BYTES)
         if access = "" or refresh = "" then return record
@@ -106,6 +133,7 @@ namespace storage
         if isPairingKey(record.pairingKey) then raw.pairing_key = record.pairingKey
         put(raw, "account", record.accountId, MAX_ID_BYTES)
         put(raw, "profile", record.profileId, MAX_ID_BYTES)
+        put(raw, "server_name", record.serverName, MAX_NAME_BYTES)
         put(raw, "access_token", record.accessToken, MAX_TOKEN_BYTES)
         put(raw, "refresh_token", record.refreshToken, MAX_TOKEN_BYTES)
         if not raw.DoesExist("access_token") or not raw.DoesExist("refresh_token")
@@ -124,9 +152,10 @@ namespace storage
     ' and flushes. Gives whether every write, delete, and the flush succeeded;
     ' after a failure the section may hold part of raw, and the next write
     ' compares again, so it retries just the keys that still differ.
-    function write(section as Object, raw as Object) as Boolean
+    ' managed lists the keys it manages, "|"-separated (KEYS, or SERVERS_KEYS).
+    function write(section as Object, raw as Object, managed = KEYS as String) as Boolean
         ok = true
-        for each key in KEYS.Split("|")
+        for each key in managed.Split("|")
             if raw.DoesExist(key)
                 if not section.Exists(key) or section.Read(key) <> raw[key]
                     if not section.Write(key, raw[key]) then ok = false
@@ -145,13 +174,13 @@ namespace storage
     ' MAX_RETRY_MS; a save that succeeds, the retry or any other, makes it
     ' clean. Times are the caller's milliseconds, on a clock that is never
     ' reset, so they wrap after 24 days; only elapsed time is compared.
-    function writer(section as Object) as Object
-        return { section: section, dirty: false, failedAt: invalid, delay: 0 }
+    function writer(section as Object, managed = KEYS as String) as Object
+        return { section: section, managed: managed, dirty: false, failedAt: invalid, delay: 0 }
     end function
 
     ' Writes raw through store, a writer (write). Gives whether it succeeded.
     function save(store as Object, raw as Object, now as Integer) as Boolean
-        if write(store.section, raw)
+        if write(store.section, raw, store.managed)
             store.dirty = false
             store.failedAt = invalid
             store.delay = 0
@@ -196,7 +225,7 @@ namespace storage
 
     ' The most the section can hold: every managed key with a value at its bound.
     function maxBytes() as Integer
-        values = { schema: MAX_SECONDS_BYTES, origin: MAX_ORIGIN_BYTES, device: MAX_ID_BYTES, account: MAX_ID_BYTES, profile: MAX_ID_BYTES, access_token: MAX_TOKEN_BYTES, refresh_token: MAX_TOKEN_BYTES, expires_at: MAX_SECONDS_BYTES, refresh_at: MAX_SECONDS_BYTES, profile_tokens: MAX_PROFILE_TOKENS_BYTES, pairing_key: PAIRING_KEY_BYTES }
+        values = { schema: MAX_SECONDS_BYTES, origin: MAX_ORIGIN_BYTES, device: MAX_ID_BYTES, account: MAX_ID_BYTES, profile: MAX_ID_BYTES, access_token: MAX_TOKEN_BYTES, refresh_token: MAX_TOKEN_BYTES, expires_at: MAX_SECONDS_BYTES, refresh_at: MAX_SECONDS_BYTES, profile_tokens: MAX_PROFILE_TOKENS_BYTES, pairing_key: PAIRING_KEY_BYTES, server_name: MAX_NAME_BYTES }
         total = 0
         for each key in KEYS.Split("|")
             total = total + Len(key) + values[key]
@@ -233,6 +262,101 @@ namespace storage
         if not util.isString(value) or value = "" or Len(value) > 4 or not isDigits(value) then return 1
         return value.ToInt()
     end function
+
+    ' The saved servers' section for a record's servers: their JSON under
+    ' SERVERS_KEY within SERVERS_BUDGET_BYTES, or nothing for none. Past the
+    ' budget the oldest server still signed in loses its session, then,
+    ' once none is, the oldest server goes.
+    function encodeServers(list as Dynamic) as Object
+        kept = []
+        if type(list) = "roArray"
+            for each entry in list
+                server = serverEntry(entry)
+                if server <> invalid and kept.Count() < MAX_SAVED_SERVERS then kept.Push(server)
+            end for
+        end if
+        while kept.Count() > 0
+            text = FormatJson(kept)
+            if byteLength(SERVERS_KEY) + byteLength(text) <= SERVERS_BUDGET_BYTES then return { list: text }
+            dropped = false
+            for i = kept.Count() - 1 to 0 step -1
+                if kept[i].DoesExist("access_token")
+                    signOutEntry(kept[i])
+                    dropped = true
+                    exit for
+                end if
+            end for
+            if not dropped then kept.Pop()
+        end while
+        return {}
+    end function
+
+    ' The saved servers a section's list holds, most recently used first:
+    ' each origin once, never current's, at most MAX_SAVED_SERVERS.
+    function decodeServers(text as Dynamic, current as String) as Object
+        out = []
+        if not util.isString(text) or Left(text, 1) <> "[" then return out
+        list = ParseJson(text)
+        if type(list) <> "roArray" then return out
+        seen = {}
+        if current <> "" then seen[current] = true
+        for each entry in list
+            server = decodeServer(entry)
+            if server <> invalid and not seen.DoesExist(server.origin) and out.Count() < MAX_SAVED_SERVERS
+                seen[server.origin] = true
+                out.Push(server)
+            end if
+        end for
+        return out
+    end function
+
+    function decodeServer(entry as Dynamic) as Dynamic
+        if not util.isObject(entry) then return invalid
+        origin = api.request.baseUrl(entry.origin)
+        if origin = invalid or origin <> entry.origin or not fits(origin, MAX_ORIGIN_BYTES) then return invalid
+        server = { origin: origin, name: boundedText(entry.name, MAX_NAME_BYTES), accountId: boundedText(entry.account, MAX_ID_BYTES), profileId: boundedText(entry.profile, MAX_ID_BYTES), accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileTokens: [], usedAt: seconds(entry.used_at) }
+        access = boundedText(entry.access_token, MAX_TOKEN_BYTES)
+        refresh = boundedText(entry.refresh_token, MAX_TOKEN_BYTES)
+        if access = "" or refresh = "" then return server
+        server.accessToken = access
+        server.refreshToken = refresh
+        server.expiresAt = seconds(entry.expires_at)
+        server.refreshAt = seconds(entry.refresh_at)
+        server.profileTokens = decodeProfileTokens(entry.profile_tokens)
+        return server
+    end function
+
+    ' A saved server as stored: strings by key, empty values left out, or
+    ' invalid for one without a valid origin.
+    function serverEntry(server as Dynamic) as Dynamic
+        if not util.isObject(server) then return invalid
+        origin = api.request.baseUrl(server.origin)
+        if origin = invalid or origin <> server.origin or not fits(origin, MAX_ORIGIN_BYTES) then return invalid
+        out = { origin: origin }
+        put(out, "name", server.name, MAX_NAME_BYTES)
+        put(out, "account", server.accountId, MAX_ID_BYTES)
+        put(out, "profile", server.profileId, MAX_ID_BYTES)
+        if util.isNumber(server.usedAt) and server.usedAt > 0 then out.used_at = server.usedAt.ToStr()
+        put(out, "access_token", server.accessToken, MAX_TOKEN_BYTES)
+        put(out, "refresh_token", server.refreshToken, MAX_TOKEN_BYTES)
+        if not out.DoesExist("access_token") or not out.DoesExist("refresh_token")
+            signOutEntry(out)
+            return out
+        end if
+        if util.isNumber(server.expiresAt) and server.expiresAt > 0 then out.expires_at = server.expiresAt.ToStr()
+        if util.isNumber(server.refreshAt) and server.refreshAt > 0 then out.refresh_at = server.refreshAt.ToStr()
+        tokens = encodeProfileTokens(server.profileTokens)
+        if tokens <> "" then out.profile_tokens = tokens
+        return out
+    end function
+
+    ' A stored saved server without its session; its account and profile
+    ' stay, so signing in to it again reopens that profile.
+    sub signOutEntry(entry as Object)
+        for each key in ["access_token", "refresh_token", "expires_at", "refresh_at", "profile_tokens"]
+            entry.Delete(key)
+        end for
+    end sub
 
     function decodeProfileTokens(text as Dynamic) as Object
         out = []

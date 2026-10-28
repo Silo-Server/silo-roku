@@ -23,8 +23,8 @@ you type its address into the app.
 - The app sends nothing to the Silo project, to [the publisher], or to any
   other company. It contains no analytics, crash reporting, advertising, or
   tracking software.
-- On the Roku device the app keeps the server address, a random installation
-  ID, and the sign-in tokens your server issued. It never stores your
+- On the Roku device the app keeps the addresses of the servers you saved, a
+  random installation ID, and the sign-in tokens each server issued. It never stores your
   password or PIN. Signing out removes the tokens at once, even when the
   server cannot be reached.
 
@@ -41,12 +41,14 @@ you type its address into the app.
 
 ## What the app stores on your Roku
 
-The app keeps one storage area on the device (Roku's registry, readable only
-by apps signed with this app's developer key). It holds:
+The app keeps its sign-ins in Roku's registry, readable only by apps signed
+with this app's developer key: one area for the server in use and one for
+the other servers you saved. They hold:
 
 | Item | Why |
 | --- | --- |
-| The Silo server address you entered | To connect to it at each launch |
+| The Silo server address you entered, and the server's name once the app has read it | To connect to it at each launch, and to name it in the server list |
+| Up to seven other Silo servers you saved, each with the same items as the server in use (its address and name, account identifier, tokens, remembered profile, and profile tokens) and when you last used it | To switch back to one without signing in again. Its tokens are sent only to that server: once it is the server in use again, or, when you remove it, to end its session there if the app reached that server since it was opened |
 | An installation ID: a random identifier the app makes once on this device | Your server lists this device as one of your signed-in devices with it. It is not the Roku serial number, the Roku advertising ID, or your Roku account |
 | Your Silo account's identifier (not your username) | To reopen the right profile after you sign in again |
 | The access and refresh tokens your server issued at sign-in, and when they expire | To keep you signed in |
@@ -140,7 +142,8 @@ The app never changes your settings on the server.
 | Action | What the app clears | What stays |
 | --- | --- | --- |
 | Sign out | Sign-in tokens, profile PIN tokens, the account identifier, and the remembered profile, even if the server cannot be reached. If a title was playing, the app first waits up to 10 seconds to send its final position with the old sign-in; anything still unsent is discarded, never sent with another sign-in | The server address and the installation ID, so you can sign in again |
-| Change server (once the new server answers) | The same as sign-out, and the old server address | The installation ID |
+| Change server (once the new server answers) | Nothing is cleared: the old server is kept in the app's saved servers with its sign-in, so you can switch back without signing in again | The installation ID, and every saved server with its sign-in |
+| Remove a saved server | That server's address, sign-in tokens, profile PIN tokens, account identifier, and remembered profile. Removing the server in use also signs it out, as Sign out does | The installation ID and the other saved servers |
 | Switch profile | Nothing is cleared; the new profile becomes the remembered one | Other profiles' PIN tokens for this sign-in |
 | The server ends your session (for example, it was revoked) | Sign-in tokens and profile PIN tokens | The server address, the installation ID, the account identifier, and the remembered profile, so signing in to the same account reopens it |
 | Remove the app from the Roku | Roku deletes the app's stored data | Nothing on the device. Your server keeps its own records until its operator removes them |
