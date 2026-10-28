@@ -151,6 +151,10 @@ Play:
   to a chapter, the chapter playing in Info, and ticks on the scrubber
   (section 5.7);
 - audio, subtitle, and quality selection through replan;
+- Search Subtitles… in the player's Options: the server's subtitle
+  providers searched for the playing file in a language the viewer picks,
+  and the result chosen downloaded and turned on, when the server offers
+  it (`GET /api/v2/subtitles/providers/status`, section 5.7);
 - Skip Intro, Skip Recap, and Skip Credits using server markers, with the
   profile's recap and credits auto-skip (`playback.auto_skip_recap`,
   `playback.auto_skip_credits`);
@@ -189,7 +193,6 @@ Planned:
 - a sleep timer in the video player (Android TV; tvOS sets one only in its
   audio player);
 - the marker on AI-translated subtitle tracks (Android TV);
-- subtitle search and download (tvOS, Android TV);
 - profile creation (tvOS, Android TV) and editing (Android TV).
 
 Not decided yet, and deferred until the owner chooses:
@@ -1391,6 +1394,9 @@ Subtitles tab (criterion 4.8).
       first (tvOS's `SubtitleDisplayOrder`). A track only the plan lists (a
       sidecar the projection does not name) takes its language's place
       here and is not in the detail menu, as on tvOS.
+      CAPTIONS ends with Search Subtitles…, a setting row with a chevron,
+      while a plan plays and the server has not said its subtitle
+      providers are unavailable (Search Subtitles, below).
     - Chapters: CHAPTERS, a row for each chapter of the playing version
       (the watch projection's `chapters`, section 8.1): its number ("01")
       in a 44 px column at 55%, its title (an untitled one "Chapter 2", by
@@ -1461,8 +1467,73 @@ Subtitles tab (criterion 4.8).
   Thumbnails come from the server's trickplay sprite sheets for the file
   playing. A title without them shows the time where a thumbnail's would be,
   under "Previews aren't available for this title".
+- **Search Subtitles**, as tvOS's SubtitleSearchMenu (silo-apple
+  `791b1e0e`; assumptions AG-490 to AG-495).
+  - Offered: the Subtitles tab's Search Subtitles… row shows while a plan
+    plays a file. The player reads `GET /api/v2/subtitles/providers/status`
+    each time Options opens, and only an answer hides the row: `enabled`
+    false, a `state` other than `available`, or `allowed` false. Before
+    the first answer, and after a failed read, the row shows, as tvOS's
+    `SubtitleProvidersStore` does. An answer of no that arrives while the
+    panel sits on its language list replaces the list with "Subtitle
+    search is not set up on this server." and Back.
+  - The panel opens over the Options panel, which stays open but hidden: a
+    900 by 780 px glass panel centred over the video dimmed to 45%, radius
+    28 with a 1 px white 18% outline, padding 34 by 28. The title "Search
+    Subtitles" is 30 px SemiBold, the line under it 17 px at white 65%,
+    and a hint at the foot 17 px at 55%. Rows are the Options panel's
+    track rows (72 px, name over details), section names are 14 px
+    SemiBold uppercase at 50%, and lines of copy 22 px. The rows scroll to
+    keep focus in view.
+  - Languages: "Choose a language to find subtitles for this video." The
+    profile's subtitle language for the title (the watch projection's
+    `effective_subtitle_language`, else `playback.subtitle_language`)
+    leads under PREFERRED LANGUAGE, marked Preferred; then ALL LANGUAGES,
+    the 43 languages the client names, by name. Focus opens on the
+    preferred language. There is no query text: the server searches by
+    the file.
+  - OK on a language is the search (`POST /api/v2/subtitles/search` with
+    the playing file's `effective_media_file_id` and that one language;
+    60 s timeout). Meanwhile "Finding subtitles in French", "Searching
+    providers…", "This can take up to half a minute.", and Cancel.
+  - Results, in the server's order, under "French · 12 results": the
+    release name ("Untitled release" without one) over "88% match ·
+    French · 1234 downloads · HI · SRT", with the provider's name at the
+    right (OpenSubtitles, SubDL, Subsource, else as the server names it).
+    The server's warning shows first, in amber. With none: "No subtitles
+    found for French." and Choose another language. The hint says "Select
+    a subtitle to download and use it".
+  - OK on a result sends `POST /api/v2/subtitles/download` once, echoing
+    the result. Its row says "Adding subtitle…" at the right, the others
+    dim and take no focus, and Back does nothing until it settles. A
+    stored subtitle is brought into playback (section 9.7); once its plan
+    selects it, with Roku's captions On, the panel and Options close.
+  - A refusal shows its message with Back: "Subtitle providers are busy.
+    Try again in a minute." (429), "This server does not allow subtitle
+    downloads here." (403), "That subtitle is no longer available. Try
+    another result." (404), else "Couldn't add that subtitle. Try another
+    result." A failed search shows "Subtitle search could not finish. Try
+    again." or the busy message, with Try Again and Back.
+  - A subtitle stored but not brought into playback says "The subtitle
+    was saved but couldn't be turned on now. It will be available the next
+    time you play this video."; one listed but not selected (the choice
+    refused) says "The subtitle was saved but couldn't be turned on.
+    Choose it under Tracks in Subtitles."; a download with no usable answer (a
+    timeout, a lost connection, a gateway's error) says "Silo couldn't
+    confirm the download. If it was saved, it will be available the next
+    time you play this video." Either result is not sent again while the
+    panel stays open; choosing it shows the message again.
+  - Back from results, a failure, or a search returns to the languages
+    (a search in flight is cancelled); from the languages it returns to
+    Options on the Search Subtitles… row. Anything that closes Options
+    closes the panel; a download on its way still completes, and its
+    subtitle is still brought in. A search or its results for a file that
+    no longer plays (playback moved to another version) give way to the
+    languages, so a result is only ever downloaded for the file it was
+    found for.
 - **Back, first match wins:** cancel a seek or scrub; dismiss Skip Intro's
-  pill; from Up Next, Keep Watching (tvOS); close the Quality picker, then
+  pill; from Up Next, Keep Watching (tvOS); step Search Subtitles back to
+  its languages, then close it; close the Quality picker, then
   Options; hide the controls while playing; otherwise stop and exit. The
   segment pill (Skip Recap or Skip Credits) stays through Back, as tvOS's
   stays through Menu (assumption AG-291).
@@ -1851,6 +1922,10 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Subtitles draw under the controls: the controls and their gradient cover a cue while they show | Roku's captions are hidden while the controls show (not over Options or Up Next), and return as they hide; content within 3 s of its first frame is left as it is | Roku draws captions above the UI at a place of its own, so a cue crossed the scrubber and the time row (hardware run 26). The node's own `suppressCaptions`, which Roku documents for UI drawn where captions are, hides them without touching the caption mode or the subtitle selected (assumption AG-293) |
 | The Video tab always has rows: Speed (0.75× to 2×) and Aspect (Fit, Fill, Stretch), kept in `player.playback_speed` and `player.video_gravity` | No Speed or Aspect rows: video plays at 1× and fits the screen, as Roku draws it. Without a choice of quality the PLAYBACK column shows the quality as a line, and a movie's Video tab has no rows. A phone's `set_playback_speed` and `set_video_gravity` are refused ([`silocontrol.md`](silocontrol.md) section 6.5) | Roku documents no playback-rate control and no scaling or cropping for the `Video` node (developer documentation and Roku OS 12.0–15.3 release notes, read 2026-10-28). Its one rate field, `playbackSpeed`, is undocumented: Roku switched it off for every app in 2024 and says not every device can play at other speeds, and other channels report models that stop at 2× (assumption AG-433). The node keeps the picture's shape inside its rectangle, so Stretch cannot be drawn; Fill would rest on a node larger than the screen, which nobody has shown to crop on hardware and which screenshots cannot show, since they never capture the video plane (assumption AG-434) |
 | Options' Subtitles tab shows only with tracks or a subtitle tool | Stats and Subtitles always show | A fixed set of tabs keeps Left and Right predictable while the player's stats arrive, and Subtitles holds Roku's caption modes even for a title without subtitle tracks (criterion 4.8) |
+| A downloaded subtitle is registered on the playing stream at once, at a stream URL the player builds, and selected without a reload | The player asks the server for a plan that lists it (a `track_change` keeping the selection), then chooses its row; the title reloads at the position to carry the new sidecar (section 9.7) | The client never builds a stream URL (AGENTS.md), and content on the `Video` node never takes another track (hardware run 19) |
+| Search Subtitles… sits in the Subtitles pane's OPTIONS column, beside AI Subtitles… | It ends the CAPTIONS column | Roku's second column holds the caption modes (the row below); AI subtitles are not built (section 3.3) |
+| A search result's score is a badge coloured by tier (70 and up green, 40 amber, else red) over "Match" | "88% match" leads the result's second line | The panel reuses the Options panel's text rows; `playback.subtitleSearch.scoreTier` keeps tvOS's tiers for a badge later |
+| The language list is the app's whole playback-language catalog | 43 languages, the ones the client's strings name | The client names no others (`language.*` in `locale/`); a search takes any language the server knows, so the list can grow with the strings |
 | Options' Subtitles tab has TRACKS and OPTIONS columns | Its second column is CAPTIONS: Off, On, On replay, and On mute (Roku TVs only), Roku's global caption mode; while a subtitle is burned into the video, or captions Off set one aside, only Off and On, and Off asks the server for the stream without it. On mute is checked whether Options or Roku's own menu set it, and stays checked as the TV is muted and unmuted | Criterion 4.8 (plan section 6.10); burned-in pixels cannot follow a caption mode |
 | The remote's Menu or Settings key opens the player's options (Android TV) | Options opens from the controls' Options button and from Down with the controls hidden; on a Roku TV, `*` during playback opens Roku's own menu, whose Accessibility entry holds the caption setting | Roku TVs take `*` during full-screen playback whatever has focus (hardware run 6, assumption AG-117); Roku remotes have no Menu key |
 | Tracks change only in the app's menus | Roku's own `*` overlay, reached with the controls hidden, can change audio and subtitles; a change that names one inventory track becomes a `track_change`, and any other is undone | Criterion 4.4 keeps the overlay; the plan owns track identity (section 9.7) |
@@ -2256,7 +2331,11 @@ The first release consumes:
   `GET /api/v2/calendar` for the Calendar tab's week (section 5.10);
 - `GET /api/v2/catalog/themes/capabilities` for whether theme music plays,
   and `POST /api/v2/catalog/items/{id}/themes/{theme_id}/playback` for a
-  theme's grant, whose URL the Audio node plays (section 5.6).
+  theme's grant, whose URL the Audio node plays (section 5.6);
+- `GET /api/v2/subtitles/providers/status` for whether Search Subtitles…
+  shows, `POST /api/v2/subtitles/search` for one language of the playing
+  file, and `POST /api/v2/subtitles/download` for the result chosen,
+  sent once (section 5.7).
 
 ### 8.2 Loading rules
 
@@ -3017,6 +3096,27 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   stream index). A track picked from those in Roku's `*` overlay is written
   back, as any track that is not the plan's. The reload without carried
   sidecars when captions come on (above) is unchanged.
+- A subtitle Search Subtitles downloads (section 5.7) reaches playback only
+  through a plan, never through a URL the client builds (tvOS synthesizes
+  the session's stream URL for it). The server announces no provider
+  download in realtime, but every plan lists the file's stored subtitles
+  again, after the file's external and embedded tracks, as `source:
+  "downloaded"`. So, unless the playing plan lists it already, the player
+  sends a `track_change` that keeps the plan's audio and subtitle (in
+  place when the content carries that subtitle, so the content plays on),
+  or waits for a `track_change` already on its way. In the first plan
+  after the download it finds the inventory row whose `sync_key` is
+  `stored-{id}`, the download's `subtitle.id`, else the one downloaded
+  row in the result's language that the plan before the download did not
+  list, and chooses it as Options chooses a subtitle: a `track_change`
+  naming its `track_id` and `combined_index`, captions On, and, since the
+  content does not carry it, a reload at the position. It counts as
+  added, and the panel and Options close, only once a plan selects it; a
+  refused choice, a plan that selects another track, or no such plan
+  within 30 seconds says it was saved and is listed under Tracks. A plan
+  after the refresh that does not list it, a refused refresh, a plan of
+  another file, or no plan within 30 seconds leaves it stored for the
+  next time the file plays, and the panel says so (assumption AG-492).
 
 Subtitle artifacts are authenticated resources on the API origin, even when
 media comes from elsewhere; there is no signed subtitle URL. Sidecars use

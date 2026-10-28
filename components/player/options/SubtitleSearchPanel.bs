@@ -1,0 +1,243 @@
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/theme/upNext.bs"
+import "pkg:/source/util/values.bs"
+
+' Search Subtitles' drawing and focus. What a row does is decided in
+' source/playback/subtitleSearch.bs, which the specs cover.
+'
+' components/player/PlayerSubtitleSearch.bs creates the panel under the
+' player's optionsLayer in place of the Options panel, sets model, gives it
+' focus, and removes it when the search closes. It observes action and
+' back, and sets model again whenever the search moves on.
+'
+' tvOS's TVSubtitleDialog, in the Options panel's materials (spec section
+' 5.7): a 900 by 780 px glass panel centred over the video dimmed to 45%,
+' radius 28, a 1 px white 18% outline, padding 34 by 28; the title 30 px
+' SemiBold, the line under it 17 px at white 65%, then the rows: 72 px
+' track rows (OptionsRow, name over details, the provider at the right),
+' 14 px SemiBold section names at white 50%, lines of copy in 22 px, and
+' provider warnings in amber. A row another download waits behind is drawn
+' at 40%. The rows scroll to keep focus in view; the hint, 17 px at white
+' 55%, sits at the foot.
+const PANEL_FILL = "pkg:/images/player/rounded_28_fill_$$RES$$.9.png"
+const PANEL_RING = "pkg:/images/player/rounded_28_ring_$$RES$$.9.png"
+const PANEL_WIDTH = 900
+const PANEL_HEIGHT = 780
+const PANEL_X = 510
+const PANEL_TOP = 150
+const PADDING_X = 34
+const PADDING_Y = 28
+const TITLE_HEIGHT = 36
+const SUBTITLE_GAP = 6
+const SUBTITLE_HEIGHT = 24
+const LIST_GAP = 18
+const HINT_HEIGHT = 24
+const HINT_GAP = 14
+const TRACK_ROW = 72
+const PLAIN_ROW = 52
+const HEADER_HEIGHT = 17
+const HEADER_TOP = 14
+const HEADER_GAP = 10
+const LINE_HEIGHT = 34
+const ROW_SPACING = 4
+const DIM_OPACITY = 0.45
+const RING_OPACITY = 0.18
+const DISABLED_OPACITY = 0.4
+const HEADER_COLOR = "0xFFFFFF80"
+const SUBTITLE_COLOR = "0xFFFFFFA6"
+const HINT_COLOR = "0xFFFFFF8C"
+const LINE_COLOR = "0xFFFFFFB3"
+
+sub init()
+    m.top.findNode("dim").setFields({ width: 1920, height: 1080, color: "0x000000FF", opacity: DIM_OPACITY })
+    m.top.findNode("fill").setFields({ uri: PANEL_FILL, blendColor: theme.player.GLASS, opacity: theme.player.GLASS_OPACITY, translation: [PANEL_X, PANEL_TOP], width: PANEL_WIDTH, height: PANEL_HEIGHT })
+    m.top.findNode("border").setFields({ uri: PANEL_RING, blendColor: theme.color.WHITE, opacity: RING_OPACITY, translation: [PANEL_X, PANEL_TOP], width: PANEL_WIDTH, height: PANEL_HEIGHT })
+    m.width = PANEL_WIDTH - 2 * PADDING_X
+    x = PANEL_X + PADDING_X
+    y = PANEL_TOP + PADDING_Y
+    m.title = m.top.findNode("title")
+    m.title.setFields({ font: theme.font(theme.textStyle.HUD_PICKER_TITLE), color: theme.color.WHITE, translation: [x, y], width: m.width, height: TITLE_HEIGHT, vertAlign: "center" })
+    y = y + TITLE_HEIGHT + SUBTITLE_GAP
+    m.subtitle = m.top.findNode("subtitle")
+    m.subtitle.setFields({ font: theme.font(theme.textStyle.HUD_ATTR), color: SUBTITLE_COLOR, translation: [x, y], width: m.width, height: SUBTITLE_HEIGHT, vertAlign: "center" })
+    y = y + SUBTITLE_HEIGHT + LIST_GAP
+    bottom = PANEL_TOP + PANEL_HEIGHT - PADDING_Y
+    m.hint = m.top.findNode("hint")
+    m.hint.setFields({ font: theme.font(theme.textStyle.HUD_ATTR), color: HINT_COLOR, translation: [x, bottom - HINT_HEIGHT], width: m.width, height: HINT_HEIGHT, vertAlign: "center" })
+    m.listHeight = bottom - HINT_HEIGHT - HINT_GAP - y
+    m.list = m.top.findNode("list")
+    m.list.translation = [x, y]
+    m.list.clippingRect = [0, 0, m.width, m.listHeight]
+    m.rowLayer = m.top.findNode("rows")
+    m.keyFocus = m.top.findNode("keyFocus")
+    ' Pooled OptionsRow and Label nodes, and the model's rows as drawn:
+    ' { entry, node, top, height }.
+    m.rowPool = []
+    m.labelPool = []
+    m.drawn = []
+    m.focus = -1
+    m.scroll = 0
+    m.spokenTitle = ""
+end sub
+
+' --- The model --------------------------------------------------------------------
+
+sub onModel()
+    model = m.top.model
+    if not util.isObject(model) then return
+    previous = invalid
+    if m.focus >= 0 and m.focus < m.drawn.Count() then previous = m.drawn[m.focus].entry
+    m.title.text = util.text(model.title)
+    m.subtitle.text = util.text(model.subtitle)
+    m.hint.text = util.text(model.hint)
+    draw(model.rows)
+    target = -1
+    if previous <> invalid then target = sameRow(previous)
+    if target < 0 and util.isNumber(model.focus) then target = model.focus
+    if not focusable(target) then target = nextFocusable(-1, 1)
+    m.keyFocus.setFocus(true)
+    focusAt(target, true)
+end sub
+
+sub draw(rows as Dynamic)
+    m.drawn = []
+    usedRows = 0
+    usedLabels = 0
+    y = 0
+    if type(rows) <> "roArray" then rows = []
+    for each entry in rows
+        style = util.text(entry.style)
+        if style = "track"
+            if usedRows >= m.rowPool.Count() then m.rowPool.Push(m.rowLayer.createChild("OptionsRow"))
+            node = m.rowPool[usedRows]
+            usedRows = usedRows + 1
+            height = PLAIN_ROW
+            if util.text(entry.detail) <> "" then height = TRACK_ROW
+            opacity = 1.0
+            if not util.isTrue(entry.enabled) then opacity = DISABLED_OPACITY
+            node.setFields({ visible: true, opacity: opacity, width: m.width, height: height, translation: [0, y], style: "track", label: util.text(entry.label), detail: util.text(entry.detail), trailing: util.text(entry.trailing), chevron: false, checked: false, lit: false })
+        else
+            if usedLabels >= m.labelPool.Count() then m.labelPool.Push(m.rowLayer.createChild("Label"))
+            node = m.labelPool[usedLabels]
+            usedLabels = usedLabels + 1
+            top = y
+            height = LINE_HEIGHT
+            fields = { visible: true, width: m.width, text: util.text(entry.label), vertAlign: "center", wrap: false }
+            if style = "header"
+                if y > 0 then top = y + HEADER_TOP
+                height = top - y + HEADER_HEIGHT + HEADER_GAP
+                fields.font = theme.font(theme.textStyle.HUD_COLUMN_HEADER)
+                fields.color = HEADER_COLOR
+                fields.text = theme.tracked(UCase(fields.text))
+                fields.height = HEADER_HEIGHT
+            else
+                fields.font = theme.font(theme.textStyle.HUD_ROW)
+                fields.color = LINE_COLOR
+                if style = "warning" then fields.color = theme.color.WARNING
+                fields.height = LINE_HEIGHT
+            end if
+            fields.translation = [0, top]
+            node.setFields(fields)
+        end if
+        m.drawn.Push({ entry: entry, node: node, top: y, height: height })
+        y = y + height + ROW_SPACING
+    end for
+    for i = usedRows to m.rowPool.Count() - 1
+        m.rowPool[i].visible = false
+    end for
+    for i = usedLabels to m.labelPool.Count() - 1
+        m.labelPool[i].visible = false
+    end for
+    m.contentHeight = y - ROW_SPACING
+end sub
+
+' The index of the row that is previous by kind and value, or -1.
+function sameRow(previous as Object) as Integer
+    for i = 0 to m.drawn.Count() - 1
+        entry = m.drawn[i].entry
+        if util.text(entry.kind) <> "" and entry.kind = previous.kind and util.text(entry.value) = util.text(previous.value) then return i
+    end for
+    return -1
+end function
+
+' --- Focus ------------------------------------------------------------------------------
+
+function focusable(index as Integer) as Boolean
+    if index < 0 or index >= m.drawn.Count() then return false
+    entry = m.drawn[index].entry
+    return util.text(entry.style) = "track" and util.isTrue(entry.enabled)
+end function
+
+' The next row that takes focus from index in direction (1 or -1), or
+' index when there is none.
+function nextFocusable(index as Integer, direction as Integer) as Integer
+    i = index + direction
+    while i >= 0 and i < m.drawn.Count()
+        if focusable(i) then return i
+        i = i + direction
+    end while
+    return index
+end function
+
+sub focusAt(index as Integer, opened = false as Boolean)
+    m.focus = index
+    for i = 0 to m.drawn.Count() - 1
+        if util.text(m.drawn[i].entry.style) = "track" then m.drawn[i].node.lit = i = index
+    end for
+    scrollTo(index)
+    if index < 0 then return
+    spoken = util.text(m.drawn[index].entry.speech)
+    ' The panel's title and line when they change, then the row.
+    heading = m.title.text + ", " + m.subtitle.text
+    if opened and heading <> m.spokenTitle
+        m.spokenTitle = heading
+        spoken = heading + ". " + spoken
+    end if
+    say(spoken)
+end sub
+
+' Keeps the focused row in view; at the top, the section name over it
+' shows too.
+sub scrollTo(index as Integer)
+    top = 0
+    bottom = 0
+    if index >= 0
+        top = m.drawn[index].top
+        bottom = top + m.drawn[index].height
+        if index > 0 and util.text(m.drawn[index - 1].entry.style) = "header" then top = m.drawn[index - 1].top
+    end if
+    if index <= nextFocusable(-1, 1) then top = 0
+    if top < m.scroll then m.scroll = top
+    if bottom > m.scroll + m.listHeight then m.scroll = bottom - m.listHeight
+    last = m.contentHeight - m.listHeight
+    if last < 0 then last = 0
+    if m.scroll > last then m.scroll = last
+    if m.scroll < 0 then m.scroll = 0
+    m.rowLayer.translation = [0, -m.scroll]
+end sub
+
+' --- Keys ----------------------------------------------------------------------------------
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if key = "back"
+        m.top.back = true
+    else if key = "up" or key = "down"
+        direction = 1
+        if key = "up" then direction = -1
+        target = nextFocusable(m.focus, direction)
+        if target <> m.focus then focusAt(target)
+    else if key = "OK"
+        if focusable(m.focus)
+            entry = m.drawn[m.focus].entry
+            m.top.action = { kind: entry.kind, value: entry.value }
+        end if
+    end if
+    return key = "back" or key = "up" or key = "down" or key = "left" or key = "right" or key = "OK"
+end function
+
+sub say(text as String)
+    if text = "" then return
+    if m.audioGuide = invalid then m.audioGuide = CreateObject("roAudioGuide")
+    if m.audioGuide <> invalid then m.audioGuide.Say(text, true, true)
+end sub

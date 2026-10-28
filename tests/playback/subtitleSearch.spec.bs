@@ -1,0 +1,322 @@
+namespace tests
+
+    ' Search Subtitles in the player (source/playback/subtitleSearch.bs): its
+    ' requests against the contract, what an answer means, the panel's
+    ' state and rows, and the plan steps that bring a stored subtitle in, as
+    ' tvOS's SubtitleSearchMenu, SubtitleSearchModels, and
+    ' SubtitleProvidersStore have them.
+    @suite("playback subtitle search")
+    class PlaybackSubtitleSearchTests extends rooibos.BaseTestSuite
+
+        function copy() as Object
+            return playback.subtitleSearch.words(i18n.load("en_US"))
+        end function
+
+        ' The fixture plan: file 42, English audio 0, subtitles off, and five
+        ' inventory rows, the last a Spanish downloaded SRT.
+        function plan() as Object
+            return tests.sessions.fixture("playback_start_opaque_ids").playback_plan
+        end function
+
+        function result(key as String, overrides = {} as Object) as Object
+            parts = key.Split(":")
+            out = { key: key, id: parts[1], provider: parts[0], language: "en", releaseName: "Heat.1995.1080p.BluRay.x264", format: "srt", score: 87.5, downloads: 1234, hearingImpaired: false }
+            out.Append(overrides)
+            return out
+        end function
+
+        function envelope(ok as Boolean, status as Integer, body as Dynamic, errorKind = "" as String, problemType = invalid as Dynamic) as Object
+            failure = invalid
+            if not ok then failure = { kind: errorKind, status: status, problemType: problemType, instance: invalid, retryAfterSeconds: invalid, reason: invalid }
+            return { requestId: "r", ok: ok, status: status, headers: {}, body: body, error: failure }
+        end function
+
+        function kinds(rows as Object) as Object
+            out = []
+            for each entry in rows
+                if entry.style = "track" then out.Push(entry.kind) else out.Push(entry.style)
+            end for
+            return out
+        end function
+
+        @describe("the server contract")
+
+        @it("sends the provider status, search, and download with their method and path, as the profile")
+        sub _()
+            operations = tests.catalogData.operations()
+            entries = [
+                ["getSubtitleProviderStatus", playback.subtitleSearch.statusRequest()]
+                ["searchSubtitles", playback.subtitleSearch.searchRequest("42", "en")]
+                ["downloadSubtitle", playback.subtitleSearch.downloadRequest("42", m.result("opensubtitles:8812345"))]
+            ]
+            for each entry in entries
+                operation = operations[entry[0]]
+                m.assertNotInvalid(operation, entry[0])
+                request = tests.catalogData.sent(entry[1])
+                m.assertNotInvalid(request, entry[0] + " cannot be sent")
+                m.assertEqual([request.method, request.path, request.auth], [operation.method, operation.path, "profile"], entry[0])
+            end for
+        end sub
+
+        @it("sends the golden bodies for a search and a download, echoing the result as the search returned it")
+        sub _()
+            hearing = m.result("opensubtitles:8812345", { hearingImpaired: true })
+            for each entry in [["subtitle-search/english", playback.subtitleSearch.searchRequest("42", "en")], ["subtitle-download/result", playback.subtitleSearch.downloadRequest("42", hearing)]]
+                golden = tests.devices.loadJson("pkg:/tests/fixtures/golden/" + entry[0] + ".json")
+                m.assertEqual(entry[1].body, golden, "GOLDEN " + entry[0] + ".json " + FormatJson(entry[1].body))
+            end for
+        end sub
+
+        @it("waits up to a minute for a search's provider fan-out and a download")
+        sub _()
+            m.assertEqual(tests.catalogData.sent(playback.subtitleSearch.searchRequest("42", "en")).timeoutMs, 60000)
+            m.assertEqual(tests.catalogData.sent(playback.subtitleSearch.downloadRequest("42", m.result("subdl:7"))).timeoutMs, 60000)
+        end sub
+
+        @describe("answers")
+
+        @it("reads the provider status as tvOS does, and only an answer counts")
+        sub _()
+            m.assertFalse(playback.subtitleSearch.available(tests.contract.fixture("subtitle_providers_disabled")))
+            m.assertTrue(playback.subtitleSearch.available({ schema_version: 1, enabled: true, providers: ["opensubtitles"], revision: "r", state: "available", allowed: true }))
+            m.assertFalse(playback.subtitleSearch.available({ schema_version: 1, enabled: true, providers: ["opensubtitles"], revision: "r", state: "available", allowed: false }))
+            m.assertFalse(playback.subtitleSearch.available({ enabled: true, state: "disabled" }))
+            m.assertInvalid(playback.subtitleSearch.available(invalid))
+            m.assertInvalid(playback.subtitleSearch.available({ state: "available" }))
+        end sub
+
+        @it("reads the server's partial search as one result and its warning")
+        sub _()
+            body = tests.contract.fixture("subtitles_search_partial")
+            found = playback.subtitleSearch.resultsOf(body)
+            m.assertEqual(found.Count(), 1)
+            m.assertEqual(found[0].key, "example:opaque-result")
+            m.assertEqual([found[0].language, found[0].format, found[0].score, found[0].hearingImpaired], ["en", "srt", 0, false])
+            m.assertEqual(playback.subtitleSearch.warnings(body), ["One or more subtitle providers could not complete the search."])
+            m.assertInvalid(playback.subtitleSearch.resultsOf({ warnings: [] }))
+            m.assertEqual(playback.subtitleSearch.resultsOf({ results: [{ id: "1" }, { provider: "x" }], warnings: [] }).Count(), 0, "a result without an id or provider cannot be downloaded")
+        end sub
+
+        @it("tells a stored download from one never stored and one that may have been")
+        sub _()
+            stored = playback.subtitleSearch.downloadOutcome(m.envelope(true, 200, tests.contract.fixture("subtitle_download")), "42")
+            m.assertEqual([stored.kind, stored.storedId], ["stored", "9007199254740993"])
+            other = playback.subtitleSearch.downloadOutcome(m.envelope(true, 200, tests.contract.fixture("subtitle_download")), "7")
+            m.assertEqual([other.kind, other.storedId, other.message], ["stored", "", "stored"], "a row of another file is stored, not this file's")
+            for each lost in [m.envelope(false, 0, invalid, "timeout"), m.envelope(false, 0, invalid, "network"), m.envelope(false, 502, invalid, "http"), m.envelope(true, 200, {})]
+                m.assertEqual(playback.subtitleSearch.downloadOutcome(lost, "42").kind, "unconfirmed", FormatJson(lost))
+            end for
+            refused = playback.subtitleSearch.downloadOutcome(m.envelope(false, 500, invalid, "http", "internal_error"), "42")
+            m.assertEqual([refused.kind, refused.message], ["failed", "downloadFailed"])
+            m.assertEqual(playback.subtitleSearch.downloadOutcome(m.envelope(false, 429, invalid, "http", "rate_limited"), "42").message, "rateLimited")
+            m.assertEqual(playback.subtitleSearch.downloadOutcome(m.envelope(false, 403, invalid, "http", "forbidden"), "42").message, "notAllowed")
+            m.assertEqual(playback.subtitleSearch.downloadOutcome(m.envelope(false, 404, invalid, "http", "provider_not_found"), "42").message, "notFound")
+            unsent = playback.subtitleSearch.downloadOutcome(m.envelope(false, 0, invalid, "profile_required"), "42")
+            m.assertEqual([unsent.kind, unsent.message], ["failed", "downloadFailed"])
+        end sub
+
+        @it("names a failed search's cause when the viewer can act on it")
+        sub _()
+            m.assertEqual(playback.subtitleSearch.searchFailure(m.envelope(false, 429, invalid, "http", "rate_limited")), "rateLimited")
+            m.assertEqual(playback.subtitleSearch.searchFailure(m.envelope(false, 0, invalid, "timeout")), "searchFailed")
+        end sub
+
+        @describe("the panel's state")
+
+        @it("opens on the language list at the profile's subtitle language, else the first")
+        sub _()
+            m.assertEqual(playback.subtitleSearch.create("fre").language, "fr")
+            m.assertEqual(playback.subtitleSearch.create("").language, "ar")
+        end sub
+
+        @it("searches on a pick, once at a time, and lists what comes back")
+        sub _()
+            state = playback.subtitleSearch.create("en")
+            m.assertTrue(playback.subtitleSearch.pick(state, "de", false))
+            m.assertEqual([state.phase, state.searched], ["searching", "de"])
+            m.assertFalse(playback.subtitleSearch.pick(state, "fr", false), "one search at a time")
+            playback.subtitleSearch.searched(state, [m.result("opensubtitles:1")], [])
+            m.assertEqual(state.phase, "results")
+            m.assertTrue(playback.subtitleSearch.back(state) = false and state.phase = "picking", "Back returns to the languages")
+            m.assertTrue(playback.subtitleSearch.back(state), "Back from the languages closes")
+        end sub
+
+        @it("offers Try Again after a failed search, and says when search is not set up")
+        sub _()
+            state = playback.subtitleSearch.create("en")
+            playback.subtitleSearch.pick(state, "en", false)
+            playback.subtitleSearch.searchFailed(state, "searchFailed")
+            m.assertEqual([state.phase, state.message, state.retry], ["failed", "searchFailed", true])
+            off = playback.subtitleSearch.create("en")
+            m.assertFalse(playback.subtitleSearch.pick(off, "en", true))
+            m.assertEqual([off.phase, off.message, off.retry], ["failed", "notSetUp", false])
+            idle = playback.subtitleSearch.create("en")
+            playback.subtitleSearch.unavailable(idle)
+            m.assertEqual(idle.message, "notSetUp")
+            busy = playback.subtitleSearch.create("en")
+            playback.subtitleSearch.pick(busy, "en", false)
+            playback.subtitleSearch.unavailable(busy)
+            m.assertEqual(busy.phase, "searching", "a search on its way stays")
+        end sub
+
+        @it("downloads one result at a time and never sends a stored or uncertain one again")
+        sub _()
+            state = playback.subtitleSearch.create("en")
+            playback.subtitleSearch.pick(state, "en", false)
+            playback.subtitleSearch.searched(state, [m.result("opensubtitles:1"), m.result("subdl:2")], [])
+            chosen = playback.subtitleSearch.choose(state, "subdl:2")
+            m.assertEqual(chosen.id, "2")
+            m.assertInvalid(playback.subtitleSearch.choose(state, "opensubtitles:1"), "one download at a time")
+            m.assertFalse(playback.subtitleSearch.back(state))
+            m.assertEqual(state.phase, "results", "Back does nothing while a download is out")
+            playback.subtitleSearch.downloaded(state, "subdl:2", playback.subtitleSearch.UNCONFIRMED, "unconfirmed")
+            m.assertEqual([state.phase, state.message, state.downloading], ["failed", "unconfirmed", ""])
+            playback.subtitleSearch.back(state)
+            playback.subtitleSearch.pick(state, "en", false)
+            playback.subtitleSearch.searched(state, [m.result("opensubtitles:1"), m.result("subdl:2")], [])
+            m.assertInvalid(playback.subtitleSearch.choose(state, "subdl:2"))
+            m.assertEqual([state.phase, state.message], ["failed", "unconfirmed"], "the message shows again instead of a second download")
+        end sub
+
+        @describe("what the panel draws")
+
+        @it("lists the preferred language first, then the rest by name, focused on the preferred")
+        sub _()
+            copy = m.copy()
+            view = playback.subtitleSearch.view(playback.subtitleSearch.create("ja"), "ja", copy)
+            rows = view.rows
+            m.assertEqual([rows[0].style, rows[0].label], ["header", "Preferred language"])
+            m.assertEqual([rows[1].value, rows[1].label, rows[1].detail], ["ja", "Japanese", "Preferred"])
+            m.assertEqual([rows[2].style, rows[2].label], ["header", "All languages"])
+            m.assertEqual([rows[3].label, rows[4].label], ["Arabic", "Bulgarian"])
+            m.assertEqual(view.focus, 1)
+            m.assertEqual(rows.Count(), 45, "43 languages and 2 section names")
+            plain = playback.subtitleSearch.view(playback.subtitleSearch.create(""), "", copy)
+            m.assertEqual(plain.rows[0].label, "Language")
+        end sub
+
+        @it("draws results with their match, language, downloads, HI, format, and provider, warnings first")
+        sub _()
+            copy = m.copy()
+            state = playback.subtitleSearch.create("en")
+            playback.subtitleSearch.pick(state, "en", false)
+            playback.subtitleSearch.searched(state, [m.result("opensubtitles:1", { hearingImpaired: true }), m.result("subdl:2", { releaseName: "", downloads: 0 })], ["One or more subtitle providers could not complete the search."])
+            view = playback.subtitleSearch.view(state, "en", copy)
+            m.assertEqual(view.subtitle, "English · 2 results")
+            m.assertEqual(m.kinds(view.rows), ["warning", "result", "result"])
+            m.assertEqual([view.rows[1].label, view.rows[1].detail, view.rows[1].trailing], ["Heat.1995.1080p.BluRay.x264", "88% match · English · 1234 downloads · HI · SRT", "OpenSubtitles"])
+            m.assertEqual([view.rows[2].label, view.rows[2].trailing], ["Untitled release", "SubDL"])
+            m.assertEqual(view.focus, 1)
+            m.assertEqual(view.hint, "Select a subtitle to download and use it")
+            playback.subtitleSearch.choose(state, "subdl:2")
+            busy = playback.subtitleSearch.view(state, "en", copy)
+            m.assertEqual([busy.rows[1].enabled, busy.rows[2].enabled, busy.rows[2].trailing, busy.focus, busy.hint], [false, true, "Adding subtitle…", 2, "Adding subtitle…"])
+        end sub
+
+        @it("offers another language when nothing was found, and Try Again and Back after a failure")
+        sub _()
+            copy = m.copy()
+            state = playback.subtitleSearch.create("en")
+            playback.subtitleSearch.pick(state, "fr", false)
+            playback.subtitleSearch.searched(state, [], [])
+            empty = playback.subtitleSearch.view(state, "en", copy)
+            m.assertEqual(m.kinds(empty.rows), ["text", "back"])
+            m.assertEqual(empty.rows[0].label, "No subtitles found for French.")
+            m.assertEqual(empty.rows[1].label, "Choose another language")
+            playback.subtitleSearch.back(state)
+            playback.subtitleSearch.pick(state, "fr", false)
+            searching = playback.subtitleSearch.view(state, "en", copy)
+            m.assertEqual([searching.subtitle, searching.rows[2].label], ["Finding subtitles in French", "Cancel"])
+            playback.subtitleSearch.searchFailed(state, "rateLimited")
+            failed = playback.subtitleSearch.view(state, "en", copy)
+            m.assertEqual(m.kinds(failed.rows), ["text", "retry", "back"])
+            m.assertEqual([failed.rows[0].label, failed.rows[1].value, failed.focus], ["Subtitle providers are busy. Try again in a minute.", "fr", 1])
+        end sub
+
+        @it("names providers as tvOS does and colours scores in its tiers")
+        sub _()
+            m.assertEqual(playback.subtitleSearch.providerName("subsource"), "Subsource")
+            m.assertEqual(playback.subtitleSearch.providerName("addic7ed"), "addic7ed")
+            m.assertEqual([playback.subtitleSearch.scoreTier(70), playback.subtitleSearch.scoreTier(40), playback.subtitleSearch.scoreTier(39.9)], ["good", "fair", "poor"])
+        end sub
+
+        @describe("into playback")
+
+        @it("is offered while a plan plays a file, until the provider status says no")
+        sub _()
+            m.assertTrue(playback.subtitleSearch.offered(m.plan(), invalid))
+            m.assertTrue(playback.subtitleSearch.offered(m.plan(), true))
+            m.assertFalse(playback.subtitleSearch.offered(m.plan(), false))
+            m.assertFalse(playback.subtitleSearch.offered(invalid, true))
+        end sub
+
+        @it("replans keeping the plan's audio and subtitle")
+        sub _()
+            plan = m.plan()
+            plan.selected_tracks.subtitle = { id: "file:42:subtitle:0", index: 0 }
+            event = playback.subtitleSearch.refreshEvent(plan, true)
+            m.assertEqual(event, { type: "trackChange", tracks: { audio: { id: "file:42:audio:0", index: 0 }, subtitle: { id: "file:42:subtitle:0", index: 0 } }, inPlace: true })
+            plan.selected_tracks.Delete("subtitle")
+            m.assertEqual(playback.subtitleSearch.refreshEvent(plan, true).tracks, { audio: { id: "file:42:audio:0", index: 0 } }, "Off stays off")
+        end sub
+
+        @it("finds the stored subtitle in the new plan by its sync key, else as the one new downloaded row")
+        sub _()
+            before = playback.subtitleSearch.trackIds(m.plan())
+            plan = m.plan()
+            plan.subtitle.inventory.Push({ track_id: "file:42:subtitle:5", combined_index: 5, source: "downloaded", codec: "srt", language: "en", label: "Heat.1995", forced: false, default: false, hearing_impaired: false, delivery: "sidecar", url: "/api/v2/stream/s/subtitles/5.vtt?file_id=42", sync_key: "stored-77" })
+            m.assertEqual(playback.subtitleSearch.downloadedEntry(plan, "77", before, "en").track_id, "file:42:subtitle:5")
+            plan.subtitle.inventory[5].Delete("sync_key")
+            m.assertEqual(playback.subtitleSearch.downloadedEntry(plan, "77", before, "en").track_id, "file:42:subtitle:5", "a format without a sync key")
+            m.assertInvalid(playback.subtitleSearch.downloadedEntry(plan, "77", before, "de"), "not in the language downloaded")
+            m.assertInvalid(playback.subtitleSearch.downloadedEntry(m.plan(), "77", before, "en"), "a plan that does not list it yet")
+            plan.subtitle.inventory.Push({ track_id: "file:42:subtitle:6", combined_index: 6, source: "downloaded", codec: "srt", language: "eng", forced: false, default: false, hearing_impaired: false, delivery: "sidecar" })
+            m.assertInvalid(playback.subtitleSearch.downloadedEntry(plan, "77", before, "en"), "two new rows: neither is chosen")
+        end sub
+
+        @it("drops a search or results for a file that no longer plays, but not a download on its way")
+        sub _()
+            state = playback.subtitleSearch.create("en")
+            playback.subtitleSearch.pick(state, "fr", false)
+            state.file = "42"
+            m.assertFalse(playback.subtitleSearch.forFile(state, "42"))
+            playback.subtitleSearch.searched(state, [m.result("opensubtitles:1")], [])
+            m.assertTrue(playback.subtitleSearch.forFile(state, "43"))
+            m.assertEqual([state.phase, state.results.Count(), state.searched, state.file], ["picking", 0, "", ""])
+            playback.subtitleSearch.pick(state, "fr", false)
+            state.file = "43"
+            playback.subtitleSearch.searched(state, [m.result("opensubtitles:1")], [])
+            playback.subtitleSearch.choose(state, "opensubtitles:1")
+            m.assertFalse(playback.subtitleSearch.forFile(state, "44"), "the download is the player's")
+            m.assertEqual(state.phase, "results")
+        end sub
+
+        @it("counts the stored subtitle as added only once a plan selects it")
+        sub _()
+            plan = m.plan()
+            plan.selected_tracks.subtitle = { id: "file:42:subtitle:4", index: 4 }
+            plan.subtitle.mode = "render"
+            plan.subtitle.track_id = "file:42:subtitle:4"
+            m.assertEqual(playback.subtitleSearch.selectionOutcome(plan, "file:42:subtitle:4", false), "added")
+            other = m.plan()
+            m.assertEqual(playback.subtitleSearch.selectionOutcome(other, "file:42:subtitle:4", true), "", "a track change still on its way brings another plan")
+            m.assertEqual(playback.subtitleSearch.selectionOutcome(other, "file:42:subtitle:4", false), "failed", "refused or replaced: not turned on")
+            m.assertEqual(playback.subtitleSearch.words(i18n.load("en_US")).notTurnedOn, "The subtitle was saved but couldn't be turned on. Choose it under Tracks in Subtitles.")
+        end sub
+
+        @it("adds Search Subtitles… under the caption modes, which opens the search")
+        sub _()
+            copy = playback.options.words(i18n.load("en_US"))
+            state = { plan: m.plan(), version: invalid, quality: "auto", switching: false, captionMode: "Off", modelType: "STB", autoplay: true, episode: false, info: { title: "Heat" }, stats: [], contentTracks: invalid, subtitleSearch: true }
+            columns = playback.options.subtitleColumns(state, copy)
+            modes = columns[1].rows
+            last = modes[modes.Count() - 1]
+            m.assertEqual([last.kind, last.label, last.style, last.chevron], ["subtitleSearch", "Search Subtitles…", "setting", true])
+            m.assertEqual(playback.options.choose(state, { kind: "subtitleSearch", value: invalid }), { kind: "subtitleSearch" })
+            state.subtitleSearch = false
+            columns = playback.options.subtitleColumns(state, copy)
+            m.assertEqual(columns[1].rows[columns[1].rows.Count() - 1].kind, "caption")
+            m.assertEqual(playback.options.choose(state, { kind: "subtitleSearch", value: invalid }), { kind: "none" })
+        end sub
+    end class
+end namespace

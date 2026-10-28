@@ -4,8 +4,9 @@ History page's removal body, against the server contract.
 
 Every tests/fixtures/golden/<kind>/*.json must be a valid body of its kind
 (GOLDEN below: start, replan, progress, stop, route-event, and
-history-remove, theme-playback, the shuffle bodies, and Browse's catalog
-groups, which are checked against their schemas only), checked three ways:
+history-remove, theme-playback, the shuffle bodies, Browse's catalog
+groups, and the subtitle search and download bodies, which are checked
+against their schemas only), checked three ways:
 
 1. The vendored schema subset (tests/fixtures/openapi/playback-v3.json, from
    scripts/sync-fixtures.sh): required members, additionalProperties, types,
@@ -63,6 +64,10 @@ GOLDEN = {
     # Browse's filters as the groups parameter's JSON (libraryFilters.query):
     # an array of the schema's groups.
     "catalog-groups": "CatalogQueryGroup[]",
+    # The player's subtitle search and download (playback.subtitleSearch's
+    # searchRequest and downloadRequest).
+    "subtitle-search": "SubtitleSearchBody",
+    "subtitle-download": "SubtitleDownloadBody",
 }
 PLAYBACK = {"start", "replan", "progress", "stop", "route-event"}
 REQUESTS = {
@@ -75,6 +80,8 @@ REQUESTS = {
     "createShuffle": "CreateShuffleRequest",
     "advanceShuffle": "AdvanceShuffleRequest",
     "skipShuffleItem": "SkipShuffleItemRequest",
+    "searchSubtitles": "SubtitleSearchBody",
+    "downloadSubtitle": "SubtitleDownloadBody",
 }
 # Keywords the walker checks, and ones that only document a schema (format
 # adds nothing here: every int64 and double member also has a type).
@@ -120,6 +127,16 @@ def json_type(value):
     return "null"
 
 
+# Go's RE2 class for Unicode separators (SubtitleDownloadBody.language), which
+# Python's re lacks, as the members it stands for.
+UNICODE_SEPARATORS = "\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"
+
+
+def python_pattern(pattern):
+    """A schema's RE2 pattern as Python's re reads it."""
+    return pattern.replace("\\p{Z}", UNICODE_SEPARATORS)
+
+
 def walk(schema, value, path, errors):
     """Append every way value breaks schema to errors."""
     ref = schema.get("$ref")
@@ -152,7 +169,7 @@ def walk(schema, value, path, errors):
             errors.append(f"{path}: shorter than {schema['minLength']}")
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             errors.append(f"{path}: longer than {schema['maxLength']}")
-        if "pattern" in schema and not re.search(schema["pattern"], value):
+        if "pattern" in schema and not re.search(python_pattern(schema["pattern"]), value):
             errors.append(f"{path}: does not match {schema['pattern']}")
     elif actual in ("integer", "number"):
         if "minimum" in schema and value < schema["minimum"]:

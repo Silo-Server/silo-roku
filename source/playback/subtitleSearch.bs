@@ -1,0 +1,512 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/playback/media.bs"
+import "pkg:/source/playback/tracks.bs"
+import "pkg:/source/playback/options.bs"
+import "pkg:/source/catalog/pickers.bs"
+
+' Search Subtitles in the player (spec sections 5.7 and 9.7), as tvOS's
+' SubtitleSearchMenu and SubtitleProvidersStore have it: the viewer picks a
+' language, the server searches its subtitle providers for the playing file,
+' and the result picked is downloaded, stored on the server for that file,
+' and turned on. Pure: request builders for api.send, what an answer means,
+' the panel's state and what it draws (view), and the plan steps that bring
+' the stored subtitle into playback. components/player/PlayerSubtitleSearch.bs
+' sends the requests and carries the steps out.
+'
+' The server keys a search on the media file alone (title, year, episode,
+' and hash are its own); the client sends the file and one language, with
+' no query text and no hearing-impaired or forced filter, as tvOS and
+' Android TV do. A download is sent once (the contract's non_retryable):
+' a result whose download was stored, or may have been, is not sent again
+' while the panel stays open (settled).
+'
+' The stored subtitle reaches playback only through a plan (AGENTS.md;
+' spec section 9.7): tvOS builds its stream URL itself, which Roku must
+' not. The server sends no realtime event for a provider download, but
+' every replan lists the file's stored subtitles again, so the player sends
+' a track_change that keeps the plan's selection (refreshEvent), finds the
+' new row in the plan that answers it (downloadedEntry), and chooses it as
+' a viewer chooses a subtitle in Options (assumption AG-492). It counts
+' as added once a plan selects it (selectionOutcome).
+'
+' The panel's state (create):
+'   phase: PICKING, SEARCHING, RESULTS, or FAILED
+'   language: the language focused or last searched, a code from LANGUAGES
+'   searched: the language the results or failure are for, "" for none
+'   results: the results (resultsOf()), warnings: the provider warnings
+'   downloading: the key of the result whose download is out, or ""
+'   settled: result key to the message shown for it again (stored or
+'     unconfirmed downloads)
+'   message: the failure's copy key under subtitleSearch.
+'   file: the media file the search was sent for, "" before one (forFile)
+'   retry: whether the failure offers Try Again
+namespace playback.subtitleSearch
+    const PICKING = "picking"
+    const SEARCHING = "searching"
+    const RESULTS = "results"
+    const FAILED = "failed"
+
+    ' What a download did, as tvOS's SubtitleDownloadOutcome: stored on the
+    ' server (and then added to playback, or not), definitely not stored, or
+    ' maybe stored with no usable answer.
+    const STORED = "stored"
+    const ADDED = "added"
+    const NOT_STORED = "failed"
+    const UNCONFIRMED = "unconfirmed"
+
+    ' The server fans a search out to its providers with a 20 to 30 second
+    ' timeout each (tvOS: "This can take up to half a minute"); a download
+    ' fetches one file from one provider.
+    const SEARCH_TIMEOUT_MS = 60000
+    const DOWNLOAD_TIMEOUT_MS = 60000
+
+    ' The languages offered, the strings table's language names (language.*
+    ' in locale/), as tvOS offers its PlaybackLanguageOption catalog.
+    const LANGUAGES = "ar,bg,ca,cs,da,de,el,en,es,et,fa,fi,fr,he,hi,hr,hu,id,is,it,ja,ko,lt,lv,ms,nl,no,pl,pt,ro,ru,sk,sl,sr,sv,ta,te,th,tl,tr,uk,vi,zh"
+
+    ' Row kinds the panel reports back with a row's value.
+    const ROW_LANGUAGE = "language"
+    const ROW_RESULT = "result"
+    const ROW_RETRY = "retry"
+    const ROW_BACK = "back"
+    const ROW_CANCEL = "cancel"
+
+    ' --- Requests ----------------------------------------------------------------
+
+    ' GET /api/v2/subtitles/providers/status: whether this viewer can search.
+    function statusRequest() as Object
+        return { path: "/api/v2/subtitles/providers/status", auth: "profile" }
+    end function
+
+    ' POST /api/v2/subtitles/search for the playing file in one language.
+    function searchRequest(fileId as String, language as String) as Object
+        return { method: "POST", path: "/api/v2/subtitles/search", body: { media_file_id: fileId, languages: [language] }, auth: "profile", timeoutMs: SEARCH_TIMEOUT_MS }
+    end function
+
+    ' POST /api/v2/subtitles/download for a result (resultsOf()), echoing it as
+    ' the search returned it, its language included.
+    function downloadRequest(fileId as String, result as Object) as Object
+        body = { media_file_id: fileId, provider: result.provider, subtitle_id: result.id, language: result.language, release_name: result.releaseName, score: result.score, hearing_impaired: result.hearingImpaired }
+        return { method: "POST", path: "/api/v2/subtitles/download", body: body, auth: "profile", timeoutMs: DOWNLOAD_TIMEOUT_MS }
+    end function
+
+    ' --- Answers ------------------------------------------------------------------
+
+    ' The provider status as tvOS reads it (APIv2SubtitleProviderStatus
+    ' isAvailable): available when enabled, its state available, and
+    ' allowed not false. invalid when the body is not an answer, which
+    ' leaves what was known (SubtitleProvidersStore: only an answer turns
+    ' search off).
+    function available(body as Dynamic) as Dynamic
+        if not util.isObject(body) or not util.isBoolean(body.enabled) then return invalid
+        if not body.enabled then return false
+        if util.isString(body.state) and body.state <> "available" then return false
+        return not (util.isBoolean(body.allowed) and not body.allowed)
+    end function
+
+    ' A search's results in the server's order (best first), each
+    ' { key, id, provider, language, releaseName, format, score, downloads,
+    ' hearingImpaired }, key "provider:id" as tvOS's uniqueKey; invalid when
+    ' the body is not an answer. A result without an id or provider cannot
+    ' be downloaded and is left out.
+    function resultsOf(body as Dynamic) as Dynamic
+        if not util.isObject(body) or not playback.values.isArray(body.results) then return invalid
+        out = []
+        for each item in body.results
+            if util.isObject(item) and playback.values.isText(item.id) and playback.values.isText(item.provider)
+                out.Push({ key: item.provider + ":" + item.id, id: item.id, provider: item.provider, language: util.text(item.language), releaseName: util.text(item.release_name).Trim(), format: util.text(item.format), score: playback.values.number(item.score, 0), downloads: playback.values.number(item.downloads, 0), hearingImpaired: util.isTrue(item.hearing_impaired) })
+            end if
+        end for
+        return out
+    end function
+
+    function warnings(body as Dynamic) as Object
+        out = []
+        if util.isObject(body) and playback.values.isArray(body.warnings)
+            for each warning in body.warnings
+                if playback.values.isText(warning) then out.Push(warning)
+            end for
+        end if
+        return out
+    end function
+
+    ' The copy key for a search that failed, from the result envelope
+    ' (source/api/response.bs).
+    function searchFailure(result as Dynamic) as String
+        reason = refusal(result)
+        if reason <> "" then return reason
+        return "searchFailed"
+    end function
+
+    ' What a download's result envelope means: { kind, storedId, message }.
+    ' A 200 naming the stored subtitle is STORED, unless it names another
+    ' file, which is stored but not this file's (tvOS's
+    ' invalidSubtitleResponse); a 200 without one, a lost answer, or a
+    ' gateway's error without the server's Problem may have stored it
+    ' (UNCONFIRMED); the server's own refusal, or a request never sent, did
+    ' not (NOT_STORED).
+    function downloadOutcome(result as Dynamic, fileId as String) as Object
+        if not util.isObject(result) then return { kind: UNCONFIRMED, storedId: "", message: "unconfirmed" }
+        if util.isTrue(result.ok)
+            subtitle = invalid
+            if util.isObject(result.body) then subtitle = result.body.subtitle
+            if not util.isObject(subtitle) or not playback.values.isText(subtitle.id) then return { kind: UNCONFIRMED, storedId: "", message: "unconfirmed" }
+            if util.text(subtitle.media_file_id) <> fileId then return { kind: STORED, storedId: "", message: "stored" }
+            return { kind: STORED, storedId: subtitle.id, message: "" }
+        end if
+        failure = result.error
+        errorKind = ""
+        if util.isObject(failure) then errorKind = util.text(failure.kind)
+        if errorKind = "timeout" or errorKind = "network" or errorKind = "parse" or errorKind = "too_large" or errorKind = "cancelled" or (errorKind = "http" and not playback.values.isText(failure.problemType))
+            return { kind: UNCONFIRMED, storedId: "", message: "unconfirmed" }
+        end if
+        message = refusal(result)
+        if message = "" then message = "downloadFailed"
+        return { kind: NOT_STORED, storedId: "", message: message }
+    end function
+
+    ' The copy key for a refusal the viewer can act on, or "": providers
+    ' busy (429), not allowed here (403, such as a demo server), or a
+    ' result or file that is gone (404).
+    function refusal(result as Dynamic) as String
+        if not util.isObject(result) or not util.isObject(result.error) then return ""
+        failure = result.error
+        status = playback.values.number(failure.status, 0)
+        if status = 0 then status = playback.values.number(result.status, 0)
+        if status = 429 or util.text(failure.problemType) = "rate_limited" then return "rateLimited"
+        if status = 403 then return "notAllowed"
+        if status = 404 then return "notFound"
+        return ""
+    end function
+
+    ' --- The panel's state ----------------------------------------------------------
+
+    ' A panel on the language list, focused on preferred (a language code,
+    ' or "" for none), else the first language.
+    function create(preferred as String) as Object
+        language = playback.tracks.languageKey(preferred)
+        if language = "" then language = LANGUAGES.Split(",")[0]
+        return { phase: PICKING, language: language, searched: "", results: [], warnings: [], downloading: "", settled: {}, message: "", retry: false, file: "" }
+    end function
+
+    ' A language picked: whether to send its search, which is not while one
+    ' is out or a download is (tvOS's search(language:)). Picking is the
+    ' search. turnedOff (the provider status said no after the panel
+    ' opened) shows that instead, with Back alone.
+    function pick(state as Object, language as String, turnedOff as Boolean) as Boolean
+        if state.downloading <> "" or state.phase = SEARCHING then return false
+        state.language = language
+        if turnedOff
+            fail(state, "notSetUp", false)
+            state.searched = ""
+            return false
+        end if
+        state.searched = language
+        state.phase = SEARCHING
+        state.results = []
+        state.warnings = []
+        return true
+    end function
+
+    sub searched(state as Object, found as Object, warned as Object)
+        if state.phase <> SEARCHING then return
+        state.results = found
+        state.warnings = warned
+        state.phase = RESULTS
+    end sub
+
+    ' A search that failed offers Try Again.
+    sub searchFailed(state as Object, message as String)
+        if state.phase <> SEARCHING then return
+        fail(state, message, true)
+    end sub
+
+    ' The result with key picked: the result to download, or invalid when a
+    ' download is out or the result settled already, whose message shows
+    ' again instead of a second download.
+    function choose(state as Object, key as String) as Dynamic
+        if state.downloading <> "" or state.phase <> RESULTS then return invalid
+        if state.settled.DoesExist(key)
+            fail(state, state.settled[key], false)
+            return invalid
+        end if
+        for each result in state.results
+            if result.key = key
+                state.downloading = key
+                return result
+            end if
+        end for
+        return invalid
+    end function
+
+    ' How the download of the result with key ended: kind ADDED closes the
+    ' panel (the player's doing); the others show their message, STORED and
+    ' UNCONFIRMED settling the result.
+    sub downloaded(state as Object, key as String, kind as String, message as String)
+        if state.downloading <> key then return
+        state.downloading = ""
+        if kind = ADDED then return
+        if kind = STORED or kind = UNCONFIRMED then state.settled[key] = message
+        fail(state, message, false)
+    end sub
+
+    ' The file playing now (fileId): a search or results for another file
+    ' (playback fell back to another version meanwhile) give way to the
+    ' language list, so no result is downloaded onto a file it was not
+    ' matched to; true when they did. A download on its way is the
+    ' player's, and stays.
+    function forFile(state as Object, fileId as String) as Boolean
+        if state.file = "" or state.file = fileId or state.downloading <> "" then return false
+        state.file = ""
+        state.searched = ""
+        state.phase = PICKING
+        state.results = []
+        state.warnings = []
+        state.message = ""
+        return true
+    end function
+
+    ' The provider status said no: an idle language list says so (tvOS's
+    ' reflectUnavailabilityIfIdle); a search or results stay.
+    sub unavailable(state as Object)
+        if state.phase <> PICKING then return
+        state.searched = ""
+        fail(state, "notSetUp", false)
+    end sub
+
+    ' Back, or a Back or Cancel row: from the language list the panel
+    ' closes (true); from anywhere else it returns to the list, and while a
+    ' download is out Back does nothing (tvOS: Back is inert then).
+    function back(state as Object) as Boolean
+        if state.downloading <> "" then return false
+        if state.phase = PICKING then return true
+        state.phase = PICKING
+        state.results = []
+        state.warnings = []
+        state.message = ""
+        return false
+    end function
+
+    sub fail(state as Object, message as String, retry as Boolean)
+        state.phase = FAILED
+        state.message = message
+        state.retry = retry and state.searched <> ""
+    end sub
+
+    ' --- What the panel draws -----------------------------------------------------------
+
+    ' The panel's copy (subtitleSearch.* in locale/), with the strings
+    ' table, which names languages (catalog.pickers.languageName).
+    function words(strings as Object) as Object
+        out = { strings: strings }
+        for each key in ["title", "explainer", "searchingIn", "searching", "searchingNote", "resultCount", "resultCountOne", "failedTitle", "preferredHeader", "allHeader", "languageHeader", "preferred", "chooseAnother", "noResults", "untitled", "downloads", "match", "hearingImpaired", "selectHint", "adding", "notSetUp", "searchFailed", "rateLimited", "notAllowed", "notFound", "downloadFailed", "stored", "notTurnedOn", "unconfirmed"]
+            out[key] = i18n.lookup(strings, "subtitleSearch." + key)
+        end for
+        out.cancel = i18n.lookup(strings, "common.cancel")
+        out.tryAgain = i18n.lookup(strings, "common.tryAgain")
+        out.back = i18n.lookup(strings, "common.back")
+        return out
+    end function
+
+    ' The languages in the order the list shows them: preferred first when
+    ' it is one, then the rest by name (tvOS's SubtitleLanguageChoices).
+    ' Each is { code, label, preferred }.
+    function languageChoices(preferred as String, copy as Object) as Object
+        first = playback.tracks.languageKey(preferred)
+        rest = []
+        out = []
+        for each code in LANGUAGES.Split(",")
+            entry = { code: code, label: catalog.pickers.languageName(code, copy.strings), preferred: code = first }
+            if entry.preferred then out.Push(entry) else rest.Push(entry)
+        end for
+        rest.SortBy("label", "i")
+        out.Append(rest)
+        return out
+    end function
+
+    ' What the panel shows: { title, subtitle, hint, rows, focus }. A row is
+    ' { kind, value, style, label, detail, trailing, enabled, speech }:
+    ' style "track" (a focusable row, label over detail), "header" (a
+    ' section's name), "text" (a line of copy), or "warning" (a provider's
+    ' warning, in amber). focus is the index of the row focus belongs on.
+    function view(state as Object, preferred as String, copy as Object) as Object
+        title = copy.title
+        name = catalog.pickers.languageName(state.searched, copy.strings)
+        out = { title: title, subtitle: "", hint: "", rows: [], focus: -1 }
+        if state.phase = PICKING
+            out.subtitle = copy.explainer
+            choices = languageChoices(preferred, copy)
+            hasPreferred = choices.Count() > 0 and choices[0].preferred
+            if hasPreferred then out.rows.Push(headerRow(copy.preferredHeader))
+            for i = 0 to choices.Count() - 1
+                if hasPreferred and i = 1 then out.rows.Push(headerRow(copy.allHeader))
+                if not hasPreferred and i = 0 then out.rows.Push(headerRow(copy.languageHeader))
+                choice = choices[i]
+                detail = ""
+                if choice.preferred then detail = copy.preferred
+                if choice.code = state.language then out.focus = out.rows.Count()
+                out.rows.Push(actionRow(ROW_LANGUAGE, choice.code, choice.label, detail, "", true))
+            end for
+        else if state.phase = SEARCHING
+            out.subtitle = i18n.format(copy.searchingIn, { language: name })
+            out.rows.Push(textRow(copy.searching))
+            out.rows.Push(textRow(copy.searchingNote))
+            out.focus = out.rows.Count()
+            out.rows.Push(actionRow(ROW_CANCEL, "", copy.cancel, "", "", true))
+        else if state.phase = RESULTS
+            count = state.results.Count()
+            template = copy.resultCount
+            if count = 1 then template = copy.resultCountOne
+            out.subtitle = i18n.format(template, { language: name, count: count })
+            for each warning in state.warnings
+                out.rows.Push({ kind: "", value: "", style: "warning", label: warning, detail: "", trailing: "", enabled: false, speech: warning })
+            end for
+            if count = 0
+                out.rows.Push(textRow(i18n.format(copy.noResults, { language: name })))
+                out.focus = out.rows.Count()
+                out.rows.Push(actionRow(ROW_BACK, "", copy.chooseAnother, "", "", true))
+            else
+                for each result in state.results
+                    if out.focus < 0 then out.focus = out.rows.Count()
+                    if result.key = state.downloading then out.focus = out.rows.Count()
+                    trailing = providerName(result.provider)
+                    if result.key = state.downloading then trailing = copy.adding
+                    out.rows.Push(actionRow(ROW_RESULT, result.key, orText(result.releaseName, copy.untitled), resultDetail(result, copy), trailing, state.downloading = "" or result.key = state.downloading))
+                end for
+                out.hint = copy.selectHint
+                if state.downloading <> "" then out.hint = copy.adding
+            end if
+        else
+            out.subtitle = copy.failedTitle
+            out.rows.Push(textRow(i18n.lookup(copy.strings, "subtitleSearch." + state.message)))
+            if state.retry
+                out.focus = out.rows.Count()
+                out.rows.Push(actionRow(ROW_RETRY, state.searched, copy.tryAgain, "", "", true))
+            end if
+            if out.focus < 0 then out.focus = out.rows.Count()
+            out.rows.Push(actionRow(ROW_BACK, "", copy.back, "", "", true))
+        end if
+        return out
+    end function
+
+    ' A result's second line: its match score, language, downloads, HI,
+    ' and format (tvOS's resultDetail, with the score its badge shows).
+    function resultDetail(result as Object, copy as Object) as String
+        parts = [i18n.format(copy.match, { score: Int(result.score + 0.5) })]
+        language = catalog.pickers.languageName(result.language, copy.strings)
+        if language <> "" then parts.Push(language)
+        if result.downloads > 0 then parts.Push(i18n.format(copy.downloads, { count: result.downloads }))
+        if result.hearingImpaired then parts.Push(copy.hearingImpaired)
+        if result.format <> "" then parts.Push(UCase(result.format))
+        return parts.Join(" · ")
+    end function
+
+    ' A provider as tvOS names it (tvProviderName), else as the server does.
+    function providerName(provider as String) as String
+        named = { opensubtitles: "OpenSubtitles", subdl: "SubDL", subsource: "Subsource" }
+        found = named[LCase(provider)]
+        if found <> invalid then return found
+        return provider
+    end function
+
+    ' A score's tier, as tvOS, Android, and the web colour it: 70 and up
+    ' good, 40 and up fair, else poor.
+    function scoreTier(score as Dynamic) as String
+        value = playback.values.number(score, 0)
+        if value >= 70 then return "good"
+        if value >= 40 then return "fair"
+        return "poor"
+    end function
+
+    function actionRow(kind as String, value as String, label as String, detail as String, trailing as String, enabled as Boolean) as Object
+        spoken = [label]
+        if detail <> "" then spoken.Push(detail)
+        if trailing <> "" then spoken.Push(trailing)
+        return { kind: kind, value: value, style: "track", label: label, detail: detail, trailing: trailing, enabled: enabled, speech: spoken.Join(", ") }
+    end function
+
+    function headerRow(text as String) as Object
+        return { kind: "", value: "", style: "header", label: text, detail: "", trailing: "", enabled: false, speech: text }
+    end function
+
+    function textRow(text as String) as Object
+        return { kind: "", value: "", style: "text", label: text, detail: "", trailing: "", enabled: false, speech: text }
+    end function
+
+    function orText(value as String, fallback as String) as String
+        if value = "" then return fallback
+        return value
+    end function
+
+    ' --- Into playback ---------------------------------------------------------------------
+
+    ' Whether Options offers Search Subtitles…: a plan plays a file of the
+    ' server's and the provider status has not said no (known is
+    ' available()'s answer, or invalid before one; tvOS's
+    ' subtitleSearchEnabled shows the row until an answer hides it).
+    function offered(plan as Dynamic, known as Dynamic) as Boolean
+        if util.isBoolean(known) and not known then return false
+        return fileOf(plan) <> ""
+    end function
+
+    ' The file a plan plays, which a search and download name.
+    function fileOf(plan as Dynamic) as String
+        if not util.isObject(plan) then return ""
+        return util.text(plan.effective_media_file_id)
+    end function
+
+    ' The track_ids of a plan's subtitle inventory.
+    function trackIds(plan as Dynamic) as Object
+        out = []
+        for each entry in playback.options.subtitleEntries(plan)
+            out.Push(entry.track_id)
+        end for
+        return out
+    end function
+
+    ' A track_change that keeps the plan's audio and subtitle, which the
+    ' server answers with a plan whose inventory lists the stored subtitle
+    ' (it reads the file's stored subtitles for every plan). inPlace as
+    ' playback.options.chooseSubtitle works it out, so the content plays on
+    ' when the new plan streams the same media.
+    function refreshEvent(plan as Object, inPlace as Boolean) as Object
+        selection = playback.options.keepAudio(plan)
+        selection.Append(playback.options.keepSubtitle(plan))
+        return playback.options.trackOutcome(selection, inPlace, invalid).event
+    end function
+
+    ' Whether the plan after choosing the stored subtitle (its track_id,
+    ' trackId) settles the choice: ADDED when the plan selects it; while a
+    ' track_change is still on its way (changing), "" to wait for its plan;
+    ' else NOT_STORED, the choice not taken (refused, or replaced).
+    function selectionOutcome(plan as Dynamic, trackId as String, changing as Boolean) as String
+        if util.isObject(plan) and playback.media.selectedSubtitle(plan) = trackId then return ADDED
+        if changing then return ""
+        return NOT_STORED
+    end function
+
+    ' The inventory entry of the stored subtitle storedId in plan, or
+    ' invalid: the entry whose sync_key names it ("stored-{id}", as tvOS's
+    ' and Android TV's SubtitleSyncState.storedKey name it), else the one
+    ' downloaded entry the plan lists that before (trackIds of the plan the
+    ' download was made under) did not, in its language. A format the
+    ' server cannot retime carries no sync_key.
+    function downloadedEntry(plan as Dynamic, storedId as String, before as Object, language as String) as Dynamic
+        if storedId = "" then return invalid
+        entries = playback.options.subtitleEntries(plan)
+        for each entry in entries
+            if util.text(entry.sync_key) = "stored-" + storedId then return entry
+        end for
+        found = invalid
+        wanted = playback.tracks.languageKey(language)
+        for each entry in entries
+            if util.text(entry.source) = "downloaded" and not util.contains(before, entry.track_id) and playback.tracks.languageKey(util.text(entry.language)) = wanted
+                if found <> invalid then return invalid
+                found = entry
+            end if
+        end for
+        return found
+    end function
+end namespace

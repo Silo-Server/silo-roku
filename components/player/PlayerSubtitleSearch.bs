@@ -1,0 +1,404 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/playback/options.bs"
+import "pkg:/source/playback/session.bs"
+import "pkg:/source/playback/sidecars.bs"
+import "pkg:/source/playback/subtitleSearch.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+const SUBTITLE_SEARCH_LOG_TAG = "player"
+' How long a downloaded subtitle waits for the plan that lists it before
+' the panel says it is stored for next time.
+const SUBTITLE_SEARCH_PLAN_SECONDS = 30
+
+' Search Subtitles… in the player (spec sections 5.7 and 9.7), as tvOS's
+' PlayerViewModel runs SubtitleSearchMenu (subtitleSearchEnabled,
+' searchSubtitles, downloadSearchedSubtitle). playback.subtitleSearch
+' decides; this sends its requests and carries its plan steps out.
+'
+' The provider status is read each time Options opens, as tvOS reads it
+' when the subtitle controls open, and only an answer changes what is
+' known (m.subSearch.known: true, false, or invalid before one). Options'
+' Subtitles tab offers the row while a plan plays a file and the status
+' has not said no.
+'
+' The panel opens over the Options panel, which stays open but hidden, so
+' Back from the language list returns to the row it was opened from;
+' closeOptionsPanel closes both. The search belongs to the panel: closing
+' it cancels a search in flight. The download belongs to the player, as
+' tvOS's does: it is sent once, and a stored subtitle is still brought
+' into playback if the panel goes away meanwhile.
+'
+' Bringing it in (handoff): a plan that already lists it (sync_key) has it
+' chosen at once. Otherwise the player sends a track_change that keeps the
+' plan's selection (playback.subtitleSearch.refreshEvent), or waits for a
+' track_change already on its way, and the first new plan that lists the
+' stored subtitle has it chosen as Options chooses a subtitle
+' (applyChoice), captions On; once a plan selects it, the panel and
+' Options close, as tvOS closes its subtitle UI. A refused choice, a plan
+' that selects another track, or no such plan within
+' SUBTITLE_SEARCH_PLAN_SECONDS says it is saved and listed under Tracks
+' (notTurnedOn). A plan without it after the refresh, a refused refresh,
+' or no plan within that time says it is stored for the next time the
+' video plays.
+
+sub subtitleSearchInitPlayer()
+    ' known: the provider status; statusHandle: its read in flight; panel:
+    ' the panel node; state: playback.subtitleSearch's; searchHandle: the
+    ' search in flight; download: { handle, key, fileId, language, before }
+    ' of the download in flight; handoff: { storedId, fileId, language, key,
+    ' before, attemptId, refreshed, selecting } while a stored subtitle
+    ' waits for its plan, selecting the track_id chosen once one lists it.
+    m.subSearch = { known: invalid, statusHandle: invalid, panel: invalid, state: invalid, searchHandle: invalid, download: invalid, handoff: invalid, copy: invalid }
+    m.subSearchTimer = CreateObject("roSGNode", "Timer")
+    m.subSearchTimer.duration = SUBTITLE_SEARCH_PLAN_SECONDS
+    m.subSearchTimer.observeField("fire", "subtitleSearchTimedOut")
+end sub
+
+' --- The provider status ----------------------------------------------------------
+
+sub subtitleSearchProbe()
+    if m.subSearch.statusHandle <> invalid then return
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", "onSubtitleSearchStatus")
+    m.subSearch.statusHandle = handle
+    api.send(playback.subtitleSearch.statusRequest(), handle)
+end sub
+
+sub onSubtitleSearchStatus(event as Object)
+    handle = event.getRoSGNode()
+    if m.subSearch.statusHandle = invalid or not handle.isSameNode(m.subSearch.statusHandle) then return
+    m.subSearch.statusHandle = invalid
+    result = api.resultOf(handle)
+    if not util.isObject(result) or not util.isTrue(result.ok) then return
+    known = playback.subtitleSearch.available(result.body)
+    if known = invalid then return
+    m.subSearch.known = known
+    if not known and m.subSearch.state <> invalid
+        playback.subtitleSearch.unavailable(m.subSearch.state)
+        subtitleSearchRender()
+    end if
+    refreshOptions()
+end sub
+
+' Whether Options' Subtitles tab offers Search Subtitles… (optionsState).
+function subtitleSearchOffered() as Boolean
+    if m.state = invalid or m.state.phase <> "active" or m.state.plan = invalid then return false
+    return playback.subtitleSearch.offered(m.state.plan.data, m.subSearch.known)
+end function
+
+' --- The panel ---------------------------------------------------------------------------
+
+' Options' Search Subtitles… row: the panel opens on the language list,
+' focused on the profile's subtitle language, unless a download is out,
+' whose panel opens again as it was.
+sub openSubtitleSearch()
+    if m.optionsPanel = invalid or m.subSearch.panel <> invalid or not subtitleSearchOffered() then return
+    if m.subSearch.download = invalid and m.subSearch.handoff = invalid then m.subSearch.state = playback.subtitleSearch.create(subtitleSearchPreferred())
+    m.optionsPanel.visible = false
+    panel = m.optionsLayer.createChild("SubtitleSearchPanel")
+    panel.observeField("action", "onSubtitleSearchAction")
+    panel.observeField("back", "onSubtitleSearchBack")
+    m.subSearch.panel = panel
+    subtitleSearchRender()
+end sub
+
+' The panel goes, and Options shows again, focused where it was (back), or
+' closes with it (closeOptionsPanel calls this first).
+sub closeSubtitleSearchPanel(backToOptions = false as Boolean)
+    panel = m.subSearch.panel
+    if panel = invalid then return
+    m.subSearch.panel = invalid
+    m.optionsLayer.removeChild(panel)
+    cancelSubtitleSearch()
+    if backToOptions and m.optionsPanel <> invalid
+        m.optionsPanel.visible = true
+        m.optionsPanel.setFocus(true)
+    end if
+end sub
+
+sub cancelSubtitleSearch()
+    if m.subSearch.searchHandle = invalid then return
+    api.cancel(m.subSearch.searchHandle)
+    m.subSearch.searchHandle = invalid
+    if m.subSearch.state <> invalid then playback.subtitleSearch.back(m.subSearch.state)
+end sub
+
+sub subtitleSearchRender()
+    panel = m.subSearch.panel
+    if panel = invalid or m.subSearch.state = invalid then return
+    panel.model = playback.subtitleSearch.view(m.subSearch.state, subtitleSearchPreferred(), subtitleSearchWords())
+end sub
+
+' The profile's subtitle language for this title (the watch projection's
+' effective one, else the profile's preference), which leads the list.
+function subtitleSearchPreferred() as String
+    prefs = m.preferences
+    if not util.isObject(prefs) then prefs = {}
+    return playback.options.subtitlePreferences(m.watch, prefs).language
+end function
+
+function subtitleSearchWords() as Object
+    if m.subSearch.copy = invalid
+        i18n.install()
+        m.subSearch.copy = playback.subtitleSearch.words(m.global.strings)
+    end if
+    return m.subSearch.copy
+end function
+
+sub onSubtitleSearchAction()
+    panel = m.subSearch.panel
+    state = m.subSearch.state
+    if panel = invalid or state = invalid then return
+    action = panel.action
+    kind = util.text(action.kind)
+    value = util.text(action.value)
+    if kind = playback.subtitleSearch.ROW_LANGUAGE or kind = playback.subtitleSearch.ROW_RETRY
+        unavailable = util.isBoolean(m.subSearch.known) and not m.subSearch.known
+        if playback.subtitleSearch.pick(state, value, unavailable) then sendSubtitleSearch(value)
+    else if kind = playback.subtitleSearch.ROW_RESULT
+        if subtitleSearchFollowFile() then return
+        result = playback.subtitleSearch.choose(state, value)
+        if result <> invalid then sendSubtitleDownload(result)
+    else if kind = playback.subtitleSearch.ROW_BACK or kind = playback.subtitleSearch.ROW_CANCEL
+        if m.subSearch.searchHandle <> invalid
+            cancelSubtitleSearch()
+        else
+            playback.subtitleSearch.back(state)
+        end if
+    end if
+    subtitleSearchRender()
+end sub
+
+sub onSubtitleSearchBack()
+    state = m.subSearch.state
+    if m.subSearch.panel = invalid or state = invalid then return
+    if m.subSearch.searchHandle <> invalid
+        cancelSubtitleSearch()
+    else if playback.subtitleSearch.back(state)
+        closeSubtitleSearchPanel(true)
+        return
+    end if
+    subtitleSearchRender()
+end sub
+
+' --- The search ---------------------------------------------------------------------------
+
+sub sendSubtitleSearch(language as String)
+    fileId = playback.subtitleSearch.fileOf(m.state.plan.data)
+    m.subSearch.state.file = fileId
+    if m.subSearch.searchHandle <> invalid then api.cancel(m.subSearch.searchHandle)
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", "onSubtitleSearchAnswer")
+    m.subSearch.searchHandle = handle
+    api.send(playback.subtitleSearch.searchRequest(fileId, language), handle)
+end sub
+
+sub onSubtitleSearchAnswer(event as Object)
+    handle = event.getRoSGNode()
+    if m.subSearch.searchHandle = invalid or not handle.isSameNode(m.subSearch.searchHandle) then return
+    m.subSearch.searchHandle = invalid
+    state = m.subSearch.state
+    if subtitleSearchFollowFile() then return
+    result = api.resultOf(handle)
+    found = invalid
+    if util.isObject(result) and util.isTrue(result.ok) then found = playback.subtitleSearch.resultsOf(result.body)
+    if found <> invalid
+        playback.subtitleSearch.searched(state, found, playback.subtitleSearch.warnings(result.body))
+    else
+        log.warn(SUBTITLE_SEARCH_LOG_TAG, "subtitle search failed", subtitleSearchFailure(result))
+        playback.subtitleSearch.searchFailed(state, playback.subtitleSearch.searchFailure(result))
+    end if
+    subtitleSearchRender()
+end sub
+
+' A search or results for a file that no longer plays go back to the
+' language list (playback.subtitleSearch.forFile), its search in flight
+' cancelled; true when they did, and the panel is drawn again.
+function subtitleSearchFollowFile() as Boolean
+    state = m.subSearch.state
+    if state = invalid or m.state = invalid or m.state.plan = invalid then return false
+    if not playback.subtitleSearch.forFile(state, playback.subtitleSearch.fileOf(m.state.plan.data)) then return false
+    log.info(SUBTITLE_SEARCH_LOG_TAG, "the playing file changed; subtitle results dropped", invalid)
+    if m.subSearch.searchHandle <> invalid
+        api.cancel(m.subSearch.searchHandle)
+        m.subSearch.searchHandle = invalid
+    end if
+    subtitleSearchRender()
+    return true
+end function
+
+' What a failed request's log says: its error kind and status, never its
+' body.
+function subtitleSearchFailure(result as Dynamic) as Object
+    if not util.isObject(result) or not util.isObject(result.error) then return { kind: "unreadable" }
+    return { kind: util.text(result.error.kind), status: result.error.status, problem: util.text(result.error.problemType) }
+end function
+
+' --- The download -------------------------------------------------------------------------
+
+' The download names the file the results were found for, which is the
+' one playing (subtitleSearchFollowFile).
+sub sendSubtitleDownload(result as Object)
+    fileId = m.subSearch.state.file
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", "onSubtitleDownloadAnswer")
+    ' The inventory as the download leaves: a plan that answers meanwhile
+    ' may list the stored row already, which must still count as new.
+    m.subSearch.download = { handle: handle, key: result.key, fileId: fileId, language: result.language, before: playback.subtitleSearch.trackIds(m.state.plan.data) }
+    log.info(SUBTITLE_SEARCH_LOG_TAG, "subtitle download sent", { provider: result.provider })
+    api.send(playback.subtitleSearch.downloadRequest(fileId, result), handle)
+end sub
+
+sub onSubtitleDownloadAnswer(event as Object)
+    handle = event.getRoSGNode()
+    download = m.subSearch.download
+    if download = invalid or not handle.isSameNode(download.handle) then return
+    m.subSearch.download = invalid
+    result = api.resultOf(handle)
+    outcome = playback.subtitleSearch.downloadOutcome(result, download.fileId)
+    if outcome.kind <> playback.subtitleSearch.STORED then log.warn(SUBTITLE_SEARCH_LOG_TAG, "subtitle download " + outcome.kind, subtitleSearchFailure(result))
+    if outcome.kind = playback.subtitleSearch.STORED and outcome.storedId <> ""
+        beginSubtitleHandoff(outcome.storedId, download)
+    else
+        settleSubtitleDownload(download.key, outcome.kind, outcome.message)
+    end if
+end sub
+
+' How the download of the result with key ended, for the panel; ADDED
+' closes it and Options.
+sub settleSubtitleDownload(key as String, kind as String, message as String)
+    m.subSearchTimer.control = "stop"
+    m.subSearch.handoff = invalid
+    log.info(SUBTITLE_SEARCH_LOG_TAG, "subtitle download settled", { outcome: kind })
+    if m.subSearch.state <> invalid then playback.subtitleSearch.downloaded(m.subSearch.state, key, kind, message)
+    if kind = playback.subtitleSearch.ADDED
+        closeOptionsPanel()
+    else
+        subtitleSearchRender()
+    end if
+end sub
+
+' --- Into playback --------------------------------------------------------------------------
+
+sub beginSubtitleHandoff(storedId as String, download as Object)
+    if m.state = invalid or m.state.phase <> "active" or m.state.plan = invalid or playback.subtitleSearch.fileOf(m.state.plan.data) <> download.fileId
+        ' Playback moved to another file meanwhile.
+        settleSubtitleDownload(download.key, playback.subtitleSearch.STORED, "stored")
+        return
+    end if
+    plan = m.state.plan.data
+    m.subSearch.handoff = { storedId: storedId, fileId: download.fileId, language: download.language, key: download.key, before: download.before, attemptId: m.state.plan.attemptId, refreshed: false, selecting: "" }
+    m.subSearchTimer.control = "start"
+    entry = playback.subtitleSearch.downloadedEntry(plan, storedId, m.subSearch.handoff.before, download.language)
+    if entry <> invalid
+        chooseDownloadedSubtitle(entry)
+        return
+    end if
+    ' A track_change on its way brings a plan of its own first.
+    if not playback.session.changingTracks(m.state) then refreshForSubtitle()
+end sub
+
+' The track_change that keeps the plan's selection, so the server plans
+' again with the stored subtitle listed.
+sub refreshForSubtitle()
+    handoff = m.subSearch.handoff
+    plan = m.state.plan.data
+    handoff.refreshed = true
+    state = optionsState()
+    selection = playback.options.keepAudio(plan)
+    selection.Append(playback.options.keepSubtitle(plan))
+    inPlace = playback.values.isArray(state.contentTracks) and playback.sidecars.inPlace(state.contentTracks, selection, state.rokuSubtitles)
+    log.info(SUBTITLE_SEARCH_LOG_TAG, "replanning for the downloaded subtitle", { inPlace: inPlace })
+    dispatch(playback.subtitleSearch.refreshEvent(plan, inPlace))
+end sub
+
+' A plan arrived (planLoaded, retrack). While the stored subtitle is
+' being chosen, a plan that selects it settles it as added, and the first
+' plan with no track_change left on its way that does not, as not turned
+' on. Before that, one that lists it has it chosen; while a track_change
+' is on its way, one that does not waits for that change's plan; after
+' the refresh, the first that does not leaves it stored; one before the
+' refresh asks for it.
+sub subtitleSearchFollowPlan()
+    subtitleSearchFollowFile()
+    handoff = m.subSearch.handoff
+    if handoff = invalid or m.state = invalid or m.state.plan = invalid then return
+    if m.state.plan.attemptId = handoff.attemptId then return
+    handoff.attemptId = m.state.plan.attemptId
+    plan = m.state.plan.data
+    if playback.subtitleSearch.fileOf(plan) <> handoff.fileId
+        settleSubtitleDownload(handoff.key, playback.subtitleSearch.STORED, "stored")
+        return
+    end if
+    if handoff.selecting <> ""
+        settled = playback.subtitleSearch.selectionOutcome(plan, handoff.selecting, playback.session.changingTracks(m.state))
+        if settled = playback.subtitleSearch.ADDED
+            settleSubtitleDownload(handoff.key, settled, "")
+        else if settled <> ""
+            log.warn(SUBTITLE_SEARCH_LOG_TAG, "the plan did not select the downloaded subtitle", invalid)
+            settleSubtitleDownload(handoff.key, playback.subtitleSearch.STORED, "notTurnedOn")
+        end if
+        return
+    end if
+    entry = playback.subtitleSearch.downloadedEntry(plan, handoff.storedId, handoff.before, handoff.language)
+    if entry <> invalid
+        chooseDownloadedSubtitle(entry)
+    else if playback.session.changingTracks(m.state)
+        ' The refresh, or the viewer's track_change, is still on its way
+        ' (queued behind this plan's replan, a quality change say): its
+        ' own plan answers.
+    else if handoff.refreshed
+        log.warn(SUBTITLE_SEARCH_LOG_TAG, "the replanned inventory does not list the downloaded subtitle", invalid)
+        settleSubtitleDownload(handoff.key, playback.subtitleSearch.STORED, "stored")
+    else
+        refreshForSubtitle()
+    end if
+end sub
+
+' The server refused a track_change: the refresh's or the choice's
+' (true), which leaves the subtitle stored, or stored and listed, and
+' says so in the panel instead of the player's notice. The handoff
+' waiting for another track_change's plan (not refreshed) sends its own
+' refresh once that one is refused, since no plan comes from it; the
+' refusal is the viewer's, and keeps its notice.
+function subtitleSearchRefused() as Boolean
+    handoff = m.subSearch.handoff
+    if handoff = invalid then return false
+    if not handoff.refreshed
+        if m.state <> invalid and m.state.plan <> invalid and not playback.session.changingTracks(m.state) then refreshForSubtitle()
+        return false
+    end if
+    message = "stored"
+    if handoff.selecting <> "" then message = "notTurnedOn"
+    settleSubtitleDownload(handoff.key, playback.subtitleSearch.STORED, message)
+    return true
+end function
+
+sub subtitleSearchTimedOut()
+    handoff = m.subSearch.handoff
+    if handoff = invalid then return
+    message = "stored"
+    if handoff.selecting <> "" then message = "notTurnedOn"
+    log.warn(SUBTITLE_SEARCH_LOG_TAG, "no plan selected the downloaded subtitle in time", { listed: handoff.selecting <> "" })
+    settleSubtitleDownload(handoff.key, playback.subtitleSearch.STORED, message)
+end sub
+
+' Chooses the stored subtitle as Options would; its plan settles it
+' (subtitleSearchFollowPlan). It counts as sent, so a refused choice comes
+' back to subtitleSearchRefused. A plan that selects it already sends no
+' track_change (at most captions On), so it settles at once.
+sub chooseDownloadedSubtitle(entry as Object)
+    handoff = m.subSearch.handoff
+    handoff.selecting = entry.track_id
+    handoff.refreshed = true
+    handoff.attemptId = m.state.plan.attemptId
+    m.subSearchTimer.control = "stop"
+    m.subSearchTimer.control = "start"
+    log.info(SUBTITLE_SEARCH_LOG_TAG, "choosing the downloaded subtitle", { trackId: entry.track_id })
+    applyChoice({ kind: playback.options.KIND_SUBTITLE, value: entry.track_id })
+    if m.subSearch.handoff <> invalid and playback.subtitleSearch.selectionOutcome(m.state.plan.data, entry.track_id, true) = playback.subtitleSearch.ADDED
+        settleSubtitleDownload(handoff.key, playback.subtitleSearch.ADDED, "")
+    end if
+end sub

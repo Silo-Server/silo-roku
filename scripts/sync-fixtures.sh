@@ -35,7 +35,9 @@ REPOSITORY = "https://github.com/Silo-Server/silo-server"
 ROOTS = ["PlaybackStartBody", "PlaybackReplanBody", "PlaybackProgressBody", "PlaybackStopBody", "PlaybackRouteEventBody", "HistoryRemoveInputBody", "ThemePlaybackRequest",
          "CreateShuffleRequest", "AdvanceShuffleRequest", "SkipShuffleItemRequest", "CatalogQueryGroup",
          # The connection speed test: what the client reads and reports.
-         "PlaybackCapabilities", "PlaybackConnection", "PlaybackProbeResultsInputBody"]
+         "PlaybackCapabilities", "PlaybackConnection", "PlaybackProbeResultsInputBody",
+         # The player's subtitle search and download (source/playback/subtitleSearch.bs).
+         "SubtitleSearchBody", "SubtitleDownloadBody"]
 OPERATIONS = {
     "getPlaybackCapabilities", "startPlayback", "replanPlayback", "updatePlaybackProgress", "stopPlayback", "reportPlaybackRouteEvent",
     # Server setup, sign-in, and profiles (source/auth/).
@@ -66,6 +68,8 @@ CATALOG = {
 # The connection state, its learned-limit reset, and the speed test
 # (source/playback/connection.bs, components/AppSceneConnection.bs).
 CATALOG |= {"getPlaybackConnection", "resetPlaybackLearnedLimit", "getPlaybackBandwidthProbe", "reportPlaybackBandwidthProbe"}
+# The player's subtitle search and download (source/playback/subtitleSearch.bs).
+CATALOG |= {"getSubtitleProviderStatus", "searchSubtitles", "downloadSubtitle"}
 OPERATIONS |= CATALOG
 # The keys Settings edits (settings.supportedControls).
 SETTINGS = [
