@@ -36,6 +36,9 @@ sub init()
     m.pending = []
     ' Counts the layouts applied; a row answer for an earlier one is dropped.
     m.layout = 0
+    ' A whole request's rows (load's request) have been read again for a
+    ' failed image since it was loaded.
+    m.wholeRefreshed = false
     ' The list's focus as it last reported it (rowItemFocused): the source
     ' of focusedItem while the list has focus (AG-151, showFocused).
     m.focusRow = 0
@@ -68,6 +71,7 @@ function load(source as Object) as Boolean
     ' The low tier marks focus with the list's 9-patch ring (plan section 4.6).
     m.list.drawFocusFeedback = m.lowTier
     if m.lowTier then m.list.focusBitmapUri = theme.art.FOCUS_RING
+    m.wholeRefreshed = false
     m.top.state = "loading"
     send(layoutRequest(), { kind: "layout", quiet: false }, "interactive")
     return true
@@ -79,7 +83,26 @@ function refresh() as Boolean
     return true
 end function
 
+' Whether the rows come whole from load's request.
+function wholeRows() as Boolean
+    return util.isObject(m.source.request)
+end function
+
+' Reads a whole request's rows again quietly, unless that is already out.
+sub refreshWhole()
+    for each entry in m.pending
+        if entry.kind = "layout" then return
+    end for
+    refresh()
+end sub
+
 function layoutRequest() as Object
+    if wholeRows()
+        ' send adds to the request, so each read gets its own copy.
+        request = {}
+        request.Append(m.source.request)
+        return request
+    end if
     if m.source.surface = "library" then return catalog.request.librarySections(util.text(m.source.libraryId), m.lowTier)
     return catalog.request.homeSections(m.lowTier)
 end function
@@ -104,8 +127,17 @@ end sub
 
 sub onLayout(result as Object, content as Dynamic, quiet as Boolean)
     if not result.ok or content = invalid
-        ' A quiet refresh that failed keeps the rows on screen.
-        if quiet then return
+        ' A quiet refresh that failed keeps the rows on screen; whole rows
+        ' wait the stale time again before the next try.
+        if quiet
+            if wholeRows()
+                now = nowSeconds()
+                for each record in m.rows
+                    record.loadedAt = now
+                end for
+            end if
+            return
+        end if
         m.top.errorKind = result.error.kind
         m.top.state = "error"
         return
@@ -124,6 +156,7 @@ sub onLayout(result as Object, content as Dynamic, quiet as Boolean)
         m.rows.Push(catalog.rows.newRow(row.id, state, now))
     end for
     m.content = content
+    publishKeys()
     sizeRows()
     if m.attached then showContent()
     if m.rows.Count() = 0
@@ -254,9 +287,11 @@ function cardAt(rowIndex as Integer, itemIndex as Integer) as Dynamic
     return m.content.getChild(rowIndex).getChild(itemIndex)
 end function
 
-' Loads and drops row items around focus (catalog.rows.plan).
+' Loads and drops row items around focus (catalog.rows.plan). A whole
+' request's rows stay; stale ones are read again (loadRow).
 sub plan()
     decision = catalog.rows.plan(m.rows, focusGoal().row, nowSeconds())
+    if wholeRows() then decision.drop = []
     for each index in decision.drop
         dropRow(index)
     end for
@@ -267,6 +302,10 @@ end sub
 
 ' refreshArt is true when a failed image asks for fresh signed URLs.
 sub loadRow(index as Integer, refreshArt as Boolean)
+    if wholeRows()
+        refreshWhole()
+        return
+    end if
     record = m.rows[index]
     lane = catalog.rows.lane(index, focusGoal().row)
     ' Memory pressure sheds prefetch requests; ask again when focus moves.
@@ -349,6 +388,7 @@ end sub
 sub removeRow(index as Integer)
     m.content.removeChildIndex(index)
     m.rows.Delete(index)
+    publishKeys()
     sizeRows()
     if m.rows.Count() = 0
         m.top.state = "empty"
@@ -365,13 +405,36 @@ sub removeRow(index as Integer)
     end if
 end sub
 
-' A card's image failed: fetch its row again for fresh signed URLs, once per load.
+' A card's image failed: fetch its row again for fresh signed URLs, once per
+' load; a whole request's rows are read again once for every row.
 sub onArtFailed(event as Object)
+    if wholeRows()
+        if m.wholeRefreshed then return
+        m.wholeRefreshed = true
+        refreshWhole()
+        return
+    end if
     index = rowIndexOf(event.getRoSGNode().id)
     if index < 0 or not catalog.rows.shouldRefresh(m.rows[index]) then return
     m.rows[index].refreshed = true
     loadRow(index, true)
 end sub
+
+sub publishKeys()
+    keys = []
+    for each record in m.rows
+        keys.Push(record.key)
+    end for
+    m.top.rowKeys = keys
+end sub
+
+function focusRow(index as Integer) as Boolean
+    if index < 0 or index >= m.rows.Count() then return false
+    m.restoreKey = invalid
+    m.restoreTimer.control = "stop"
+    jumpTo(index, 0)
+    return true
+end function
 
 function rowIndexOf(key as String) as Integer
     for i = 0 to m.rows.Count() - 1

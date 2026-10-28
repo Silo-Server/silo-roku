@@ -1,0 +1,372 @@
+import "pkg:/source/catalog/art.bs"
+import "pkg:/source/catalog/cards.bs"
+import "pkg:/source/catalog/detail.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/catalog/rows.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' The Calendar tab's decisions (spec section 5.10, tvOS CalendarView), pure:
+' the week it shows, the request for it, and the rows and cards its answer
+' becomes. A day is a whole number of days since 1970-01-01 in the TV's
+' time zone; weeks run Monday to Sunday, as on tvOS (CalendarWeek).
+namespace calendarPage
+    ' The filter chips, in order; the server's names. tvOS's "All" sends
+    ' everything.
+    const FOLLOWING = "following"
+    const TRENDING = "trending"
+    const EVERYTHING = "everything"
+    const SECONDS_PER_DAY = 86400
+    ' A card shows at most this many badges, as tvOS's CalendarEventCard.
+    const MAX_BADGES = 2
+
+    ' [[key, label key]] for the filter, in order.
+    function filters() as Object
+        return [[FOLLOWING, "calendar.filter.following"], [TRENDING, "calendar.filter.trending"], [EVERYTHING, "calendar.filter.all"]]
+    end function
+
+    function isFilter(value as Dynamic) as Boolean
+        text = util.text(value)
+        return text = FOLLOWING or text = TRENDING or text = EVERYTHING
+    end function
+
+    ' ---- Days
+
+    ' The day of a civil date (Howard Hinnant's days_from_civil).
+    function dayOf(year as Integer, month as Integer, day as Integer) as Integer
+        y = year
+        if month <= 2 then y = y - 1
+        era = y \ 400
+        if y < 0 and y mod 400 <> 0 then era = era - 1
+        yoe = y - era * 400
+        mp = (month + 9) mod 12
+        doy = (153 * mp + 2) \ 5 + day - 1
+        doe = yoe * 365 + yoe \ 4 - yoe \ 100 + doy
+        return era * 146097 + doe - 719468
+    end function
+
+    ' { year, month, day } of a day (civil_from_days).
+    function civil(day as Integer) as Object
+        z = day + 719468
+        era = z \ 146097
+        if z < 0 and z mod 146097 <> 0 then era = era - 1
+        doe = z - era * 146097
+        yoe = (doe - doe \ 1460 + doe \ 36524 - doe \ 146096) \ 365
+        doy = doe - (365 * yoe + yoe \ 4 - yoe \ 100)
+        mp = (5 * doy + 2) \ 153
+        d = doy - (153 * mp + 2) \ 5 + 1
+        month = mp + 3
+        if month > 12 then month = month - 12
+        y = yoe + era * 400
+        if month <= 2 then y = y + 1
+        return { year: y, month: month, day: d }
+    end function
+
+    ' 1 for Monday to 7 for Sunday; 1970-01-01 was a Thursday.
+    function weekday(day as Integer) as Integer
+        return ((day + 3) mod 7 + 7) mod 7 + 1
+    end function
+
+    ' The Monday of day's week.
+    function weekStart(day as Integer) as Integer
+        return day - weekday(day) + 1
+    end function
+
+    ' The TV's day at wall-clock second now, offsetSeconds east of UTC.
+    function today(now as Integer, offsetSeconds as Integer) as Integer
+        local = now + offsetSeconds
+        out = local \ SECONDS_PER_DAY
+        if local < 0 and local mod SECONDS_PER_DAY <> 0 then out = out - 1
+        return out
+    end function
+
+    ' "2026-06-09".
+    function isoDate(day as Integer) as String
+        date = civil(day)
+        return date.year.ToStr() + "-" + pad(date.month) + "-" + pad(date.day)
+    end function
+
+    ' The day of "YYYY-MM-DD", or invalid.
+    function parseDate(value as Dynamic) as Dynamic
+        text = util.text(value)
+        if Len(text) <> 10 or Mid(text, 5, 1) <> "-" or Mid(text, 8, 1) <> "-" then return invalid
+        if not digits(Left(text, 4)) or not digits(Mid(text, 6, 2)) or not digits(Mid(text, 9, 2)) then return invalid
+        month = Val(Mid(text, 6, 2), 10)
+        day = Val(Mid(text, 9, 2), 10)
+        if month < 1 or month > 12 or day < 1 or day > 31 then return invalid
+        return dayOf(Val(Left(text, 4), 10), month, day)
+    end function
+
+    ' ---- The time zone
+
+    ' The IANA name the server groups days by for the TV's time zone setting
+    ' (roDeviceInfo.GetTimeZone, which uses Roku's own names), or else for
+    ' its offset from UTC in minutes east when that is whole hours ("Etc/GMT"
+    ' names count west as positive), or "" to let the server use UTC.
+    function timeZone(rokuName as String, offsetMinutes as Integer) as String
+        known = {
+            "US/Puerto Rico": "America/Puerto_Rico", "US/Guam": "Pacific/Guam", "US/Samoa": "Pacific/Pago_Pago",
+            "US/Hawaii": "Pacific/Honolulu", "US/Aleutian": "America/Adak", "US/Alaska": "America/Anchorage",
+            "US/Pacific": "America/Los_Angeles", "US/Arizona": "America/Phoenix", "US/Mountain": "America/Denver",
+            "US/Central": "America/Chicago", "US/Eastern": "America/New_York",
+            "Canada/Pacific": "America/Vancouver", "Canada/Mountain": "America/Edmonton",
+            "Canada/Central Standard": "America/Regina", "Canada/Central": "America/Winnipeg",
+            "Canada/Eastern": "America/Toronto", "Canada/Atlantic": "America/Halifax",
+            "Canada/Newfoundland": "America/St_Johns",
+            "Europe/Iceland": "Atlantic/Reykjavik", "Europe/Ireland": "Europe/Dublin",
+            "Europe/United Kingdom": "Europe/London", "Europe/Portugal": "Europe/Lisbon",
+            "Europe/Central European Time": "Europe/Paris", "Europe/Greece/Finland": "Europe/Athens"
+        }
+        name = rokuName.Trim()
+        if known.DoesExist(name) then return known[name]
+        if ianaLike(name) then return name
+        if offsetMinutes mod 60 <> 0 then return ""
+        hours = offsetMinutes \ 60
+        if hours = 0 then return "Etc/UTC"
+        if hours > 0 then return "Etc/GMT-" + hours.ToStr()
+        return "Etc/GMT+" + (-hours).ToStr()
+    end function
+
+    ' Whether a name not in Roku's list reads as an IANA zone ("Asia/Tokyo"),
+    ' as newer firmware may give: an IANA area, a slash, and no spaces.
+    function ianaLike(name as String) as Boolean
+        slash = Instr(1, name, "/")
+        if slash < 2 or slash = Len(name) or Instr(1, name, " ") > 0 then return false
+        areas = { Africa: true, America: true, Antarctica: true, Asia: true, Atlantic: true, Australia: true, Europe: true, Indian: true, Pacific: true, Etc: true }
+        return areas.DoesExist(Left(name, slash - 1))
+    end function
+
+    ' ---- The request
+
+    ' GET /api/v2/calendar for the week from monday: clock is
+    ' { today, offsetSeconds, clock24, zoneRules }, which the map step
+    ' (rowsTree) reads; zoneRules true converts each air time with the TV's
+    ' time zone rules for its own date (localOffset), else offsetSeconds
+    ' applies to all; timeZone may be "" (UTC).
+    function request(monday as Integer, filter as String, zone as String, clock as Object) as Object
+        query = { start: isoDate(monday), end: isoDate(monday + 6), filter: filter }
+        if zone <> "" then query.timezone = zone
+        return { path: "/api/v2/calendar", query: query, auth: "profile", map: { kind: catalog.kind.CALENDAR, today: clock.today, offsetSeconds: clock.offsetSeconds, clock24: clock.clock24, zoneRules: util.isTrue(clock.zoneRules) } }
+    end function
+
+    ' ---- The answer
+
+    ' A CalendarResponse as rows, one per day with events in date order,
+    ' titled "Today", "Tomorrow", or "Monday, June 9" and keyed by date,
+    ' holding a card per event in the server's order. strings is the
+    ' locale's table; mapping is the request's map (request).
+    function rowsTree(body as Object, strings as Object, mapping as Object) as Dynamic
+        if type(body.events) <> "roArray" then return invalid
+        todayDay = 0
+        if util.isNumber(mapping.today) then todayDay = Int(mapping.today)
+        offset = 0
+        if util.isNumber(mapping.offsetSeconds) then offset = Int(mapping.offsetSeconds)
+        clock24 = util.isTrue(mapping.clock24)
+        zoneRules = util.isTrue(mapping.zoneRules)
+        origin = util.text(mapping.origin)
+        root = CreateObject("roSGNode", "ContentNode")
+        for each group in body.events
+            day = invalid
+            if util.isObject(group) and type(group.items) = "roArray" then day = parseDate(group.date)
+            if day <> invalid
+                node = CreateObject("roSGNode", "RowContent")
+                node.setFields({ id: isoDate(day), title: heading(day, todayDay, strings), shape: catalog.shape.POSTER })
+                for each event in group.items
+                    if node.getChildCount() >= catalog.rows.MAX_ITEMS then exit for
+                    fields = card(event, strings, origin, offset, clock24, zoneRules)
+                    if fields <> invalid then node.createChild("CardContent").setFields(fields)
+                end for
+                node.totalCount = node.getChildCount()
+                if node.getChildCount() > 0 then root.appendChild(node)
+            end if
+        end for
+        return root
+    end function
+
+    ' A day's heading: "Today", "Tomorrow", else "Monday, June 9".
+    function heading(day as Integer, todayDay as Integer, strings as Object) as String
+        if day = todayDay then return i18n.lookup(strings, "calendar.today")
+        if day = todayDay + 1 then return i18n.lookup(strings, "calendar.tomorrow")
+        date = civil(day)
+        return i18n.format(i18n.lookup(strings, "calendar.dayHeading"), { weekday: i18n.lookup(strings, "calendar.weekday." + weekday(day).ToStr()), month: i18n.lookup(strings, "calendar.month." + date.month.ToStr()), day: date.day })
+    end function
+
+    ' The week strip's month: "June 2026", from the week's Thursday, so the
+    ' month most of the week falls in wins (tvOS CalendarWeek).
+    function monthLabel(monday as Integer, strings as Object) as String
+        date = civil(monday + 3)
+        return i18n.format(i18n.lookup(strings, "calendar.monthYear"), { month: i18n.lookup(strings, "calendar.month." + date.month.ToStr()), year: date.year })
+    end function
+
+    ' A CalendarEvent as CardContent fields, or invalid without a content_id:
+    ' its poster, the series' or movie's title over "S5 · E14 · Title",
+    ' "Season 2", or "Movie", up to two badges ("PREMIERE") at the top left,
+    ' its air time ("9:00 PM") at the bottom right, and the check disc when
+    ' watched.
+    function card(event as Dynamic, strings as Object, origin as String, offsetSeconds as Integer, clock24 as Boolean, zoneRules = false as Boolean) as Dynamic
+        if not util.isObject(event) then return invalid
+        id = util.text(event.content_id)
+        if id = "" then return invalid
+        kind = util.text(event.type)
+        title = util.text(event.title)
+        detail = subtitle(event, strings)
+        flags = []
+        if type(event.badges) = "roArray"
+            for each badge in event.badges
+                label = badgeLabel(badge, strings)
+                if label <> "" and flags.Count() < MAX_BADGES then flags.Push(label)
+            end for
+        end if
+        time = airTime(event, offsetSeconds, clock24, strings, zoneRules)
+        poster = catalog.art.uri(event.poster_url, origin)
+        spoken = [title, detail]
+        spoken.Append(flags)
+        spoken.Push(time)
+        if util.isTrue(event.watched) then spoken.Push(i18n.lookup(strings, "calendar.watched"))
+        return {
+            id: id,
+            title: title,
+            shape: catalog.shape.POSTER,
+            caption: title,
+            captionDetail: detail,
+            artUri: poster,
+            heroTitle: title,
+            flags: flags,
+            timeTag: time,
+            played: util.isTrue(event.watched),
+            itemType: kind,
+            seriesId: util.text(event.series_id),
+            seasonNumber: catalog.cards.whole(event.season_number),
+            episodeNum: catalog.cards.whole(event.episode_number),
+            audioGuideText: catalog.cards.spoken(spoken)
+        }
+    end function
+
+    ' "S5 · E14 · Title" for an episode, "Season 2" for a season premiere,
+    ' "Movie" for a movie.
+    function subtitle(event as Object, strings as Object) as String
+        kind = util.text(event.type)
+        if kind = "movie" then return i18n.lookup(strings, "calendar.movie")
+        if kind = "season_premiere"
+            if util.isNumber(event.season_number) then return i18n.format(i18n.lookup(strings, "calendar.season"), { season: Int(event.season_number) })
+            return ""
+        end if
+        parts = []
+        if util.isNumber(event.season_number) then parts.Push(i18n.format(i18n.lookup(strings, "calendar.seasonShort"), { season: Int(event.season_number) }))
+        if util.isNumber(event.episode_number) then parts.Push(i18n.format(i18n.lookup(strings, "calendar.episodeShort"), { episode: Int(event.episode_number) }))
+        name = util.text(event.episode_title).Trim()
+        if name <> "" then parts.Push(name)
+        return parts.Join(catalog.cards.SEPARATOR)
+    end function
+
+    function badgeLabel(badge as Dynamic, strings as Object) as String
+        name = util.text(badge)
+        if name <> "series_premiere" and name <> "season_premiere" and name <> "finale" then return ""
+        return i18n.lookup(strings, "calendar.badge." + name)
+    end function
+
+    ' When the event airs on the TV's clock: air_at moved to the TV's time
+    ' zone (by its rules for that date with zoneRules, as a week across a
+    ' daylight-saving change needs, else by offsetSeconds), else the
+    ' network's air_time as it is, else "" (no time).
+    function airTime(event as Object, offsetSeconds as Integer, clock24 as Boolean, strings as Object, zoneRules = false as Boolean) as String
+        instant = instantSeconds(event.air_at)
+        if instant <> invalid
+            if zoneRules then offsetSeconds = localOffset(instant)
+            local = instant + offsetSeconds
+            minuteOfDay = ((local mod SECONDS_PER_DAY) + SECONDS_PER_DAY) mod SECONDS_PER_DAY \ 60
+            return clockText(minuteOfDay \ 60, minuteOfDay mod 60, clock24, strings)
+        end if
+        text = util.text(event.air_time)
+        if Len(text) >= 5 and Mid(text, 3, 1) = ":" and digits(Left(text, 2)) and digits(Mid(text, 4, 2))
+            hour = Val(Left(text, 2), 10)
+            minute = Val(Mid(text, 4, 2), 10)
+            if hour < 24 and minute < 60 then return clockText(hour, minute, clock24, strings)
+        end if
+        return ""
+    end function
+
+    ' "21:05" on a 24-hour clock, else "9:05 PM".
+    function clockText(hour as Integer, minute as Integer, clock24 as Boolean, strings as Object) as String
+        if clock24 then return i18n.format(i18n.lookup(strings, "calendar.time24"), { hour: pad(hour), minute: pad(minute) })
+        period = i18n.lookup(strings, "calendar.am")
+        if hour >= 12 then period = i18n.lookup(strings, "calendar.pm")
+        shown = hour mod 12
+        if shown = 0 then shown = 12
+        return i18n.format(i18n.lookup(strings, "calendar.time12"), { hour: shown, minute: pad(minute), period: period })
+    end function
+
+    ' The TV's offset east of UTC at instant, by its time zone's rules for
+    ' that date (roDateTime.ToLocalTime), not today's offset.
+    function localOffset(instant as Integer) as Integer
+        moment = CreateObject("roDateTime")
+        moment.FromSeconds(instant)
+        moment.ToLocalTime()
+        return moment.AsSeconds() - instant
+    end function
+
+    ' Seconds since 1970 of an RFC 3339 instant with "Z" or a numeric
+    ' offset ("2026-06-09T21:00:00-04:00"), or invalid.
+    function instantSeconds(value as Dynamic) as Dynamic
+        text = util.text(value)
+        if Len(text) < 20 or (Mid(text, 11, 1) <> "T" and Mid(text, 11, 1) <> "t") then return invalid
+        day = parseDate(Left(text, 10))
+        if day = invalid then return invalid
+        clock = Mid(text, 12, 8)
+        if Mid(clock, 3, 1) <> ":" or Mid(clock, 6, 1) <> ":" or not digits(Left(clock, 2)) or not digits(Mid(clock, 4, 2)) or not digits(Mid(clock, 7, 2)) then return invalid
+        seconds = day * SECONDS_PER_DAY + Val(Left(clock, 2), 10) * 3600 + Val(Mid(clock, 4, 2), 10) * 60 + Val(Mid(clock, 7, 2), 10)
+        rest = Mid(text, 20)
+        if Left(rest, 1) = "."
+            i = 2
+            while i <= Len(rest) and digits(Mid(rest, i, 1))
+                i = i + 1
+            end while
+            rest = Mid(rest, i)
+        end if
+        if rest = "Z" or rest = "z" then return seconds
+        if Len(rest) <> 6 or Mid(rest, 4, 1) <> ":" or not digits(Mid(rest, 2, 2)) or not digits(Mid(rest, 5, 2)) then return invalid
+        offset = Val(Mid(rest, 2, 2), 10) * 3600 + Val(Mid(rest, 5, 2), 10) * 60
+        if Left(rest, 1) = "+" then return seconds - offset
+        if Left(rest, 1) = "-" then return seconds + offset
+        return invalid
+    end function
+
+    ' The nav.route.DETAIL params for a calendar card: an episode opens its
+    ' series with the episode selected, a season premiere its series on that
+    ' season, and a movie itself (tvOS CalendarEvent's destination).
+    function detailParams(chosen as Object) as Object
+        seriesId = util.text(chosen.seriesId)
+        if util.text(chosen.itemType) = "season_premiere" and seriesId <> ""
+            out = { itemId: seriesId, seed: { title: util.text(chosen.heroTitle), series: true } }
+            if util.isNumber(chosen.seasonNumber) and chosen.seasonNumber >= 0 then out.seasonNumber = chosen.seasonNumber
+            return out
+        end if
+        return catalog.detail.routeParams(chosen)
+    end function
+
+    ' The row to focus for a day chosen in the week strip: its own, else the
+    ' next day's with events, else the last before it; -1 without rows.
+    ' keys are the rows' dates in order.
+    function rowFor(day as Integer, keys as Dynamic) as Integer
+        if type(keys) <> "roArray" or keys.Count() = 0 then return -1
+        for i = 0 to keys.Count() - 1
+            rowDay = parseDate(keys[i])
+            if rowDay <> invalid and rowDay >= day then return i
+        end for
+        return keys.Count() - 1
+    end function
+
+    function pad(value as Integer) as String
+        if value < 10 then return "0" + value.ToStr()
+        return value.ToStr()
+    end function
+
+    function digits(text as String) as Boolean
+        if text = "" then return false
+        for i = 1 to Len(text)
+            code = Asc(Mid(text, i, 1))
+            if code < 48 or code > 57 then return false
+        end for
+        return true
+    end function
+end namespace

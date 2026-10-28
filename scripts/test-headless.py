@@ -59,7 +59,7 @@ SHARDS = [
     ("views", ["views"]),
     ("player", ["player"]),
     ("player-remote", ["player/shuffle.spec.bs", "player/remote.spec.bs", "player/voice.spec.bs"]),
-    ("screens", ["home", "library", "people", "personal", "search", "settings"]),
+    ("screens", ["home", "library", "people", "personal", "search", "settings", "calendar"]),
 ]
 
 

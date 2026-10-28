@@ -58,6 +58,8 @@ CATALOG = {
     "getThemeSongsCapability", "createThemeSongPlayback",
     # Browse's filters (source/library/filters.bs) and Shuffle (source/playback/shuffle.bs).
     "getCatalogFilters", "getShuffleCapability", "createShuffle", "getShuffle", "advanceShuffle", "skipShuffleItem", "deleteShuffle",
+    # The For You and Calendar tabs (source/catalog/map.bs, source/calendar/page.bs).
+    "getDiscover", "getCalendar",
 }
 # The connection state, its learned-limit reset, and the speed test
 # (source/playback/connection.bs, components/AppSceneConnection.bs).

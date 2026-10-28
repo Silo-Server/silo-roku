@@ -11,6 +11,10 @@
                  the bookmark filled: Watchlist, on the list (tvOS's
                  bookmark and bookmark.fill)
   more.png       three dots in a row: More (tvOS's ellipsis)
+  heart_fill.png a filled heart: Favorites in the For You menu (tvOS's
+                 heart.fill)
+  sparkles.png   a large four-pointed star with two small ones: For You's
+                 Recommendations (tvOS's sparkles)
   check.png      a bold check mark, 26 px: the choice in the Version, Audio
                  Tracks, and Subtitles menus (tvOS's 20 pt bold checkmark in
                  its 26 pt column)
@@ -202,6 +206,27 @@ def more(size):
     return coverage(size, covered, GLYPH_SCALE)
 
 
+def heart_fill(size):
+    """The heart curve (x^2 + y^2 - 1)^3 <= x^2 y^3, filling the square."""
+    cx, cy, scale = size / 2, size * 0.47, size * 0.33
+
+    def covered(x, y):
+        u, v = (x - cx) / scale, (cy - y) / scale
+        return (u * u + v * v - 1) ** 3 - u * u * v ** 3 <= 0
+    return coverage(size, covered, GLYPH_SCALE)
+
+
+def sparkles(size):
+    """Four-pointed stars with concave sides (|x|^0.5 + |y|^0.5 <= r^0.5):
+    a large one low on the left, a small one high on the right, and a
+    smaller one below it, as SF Symbols' sparkles."""
+    stars = ((size * 0.40, size * 0.58, size * 0.38), (size * 0.76, size * 0.22, size * 0.20), (size * 0.80, size * 0.70, size * 0.13))
+
+    def covered(x, y):
+        return any(math.sqrt(abs(x - sx)) + math.sqrt(abs(y - sy)) <= math.sqrt(r) for sx, sy, r in stars)
+    return coverage(size, covered, GLYPH_SCALE)
+
+
 def check(size):
     """SF Symbols' checkmark at its bold weight: a short stroke down to the
     foot and a long one up to the right, round-capped."""
@@ -277,6 +302,8 @@ def images():
     yield "bookmark.png", bookmark_outline(GLYPH)
     yield "bookmark_fill.png", bookmark_fill(GLYPH)
     yield "more.png", more(GLYPH)
+    yield "heart_fill.png", heart_fill(GLYPH)
+    yield "sparkles.png", sparkles(GLYPH)
     yield "check.png", check(CHECK)
     yield "film.png", film(FILM)
     for radius in FILL_RADII:

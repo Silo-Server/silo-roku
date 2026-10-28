@@ -118,7 +118,10 @@ Browse:
   (`GET /api/v2/catalog/themes/capabilities`);
 - on the heroes, the detail page's credit line ("Directed by", "Starring")
   and the server's external ratings, Home's quality badges, and the
-  profile's title-art preference (`ui.title_art`).
+  profile's title-art preference (`ui.title_art`);
+- the For You tab, with the server's recommendation rows, and the Calendar
+  tab, with a week of releases and airings for the profile's followed,
+  trending, or all titles (section 5.10).
 
 Personal lists:
 
@@ -176,8 +179,7 @@ Planned:
 
 - Shuffle on a collection's page (tvOS, Android TV), when the server
   offers it;
-- Requests, Calendar, and the For You tab (tvOS, Android TV); Requests show
-  only when the server offers them;
+- Requests (tvOS, Android TV), shown only when the server offers them;
 - chapters, playback speed, and aspect in the player's Options (tvOS,
   Android TV);
 - a sleep timer in the video player (Android TV; tvOS sets one only in its
@@ -377,12 +379,14 @@ their existing HD/FHD assets.
   and no background band. Left to right:
   - the Silo wordmark, 96 px wide;
   - then, centred on the screen, a 58 px Search circle, then Home, Movies,
-    and Series, 8 px apart;
+    Series, For You, and Calendar, 8 px apart;
   - the 58 px profile avatar, at the right inset.
 
   The avatar, here and in its menu's header, is drawn as on the profile
   picker (section 5.4). A library tab appears only when the profile can see a
-  library of that type. The bar appears on root pages only: Search is a pushed
+  library of that type; For You and Calendar always appear, as on tvOS,
+  whose default menu ends with them (`TVPrimaryMenuProjection`). Opening
+  either from the bar starts in its content. The bar appears on root pages only: Search is a pushed
   page without it (D3), and detail pages have none.
 - **Tabs** are capsules 56 px tall with 29 px side padding and 26 px labels:
   - focused: a pure white fill with black text;
@@ -392,7 +396,7 @@ their existing HD/FHD assets.
   The Search circle follows the same states. The avatar has no ring at rest;
   focused, it gets a 3 px white ring inside the circle and scales to 1.05. The
   bar dims to 70% over 0.2 s while focus is in the content.
-- **Panels.** Resting 250 ms on Movies, Series, or the avatar opens that
+- **Panels.** Resting 250 ms on Movies, Series, For You, or the avatar opens that
   item's panel as a passive preview, with no row highlighted. Down or OK
   enters it. Moving to another bar item closes the preview. Panels are drawn
   as gradients from `#23252C` at 92% to `#141519` at 95% with a 1 px border
@@ -413,6 +417,17 @@ their existing HD/FHD assets.
     does, keeping its highlighted row. History always shows.
   - A divider separates groups only.
   - Sign Out asks for confirmation (Sign Out / Cancel).
+- **For You menu** (tvOS's `TVForYouDropdown`). The avatar menu's panel,
+  460 px wide at y 132, centred under the tab within the side insets,
+  headed "FOR YOU" in the library list's header style, then
+  Recommendations, Watchlist, and Favorites as the avatar menu's rows, each after a
+  26 px glyph (bookmark, heart, sparkles) in a 30 px column, 14 px before
+  its label. Watchlist and Favorites show only when the avatar menu lists
+  them. Entering it highlights its first row; Up past the first row closes
+  it onto the tab, and Down past the last closes it into the content.
+  Watchlist and Favorites open their pages, as from the avatar menu;
+  Recommendations opens the For You page, or on that page enters its
+  content.
 - **Library list** (Movies or Series).
   - Level 1: a 460 px column at y 132, centred under the tab and kept within
     88–1832 together with its flyout. Padding 14. Header ("MOVIE LIBRARIES"):
@@ -711,24 +726,28 @@ their existing HD/FHD assets.
     lightweight card metadata and materializes a bounded grid window.
     Groups retain server order, including the ungrouped section's declared
     position; empty groups are omitted.
-  - A pill labeled "Collection groups" selects one group at a time through
-    a scrollable menu. The ungrouped curated section is labeled "Server
-    collections", distinct from "My collections".
+  - One poster grid holds every group's collections (personal and server
+    ones together) in the groups' order, each collection once, from y 150
+    under the bar, as the personal lists' grid: eight 176×264 posters (the
+    rows' size) with the same captions and gaps;
+    there is no group pill, sort, or alphabet rail. Up from the grid goes to the bar.
     Opening a collection shows a paginated poster grid in server order;
-    opening a title uses the existing detail page. Back restores the group
-    and selected collection or title. Ordinary libraries retain all visible
+    opening a title uses the existing detail page. Back restores the
+    selected collection or title. Ordinary libraries retain all visible
     collection members; only a typed mixed-library view narrows membership.
     Empty and failed reads use the
     standard empty state or Retry.
   - These pages are read-only. Creating, editing, and deleting collections
     remain deferred.
-- **Watchlist, Favorites, and History.** The avatar menu's rows push one
-  page each, without the top bar (5.9).
-  - The list's name ("Watchlist", "Favorites", "History") at the
-    Collections page's place and size; History adds a count of the items
-    read so far, "40+ items" while more remain and "523 items" or "1 item"
-    once the end is read, as tvOS counts it.
-  - Browse's grid of 260×390 posters below it, newest first: the list's
+- **Watchlist, Favorites, and History.** The avatar menu's rows, and For
+  You's, push one page each, without the top bar (5.9).
+  - The list's name ("Watchlist", "Favorites", "History") in 64 px Bold at
+    (80, 48), as tvOS's `WatchlistView` titles it; History adds a count of
+    the items read so far at y 132, "40+ items" while more remain and "523
+    items" or "1 item" once the end is read, as tvOS counts it.
+  - From y 184, tvOS's grid of eight 176×264 posters, 40 px apart across
+    and 48 px down with their captions (titles 20 px over 18 px metadata,
+    12 px below the poster), the top half of a third row showing, newest first: the list's
     own endpoint (`/api/v2/watchlist`, `/api/v2/favorites`,
     `/api/v2/history`), 40 a page, held and paged as Browse is. History
     lists one card per title, a series for its episodes' watches.
@@ -1605,6 +1624,11 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The TV's remote-control standby screen takes over while a phone is connected | No Connect a Phone entry is exposed in the avatar menu; the pairing route remains implemented. A phone connecting shows "<phone> connected" for four seconds and nothing else changes | The avatar menu omits the pairing entry for the first release. Roku apps cannot be opened by a phone (no ECP from phone apps), so there is nothing to stand by for; `docs/silocontrol.md` section 4 (every build since decision D-7) |
 | A phone's profile handoff shows a "Playing as" card for six seconds | The player's notice card says "Playing as <profile> · From <phone>" for four seconds | The notice card is the player's one non-focusable card; `docs/silocontrol.md` section 4.2 |
 | The sign-in screens offer phone sign-in over TLS (`_silopair._tcp`) and show the code in their own card | A phone push opens a Companion screen over the server or sign-in screen: Allow / Don't Allow, the check, then the code and match words; the card says "Use your phone"; the service is `_silopair-roku._tcp` over plain TCP | Roku has no TLS on listening sockets, and the sign-in screen shows no code until a phone asks for one; `docs/companion-pairing.md` |
+| Calendar shows all seven days, an empty one titled at reduced opacity over "Nothing scheduled" | Only days with events have a row; the week strip's dots mark them, and the audio guide says "Nothing scheduled" on a day without | A `RowList` row needs a focusable item, and a placeholder card would take focus for nothing |
+| An empty Calendar week offers the other two filters as buttons | The message alone; the filter is two presses up | The empty state has one button (section 5.8), and either filter is already on screen |
+| The Calendar's filter is kept on the device | It is kept until the app closes | The registry keeps the session and Browse's choices (AG-382); a filter is one press to set again |
+| The Calendar sends the device's IANA time zone | Roku's own zone name (`roDeviceInfo.GetTimeZone`, such as "US/Eastern" or "Europe/United Kingdom") mapped to its IANA zone; else a whole-hour `Etc/GMT` zone from the TV's offset; else none, which the server reads as UTC | Roku does not report IANA names (AG-400) |
+| The For You menu lists Watchlist, Favorites, then Recommendations | Recommendations first, then Watchlist and Favorites | The owner's order (2026-10-28): the tab's own page leads its menu |
 | Custom PIN keypad | Roku `DynamicPinPad` inside the same layout | Criterion 4.12 requires Roku keyboards for PINs |
 | Platform or custom text fields | Roku dynamic keyboards, with voice entry | Criterion 4.12 for credentials; Roku's standard for search |
 | tvOS's keyboard is full screen; Android TV's rises over the lower screen | A `DynamicKeyboard` panel covers the screen, with the address chips, Show/Hide, and Done below it | Roku sizes `DynamicKeyboard` itself; the panel keeps the text, voice entry, and shortcuts together |
@@ -1660,7 +1684,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A failed Home shows the server's message, or "Failed to load home sections" | The message every browse page uses for a failed load, with Retry | Section 5.8; the client's copy lives in `locale/` |
 | Library pages draw skeletons while they load | A centred 128 px spinner | One `Poster` instead of a placeholder per card on 512 MB devices |
 | On a mixed library, each Recommended section shows only the tab's type | Both tabs show every item of a mixed library's sections | Not built (AG-280): the server's section reads refuse a type, so the client would filter each section and refill it page by page, as tvOS does, which `BrowseRows`' loading and dropping of rows around focus does not yet support |
-| Collection groups appear as vertically stacked grids with uppercase headers | One group at a time, selected with a group pill and scrollable menu | Reuses the bounded Roku grid and keeps only one group's rendered cards active |
+| Collection groups appear as vertically stacked grids with uppercase headers | One grid of every group's collections in order, without headers | The owner's choice (2026-10-28): no toggle between groups; Roku's bounded grid has no section headers |
 | The Sort, Filter, and Shuffle pills, each with its icon, are the first item of the Browse grid and scroll away with it | The pills stay above the grid, without icons, and the grid keeps its focused row at the top (fixed focus) instead of scrolling the page | `MarkupGrid` has no full-width header item, and no icon art ships |
 | The filter panel's rows carry SF Symbols: chevrons, a cross on Clear, an arrow on Reset filters, and a check on Done | Its radio, box, and check marks are drawn art; the chevrons and Clear's cross are Inter's ‹, ›, and ×; Reset filters has no mark | No icon art ships for the rest, and the packaged Inter subset has those three glyphs (assumption AG-380) |
 | A filter set whose `groups` pass 32,768 characters goes to `POST /api/v2/catalog/query` | Every Browse read is a `GET` | A remote picks a value at a time; it takes hundreds of values to pass the limit (assumption AG-380) |
@@ -1751,6 +1775,60 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The connection speed test times one streamed download in 500 ms windows, following the probe's redirect without credentials | Back-to-back chunks, each timed whole and spread over the windows, which reads low by the gaps; only against a server with `bandwidth_probe_location_v1`, whose credential-free URL is fetched without the redirect | Roku shows no bytes inside a transfer, and forwards profile headers across a redirect (assumptions AG-391 and A-14) |
 | Buffering is told from a slow device by the buffered duration, and plan summaries survive the app's exit | No renderer waits; a progressive plan measures no throughput, so it lowers before its first frame only on its 20 s deadline's failure path; a plan the Home button ends sends no summary; no foreground check | Roku reports only a fill percentage and segment downloads, and gives a channel no exit callback or background state (AG-390, AG-391; Android TV keeps no exit journal either) |
 | People, the Audiobooks chip, and "Available to request" in search; Home row reordering; Watch Party in the avatar menu; Chapters, Speed, and Aspect; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; spoiler hiding; the AI-translation marker | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+
+### 5.10 For You and Calendar
+
+Both are tab pages and stack roots like Home (section 5.3), built from tvOS
+at silo-apple `ec9278f8` (`RecommendationsView`, `CalendarView`).
+
+- **For You.** Drawn as Home is (tvOS draws both with its Skyline feed):
+  the hero over the rows in the bottom band, from
+  `GET /api/v2/recommendations/discover` with Home's artwork widths. The
+  answer holds every row with all its items and is never paged, so its rows
+  are never dropped or loaded one by one; a failed image, or rows older than
+  the signed URLs' lifetime, reads the whole answer again quietly, once per
+  load. The server titles the rows ("Because you enjoy Crime", "Top Drama",
+  "Profiles Like You Enjoyed"); as on tvOS, a row titled "For You" goes
+  first, empty rows are left out, and a row of episodes shows stills. OK on
+  a card opens its detail page. With no rows the page says "No
+  recommendations yet" / "Watch or rate a few titles to build your
+  personalised recommendations." with Refresh; a failed read offers Retry.
+- **Calendar.** Under the bar, at the side inset:
+  - the filter, Search's segmented control (section 5.6) with Following,
+    Trending, and All (sent as `following`, `trending`, and `everything`),
+    Following first;
+  - the week strip, 90 px below: the previous-week chevron, the seven days
+    Monday to Sunday as 88×96 tiles 12 px apart (the short weekday over the
+    date, a dot when the day has events; white 6% at rest, the selected day
+    white 14%, today with a white ring, the highlighted item `#EDEDED` with
+    black text), the next-week chevron, Today while another week shows,
+    and the week's month ("June 2026", from its Thursday) at the right
+    inset;
+  - from y 380, a row of posters for each day with events, titled "Today",
+    "Tomorrow", or "Monday, June 9".
+
+  The week is read with `GET /api/v2/calendar?start=&end=&filter=&timezone=`,
+  Monday to Sunday in the TV's time zone, as an IANA name (section 5.9). A
+  card shows the series' or movie's title over "S5 · E14 · Title",
+  "Season 2", or "Movie"; up to two badges (PREMIERE, NEW SEASON, FINALE)
+  as white pills down its top left, its air time as a dark pill at the
+  bottom right
+  (`air_at` on the TV's clock, else the network's `air_time`, in 12- or
+  24-hour form as the TV's clock is set), and the check disc when watched.
+  OK opens an episode's series with that episode selected, a season
+  premiere's series on that season, and a movie itself.
+
+  Down moves from the filter to the strip and from the strip to the
+  week's first row; Up moves back, and from the filter to the bar. In the
+  strip, OK on a day focuses its row (or the next day's with events),
+  the chevrons move a week and select its Monday, and Today returns to
+  this week and today. The selected day follows the focused card. An empty
+  week says so for its filter: "Nothing from shows you follow", "Nothing
+  trending this week", or "Nothing scheduled this week", each with tvOS's
+  second line; a failed read offers Retry. Returning restores the week,
+  the filter, and the focused card; after the player closes the week is
+  read again quietly. A new day or time zone reads the week again when the
+  page shows.
 
 ## 6. Application architecture
 
@@ -2039,6 +2117,8 @@ The first release consumes:
   offered; `POST /api/v2/shuffles` to start one; `GET`, `DELETE`, and
   `POST .../advance` and `.../skip` on `/api/v2/shuffles/{id}` in the
   player (section 5.7);
+- `GET /api/v2/recommendations/discover` for the For You tab's rows, and
+  `GET /api/v2/calendar` for the Calendar tab's week (section 5.10);
 - `GET /api/v2/catalog/themes/capabilities` for whether theme music plays,
   and `POST /api/v2/catalog/items/{id}/themes/{theme_id}/playback` for a
   theme's grant, whose URL the Audio node plays (section 5.6).

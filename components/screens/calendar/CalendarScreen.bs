@@ -1,0 +1,284 @@
+import "pkg:/components/screens/home/shell.bs"
+import "pkg:/components/theme/browse.bs"
+import "pkg:/components/theme/calendar.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/source/calendar/page.bs"
+import "pkg:/source/home/page.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/textures.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Where focus is in the content.
+const ZONE_FILTER = "filter"
+const ZONE_STRIP = "strip"
+const ZONE_ROWS = "rows"
+
+sub init()
+    shellInit()
+    m.filter = m.top.findNode("filter")
+    m.filter.translation = [theme.size.SIDE_INSET, theme.calendar.FILTER_TOP]
+    segments = []
+    for each option in calendarPage.filters()
+        segments.Push([option[0], i18n.text(option[1])])
+    end for
+    m.filter.segments = segments
+    m.filter.observeField("chosen", "onFilterChosen")
+    m.strip = m.top.findNode("strip")
+    m.strip.translation = [theme.size.SIDE_INSET, theme.calendar.STRIP_TOP]
+    m.strip.observeField("chosen", "onStripChosen")
+    m.rows = m.top.findNode("rows")
+    m.rows.translation = [0, theme.calendar.ROWS_TOP]
+    m.rows.observeField("state", "onRowsState")
+    m.rows.observeField("focusedItem", "onRowsFocus")
+    m.rows.observeField("selectedItem", "onRowsSelected")
+    m.rows.observeField("rowKeys", "onRowKeys")
+    m.list = m.rows.findNode("list")
+    m.status = m.top.findNode("status")
+    m.status.centre = [960, theme.calendar.STATUS_CENTRE_Y]
+    m.status.observeField("activated", "onStatusActivated")
+    m.spinner = m.top.findNode("spinner")
+    m.spinner.centre = [960, theme.calendar.STATUS_CENTRE_Y]
+    m.refreshTimer = m.top.findNode("refreshTimer")
+    m.refreshTimer.duration = homeFeed.REFRESH_SECONDS
+    m.refreshTimer.observeField("fire", "onRefreshTimer")
+    m.textures = nav.textures.create()
+    nav.textures.addView(m.textures, m.rows)
+    m.lowTier = false
+    m.zone = ZONE_FILTER
+    m.clock = readClock()
+    ' The week's Monday, the day chosen in the strip, and the filter.
+    m.weekStart = calendarPage.weekStart(m.clock.today)
+    m.selected = m.clock.today
+    m.choice = calendarPage.FOLLOWING
+    if m.global.hasField("calendarFilter") and calendarPage.isFilter(m.global.calendarFilter) then m.choice = m.global.calendarFilter
+    ' Set when the player has closed, until the rows are read again.
+    m.refreshDue = false
+end sub
+
+sub onShow(event as Object)
+    if event.first
+        shellStart()
+        m.lowTier = platform.current().memory.tier = "low"
+        m.rows.owner = m.top.owner
+        if util.isObject(event.restore) then readSaved(event.restore.content)
+        loadWeek()
+    else
+        ' A new day changes the headings and may change the week's Today.
+        clock = readClock()
+        if clock.today <> m.clock.today or clock.zone <> m.clock.zone
+            m.clock = clock
+            loadWeek()
+        end if
+    end if
+    target = mainShell.restoreTarget(event.restore, m.shellSelected, m.top.entry.params)
+    reattached = nav.textures.restore(m.textures)
+    if util.isObject(target.content)
+        if util.isString(target.content.zone) then m.zone = target.content.zone
+        if (event.first or reattached) and target.content.list <> invalid then m.rows.callFunc("restoreFocus", target.content.list)
+    end if
+    shellRestore(target)
+    if event.refresh then m.refreshDue = true
+    if m.refreshDue then m.refreshTimer.control = "start"
+end sub
+
+sub onHide()
+    nav.textures.hide(m.textures)
+    m.refreshTimer.control = "stop"
+end sub
+
+sub onPressure(_level as String)
+    nav.textures.detach(m.textures)
+end sub
+
+function focusKey() as Dynamic
+    return shellFocusKey({ zone: m.zone, weekStart: m.weekStart, selected: m.selected, filter: m.choice, list: m.rows.callFunc("focusKey") })
+end function
+
+' A rebuilt page's week, day, and filter.
+sub readSaved(saved as Dynamic)
+    if not util.isObject(saved) then return
+    if util.isNumber(saved.weekStart) then m.weekStart = calendarPage.weekStart(Int(saved.weekStart))
+    if util.isNumber(saved.selected) then m.selected = Int(saved.selected)
+    if calendarPage.isFilter(saved.filter) then m.choice = saved.filter
+end sub
+
+' The TV's day, its offset from UTC now, its time zone as the server names
+' it, and whether its clock shows 24 hours; air times use the zone's rules
+' for their own dates (zoneRules).
+function readClock() as Object
+    now = CreateObject("roDateTime")
+    offsetSeconds = -now.GetTimeZoneOffset() * 60
+    info = CreateObject("roDeviceInfo")
+    zone = calendarPage.timeZone(info.GetTimeZone(), offsetSeconds \ 60)
+    return { today: calendarPage.today(now.AsSeconds(), offsetSeconds), offsetSeconds: offsetSeconds, zone: zone, clock24: info.GetClockFormat() = "24h", zoneRules: true }
+end function
+
+' Reads the week for the filter.
+sub loadWeek()
+    m.filter.selected = m.choice
+    m.strip.setFields({ today: m.clock.today, weekStart: m.weekStart, selected: m.selected })
+    request = calendarPage.request(m.weekStart, m.choice, m.clock.zone, m.clock)
+    m.rows.callFunc("load", { request: request, lowTier: m.lowTier })
+end sub
+
+' ---- Focus
+
+function shellContent() as Dynamic
+    if m.zone = ZONE_STRIP then return m.strip
+    if m.zone = ZONE_ROWS
+        if m.status.visible and m.status.action <> "" then return m.status
+        if m.rows.state = "ready" then return m.rows
+        return m.strip
+    end if
+    return m.filter
+end function
+
+sub shellToTop()
+    m.zone = ZONE_FILTER
+end sub
+
+sub shellLibrariesKnown()
+end sub
+
+sub focusZone(zone as String)
+    m.zone = zone
+    shellFocusContent()
+end sub
+
+' Down goes from the filter to the strip and from the strip to the week's
+' first row (or the error's Retry); Up goes back, and from the filter to
+' the top bar (shellKey).
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press or m.bar.isInFocusChain() or m.menu <> invalid or m.shellDialog <> invalid then return shellKey(key, press)
+    if m.filter.isInFocusChain()
+        if key = "down"
+            focusZone(ZONE_STRIP)
+            return true
+        end if
+    else if m.strip.isInFocusChain()
+        if key = "up"
+            focusZone(ZONE_FILTER)
+            return true
+        else if key = "down"
+            enterRows(0)
+            return true
+        end if
+    else if key = "up"
+        focusZone(ZONE_STRIP)
+        return true
+    end if
+    return shellKey(key, press)
+end function
+
+' Focus to row index; or to Retry.
+sub enterRows(index as Integer)
+    if m.rows.state = "ready"
+        if index >= 0 then m.rows.callFunc("focusRow", index)
+        focusZone(ZONE_ROWS)
+    else if m.status.visible and m.status.action <> ""
+        focusZone(ZONE_ROWS)
+    end if
+end sub
+
+' ---- The filter and the week
+
+sub onFilterChosen()
+    choice = m.filter.chosen
+    if not calendarPage.isFilter(choice) or choice = m.choice then return
+    m.choice = choice
+    if not m.global.hasField("calendarFilter") then m.global.addFields({ calendarFilter: "" })
+    m.global.calendarFilter = choice
+    loadWeek()
+end sub
+
+' A chevron moves a week and selects its Monday, Today returns to this
+' week and today (tvOS CalendarViewModel), and a day focuses its row.
+sub onStripChosen()
+    chosen = m.strip.chosen
+    kind = util.text(chosen.kind)
+    if kind = "day"
+        m.selected = Int(chosen.day)
+        m.strip.selected = m.selected
+        ' The day's row, else the next day's with events, else the last.
+        enterRows(calendarPage.rowFor(m.selected, m.rows.rowKeys))
+        return
+    end if
+    if kind = "previous"
+        m.weekStart = m.weekStart - 7
+        m.selected = m.weekStart
+    else if kind = "next"
+        m.weekStart = m.weekStart + 7
+        m.selected = m.weekStart
+    else if kind = "today"
+        m.clock = readClock()
+        m.weekStart = calendarPage.weekStart(m.clock.today)
+        m.selected = m.clock.today
+    else
+        return
+    end if
+    loadWeek()
+end sub
+
+sub onRowKeys()
+    m.strip.marked = m.rows.rowKeys
+end sub
+
+' ---- The rows
+
+' The spinner shows while nothing else does; the empty and error states take
+' the rows' place.
+sub onRowsState()
+    state = m.rows.state
+    shown = m.list.content
+    m.spinner.running = state = "loading" and (shown = invalid or shown.getChildCount() = 0)
+    m.list.visible = state <> "empty" and state <> "error"
+    if state = "empty"
+        key = "calendar.empty." + m.choice
+        showStatus("empty", i18n.text(key), i18n.text(key + "Body"), "")
+    else if state = "error"
+        showStatus("error", i18n.text("browse.error.load"), "", i18n.text("states.retry"))
+    else
+        m.status.visible = false
+    end if
+    if state = "ready" or state = "empty" or state = "error" then m.strip.marked = m.rows.rowKeys
+    ' Focus in the rows that lost them goes to the strip.
+    if m.zone = ZONE_ROWS and shellInContent() then shellFocusContent()
+    if m.zone = ZONE_ROWS and shellContent().isSameNode(m.strip) then m.zone = ZONE_STRIP
+    shellAnnounce(m.status)
+end sub
+
+' kind is StatusView's: "empty" or "error" (spec section 5.8).
+sub showStatus(kind as String, message as String, detail as String, action as String)
+    m.status.kind = kind
+    m.status.message = message
+    m.status.detail = detail
+    m.status.action = action
+    m.status.visible = true
+end sub
+
+sub onStatusActivated()
+    loadWeek()
+end sub
+
+' The strip follows the day of the focused card.
+sub onRowsFocus()
+    card = m.rows.focusedItem
+    if card = invalid or not m.rows.isInFocusChain() then return
+    row = card.getParent()
+    if row = invalid then return
+    day = calendarPage.parseDate(row.id)
+    if day = invalid or day = m.selected then return
+    m.selected = day
+    m.strip.selected = day
+end sub
+
+sub onRowsSelected()
+    nav.push(nav.route.DETAIL, calendarPage.detailParams(m.rows.selectedItem))
+end sub
+
+sub onRefreshTimer()
+    m.refreshDue = false
+    m.rows.callFunc("refresh")
+end sub
