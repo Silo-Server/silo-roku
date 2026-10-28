@@ -1,0 +1,174 @@
+namespace tests
+
+    @suite("onboarding createProfile")
+    class OnboardingCreateProfileTests extends rooibos.BaseTestSuite
+
+        function form(name = "Sam" as String) as Object
+            out = onboarding.createProfile.newForm()
+            out.name = name
+            return out
+        end function
+
+        function problemBody(status as Integer, problemType as String, detail as String, errors = invalid as Dynamic) as Object
+            body = { type: "https://siloserver.org/docs/api/v2/problems/" + problemType, title: "x", status: status, detail: detail, instance: "urn:silo:request:1" }
+            if errors <> invalid then body.errors = errors
+            return body
+        end function
+
+        function failed(status as Integer, kind as String, problemType = "" as String, body = invalid as Dynamic) as Object
+            return { ok: false, status: status, body: body, error: { kind: kind, status: status, problemType: problemType } }
+        end function
+
+        @describe("Child Profile")
+
+        @it("fills in PG and restricts libraries when turned on, as tvOS does")
+        sub _()
+            child = onboarding.createProfile.withChild(m.form(), true)
+            m.assertEqual([child.isChild, child.rating, child.restrict], [true, "PG", true])
+            m.assertTrue(child.allowed.IsEmpty())
+        end sub
+
+        @it("keeps a chosen ceiling and clears everything when turned off")
+        sub _()
+            values = m.form()
+            values.rating = "PG-13"
+            child = onboarding.createProfile.withChild(values, true)
+            m.assertEqual(child.rating, "PG-13")
+            child.allowed = { "2": true }
+            adult = onboarding.createProfile.withChild(child, false)
+            m.assertEqual([adult.isChild, adult.rating, adult.restrict], [false, "", false])
+            m.assertTrue(adult.allowed.IsEmpty())
+            m.assertEqual(child.rating, "PG-13", "the form given is not changed")
+        end sub
+
+        @it("lists tvOS's four ceilings and finds a value's place")
+        sub _()
+            values = []
+            for each rating in onboarding.createProfile.ratings()
+                values.Push(rating.value)
+            end for
+            m.assertEqual(values, ["G", "PG", "PG-13", "R"])
+            m.assertEqual(onboarding.createProfile.ratingIndex("PG-13"), 2)
+            m.assertEqual(onboarding.createProfile.ratingIndex("NC-17"), 0)
+        end sub
+
+        @describe("PIN")
+
+        @it("keeps at most four digits and accepts none or all four")
+        sub _()
+            m.assertEqual(onboarding.createProfile.pinOf("12a345"), "1234")
+            m.assertTrue(onboarding.createProfile.pinAcceptable(""))
+            m.assertTrue(onboarding.createProfile.pinAcceptable("0000"))
+            m.assertFalse(onboarding.createProfile.pinAcceptable("12"))
+        end sub
+
+        @describe("problem")
+
+        @it("asks for a name first, then the whole PIN, then a library")
+        sub _()
+            values = m.form("  ")
+            values.pin = "12"
+            m.assertEqual(onboarding.createProfile.problem(values, []).field, "name")
+            values.name = "Sam"
+            answer = onboarding.createProfile.problem(values, [])
+            m.assertEqual([answer.field, answer.key, answer.titleKey], ["pin", "newProfile.error.pin", "newProfile.error.pinTitle"])
+            values.pin = "1234"
+            values = onboarding.createProfile.withChild(values, true)
+            m.assertEqual(onboarding.createProfile.problem(values, ["1", "2"]).field, "libraries")
+            values.allowed = { "9": true }
+            m.assertEqual(onboarding.createProfile.problem(values, ["1", "2"]).field, "libraries", "a library the form does not list does not count")
+            values.allowed["2"] = true
+            m.assertEqual(onboarding.createProfile.problem(values, ["1", "2"]).field, "")
+            values.restrict = false
+            values.allowed = {}
+            m.assertEqual(onboarding.createProfile.problem(values, ["1", "2"]).field, "")
+        end sub
+
+        @describe("body")
+
+        @it("sends the trimmed name alone for a profile without a PIN")
+        sub _()
+            m.assertEqual(onboarding.createProfile.body(m.form("  Sam  "), []), { name: "Sam" })
+        end sub
+
+        @it("sends the PIN, the child flag, its ceiling, and the allowlist in the form's library order")
+        sub _()
+            values = onboarding.createProfile.withChild(m.form(), true)
+            values.pin = "2468"
+            values.allowed = { "3": true, "1": true }
+            body = onboarding.createProfile.body(values, ["1", "2", "3"])
+            m.assertEqual(body, { name: "Sam", pin: "2468", is_child: true, max_content_rating: "PG", library_restrictions_enabled: true, allowed_library_ids: ["1", "3"] })
+        end sub
+
+        @it("leaves the allowlist out when a child's libraries are not restricted")
+        sub _()
+            values = onboarding.createProfile.withChild(m.form(), true)
+            values.restrict = false
+            m.assertEqual(onboarding.createProfile.body(values, ["1"]), { name: "Sam", is_child: true, max_content_rating: "PG" })
+        end sub
+
+        @it("reads the assignable libraries on the account alone")
+        sub _()
+            request = onboarding.createProfile.librariesRequest()
+            m.assertEqual([request.path, request.auth, request.map.kind], ["/api/v2/user/libraries", "account", catalog.kind.LIBRARIES])
+        end sub
+
+        @describe("outcome")
+
+        @it("returns to the picker on 201")
+        sub _()
+            m.assertEqual(onboarding.createProfile.outcome({ ok: true, status: 201, body: {}, error: invalid }).action, onboarding.createProfile.CREATED)
+        end sub
+
+        @it("shows the server's reason for a taken name, a full household, or a rejected member")
+        sub _()
+            taken = onboarding.createProfile.outcome(m.failed(409, "http", "conflict", m.problemBody(409, "conflict", "A profile with this name already exists")))
+            m.assertEqual([taken.action, taken.titleKey, taken.text], [onboarding.createProfile.FAILED, "newProfile.refused.title", "A profile with this name already exists"])
+            full = onboarding.createProfile.outcome(m.failed(409, "http", "conflict", m.problemBody(409, "conflict", "This account has reached its profile limit (5)")))
+            m.assertEqual(full.text, "This account has reached its profile limit (5)")
+            errors = [{ location: "body.pin", code: "out_of_range", detail: "" }, { location: "body.name", code: "invalid", detail: "Profile name is required" }]
+            rejected = onboarding.createProfile.outcome(m.failed(422, "http", "validation_failed", m.problemBody(422, "validation_failed", "The request did not pass validation; see errors.", errors)))
+            m.assertEqual(rejected.text, "Profile name is required")
+            demo = onboarding.createProfile.outcome(m.failed(403, "http", "permission_denied", m.problemBody(403, "permission_denied", "")))
+            m.assertEqual([demo.action, demo.text, demo.key], [onboarding.createProfile.FAILED, "", "newProfile.error.failed"])
+        end sub
+
+        @it("takes a 2xx whose body could not be read as created")
+        sub _()
+            for each kind in ["parse", "too_large"]
+                answer = onboarding.createProfile.outcome(m.failed(201, kind))
+                m.assertEqual(answer.action, onboarding.createProfile.CREATED, kind)
+            end for
+        end sub
+
+        @it("closes the form when the request may have created the profile")
+        sub _()
+            for each kind in ["network", "timeout"]
+                answer = onboarding.createProfile.outcome(m.failed(0, kind))
+                m.assertEqual([answer.action, answer.titleKey, answer.key], [onboarding.createProfile.UNCONFIRMED, "newProfile.unconfirmed.title", "newProfile.unconfirmed.body"])
+            end for
+        end sub
+
+        @it("asks for the primary's PIN again when its token is gone or refused")
+        sub _()
+            m.assertEqual(onboarding.createProfile.outcome(m.failed(0, "pin_required")).action, onboarding.createProfile.VERIFY)
+            refused = m.failed(403, "http", "profile_verification_required", m.problemBody(403, "profile_verification_required", "x"))
+            m.assertEqual(onboarding.createProfile.outcome(refused).action, onboarding.createProfile.VERIFY)
+        end sub
+
+        @it("ignores a cancelled request and gives other failures the general message")
+        sub _()
+            m.assertEqual(onboarding.createProfile.outcome(m.failed(0, "cancelled")).action, onboarding.createProfile.CANCELLED)
+            other = onboarding.createProfile.outcome(m.failed(500, "http", "internal", m.problemBody(500, "internal", "boom")))
+            m.assertEqual([other.action, other.text, other.key], [onboarding.createProfile.FAILED, "", "newProfile.error.failed"])
+        end sub
+
+        @it("shortens a long explanation")
+        sub _()
+            long = string(300, "a")
+            text = onboarding.createProfile.detailOf({ detail: long })
+            m.assertEqual(Len(text), onboarding.createProfile.MAX_DETAIL)
+            m.assertEqual(onboarding.createProfile.detailOf(invalid), "")
+        end sub
+    end class
+end namespace

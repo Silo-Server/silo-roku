@@ -96,6 +96,8 @@ Account and setup:
 - on-device password sign-in for local accounts and password-based sign-in
   providers such as LDAP;
 - profile picker, profile PIN entry, and child-profile restrictions;
+- creating a profile from the picker's Add profile, as the household's
+  primary profile (sections 5.4 and 7.3);
 - profile at launch: Profile Selection (Automatic, Every Time, After 1 Hour,
   After 12 Hours) and, on a new TV, "Open {name} automatically?" after the
   first pick (sections 5.4 and 7.3);
@@ -203,7 +205,7 @@ Planned:
 - a sleep timer in the video player (Android TV; tvOS sets one only in its
   audio player);
 - the marker on AI-translated subtitle tracks (Android TV);
-- profile creation (tvOS, Android TV) and editing (Android TV).
+- profile editing (Android TV); profile creation has shipped (section 3.2).
 
 Not decided yet, and deferred until the owner chooses:
 
@@ -570,6 +572,14 @@ their existing HD/FHD assets.
   - A list that fails to load shows the error as section 5.8 does, with Try
     again.
   - Focus starts on the profile last opened on this device, else the first.
+  - Add profile, tvOS's last tile, follows the profiles when the household
+    has a primary profile (the one marked `is_primary`, or an only profile),
+    as Android TV shows it: a 220 px circle with a 2 px dashed outline at
+    25% and a 66 px plus at 40%, the name "Add profile"; focused, the circle
+    fills white at 14%, the outline goes to 70%, the plus to 100%, and it
+    takes the profiles' ring, scale, and name. It opens the primary
+    profile's PIN when it has one, then New Profile; back on the picker, the
+    list is read again and a new profile joins it with focus.
   - An account with a single profile and no PIN skips the picker, except
     when Profile Selection asks at launch; right after a sign-in it skips
     it then too, as tvOS does.
@@ -621,6 +631,48 @@ their existing HD/FHD assets.
     "Checking…", or the error in `#FF6961` (a lockout gives the minutes left).
   - The PIN submits on the fourth digit. A wrong PIN turns the dots red. Back
     deletes the last digit, then cancels.
+  - For Add profile, the screen takes the primary profile's PIN the same
+    way; it chooses no profile, and gives way to New Profile.
+- **New Profile** (tvOS's `CreateProfileView`).
+  - Full screen on black. "New Profile" in 48 px SemiBold and "Give it a
+    name." in 20 px at 55%, 4 px below, 60 px from the top and 80 px from
+    the left; Cancel, a compact button, at the right.
+  - 32 px below, the preview column, 360 px wide: the picker's tile at rest
+    with the name typed (or "Your Name"), its initial, and the lock and KIDS
+    badges the PIN and Child Profile give it; "Your tile will look like
+    this." 24 px under the name while there is none.
+  - 80 px to its right, the form, which scrolls to keep the highlighted
+    control 60 px inside the screen. Sections 32 px apart, each under an
+    uppercase caption (19 px SemiBold, letter-spaced, 50%), 10 px above it:
+    - Name: a first-run field, "Profile name", typed with the Roku keyboard,
+      at most 64 characters;
+    - PIN (optional): a field, "4-digit PIN", typed with the keyboard's
+      digits; a partial PIN shows "Enter all 4 digits, or clear the field
+      for no PIN." 10 px under it;
+    - Child Profile, "Restricts content to kid-friendly ratings": a switch
+      row (20 px Medium title, 16 px detail at 55%, a 58 px switch, white
+      with a dark puck when on); highlighted, it fills white at 8% with a
+      white 35% outline;
+    - for a child, a panel (radius 16, 14 px inside, rows 14 px apart):
+      Maximum content rating, whose OK opens Settings' centred menu with
+      G / TV-G, PG / TV-PG / TV-Y7 (the default), PG-13 / TV-14, and R /
+      TV-MA / NC-17; Restrict libraries, on by default; and, while it is on,
+      "Allowed libraries" with a switch for each of the account's libraries,
+      or "Loading libraries…", "Couldn't load libraries." with Try again, or
+      "No libraries are available to assign.";
+    - Create Profile, a first-run button, 40 px below.
+  - Create Profile with no name, a partial PIN, or a restricted child profile
+    without a library shows tvOS's alert (Name Required, PIN Too Short,
+    Choose a Library) and highlights what is missing. Otherwise it reads
+    "Creating…" and nothing else acts until the server answers. A created
+    profile returns to the picker. A taken name, a full household, or
+    another refusal shows "Can't Create Profile" with the server's reason;
+    no answer shows "Profile May Have Been Created" and returns to the
+    picker, so the list shows whether it was; a refused primary token returns
+    to the picker to enter its PIN again.
+  - tvOS's "Allow requests" switch shows only on servers that accept
+    `requests_allowed`; none does on silo-server `main` (f133b241f), so
+    Roku leaves it out until one does.
 
 ### 5.5 Home and libraries
 
@@ -1943,6 +1995,11 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A PIN lockout shows the server's text (Android TV) | The minutes left from `Retry-After`, as tvOS words them | Section 7.3 |
 | The brand light drifts slowly | A still image of the same mesh at rest | Packaged art (section 5.4) costs no frame time on low-memory devices |
 | Preset (SVG), emoji, and DiceBear avatars are drawn | The name's initial on the profile's colour | Roku cannot draw SVG or colour emoji, and the client does not rewrite avatar URLs |
+| New Profile has Style and Avatar sections: DiceBear presets in an 18-avatar grid with Shuffle | No avatar choice; a new profile has none, so every client draws its initial | The previews are PNG URLs the clients build on api.dicebear.com: AGENTS.md allows no client-invented URLs, and the privacy policy says the app sends nothing to a third party. The server's own preset URL is SVG, which Roku cannot draw (assumption AG-520) |
+| Add profile is always the picker's last tile | It shows only when the household has a primary profile (Android TV) | Only the primary profile may create profiles (section 7.3) |
+| Create Profile is disabled until there is a name and a whole PIN | It stays enabled, and answers with tvOS's own alerts for what is missing | CapsuleButton has no disabled state, and the alerts say what to fix |
+| New Profile's section captions are 13 pt, over a soft white glow | 19 px (Settings' section captions), on plain black | 13 px is hard to read across a room; the glow would be another packaged image |
+| The PIN field types with the number pad | The Roku keyboard, its digits kept | Roku's keyboard; the field keeps four digits as tvOS does |
 | The top bar's avatar and the avatar menu's header draw a profile without an image as its initial on white at 16–18% | The initial on the profile's colour, as on the picker | One avatar drawing from the picker to the shell keeps a profile's colour after the picker (parity review P-17) |
 | Avatar images are round everywhere | Square on devices without OpenGL | `MaskGroup` does not clip there (implementation plan section 4.6) |
 | The PIN screen's avatar is a near-black disc with the initial in `#EDEDED` | The profile's colour, as on the picker | One avatar drawing from the picker to the shell (parity review P-17) |
@@ -2378,6 +2435,19 @@ profile_verification_required`, for example after the PIN changed):
 - its playback is closed, and the session's stop waits for the new PIN's
   token; it is never sent with another profile's credentials.
 
+Creating a profile takes the household's primary profile, which the
+picker has not chosen (Add profile, section 5.4). As tvOS and Android TV do,
+the client acts as it without opening it: for a PIN-locked primary, the PIN
+screen sends `verify-pin` once, and the token stays in the account session's
+memory, never in the registry. `POST /api/v2/profiles` then carries the
+primary's `X-Profile-Id` and that token. The session forgets it when New
+Profile closes, when the server refuses it (`403
+profile_verification_required`; the request is not replayed), or when the
+session ends; the remembered profile and the open one are untouched, and
+opening the primary to watch still needs its PIN. The create is never
+retried (`non_retryable`): a request without an answer may have created the
+profile, so the picker reads the list again instead.
+
 ### 7.4 Request headers
 
 Every authenticated request carries:
@@ -2456,6 +2526,9 @@ The first release consumes:
   player (section 5.7);
 - `GET /api/v2/recommendations/discover` for the For You tab's rows, and
   `GET /api/v2/calendar` for the Calendar tab's week (section 5.10);
+- `POST /api/v2/profiles` to create a profile as the household's primary
+  profile, and `GET /api/v2/user/libraries` without profile headers for the
+  libraries a child profile may be given (sections 5.4 and 7.3);
 - `GET /api/v2/catalog/themes/capabilities` for whether theme music plays,
   and `POST /api/v2/catalog/items/{id}/themes/{theme_id}/playback` for a
   theme's grant, whose URL the Audio node plays (section 5.6);

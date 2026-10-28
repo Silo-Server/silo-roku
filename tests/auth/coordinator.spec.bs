@@ -974,6 +974,96 @@ namespace tests
             m.assertTrue(api.auth.coordinator.view(loop.session).verification.hasPin)
         end sub
 
+        @describe("household management")
+
+        @it("acts as a primary profile without a PIN, sending its id alone, and stops with endManage")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            primary = { id: "p-owner", name: "Laura", hasPin: false, isChild: false }
+            tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/profiles", method: "POST", body: { name: "Sam" }, auth: "manager" })
+            m.assertEqual(loop.delivered.r1.error.kind, "pin_required", "no manager yet")
+            tests.sessions.send(loop, { requestId: "r2", session: "manage", profile: primary, pin: "" })
+            m.assertEqual(loop.delivered.r2.body.outcome, "verified")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/profiles/p-owner/verify-pin"), 0)
+            tests.sessions.send(loop, { requestId: "r3", path: "/api/v2/profiles", method: "POST", body: { name: "Sam" }, auth: "manager" })
+            m.assertEqual(loop.running.r3.headers["X-Profile-Id"], "p-owner")
+            m.assertFalse(loop.running.r3.headers.DoesExist("X-Profile-Token"))
+            m.assertEqual(loop.running.r3.headers["Authorization"], "Bearer acc")
+            view = api.auth.coordinator.view(loop.session)
+            m.assertInvalid(view.profile, "managing chooses no profile")
+            m.assertEqual(view.rememberedProfileId, "")
+            m.assertEqual(api.auth.coordinator.identity(loop.session).profile, "")
+            tests.sessions.send(loop, { requestId: "r4", session: "endManage" })
+            m.assertTrue(loop.delivered.r4.ok)
+            tests.sessions.send(loop, { requestId: "r5", path: "/api/v2/profiles", method: "POST", body: { name: "Sam" }, auth: "manager" })
+            m.assertEqual(loop.delivered.r5.error.kind, "pin_required")
+        end sub
+
+        @it("checks a PIN-locked primary's PIN once and keeps its token in memory alone")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            primary = { id: "p-owner", name: "Laura", hasPin: true, isChild: false }
+            tests.sessions.send(loop, { requestId: "r0", session: "manage", profile: primary, pin: "" })
+            m.assertEqual(loop.delivered.r0.error.kind, "invalid_request", "a locked primary needs its PIN")
+            tests.sessions.send(loop, { requestId: "r1", session: "manage", profile: primary, pin: "1234" })
+            m.assertEqual(loop.running.r1.request.path, "/api/v2/profiles/p-owner/verify-pin")
+            m.assertFalse(loop.running.r1.headers.DoesExist("X-Profile-Id"))
+            m.assertTrue(api.auth.coordinator.sendsSecret(loop.session, "r1"))
+            persisted = loop.persisted.Count()
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("verify_profile_pin_ok"))
+            m.assertEqual(loop.delivered.r1.body, { outcome: "verified", retryAfterSeconds: invalid })
+            m.assertEqual(Instr(1, FormatJson(loop.delivered.r1), "pvt_fixture"), 0, "the token stays in ApiTask")
+            m.assertEqual(loop.persisted.Count(), persisted, "nothing is written to the registry")
+            m.assertEqual(api.auth.coordinator.record(loop.session).profileTokens, [])
+            m.assertInvalid(api.auth.coordinator.view(loop.session).profile)
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/profiles", method: "POST", body: { name: "Sam" }, auth: "manager" })
+            m.assertEqual([loop.running.r2.headers["X-Profile-Id"], loop.running.r2.headers["X-Profile-Token"]], ["p-owner", "pvt_fixture"])
+            ' Choosing the primary to watch still takes its PIN.
+            tests.sessions.send(loop, { requestId: "r3", session: "selectProfile", profile: primary })
+            m.assertEqual(loop.delivered.r3.error.kind, "pin_required")
+        end sub
+
+        @it("answers a wrong manager PIN without retrying and without a manager")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            primary = { id: "p-owner", name: "Laura", hasPin: true, isChild: false }
+            tests.sessions.send(loop, { requestId: "r1", session: "manage", profile: primary, pin: "0000" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("verify_profile_pin_wrong"))
+            m.assertEqual(loop.delivered.r1.body.outcome, "wrong")
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/profiles/p-owner/verify-pin"), 1)
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/profiles", method: "POST", body: { name: "Sam" }, auth: "manager" })
+            m.assertEqual(loop.delivered.r2.error.kind, "pin_required")
+        end sub
+
+        @it("forgets the manager when the server refuses its token, and leaves the open profile alone")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.profileId = "p-kid"
+            record.profileTokens = [{ id: "p-owner", token: "stored" }]
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r0", session: "selectProfile", profile: { id: "p-kid", name: "Kid", hasPin: false, isChild: true } })
+            primary = { id: "p-owner", name: "Laura", hasPin: true, isChild: false }
+            tests.sessions.send(loop, { requestId: "r1", session: "manage", profile: primary, pin: "1234" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("verify_profile_pin_ok"))
+            tests.sessions.send(loop, { requestId: "r2", path: "/api/v2/profiles", method: "POST", body: { name: "Sam" }, auth: "manager" })
+            tests.sessions.respond(loop, "r2", 403, m.refusedProof())
+            m.assertEqual(loop.delivered.r2.status, 403)
+            m.assertEqual(tests.sessions.count(loop, "start /api/v2/profiles"), 1, "never replayed")
+            m.assertEqual(api.auth.coordinator.record(loop.session).profileTokens, [{ id: "p-owner", token: "stored" }], "the stored token is not the manager's")
+            m.assertEqual(api.auth.coordinator.view(loop.session).profile.id, "p-kid")
+            m.assertInvalid(api.auth.coordinator.view(loop.session).verification)
+            tests.sessions.send(loop, { requestId: "r3", path: "/api/v2/profiles", method: "POST", body: { name: "Sam" }, auth: "manager" })
+            m.assertEqual(loop.delivered.r3.error.kind, "pin_required")
+        end sub
+
+        @it("ends the manager with the session")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "r1", session: "manage", profile: { id: "p-owner", hasPin: false }, pin: "" })
+            tests.sessions.send(loop, { requestId: "r2", session: "signOut" })
+            m.assertInvalid(loop.session.manager)
+        end sub
+
         @it("ignores coordinator markers a screen puts on a request")
         sub _()
             loop = tests.sessions.create(tests.sessions.signedIn())

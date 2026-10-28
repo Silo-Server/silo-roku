@@ -43,6 +43,9 @@ import "pkg:/source/util/values.bs"
 '   { session: "inUse" }            a profile is still open on screen
 '   { session: "requireSelection", profileId }  Silo came back after time
 '     away that asks who's watching (onboarding.launch.asksOnReturn)
+'   { session: "manage", profile, pin }  act as the household's primary
+'                                   profile for profile creation (manage)
+'   { session: "endManage" }        stop acting as it
 '   { session: "checkOrigin" }      check the configured origin again
 '   { session: "nameServer", origin, name }  remember a saved server's name
 '   { session: "forgetServer", origin }  remove a saved server (forgetServer)
@@ -75,6 +78,14 @@ import "pkg:/source/util/values.bs"
 ' sets in every build), reports another origin, or does not serve /api/v2,
 ' they fail with that refusal, which the session view reports until the
 ' viewer asks for another check or changes servers.
+'
+' Household management: profile creation needs the household's primary
+' profile (spec section 7.3), which the picker has not chosen. manage keeps
+' that profile, and the token verify-pin gave for its PIN, in memory alone
+' as the manager, for requests with auth "manager": it is never persisted,
+' never selected, and never the identity, so it neither opens the profile
+' nor counts as a choice (assumption AG-522). It ends with endManage, a
+' refused token, or the session.
 '
 ' Profile at launch (spec section 7.3, onboarding.launch): launchAsks says
 ' the remembered profile does not reopen on its own, but waits for the
@@ -128,7 +139,7 @@ namespace api.auth.coordinator
     ' "checking" | "verified" | "refused", problem, url, requestId } for the
     ' base URL url.
     function create(saved as Object, facts as Object, allowUnconfirmedOrigin = false as Boolean) as Object
-        return { saved: saved, facts: facts, verified: {}, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, companion: invalid, companionAttempt: 0, launchAsks: false, afterSignIn: false, offer: invalid, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
+        return { saved: saved, facts: facts, verified: {}, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, manager: invalid, companion: invalid, companionAttempt: 0, launchAsks: false, afterSignIn: false, offer: invalid, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
     end function
 
     ' The decisions to carry out once, at launch, before the first publish:
@@ -228,7 +239,7 @@ namespace api.auth.coordinator
     function sendsSecret(state as Object, requestId as String) as Boolean
         op = state.ops[requestId]
         if op = invalid then return false
-        return op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "pin" or op.kind = "borrowRefresh" or op.kind = "handoffPoll" or op.kind = "handoffCancel" or op.kind = "companionPoll" or op.kind = "companionCancel"
+        return op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "pin" or op.kind = "managerPin" or op.kind = "borrowRefresh" or op.kind = "handoffPoll" or op.kind = "handoffCancel" or op.kind = "companionPoll" or op.kind = "companionCancel"
     end function
 
     ' A session operation from the render thread.
@@ -243,6 +254,8 @@ namespace api.auth.coordinator
         if op = "answerOffer" then return answerOffer(state, input)
         if op = "inUse" then return inUse(state, input, now)
         if op = "requireSelection" then return requireSelection(state, input)
+        if op = "manage" then return manage(state, input)
+        if op = "endManage" then return endManage(state, input)
         if op = "checkOrigin" then return checkOrigin(state, input)
         if op = "nameServer" then return nameServer(state, input)
         if op = "forgetServer" then return forgetServer(state, input, now)
@@ -265,7 +278,7 @@ namespace api.auth.coordinator
     ' waits for it when the token has expired. Markers this module sets on
     ' requests are removed first.
     function submitted(state as Object, request as Object, now as Integer) as Object
-        for each marker in ["authGeneration", "authRetried", "authProfileId", "authProof", "authBorrowed", "rotatesCredentials", "confidential"]
+        for each marker in ["authGeneration", "authRetried", "authProfileId", "authProof", "authBorrowed", "authManager", "rotatesCredentials", "confidential"]
             request.Delete(marker)
         end for
         if request.auth = "none" or state.saved.refreshToken = "" then return []
@@ -326,6 +339,13 @@ namespace api.auth.coordinator
             out.Append(pair.headers)
             request.authProfileId = state.profile.id
             request.authProof = proofSerial(state, state.profile.id)
+        else if request.auth = "manager"
+            manager = state.manager
+            if manager = invalid or manager.epoch <> state.epoch then return { headers: {}, error: "pin_required" }
+            pair = api.auth.headers.profile(manager.profile, manager.token)
+            if pair.error <> invalid then return { headers: {}, error: pair.error }
+            out.Append(pair.headers)
+            request.authManager = manager.serial
         end if
         return { headers: out, error: invalid }
     end function
@@ -342,6 +362,12 @@ namespace api.auth.coordinator
             return [finish(result)]
         end if
         if result.status = 401 then return unauthorized(state, request, result, now)
+        ' A refused manager token ends the manager it was sent for; the
+        ' screen asks for the primary's PIN again.
+        if result.status = 403 and problemType(result) = "profile_verification_required" and util.isNumber(request.authManager)
+            if state.manager <> invalid and state.manager.serial = request.authManager then state.manager = invalid
+            return [finish(result)]
+        end if
         if result.status = 403 and problemType(result) = "profile_verification_required" and util.isString(request.authProfileId)
             decisions = refuseProof(state, request.authProfileId, request.authProof)
             decisions.Unshift(finish(result))
@@ -361,6 +387,7 @@ namespace api.auth.coordinator
         if op.kind = "server" then return serverChecked(state, request, op, result, now)
         if op.kind = "origin" then return originChecked(state, request, op, result)
         if op.kind = "pin" then return pinChecked(state, request, op, result, now)
+        if op.kind = "managerPin" then return managerChecked(state, request, op, result)
         if op.kind = "handoffCapability" then return handoffCapable(state, op, result)
         if op.kind = "handoffStart" then return handoffStarted(state, op, result)
         if op.kind = "handoffPoll" then return handoffPolled(state, op, result)
@@ -455,6 +482,38 @@ namespace api.auth.coordinator
         request = build(state, input, { method: "POST", path: api.auth.profiles.verifyPath(chosen.id), body: { pin: input.pin }, auth: "account", timeoutMs: PIN_TIMEOUT_MS }, { kind: "pin", origin: state.saved.origin, profile: chosen, epoch: state.epoch, viewer: util.isTrue(input.viewer) })
         return submitConfidential(state, request)
     end function
+
+    ' Acts as profile, the household's primary profile, for requests with
+    ' auth "manager". A profile without a PIN needs none; one with a PIN is
+    ' checked with POST /profiles/{id}/verify-pin, never retried, and the
+    ' answer is verifyPin's { outcome, retryAfterSeconds } without profile:
+    ' a match keeps the token in memory alone and selects nothing.
+    function manage(state as Object, input as Object) as Object
+        if state.saved.accessToken = "" then return [reply(api.response.failure(input, "signed_out"))]
+        chosen = profileInput(input.profile)
+        if chosen = invalid then return [reply(api.response.failure(input, "invalid_request"))]
+        if not chosen.hasPin
+            setManager(state, chosen, "")
+            return [reply(succeeded(input, { outcome: "verified", retryAfterSeconds: invalid }))]
+        end if
+        if not nonEmpty(input.pin) then return [reply(api.response.failure(input, "invalid_request"))]
+        state.manager = invalid
+        request = build(state, input, { method: "POST", path: api.auth.profiles.verifyPath(chosen.id), body: { pin: input.pin }, auth: "account", timeoutMs: PIN_TIMEOUT_MS }, { kind: "managerPin", origin: state.saved.origin, profile: chosen, epoch: state.epoch })
+        return submitConfidential(state, request)
+    end function
+
+    function endManage(state as Object, input as Object) as Object
+        state.manager = invalid
+        return [reply(succeeded(input, {}))]
+    end function
+
+    ' Each manager has its own serial, so a refusal of an earlier one's
+    ' token leaves a later one alone.
+    sub setManager(state as Object, profile as Object, token as String)
+        serial = 1
+        if state.manager <> invalid then serial = state.manager.serial + 1
+        state.manager = { profile: profile, token: token, epoch: state.epoch, serial: serial }
+    end sub
 
     ' The Video node's HttpHeaders for a plan's media URL (plan section 6.4),
     ' body { httpHeaders, generation, credentialed }, and with credentials
@@ -866,6 +925,24 @@ namespace api.auth.coordinator
         return [persist(), publish(), reply(answer)]
     end function
 
+    ' A manager PIN check ended: a match makes the profile the manager. Nothing
+    ' is persisted or published.
+    function managerChecked(state as Object, request as Object, op as Object, result as Object) as Object
+        outcome = api.auth.profiles.pinOutcome(result)
+        answer = withoutBody(result)
+        answer.body = { outcome: outcome.outcome, retryAfterSeconds: outcome.retryAfterSeconds }
+        if outcome.outcome <> "verified" then return [reply(answer)]
+        if op.epoch <> state.epoch or state.saved.accessToken = ""
+            answer.ok = false
+            answer.body.outcome = "error"
+            answer.error = api.response.failure(request, "signed_out").error
+            return [reply(answer)]
+        end if
+        op.profile.hasPin = true
+        setManager(state, op.profile, outcome.token)
+        return [reply(answer)]
+    end function
+
     function refreshed(state as Object, request as Object, op as Object, result as Object, now as Integer) as Object
         current = state.refreshing
         if current = invalid or current.requestId <> request.requestId or op.generation <> state.generation then return []
@@ -1013,6 +1090,7 @@ namespace api.auth.coordinator
         state.afterSignIn = false
         state.offer = invalid
         state.proofs = {}
+        state.manager = invalid
         state.generation = state.generation + 1
         state.epoch = state.epoch + 1
         state.refreshing = invalid

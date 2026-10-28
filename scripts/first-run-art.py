@@ -24,6 +24,10 @@
   lock_badge.png          the 60 px padlock badge of a PIN-locked profile
   pin_dot.png, pin_dot_ring.png
                           a 26 px PIN dot, filled or as a 3 px outline
+  add_ring.png            the picker's Add profile tile: a 220 px circle's
+                          2 px dashed outline (6 px dashes, 5 px gaps), as
+                          tvOS's AddProfileTile strokes it
+  add_plus.png            its 66 px plus, light weight
   spinner.png             the 128 px loading spinner (spec section 5.8)
 
 tvOS's first-run art (spec section 5.4, silo-apple b90a86ea; AG-222):
@@ -85,6 +89,11 @@ PIN_DOT = 26
 PIN_DOT_RING = 3
 SPINNER = 128
 MESH_SIZE = (640, 360)
+ADD_RING_WIDTH = 2
+ADD_DASH = 6
+ADD_GAP = 5
+ADD_PLUS = 66
+ADD_PLUS_STROKE = 4
 SERVER_MARK = 80
 HELP_SYMBOL = 112
 WARNING = (56, 48)
@@ -237,6 +246,47 @@ def lock_badge(scale=GLYPH_SCALE):
             ink = max(body, arc) * 0.75
             color = mix(color, INK, ink)
             row.append(tuple(round(c) for c in color) + (round(255 * disc[py][px]),))
+        rows.append(row)
+    return rows
+
+
+def add_ring():
+    """A 2 px outline inside the 220 px circle, dashed evenly: 6 px on, 5 px off along its middle."""
+    size, width = AVATAR, ADD_RING_WIDTH
+    ring = disc_alpha(size, size / 2, ring=width)
+    radius = size / 2 - width / 2
+    periods = round(2 * math.pi * radius / (ADD_DASH + ADD_GAP))
+    period = 2 * math.pi * radius / periods
+    dash = period * ADD_DASH / (ADD_DASH + ADD_GAP)
+    rows = []
+    for py in range(size):
+        row = []
+        for px in range(size):
+            angle = math.atan2(py + 0.5 - size / 2, px + 0.5 - size / 2) % (2 * math.pi)
+            along = (angle * radius) % period
+            # Coverage across the dash's two ends, antialiased over a pixel.
+            cover = clamp(min(along + 0.5, dash - along + 0.5, 1.0))
+            if along > dash + 0.5:
+                cover = clamp(along - period + 0.5)
+            row.append(WHITE + (round(255 * ring[py][px] * cover),))
+        rows.append(row)
+    return rows
+
+
+def add_plus(scale=GLYPH_SCALE):
+    """A plus ADD_PLUS px across with ADD_PLUS_STROKE px round-ended strokes."""
+    size, stroke = ADD_PLUS, ADD_PLUS_STROKE
+    half = size / 2
+    rows = []
+    for py in range(size * scale):
+        row = []
+        for px in range(size * scale):
+            x, y = (px + 0.5) / scale, (py + 0.5) / scale
+            reach = half - stroke / 2
+            across = segment_distance(x, y, half - reach, half, half + reach, half)
+            down = segment_distance(x, y, half, half - reach, half, half + reach)
+            cover = clamp(0.5 - scale * (min(across, down) - stroke / 2))
+            row.append(WHITE + (round(255 * cover),))
         rows.append(row)
     return rows
 
@@ -461,6 +511,8 @@ def images():
     yield "pin_dot.png", rgba(disc_alpha(PIN_DOT, PIN_DOT / 2), WHITE)
     yield "pin_dot_ring.png", rgba(disc_alpha(PIN_DOT, PIN_DOT / 2, ring=PIN_DOT_RING), WHITE)
     yield "spinner.png", spinner()
+    yield "add_ring.png", add_ring()
+    yield "add_plus.png", add_plus()
     for height in (76, 52):
         yield from capsule_line_nine_patches(height)
     yield from line_nine_patches("rounded_16", 16, hd(16), 1)

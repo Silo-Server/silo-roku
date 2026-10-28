@@ -1,0 +1,181 @@
+import "pkg:/source/auth/profiles.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/onboarding/pin.bs"
+import "pkg:/source/util/values.bs"
+
+' New Profile (spec section 5.4), tvOS's CreateProfileView without its
+' avatar sections (assumption AG-520): the name, an optional four-digit PIN,
+' and Child Profile with its content-rating ceiling and library allowlist.
+' Pure; messages are locale keys (source/util/i18n.bs). A form is
+'   { name, pin, isChild, rating, restrict, allowed }
+' where rating is a ratings() value ("" for none) and allowed the chosen
+' library IDs, { id: true }.
+namespace onboarding.createProfile
+    ' The server's limit on a name, which it trims.
+    const NAME_MAX = 64
+    ' The ceiling Child Profile fills in when none is chosen (tvOS, Android TV).
+    const CHILD_RATING = "PG"
+    ' What a failed create does (outcome).
+    const CREATED = "created"
+    const FAILED = "failed"
+    ' The request may have reached the server: the form closes and the
+    ' picker's list shows whether the profile exists, so it is not created
+    ' twice (tvOS).
+    const UNCONFIRMED = "unconfirmed"
+    ' The primary profile's PIN is needed again: the form closes.
+    const VERIFY = "verify"
+    const CANCELLED = "cancelled"
+    ' The most of a server's explanation shown.
+    const MAX_DETAIL = 240
+
+    function newForm() as Object
+        return { name: "", pin: "", isChild: false, rating: "", restrict: false, allowed: {} }
+    end function
+
+    ' tvOS's content-rating ceilings, as { value, key }: the value sent as
+    ' max_content_rating and the locale key of its label.
+    function ratings() as Object
+        return [
+            { value: "G", key: "newProfile.rating.g" },
+            { value: "PG", key: "newProfile.rating.pg" },
+            { value: "PG-13", key: "newProfile.rating.pg13" },
+            { value: "R", key: "newProfile.rating.r" }
+        ]
+    end function
+
+    ' The index of value in ratings(), or 0.
+    function ratingIndex(value as String) as Integer
+        list = ratings()
+        for i = 0 to list.Count() - 1
+            if list[i].value = value then return i
+        end for
+        return 0
+    end function
+
+    ' Child Profile on fills in the kid-safe defaults, as tvOS does: the PG
+    ' ceiling when none is chosen, and restricted libraries, so the parent
+    ' picks at least one. Off clears both. Gives a new form.
+    function withChild(form as Object, child as Boolean) as Object
+        out = {}
+        out.Append(form)
+        out.isChild = child
+        if child
+            if out.rating = "" then out.rating = CHILD_RATING
+            out.restrict = true
+        else
+            out.rating = ""
+            out.restrict = false
+            out.allowed = {}
+        end if
+        return out
+    end function
+
+    ' The PIN a field's text holds: its digits, at most onboarding.pin.LENGTH.
+    function pinOf(text as String) as String
+        return onboarding.pin.digits(text)
+    end function
+
+    ' No PIN, or all four digits.
+    function pinAcceptable(pin as String) as Boolean
+        return pin = "" or Len(pin) = onboarding.pin.LENGTH
+    end function
+
+    ' What stops the form being sent, as { field, key, titleKey }, tvOS's
+    ' alert: field is "" when
+    ' nothing does, else "name", "pin", or "libraries", the control to
+    ' highlight. listed are the IDs of the libraries the form lists; chosen IDs
+    ' that are not among them do not count.
+    function problem(form as Object, listed as Object) as Object
+        if form.name.Trim() = "" then return { field: "name", key: "newProfile.error.name", titleKey: "newProfile.error.nameTitle" }
+        if not pinAcceptable(form.pin) then return { field: "pin", key: "newProfile.error.pin", titleKey: "newProfile.error.pinTitle" }
+        if form.isChild and form.restrict and allowedIds(form, listed).Count() = 0 then return { field: "libraries", key: "newProfile.error.library", titleKey: "newProfile.error.libraryTitle" }
+        return { field: "", key: "", titleKey: "" }
+    end function
+
+    ' The chosen libraries among listed, in its order.
+    function allowedIds(form as Object, listed as Object) as Object
+        out = []
+        for each id in listed
+            if form.allowed[id] = true then out.Push(id)
+        end for
+        return out
+    end function
+
+    ' The POST /api/v2/profiles body, as tvOS sends it: the trimmed name, the
+    ' PIN when there is one, and for a child profile is_child, its ceiling,
+    ' and the allowlist when libraries are restricted. A member not set is
+    ' left out: the server rejects null, and its defaults are tvOS's.
+    function body(form as Object, listed as Object) as Object
+        out = { name: form.name.Trim() }
+        if form.pin <> "" then out.pin = form.pin
+        if form.isChild
+            out.is_child = true
+            if form.rating <> "" then out.max_content_rating = form.rating
+            if form.restrict
+                out.library_restrictions_enabled = true
+                out.allowed_library_ids = allowedIds(form, listed)
+            end if
+        end if
+        return out
+    end function
+
+    ' The libraries a profile can be given: GET /api/v2/user/libraries on the
+    ' account alone, so neither an open profile's limits nor its hidden
+    ' libraries narrow the list (Android TV). The body maps to
+    ' catalog.summary.libraries.
+    function librariesRequest() as Object
+        return { path: "/api/v2/user/libraries", auth: "account", map: { kind: catalog.kind.LIBRARIES } }
+    end function
+
+    ' What a create answer means, as { action, titleKey, key, text }: the
+    ' alert's title key, and its message as a locale key, or as text, the
+    ' server's own explanation. POST /api/v2/profiles is never retried
+    ' (non_retryable), as on tvOS:
+    '   CREATED      201, or any 2xx whose body could not be read: the form
+    '                never reads it, and the profile exists
+    '   UNCONFIRMED  sent without an answer (network, timeout)
+    '   VERIFY       the primary profile's token is gone or was refused
+    '   FAILED       a taken name or a full household (409), a rejected
+    '                member (422), or a refusal (403, such as a demo
+    '                server) with the server's detail; anything else with
+    '                a general message
+    '   CANCELLED    the request was cancelled
+    function outcome(result as Object) as Object
+        out = { action: FAILED, titleKey: "newProfile.error.title", key: "newProfile.error.failed", text: "" }
+        if result.ok = true or (result.status >= 200 and result.status < 300)
+            out.action = CREATED
+            return out
+        end if
+        kind = ""
+        if result.error <> invalid then kind = util.text(result.error.kind)
+        if kind = "cancelled"
+            out.action = CANCELLED
+        else if kind = "network" or kind = "timeout"
+            out.action = UNCONFIRMED
+            out.titleKey = "newProfile.unconfirmed.title"
+            out.key = "newProfile.unconfirmed.body"
+        else if kind = "pin_required" or (result.status = 403 and util.text(result.error.problemType) = "profile_verification_required")
+            out.action = VERIFY
+            out.key = "newProfile.error.verify"
+        else if result.status = 403 or result.status = 409 or result.status = 422
+            out.titleKey = "newProfile.refused.title"
+            out.text = detailOf(result.body)
+        end if
+        return out
+    end function
+
+    ' The first non-empty errors[].detail of a problem body, else its detail,
+    ' at most MAX_DETAIL characters, or "".
+    function detailOf(answer as Dynamic) as String
+        if not util.isObject(answer) then return ""
+        text = ""
+        if type(answer.errors) = "roArray"
+            for each entry in answer.errors
+                if text = "" and util.isObject(entry) then text = util.text(entry.detail).Trim()
+            end for
+        end if
+        if text = "" then text = util.text(answer.detail).Trim()
+        if Len(text) > MAX_DETAIL then text = Left(text, MAX_DETAIL - 1) + "…"
+        return text
+    end function
+end namespace

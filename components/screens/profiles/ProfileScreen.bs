@@ -53,6 +53,11 @@ sub init()
     m.choosing = false
     ' The focus key a rebuilt picker returns to (Screen.xml onShow).
     m.restore = invalid
+    ' Add profile shows (the household has a primary profile), and the add
+    ' flow (PIN, New Profile) was opened from it.
+    m.canAdd = false
+    m.adding = false
+    m.reload = invalid
 end sub
 
 function addFooterButton(label as String) as Object
@@ -75,6 +80,7 @@ sub onShow(event as Object)
     else if nav.textures.restore(m.textures)
         restoreTile(event.restore)
     end if
+    if not event.first and m.adding then reloadAfterAdd()
     m.top.prompting = m.state = "picking" or m.state = "error"
     focusPicker()
 end sub
@@ -87,6 +93,7 @@ end function
 sub onHide()
     m.top.prompting = false
     nav.textures.hide(m.textures)
+    dropReload()
 end sub
 
 sub onPressure(_level as String)
@@ -168,21 +175,38 @@ end sub
 
 ' The focused tile, kept when PIN covers the picker (spec section 5.3).
 function focusKey() as Dynamic
-    index = m.grid.itemFocused
-    if m.state <> "picking" or index < 0 or index >= m.profiles.Count() then return invalid
-    return nav.focus.newKey("profiles", m.profiles[index].id, 0, index)
+    return keyAt(m.grid.itemFocused)
+end function
+
+' The focus key of the tile at index: a profile's ID, or
+' onboarding.profiles.ADD_TILE for Add profile, so a picker rebuilt under
+' memory pressure returns to it after the add flow.
+function keyAt(index as Integer) as Dynamic
+    ids = tileIds()
+    if m.state <> "picking" or index < 0 or index >= ids.Count() then return invalid
+    return nav.focus.newKey("profiles", ids[index], 0, index)
+end function
+
+' The grid's tiles' keys in order: the profiles' IDs, then Add profile's.
+function tileIds() as Object
+    ids = []
+    for each profile in m.profiles
+        ids.Push(profile.id)
+    end for
+    if m.canAdd then ids.Push(onboarding.profiles.ADD_TILE)
+    return ids
 end function
 
 ' Focus on the tile key names, or on the same position when that profile has
 ' gone.
 sub restoreTile(key as Dynamic)
-    ids = []
-    for each profile in m.profiles
-        ids.Push(profile.id)
-    end for
-    spot = nav.focus.target(key, { rows: [nav.focus.newRow("profiles", ids, true)], complete: true }, true)
-    m.grid.jumpToItem = spot.item
+    m.grid.jumpToItem = restoreIndex(key)
 end sub
+
+function restoreIndex(key as Dynamic) as Integer
+    spot = nav.focus.target(key, { rows: [nav.focus.newRow("profiles", tileIds(), true)], complete: true }, true)
+    return spot.item
+end function
 
 ' Builds the grid, once, and shows it with Change server and Sign out.
 sub showPicker()
@@ -199,7 +223,14 @@ sub showPicker()
             item.isChild = profile.isChild
             item.description = profileDescription(profile)
         end for
-        grid = onboarding.profiles.gridLayout(m.profiles.Count())
+        m.canAdd = onboarding.profiles.householdPrimary(m.profiles) <> invalid
+        if m.canAdd
+            item = root.createChild("ProfileContent")
+            item.isAdd = true
+            item.title = i18n.text("profiles.add")
+            item.description = item.title
+        end if
+        grid = onboarding.profiles.gridLayout(root.getChildCount())
         m.grid.numColumns = grid.columns
         rows = grid.rows
         if rows > VISIBLE_ROWS then rows = VISIBLE_ROWS
@@ -293,8 +324,69 @@ sub placeHeading(footerTop as Integer)
     m.grid.translation = [m.grid.translation[0], avatarTop - onboarding.profiles.AVATAR_TOP]
 end sub
 
+' Add profile (tvOS, Android TV): creating a profile takes the household's
+' primary profile, so a PIN-locked primary's PIN comes first, on the PIN
+' screen; New Profile then acts as it without choosing it (spec section 7.3).
+sub startAdd()
+    primary = onboarding.profiles.householdPrimary(m.profiles)
+    if primary = invalid then return
+    m.adding = true
+    if primary.hasPin
+        nav.push(nav.route.PIN, { profile: primary, purpose: "manage" })
+    else
+        nav.push(nav.route.CREATE_PROFILE, { primary: primary })
+    end if
+end sub
+
+' Back from the add flow, the list is read again behind the picker, which
+' stays usable; a new profile joins it with focus, as tvOS's refreshed list
+' shows it. A failed read keeps the list shown.
+sub reloadAfterAdd()
+    m.adding = false
+    if m.state <> "picking" then return
+    m.reload = api.newHandle(m.top.owner)
+    m.reload.observeField("status", "onReloaded")
+    sendReload(m.reload)
+end sub
+
+sub sendReload(handle as Object)
+    api.session.profiles(handle)
+end sub
+
+' A covered picker takes no answer, which would rebuild it and take focus
+' from the screen on top (Add profile again before the list came back); it
+' reads the list again when shown.
+sub dropReload()
+    if m.reload = invalid then return
+    m.reload.unobserveField("status")
+    cancelReload(m.reload)
+    m.reload = invalid
+    m.adding = true
+end sub
+
+sub cancelReload(handle as Object)
+    api.cancel(handle)
+end sub
+
+sub onReloaded(event as Object)
+    result = api.resultOf(event.getRoSGNode())
+    m.reload = invalid
+    if not result.ok or m.state <> "picking" or m.request <> invalid then return
+    list = api.auth.profiles.list(result.body)
+    added = onboarding.profiles.addedProfile(list, m.profiles)
+    if added = invalid then return
+    m.profiles = list
+    m.grid.content = invalid
+    showPicker()
+    m.grid.jumpToItem = onboarding.profiles.focusIndex(m.profiles, added.id)
+end sub
+
 sub onProfileSelected()
     if m.request <> invalid then return
+    if m.grid.itemSelected >= m.profiles.Count()
+        startAdd()
+        return
+    end if
     ' A new choice clears the last one's error.
     showAccountLine(m.accountText, theme.color.MARQUEE_SECONDARY)
     openProfile(m.profiles[m.grid.itemSelected], false)
