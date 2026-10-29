@@ -1,0 +1,194 @@
+import "pkg:/source/util/values.bs"
+
+' Sign-in with a code on the sign-in screen (spec sections 5.4 and 7.2), as
+' tvOS's QRLoginViewModel and TVSignInPresentation word and run it: the
+' states, what each shows, and how an answer moves between them. Pure;
+' messages are locale keys (source/util/i18n.bs). The screen
+' (components/screens/setup/SignInScreen.bs) runs the loop.
+namespace onboarding.deviceCode
+    ' Statuses, tvOS's QRLoginViewModel.Status.
+    const GETTING_CODE = "gettingCode"
+    const WAITING = "waiting"
+    const OPENED = "opened"
+    const APPROVED = "approved"
+    const COULD_NOT_FINISH = "couldNotFinish"
+    const DENIED = "denied"
+    const PAUSED = "paused"
+    const UNREACHABLE = "unreachable"
+    const RATE_LIMITED = "rateLimited"
+    const NO_DEVICE_SIGN_IN = "noDeviceSignIn"
+    const FAILED = "failed"
+
+    ' What a start or poll answer means (startOutcome, pollOutcome).
+    const STARTED = "started"
+    const PENDING = "pending"
+    const EXPIRED = "expired"
+    const TRANSIENT = "transient"
+
+    ' Timing, in seconds: a failure streak while getting a code, or while
+    ' polling, before "Can't reach"; a 429 streak before "Too many"; the
+    ' longest backoff; how long codes renew themselves before the screen
+    ' pauses; the shortest wait between polls.
+    const UNREACHABLE_STARTING = 10
+    const UNREACHABLE_POLLING = 30
+    const RATE_LIMITED_AFTER = 60
+    const MAX_BACKOFF = 30
+    const RENEWAL_LIMIT = 3600
+    const MINIMUM_POLL = 1
+
+    ' States the screen leaves only when the viewer acts.
+    function isTerminal(status as String) as Boolean
+        return status = APPROVED or status = COULD_NOT_FINISH or status = DENIED or status = PAUSED or status = NO_DEVICE_SIGN_IN or status = FAILED
+    end function
+
+    ' Whether the QR code, the code, and the URL show for a status, with a
+    ' code in hand.
+    function showsCode(status as String) as Boolean
+        return status = WAITING or status = OPENED or status = UNREACHABLE or status = RATE_LIMITED
+    end function
+
+    ' The code grouped 4+4 ("4821 7730"): eight letters or digits after
+    ' dropping the rest, as older servers' letter codes group too; anything
+    ' else as the server sent it.
+    function display(raw as String) as String
+        code = normalized(raw)
+        if Len(code) <> 8 then return raw.Trim()
+        return Left(code, 4) + " " + Right(code, 4)
+    end function
+
+    ' Letters and digits only, uppercased.
+    function normalized(raw as String) as String
+        out = ""
+        upper = UCase(raw)
+        for i = 1 to Len(upper)
+            c = Mid(upper, i, 1)
+            if (c >= "A" and c <= "Z") or (c >= "0" and c <= "9") then out = out + c
+        end for
+        return out
+    end function
+
+    ' Whether a displayed code is digits and spaces, which the tabular face
+    ' draws; letter codes take the bold face.
+    function isNumeric(code as String) as Boolean
+        for i = 1 to Len(code)
+            c = Mid(code, i, 1)
+            if c <> " " and (c < "0" or c > "9") then return false
+        end for
+        return true
+    end function
+
+    ' <host>/activate as people type it: the verification URI (or, when the
+    ' server leaves it blank, the QR URI without its query) with no trailing
+    ' slash, and without https:// (browsers try it for a bare host); an
+    ' http:// server keeps its scheme.
+    function typedUrl(uri as String, complete as String) as String
+        text = uri.Trim()
+        if text = ""
+            text = complete
+            q = Instr(1, text, "?")
+            if q > 0 then text = Left(text, q - 1)
+            text = text.Trim()
+        end if
+        while Right(text, 1) = "/"
+            text = Left(text, Len(text) - 1)
+        end while
+        if LCase(Left(text, 8)) = "https://" then text = Mid(text, 9)
+        return text
+    end function
+
+    ' The status line under the code, as { key, values }, or invalid when
+    ' the state says nothing there.
+    function statusLine(status as String, renewed as Boolean, account as String, server as String) as Dynamic
+        if status = GETTING_CODE then return { key: "signIn.status.gettingCode", values: invalid }
+        if status = WAITING
+            if renewed then return { key: "signIn.status.renewed", values: invalid }
+            return { key: "signIn.status.waiting", values: invalid }
+        end if
+        if status = OPENED then return { key: "signIn.status.opened", values: invalid }
+        if status = APPROVED
+            if account <> "" then return { key: "signIn.status.approvedAs", values: { account: account } }
+            return { key: "signIn.status.approved", values: invalid }
+        end if
+        if status = COULD_NOT_FINISH then return { key: "signIn.status.couldNotFinish", values: invalid }
+        if status = DENIED then return { key: "signIn.status.denied", values: invalid }
+        if status = PAUSED then return { key: "signIn.status.paused", values: invalid }
+        if status = UNREACHABLE then return { key: "signIn.status.unreachable", values: { server: server } }
+        if status = RATE_LIMITED then return { key: "signIn.status.rateLimited", values: invalid }
+        if status = NO_DEVICE_SIGN_IN then return { key: "signIn.passwordOnly", values: invalid }
+        if status = FAILED then return { key: "signIn.status.failed", values: invalid }
+        return invalid
+    end function
+
+    ' Whether the status line shows its small spinner.
+    function statusSpins(status as String) as Boolean
+        return status = WAITING or status = OPENED or status = GETTING_CODE
+    end function
+
+    ' The state's button: "tryAgain", "showNewCode", or "".
+    function stateAction(status as String) as String
+        if status = COULD_NOT_FINISH or status = UNREACHABLE or status = RATE_LIMITED or status = FAILED then return "tryAgain"
+        if status = DENIED or status = PAUSED then return "showNewCode"
+        return ""
+    end function
+
+    ' Whether that button takes the highlight when it appears: the states
+    ' that end the attempt do; retrying in the background does not.
+    function actionTakesFocus(status as String) as Boolean
+        return status = COULD_NOT_FINISH or status = DENIED or status = PAUSED or status = FAILED
+    end function
+
+    ' A deviceStart envelope, as tvOS's startResult sorts it: STARTED,
+    ' NO_DEVICE_SIGN_IN for a 403 or 404 (device sign-in turned off),
+    ' RATE_LIMITED for a 429, FAILED for a server too old for this Roku,
+    ' and TRANSIENT, retried with backoff, for everything else.
+    function startOutcome(result as Object) as String
+        if result.ok = true then return STARTED
+        status = result.status
+        if status = 403 or status = 404 then return NO_DEVICE_SIGN_IN
+        if status = 429 then return RATE_LIMITED
+        if result.error <> invalid and util.text(result.error.kind) = "server_update_required" then return FAILED
+        return TRANSIENT
+    end function
+
+    ' A devicePoll envelope, as tvOS's pollCode sorts it: PENDING
+    ' (body.opened says whether an approver looked it up), APPROVED, DENIED,
+    ' EXPIRED for an ended code (expired, consumed, canceled, a 404, or a
+    ' code the coordinator no longer holds), COULD_NOT_FINISH for an
+    ' approval it could not use, RATE_LIMITED for a 429, and TRANSIENT,
+    ' retried, for anything else, an unknown status included.
+    function pollOutcome(result as Object) as String
+        if result.ok = true
+            status = util.text(result.body.status)
+            if status = "pending" then return PENDING
+            if status = "approved" then return APPROVED
+            if status = "denied" then return DENIED
+            if status = "invalid" then return COULD_NOT_FINISH
+            if status = "expired" or status = "consumed" or status = "canceled" then return EXPIRED
+            return TRANSIENT
+        end if
+        if result.error <> invalid and util.text(result.error.kind) = "handoff_gone" then return EXPIRED
+        if result.status = 404 then return EXPIRED
+        if result.status = 429 then return RATE_LIMITED
+        return TRANSIENT
+    end function
+
+    ' Seconds until the next poll: the server's poll_after, or the start
+    ' answer's interval when a poll gives none, at least MINIMUM_POLL.
+    function pollWait(pollAfter as Integer, interval as Integer) as Integer
+        wait = pollAfter
+        if wait <= 0 then wait = interval
+        if wait < MINIMUM_POLL then wait = MINIMUM_POLL
+        return wait
+    end function
+
+    ' The next backoff in seconds after a failure: the poll interval at
+    ' first, then doubling to MAX_BACKOFF.
+    function backoff(previous as Integer, interval as Integer) as Integer
+        base = interval
+        if base < MINIMUM_POLL then base = MINIMUM_POLL
+        if previous <= 0 then return base
+        doubled = previous * 2
+        if doubled > MAX_BACKOFF then return MAX_BACKOFF
+        return doubled
+    end function
+end namespace

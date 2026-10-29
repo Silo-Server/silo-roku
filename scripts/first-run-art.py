@@ -46,10 +46,49 @@ tvOS's first-run art (spec section 5.4, silo-apple b90a86ea; AG-222):
                           (radius 20) shaded #EAA65C to #A8521D to #5E290D
                           from top left to bottom right, with a 1 px white
                           18% outline, under the server's initial
-  help_remote.png         the first-run card's 112 px glass circle (white 8%,
-                          1 px white 14% outline) with a remote in #EDEDED
   warning_triangle.png    an error state's 48 px warning triangle, white, with
                           the exclamation mark cut out
+
+tvOS's phone-first setup, code sign-in, and pairing screens (silo-apple
+6fb70758: TVServerSetupView, TVLoginView, TVPairingReceiverView, MarqueeTV):
+
+  glyph_*.png             line glyphs in white, after the SF Symbols the
+                          screens name, drawn at 2x (GLYPH_SCALE) so a
+                          Poster sets their size in FHD px: globe, person,
+                          lock, key, qrcode, phone (iphone.gen3), tv, and
+                          retry (arrow.clockwise) at 32; eye and eye_slash at
+                          40; gear (gearshape), check, and number at 28;
+                          check_large at 64 (the 140 px card's checkmark);
+                          phone_large, wifi_alert (wifi.exclamationmark),
+                          pause_circle, xmark_circle, and alert_large
+                          (exclamationmark.triangle) at 52 for the card's
+                          112 px symbol circle
+  card_symbol{,_96,_140}.png
+                          the card's glass circle at 112, 96, and 140 px:
+                          white 8% with a 1 px white 14% outline
+  step_tile.png           a setup step's 168 px tile: radius 34, white 6%
+                          with a 1 px white 14% outline
+  step_badge.png          a step's number disc: a 52 px white disc at (11, 6)
+                          in a 74x76 canvas, over a black 50% shadow 6 px
+                          lower, blurred as SwiftUI's radius 7 (sigma 3.5)
+  step_app_icon.png       the Silo app icon, 92 px at 2x: #010D9F
+                          (siloIconField), radius 22, a 1 px white 18%
+                          outline, and the Silo mark 77 px tall, embedded
+                          from silo-branding's logo/svg/silo-mark-flat.svg
+                          (needs rsvg-convert and magick, and the branding
+                          checkout as the first argument; without it the
+                          committed file is kept)
+  step_done.png           the last step's 96 px check at 2x, in #30D158
+                          (tvOS siloSuccess, the system green): the disc at
+                          16%, a 3 px outline, and a bold checkmark
+  rounded_{20,24}_fill_{fhd,hd}.9.png, rounded_20_line_{fhd,hd}.9.png
+                          the Set Up picture's card (radius 20) and the QR
+                          code's white frame (radius 24)
+  capsule_30_fill_{fhd,hd}.9.png
+                          the picture's 30 px Set Up button
+  capsule_30_ring4_{fhd,hd}.9.png
+                          its 4 px ring, 38 px tall, drawn 4 px outside it
+  dot_10.png              a 10 px waiting dot
 
 Everything is white or greyscale unless it carries a fixed colour, so screens
 tint it with a Poster's blendColor and opacity. The mesh follows the Android
@@ -65,12 +104,16 @@ capsule's radius is half its height less 1 px, so the corners and the band fit
 the height exactly.
 
 Edges are antialiased analytically. Uses only the standard library, so the
-pixels are the same on every machine. Run from anywhere:
-python3 scripts/first-run-art.py
+pixels are the same on every machine, except step_app_icon.png's mark. Run
+from anywhere:
+python3 scripts/first-run-art.py [/path/to/silo-branding]
 """
 import math
 import pathlib
+import shutil
 import struct
+import subprocess
+import sys
 import zlib
 
 BLUE = (0x00, 0x34, 0xFB)
@@ -331,32 +374,6 @@ def segment_distance(x, y, ax, ay, bx, by):
     return math.hypot(x - ax - t * dx, y - ay - t * dy)
 
 
-def help_remote(scale=GLYPH_SCALE):
-    """A glass circle (white 8% under a 1 px white 14% outline) holding a remote:
-    a rounded outline with a ring for its pad and two buttons below."""
-    size = HELP_SYMBOL
-    disc = disc_alpha(size, size / 2, scale=scale)
-    edge = disc_alpha(size, size / 2, ring=1, scale=scale)
-    width, height, stroke = 26, 52, 3.5
-    left, top = (size - width) / 2, (size - height) / 2
-    pad_x, pad_y, pad_r = size / 2, top + 15, 7
-    rows = []
-    for py in range(size * scale):
-        row = []
-        for px in range(size * scale):
-            x, y = (px + 0.5) / scale, (py + 0.5) / scale
-            body = clamp(0.5 - scale * (abs(rounded_rect_distance(x - left, y - top, width, height, 9) + stroke / 2) - stroke / 2))
-            pad = clamp(0.5 - scale * (abs(math.hypot(x - pad_x, y - pad_y) - pad_r) - 1.5))
-            buttons = max(clamp(0.5 - scale * (math.hypot(x - pad_x, y - b) - 2.5)) for b in (top + 31, top + 40))
-            ink = max(body, pad, buttons)
-            glass = 0.08 + (0.14 - 0.08) * edge[py][px]
-            alpha = ink + glass * (1 - ink)
-            color = mix(WHITE, INK, ink / alpha) if alpha > 0 else WHITE
-            row.append(tuple(round(c) for c in color) + (round(255 * alpha * disc[py][px]),))
-        rows.append(row)
-    return rows
-
-
 def warning_triangle(scale=GLYPH_SCALE):
     """exclamationmark.triangle.fill: a triangle with rounded corners, white,
     with the mark cut out, for blendColor."""
@@ -378,6 +395,357 @@ def warning_triangle(scale=GLYPH_SCALE):
             row.append(WHITE + (round(255 * shape * (1 - max(bar, dot))),))
         rows.append(row)
     return rows
+
+
+# --- Onboarding glyphs ------------------------------------------------------
+#
+# Each glyph is a function of (x, y) in logical FHD px giving the ink's
+# coverage there, sampled at GLYPH_SCALE. Line work is a distance to its
+# centre line, stroked to a width; fills are signed distances.
+
+ICON_FIELD = (0x01, 0x0D, 0x9F)
+SUCCESS = (0x30, 0xD1, 0x58)
+
+
+def stroked(distance, stroke, scale):
+    return clamp(0.5 - scale * (distance - stroke / 2))
+
+
+def filled(signed, scale):
+    return clamp(0.5 - scale * signed)
+
+
+def ring_distance(x, y, cx, cy, r):
+    return abs(math.hypot(x - cx, y - cy) - r)
+
+
+def arc_distance(x, y, cx, cy, r, start, end):
+    """Distance to the arc from start to end degrees, clockwise on screen (y down)."""
+    angle = math.degrees(math.atan2(y - cy, x - cx))
+    span = (end - start) % 360 or 360
+    if (angle - start) % 360 <= span:
+        return ring_distance(x, y, cx, cy, r)
+    ends = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in (start, end)]
+    return min(math.hypot(x - ex, y - ey) for ex, ey in ends)
+
+
+def ellipse_distance(x, y, cx, cy, rx, ry):
+    """Approximate distance to an ellipse's outline: its implicit value over its gradient."""
+    dx, dy = (x - cx) / rx, (y - cy) / ry
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return min(rx, ry)
+    gradient = math.hypot(dx / rx, dy / ry) / length
+    return abs(length - 1) / gradient
+
+
+def polyline_distance(x, y, points):
+    return min(segment_distance(x, y, *a, *b) for a, b in zip(points, points[1:]))
+
+
+def rect_outline_distance(x, y, left, top, width, height, radius):
+    return abs(rounded_rect_distance(x - left, y - top, width, height, radius))
+
+
+def rect_signed(x, y, left, top, width, height, radius):
+    return rounded_rect_distance(x - left, y - top, width, height, radius)
+
+
+def glyph(size, cover, scale=GLYPH_SCALE):
+    """White rows of a size px glyph whose coverage at (x, y) is cover(x, y, scale)."""
+    rows = []
+    for py in range(size * scale):
+        row = []
+        for px in range(size * scale):
+            row.append(WHITE + (round(255 * clamp(cover((px + 0.5) / scale, (py + 0.5) / scale, scale))),))
+        rows.append(row)
+    return rows
+
+
+def globe(x, y, s):
+    stroke = 2.4
+    d = min(ring_distance(x, y, 16, 16, 13), ellipse_distance(x, y, 16, 16, 5.6, 13))
+    for line_y in (10, 22):
+        reach = math.sqrt(13 ** 2 - (line_y - 16) ** 2)
+        d = min(d, segment_distance(x, y, 16 - reach, line_y, 16 + reach, line_y))
+    return stroked(d, stroke, s)
+
+
+def person(x, y, s):
+    stroke = 2.4
+    d = ring_distance(x, y, 16, 10, 5.5)
+    shoulders = arc_distance(x, y, 16, 28.5, 10.5, 180, 360)
+    d = min(d, shoulders, segment_distance(x, y, 5.5, 28.5, 26.5, 28.5))
+    return stroked(d, stroke, s)
+
+
+def lock(x, y, s):
+    stroke = 2.4
+    d = rect_outline_distance(x, y, 7, 14.5, 18, 14.5, 3.5)
+    d = min(d, arc_distance(x, y, 16, 10.5, 5.5, 180, 360),
+            segment_distance(x, y, 10.5, 10.5, 10.5, 14.5), segment_distance(x, y, 21.5, 10.5, 21.5, 14.5))
+    return stroked(d, stroke, s)
+
+
+def lock_open(x, y, s):
+    """lock.open: the body, its shackle lifted and swung open to the right."""
+    stroke = 2.4
+    d = rect_outline_distance(x, y, 4, 14.5, 18, 14.5, 3.5)
+    d = min(d, arc_distance(x, y, 24, 8.5, 5.5, 180, 360),
+            segment_distance(x, y, 18.5, 8.5, 18.5, 14.5), segment_distance(x, y, 29.5, 8.5, 29.5, 11.5))
+    return stroked(d, stroke, s)
+
+
+def eye_shape(x, y, size):
+    """The eye's almond outline and pupil, scaled from a 40 px box."""
+    k = size / 40
+    chord, sag = 16 * k, 10 * k
+    radius = (chord ** 2 + sag ** 2) / (2 * sag)
+    mid = 20 * k
+    if y <= mid:
+        lid = ring_distance(x, y, mid, mid - sag + radius, radius)
+    else:
+        lid = ring_distance(x, y, mid, mid + sag - radius, radius)
+    corners = min(math.hypot(x - (mid - chord), y - mid), math.hypot(x - (mid + chord), y - mid))
+    if abs(x - mid) > chord:
+        lid = corners
+    return lid, math.hypot(x - mid, y - mid) - 5.5 * k
+
+
+def eye(x, y, s):
+    lid, pupil = eye_shape(x, y, 40)
+    return max(stroked(lid, 2.6, s), filled(pupil, s))
+
+
+def eye_slash(x, y, s):
+    lid, pupil = eye_shape(x, y, 40)
+    ink = max(stroked(lid, 2.6, s), filled(pupil, s))
+    line = segment_distance(x, y, 8, 6, 32, 34)
+    # The eye is cut back on the slash's lower side, as SF Symbols draw it.
+    cut = stroked(segment_distance(x, y, 9.8, 4.6, 33.8, 32.6), 2.6 * 1.6, s)
+    return max(ink * (1 - cut), stroked(line, 2.6, s))
+
+
+def key(x, y, s):
+    """key: upright, the bow on top and two teeth on the shaft's right."""
+    stroke = 2.4
+    d = min(ring_distance(x, y, 16, 9.5, 6),
+            segment_distance(x, y, 16, 15.5, 16, 29),
+            segment_distance(x, y, 16, 23.5, 20.5, 23.5),
+            segment_distance(x, y, 16, 28, 19.5, 28))
+    return stroked(d, stroke, s)
+
+
+def qrcode(x, y, s):
+    ink = 0.0
+    for left, top in ((3, 3), (19, 3), (3, 19)):
+        ink = max(ink, stroked(rect_outline_distance(x, y, left + 1.2, top + 1.2, 7.6, 7.6, 1.6), 2.4, s),
+                  filled(rect_signed(x, y, left + 3.5, top + 3.5, 3, 3, 0.6), s))
+    for left, top in ((19.5, 19.5), (25.5, 19.5), (22.5, 22.5), (19.5, 25.5), (25.5, 25.5)):
+        ink = max(ink, filled(rect_signed(x, y, left, top, 3.2, 3.2, 0.6), s))
+    return ink
+
+
+def phone_glyph(size):
+    k = size / 32
+    width, height, stroke = 14 * k, 26 * k, 2.4 * k
+    if size > 32:
+        width, height = 26, 48
+        stroke = 3.4
+    left, top = (size - width) / 2, (size - height) / 2
+    radius = width * 0.3
+
+    def cover(x, y, s):
+        d = rect_outline_distance(x, y, left + stroke / 2, top + stroke / 2, width - stroke, height - stroke, radius - stroke / 2)
+        notch = segment_distance(x, y, size / 2 - width * 0.14, top + height * 0.12, size / 2 + width * 0.14, top + height * 0.12)
+        return max(stroked(d, stroke, s), stroked(notch, stroke * 0.85, s))
+    return cover
+
+
+def tv(x, y, s):
+    stroke = 2.4
+    d = min(rect_outline_distance(x, y, 3.2, 5.2, 25.6, 18, 3), segment_distance(x, y, 11, 27.5, 21, 27.5))
+    return stroked(d, stroke, s)
+
+
+def gear(x, y, s):
+    cx = cy = 14
+    angle = math.atan2(y - cy, x - cx)
+    teeth = clamp(math.cos(8 * angle) * 2.2 + 0.4, -1, 1)
+    outer = 9.6 + 1.9 * teeth
+    body = abs(math.hypot(x - cx, y - cy) - outer)
+    return max(stroked(body, 2.2, s), stroked(ring_distance(x, y, cx, cy, 3.6), 2.2, s))
+
+
+def check(x, y, s):
+    return stroked(polyline_distance(x, y, [(6, 14.5), (11.5, 20.5), (22.5, 7.5)]), 3, s)
+
+
+def check_large(x, y, s):
+    return stroked(polyline_distance(x, y, [(13, 33), (26, 46), (51, 19)]), 7, s)
+
+
+def retry(x, y, s):
+    stroke = 2.4
+    d = min(arc_distance(x, y, 16, 17, 10, -50, 270),
+            polyline_distance(x, y, [(13, 3), (17.5, 7), (13, 11)]))
+    return stroked(d, stroke, s)
+
+
+def number(x, y, s):
+    d = min(segment_distance(x, y, 11.5, 4, 9.5, 24), segment_distance(x, y, 19.5, 4, 17.5, 24),
+            segment_distance(x, y, 5.5, 10.5, 23, 10.5), segment_distance(x, y, 5, 17.5, 22.5, 17.5))
+    return stroked(d, 2.4, s)
+
+
+def wifi_alert(x, y, s):
+    stroke = 3.6
+    cx, cy = 21, 38
+    d = min(arc_distance(x, y, cx, cy, 11, 225, 315), arc_distance(x, y, cx, cy, 19.5, 225, 315))
+    dot = math.hypot(x - cx, y - cy) - 3.4
+    mark = segment_distance(x, y, 45, 13, 45, 29)
+    mark_dot = math.hypot(x - 45, y - 37) - 2.6
+    return max(stroked(d, stroke, s), filled(dot, s), stroked(mark, stroke, s), filled(mark_dot, s))
+
+
+def pause_circle(x, y, s):
+    ring = stroked(ring_distance(x, y, 26, 26, 22), 3.2, s)
+    bars = max(filled(rect_signed(x, y, 19.5, 17, 4.2, 18, 1.4), s), filled(rect_signed(x, y, 28.3, 17, 4.2, 18, 1.4), s))
+    return max(ring, bars)
+
+
+def xmark_circle(x, y, s):
+    d = min(ring_distance(x, y, 26, 26, 22), segment_distance(x, y, 19, 19, 33, 33), segment_distance(x, y, 33, 19, 19, 33))
+    return stroked(d, 3.2, s)
+
+
+def alert_large(x, y, s):
+    corners = [(26, 6.5), (47.5, 44.5), (4.5, 44.5)]
+    edge = polyline_distance(x, y, corners + corners[:1])
+    bar = segment_distance(x, y, 26, 19.5, 26, 31.5)
+    dot = math.hypot(x - 26, y - 38.5) - 2.4
+    return max(stroked(edge, 3.2, s), stroked(bar, 3.4, s), filled(dot, s))
+
+
+def glass_circle(size):
+    """The card's symbol circle: white 8% under a 1 px white 14% outline."""
+    disc = disc_alpha(size, size / 2)
+    edge = disc_alpha(size, size / 2, ring=1)
+    return [[WHITE + (round(255 * (0.08 + 0.06 * e) * d),) for d, e in zip(dl, el)] for dl, el in zip(disc, edge)]
+
+
+def step_tile():
+    size = 168
+    cover = shape_alpha(size, size, 34)
+    edge = shape_alpha(size, size, 34, ring=1)
+    return [[WHITE + (round(255 * (0.06 + 0.08 * e) * c),) for c, e in zip(cl, el)] for cl, el in zip(cover, edge)]
+
+
+BADGE = 52
+BADGE_CANVAS = (74, 76)
+BADGE_AT = (11, 6)
+BADGE_SHADOW = (0, 6, 3.5, 0.5)  # x and y offset, sigma, alpha
+
+
+def step_badge():
+    width, height = BADGE_CANVAS
+    left, top = BADGE_AT
+    radius = BADGE / 2
+    cx, cy = left + radius, top + radius
+    dx, dy, sigma, strength = BADGE_SHADOW
+    rows = []
+    for py in range(height):
+        row = []
+        for px in range(width):
+            x, y = px + 0.5, py + 0.5
+            disc = clamp(0.5 - (math.hypot(x - cx, y - cy) - radius))
+            # A disc blurred by a Gaussian: across its edge, the error function.
+            d = math.hypot(x - cx - dx, y - cy - dy) - radius
+            shadow = strength * 0.5 * math.erfc(d / (sigma * math.sqrt(2)))
+            total = disc + shadow * (1 - disc)
+            color = tuple(255 * disc / total for _ in range(3)) if total > 0 else WHITE
+            row.append(tuple(round(c) for c in color) + (round(255 * total),))
+        rows.append(row)
+    return rows
+
+
+def step_done(scale=GLYPH_SCALE):
+    size = 96
+    disc = disc_alpha(size, size / 2, scale=scale)
+    ring = disc_alpha(size, size / 2, ring=3, scale=scale)
+    rows = []
+    for py in range(size * scale):
+        row = []
+        for px in range(size * scale):
+            x, y = (px + 0.5) / scale, (py + 0.5) / scale
+            mark = stroked(polyline_distance(x, y, [(29, 48), (42, 61), (67, 33)]), 7, scale)
+            ink = max(ring[py][px], mark)
+            alpha = ink + 0.16 * disc[py][px] * (1 - ink)
+            row.append(SUCCESS + (round(255 * alpha),))
+        rows.append(row)
+    return rows
+
+
+APP_ICON = 92
+APP_MARK_HEIGHT = 77
+
+
+def rendered_mark(branding, height):
+    """RGBA rows of the flat Silo mark height px tall, from the branding master."""
+    svg = pathlib.Path(branding) / "logo" / "svg" / "silo-mark-flat.svg"
+    if not svg.is_file() or not shutil.which("rsvg-convert") or not shutil.which("magick"):
+        return None
+    drawn = subprocess.run(["rsvg-convert", "-h", str(height), str(svg)], check=True, capture_output=True).stdout
+    size = subprocess.run(["magick", "png:-", "-format", "%w %h", "info:"], input=drawn, check=True, capture_output=True).stdout
+    width, rows_count = (int(v) for v in size.split())
+    raw = subprocess.run(["magick", "png:-", "-depth", "8", "rgba:-"], input=drawn, check=True, capture_output=True).stdout
+    return [[tuple(raw[(r * width + c) * 4:(r * width + c) * 4 + 4]) for c in range(width)] for r in range(rows_count)]
+
+
+def step_app_icon(mark, scale=GLYPH_SCALE):
+    size = APP_ICON * scale
+    cover = shape_alpha(APP_ICON, APP_ICON, 22, scale=scale)
+    edge = shape_alpha(APP_ICON, APP_ICON, 22, ring=1, scale=scale)
+    mark_height, mark_width = len(mark), len(mark[0])
+    left, top = (size - mark_width) // 2, (size - mark_height) // 2
+    rows = []
+    for py in range(size):
+        row = []
+        for px in range(size):
+            color = mix(ICON_FIELD, WHITE, 0.18 * edge[py][px])
+            mx, my = px - left, py - top
+            if 0 <= mx < mark_width and 0 <= my < mark_height:
+                r, g, b, a = mark[my][mx]
+                color = mix(color, (r, g, b), a / 255)
+            row.append(tuple(round(c) for c in color) + (round(255 * cover[py][px]),))
+        rows.append(row)
+    return rows
+
+
+def onboarding_images():
+    for name, size, cover in (
+        ("globe", 32, globe), ("person", 32, person), ("lock", 32, lock), ("lock_open", 32, lock_open), ("eye", 40, eye),
+        ("eye_slash", 40, eye_slash), ("key", 32, key), ("qrcode", 32, qrcode),
+        ("phone", 32, phone_glyph(32)), ("phone_large", 52, phone_glyph(52)), ("tv", 32, tv),
+        ("gear", 28, gear), ("check", 28, check), ("check_large", 64, check_large),
+        ("retry", 32, retry), ("number", 28, number), ("wifi_alert", 52, wifi_alert),
+        ("pause_circle", 52, pause_circle), ("xmark_circle", 52, xmark_circle), ("alert_large", 52, alert_large),
+    ):
+        yield f"glyph_{name}.png", glyph(size, cover)
+    yield "card_symbol.png", glass_circle(112)
+    yield "card_symbol_96.png", glass_circle(96)
+    yield "card_symbol_140.png", glass_circle(140)
+    yield "step_tile.png", step_tile()
+    yield "step_badge.png", step_badge()
+    yield "step_done.png", step_done()
+    for name, radius in (("rounded_20", 20), ("rounded_24", 24)):
+        for res, r in (("fhd", radius), ("hd", hd(radius))):
+            yield f"{name}_fill_{res}.9.png", nine_patch(shape_alpha(2 * r + STRETCH, 2 * r + STRETCH, r))
+    yield from line_nine_patches("rounded_20", 20, hd(20), 1)
+    yield from capsule_nine_patches(30, with_ring=False)
+    for res, r, ring in (("fhd", 38 // 2 - 1, 4), ("hd", hd(38) // 2 - 1, hd(4))):
+        yield f"capsule_30_ring4_{res}.9.png", nine_patch(shape_alpha(2 * r + STRETCH, 2 * r + STRETCH, r, ring))
+    yield "dot_10.png", rgba(disc_alpha(10, 5), WHITE)
 
 
 # --- Brand mesh -------------------------------------------------------------
@@ -527,14 +895,20 @@ def images():
         yield f"capsule_36_fill_{res}.9.png", nine_patch(shape_alpha(2 * r + STRETCH, 2 * r + STRETCH, r))
     yield from capsule_line_nine_patches(36)
     yield "server_mark.png", server_mark()
-    yield "help_remote.png", help_remote()
     yield "warning_triangle.png", warning_triangle()
+    yield from onboarding_images()
 
 
 def main():
     out = pathlib.Path(__file__).resolve().parent.parent / "images" / "firstrun"
     out.mkdir(parents=True, exist_ok=True)
-    for name, rows in images():
+    generated = list(images())
+    mark = rendered_mark(sys.argv[1], APP_MARK_HEIGHT * GLYPH_SCALE) if len(sys.argv) > 1 else None
+    if mark is not None:
+        generated.append(("step_app_icon.png", step_app_icon(mark)))
+    else:
+        print("step_app_icon.png kept: pass the silo-branding checkout to redraw it (needs rsvg-convert and magick)")
+    for name, rows in generated:
         data = png(rows)
         (out / name).write_bytes(data)
         print(f"images/firstrun/{name}  {len(rows[0])}x{len(rows)}  {len(data)} bytes")

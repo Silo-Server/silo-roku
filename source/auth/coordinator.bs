@@ -2,6 +2,7 @@ import "pkg:/source/api/request.bs"
 import "pkg:/source/api/response.bs"
 import "pkg:/source/api/scheduler.bs"
 import "pkg:/source/auth/companion.bs"
+import "pkg:/source/auth/deviceSignIn.bs"
 import "pkg:/source/auth/handoff.bs"
 import "pkg:/source/auth/headers.bs"
 import "pkg:/source/auth/problems.bs"
@@ -52,6 +53,8 @@ import "pkg:/source/util/values.bs"
 '   { session: "mediaHeaders", url, generation, refresh }  (mediaHeaders)
 '   { session: "companionServer" | "companionStart" | "companionPoll" |
 '     "companionCancel" }  companion sign-in (source/auth/companion.bs)
+'   { session: "deviceCapability" | "deviceStart" | "devicePoll" |
+'     "deviceCancel" }  sign-in with a code (source/auth/deviceSignIn.bs)
 ' profile is an item of api.auth.profiles.list. Their envelopes carry no
 ' tokens, but for mediaHeaders, whose lines the player sets on its Video
 ' node's content. Tokens, the password, and PINs leave this state only as
@@ -139,7 +142,7 @@ namespace api.auth.coordinator
     ' "checking" | "verified" | "refused", problem, url, requestId } for the
     ' base URL url.
     function create(saved as Object, facts as Object, allowUnconfirmedOrigin = false as Boolean) as Object
-        return { saved: saved, facts: facts, verified: {}, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, manager: invalid, companion: invalid, companionAttempt: 0, launchAsks: false, afterSignIn: false, offer: invalid, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
+        return { saved: saved, facts: facts, verified: {}, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, manager: invalid, companion: invalid, companionAttempt: 0, device: invalid, deviceAttempt: 0, launchAsks: false, afterSignIn: false, offer: invalid, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
     end function
 
     ' The decisions to carry out once, at launch, before the first publish:
@@ -235,11 +238,12 @@ namespace api.auth.coordinator
     end function
 
     ' Whether requestId's body holds the password, a PIN, or a refresh token,
-    ' which ApiTask never writes to a file (api.request.transport).
+    ' or its answer a device code, which ApiTask never writes to a file
+    ' (api.request.transport).
     function sendsSecret(state as Object, requestId as String) as Boolean
         op = state.ops[requestId]
         if op = invalid then return false
-        return op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "pin" or op.kind = "managerPin" or op.kind = "borrowRefresh" or op.kind = "handoffPoll" or op.kind = "handoffCancel" or op.kind = "companionPoll" or op.kind = "companionCancel"
+        return op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "pin" or op.kind = "managerPin" or op.kind = "borrowRefresh" or op.kind = "handoffPoll" or op.kind = "handoffCancel" or op.kind = "companionPoll" or op.kind = "companionCancel" or op.kind = "deviceStart" or op.kind = "devicePoll" or op.kind = "deviceCancel"
     end function
 
     ' A session operation from the render thread.
@@ -270,6 +274,10 @@ namespace api.auth.coordinator
         if op = "companionStart" then return companionStart(state, input)
         if op = "companionPoll" then return companionPoll(state, input)
         if op = "companionCancel" then return companionCancel(state, input)
+        if op = "deviceCapability" then return deviceCapability(state, input)
+        if op = "deviceStart" then return deviceStart(state, input)
+        if op = "devicePoll" then return devicePoll(state, input)
+        if op = "deviceCancel" then return deviceCancel(state, input)
         return [reply(api.response.failure(input, "invalid_request"))]
     end function
 
@@ -396,6 +404,9 @@ namespace api.auth.coordinator
         if op.kind = "companionIdentity" then return companionIdentity(state, op, result)
         if op.kind = "companionStart" then return companionStarted(state, op, result)
         if op.kind = "companionPoll" then return companionPolled(state, op, result, now)
+        if op.kind = "deviceCapability" then return deviceCapable(request, result)
+        if op.kind = "deviceStart" then return deviceStarted(state, request, op, result)
+        if op.kind = "devicePoll" then return devicePolled(state, request, op, result, now)
         if op.kind = "logoutRefresh"
             tokens = parseTokens(result)
             if tokens = invalid then return []
@@ -410,7 +421,7 @@ namespace api.auth.coordinator
     function useServer(state as Object, origin as String, now = 0 as Integer) as Object
         if origin = state.saved.origin then return []
         ' A companion withdrawal goes after the change cancels every request.
-        withdraw = endCompanion(state)
+        withdraw = endSignInAttempts(state)
         decisions = switchServer(state, origin, now)
         state.originCheck = originState("unverified", "", origin)
         decisions.Append(setOriginHold(state, false))
@@ -654,7 +665,7 @@ namespace api.auth.coordinator
         origin = util.text(input.origin)
         if origin <> "" and origin = state.saved.origin
             removed = currentSession(state, now)
-            withdraw = endCompanion(state)
+            withdraw = endSignInAttempts(state)
             decisions = endSession(state, "signed_out")
             nextServer = invalid
             nextOrigin = ""
@@ -754,7 +765,7 @@ namespace api.auth.coordinator
     ' Whether op ends a session on a server other than the configured one
     ' whose origin system/info confirmed in this run (forgetServer).
     function leaving(state as Object, op as Dynamic) as Boolean
-        if op = invalid or (op.kind <> "logout" and op.kind <> "logoutRefresh") then return false
+        if op = invalid or (op.kind <> "logout" and op.kind <> "logoutRefresh" and op.kind <> "deviceCancel") then return false
         return util.isString(op.origin) and op.origin <> state.saved.origin and state.verified[op.origin] = true
     end function
 
@@ -859,7 +870,7 @@ namespace api.auth.coordinator
         decisions = []
         if changed
             ' A companion withdrawal goes after the change cancels every request.
-            withdraw = endCompanion(state)
+            withdraw = endSignInAttempts(state)
             decisions = switchServer(state, op.origin, now)
             decisions.Append([{ kind: "server", origin: op.origin }, persist()])
             decisions.Append(withdraw)
@@ -1071,9 +1082,10 @@ namespace api.auth.coordinator
     ' out. An explicit sign-out or a server change also forgets the account and
     ' its remembered profile; an expired session keeps them, so signing in to
     ' the same account reopens its profile. reason "" is a new sign-in. A
-    ' companion sign-in in progress ends too (endCompanion), and a login
-    ' started before answers identity_changed (loggedIn): whichever sign-in
-    ' installs first is the one kept.
+    ' companion sign-in in progress and a code on screen end too
+    ' (endSignInAttempts), and a login started before answers
+    ' identity_changed (loggedIn): whichever sign-in installs first is the
+    ' one kept.
     function endSession(state as Object, reason as String) as Object
         state.saved.accessToken = ""
         state.saved.refreshToken = ""
@@ -1102,7 +1114,7 @@ namespace api.auth.coordinator
         state.handoffs = {}
         state.handoffStarts = {}
         decisions = endBorrowed(state, "", true)
-        decisions.Append(endCompanion(state))
+        decisions.Append(endSignInAttempts(state))
         decisions.Append(setHold(state, false))
         ' Media headers waiting for a refresh are answered signed_out.
         decisions.Append(answerMedia(state))
@@ -1300,6 +1312,9 @@ namespace api.auth.coordinator
         if op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "borrowRefresh" then spec.rotatesCredentials = true
         ' These carry a credential without auth, and wait for the origin check.
         if op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "logout" then spec.confidential = true
+        ' Sign-in with a code waits for the origin check too, rather than
+        ' failing origin_unverified while it runs.
+        if op.kind = "deviceCapability" or op.kind = "deviceStart" or op.kind = "devicePoll" then spec.confidential = true
         state.ops[id] = op
         return api.request.normalize(spec)
     end function

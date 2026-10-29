@@ -1,0 +1,109 @@
+namespace tests
+
+    @suite("onboarding sign-in with a code")
+    class OnboardingDeviceCodeTests extends rooibos.BaseTestSuite
+
+        function failure(status as Integer, kind = "http" as String) as Object
+            return { requestId: "r1", ok: false, status: status, headers: {}, body: invalid, error: { kind: kind, status: status, problemType: invalid, instance: invalid, retryAfterSeconds: invalid } }
+        end function
+
+        function polled(status as String, opened = false as Boolean) as Object
+            return { requestId: "r1", ok: true, status: 200, headers: {}, body: { status: status, opened: opened, pollAfter: 5, expiresAt: "", account: "" }, error: invalid }
+        end function
+
+        @describe("display")
+
+        @it("groups eight digits or letters 4+4, as tvOS's DeviceUserCode.display does")
+        sub _()
+            m.assertEqual(onboarding.deviceCode.display("4821-7730"), "4821 7730")
+            m.assertEqual(onboarding.deviceCode.display("abcd-efgh"), "ABCD EFGH")
+            m.assertEqual(onboarding.deviceCode.display(" 123-456 "), "123-456")
+            m.assertTrue(onboarding.deviceCode.isNumeric("4821 7730"))
+            m.assertFalse(onboarding.deviceCode.isNumeric("ABCD EFGH"))
+        end sub
+
+        @describe("typedUrl")
+
+        @it("names <host>/activate without https:// or a trailing slash, as tvOS's TVSignInPresentation.typedURL does")
+        sub _()
+            m.assertEqual(onboarding.deviceCode.typedUrl("https://media.example.com/activate/", ""), "media.example.com/activate")
+            m.assertEqual(onboarding.deviceCode.typedUrl("http://10.0.0.5:8096/activate", ""), "http://10.0.0.5:8096/activate")
+            m.assertEqual(onboarding.deviceCode.typedUrl("", "https://media.example.com/activate?code=48217730"), "media.example.com/activate")
+            m.assertEqual(onboarding.deviceCode.typedUrl("", ""), "")
+        end sub
+
+        @describe("states")
+
+        @it("words the status line as tvOS does, with a spinner while it waits")
+        sub _()
+            m.assertEqual(onboarding.deviceCode.statusLine(onboarding.deviceCode.WAITING, false, "", "h").key, "signIn.status.waiting")
+            m.assertEqual(onboarding.deviceCode.statusLine(onboarding.deviceCode.WAITING, true, "", "h").key, "signIn.status.renewed")
+            m.assertEqual(onboarding.deviceCode.statusLine(onboarding.deviceCode.APPROVED, false, "laura", "h"), { key: "signIn.status.approvedAs", values: { account: "laura" } })
+            m.assertEqual(onboarding.deviceCode.statusLine(onboarding.deviceCode.APPROVED, false, "", "h").key, "signIn.status.approved")
+            m.assertEqual(onboarding.deviceCode.statusLine(onboarding.deviceCode.UNREACHABLE, false, "", "media.example.com"), { key: "signIn.status.unreachable", values: { server: "media.example.com" } })
+            m.assertTrue(onboarding.deviceCode.statusSpins(onboarding.deviceCode.OPENED))
+            m.assertFalse(onboarding.deviceCode.statusSpins(onboarding.deviceCode.DENIED))
+        end sub
+
+        @it("offers Try again or Show a new code, and moves the highlight only for states that end the attempt")
+        sub _()
+            m.assertEqual(onboarding.deviceCode.stateAction(onboarding.deviceCode.UNREACHABLE), "tryAgain")
+            m.assertEqual(onboarding.deviceCode.stateAction(onboarding.deviceCode.DENIED), "showNewCode")
+            m.assertEqual(onboarding.deviceCode.stateAction(onboarding.deviceCode.PAUSED), "showNewCode")
+            m.assertEqual(onboarding.deviceCode.stateAction(onboarding.deviceCode.WAITING), "")
+            m.assertTrue(onboarding.deviceCode.actionTakesFocus(onboarding.deviceCode.DENIED))
+            m.assertFalse(onboarding.deviceCode.actionTakesFocus(onboarding.deviceCode.UNREACHABLE))
+            m.assertTrue(onboarding.deviceCode.isTerminal(onboarding.deviceCode.PAUSED))
+            m.assertFalse(onboarding.deviceCode.isTerminal(onboarding.deviceCode.RATE_LIMITED))
+            m.assertTrue(onboarding.deviceCode.showsCode(onboarding.deviceCode.RATE_LIMITED))
+            m.assertFalse(onboarding.deviceCode.showsCode(onboarding.deviceCode.GETTING_CODE))
+        end sub
+
+        @describe("answers")
+
+        @it("reads a start as tvOS does: 403 and 404 leave the password, 429 is rate limited, the rest retry")
+        sub _()
+            m.assertEqual(onboarding.deviceCode.startOutcome({ ok: true, status: 201, body: {} }), onboarding.deviceCode.STARTED)
+            m.assertEqual(onboarding.deviceCode.startOutcome(m.failure(429)), onboarding.deviceCode.RATE_LIMITED)
+            m.assertEqual(onboarding.deviceCode.startOutcome(m.failure(0, "network")), onboarding.deviceCode.TRANSIENT)
+            m.assertEqual(onboarding.deviceCode.startOutcome(m.failure(503)), onboarding.deviceCode.TRANSIENT)
+            m.assertEqual(onboarding.deviceCode.startOutcome(m.failure(404)), onboarding.deviceCode.NO_DEVICE_SIGN_IN)
+            m.assertEqual(onboarding.deviceCode.startOutcome(m.failure(403)), onboarding.deviceCode.NO_DEVICE_SIGN_IN)
+            m.assertEqual(onboarding.deviceCode.startOutcome(m.failure(501)), onboarding.deviceCode.TRANSIENT)
+            m.assertEqual(onboarding.deviceCode.startOutcome(m.failure(400)), onboarding.deviceCode.TRANSIENT)
+            m.assertEqual(onboarding.deviceCode.startOutcome(m.failure(426, "server_update_required")), onboarding.deviceCode.FAILED)
+        end sub
+
+        @it("reads a poll: pending, approved, denied, an ended code to renew, and failures to retry")
+        sub _()
+            m.assertEqual(onboarding.deviceCode.pollOutcome(m.polled("pending", true)), onboarding.deviceCode.PENDING)
+            m.assertEqual(onboarding.deviceCode.pollOutcome(m.polled("approved")), onboarding.deviceCode.APPROVED)
+            m.assertEqual(onboarding.deviceCode.pollOutcome(m.polled("denied")), onboarding.deviceCode.DENIED)
+            m.assertEqual(onboarding.deviceCode.pollOutcome(m.polled("invalid")), onboarding.deviceCode.COULD_NOT_FINISH)
+            for each ended in ["expired", "canceled", "consumed"]
+                m.assertEqual(onboarding.deviceCode.pollOutcome(m.polled(ended)), onboarding.deviceCode.EXPIRED, ended)
+            end for
+            m.assertEqual(onboarding.deviceCode.pollOutcome(m.failure(0, "handoff_gone")), onboarding.deviceCode.EXPIRED)
+            m.assertEqual(onboarding.deviceCode.pollOutcome(m.failure(429)), onboarding.deviceCode.RATE_LIMITED)
+            m.assertEqual(onboarding.deviceCode.pollOutcome(m.failure(502)), onboarding.deviceCode.TRANSIENT)
+            m.assertEqual(onboarding.deviceCode.pollOutcome(m.failure(410)), onboarding.deviceCode.TRANSIENT)
+            m.assertEqual(onboarding.deviceCode.pollOutcome(m.polled("mystery")), onboarding.deviceCode.TRANSIENT)
+        end sub
+
+        @it("polls after poll_after, else the code's interval, never under a second")
+        sub _()
+            m.assertEqual(onboarding.deviceCode.pollWait(7, 5), 7)
+            m.assertEqual(onboarding.deviceCode.pollWait(0, 5), 5)
+            m.assertEqual(onboarding.deviceCode.pollWait(0, 0), 1)
+            m.assertEqual(onboarding.deviceCode.pollWait(2, 5), 2)
+        end sub
+
+        @it("backs off from the poll interval, doubling to 30 s")
+        sub _()
+            m.assertEqual(onboarding.deviceCode.backoff(0, 5), 5)
+            m.assertEqual(onboarding.deviceCode.backoff(5, 5), 10)
+            m.assertEqual(onboarding.deviceCode.backoff(20, 5), 30)
+            m.assertEqual(onboarding.deviceCode.backoff(0, 0), 1)
+        end sub
+    end class
+end namespace

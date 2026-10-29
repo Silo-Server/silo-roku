@@ -97,10 +97,19 @@ objects with `type` and `v: 1`:
 
 ## 5. Flow on the Roku
 
-1. **Consent.** The first push of a session shows, over the current screen:
-   "Sign in to {server}?", "A phone on your network wants to sign this Roku
-   in to {server} at {address}." For an `http` address it adds "This
-   connection isn't encrypted." Buttons Allow and Don't Allow. Nothing is
+The Companion screen draws each step as tvOS's `TVPairingReceiverView`
+does (spec section 5.4): a status chip over the headline where tvOS has
+one, and a card on the right for each step.
+
+1. **Consent.** The first push of a session shows, over the current screen,
+   the chip "A nearby phone is signing in this Roku" (on the server screen,
+   "…is setting up this Roku"), "Allow this sign-in?" ("Allow this
+   setup?"), and "A nearby phone or tablet wants to sign this Roku in to
+   {server}." For an `http` address it adds "This connection isn't
+   encrypted." Buttons Allow and Don't Allow, and under them "Only allow it
+   if you started this on your own phone or tablet." The card shows the
+   phone, waiting dots, and the server's mark over its name: "After you
+   allow it, a code appears here to compare with your phone." Nothing is
    contacted before Allow. Don't Allow sends `cancel` `consent_denied` and
    closes. Consent covers the rest of the session.
 2. **Check the server.** The pushed address goes through the same checks as a
@@ -116,7 +125,9 @@ objects with `type` and `v: 1`:
      and the push listed `endpoints`, the Roku checks them in order for the
      same identity and offers the first that matches: "Can't reach
      {server}", "{server} also answers at {alternate}.", with "Use
-     {alternate}", Try again, and Cancel. Nothing switches without that
+     {alternate}", Try again, and Cancel; the card says "No answer". While
+     it checks, the chip says "Checking the address" over "Connecting to
+     {server}". Nothing switches without that
      choice. With no alternate the same screen offers Try again and Cancel;
      Cancel sends the phone `serverResult failed unreachable`, then
      `cancel` `receiver_cancelled`.
@@ -126,8 +137,11 @@ objects with `type` and `v: 1`:
      Roku's saved address.
 3. **Start.** `POST /api/v2/auth/device/start` with `device_name` and
    `device_platform: "roku"`. The Roku sends `deviceStarted` and shows the
-   code: "Approve on your phone", the `user_code` large, and the match words
-   (`match_code`) under it, "Check that your phone shows the same code."
+   chip "Waiting for your phone" over "Confirm on your phone", "Check that
+   your phone or tablet shows this code, then approve."; the card holds
+   "Sign-in code", the `user_code` grouped 4+4 in 72 px, "Older phones show
+   {match words} instead." when the server sent `match_code`, and the
+   server's mark and name under a divider.
 4. **Poll.** `POST /api/v2/auth/device/poll` at `poll_after` (else
    `interval`) until `expires_in` runs out. `denied` fails `denied`;
    `expired`, `consumed`, `canceled`, or the deadline fail `expired`.
@@ -142,12 +156,15 @@ objects with `type` and `v: 1`:
    on the Roku that finishes first, a sign-out, or a server change ends the
    attempt the same way, and an approval collected after it is dropped.
 
-A failure stays on screen with its reason and Try again (back to waiting for
-a phone) until the person acts; the phone gets `serverResult failed` with
-the code. On a new step the highlight starts on its first button. While
-waiting, the server and sign-in screens' card reads "Use your phone": "Open
-Silo on a phone on this network to sign this Roku in. Or type with the
-remote, or the Roku mobile app's keyboard."
+A failure stays on screen ("Sign-in didn't finish", or "Setup didn't
+finish", with its reason in tvOS's words and a "Not finished" card) with
+Try again (back to waiting for a phone) until the person acts; the phone
+gets `serverResult failed` with the code. On a new step the highlight
+starts on its first button. While waiting, the server screen opens on "Set
+up with your phone" with the chip "Looking for a phone or tablet…" and the
+three setup steps, and the sign-in screen says "Have Silo on your phone?
+Open it on the same Wi‑Fi to sign in this TV." under its code (spec
+section 5.4).
 
 Tokens, device codes, and the poll answer stay inside the auth coordinator
 (`ApiTask`); the receiver and screens see only the user code, match words,

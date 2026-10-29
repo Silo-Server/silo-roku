@@ -93,6 +93,9 @@ Account and setup:
 
 - Silo servers entered as URLs, several saved at once, each keeping its
   sign-in, with Change server switching between them (section 5.4);
+- sign-in with a code: a QR code and a code approved at the server's
+  `/activate` page or on a phone, leading the sign-in screen (section 7.2;
+  decision D-9);
 - on-device password sign-in for local accounts and password-based sign-in
   providers such as LDAP;
 - profile picker, profile PIN entry, and child-profile restrictions;
@@ -249,8 +252,7 @@ supported settings are available there (section 5.8.1).
 
 ### 3.4 Excluded from the first release
 
-- browser-based (OIDC/OAuth) sign-in, account sign-up, and device-code sign-in
-  in public builds other than companion sign-in (section 7.2);
+- browser-based (OIDC/OAuth) sign-in and account sign-up (section 7.2);
 - music and audiobooks (decision D-8), although tvOS and Android TV play
   them;
 - a notifications inbox, and collection creation and editing, which no Silo
@@ -505,16 +507,27 @@ their existing HD/FHD assets.
   - Background: the brand mesh (`#0034FB`, `#F50B4F`, `#FD7403`) over black,
     darkened on the left, as a packaged image.
   - Frame: padding 90 px at the sides and 60 px at the top. A 64 px top row
-    holds the Silo wordmark, 150 px wide, on the left; on the server screen it
+    holds the Silo wordmark, drawn 122×64 4 px in from the column as tvOS's
+    150 pt `SiloWordmarkView` draws its letters, on the left; on the server screen it
     also holds a chip with the TV's name on the right.
   - Below the top row: a 900 px column on the left and a 640 px card on the
     right (radius 40, `#1F1F1F` at 72%, 1 px white 14% outline), 80 px apart.
     They are centred in the space below the top row (centre y 572).
-  - The column holds the whole form (D6). The card holds Roku help: the
-    remote, or the Roku mobile app's keyboard, in place of tvOS's "Type on
-    your phone". Message screens have no card.
-  - Type: headlines 88 px Heavy, two or three lines. Body 28 px Regular at
-    62%, 22 px below the headline.
+  - The column holds the whole form (D6). The card holds tvOS's "Type on
+    your phone" (a phone in a 112 px glass circle), with Roku's way of
+    typing on a phone: the Roku mobile app's keyboard. The phone-first
+    setup screen puts the setup steps there, the code sign-in its QR code,
+    and the Companion screen a card for each stage. Message screens have no
+    card.
+  - Type: headlines 88 px Heavy, two or three lines, their lines about
+    105 px apart as tvOS sets them. Body 28 px Regular at 62%, 22 px below
+    the headline.
+  - Status chips (tvOS's `MarqueeTVStatusChip`): 52 px capsules, white 8%
+    under a white 14% outline, 22 px Medium text at 62% after a small
+    spinner or glyph. One sits over a headline where tvOS has one ("Looking
+    for a phone or tablet…", the Companion screen's stages).
+  - Glyphs: fields and buttons carry tvOS's symbols (globe, person, lock,
+    eye, key, QR code, gear), drawn as packaged white line art.
   - Fields: 760×84, radius 16, text 30 px with a 30 px inset. At rest, a white
     8% fill with a 1 px white 12% outline. Focused, a `#EDEDED` fill with
     black text, scaled 1.04. In error, a 3 px `#FF6961` outline at 75%.
@@ -524,14 +537,36 @@ their existing HD/FHD assets.
     - Primary: a white 8% fill with a white 14% outline.
     - Plain (Back, Change server, Cancel): no capsule at rest, labels at 62%.
     - Focused: an `#EDEDED` fill with black text, scaled 1.06.
-- **Server address.** "Enter your server address", "Type the address you use
-  for Silo.", then the field (placeholder `media.example.com`). Then shortcut
-  chips `https://`, `http://`, and `.com` (Android TV's; 5.9), a note line,
-  then Connect and Back. An address without a scheme tries HTTPS, then HTTP.
-  Before using plain HTTP, the client asks "Connect without encryption?".
+- **Set up with your phone.** Server setup opens here, as tvOS's
+  `TVServerSetupView` does, while the Roku waits for a phone (companion
+  sign-in, [`companion-pairing.md`](companion-pairing.md)): the chip
+  "Looking for a phone or tablet…" with a spinner, 36 px over "Set up with
+  your phone"; "It's the easiest way. There's nothing to type with the
+  remote." in 32 px; "No phone nearby?" 64 px under it in 26 px at 40%; and
+  Enter server address (globe) 18 px under that. On the right, without a
+  card, the three setup steps 30 px apart, 700 px wide: a 168 px tile
+  (radius 34, white 6% under a white 14% outline) holding a picture (the
+  app icon; the phone's setup card with its Set Up button ringed in
+  orange; a green check), its number on a 52 px white disc 16 px outside
+  the tile's top left, and the title in 38 px Bold 34 px to its right:
+  "Open Silo on your phone", "Tap Set Up", "Finish on your phone". The TV's
+  name sits in the top row's chip with a TV glyph.
+- **Server address.** Enter server address swaps in the address entry in
+  place: "Enter your server address", "Type the address you use for Silo.",
+  then the field (globe; placeholder `media.example.com`), then Advanced
+  options (a compact plain button with a gear, "Hide advanced options" while
+  open), which shows the protocol (Auto, HTTPS, HTTP; compact buttons 14 px
+  apart, the chosen one checked) and a 250 px Port field ("Port: auto"),
+  then Connect and Back, which returns to the phone (as does the remote's
+  Back). A chosen protocol replaces a typed one; a port typed in the address
+  wins over the Port field. An address without a scheme tries HTTPS, then
+  HTTP. Before using plain HTTP, the client asks "Connect without
+  encryption?". The address keyboard keeps its `https://`, `http://`, and
+  `.com` chips (5.9).
 - **Saved servers.** Change server (sign-in, the picker, the message
   screens, Settings, and the avatar menu's Switch Server) opens this list
-  when another server is saved, and server address entry otherwise. Message
+  when another server is saved, and server setup ("Set up with your phone")
+  otherwise. Message
   screen layout with no card: "Choose a server", "Switch to a saved server,
   or add another.", then one row per server, then Add server and Back.
   - Rows: the server card at 760 px, its badge at the right edge: CURRENT
@@ -544,21 +579,37 @@ their existing HD/FHD assets.
     row; Options (*) on a row removes it too.
   - OK on the current server goes back. On another, its row says
     CONNECTING… while `system/info` checks it as address entry checks a
-    typed address (Back stops it); the app then starts over on that server
+    typed address; the app then starts over on that server
     with the sign-in it kept, so its remembered profile reopens. A server
     that does not answer shows "Couldn't reach {server}…" under the list;
     one too old shows "Server update required".
   - Remove asks "Remove {server}?" (Remove / Cancel). Removing the current
     server signs it out and switches to the most recently used saved
     server, which the dialog names, or to address entry when none is left.
-- **Sign-in.**
+- **Sign-in.** As tvOS's `TVLoginView`:
   - A server card sits above the headline: an 80 px mark (the server's
-    initial), the name in 34 px Bold, the address in 23 px at 40%, and a
-    "SECURE" or "HTTP" badge. Padding 24, radius 30.
-  - Headline "Sign in with a password"; body "Use your {server} username and
-    password."
-  - Username, then Password with a 76 px show/hide button beside it, then the
-    error line, then Sign in and Change server.
+    initial), the server's own name (theme/branding's `server_name`, read
+    as the screen opens; its host until then) in 34 px Bold, its host in
+    23 px at 40%, and a "SECURE" (lock) or "HTTP" (open lock) badge.
+    Padding 24, radius 30.
+  - With a code (the server's `auth/device/capability` says available):
+    "Sign in to {server}"; "Scan the code with your phone's camera, or go
+    to {host}/activate and enter it. Approve on your phone and this Roku
+    signs in by itself."; the nearby hint (a phone glyph, "Have Silo on your
+    phone? Open it on the same Wi‑Fi to sign in this TV.", 22 px at 40%);
+    then the state's action (Try again, or Show a new code), Sign in with a
+    password (key; when the server takes passwords), and Change server. The
+    card holds the QR code (360 px on a white frame, radius 24, 30 px
+    margin), the code grouped 4+4 in 72 px, `{host}/activate` in 24 px, and
+    the status line with a small spinner ("Waiting for approval", "Continue
+    on your phone", "Signed in as {account}", …); a state that ended shows a
+    symbol in place of the QR code. Section 7.2 runs the code.
+  - Sign in with a password swaps in the form: "Sign in with a password";
+    "Use your {server} username and password." (or "This server only
+    supports password sign-in." without codes); Username (person), then
+    Password (lock) with a 76 px eye button beside it (eye with a slash
+    while shown), then the error line, then Sign in, Use your phone instead
+    (QR code; back to the code, as Back is), and Change server.
   - A failure shows "Invalid username or password".
 - **Server not ready.** When `GET /api/v2/system/setup` reports
   `needs_setup`, sign-in becomes tvOS's message screen: the server card with
@@ -2035,11 +2086,21 @@ Roku as it is, and the work package that builds the change deletes the row.
 
 | tvOS (or as named) | Roku | Reason |
 | --- | --- | --- |
-| QR or device-code sign-in is the default; password is the alternative | Password sign-in, or a code shown only when a Silo phone app on the network offers to sign the Roku in (companion sign-in) | Certification criterion 2.2 (section 7.2) |
-| "Set up with your phone" and network discovery lead server setup | Address entry, or a Silo phone app pushes the server (companion sign-in); no discovery of servers | Discovery deferred (section 3.3) |
+| Servers found on the network or the tailnet are listed under "No phone nearby?", above Enter server address | Enter server address alone | Discovery deferred (section 3.3); a Roku cannot join a tailnet |
+| A server reached through a network identity provider (Tailscale) offers "Continue as {owner}" | Not offered | A Roku cannot join a tailnet, so no provider can name its owner |
+| Auto with no port also tries `http://{host}:8090`, the stock compose port | HTTPS, then HTTP on the typed port once the viewer agrees | Each plain-HTTP attempt asks "Connect without encryption?" first (below); a silent extra HTTP probe would skip that |
+| "Type on your phone": a keyboard notification appears on nearby iPhones and iPads | The same title over the Roku mobile app's keyboard | Roku's phone keyboard is its mobile app's |
+| A code approved on a phone shows "Signed in as {account}" for a second before the profiles | The profiles open as soon as the session is installed, as after a password sign-in | The session's change moves the app on (section 6.2); a held navigation would be a second path into the picker |
+| A failed password sign-in shakes the fields | The error line alone | Roku `Group` animations would add a frame-time cost to the form for one cue |
+| The code is 72 pt Bold monospaced, its slashed zero apart from O | 72 px SemiBold tabular Inter, two spaces between its groups; letter codes from older servers in Bold | No monospaced face ships (the Versions menu row below) |
+| The spinner is the system's spokes | The packaged arc spinner (section 5.8) | No system spinner on Roku |
+| Choosing HTTP, or typing `http://`, connects without asking | "Connect without encryption?" asks first | Plain HTTP always asks on Roku (row below) |
+| The Companion screen's consent and unreachable steps say nothing more | An `http` address adds "This connection isn't encrypted."; an alternate adds "{server} also answers at {alternate}." | `companion-pairing.md` section 5: the Roku reads both before its consent or choice |
+| The pairing screens have no exit command; their buttons end them | Back denies at consent, closes a failure, and cancels the other steps | Back returns from every screen on Roku (criterion 4.6) |
 | The TV's remote-control standby screen takes over while a phone is connected | No Connect a Phone entry is exposed in the avatar menu; the pairing route remains implemented. A phone connecting shows "<phone> connected" for four seconds and nothing else changes | The avatar menu omits the pairing entry for the first release. Roku apps cannot be opened by a phone (no ECP from phone apps), so there is nothing to stand by for; `docs/silocontrol.md` section 4 (every build since decision D-7) |
 | A phone's profile handoff shows a "Playing as" card for six seconds | The player's notice card says "Playing as <profile> · From <phone>" for four seconds | The notice card is the player's one non-focusable card; `docs/silocontrol.md` section 4.2 |
-| The sign-in screens offer phone sign-in over TLS (`_silopair._tcp`) and show the code in their own card | A phone push opens a Companion screen over the server or sign-in screen: Allow / Don't Allow, the check, then the code and match words; the card says "Use your phone"; the service is `_silopair-roku._tcp` over plain TCP | Roku has no TLS on listening sockets, and the sign-in screen shows no code until a phone asks for one; `docs/companion-pairing.md` |
+| The sign-in screens offer phone sign-in over TLS (`_silopair._tcp`), and a phone on the sign-in screen approves the code it already shows | A phone push opens the Companion screen over the server or sign-in screen, drawn as tvOS's pairing screens (chip, copy, and card for each stage), which starts its own device login for the phone; the service is `_silopair-roku._tcp` over plain TCP | Roku has no TLS on listening sockets; `docs/companion-pairing.md` |
+| A phone's setup ends on "You're all set" with Continue, which moves on after a short dwell | "Signed in", then the profiles once the phone says done or three seconds pass | The receiver stops after the sign-in (`docs/companion-pairing.md` section 5) |
 | Calendar shows all seven days, an empty one titled at reduced opacity over "Nothing scheduled" | Only days with events have a row; the week strip's dots mark them, and the audio guide says "Nothing scheduled" on a day without | A `RowList` row needs a focusable item, and a placeholder card would take focus for nothing |
 | An empty Calendar week offers the other two filters as buttons | The message alone; the filter is two presses up | The empty state has one button (section 5.8), and either filter is already on screen |
 | The Calendar's filter is kept on the device | It is kept until the app closes | The registry keeps the session and Browse's choices (AG-382); a filter is one press to set again |
@@ -2048,11 +2109,10 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Custom PIN keypad | Roku `DynamicPinPad` inside the same layout | Criterion 4.12 requires Roku keyboards for PINs |
 | Platform or custom text fields | Roku dynamic keyboards, with voice entry | Criterion 4.12 for credentials; Roku's standard for search |
 | tvOS's keyboard is full screen; Android TV's rises over the lower screen | A `DynamicKeyboard` panel covers the screen, with the address chips, Show/Hide, and Done below it | Roku sizes `DynamicKeyboard` itself; the panel keeps the text, voice entry, and shortcuts together |
-| The scheme shortcuts sit behind an Advanced options toggle | Chips `https://`, `http://`, and `.com` always show under the field (Android TV) | Typing a scheme on a Roku remote's keyboard is slow; the chips are one press each |
-| A welcome step leads to address entry, and Back returns to it | Address entry opens first; its Back button shows only when Change server opened it, and the remote's Back exits | Nothing comes before address entry on Roku: server discovery is deferred, and a phone sets the Roku up from address entry itself (companion sign-in) |
+| The address keyboard has no shortcuts | Chips `https://`, `http://`, and `.com` under the keyboard (Android TV) | Typing a scheme on a Roku remote's keyboard is slow; the chips are one press each |
 | "Connect without encryption?" appears once the HTTP address has answered (Android TV) | It appears before the first plain-HTTP request | The setup check stores a server as soon as it answers, so the viewer agrees first |
 | An older server is an inline error on address entry | A "Server update required" screen, whose Change server returns to the typed address | Section 7.1 |
-| A server without password sign-in offers only the code | An explanation with Try again and Change server | Section 7.2; Roku allows no off-device sign-in |
+| A server with neither password sign-in nor device sign-in offers only "Continue as" (network sign-in) | An explanation with Try again and Change server | No network sign-in on Roku (above) |
 | "Open {name} automatically?" is an alert over the picker, before Home | A dialog over Home, once Home has rendered | Choosing a profile moves the app to Home at once (section 6.2), and Home's loading and `AppLaunchComplete` never wait for the answer (AG-574) |
 | Time away runs from the moment Silo goes to the background, and a return to the foreground applies it | From the last use the app stamped (at a pick, then every five minutes under a timed choice), and from the last tick before a Roku player's suspend | Roku apps are closed rather than backgrounded, and give no notice when the viewer presses Home (AG-572) |
 | An explicit Switch Profile marks the picker as required, so quitting on the picker never reopens the previous profile | Switch Profile keeps the open profile while the picker shows, and Back returns to it; quitting there reopens it under Automatic | Roku's Switch Profile pushes the picker over the open profile rather than closing it (section 5.3, AG-576) |
@@ -2069,9 +2129,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Avatar images are round everywhere | Square on devices without OpenGL | `MaskGroup` does not clip there (implementation plan section 4.6) |
 | The PIN screen's avatar is a near-black disc with the initial in `#EDEDED` | The profile's colour, as on the picker | One avatar drawing from the picker to the shell (parity review P-17) |
 | The brand light changes stage for sign-in and for the profiles, and takes the server's accent or the colour of the profile being opened or PIN-checked | Setup, sign-in, and messages share one mesh, the picker and PIN another, without a server's or profile's colour | Each stage or colour would be another packaged image of about 60–80 KB |
-| The card beside a text form says "Type on your phone" (a keyboard on nearby iPhones and iPads) | It says "Use your phone": open Silo on a phone to sign the Roku in, or type with the remote or the Roku mobile app's keyboard (D6) | tvOS's phone keyboard has no Roku counterpart; companion sign-in takes its place |
-| Fields lead with an icon (globe, person, lock), inline errors with an exclamation mark, and Show/Hide is an eye; the server badge, the TV's chip, and the picker's buttons carry icons | Text only; Show/Hide is a text button as wide as its longer label | No icon art ships for them |
-| The server card names the server (its branding or system name) over its host, and its mark can be the server's logo | The server's `server_name` once Home or the saved servers list has read its branding, else the host, over the server's URL, and the name's initial on the warm tile; over setup, the update screen's card shows the host just checked | The logo would be one more image per first-run screen; the name is kept with the saved server (section 7.2) |
+| Inline errors lead with an exclamation mark, and the picker's buttons carry icons | Errors and the picker's buttons are text only | No icon art ships for them |
+| The server card's mark can be the server's logo | The name's initial on the warm tile; over setup, the update screen's card shows the host just checked | The logo would be one more image per first-run screen |
 | "This server isn't ready" marks its server card with a server glyph on a dark tile | The host's initial on the warm tile, as on sign-in | No icon art ships for it |
 | First-run headlines and the picker's title are set 2 px and 1.6 px tighter than the font | Inter at its own spacing | Roku `Label` has no letter-spacing field |
 | Compact buttons (the picker's buttons, PIN's Cancel, the address chips) are 57 px tall | 56 px, the top bar's tab capsule | Even heights scale to HD without half pixels, and the art is shared |
@@ -2458,8 +2517,12 @@ screen may infer its previous screen from global flags. A screen's own
 navigation acts only while that screen is on top: a change it asks for while
 another screen covers it, such as an answer that arrives under the Companion
 screen, waits until it is on top again and is dropped if it is released first.
-A server check or sign-in under way when another screen covers its screen
-stops, as Back stops it, so its answer cannot change the session under it.
+A server check or password sign-in under way when another screen covers its
+screen stops, so its answer cannot change the session under it. A code
+already approved still signs the Roku in: its poll in flight answers, and
+the first sign-in to finish keeps the session (section 7.2). While a check
+or sign-in runs on screen, the remote's keys wait for it, Back included, as
+tvOS disables its buttons.
 
 ### 6.3 Threading and ownership
 
@@ -2551,16 +2614,30 @@ bypass for certificate validation.
 
 ### 7.2 Account sign-in
 
-The public release uses on-device credential entry. Sign-in first reads
+Sign-in leads with a code, as tvOS's does, and offers the password as the
+alternative (section 5.4). Sign-in first reads
 `GET /api/v2/system/setup`; a server that still needs its first
 administrator (`needs_setup`) gets the "This server isn't ready" screen
 (section 5.4) instead of the form. Any other answer, including an older
 server's 404, goes on:
 
-1. `GET /api/v2/auth/providers` lists sign-in modes. When `password_login` is
-   false, the server offers only browser sign-in, which Roku does not allow.
-   The client explains that the server administrator must enable password
-   sign-in, and stops there.
+1. `GET /api/v2/auth/providers` lists sign-in modes, and
+   `GET /api/v2/auth/device/capability` says whether the server offers
+   sign-in with a code (`state` "available"). With a code, the screen
+   starts a device login (`POST /api/v2/auth/device/start`) and polls it
+   (`/poll`) as tvOS's `QRLoginViewModel` does: at once, then after each
+   answer's `poll_after`, or the start's `interval` when an answer gives
+   none, at least a second apart; an expired code is replaced in place for up to an hour,
+   then the screen pauses until Show a new code; failures back off from the
+   interval to 30 s, and a streak of 10 s (getting a code) or 30 s
+   (polling) shows "Can't reach", 60 s of 429s "Too many sign-in attempts",
+   while retrying goes on. A password sign-in stops the polling while it
+   runs and withdraws the code when it succeeds; leaving the screen, Change
+   server, or a new code withdraws the one before (`/cancel`). An approval
+   installs the session as a password sign-in does. When `password_login`
+   is false and there is no code, the server offers only browser sign-in,
+   which Roku does not allow: the client explains that the server
+   administrator must enable password sign-in, and stops there.
 2. The username and password are entered with the Roku voice keyboard and
    posted to `POST /api/v2/auth/login`.
 3. Access and refresh tokens are written to an app-specific registry section
@@ -2577,20 +2654,20 @@ account's session list.
 
 Roku certification criterion 2.2 requires on-device authentication and
 prohibits off-device sign-in or activation, and Roku's rendezvous-linking
-page says "Only TVE apps may use rendezvous linking". Silo's device-code login
-(`/api/v2/auth/device/*`) and browser-based OAuth sign-in are therefore
-excluded from public builds. Profile handoff reuses the device login for
-a temporary session; it is on in every build by the project owner's
-decision of 2026-10-25, before Roku confirms it
-([`silocontrol.md`](silocontrol.md) section 2.3). Device-code login may remain in development and
-beta builds. Companion sign-in, where a phone on the network signs a new
-Roku in with a device login it approves, is the exception: it ships in
-public builds by the project owner's decision, as comparable apps offer it
-([`companion-pairing.md`](companion-pairing.md) section 1).
-The server and sign-in screens' card then says "Use your phone" beside the
-remote and Roku mobile app keyboard help. When a password sign-in and a
-companion approval overlap, the first to finish keeps the session: the
-other's tokens are dropped, and an open device login is withdrawn.
+page says "Only TVE apps may use rendezvous linking". By the project
+owner's decision of 2026-10-29, sign-in with a code (`/api/v2/auth/device/*`)
+leads sign-in in every build anyway, so the Roku matches tvOS; the owner
+accepts that this may fail criterion 2.2 at submission. Browser-based OAuth
+sign-in stays excluded. Profile handoff reuses the device login for a
+temporary session; it is on in every build by the project owner's decision
+of 2026-10-25, before Roku confirms it
+([`silocontrol.md`](silocontrol.md) section 2.3). Companion sign-in, where
+a phone on the network signs a new Roku in with a device login it
+approves, ships in every build too
+([`companion-pairing.md`](companion-pairing.md) section 1). When a password
+sign-in, the code on screen, and a companion approval overlap, the first to
+finish keeps the session: the others' tokens are dropped, and open device
+logins are withdrawn.
 
 Saved servers: changing the server keeps the one left behind, with its
 tokens, profile tokens, account, and remembered profile, in a second
@@ -3967,7 +4044,7 @@ allowlist. The following follow-ups are tracked with the server:
 | Public Store or beta-first | Beta-first | Roku policy answers and household testing |
 | Plain LAN HTTP | Allow after the "Connect without encryption?" confirmation | Roku reviewer answer |
 | Password-less (OAuth-only) servers | Explain and stop; no browser sign-in | None; confirm product copy |
-| Device-code sign-in | Development and beta only, except companion sign-in (section 7.2) | None: Roku allows rendezvous linking only in TVE apps (section 7.2) |
+| Device-code sign-in | Leads sign-in in every build, as on tvOS (owner, 2026-10-29; section 7.2) | Roku's ruling on criterion 2.2 at submission: Roku allows rendezvous linking only in TVE apps |
 | Reviewer test server | Required; owner not yet assigned | An owner and a host |
 | Media authentication | `HttpHeaders` on the `ContentNode` | Milestone 0 header test |
 | Side-loaded subtitles | Advertised (`sidecar_text`); each sidecar is downloaded and shown as a local SRT track (section 9.7) | Section 12.5 matrix on the cohorts other than the Roku TV |

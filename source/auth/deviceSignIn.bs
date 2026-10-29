@@ -1,0 +1,155 @@
+import "pkg:/source/api/response.bs"
+import "pkg:/source/auth/headers.bs"
+import "pkg:/source/util/values.bs"
+
+' Sign-in with a code (spec section 7.2), as tvOS's QRLoginViewModel runs
+' it: the sign-in screen shows a QR code and a user code for the configured
+' server, a phone or browser approves it at <host>/activate, and the Roku
+' collects the session by polling. Part of api.auth.coordinator, whose
+' decisions it returns.
+'
+' Session operations:
+'   { session: "deviceCapability" }  GET /api/v2/auth/device/capability at
+'       the configured server; answers { offered, cancel }
+'   { session: "deviceStart", deviceName }  withdraws the code before, if
+'       any, and starts a device login; answers { userCode, verificationUri,
+'       verificationUriComplete, interval, expiresIn, expiresAt }
+'   { session: "devicePoll" }  polls the code once; answers { status,
+'       opened, pollAfter, expiresAt, account }. An approval installs the
+'       session as a password sign-in does; account is its username.
+'   { session: "deviceCancel" }  withdraws the code, best effort
+' The device code and the tokens never leave this state but as request
+' bodies to the configured origin; the user code and the verification URIs
+' go to the render thread, which shows them. Each start and cancel begins a
+' new attempt, as does the end of the login session (endSession), and an
+' answer for an earlier one changes nothing.
+namespace api.auth.coordinator
+    const DEVICE_TIMEOUT_MS = 15000
+
+    function deviceCapability(state as Object, input as Object) as Object
+        if state.saved.origin = "" then return [reply(api.response.failure(input, "no_server"))]
+        request = build(state, input, { method: "GET", path: CAPABILITY_PATH, timeoutMs: DEVICE_TIMEOUT_MS }, { kind: "deviceCapability", origin: state.saved.origin })
+        return submitConfidential(state, request)
+    end function
+
+    ' tvOS's offersDeviceSignIn: only an "available" document offers it.
+    function deviceCapable(request as Object, result as Object) as Object
+        if result.ok <> true then return [reply(withoutBody(result))]
+        ' An empty 2xx answer is no document: a parse failure, not "ok".
+        if not util.isObject(result.body) then return [reply(withoutBody(api.response.failure(request, "parse")))]
+        body = result.body
+        offered = util.text(body.state) = "available"
+        return [reply(succeeded(request, { offered: offered, cancel: offered and util.isTrue(body.cancel) }, result.status))]
+    end function
+
+    function deviceStart(state as Object, input as Object) as Object
+        if state.saved.origin = "" then return [reply(api.response.failure(input, "no_server"))]
+        if state.saved.accessToken <> "" then return [reply(api.response.failure(input, "invalid_request"))]
+        decisions = endDevice(state)
+        state.device = { origin: state.saved.origin, deviceCode: "", attempt: state.deviceAttempt, epoch: state.epoch }
+        name = api.auth.headers.clampName(input.deviceName)
+        request = build(state, input, { method: "POST", path: DEVICE_START_PATH, body: { device_name: name, device_platform: api.auth.headers.DEVICE_PLATFORM }, timeoutMs: DEVICE_TIMEOUT_MS }, { kind: "deviceStart", origin: state.saved.origin, attempt: state.deviceAttempt })
+        decisions.Append(submitConfidential(state, request))
+        return decisions
+    end function
+
+    ' The device login started; its device code stays here. A login an
+    ' ended attempt started is withdrawn.
+    function deviceStarted(state as Object, request as Object, op as Object, result as Object) as Object
+        body = result.body
+        device = state.device
+        if device = invalid or device.attempt <> op.attempt or op.origin <> state.saved.origin
+            decisions = [reply(api.response.failure(request, "handoff_gone"))]
+            if result.ok = true and util.isObject(body) and nonEmpty(body.device_code) then decisions.Push(deviceWithdraw(state, op.origin, body.device_code))
+            return decisions
+        end if
+        if result.ok <> true
+            state.device = invalid
+            return [reply(withoutBody(result))]
+        end if
+        if not util.isObject(body) or not nonEmpty(body.device_code) or not nonEmpty(body.user_code)
+            state.device = invalid
+            return [reply(withoutBody(api.response.failure(request, "parse")))]
+        end if
+        device.deviceCode = body.device_code
+        interval = 5
+        if util.isNumber(body.interval) and body.interval > 0 then interval = Int(body.interval)
+        expiresIn = 600
+        if util.isNumber(body.expires_in) and body.expires_in > 0 then expiresIn = Int(body.expires_in)
+        answer = { userCode: body.user_code, verificationUri: util.text(body.verification_uri), verificationUriComplete: util.text(body.verification_uri_complete), interval: interval, expiresIn: expiresIn, expiresAt: util.text(body.expires_at) }
+        return [reply(succeeded(request, answer, result.status))]
+    end function
+
+    function devicePoll(state as Object, input as Object) as Object
+        device = state.device
+        if device = invalid or device.deviceCode = "" or device.origin <> state.saved.origin then return [reply(api.response.failure(input, "handoff_gone"))]
+        request = build(state, input, { method: "POST", path: DEVICE_POLL_PATH, body: { device_code: device.deviceCode }, timeoutMs: DEVICE_TIMEOUT_MS }, { kind: "devicePoll", origin: device.origin, deviceCode: device.deviceCode, epoch: state.epoch })
+        return submitConfidential(state, request)
+    end function
+
+    ' A poll answered. An approval installs the session; any other end
+    ' (denied, expired, canceled, consumed) forgets the code. A failed poll
+    ' is answered as it is, and the screen polls again.
+    function devicePolled(state as Object, request as Object, op as Object, result as Object, now as Integer) as Object
+        device = state.device
+        if device = invalid or device.deviceCode <> op.deviceCode or op.epoch <> state.epoch or op.origin <> state.saved.origin then return [reply(api.response.failure(request, "handoff_gone"))]
+        body = result.body
+        if result.ok <> true then return [reply(withoutBody(result))]
+        if not util.isObject(body) then return [reply(withoutBody(api.response.failure(request, "parse")))]
+        status = util.text(body.status)
+        pollAfter = 0
+        if util.isNumber(body.poll_after) then pollAfter = Int(body.poll_after)
+        answer = { status: status, opened: util.isTrue(body.opened), pollAfter: pollAfter, expiresAt: util.text(body.expires_at), account: "" }
+        if status = "pending" then return [reply(succeeded(request, answer, result.status))]
+        state.device = invalid
+        if status <> "approved" then return [reply(succeeded(request, answer, result.status))]
+        tokens = invalid
+        user = invalid
+        if util.isObject(body.tokens)
+            tokens = parseTokens({ ok: true, body: body.tokens })
+            if util.isObject(body.tokens.user) then user = body.tokens.user
+        end if
+        if tokens = invalid or user = invalid or not nonEmpty(user.id) or util.isTrue(body.temporary)
+            answer.status = "invalid"
+            return [reply(succeeded(request, answer, result.status))]
+        end if
+        decisions = endSession(state, "")
+        if user.id <> state.saved.accountId then state.saved.profileId = ""
+        state.saved.accountId = user.id
+        setTokens(state, tokens, now)
+        signedIn(state)
+        answer.account = util.text(user.username)
+        decisions.Append([persist(), publish(), reply(succeeded(request, answer, result.status))])
+        return decisions
+    end function
+
+    function deviceCancel(state as Object, input as Object) as Object
+        decisions = [reply(succeeded(input, {}))]
+        decisions.Append(endDevice(state))
+        return decisions
+    end function
+
+    ' Ends the attempt, so an answer for it changes nothing, and withdraws
+    ' its code. endSession calls this too: a password or companion sign-in
+    ' withdraws the code on screen, as tvOS's does.
+    function endDevice(state as Object) as Object
+        device = state.device
+        state.device = invalid
+        state.deviceAttempt += 1
+        if device = invalid or device.deviceCode = "" then return []
+        return [deviceWithdraw(state, device.origin, device.deviceCode)]
+    end function
+
+    function deviceWithdraw(state as Object, origin as String, deviceCode as String) as Object
+        return submit(build(state, { owner: "" }, { method: "POST", url: origin + DEVICE_CANCEL_PATH, body: { device_code: deviceCode }, timeoutMs: DEVICE_TIMEOUT_MS }, { kind: "deviceCancel", origin: origin }))
+    end function
+
+    ' The companion attempt and the code on screen, which a session change
+    ' ends together: { withdrawals } to append after a server change cancels
+    ' every request.
+    function endSignInAttempts(state as Object) as Object
+        decisions = endCompanion(state)
+        decisions.Append(endDevice(state))
+        return decisions
+    end function
+end namespace

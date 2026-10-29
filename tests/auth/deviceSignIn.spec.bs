@@ -1,0 +1,175 @@
+namespace tests
+
+    ' Sign-in with a code in the account session (source/auth/deviceSignIn.bs),
+    ' driven through tests.sessions. Bodies follow the server contract's
+    ' DeviceLoginCapability, DeviceLoginStart, and DeviceLoginPoll.
+    @suite("auth sign-in with a code")
+    class AuthDeviceSignInTests extends rooibos.BaseTestSuite
+
+        function started() as Object
+            return { device_code: "dev-secret", user_code: "4821-7730", match_code: "warm pony", verification_uri: "https://silo.example/activate", verification_uri_complete: "https://silo.example/activate?code=48217730", expires_at: "2026-10-25T18:15:00Z", expires_in: 600, interval: 4, device_name: "Living Room", device_platform: "roku", client_purpose: "device_login", temporary: false }
+        end function
+
+        function approved() as Object
+            return { status: "approved", poll_after: 4, opened: true, profile_id: "", profile_token: "", temporary: false, tokens: { access_token: "cacc", refresh_token: "cref", expires_in: 3600, user: { id: "7", username: "sam", role: "user" } } }
+        end function
+
+        function begun(loop as Object) as Object
+            tests.sessions.send(loop, { requestId: "d1", session: "deviceStart", deviceName: "Living Room" })
+            tests.sessions.respond(loop, "d1", 201, m.started())
+            return loop.delivered.d1
+        end function
+
+        ' The withdrawals sent, as their device codes.
+        function withdrawn(loop as Object) as Object
+            out = []
+            for each id in loop.running
+                request = loop.running[id].request
+                if tests.sessions.pathOf(request) = "/api/v2/auth/device/cancel" then out.Push(request.body.device_code)
+            end for
+            return out
+        end function
+
+        @describe("the capability")
+
+        @it("offers a code only when the server says available, as tvOS's offersDeviceSignIn")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "c1", session: "deviceCapability" })
+            m.assertEqual(tests.sessions.pathOf(loop.running.c1.request), "/api/v2/auth/device/capability")
+            tests.sessions.respond(loop, "c1", 200, { state: "available", cancel: true, protocol_versions: [2] })
+            m.assertEqual(loop.delivered.c1.body, { offered: true, cancel: true })
+            tests.sessions.send(loop, { requestId: "c2", session: "deviceCapability" })
+            tests.sessions.respond(loop, "c2", 200, { state: "disabled", cancel: true })
+            m.assertEqual(loop.delivered.c2.body, { offered: false, cancel: false })
+        end sub
+
+        @it("answers an empty successful capability or poll as a parse failure")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "c1", session: "deviceCapability" })
+            tests.sessions.respond(loop, "c1", 200, invalid)
+            m.assertEqual(loop.delivered.c1.error.kind, "parse")
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "p1", session: "devicePoll" })
+            tests.sessions.respond(loop, "p1", 200, invalid)
+            m.assertEqual(loop.delivered.p1.error.kind, "parse")
+        end sub
+
+        @describe("the code")
+
+        @it("starts a login at the configured server, keeping the device code here")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "d1", session: "deviceStart", deviceName: "Living Room" })
+            m.assertEqual(tests.sessions.pathOf(loop.running.d1.request), "/api/v2/auth/device/start")
+            m.assertEqual(loop.running.d1.request.body, { device_name: "Living Room", device_platform: "roku" })
+            tests.sessions.respond(loop, "d1", 201, m.started())
+            m.assertEqual(loop.delivered.d1.body, { userCode: "4821-7730", verificationUri: "https://silo.example/activate", verificationUriComplete: "https://silo.example/activate?code=48217730", interval: 4, expiresIn: 600, expiresAt: "2026-10-25T18:15:00Z" })
+            m.assertFalse(FormatJson(loop.delivered.d1).Instr("dev-secret") >= 0)
+        end sub
+
+        @it("starts nothing while signed in")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "d1", session: "deviceStart", deviceName: "Living Room" })
+            m.assertEqual(loop.delivered.d1.error.kind, "invalid_request")
+        end sub
+
+        @it("withdraws the code before when it starts another")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "d2", session: "deviceStart", deviceName: "Living Room" })
+            m.assertEqual(m.withdrawn(loop), ["dev-secret"])
+            m.assertNotInvalid(loop.running.d2)
+        end sub
+
+        @it("signs in on approval, as a password sign-in does, and answers without tokens")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "p1", session: "devicePoll" })
+            m.assertEqual(loop.running.p1.request.body, { device_code: "dev-secret" })
+            tests.sessions.respond(loop, "p1", 200, { status: "pending", poll_after: 6, opened: true, temporary: false, expires_at: "2026-10-25T18:20:00Z" })
+            m.assertEqual(loop.delivered.p1.body, { status: "pending", opened: true, pollAfter: 6, expiresAt: "2026-10-25T18:20:00Z", account: "" })
+            tests.sessions.send(loop, { requestId: "p2", session: "devicePoll" })
+            tests.sessions.respond(loop, "p2", 200, m.approved())
+            m.assertEqual(loop.delivered.p2.body.status, "approved")
+            m.assertEqual(loop.delivered.p2.body.account, "sam")
+            m.assertFalse(FormatJson(loop.delivered.p2).Instr("cacc") >= 0)
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual(view.status, "signed_in")
+            m.assertEqual(view.accountId, "7")
+            m.assertEqual(loop.session.saved.accessToken, "cacc")
+            m.assertEqual(m.withdrawn(loop), [], "an approved code is not withdrawn")
+        end sub
+
+        @it("refuses a temporary approval, which is a handoff's")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "p1", session: "devicePoll" })
+            body = m.approved()
+            body.temporary = true
+            tests.sessions.respond(loop, "p1", 200, body)
+            m.assertEqual(loop.delivered.p1.body.status, "invalid")
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "signed_out")
+        end sub
+
+        @it("forgets a denied code and polls it no more")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "p1", session: "devicePoll" })
+            tests.sessions.respond(loop, "p1", 200, { status: "denied", poll_after: 0, temporary: false })
+            m.assertEqual(loop.delivered.p1.body.status, "denied")
+            tests.sessions.send(loop, { requestId: "p2", session: "devicePoll" })
+            m.assertEqual(loop.delivered.p2.error.kind, "handoff_gone")
+        end sub
+
+        @describe("ending it")
+
+        @it("withdraws the code when the screen leaves")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "x1", session: "deviceCancel" })
+            m.assertTrue(loop.delivered.x1.ok)
+            m.assertEqual(m.withdrawn(loop), ["dev-secret"])
+        end sub
+
+        @it("withdraws the code when a password sign-in installs first, as tvOS's does")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "pw" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("login_ok"))
+            m.assertEqual(m.withdrawn(loop), ["dev-secret"])
+            tests.sessions.send(loop, { requestId: "p1", session: "devicePoll" })
+            m.assertEqual(loop.delivered.p1.error.kind, "handoff_gone")
+        end sub
+
+        @it("withdraws the code at its own server after a server change cancels every request")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            m.begun(loop)
+            tests.sessions.send(loop, { requestId: "s1", session: "server", address: "https://other.example" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, tests.sessions.systemInfo("https://other.example"))
+            m.assertEqual(m.withdrawn(loop), ["dev-secret"])
+            id = tests.sessions.runningId(loop, "/api/v2/auth/device/cancel")
+            m.assertEqual(loop.running[id].request.url, "https://silo.example/api/v2/auth/device/cancel")
+            m.assertNotInvalid(loop.running[id].headers)
+        end sub
+
+        @it("withdraws a code an ended attempt started")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "d1", session: "deviceStart", deviceName: "Living Room" })
+            tests.sessions.send(loop, { requestId: "x1", session: "deviceCancel" })
+            tests.sessions.respond(loop, "d1", 201, m.started())
+            m.assertEqual(loop.delivered.d1.error.kind, "handoff_gone")
+            m.assertEqual(m.withdrawn(loop), ["dev-secret"])
+        end sub
+    end class
+end namespace

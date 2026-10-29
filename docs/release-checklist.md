@@ -2,7 +2,7 @@
 
 **Status:** Draft for Milestone 4 (beta and public readiness)
 
-**Last updated:** 2026-10-25 (section 1 items 1 and 2, rows 2.2 and 4.15, and section 7's device, token-refresh, and API-restart rows; other rows still as of 2026-10-22, against integration commit `f1d9d9b`)
+**Last updated:** 2026-10-29 (row 2.2); 2026-10-25 (section 1 items 1 and 2, row 4.15, and section 7's device, token-refresh, and API-restart rows; other rows still as of 2026-10-22, against integration commit `f1d9d9b`)
 
 **Companion to:** [`spec.md`](spec.md) sections 10–13 and
 [`implementation-plan.md`](implementation-plan.md) sections 7, 9.1, and 9.2.
@@ -70,7 +70,7 @@ Source for every row: Roku certification criteria,
 | --- | --- | --- | --- | --- |
 | 1.1 | Video ads follow Roku's ad requirements | No ads | — | N/A |
 | 2.1 | Transactional apps use Roku Pay | Free, nothing for sale | — | N/A |
-| 2.2 | On-device authentication only; no off-device sign-up, sign-in, or activation | Password sign-in with Roku's `DynamicKeyboard` (spec 7.2). Companion sign-in (a phone approves a device login) ships in public builds by the owner's decision (spec 7.2), and profile handoff by D-7, both before Roku answers Q10. A server without password sign-in gets an explanation and stops | Hardware runs 4 and 5, onboarding rows | At risk, owner-accepted |
+| 2.2 | On-device authentication only; no off-device sign-up, sign-in, or activation | Sign-in leads with a QR code and a code approved at the server's /activate page, as on tvOS, with password sign-in (Roku's `DynamicKeyboard`) as the alternative, by the owner's decision of 2026-10-29 (spec 7.2). Companion sign-in (a phone approves a device login) and profile handoff (D-7) ship in every build too, all before Roku confirms them. A server with neither a code nor password sign-in gets an explanation and stops | Hardware runs 4 and 5, onboarding rows | At risk, owner-accepted |
 | 2.3 | Instant Signup for SVOD above 10M hours a month | Not SVOD | — | N/A |
 | 2.4 | No nested apps, browsers, embedded screens, or cross-app features | None. The typed server address is a separate question (section 1, item 5) | Code | Met, pending Roku's answer on the typed address |
 | 2.5 | Disclose any payment SDK | None | — | N/A |
