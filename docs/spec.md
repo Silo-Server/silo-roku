@@ -1652,7 +1652,7 @@ Subtitles tab (criterion 4.8).
   | `*` (Options) | Roku's caption and audio overlay: the `Video` node keeps focus (implementation plan section 6.10) | Open Options on Video on a Roku player that passes the key on; a Roku TV opens its own menu instead (section 5.9) |
   | Play/Pause | Toggle | Toggle; while a seek is pending, commit it and resume |
   | Replay | Skip back by the skip-back value clamped to 10–25 s (criterion 4.9) | Same |
-  | Rewind / Fast-forward | Start the rate ladder; each press steps up | Same |
+  | Rewind / Fast-forward | Show the controls on the scrubber and start the rate ladder; each press steps up | Start the rate ladder; each press steps up |
   | Back | See below | See below |
 
   Rapid skips merge into one seek 200 ms after the last. Holds are timed from
@@ -1669,10 +1669,12 @@ Subtitles tab (criterion 4.8).
   it; Up and Down do nothing meanwhile. The rate chip sits at the scrubber's
   right end, its top 62 px above the scrubber's centre line (tvOS's 34 pt
   over the scrubber's 56 pt box): a 36 px white capsule with a black glyph
-  and "2×" in 18 px Bold. A hold, or Rewind or Fast-forward, with the
-  controls hidden runs the ladder without them and shows tvOS's top-centre
-  indicator: the 480 px thumbnail at y 180, the direction, rate, and time
-  in a chip under it, a 520 px progress line, and the keys' hint.
+  and "2×" in 18 px Bold. Rewind and Fast-forward show the controls and
+  run the ladder on the scrubber, as a Left or Right press does (section
+  5.9). A hold of Left or Right with the controls hidden runs the ladder
+  without them and shows tvOS's top-centre indicator: the 480 px thumbnail
+  at y 180, the direction, rate, and time in a chip under it, a 520 px
+  progress line, and the keys' hint.
 - **Seek previews.** While the viewer scrubs, with Left/Right or at any
   rate-ladder speed, a 340 px card shows above the scrubber, centred on the
   scrub point and kept within the scrubber's ends. The card holds the
@@ -2179,6 +2181,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | One intro, credits, recap, and preview per file (Android TV) | Every `marker_segments` range, each skipped or drawn on its own | Section 9.8; the server's collection replaces the single markers |
 | The scrubber has rounded ends, a buffered range, chapter ticks, and one band, the intro's, in cyan | A square track with the played range, the chapter ticks, and the intro (tvOS's cyan), recap, and credits bands | Sections 5.7 and 9.8 name three bands; the ladder's 100 ms tick only moves `Rectangle`s |
 | A chapter row's number is 20 pt rounded SemiBold and its time 20 pt; the playing chapter's glyph is SF Symbols' `play.fill` | Both 22 px SemiBold, the setting value's style; the player's own play glyph, 18 px | Roku ships no rounded face, and the panel's existing styles keep the font set small (assumption AG-432) |
+| A seek session started with the controls hidden shows only the top-centre hold indicator | Only a held Left or Right does; Rewind and Fast-forward show the controls and scan on the scrubber, with the 340 px preview card over the scrub point | Testers read the indicator's 480 px thumbnail as small next to the scrubber that Left and Right bring up, and the transport keys are the Roku remote's usual way to scan |
 | Holding Left or Right on the focused scrubber starts a fixed-rate auto-seek; OK there commits a scrub and then toggles play/pause | The same 300 ms hold and rate ladder as with the controls hidden; OK commits, or toggles when nothing is pending | Section 5.7's key table; Roku documents no key repeats for a held key |
 | No Replay key | Replay skips back by the skip-back value clamped to 10–25 s, with "Instant replay" captions for the replayed span once its seek commits; a Replay that Back cancels, or whose merged seek lands past where it was pressed, shows none | Certification criteria 4.8 and 4.9 (implementation plan section 6.10) |
 | Scrub previews come from the server's sprite sheets or, without them, from frames the player cuts from the stream | The server's sheets only; a title without them shows the time and "Previews aren't available for this title" | Roku apps cannot read frames from the `Video` node |
