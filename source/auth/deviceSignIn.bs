@@ -18,7 +18,9 @@ import "pkg:/source/util/values.bs"
 '   { session: "devicePoll" }  polls the code once; answers { status,
 '       opened, pollAfter, expiresAt, account }. An approval installs the
 '       session as a password sign-in does; account is its username.
-'   { session: "deviceCancel" }  withdraws the code, best effort
+'   { session: "deviceCancel" }  withdraws the code, best effort, and
+'       answers once the withdrawal has (at once without a code), so a
+'       caller about to close the app can wait for it
 ' The device code and the tokens never leave this state but as request
 ' bodies to the configured origin; the user code and the verification URIs
 ' go to the render thread, which shows them. Each start and cancel begins a
@@ -125,24 +127,33 @@ namespace api.auth.coordinator
     end function
 
     function deviceCancel(state as Object, input as Object) as Object
-        decisions = [reply(succeeded(input, {}))]
-        decisions.Append(endDevice(state))
-        return decisions
+        ' The withdrawal answers the caller. Its owner stays "": a screen
+        ' that withdraws as it goes would otherwise cancel it.
+        withdrawals = endDevice(state, { requestId: input.requestId, owner: "" })
+        if withdrawals.Count() = 0 then return [reply(succeeded(input, {}))]
+        return withdrawals
     end function
 
     ' Ends the attempt, so an answer for it changes nothing, and withdraws
     ' its code. endSession calls this too: a password or companion sign-in
     ' withdraws the code on screen, as tvOS's does.
-    function endDevice(state as Object) as Object
+    function endDevice(state as Object, input = { owner: "" } as Object) as Object
         device = state.device
         state.device = invalid
         state.deviceAttempt += 1
         if device = invalid or device.deviceCode = "" then return []
-        return [deviceWithdraw(state, device.origin, device.deviceCode)]
+        return [deviceWithdraw(state, device.origin, device.deviceCode, input)]
     end function
 
-    function deviceWithdraw(state as Object, origin as String, deviceCode as String) as Object
-        return submit(build(state, { owner: "" }, { method: "POST", url: origin + DEVICE_CANCEL_PATH, body: { device_code: deviceCode }, timeoutMs: DEVICE_TIMEOUT_MS }, { kind: "deviceCancel", origin: origin }))
+    function deviceWithdraw(state as Object, origin as String, deviceCode as String, input = { owner: "" } as Object) as Object
+        return submit(build(state, input, { method: "POST", url: origin + DEVICE_CANCEL_PATH, body: { device_code: deviceCode }, timeoutMs: DEVICE_TIMEOUT_MS }, { kind: "deviceCancel", origin: origin, caller: nonEmpty(input.requestId) }))
+    end function
+
+    ' A withdrawal ended, answered or not: a deviceCancel waiting for it
+    ' answers now.
+    function deviceWithdrawn(request as Object, op as Object) as Object
+        if op.caller <> true then return []
+        return [reply(succeeded(request, {}))]
     end function
 
     ' The companion attempt and the code on screen, which a session change

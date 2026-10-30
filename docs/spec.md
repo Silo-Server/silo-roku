@@ -2656,7 +2656,10 @@ server's 404, goes on:
    whose phone confirms this code ([`companion-pairing.md`](companion-pairing.md)
    section 5). A password sign-in stops the polling while it
    runs and withdraws the code when it succeeds; leaving the screen, Change
-   server, or a new code withdraws the one before (`/cancel`). An approval
+   server, or a new code withdraws the one before (`/cancel`). Back that
+   closes the app from this screen withdraws the code too, and the app
+   closes once the withdrawal answers or after 2 seconds: Roku tells an
+   app nothing as it closes. An approval
    installs the session as a password sign-in does. When `password_login`
    is false and there is no code, the server offers only browser sign-in,
    which Roku does not allow: the client explains that the server
