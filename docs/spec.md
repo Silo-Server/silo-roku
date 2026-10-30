@@ -2099,7 +2099,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The pairing screens have no exit command; their buttons end them | Back denies at consent, closes a failure, and cancels the other steps | Back returns from every screen on Roku (criterion 4.6) |
 | The TV's remote-control standby screen takes over while a phone is connected | No Connect a Phone entry is exposed in the avatar menu; the pairing route remains implemented. A phone connecting shows "<phone> connected" for four seconds and nothing else changes | The avatar menu omits the pairing entry for the first release. Roku apps cannot be opened by a phone (no ECP from phone apps), so there is nothing to stand by for; `docs/silocontrol.md` section 4 (every build since decision D-7) |
 | A phone's profile handoff shows a "Playing as" card for six seconds | The player's notice card says "Playing as <profile> · From <phone>" for four seconds | The notice card is the player's one non-focusable card; `docs/silocontrol.md` section 4.2 |
-| The sign-in screens offer phone sign-in over TLS (`_silopair._tcp`), and a phone on the sign-in screen approves the code it already shows | A phone push opens the Companion screen over the server or sign-in screen, drawn as tvOS's pairing screens (chip, copy, and card for each stage), which starts its own device login for the phone; the service is `_silopair-roku._tcp` over plain TCP | Roku has no TLS on listening sockets; `docs/companion-pairing.md` |
+| The sign-in screens offer phone sign-in over TLS (`_silopair._tcp`), and a phone on the sign-in screen approves the code it already shows | A phone push opens the Companion screen over the server or sign-in screen, drawn as tvOS's pairing screens (chip, copy, and card for each stage); on the sign-in screen it shows the code that screen polls, as tvOS does; the service is `_silopair-roku._tcp` over plain TCP | Roku has no TLS on listening sockets; `docs/companion-pairing.md` |
 | A phone's setup ends on "You're all set" with Continue, which moves on after a short dwell | "Signed in", then the profiles once the phone says done or three seconds pass | The receiver stops after the sign-in (`docs/companion-pairing.md` section 5) |
 | Calendar shows all seven days, an empty one titled at reduced opacity over "Nothing scheduled" | Only days with events have a row; the week strip's dots mark them, and the audio guide says "Nothing scheduled" on a day without | A `RowList` row needs a focusable item, and a placeholder card would take focus for nothing |
 | An empty Calendar week offers the other two filters as buttons | The message alone; the filter is two presses up | The empty state has one button (section 5.8), and either filter is already on screen |
@@ -2631,7 +2631,9 @@ server's 404, goes on:
    then the screen pauses until Show a new code; failures back off from the
    interval to 30 s, and a streak of 10 s (getting a code) or 30 s
    (polling) shows "Can't reach", 60 s of 429s "Too many sign-in attempts",
-   while retrying goes on. A password sign-in stops the polling while it
+   while retrying goes on. The code goes on under the Companion screen,
+   whose phone confirms this code ([`companion-pairing.md`](companion-pairing.md)
+   section 5). A password sign-in stops the polling while it
    runs and withdraws the code when it succeeds; leaving the screen, Change
    server, or a new code withdraws the one before (`/cancel`). An approval
    installs the session as a password sign-in does. When `password_login`

@@ -4,6 +4,8 @@ import "pkg:/source/nav/client.bs"
 import "pkg:/source/onboarding/address.bs"
 import "pkg:/source/onboarding/deviceCode.bs"
 import "pkg:/source/onboarding/signin.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/platform/topics.bs"
 
 ' tvOS's gaps: the server card 44 px above the headline; on the code
 ' screen the lead 26 px under the headline, the nearby hint 24 px under it
@@ -141,17 +143,28 @@ sub resetCode()
     m.restartPending = false
     m.passwordPending = false
     m.visible = true
+    ' The status before the first change drawn while covered (setStatus).
+    m.unshownStatus = invalid
     m.lastTypedUrl = ""
 end sub
 
 sub onShow(event as Object)
     m.visible = true
+    if m.unshownStatus <> invalid
+        previous = m.unshownStatus
+        m.unshownStatus = invalid
+        if m.stage = "code" and m.state = "ready" then showStatus(previous, true)
+    end if
     if event.first
         m.host = onboarding.address.hostOf(sessionOrigin())
         showServer(m.server)
         showExpired()
         askName()
         checkSetup()
+        #if companion
+            ' AppScene unsubscribes the screen's owner when it goes.
+            platform.subscribe(m.top.owner, [platform.topic.COMPANION_STATUS], "onCompanionStatus")
+        #end if
     else if m.restartOnShow
         ' Back from Change server on the same server: a new code, as the
         ' one before was withdrawn when Change server opened.
@@ -167,17 +180,16 @@ sub onShow(event as Object)
     focusScreen()
 end sub
 
-' Another screen, such as the Companion screen, covers this one: a password
-' sign-in, or one waiting to be sent, stops, so no password signs in from
-' under that screen, and the code stops polling until the screen is on top
-' again. A poll already in flight still answers: a code someone approved
-' signs this Roku in, as on tvOS, and the first sign-in to finish keeps the
-' session (spec section 7.2), ending the phone's attempt. system/setup,
-' auth/providers, and the capability go on; their navigation waits until
-' this screen is on top again (AppSceneNav.bs navHeld).
+' The Companion screen covers this one: a password sign-in, or one waiting
+' to be sent, stops, so no password signs in from under that screen. The
+' code goes on as tvOS's does under its receiver: the phone confirms this
+' code (AppSceneCompanion.bs), so a browser's approval or the phone's,
+' whichever comes first, signs this Roku in. Its changes are drawn and said
+' once the screen is on top again. system/setup, auth/providers, and the
+' capability go on; their navigation waits until this screen is on top
+' again (AppSceneNav.bs navHeld).
 sub onHide()
     m.visible = false
-    m.codeTimer.control = "stop"
     ' A password waiting for the poll in flight stops too: nothing signs in
     ' from under another screen.
     if m.passwordPending
@@ -195,7 +207,37 @@ sub onRelease()
     m.top.prompting = false
     m.password = ""
     stopCode()
+    reportCode(false)
     m.qr.callFunc("release")
+end sub
+
+' The code for a phone on this screen to confirm (docs/companion-pairing.md
+' section 5): AppScene's receiver sends it to the phone and follows it, as
+' tvOS lends its QRLoginViewModel's code. present is false once the screen
+' goes. The device code stays in the auth coordinator.
+sub reportCode(present = true as Boolean)
+    #if companion
+        code = invalid
+        if present
+            code = { status: m.codeStatus, userCode: "", matchCode: "" }
+            if m.code <> invalid
+                code.userCode = util.text(m.code.userCode)
+                code.matchCode = util.text(m.code.matchCode)
+            end if
+        end if
+        m.top.getScene().callFunc("companionCode", code)
+    #end if
+end sub
+
+' A phone's sign-in on this screen asks for the code: one that ended
+' (paused, declined, or approved but unusable) is replaced, as tvOS's
+' restartsForNearbyPhone does, since someone is at the TV.
+sub onCompanionStatus(event as Object)
+    status = event.status
+    if not util.isObject(status) or not util.isTrue(status.signIn) or util.text(status.stage) <> "preparing" then return
+    if not m.codeOffered or m.state <> "ready" then return
+    restart = m.codeStatus = onboarding.deviceCode.PAUSED or m.codeStatus = onboarding.deviceCode.DENIED or m.codeStatus = onboarding.deviceCode.COULD_NOT_FINISH
+    if restart then retryCode()
 end sub
 
 ' ---- What the server offers
@@ -783,8 +825,7 @@ sub stopCode()
 end sub
 
 sub startCode()
-    ' Covered (the Companion screen): onShow starts it.
-    if not m.codeLoop or m.passwordHold or not m.visible then return
+    if not m.codeLoop or m.passwordHold then return
     m.polledPastDeadline = false
     if m.codeStatus = onboarding.deviceCode.WAITING or m.codeStatus = onboarding.deviceCode.OPENED then setStatus(onboarding.deviceCode.GETTING_CODE)
     m.sentAtMs = m.clock.TotalMilliseconds()
@@ -811,7 +852,7 @@ sub onCodeStarted(event as Object)
         setStatus(onboarding.deviceCode.WAITING)
         ' The audio guide reads the code character by character, as tvOS's
         ' QR code label does; this replaces the status line just said.
-        speak(i18n.text("signIn.code.qrAudio", { page: typedUrlOrDefault(), code: spelledCode(m.code.userCode) }), false)
+        if m.visible then speak(i18n.text("signIn.code.qrAudio", { page: typedUrlOrDefault(), code: spelledCode(m.code.userCode) }), false)
         ' The first poll goes at once, as tvOS's does.
         scheduleCode(0)
     else if outcome = onboarding.deviceCode.RATE_LIMITED or outcome = onboarding.deviceCode.TRANSIENT
@@ -897,9 +938,6 @@ sub renewCode()
         return
     end if
     m.renewed = true
-    ' Covered (the Companion screen): the new code waits until the screen
-    ' is on top again (onShow).
-    if not m.visible then return
     startCode()
 end sub
 
@@ -941,10 +979,9 @@ function recordFailure(rateLimited as Boolean, threshold as Integer) as Integer
     return m.backoff
 end function
 
-' Starts or polls after seconds, while the screen is on top.
+' Starts or polls after seconds.
 sub scheduleCode(seconds as Integer)
     m.codeTimer.control = "stop"
-    if not m.visible then return
     if seconds <= 0
         m.codeTimer.duration = POLL_NOW_MS / 1000
     else
@@ -965,13 +1002,27 @@ end sub
 sub setStatus(status as String)
     previous = m.codeStatus
     m.codeStatus = status
+    reportCode()
     if m.stage <> "code" or m.state <> "ready" then return
+    ' Covered (the Companion screen): drawn, highlighted, and said once the
+    ' screen is on top again (onShow).
+    if not m.visible
+        if m.unshownStatus = invalid then m.unshownStatus = previous
+        return
+    end if
+    showStatus(previous, false)
+end sub
+
+' Draws the code's status after previous; rows is true when the button row
+' is laid out again whatever changed.
+sub showStatus(previous as String, rows as Boolean)
+    status = m.codeStatus
     hadAction = m.stateAction.visible
     focused = highlightedControl()
     refresh()
-    if previous = status then return
-    takesFocus = onboarding.deviceCode.actionTakesFocus(status) and m.stateAction.visible
-    if hadAction <> m.stateAction.visible or takesFocus
+    if previous = status and not rows then return
+    takesFocus = previous <> status and onboarding.deviceCode.actionTakesFocus(status) and m.stateAction.visible
+    if rows or hadAction <> m.stateAction.visible or takesFocus
         ' The row changed: keep the highlight where it was, unless the
         ' state's action takes it (tvOS actionTakesFocus) or its control
         ' went.
@@ -984,6 +1035,7 @@ sub setStatus(status as String)
             highlightControl(defaultCodeControl())
         end if
     end if
+    if previous = status then return
     line = onboarding.deviceCode.statusLine(status, m.renewed, m.account, m.host)
     if line <> invalid then speak(i18n.text(line.key, line.values), false)
 end sub

@@ -4,6 +4,7 @@ import "pkg:/source/control/pairing.bs"
 import "pkg:/source/nav/routes.bs"
 import "pkg:/source/nav/stack.bs"
 import "pkg:/source/onboarding/address.bs"
+import "pkg:/source/onboarding/deviceCode.bs"
 import "pkg:/source/platform/topics.bs"
 import "pkg:/source/util/i18n.bs"
 import "pkg:/source/util/log.bs"
@@ -15,9 +16,10 @@ import "pkg:/source/util/values.bs"
 ' server, and this file runs the attempt: the Roku's consent, the server
 ' and identity checks, the device login whose code the Companion screen
 ' shows, and the polls, through the auth coordinator's companion
-' operations (source/auth/companion.bs). The session a sign-in installs
-' moves the app on to the profile picker. Built only with bs_const
-' companion.
+' operations (source/auth/companion.bs). On the sign-in screen there is no
+' second login: the phone confirms the code that screen shows and polls
+' (companionCode), as on tvOS. The session a sign-in installs moves the app
+' on to the profile picker. Built only with bs_const companion.
 
 const COMPANION_OWNER = "companion"
 ' Section 4: a phone that sends nothing this long, with no attempt in
@@ -26,9 +28,12 @@ const COMPANION_IDLE_SECONDS = 180
 ' Section 5 step 5: after a sign-in the receiver waits this long for the
 ' phone's done before it stops.
 const COMPANION_FINISH_SECONDS = 3
+' Section 5 step 3: how long a phone on the sign-in screen waits for that
+' screen's code (tvOS's nearbyCodeWait).
+const COMPANION_CODE_WAIT_SECONDS = 15
 
 sub companionInit()
-    m.companion = { task: invalid, taskReady: false, queued: [], retiring: [], mode: "", serverIdentity: "", identityOrigin: "", identityHandle: invalid, sid: "", phone: "", consented: false, push: invalid, stage: "idle", alternate: invalid, probing: [], userCode: "", matchCode: "", failure: "", help: "", handle: invalid, requestOpen: false, clock: CreateObject("roTimespan"), deadline: 0, interval: 5, signedIn: false, finishing: false }
+    m.companion = { task: invalid, taskReady: false, queued: [], retiring: [], mode: "", serverIdentity: "", identityOrigin: "", identityHandle: invalid, sid: "", phone: "", consented: false, push: invalid, stage: "idle", alternate: invalid, probing: [], userCode: "", matchCode: "", screenCode: invalid, failure: "", help: "", handle: invalid, requestOpen: false, clock: CreateObject("roTimespan"), deadline: 0, interval: 5, signedIn: false, finishing: false }
     m.companionPollTimer = m.top.findNode("companionPollTimer")
     m.companionIdleTimer = m.top.findNode("companionIdleTimer")
     m.companionFinishTimer = m.top.findNode("companionFinishTimer")
@@ -55,11 +60,11 @@ function companionWanted() as String
     view = m.apiSession
     if view = invalid or util.text(view.deviceId) = "" then return ""
     if m.companion.finishing then return m.companion.mode
-    ' An approval publishes its session before the poll that collected it
-    ' answers: a poll in flight keeps the receiver until its answer arrives,
-    ' so the phone hears signedIn rather than a cancel. Any other session
-    ' change (a password sign-in first) ended the attempt in the
-    ' coordinator, and that poll answers handoff_gone.
+    ' Setup: an approval publishes its session before the poll that
+    ' collected it answers: a poll in flight keeps the receiver until its
+    ' answer arrives, so the phone hears signedIn rather than a cancel. Any
+    ' other session change ended the attempt in the coordinator, and that
+    ' poll answers handoff_gone.
     if m.companion.stage = "code" and m.companion.requestOpen and m.companion.handle <> invalid then return m.companion.mode
     return companionScreenMode()
 end function
@@ -307,11 +312,11 @@ sub companionPush(server as Dynamic)
 end sub
 
 ' Checks the pushed server (step 2): at the pushed address on the server
-' screen; on the sign-in screen, only the Roku's own server, by identity.
+' screen; on the sign-in screen, only the Roku's own server, by identity,
+' and the phone then confirms that screen's code (step 3).
 sub companionBegin()
     push = m.companion.push
     if push = invalid then return
-    address = push.url
     if m.companion.mode = "login"
         if push.identity = ""
             companionFail("update_required")
@@ -321,12 +326,79 @@ sub companionBegin()
             companionFail("identity_mismatch")
             return
         end if
-        address = m.apiSession.origin
+        ' tvOS's preparingCode. The sign-in screen replaces a code that
+        ' ended when it hears this (SignInScreen onCompanionStatus).
+        m.companion.stage = "preparing"
+        m.companion.userCode = ""
+        m.companion.matchCode = ""
+        companionShowScreen()
+        companionRestartTimer(m.companionPollTimer, COMPANION_CODE_WAIT_SECONDS)
+        companionRelay()
+        return
     end if
     m.companion.stage = "reaching"
     companionShowScreen()
-    companionRequest({ session: "companionServer", address: address, identity: push.identity }, "onCompanionServer")
+    companionRequest({ session: "companionServer", address: push.url, identity: push.identity }, "onCompanionServer")
 end sub
+
+' The sign-in screen's code on each change (SignInScreen reportCode), or
+' invalid once that screen goes.
+sub companionCode(code as Dynamic)
+    m.companion.screenCode = code
+    #if companion
+        companionRelay()
+    #end if
+end sub
+
+' On the sign-in screen, the attempt follows that screen's code: the phone
+' gets it once the screen has one, and the outcome is the code's.
+sub companionRelay()
+    stage = m.companion.stage
+    if m.companion.mode <> "login" or (stage <> "preparing" and stage <> "code") then return
+    ' Signed in while the phone had the code: the screen's poll collected
+    ' its approval, the phone's or a browser's. The session can arrive
+    ' before the screen hears that poll's answer, and the screen goes with
+    ' it.
+    if stage = "code" and util.text(m.apiSession.status) = "signed_in"
+        companionSignedIn()
+        return
+    end if
+    code = m.companion.screenCode
+    ' The screen went without a sign-in: companionRefresh settles the
+    ' receiver.
+    if code = invalid then return
+    status = util.text(code.status)
+    if status = onboarding.deviceCode.APPROVED and stage = "code"
+        companionSignedIn()
+        return
+    end if
+    if onboarding.deviceCode.isTerminal(status)
+        companionFail(companionCodeFailure(status))
+        return
+    end if
+    if stage = "code"
+        ' The code the phone has, still pending (perhaps unreachable a
+        ' while), or gone: renewed or being replaced.
+        if util.text(code.userCode) <> m.companion.userCode then companionFail("expired")
+        return
+    end if
+    ' Still getting a code: the poll timer bounds the wait (onCompanionPoll).
+    if code.userCode = "" or (status <> onboarding.deviceCode.WAITING and status <> onboarding.deviceCode.OPENED) then return
+    m.companionPollTimer.control = "stop"
+    m.companion.userCode = code.userCode
+    m.companion.matchCode = util.text(code.matchCode)
+    m.companion.stage = "code"
+    companionSend(silocontrol.pairing.deviceStarted(m.companion.push.url, m.companion.userCode, m.companion.matchCode))
+    companionPublish()
+end sub
+
+' The phone's error for a code that ended (section 4), as tvOS's
+' nearbyOutcome maps it.
+function companionCodeFailure(status as String) as String
+    if status = onboarding.deviceCode.DENIED then return "denied"
+    if status = onboarding.deviceCode.COULD_NOT_FINISH then return "auth_failed"
+    return "expired"
+end function
 
 ' One coordinator operation at a time; a newer one, or abandoning the
 ' attempt, drops the answer of the one before.
@@ -443,8 +515,13 @@ sub companionSchedulePoll(seconds as Integer)
     companionRestartTimer(m.companionPollTimer, seconds)
 end sub
 
-' Step 4.
+' Step 4. On the sign-in screen the timer bounds the wait for that
+' screen's code instead.
 sub onCompanionPoll()
+    if m.companion.mode = "login"
+        if m.companion.stage = "preparing" then companionFail("expired")
+        return
+    end if
     if m.companion.stage <> "code" or not m.companion.requestOpen then return
     if m.companion.clock.TotalMilliseconds() > m.companion.deadline
         companionFail("expired")
@@ -458,10 +535,10 @@ sub onCompanionPolled(event as Object)
     if result = invalid then return
     status = ""
     if result.ok = true then status = util.text(result.body.status)
-    ' A poll that kept the receiver after its screen went with the session
-    ' (a password sign-in first): only its own approval still counts. Any
-    ' other answer, even one the server gave before that sign-in, stops
-    ' the receiver without showing it.
+    ' A poll that kept the receiver after its screen went with the
+    ' session: only its own approval still counts. Any other answer, even
+    ' one the server gave before that session changed, stops the receiver
+    ' without showing it.
     if status <> "approved" and companionScreenMode() <> m.companion.mode
         m.companion.requestOpen = false
         companionRefresh()
@@ -498,6 +575,7 @@ end sub
 ' Step 5: the session is installed; the phone hears so, and the receiver
 ' stops after the phone's done or COMPANION_FINISH_SECONDS.
 sub companionSignedIn()
+    if m.companion.signedIn then return
     m.companion.signedIn = true
     m.companion.finishing = true
     m.companion.stage = "signedIn"
@@ -526,7 +604,8 @@ end sub
 
 ' Stops the attempt in flight and withdraws a device request it opened
 ' (step 6). An operation still in flight ends with the attempt too: the
-' coordinator withdraws a request a pending start opens.
+' coordinator withdraws a request a pending start opens. The sign-in
+' screen's code is that screen's, and stays.
 sub companionAbandon()
     inFlight = m.companion.handle <> invalid
     companionDropHandle()
