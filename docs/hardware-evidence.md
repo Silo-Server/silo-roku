@@ -2334,21 +2334,33 @@ subtitle issue. Assumptions AG-643 and AG-644 follow from it.
 ## 2026-10-30 instant subtitles end to end (TCL, OS 15.3.4)
 
 2026-10-30, the TCL 55R625 Roku TV on Roku OS 15.3.4, this app with the
-native route, signed in to a lab sandbox built from the stacked
-silo-server branches through the header probe's lab relay.
-Media: the release fixtures and the sandbox's library. The start requests
-carried `embedded_subtitles_v1` and the `native_embedded` entry with its
-three limitations, which the app sent because the server advertised
-`native_embedded_limitations_v1`. Screenshots and the console stay in the
-tester's private evidence folder. Assumptions AG-643 and AG-644.
+sidecar retry, the native route, and every track as a rendition, signed in
+to a lab sandbox built from the stacked silo-server branches through
+the header probe's lab relay. Media: the release fixtures and the sandbox's
+library. The start requests carried `embedded_subtitles_v1`, the
+`native_embedded` entry with its three limitations, and
+`hls_subtitle_renditions_all_v1`, which the app sent because the server
+advertised `native_embedded_limitations_v1` and
+`hls_subtitle_renditions_all_v1`. Screenshots and the console stay in the
+tester's private evidence folder. Assumptions AG-643 to AG-645.
 
 | Test | Date | Device / OS | Sink | File class | Harness settings | Result | Observed facts |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | T1 native SRT (AG-643) | 2026-10-30 | 55R625 / 15.3.4 | TV | FX-003, MKV with one English SRT, `original_http` | English picked on Detail | PASS | A direct plan; no subtitle request and no extraction on the server; Roku drew the MKV's own cues. The first native drawing on OS 15.3.4 (the spike ran on 16.0.4). |
 | T2 a file Roku would override (AG-644) | 2026-10-30 | 55R625 / 15.3.4 | TV | FX-026, MKV with a default-flagged Forced English track, a full English SRT, and PGS; English audio | the full English track picked | PASS | Not planned native (`hidden_track_preemption`): direct play with a sidecar. The server read the full track through the Matroska Cues index in 1.9 s (1,996 reads, 4.2 MB), kept it, and served it in 1.95 s; the forced track in 0.5 s. Roku drew the full track's dialogue, not the Forced track. |
+| T3 every track as a rendition, copy remux (AG-645) | 2026-10-30 | 55R625 / 15.3.4 | TV | FX-021, MKV 1080p with DTS (`server_remux_hls`), 22 SRT tracks | English | PASS | The multivariant playlist listed all 22 SRT tracks in group `subs` with BCP 47 languages and `DEFAULT=YES` on English. The VOD playlist listed all 3,482 segments up front; subtitle segments were served on demand in about 3 ms with correctly timed cues, and Roku drew them. |
+| T3b an in-place switch on that remux (AG-645) | 2026-10-30 | 55R625 / 15.3.4 | TV | FX-021, as T3 | Options Subtitles: English to a commentary track | PASS | The server reused the running HLS transport (the same session, no new FFmpeg) and answered the replan in 25 ms; the commentary's cues drew within about 2 s. |
+| T4 a transcode started with subtitles Off (AG-645) | 2026-10-30 | 55R625 / 15.3.4 | TV | a library episode transcoded under a bandwidth limit | subtitles Off at start, then a Chinese ASS track in Options | PASS | Renditions listed, all `AUTOSELECT=YES`, and Roku drew nothing while Off. Turning the Chinese track on in place reused the transport and drew its text. |
 
 - Not covered: an in-place switch between two `mkv/N` tracks. After an early
   quality lowering on the relay path (about 6 Mbps), every later start was
   planned as a 720p transcode, as the app keeps the estimate across launches.
   The switch itself was proven in the 2026-10-29 spike and is unit-tested.
-  The sidecar retry (AG-642) was not provoked: every sidecar came within 2 s.
+  The sidecar retry (AG-642) was not provoked: every sidecar came within 2 s. The run's notes
+  do not record the rendition naming line, so how Roku numbers several
+  renditions is still unconfirmed.
+- Rendition names read "SUBRIP", "SUBRIP (2)", and so on for fixtures whose
+  tracks are titled "SUBRIP": `NAME` takes the track's title (server side,
+  cosmetic).
+- Roku's "frequent buffering" dialog after a skip ahead on the remux came from
+  the lab's network path, not subtitles.

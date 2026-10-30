@@ -578,9 +578,9 @@ passthrough, client transformations.
 
 **Client features:** `seek_reanchor_v1`, `direct_stream_resume_v1`,
 `subrip_sidecar_v1`, and `hls_subtitle_renditions_v1`, plus
-`hls_remux_subtitle_renditions_v1` and, for `native_embedded_limitations_v1`,
-`embedded_subtitles_v1`, each when the capabilities `features` list it
-(assumption AG-643). Not
+`hls_remux_subtitle_renditions_v1`, `hls_subtitle_renditions_all_v1`, and,
+for `native_embedded_limitations_v1`, `embedded_subtitles_v1`, each when the
+capabilities `features` list it (assumptions AG-643 and AG-645). Not
 `header_authenticated_media_v1` or `authorized_media_origins_v1`: the client
 uses signed-URL media mode so plans can use proxy nodes (decision D-1, section
 6.4). Never `plan_invalidated_v1` (it needs the realtime socket; when the server's
@@ -793,7 +793,8 @@ every build sends the request below (spec section 9.7).
   server advertises `native_embedded_limitations_v1`, `embedded_subtitles_v1`
   and `original_http`'s one `native_embedded` entry (MKV SubRip by
   `container_track_id`, with Roku's limitations; assumptions AG-643 and
-  AG-644).
+  AG-644); and `hls_subtitle_renditions_all_v1` when the server advertises
+  it (assumption AG-645).
 - **What arrives:** original SRT for external and downloaded SRT tracks; a WebVTT
   rendition inside the HLS stream for embedded text on a transcode (already
   `DEFAULT=YES`, no `LANGUAGE`), and on a copy remux from a server that
@@ -803,7 +804,9 @@ every build sends the request below (spec section 9.7).
   original that the server plans native arrives as nothing: Roku draws the
   file's own track, `mkv/<container_track_id>`, selected by the content's
   `SubtitleConfig` and switched in place by `Video.subtitleTrack` (spec
-  section 9.7).
+  section 9.7). With `hls_subtitle_renditions_all_v1`, every embedded text
+  track the server can index is a WebVTT rendition of an HLS plan's stream,
+  switched in place, Off included, by the name Roku lists for it.
 - **Timing:** for `.vtt`, the client requests the protocol's
   `timestamp_offset=-{timeline_offset_seconds}` (the negative of the video timeline
   offset), and the server shifts and clips the cues. Original `.srt` and raw `.ass`

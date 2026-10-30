@@ -3438,11 +3438,13 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   An audio change is matched to the version's track in its language,
   narrowed by codec when the language has several; a subtitle change is
   matched by the sidecar the player gave Roku, or, for an MKV original's
-  own track, by its `container_track_id` (below). A match to one inventory
+  own track, by its `container_track_id`, and for an HLS rendition by the
+  name Roku lists for it (below). A match to one inventory
   track becomes a `track_change`; anything else is written back. A
   subtitle change Roku reports from the content's first frame until it
-  settles 3 seconds later is Roku's own pick, never a `track_change`; the
-  check once the content settles sees to it.
+  settles 3 seconds later is Roku's own pick (an `AUTOSELECT` rendition,
+  say), never a `track_change`; the check once the content settles sees to
+  it.
 - A newly returned plan replaces the entire previous track and subtitle state.
 - Roku reads a content's subtitle tracks when the content loads. So the Roku
   client loads up to four text sidecars with each content, the plan's
@@ -3669,6 +3671,42 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   in place when the content plays it natively, else a reload, and Roku
   draws its own copy until the plan arrives; one no row names is written
   back.
+- Against a server that advertises `hls_subtitle_renditions_all_v1`, and
+  only then, every start and replan sends that client feature too (beside
+  `hls_subtitle_renditions_v1`, which every request sends, and
+  `hls_remux_subtitle_renditions_v1` when the server advertises it, which a
+  copy remux needs). The server then lists every embedded text track it
+  can index as a WebVTT rendition of an HLS plan's stream, in one group in
+  inventory order, `DEFAULT=YES` only on the selected one and none under
+  Off, and gives each listed row an `hls_rendition` with its `NAME` and its
+  1-based `index` in the group; a `track_change` among them, or to Off,
+  gets a plan for the same media, which keeps the stream, its URL, and its
+  generation (instant-subtitles contract C3; assumption AG-645). Those
+  rows are tracks of the content, like an MKV's own, and download nothing.
+  Roku names a stream's WebVTT renditions `webvtt/<n>`; how it numbers
+  several is not yet seen on a device, so the client takes each row's
+  name from Roku's list by `Description` = `NAME` first, then
+  `webvtt/<index>` only when Roku lists that track in the row's language
+  (its primary subtag), so that a numbering of Roku's own cannot put
+  another language on the plan's track, and logs `Roku's names for the
+  stream's subtitle renditions` with how each matched. A rendition matched
+  neither way has no name: the client writes nothing for it, the check
+  once the content settles included, switches to it only by a reload, and
+  leaves the plan's own to the playlist's `DEFAULT`. The content starts on the playlist's
+  `DEFAULT`, with no `subtitleTrack` written at load or at Roku's listing;
+  once it settles the client checks the plan's rendition as it checks a
+  sidecar and selects it by that name if Roku shows another, as after a
+  reload of a plan switched in place, whose playlist still names the first
+  track. A switch in place writes `Video.subtitleTrack` to the listed name.
+  Off stays `suppressCaptions`: every rendition is `AUTOSELECT=YES`, and
+  Roku would otherwise show one by the caption language, so a start with
+  subtitles Off under caption mode On draws nothing. Content with a
+  rendition selected carries the other sidecars only while captions are
+  Off, as content without a subtitle does, since until the client selects
+  the rendition Roku could show a sidecar by the caption language. A
+  `webvtt/<n>` picked in Roku's `*` overlay is a `track_change` for its
+  row, in place when the content lists it, else by its place in the group
+  and a reload.
 - A subtitle Search Subtitles downloads (section 5.7) reaches playback only
   through a plan, never through a URL the client builds (tvOS synthesizes
   the session's stream URL for it). The server announces no provider
@@ -3930,7 +3968,7 @@ Subtitle sources:
 | External or downloaded SRT | The original file (`subrip_sidecar_v1`), downloaded to `tmp:/` with its cues moved onto the plan's timeline and their ASS override tags (`{\an8}`) removed, shown as a Roku SRT track | All | Roku TV: runs 1, 4, 6 (T3), 7 (T1d); tag removal headless only |
 | Embedded SubRip in an MKV original, against a server that advertises `native_embedded_limitations_v1` and plans it native | Roku's own copy of the track, `mkv/<container_track_id>`, selected by the content's `SubtitleConfig` before the first frame and switched in place by `Video.subtitleTrack`; nothing downloads. The server keeps Forced tracks, files whose hidden track Roku would draw instead, and tracks with ASS override tags on the row below (section 9.7; assumptions AG-643, AG-644) | All | Ultra: the 2026-10-29 native embedded spike, with a throwaway channel. Roku TV: the 2026-10-30 end-to-end run in this app (a native start; a Forced-track file as a sidecar); in-place native switching not yet run in this app |
 | Embedded text on an original that is not planned native, or on a copy remux from a server without `hls_remux_subtitle_renditions_v1` | The server's WebVTT sidecar, shifted with `timestamp_offset` and converted to SRT; "Loading subtitles…" while new content waits for it, up to 10 seconds, and "Loading…" in Options once the content plays, until the server's first extraction ends (assumption A-15; asked for again after each 120-second timeout for up to 5 minutes, AG-642), then one reload at the position carries it (section 9.7). Roku never draws the container's own copy of the track (`suppressCaptions`, section 9.7), so Off shows none under any caption mode | All | Roku TV: runs 1 (first extraction about 65 s), 4; run 16 (T2l) failed before `suppressCaptions`, not yet re-run; run 19 (T6) stopped when the sidecar came, before the reload (AG-201), not yet re-run |
-| Embedded text on a transcode, or on a copy remux from a server that advertises `hls_remux_subtitle_renditions_v1` | The WebVTT rendition inside the HLS stream (`hls_subtitle_renditions_v1`, with `hls_remux_subtitle_renditions_v1` for a remux), which Roku shows while captions are on | All | Roku TV: run 4 fetched a transcode's rendition; its cues were not checked. Ultra: a remux's rendition played (assumption AG-316); its cues were not checked |
+| Embedded text on a transcode, or on a copy remux from a server that advertises `hls_remux_subtitle_renditions_v1` | The WebVTT rendition inside the HLS stream (`hls_subtitle_renditions_v1`, with `hls_remux_subtitle_renditions_v1` for a remux), which Roku shows while captions are on. Against a server that also advertises `hls_subtitle_renditions_all_v1`, every embedded text track the server can index is a rendition of the stream, switched in place by the name Roku lists for it, Off included, with no download (section 9.7; assumption AG-645) | All | Roku TV: run 4 fetched a transcode's rendition; its cues were not checked; the 2026-10-30 end-to-end run drew a remux's cues from 22 listed renditions, switched among them in place, and turned a transcode's subtitles on from Off in place. Ultra: a remux's rendition played (assumption AG-316); its cues were not checked |
 | ASS/SSA | As a sidecar, the raw `.ass` (assumption AG-216), converted to SRT on the device: text and timing only; styling, positions, effects, and drawings are dropped, and a sign repeated per frame or layer is one cue. An embedded track on a transcode, or on a copy remux from a server that advertises `hls_remux_subtitle_renditions_v1`, arrives instead as the stream's WebVTT rendition, converted by the server (row above) | All | Roku TV: runs 24 (T1, a 10.24 MiB typeset track converted on all 16 starts and picks, cues drawn as plain text) and 26 (T2, reused in the session and converted again after a relaunch); runs 22 and 23 refused that track by size before converting it |
 | Bitmap (PGS, VobSub) | Burned in by a server transcode, following captions as Off or On only (section 9.7) | All | Roku TV: runs 4, 6 (T3) |
 | Forced subtitles | As their format; shown only while captions are on (assumption AG-75) | All | Roku TV: run 6 (T7) |
