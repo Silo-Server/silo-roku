@@ -610,7 +610,7 @@ their existing HD/FHD assets.
     Password (lock) with a 76 px eye button beside it (eye with a slash
     while shown), then the error line, then Sign in, Use your phone instead
     (QR code; back to the code, as Back is), and Change server.
-  - A failure shows "Invalid username or password".
+  - A failure shows "Incorrect username or password." (tvOS's wording).
 - **Server not ready.** When `GET /api/v2/system/setup` reports
   `needs_setup`, sign-in becomes tvOS's message screen: the server card with
   a "SETUP NEEDED" badge in the warning colour, "This server isn't ready",
