@@ -1,0 +1,186 @@
+namespace tests
+
+    ' The player's natively drawn embedded subtitles through a PlayerProbe
+    ' (tests/components/PlayerProbe.bs): an MKV original whose own SubRip
+    ' tracks Roku lists as mkv/<Matroska TrackNumber>, the server's
+    ' container_track_id (2026-10-29 native embedded spike; assumption
+    ' AG-643).
+    @suite("player native subtitles")
+    class PlayerNativeSubtitlesTests extends tests.PlayerCaptionsSuite
+
+        ' English (row 0, Matroska track 3) and Arabic (row 2, track 4) the
+        ' server marks native_selectable; Spanish an external sidecar (row
+        ' 1); French (row 3, track 5) a sidecar only (its cues carry {\an8}).
+        function inventory() as Object
+            return [
+                { track_id: "file:42:subtitle:0", combined_index: 0, source: "embedded", codec: "subrip", language: "eng", label: "English", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/0.srt?file_id=42&embedded_stream_index=2", stream_index: 2, container_track_id: "3", native_selectable: true },
+                { track_id: "file:42:subtitle:1", combined_index: 1, source: "external", codec: "srt", language: "spa", label: "Spanish", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/1.srt?file_id=42" },
+                { track_id: "file:42:subtitle:2", combined_index: 2, source: "embedded", codec: "subrip", language: "ara", label: "Arabic", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/2.srt?file_id=42&embedded_stream_index=3", stream_index: 3, container_track_id: "4", native_selectable: true },
+                { track_id: "file:42:subtitle:3", combined_index: 3, source: "embedded", codec: "subrip", language: "fre", label: "French", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/3.srt?file_id=42&embedded_stream_index=4", stream_index: 4, container_track_id: "5" }
+            ]
+        end function
+
+        ' The server's native embedded decision for a row.
+        function nativeOf(index as Integer, stream as Integer, trackNumber as String) as Object
+            return { mode: "render", track_id: "file:42:subtitle:" + index.ToStr(), embedded: { stream_index: stream, container_track_id: trackNumber } }
+        end function
+
+        ' The MKV's own tracks as Roku lists them (Forced and PGS hidden).
+        function mkvTracks() as Object
+            return [{ TrackName: "mkv/3", Language: "eng", Description: "English" }, { TrackName: "mkv/4", Language: "ara", Description: "Arabic" }, { TrackName: "mkv/5", Language: "fre", Description: "French" }]
+        end function
+
+        ' English drawn natively, the Spanish sidecar carried beside it, and
+        ' Roku listing both and the MKV's own tracks.
+        function showingNative() as Object
+            node = m.player()
+            view = node.callFunc("probeStart", { container: "mkv", inventory: m.inventory(), subtitle: m.nativeOf(0, 2, "3"), captionMode: "On", carried: ["file:42:subtitle:1"] })
+            m.assertEqual([view.subtitleTrack, view.activeTrack, view.suppressed], ["mkv/3", "mkv/3", false])
+            node.callFunc("probeRokuReports", { listed: "", stream: m.mkvTracks() })
+            return node
+        end function
+
+        @describe("a native subtitle at load")
+
+        @it("selects the plan's native subtitle by the content's SubtitleConfig, downloads nothing for it, and carries the other sidecars")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { container: "mkv", inventory: m.inventory(), subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            view = node.callFunc("probeNewLoad", { subtitle: m.nativeOf(0, 2, "3"), captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.activeLoad, view.subtitleConfig, view.activeTrack, view.suppressed], [2, "mkv/3", "mkv/3", false])
+            m.assertEqual(view.subtitleTrack, "", "not written: SubtitleConfig selects it before the first frame")
+            m.assertEqual(view.carried, 2, "Spanish and French")
+            states = node.callFunc("probeDownloads").states
+            m.assertFalse(states.DoesExist("file:42:subtitle:0"), "English is drawn from the stream")
+            m.assertFalse(states.DoesExist("file:42:subtitle:2"), "so is Arabic")
+            m.assertTrue(states.DoesExist("file:42:subtitle:3"), "French, not native_selectable, is a sidecar")
+            m.assertEqual(node.callFunc("probeStatus"), "", "nothing to wait for")
+        end sub
+
+        @it("makes no selection of its own when Roku lists the tracks as the content opens")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { container: "mkv", inventory: m.inventory(), subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            node.callFunc("probeNewLoad", { subtitle: m.nativeOf(0, 2, "3"), captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            view = node.callFunc("probeRokuReports", { listed: "", stream: m.mkvTracks() })
+            m.assertEqual(view.subtitleTrack, "", "a write at the listing stopped content (hardware run 20)")
+        end sub
+
+        @it("says an embedded selection Roku cannot be told to draw is not shown")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { container: "mkv", inventory: m.inventory(), subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            view = node.callFunc("probeNewLoad", { subtitle: { mode: "render", track_id: "file:42:subtitle:0", embedded: { stream_index: 2 } }, captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.subtitleConfig, view.activeTrack, view.suppressed], ["", "", true])
+            m.assertEqual(node.callFunc("probeStatus"), "Can't show the selected subtitles.")
+            m.assertEqual(m.checkedSubtitles(node), [])
+        end sub
+
+        @it("draws nothing for an MKV plan without a subtitle, and puts no SubtitleConfig on it")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { container: "mkv", inventory: m.inventory(), subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            view = node.callFunc("probeNewLoad", { subtitle: { mode: "off" }, captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.subtitleConfig, view.activeTrack, view.suppressed, view.carried], ["", "", true, 0])
+        end sub
+
+        @it("selects the native track once the content settles if Roku does not report it, and says so if Roku then draws another")
+        sub _()
+            node = m.showingNative()
+            node.callFunc("probeFirstFrame")
+            node.callFunc("probeElapse", 3000)
+            node.callFunc("probeRokuReports", { subtitleTrack: "", current: "" })
+            view = node.callFunc("probePosition")
+            m.assertEqual(view.subtitleTrack, "mkv/3", "selected by its name, once")
+            m.assertEqual(m.checkedSubtitles(node), ["file:42:subtitle:0"])
+            node.callFunc("probeElapse", 3000)
+            node.callFunc("probeRokuReports", { current: "mkv/5" })
+            node.callFunc("probePosition")
+            m.assertEqual(m.checkedSubtitles(node), [], "Roku draws another track")
+            m.assertTrue(m.subtitleDetail(node, "file:42:subtitle:0").EndsWith("Not showing"))
+            m.assertEqual(node.callFunc("probeStatus"), "Can't show the selected subtitles.")
+        end sub
+
+        @describe("switching in place (AG-643)")
+
+        @it("switches from the native subtitle to a carried sidecar and back without reloading")
+        sub _()
+            node = m.showingNative()
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(1), inPlace: true })
+            view = node.callFunc("probeRetrack", m.spanish())
+            m.assertEqual([view.subtitleTrack, view.activeTrack, view.suppressed], ["tmp:/probe/file-42-subtitle-1.srt", "tmp:/probe/file-42-subtitle-1.srt", false])
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(0), inPlace: true }, "Roku lists mkv/3")
+            view = node.callFunc("probeRetrack", m.nativeOf(0, 2, "3"))
+            m.assertEqual([view.subtitleTrack, view.activeTrack, view.suppressed], ["mkv/3", "mkv/3", false])
+        end sub
+
+        @it("switches to another track the server marks native_selectable by writing its mkv name")
+        sub _()
+            node = m.showingNative()
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:2" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(2), inPlace: true })
+            view = node.callFunc("probeRetrack", m.nativeOf(2, 3, "4"))
+            m.assertEqual([view.subtitleTrack, view.activeTrack, view.suppressed], ["mkv/4", "mkv/4", false])
+            m.assertEqual(m.checkedSubtitles(node), ["file:42:subtitle:2"])
+        end sub
+
+        @it("turns a native subtitle off in place by suppressing captions")
+        sub _()
+            node = m.showingNative()
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: true })
+            view = node.callFunc("probeRetrack", { mode: "off" })
+            m.assertEqual([view.subtitleTrack, view.activeTrack, view.suppressed], ["", "", true])
+        end sub
+
+        @it("reloads for a row the server does not mark native_selectable and the content does not carry")
+        sub _()
+            node = m.showingNative()
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:3" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(3), inPlace: false })
+        end sub
+
+        @it("reloads when Roku still plays the native track after a switch to a sidecar, and not when it plays the native track it was switched to")
+        sub _()
+            node = m.showingNative()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:1" })
+            node.callFunc("probeRetrack", m.spanish())
+            view = node.callFunc("probeRokuPlays", { name: "mkv/3", elapsedMs: 3000 })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(1), inPlace: false }, "mkv/3 is one of the content's tracks")
+            node = m.showingNative()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:2" })
+            node.callFunc("probeRetrack", m.nativeOf(2, 3, "4"))
+            view = node.callFunc("probeRokuPlays", { name: "mkv/4", elapsedMs: 3000 })
+            m.assertInvalid(view.queued)
+        end sub
+
+        @describe("Roku's overlay (AG-643)")
+
+        @it("takes an MKV track Roku picks as the content settles for its own, not the viewer's")
+        sub _()
+            node = m.showingNative()
+            node.callFunc("probeFirstFrame")
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "mkv/4", overlay: true })
+            m.assertInvalid(view.queued, "no track_change from Roku's own pick")
+            node.callFunc("probeElapse", 3000)
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "mkv/5", overlay: true })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(3), inPlace: false }, "once settled, a pick is the viewer's")
+        end sub
+
+        @it("follows an MKV track picked in Roku's overlay: in place when the content plays it natively, else by its row")
+        sub _()
+            node = m.showingNative()
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "mkv/4", overlay: true })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(2), inPlace: true })
+            node = m.showingNative()
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "mkv/5", overlay: true })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(3), inPlace: false }, "French by its container_track_id")
+            node = m.showingNative()
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "mkv/9", overlay: true })
+            m.assertInvalid(view.queued)
+            m.assertEqual(view.subtitleTrack, "mkv/3", "a track no row names is put back")
+        end sub
+    end class
+end namespace

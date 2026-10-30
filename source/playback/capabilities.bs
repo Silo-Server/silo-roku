@@ -20,7 +20,7 @@ import "pkg:/source/util/values.bs"
 '   app: { version, build, channel },
 '   serverFeatures: the capabilities document's features (TS_COPY_FEATURE,
 '     DEFINE_FEATURE, REMUX_RENDITIONS_FEATURE, DV8_BASE_LAYER_IDS_FEATURE,
-'     CODEC_CHANNEL_CEILINGS_FEATURE)
+'     CODEC_CHANNEL_CEILINGS_FEATURE, NATIVE_LIMITATIONS_FEATURE)
 ' }
 ' A track is named by its id with its index, or by index alone when the
 ' watch projection gives no id; one with neither (codec and channels only)
@@ -58,6 +58,22 @@ namespace playback.capabilities
     ' needs no track-dependent ceiling (decision D-6) or restart.
     const CODEC_CHANNEL_CEILINGS_FEATURE = "codec_channel_ceilings_v1"
     const BUFFERING_QUALITY_FEATURE = "buffering_quality_v1"
+    ' A server advertising this honors a native_embedded entry's
+    ' limitations (instant-subtitles contract C2). Roku draws an MKV's
+    ' SubRip tracks itself only with them (assumption AG-643), so the
+    ' native entry and the client feature that asks for native planning,
+    ' NATIVE_SUBTITLES_FEATURE, go only to such a server: one without it
+    ' would plan native for files where Roku draws another track instead,
+    ' and rejects the unknown member besides.
+    const NATIVE_LIMITATIONS_FEATURE = "native_embedded_limitations_v1"
+    const NATIVE_SUBTITLES_FEATURE = "embedded_subtitles_v1"
+    ' What Roku cannot do with a container's own tracks (hardware evidence,
+    ' 2026-10-29 native embedded spike): select a Forced track (Roku lists
+    ' none); draw the selection on a file whose Forced track is in the
+    ' selected audio's language or whose bitmap track is flagged default
+    ' (Roku draws that hidden track instead); and hide ASS override tags
+    ' such as {\an8} in SRT cues (Roku prints them).
+    const NATIVE_LIMITATIONS = ["forced_unlisted", "hidden_track_preemption", "literal_override_tags"]
 
     function startBody(probe as Object, request as Object) as Object
         parts = replanParts(probe, request)
@@ -99,7 +115,24 @@ namespace playback.capabilities
         ' Lowering quality when playback keeps buffering: only with it may
         ' a request carry the fields gateBuffering keeps.
         if util.contains(request.serverFeatures, BUFFERING_QUALITY_FEATURE) then features.Push(BUFFERING_QUALITY_FEATURE)
+        if nativeSubtitles(request.serverFeatures) then features.Push(NATIVE_SUBTITLES_FEATURE)
         return features
+    end function
+
+    ' Whether a start or replan asks for natively drawn embedded subtitles
+    ' (nativeEmbedded): only of a server that honors their limitations.
+    function nativeSubtitles(serverFeatures as Dynamic) as Boolean
+        return util.contains(serverFeatures, NATIVE_LIMITATIONS_FEATURE)
+    end function
+
+    ' Roku's own MKV demuxer lists an embedded text track as
+    ' "mkv/<Matroska TrackNumber>", the server's container_track_id, and
+    ' draws it in Roku's caption style: SubRip only, since it draws ASS as
+    ' plain text and lists no MP4 track (2026-10-29 native embedded spike;
+    ' assumption AG-643). Sent on original_http alone, the one delivery
+    ' that plays the container itself.
+    function nativeEmbedded() as Object
+        return { container: "mkv", codecs: ["subrip"], track_identity: "container_track_id", ass_styling: false, font_attachments: false, limitations: copyList(NATIVE_LIMITATIONS) }
     end function
 
     ' Strips from a start or replan body what a server without
@@ -290,9 +323,9 @@ namespace playback.capabilities
     function deliveries(probe as Object, request as Object) as Object
         decoded = codecsOf(videoDecode(probe))
         audio = audioCodecs(probe)
-        subtitles = subtitleSupport(true)
 
-        original = delivery(["mp4", "mkv"], decoded, audio, subtitles)
+        original = delivery(["mp4", "mkv"], decoded, audio, subtitleSupport(true))
+        if nativeSubtitles(request.serverFeatures) then original.subtitles.native_embedded = [nativeEmbedded()]
         original.hdr_details = outputHdr(probe)
         ' On an HDR10 output, an original's P8 base layer plays as HDR10.
         if original.hdr_details.hdr10 and util.contains(request.serverFeatures, DV8_BASE_LAYER_IDS_FEATURE)
@@ -301,7 +334,7 @@ namespace playback.capabilities
         end if
 
         ' Copy remuxes carry H.264 or HEVC with AAC, AC-3, or E-AC-3.
-        hls = delivery(["hls"], intersect(["h264", "hevc"], decoded), intersect(["aac", "ac3", "eac3"], audio), subtitles)
+        hls = delivery(["hls"], intersect(["h264", "hevc"], decoded), intersect(["aac", "ac3", "eac3"], audio), subtitleSupport(true))
         ' Native DV copy remuxes can decode with a green picture. Restrict
         ' this executor explicitly: omitting hdr_details inherits output DV.
         ' Keep HDR10/HLG and let the server choose its validated fallback;
@@ -355,6 +388,8 @@ namespace playback.capabilities
     end function
 
     ' Section 6.8: sidecar text, nothing styled, embedded, or bitmap.
+    ' embedded_text stays false beside a native_embedded entry, whose one
+    ' container and codec are the whole claim (spec section 9.7).
     function subtitleSupport(sidecar as Boolean) as Object
         return { embedded_text: false, sidecar_text: sidecar, ass_styling: false, embedded_bitmap: false, sidecar_bitmap: false, font_attachments: false }
     end function
@@ -401,6 +436,12 @@ namespace playback.capabilities
     function copy(aa as Object) as Object
         out = {}
         out.Append(aa)
+        return out
+    end function
+
+    function copyList(items as Object) as Object
+        out = []
+        out.Append(items)
         return out
     end function
 

@@ -578,7 +578,9 @@ passthrough, client transformations.
 
 **Client features:** `seek_reanchor_v1`, `direct_stream_resume_v1`,
 `subrip_sidecar_v1`, and `hls_subtitle_renditions_v1`, plus
-`hls_remux_subtitle_renditions_v1` when the capabilities `features` list it. Not
+`hls_remux_subtitle_renditions_v1` and, for `native_embedded_limitations_v1`,
+`embedded_subtitles_v1`, each when the capabilities `features` list it
+(assumption AG-643). Not
 `header_authenticated_media_v1` or `authorized_media_origins_v1`: the client
 uses signed-URL media mode so plans can use proxy nodes (decision D-1, section
 6.4). Never `plan_invalidated_v1` (it needs the realtime socket; when the server's
@@ -787,13 +789,21 @@ every build sends the request below (spec section 9.7).
 - **Request:** `subtitle_fidelity_preference: "compatible"`; `sidecar_text: true`
   on every enabled delivery; `ass_styling`, `font_attachments`, `embedded_bitmap`
   false; `subrip_sidecar_v1` and `hls_subtitle_renditions_v1`, and
-  `hls_remux_subtitle_renditions_v1` when the server advertises it.
+  `hls_remux_subtitle_renditions_v1` when the server advertises it; when the
+  server advertises `native_embedded_limitations_v1`, `embedded_subtitles_v1`
+  and `original_http`'s one `native_embedded` entry (MKV SubRip by
+  `container_track_id`, with Roku's limitations; assumptions AG-643 and
+  AG-644).
 - **What arrives:** original SRT for external and downloaded SRT tracks; a WebVTT
   rendition inside the HLS stream for embedded text on a transcode (already
   `DEFAULT=YES`, no `LANGUAGE`), and on a copy remux from a server that
   advertises `hls_remux_subtitle_renditions_v1`; WebVTT sidecars for embedded
   text on originals and on remuxes from older servers; **raw `.ass`** for ASS/SSA tracks; burn-in for PGS and VobSub. All
-  sidecars carry absolute source timestamps.
+  sidecars carry absolute source timestamps. Embedded SubRip in an MKV
+  original that the server plans native arrives as nothing: Roku draws the
+  file's own track, `mkv/<container_track_id>`, selected by the content's
+  `SubtitleConfig` and switched in place by `Video.subtitleTrack` (spec
+  section 9.7).
 - **Timing:** for `.vtt`, the client requests the protocol's
   `timestamp_offset=-{timeline_offset_seconds}` (the negative of the video timeline
   offset), and the server shifts and clips the cues. Original `.srt` and raw `.ass`
