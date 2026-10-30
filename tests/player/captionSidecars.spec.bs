@@ -261,6 +261,103 @@ namespace tests
             m.assertEqual([view.activeLoad, view.carried], [2, 0], "without the sidecars still downloading")
         end sub
 
+        @describe("a selected sidecar the server is still extracting (2026-10-28; assumption AG-642)")
+
+        ' English selected, Spanish and German offered beside it, queued
+        ' for a new load whose content waits for its media headers.
+        function queuedThree() as Object
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            node.callFunc("probeElapse", 0)
+            inventory = [
+                { track_id: "file:42:subtitle:0", combined_index: 0, source: "embedded", codec: "subrip", language: "eng", label: "English", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/0.srt?file_id=42&embedded_stream_index=2" },
+                { track_id: "file:42:subtitle:1", combined_index: 1, source: "external", codec: "srt", language: "spa", label: "Spanish", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/1.srt?file_id=42" },
+                { track_id: "file:42:subtitle:2", combined_index: 2, source: "external", codec: "srt", language: "ger", label: "German", delivery: "sidecar", url: "/api/v2/stream/s-1/subtitles/2.srt?file_id=42" }
+            ]
+            node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "On", sidecarState: "queued", headers: false, videoState: "stopped", inventory: inventory })
+            return node
+        end function
+
+        @it("downloads the selected sidecar beside the others, which take turns in a lane of their own")
+        sub _()
+            node = m.queuedThree()
+            view = node.callFunc("probeFetch")
+            m.assertEqual(view.sent, [{ trackId: "file:42:subtitle:0", timeoutMs: playback.sidecars.ATTEMPT_MS }, { trackId: "file:42:subtitle:1", timeoutMs: playback.sidecars.ATTEMPT_MS }])
+            m.assertEqual(view.running, 2)
+            view = node.callFunc("probeDownloadFailed", { trackId: "file:42:subtitle:1", kind: "http" })
+            m.assertEqual(view.sent.Count(), 3)
+            m.assertEqual(view.sent[2].trackId, "file:42:subtitle:2", "German follows Spanish while English still downloads")
+            m.assertEqual([view.states["file:42:subtitle:0"], view.states["file:42:subtitle:1"], view.states["file:42:subtitle:2"]], ["loading", "failed", "loading"])
+        end sub
+
+        @it("asks for the selected sidecar again after each timeout for up to 5 minutes, then says it is not available")
+        sub _()
+            node = m.queuedThree()
+            node.callFunc("probeFetch")
+            node.callFunc("probeElapse", 120000)
+            view = node.callFunc("probeDownloadFailed", { trackId: "file:42:subtitle:0", kind: "timeout" })
+            m.assertEqual(view.sent[2], { trackId: "file:42:subtitle:0", timeoutMs: 120000 }, "the same track again")
+            m.assertEqual(view.states["file:42:subtitle:0"], "loading")
+            node.callFunc("probeElapse", 120000)
+            view = node.callFunc("probeDownloadFailed", { trackId: "file:42:subtitle:0", kind: "timeout" })
+            m.assertEqual(view.sent[3], { trackId: "file:42:subtitle:0", timeoutMs: 60000 }, "what is left of the 5 minutes")
+            node.callFunc("probeElapse", 60000)
+            view = node.callFunc("probeDownloadFailed", { trackId: "file:42:subtitle:0", kind: "timeout" })
+            m.assertEqual(view.sent.Count(), 4, "no fourth try")
+            m.assertEqual(view.states["file:42:subtitle:0"], "failed")
+            node.callFunc("probeHeaders")
+            m.assertEqual(node.callFunc("probeStatus"), "Subtitles are not available.")
+        end sub
+
+        @it("asks for the selected sidecar again after a proxy's 504, within the same budget")
+        sub _()
+            node = m.queuedThree()
+            node.callFunc("probeFetch")
+            node.callFunc("probeElapse", 100000)
+            view = node.callFunc("probeDownloadFailed", { trackId: "file:42:subtitle:0", kind: "http", status: 504 })
+            m.assertEqual(view.sent[2], { trackId: "file:42:subtitle:0", timeoutMs: 120000 })
+            node.callFunc("probeElapse", 120000)
+            view = node.callFunc("probeDownloadFailed", { trackId: "file:42:subtitle:0", kind: "http", status: 502 })
+            m.assertEqual(view.sent[3], { trackId: "file:42:subtitle:0", timeoutMs: 80000 }, "what is left of the 5 minutes")
+            view = node.callFunc("probeDownloadFailed", { trackId: "file:42:subtitle:0", kind: "http", status: 503 })
+            m.assertEqual(view.states["file:42:subtitle:0"], "failed", "another status fails as before")
+        end sub
+
+        @it("fails a sidecar that was not selected, or any other failure, without asking again")
+        sub _()
+            node = m.queuedThree()
+            node.callFunc("probeFetch")
+            view = node.callFunc("probeDownloadFailed", { trackId: "file:42:subtitle:1", kind: "timeout" })
+            m.assertEqual(view.states["file:42:subtitle:1"], "failed", "Spanish is not asked for again")
+            m.assertEqual(view.sent[2].trackId, "file:42:subtitle:2")
+            view = node.callFunc("probeDownloadFailed", { trackId: "file:42:subtitle:0", kind: "http" })
+            m.assertEqual(view.states["file:42:subtitle:0"], "failed")
+            m.assertEqual(view.sent.Count(), 3)
+        end sub
+
+        @it("drops Loading subtitles… at the content's first frame and lets the sidecar load on quietly")
+        sub _()
+            node = m.lateEnglish()
+            m.assertEqual(node.callFunc("probeStatus"), "Loading subtitles…", "before the first frame")
+            node.callFunc("probeFirstFrame")
+            m.assertEqual(node.callFunc("probeStatus"), "", "no busy capsule while the content plays")
+            m.assertEqual(m.checkedSubtitles(node), ["file:42:subtitle:0"], "still the viewer's choice")
+            m.assertEqual(m.subtitleDetail(node, "file:42:subtitle:0"), "SRT · External · Loading…")
+            m.assertEqual(node.callFunc("probeSubtitleRows").info, "English · Loading…")
+            view = node.callFunc("probeSidecarReady", { load: 2, trackId: "file:42:subtitle:0" })
+            m.assertTrue(view.subtitleReload, "the late path's one reload")
+            m.assertEqual(m.subtitleDetail(node, "file:42:subtitle:0"), "SRT · External")
+        end sub
+
+        @it("keeps Loading subtitles… while new content still waits for its sidecar")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            node.callFunc("probeNewLoad", { subtitle: m.english(), captionMode: "On", sidecarState: "loading", headers: true, videoState: "playing" })
+            node.callFunc("probeFirstFrame")
+            m.assertEqual(node.callFunc("probeStatus"), "Loading subtitles…", "the earlier content's frame is not the new content's")
+        end sub
+
         @describe("the session's converted sidecars (hardware run 24)")
 
         ' File A's subtitles as a plan gives them: its built-in English ASS

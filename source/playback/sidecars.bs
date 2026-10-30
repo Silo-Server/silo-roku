@@ -32,6 +32,31 @@ namespace playback.sidecars
     ' (assumption AG-219).
     const SELECTED_WAIT_MS = 10000
     const OTHERS_GRACE_MS = 1000
+    ' A sidecar download's deadline. First extractions of embedded text take
+    ' about 65 s on the reference file and 116 s on a 3.1 GB MKV on the
+    ' shared dev server's CephFS (2026-10-28), so the plan's 10 s would
+    ' always miss them (assumption A-15).
+    const ATTEMPT_MS = 120000
+    ' How long the selected sidecar may take in all. The server's extraction
+    ' runs on after a download it serves times out and keeps its result, so
+    ' the same URL asked again joins it or gets the kept copy: on
+    ' 2026-10-28 the download was cut off at 120 s while the extraction took
+    ' 116 s cold, and 1 s once cached. Past it the viewer is told
+    ' (assumption AG-642).
+    const SELECTED_TOTAL_MS = 300000
+    ' HTTP statuses a proxy in front of the server answers when it gives up
+    ' on a response that is slow to start (502, 504, and Cloudflare's 524):
+    ' the extraction behind it runs on as after a timeout, so they are
+    ' asked for again too (retryMs).
+    const RETRY_STATUSES = "|502|504|524|"
+    ' A retry with less time than this left is not started.
+    const MIN_ATTEMPT_MS = 5000
+    ' The download lanes: one for the selected sidecar and one the others
+    ' share, so a selected sidecar the server is still extracting holds up
+    ' none of the others, and at most two of ApiTask's transfers go to
+    ' sidecars (assumption AG-642).
+    const LANE_SELECTED = "selected"
+    const LANE_OTHERS = "others"
     ' The sidecars to download for a plan's content, the selected one first,
     ' as { trackId, url, format, language, label, shiftSeconds, selected,
     ' cacheKey }: url resolved against baseUrl and asking for the plan's
@@ -273,6 +298,44 @@ namespace playback.sidecars
 
     function isPending(track as Object) as Boolean
         return track.state = "queued" or track.state = "loading"
+    end function
+
+    ' The lane a sidecar downloads in: LANE_SELECTED for the selected one,
+    ' else LANE_OTHERS.
+    function laneOf(track as Object) as String
+        if util.isTrue(track.selected) then return LANE_SELECTED
+        return LANE_OTHERS
+    end function
+
+    ' The next sidecar among tracks (offered, with their states) to download
+    ' in lane: its first queued one, or invalid.
+    function nextDownload(tracks as Dynamic, lane as String) as Dynamic
+        if type(tracks) <> "roArray" then return invalid
+        for each track in tracks
+            if track.state = "queued" and laneOf(track) = lane then return track
+        end for
+        return invalid
+    end function
+
+    ' The deadline of the next download of a sidecar whose download failed
+    ' with kind and HTTP status, or 0 when it fails: only the selected one
+    ' is downloaded again, from the same URL, after a timeout or a proxy's
+    ' RETRY_STATUSES, while at least MIN_ATTEMPT_MS of SELECTED_TOTAL_MS is
+    ' left at now, counted from its first download (track.startedAt).
+    ' ATTEMPT_MS, or what is left of the total when that is less.
+    function retryMs(track as Object, kind as String, status as Dynamic, now as Dynamic) as Integer
+        if not retries(kind, status) or not util.isTrue(track.selected) or not util.isNumber(track.startedAt) or not util.isNumber(now) then return 0
+        left = SELECTED_TOTAL_MS - (now - track.startedAt)
+        if left < MIN_ATTEMPT_MS then return 0
+        if left > ATTEMPT_MS then return ATTEMPT_MS
+        return Int(left)
+    end function
+
+    ' Whether a download failure leaves the server extracting: a timeout, or
+    ' a proxy's RETRY_STATUSES.
+    function retries(kind as String, status as Dynamic) as Boolean
+        if kind = "timeout" then return true
+        return kind = "http" and util.isNumber(status) and Instr(1, RETRY_STATUSES, "|" + Int(status).ToStr() + "|") > 0
     end function
 
     ' Whether a track_change to selection ({ audio, subtitle }) can switch on

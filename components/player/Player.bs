@@ -185,13 +185,6 @@ import "pkg:/source/util/values.bs"
 ' notes stop at the last item of the first one (m.leftSeries).
 
 const LOG_TAG = "player"
-' The sidecar download's deadline. First extractions of embedded text take
-' about 65 s on the reference file, so the plan's 10 s would always miss them
-' (assumption A-15); "Loading subtitles…" shows meanwhile. New content waits
-' for its selected sidecar up to a cap, and a little for the others
-' (playback.sidecars.waitUntil); a selected one that arrives later reloads
-' the plan to carry it (lateSubtitle).
-const SUBTITLE_TIMEOUT_MS = 120000
 const NOTICE_MS = 4000
 ' The buffering controller's notices show for 5 s (the shared spec).
 const BUFFERING_NOTICE_MS = 5000
@@ -381,7 +374,8 @@ sub init()
     m.captionMode = ""
     m.videoMode = ""
     m.pauseLoad = invalid
-    m.subtitleHandle = invalid
+    ' The sidecar downloads running, by lane (playback.sidecars.laneOf).
+    m.subtitleHandles = {}
     m.headerGeneration = invalid
     m.flags = newFlags()
     ' The notice's time on the status line (playback.player.noticeShows).
@@ -1169,6 +1163,7 @@ sub onVideoState()
         m.titlePlayed = true
         m.settleUntil = m.env.now() + SUBTITLE_SETTLE_MS
         logRokuSubtitle("first frame")
+        subtitleStarted()
         firstFrame = true
         logFormats("first frame")
         ' Playback accepts remote keys: a deep-link launch fires AppLaunchComplete.
@@ -1302,11 +1297,17 @@ end sub
 
 ' --- Subtitles (plan section 6.8, transport 2) ------------------------------
 
-' Downloads the sidecars the content carries (playback.sidecars.offered), one
-' at a time and the plan's selected one first, each with the profile's
+' Downloads the sidecars the content carries (playback.sidecars.offered),
+' the plan's selected one in a lane of its own and the others one at a time
+' beside it (playback.sidecars.nextDownload), each with the profile's
 ' credentials (all are on the configured origin); MediaTask then shifts and
 ' converts each to SRT. One the session's cache keeps is ready at once
-' (playback.sidecarCache).
+' (playback.sidecarCache). Each download has ATTEMPT_MS; the selected one
+' downloads again after a timeout or a proxy's 502, 504, or 524, within
+' SELECTED_TOTAL_MS (retryMs),
+' since the server goes on extracting it and keeps the result.
+' "Loading subtitles…" shows while new content waits for it and until the
+' content's first frame; after that it loads quietly (subtitleStarted).
 sub startSidecars(item as Object)
     offerSidecars(item, serverBase())
     fetchSidecar(item)
@@ -1327,7 +1328,7 @@ sub offerSidecars(item as Object, base as String)
             track.state = "ready"
             log.debug(LOG_TAG, "subtitle reused from this session", { format: track.format, selected: track.selected })
         else if track.selected
-            m.flags.subtitlesLoading = true
+            m.flags.subtitlesLoading = not contentPlays(item)
         end if
         if track.selected then selected = true
         item.sidecars.Push(track)
@@ -1340,32 +1341,49 @@ sub offerSidecars(item as Object, base as String)
     if playback.media.subtitleArtifact(item.plan) <> invalid and not selected then log.warn(LOG_TAG, "the subtitle sidecar is not on the configured origin", invalid)
 end sub
 
-' Starts the next queued sidecar's download while none is running.
+' Starts each lane's next queued sidecar while the lane has no download
+' running.
 sub fetchSidecar(item as Object)
-    if m.subtitleHandle <> invalid then return
-    for each track in item.sidecars
-        if track.state = "queued"
+    for each lane in [playback.sidecars.LANE_SELECTED, playback.sidecars.LANE_OTHERS]
+        track = invalid
+        if m.subtitleHandles[lane] = invalid then track = playback.sidecars.nextDownload(item.sidecars, lane)
+        if track <> invalid
+            if not util.isNumber(track.startedAt) then track.startedAt = m.env.now()
+            timeoutMs = playback.sidecars.ATTEMPT_MS
+            if util.isNumber(track.retryMs) then timeoutMs = track.retryMs
             track.state = "loading"
-            m.subtitleHandle = handleFor("onSubtitleDownloaded")
-            m.requests[api.playback.subtitle(track.url, track.format, SUBTITLE_TIMEOUT_MS, m.subtitleHandle)] = track
-            return
+            handle = handleFor("onSubtitleDownloaded")
+            m.subtitleHandles[lane] = handle
+            m.requests[downloadSidecar(track, timeoutMs, handle)] = track
         end if
     end for
 end sub
 
+' Sends a sidecar's download through ApiTask, giving its request ID.
+function downloadSidecar(track as Object, timeoutMs as Integer, handle as Object) as String
+    return api.playback.subtitle(track.url, track.format, timeoutMs, handle)
+end function
+
 ' A new plan replaces the sidecars still to come.
 sub cancelSubtitle()
     m.flags.subtitlesLoading = false
-    if m.subtitleHandle = invalid then return
-    m.requests.Delete(m.subtitleHandle.requestId)
-    api.cancel(m.subtitleHandle)
-    m.subtitleHandle = invalid
+    for each lane in m.subtitleHandles
+        handle = m.subtitleHandles[lane]
+        if handle <> invalid
+            m.requests.Delete(handle.requestId)
+            api.cancel(handle)
+        end if
+    end for
+    m.subtitleHandles = {}
 end sub
 
 sub onSubtitleDownloaded(event as Object)
     handle = event.getRoSGNode()
     track = takeRequest(handle)
-    if m.subtitleHandle <> invalid and m.subtitleHandle.isSameNode(handle) then m.subtitleHandle = invalid
+    for each lane in m.subtitleHandles
+        running = m.subtitleHandles[lane]
+        if running <> invalid and running.isSameNode(handle) then m.subtitleHandles[lane] = invalid
+    end for
     result = api.resultOf(handle)
     if track = invalid or sidecarOf(track.load, track.trackId) = invalid
         if result <> invalid and result.ok = true then DeleteFile(result.body.path)
@@ -1373,8 +1391,21 @@ sub onSubtitleDownloaded(event as Object)
     end if
     if result = invalid or result.ok <> true
         kind = "network"
-        if result <> invalid and util.isObject(result.error) then kind = util.text(result.error.kind)
-        sidecarFailed(track, kind)
+        status = invalid
+        if result <> invalid and util.isObject(result.error)
+            kind = util.text(result.error.kind)
+            status = result.error.status
+        end if
+        retryMs = playback.sidecars.retryMs(track, kind, status, m.env.now())
+        if retryMs > 0
+            ' The server's extraction goes on and keeps its result: the same
+            ' URL again joins it or gets the kept copy.
+            log.info(LOG_TAG, "the subtitle download timed out; it is asked for again", { format: track.format, kind: kind, status: status, ms: retryMs, waitedMs: m.env.now() - track.startedAt })
+            track.state = "queued"
+            track.retryMs = retryMs
+        else
+            sidecarFailed(track, kind)
+        end if
     else
         if track.cacheKey <> ""
             cache = sidecarCache()
@@ -1500,10 +1531,38 @@ sub keptGone(result as Object)
     log.info(LOG_TAG, "the subtitle kept from this session is gone; it downloads again", { format: track.format, selected: track.selected })
     track.state = "queued"
     track.path = ""
-    if track.selected then m.flags.subtitlesLoading = true
+    if track.selected then m.flags.subtitlesLoading = not contentPlays(m.current)
     fetchSidecar(m.current)
     refreshChrome()
 end sub
+
+' Whether item's content has shown its first frame on the Video node: its
+' selected sidecar, still to come, then loads without "Loading subtitles…"
+' (subtitleStarted).
+function contentPlays(item as Object) as Boolean
+    return m.activePlayed and m.activeLoad <> invalid and m.activeLoad = item.load
+end function
+
+' The content's first frame came before its selected sidecar: "Loading
+' subtitles…", a busy state that holds every notice back, goes, and the
+' sidecar loads on quietly, its Options row reading "Loading…"
+' (loadingSubtitle). It arrives by the late path's reload (lateSubtitle),
+' or, past its retries, as the notice that it is not available
+' (assumption AG-642).
+sub subtitleStarted()
+    if not m.flags.subtitlesLoading or m.current = invalid or not contentPlays(m.current) then return
+    m.flags.subtitlesLoading = false
+    log.info(LOG_TAG, "the content plays before its subtitle, which loads on quietly", invalid)
+    refreshOptions()
+end sub
+
+' The track ID of the plan's subtitle whose sidecar still downloads or
+' converts once its content plays, or "".
+function loadingSubtitle() as String
+    item = m.current
+    if item = invalid or type(item.sidecars) <> "roArray" or not contentPlays(item) or not playback.sidecars.selectedPending(item.sidecars) then return ""
+    return playback.media.selectedSubtitle(item.plan)
+end function
 
 ' Brings the cache within limit bytes, keeping the files that content
 ' carries or that conversions still have to write; MediaTask deletes the
@@ -2281,6 +2340,7 @@ function optionsState() as Object
         subtitleLanguage: playback.options.subtitleOrderLanguage(m.watch),
         burnWanted: m.burnWanted,
         unshownSubtitle: m.unshownSubtitle,
+        loadingSubtitle: loadingSubtitle(),
         subtitleSearch: subtitleSearchOffered()
     }
 end function
