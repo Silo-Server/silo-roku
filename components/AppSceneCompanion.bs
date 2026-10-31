@@ -28,6 +28,8 @@ const COMPANION_IDLE_SECONDS = 180
 ' Section 5 step 5: after a sign-in the receiver waits this long for the
 ' phone's done before it stops.
 const COMPANION_FINISH_SECONDS = 3
+' tvOS's "You're all set" waits this long for Continue, then moves on.
+const COMPANION_COMPLETE_SECONDS = 2
 ' Section 5 step 3: how long a phone on the sign-in screen waits for that
 ' screen's code (tvOS's nearbyCodeWait).
 const COMPANION_CODE_WAIT_SECONDS = 15
@@ -40,7 +42,7 @@ sub companionInit()
     #if companion
         m.companionPollTimer.observeField("fire", "onCompanionPoll")
         m.companionIdleTimer.observeField("fire", "onCompanionIdle")
-        m.companionFinishTimer.observeField("fire", "companionFinish")
+        m.companionFinishTimer.observeField("fire", "onCompanionFinishTimer")
     #end if
 end sub
 
@@ -49,11 +51,24 @@ end sub
 ' (section 3), and through its own Companion screen and a sign-in's finish.
 sub companionRefresh()
     #if companion
+        ' The sign-in screen went (companionCode): signed in, the phone hears
+        ' so and the Companion screen comes back on top.
+        if m.companion.screenCode = invalid then companionRelay()
+        companionKeepScreen()
         wanted = companionWanted()
         if wanted = m.companion.mode then return
         if m.companion.mode <> "" then companionStop("receiver_cancelled")
         if wanted <> "" then companionStart(wanted)
     #end if
+end sub
+
+' While a sign-in finishes, the Companion screen stays on top: the session
+' it installed moves the app on (the picker, then Home for a single
+' profile), and each move starts the stack over.
+sub companionKeepScreen()
+    if not m.companion.finishing then return
+    top = nav.stack.topEntry(m.navStack)
+    if top <> invalid and top.route <> nav.route.COMPANION then navPush(nav.route.COMPANION, {})
 end sub
 
 function companionWanted() as String
@@ -342,11 +357,13 @@ sub companionBegin()
 end sub
 
 ' The sign-in screen's code on each change (SignInScreen reportCode), or
-' invalid once that screen goes.
+' invalid once that screen goes. It goes inside a navigation's plan
+' (AppSceneNav navApplyPlan), where the receiver must not navigate: the
+' companionRefresh that follows the plan relays its going.
 sub companionCode(code as Dynamic)
     m.companion.screenCode = code
     #if companion
-        companionRelay()
+        if code <> invalid then companionRelay()
     #end if
 end sub
 
@@ -572,24 +589,45 @@ sub onCompanionPolled(event as Object)
     end if
 end sub
 
-' Step 5: the session is installed; the phone hears so, and the receiver
-' stops after the phone's done or COMPANION_FINISH_SECONDS.
+' Step 5: the session is installed; the phone hears so, and the screen says
+' "You're all set" after the phone's done or COMPANION_FINISH_SECONDS, and
+' the receiver stops when the viewer continues or COMPANION_COMPLETE_SECONDS
+' pass.
 sub companionSignedIn()
     if m.companion.signedIn then return
     m.companion.signedIn = true
     m.companion.finishing = true
     m.companion.stage = "signedIn"
     companionSend(silocontrol.pairing.serverResult(m.companion.push.url, ""))
-    companionPublish()
+    ' The new session has already moved the app on (Home or the picker is
+    ' under it); the screen comes back on top for tvOS's "Signed in" and
+    ' "You're all set".
+    companionShowScreen()
     companionRestartTimer(m.companionFinishTimer, COMPANION_FINISH_SECONDS)
     log.info("companion", "signed in")
 end sub
 
+' The phone is done, or it did not say so in time: "You're all set" (tvOS's
+' completed state). A second call, as the phone leaves, changes nothing.
 sub companionFinish()
+    if not m.companion.finishing or m.companion.stage <> "signedIn" then return
+    m.companion.stage = "completed"
+    companionPublish()
+    companionRestartTimer(m.companionFinishTimer, COMPANION_COMPLETE_SECONDS)
+end sub
+
+sub onCompanionFinishTimer()
+    if m.companion.stage = "completed" then companionComplete() else companionFinish()
+end sub
+
+' Continue, or the end of the wait: the receiver stops and the app moves on.
+sub companionComplete()
     if not m.companion.finishing then return
     m.companion.finishing = false
     companionStop("")
     companionRefresh()
+    ' Home may have rendered under the Companion screen, where the offer waits.
+    launchOfferCheck()
 end sub
 
 ' A failure stays on screen until the viewer acts; the phone hears why.
@@ -658,7 +696,8 @@ sub companionLeaveScreen()
 end sub
 
 ' The Companion screen's buttons: "allow", "deny", "cancel", "alternate",
-' "retry", and "dismiss" (a failure's Try again, or Back).
+' "retry", "dismiss" (a failure's Try again, or Back), and "continue" (You're
+' all set).
 sub companionAct(action as String)
     stage = m.companion.stage
     if action = "allow" and stage = "consent"
@@ -675,7 +714,9 @@ sub companionAct(action as String)
         companionStartLogin()
     else if action = "retry" and stage = "unreachable"
         companionBegin()
-    else if action = "cancel" and stage <> "signedIn"
+    else if action = "continue" and stage = "completed"
+        companionComplete()
+    else if action = "cancel" and stage <> "signedIn" and stage <> "completed"
         companionAbandon()
         if stage = "unreachable" and m.companion.push <> invalid then companionSend(silocontrol.pairing.serverResult(m.companion.push.url, "unreachable"))
         companionClosePhone(silocontrol.pairing.cancel("receiver_cancelled"))
