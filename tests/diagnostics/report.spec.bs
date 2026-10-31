@@ -1,0 +1,115 @@
+namespace tests
+
+    @suite("diag.report and diag.state")
+    class DiagnosticsReportTests extends rooibos.BaseTestSuite
+
+        function facts(crash as Dynamic) as Object
+            return { capturedAt: "2026-10-31T03:10:00Z", run: "0f6b1c2e-3d4a-4b5c-8d9e-0a1b2c3d4e5f", appVersion: "0.1.0", appBuild: "0", osVersion: "15.3.4", collectorId: "silo-public-diagnostics-v1", consent: "manual", crash: crash, summary: { manufacturer: "TCL", model: "55R625", os: "15.3.4", form_factor: "tv" }, lines: 2, logBytes: 300, dropped: 0, categories: ["network"] }
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("exits")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("reports crashes, hangs, and forced exits, not ordinary ones")
+        sub _()
+            m.assertEqual(diag.report.typeForExit("EXIT_BRIGHTSCRIPT_CRASH"), "crash")
+            m.assertEqual(diag.report.typeForExit("EXIT_BRIGHTSCRIPT_TIMEOUT"), "hang")
+            m.assertEqual(diag.report.typeForExit("EXIT_CHANNEL_MEM_LIMIT_FG"), "abnormal_exit")
+            m.assertEqual(diag.report.typeForExit("EXIT_OUT_OF_MEMORY"), "abnormal_exit")
+            for each code in ["EXIT_USER_NAV", "EXIT_UNKNOWN", "EXIT_OS_UPDATE", "EXIT_CHANNEL_RESTART", "", invalid]
+                m.assertEqual(diag.report.typeForExit(code), "")
+            end for
+        end sub
+
+        @it("describes Roku's exit record as the crash object")
+        sub _()
+            info = { exit_code: "EXIT_CHANNEL_MEM_LIMIT_FG", timestamp: "2026-10-31T03:10:35.126Z", app_state: "background", mem_limit: 580, console_log: "Exiting 'Silo' at 10.0.0.145" }
+            crash = diag.report.crashOf(info, "")
+            m.assertEqual(crash.type, "abnormal_exit")
+            m.assertEqual(crash.code, "EXIT_CHANNEL_MEM_LIMIT_FG")
+            m.assertEqual(crash.summary, "Roku ended Silo with EXIT_CHANNEL_MEM_LIMIT_FG over its 580 MB memory limit")
+            m.assertEqual(crash.occurred_at, "2026-10-31T03:10:35.126Z")
+            m.assertFalse(crash.foreground)
+            m.assertEqual(crash.stack_excerpt, "Exiting 'Silo' at {ip}")
+        end sub
+
+        @it("falls back to Main's launch reason when Roku keeps no record")
+        sub _()
+            crash = diag.report.crashOf({ exit_code: "EXIT_UNKNOWN" }, "EXIT_BRIGHTSCRIPT_CRASH")
+            m.assertEqual(crash.type, "crash")
+            m.assertEqual(crash.occurred_at, "")
+            m.assertInvalid(diag.report.crashOf(invalid, "EXIT_USER_NAV"))
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("manifest")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("writes a manual report without a crash object or playback sessions")
+        sub _()
+            out = diag.report.manifest(m.facts(invalid))
+            m.assertEqual(out.schema_version, 1)
+            m.assertEqual(out.report.type, "manual")
+            m.assertEqual(out.report.platform, "roku")
+            m.assertEqual(out.report.capture_session_id, "0f6b1c2e-3d4a-4b5c-8d9e-0a1b2c3d4e5f")
+            m.assertEqual(out.consent, { mode: "manual", notice_version: 1 })
+            m.assertEqual(out.destination.server_instance_id, "silo-public-diagnostics-v1")
+            m.assertEqual(out.playback_session_ids, [])
+            m.assertFalse(out.DoesExist("crash"))
+            m.assertFalse(out.report.DoesExist("profile_id"))
+            m.assertTrue(out.log_summary.debug_logging)
+        end sub
+
+        @it("writes an exit report with its crash object, timed at capture when Roku gave no time")
+        sub _()
+            crash = diag.report.crashOf({ exit_code: "EXIT_BRIGHTSCRIPT_CRASH" }, "")
+            out = diag.report.manifest(m.facts(crash))
+            m.assertEqual(out.report.type, "crash")
+            m.assertEqual(out.crash.source, "exit_info")
+            m.assertEqual(out.crash.provenance, "post_restart")
+            m.assertEqual(out.crash.occurred_at, "2026-10-31T03:10:00Z")
+        end sub
+
+        @it("lists the categories a log holds")
+        sub _()
+            text = `{"cat":"network"}` + Chr(10) + `{"cat":"playback"}`
+            m.assertEqual(diag.report.categories(text), ["playback", "network"])
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("state")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("keeps the installation, the newest sent reports, and the handled exit")
+        sub _()
+            record = diag.state.empty()
+            record.installationId = "inst_" + string(36, "a")
+            record.token = "sidt_" + string(43, "b")
+            for i = 1 to diag.state.MAX_SENT + 2
+                diag.state.addSent(record, string(36, Chr(48 + i)), "SILO-" + string(8, "Z"))
+            end for
+            record.handledExit = "EXIT_BRIGHTSCRIPT_CRASH@2026-10-31T03:10:35.126Z"
+            raw = diag.state.encode(record)
+            back = diag.state.decode(raw)
+            m.assertEqual(back, record)
+            m.assertEqual(back.sent.Count(), diag.state.MAX_SENT)
+            m.assertEqual(back.sent[0].id, string(36, Chr(48 + diag.state.MAX_SENT + 2)))
+            m.assertTrue(diag.state.bytes(raw) <= diag.state.BUDGET_BYTES, "bytes " + diag.state.bytes(raw).ToStr())
+        end sub
+
+        @it("drops values that do not parse")
+        sub _()
+            back = diag.state.decode({ installation: "{", sent: "[1, {}]", exit: 4 })
+            m.assertEqual(back, diag.state.empty())
+        end sub
+
+        @it("keeps every registry section together within Roku's 32 KB")
+        sub _()
+            total = storage.BUDGET_BYTES + storage.SERVERS_BUDGET_BYTES + libraryPrefs.BUDGET_BYTES + diag.state.BUDGET_BYTES
+            m.assertTrue(total <= 32768, "total " + total.ToStr())
+        end sub
+
+    end class
+
+end namespace
