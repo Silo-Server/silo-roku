@@ -604,13 +604,22 @@ their existing HD/FHD assets.
     the status line with a small spinner ("Waiting for approval", "Continue
     on your phone", "Signed in as {account}", …); a state that ended shows a
     symbol in place of the QR code. Section 7.2 runs the code.
+  - A declined or paused code has none on screen, so the lead reads "Show a
+    new code to try again, or sign in with a password." ("Show a new code to
+    try again." when the server takes no passwords). A declined code's
+    status is "Sign-in was declined." (the TV cannot tell a phone's decline
+    from a browser's); a paused one keeps "Sign-in paused."
+    With Show a new code, Sign in with a password, and Change server in one
+    row, the row is drawn in the compact button size when it would reach
+    the card, so a focused Change server stays clear of it (a Roku fit
+    adjustment: tvOS cuts the labels off instead).
   - Sign in with a password swaps in the form: "Sign in with a password";
     "Use your {server} username and password." (or "This server only
     supports password sign-in." without codes); Username (person), then
     Password (lock) with a 76 px eye button beside it (eye with a slash
     while shown), then the error line, then Sign in, Use your phone instead
     (QR code; back to the code, as Back is), and Change server.
-  - A failure shows "Invalid username or password".
+  - A failure shows "Incorrect username or password." (tvOS's wording).
 - **Server not ready.** When `GET /api/v2/system/setup` reports
   `needs_setup`, sign-in becomes tvOS's message screen: the server card with
   a "SETUP NEEDED" badge in the warning colour, "This server isn't ready",
