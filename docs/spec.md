@@ -3700,12 +3700,15 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   several is not yet seen on a device, so the client takes each row's
   name from Roku's list by `Description` = `NAME` first, then
   `webvtt/<index>` only when Roku lists that track in the row's language
-  (its primary subtag), so that a numbering of Roku's own cannot put
-  another language on the plan's track, and logs `Roku's names for the
+  (its primary subtag) and not with a description that names another of
+  the stream's renditions, so that a numbering of Roku's own cannot put
+  another track on the plan's row, and logs `Roku's names for the
   stream's subtitle renditions` with how each matched. A rendition matched
   neither way has no name: the client writes nothing for it, the check
   once the content settles included, switches to it only by a reload, and
-  leaves the plan's own to the playlist's `DEFAULT`. The content starts on the playlist's
+  leaves the plan's own to the playlist's `DEFAULT`; if Roku names the
+  plan's own only after the content settled, the client checks it again
+  at the next position report. The content starts on the playlist's
   `DEFAULT`, with no `subtitleTrack` written at load or at Roku's listing;
   once it settles the client checks the plan's rendition as it checks a
   sidecar and selects it by that name if Roku shows another, as after a
@@ -3718,8 +3721,9 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   Off, as content without a subtitle does, since until the client selects
   the rendition Roku could show a sidecar by the caption language. A
   `webvtt/<n>` picked in Roku's `*` overlay is a `track_change` for its
-  row, in place when the content lists it, else by its place in the group
-  and a reload.
+  row, in place, when the content lists it under that name; any other is
+  written back, since Roku's number alone does not say which rendition it
+  is.
 - A subtitle Search Subtitles downloads (section 5.7) reaches playback only
   through a plan, never through a URL the client builds (tvOS synthesizes
   the session's stream URL for it). The server announces no provider
