@@ -3536,7 +3536,10 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   from the same URL, which joins the extraction or gets the kept copy (a 3.1 GB MKV
   on the shared dev server's CephFS took 116 seconds cold and 1 second
   once cached, 2026-10-28), until 5 minutes have passed since its first
-  download; then the notice "Subtitles are not available." shows. The
+  download; then the notice "Subtitles are not available." shows. Each
+  download starts at least 2 seconds after the one before, doubling to 30
+  seconds, so a proxy that answers an error at once is not asked
+  continually. The
   busy capsule says "Loading subtitles…" only until the content's first
   frame, since it holds every notice back: once the content plays without
   its sidecar, the sidecar loads quietly, and Options keeps its row

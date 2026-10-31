@@ -845,7 +845,11 @@ end sub
 
 sub onWakeTimer()
     runSlot(playback.slot.tick(m.slot, m.env.now()))
-    if m.current <> invalid then tryAssign(m.current)
+    if m.current <> invalid
+        ' A selected sidecar's retry that waited may be due.
+        if type(m.current.sidecars) = "roArray" then fetchSidecar(m.current)
+        tryAssign(m.current)
+    end if
     dispatch({ type: "wake" })
 end sub
 
@@ -857,6 +861,7 @@ sub scheduleWake()
     wake = sooner(wake, playback.slot.wakeAt(m.slot))
     item = m.current
     if item <> invalid and not item.assigned then wake = sooner(wake, playback.sidecars.waitUntil(item.sidecars, item.sidecarsAt))
+    if item <> invalid then wake = sooner(wake, playback.sidecars.nextRetryAt(item.sidecars))
     m.wakeTimer.control = "stop"
     if wake = invalid then return
     delay = (wake - now) / 1000
@@ -1318,8 +1323,9 @@ end sub
 ' converts each to SRT. One the session's cache keeps is ready at once
 ' (playback.sidecarCache). Each download has ATTEMPT_MS; the selected one
 ' downloads again after a timeout or a proxy's 502, 504, or 524, within
-' SELECTED_TOTAL_MS (retryMs),
-' since the server goes on extracting it and keeps the result.
+' SELECTED_TOTAL_MS and with a growing pause between fast failures
+' (retryDelayMs), since the server goes on extracting it and keeps the
+' result.
 ' "Loading subtitles…" shows while new content waits for it and until the
 ' content's first frame; after that it loads quietly (subtitleStarted).
 sub startSidecars(item as Object)
@@ -1358,13 +1364,18 @@ end sub
 ' Starts each lane's next queued sidecar while the lane has no download
 ' running.
 sub fetchSidecar(item as Object)
+    now = m.env.now()
     for each lane in [playback.sidecars.LANE_SELECTED, playback.sidecars.LANE_OTHERS]
         track = invalid
-        if m.subtitleHandles[lane] = invalid then track = playback.sidecars.nextDownload(item.sidecars, lane)
+        if m.subtitleHandles[lane] = invalid then track = playback.sidecars.nextDownload(item.sidecars, lane, now)
         if track <> invalid
-            if not util.isNumber(track.startedAt) then track.startedAt = m.env.now()
-            timeoutMs = playback.sidecars.ATTEMPT_MS
-            if util.isNumber(track.retryMs) then timeoutMs = track.retryMs
+            if not util.isNumber(track.startedAt) then track.startedAt = now
+            attempts = 0
+            if util.isNumber(track.attempts) then attempts = track.attempts
+            track.attempts = attempts + 1
+            track.attemptAt = now
+            track.retryAt = invalid
+            timeoutMs = playback.sidecars.attemptMs(track, now)
             track.state = "loading"
             handle = handleFor("onSubtitleDownloaded")
             m.subtitleHandles[lane] = handle
@@ -1410,13 +1421,16 @@ sub onSubtitleDownloaded(event as Object)
             kind = util.text(result.error.kind)
             status = result.error.status
         end if
-        retryMs = playback.sidecars.retryMs(track, kind, status, m.env.now())
-        if retryMs > 0
+        now = m.env.now()
+        delayMs = playback.sidecars.retryDelayMs(track, kind, status, now)
+        if delayMs >= 0
             ' The server's extraction goes on and keeps its result: the same
-            ' URL again joins it or gets the kept copy.
-            log.info(LOG_TAG, "the subtitle download timed out; it is asked for again", { format: track.format, kind: kind, status: status, ms: retryMs, waitedMs: m.env.now() - track.startedAt })
+            ' URL again joins it or gets the kept copy, after a pause when
+            ' the failure came back at once (the wake timer's fetchSidecar).
+            log.info(LOG_TAG, "the subtitle download failed while the server may still extract it; it is asked for again", { format: track.format, kind: kind, status: status, inMs: delayMs, attempts: track.attempts, waitedMs: now - track.startedAt })
             track.state = "queued"
-            track.retryMs = retryMs
+            track.retryAt = now + delayMs
+            if m.state <> invalid then scheduleWake()
         else
             sidecarFailed(track, kind)
         end if
