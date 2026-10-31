@@ -187,7 +187,8 @@ Play:
 - Skip Intro, Skip Recap, and Skip Credits using server markers, with the
   profile's recap and credits auto-skip (`playback.auto_skip_recap`,
   `playback.auto_skip_credits`);
-- Up Next near the end of every movie and episode, with autoplay and On Deck;
+- Up Next near the end of every movie and episode, with autoplay of the
+  next episode and On Deck;
 - Shuffle of a library from Browse, of a collection from its page, and of
   a series or the season shown from a series' More menu, when the server
   offers it
@@ -1854,13 +1855,17 @@ Subtitles tab (criterion 4.8).
   only when Skip Credits skips credits that run to the end (above).
   It offers an episode's next episode; with none (a movie, a series finale),
   the first On Deck item is the pick instead, unless the next-episode lookup
-  failed. The countdown is the runtime left, its ring counting from the
-  prompt window: it stops while paused, and the pick starts as it reaches
-  the end. A seek the viewer makes while it shows, spoken or from a phone
+  failed. An On Deck pick never counts down or plays by itself: it waits for
+  Play Now, and the end reads "Up Next" over it rather than "Playing Next".
+  Only the series' next episode, or a shuffle's pick, autoplays, as on
+  Android TV and in the Apple apps. The countdown is the runtime left, its
+  ring counting from the prompt window: it stops while paused, and the pick
+  starts as it reaches the end. A seek the viewer makes while it shows, spoken or from a phone
   (the remote's keys are the panel's), is Keep Watching first, so no
   countdown, over skipped credits included, starts the next item after it;
   after the end such a seek plays the title again from there. The video's
-  end always opens Up Next, as "Playing Next", or as "Finished" with "End of playback" and why
+  end always opens Up Next, as "Playing Next" ("Up Next" over an On Deck
+  pick), or as "Finished" with "End of playback" and why
   there is nothing to play; an end with Up Next already counting starts the
   pick at once, and otherwise a 10 second countdown runs. While the
   next-episode lookup runs, the panel says "Finding the next episode". The
