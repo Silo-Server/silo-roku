@@ -2253,7 +2253,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A detail page visited lately paints at once from a cache of 20 pages and refreshes quietly | Every visit reads the page again, painting the card's seed meanwhile | Implementation plan section 4.8 bounds the metadata kept on 512 MB devices |
 | Rewind and fast-forward skip (Android TV) | Rewind and fast-forward drive the rate ladder | Roku remote convention |
 | The player has a bottom-240 px gradient ending at black 55%, with a shadow behind the title footer | A bottom-600 px gradient ending at black 94%, reaching 72–76% behind the series, title, and episode tag | Covers Roku's fixed title block and preserves muted-text contrast over bright video without additional text nodes |
-| A start or a stall shows only the centred spinner | Roku's own states also show by name in a capsule at the top right: "Stopping…", "Playback progress is pending…", and "Loading subtitles…"; a notice waits while the spinner or the capsule shows | The player's durable stop and sidecar downloads have no tvOS counterpart, and a notice that came during a stall expired unseen behind it (hardware run 23; assumption AG-262) |
+| A start or a stall shows only the centred spinner | Roku's own states also show by name in a capsule at the top right: "Stopping…", "Playback progress is pending…", and "Loading subtitles…" (until the content's first frame, section 9.7); a notice waits while the spinner or the capsule shows | The player's durable stop and sidecar downloads have no tvOS counterpart, and a notice that came during a stall expired unseen behind it (hardware run 23; assumption AG-262) |
 | The hold indicator's thumbnail has radius 20 corners and a 1 px white 18% outline; its hint names Siri Remote gestures | Square corners without the outline; the hint names Roku keys ("← → Speed, OK Play, Back Cancel") | Over video Roku can round an image only with a `MaskGroup`, which does not clip on devices without OpenGL (plan section 4.6); a square outline would cross rounded art |
 | The segment pill (Skip Recap, Skip Credits) sits 96 px up, or 156 px over the controls | It sits where Skip Intro does (156 px up, 460 px over the controls, on the safe area), and above it while both show | At tvOS's raised place it would cover the scrubber's right end and the time left; Skip Intro's place clears the controls (assumption AG-260) |
 | Skip Credits on credits that run to the end, with nothing for Next Up to show, ends the item there | It seeks to the end, and the end follows when the Video node reaches it, a moment later (a `seek_reanchor` on a remux), then opens Up Next as Finished | The player has no end of its own: Roku's `finished` drives the session's stop and Up Next's end (section 9.5), so the skip reaches it as Skip Forward to the end does (assumption AG-321) |
@@ -3557,7 +3557,25 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   ASS sidecar was ready 7.8–8.3 seconds after the plan. Past the 10
   seconds, as for a first extraction of embedded text (21.8 to about 65
   seconds), the content plays without the sidecar while it downloads
-  (assumption AG-219). A converted sidecar of the file's own embedded
+  (assumption AG-219). The selected sidecar downloads in a lane of its
+  own, and the others take turns in a second one, so a selected track the
+  server is still extracting holds none of them up, and at most two of
+  ApiTask's transfers go to sidecars. Each download has 120 seconds. The
+  server's extraction runs on after a download times out and keeps its
+  result, so a selected sidecar that times out, or that a proxy in front
+  of the server gives up on with a 502, 504, or 524, is asked for again
+  from the same URL, which joins the extraction or gets the kept copy (a 3.1 GB MKV
+  on the shared dev server's CephFS took 116 seconds cold and 1 second
+  once cached, 2026-10-28), until 5 minutes have passed since its first
+  download; then the notice "Subtitles are not available." shows. Each
+  download starts at least 2 seconds after the one before, doubling to 30
+  seconds, so a proxy that answers an error at once is not asked
+  continually. The
+  busy capsule says "Loading subtitles…" only until the content's first
+  frame, since it holds every notice back: once the content plays without
+  its sidecar, the sidecar loads quietly, and Options keeps its row
+  checked and reads "Loading…" on it and on Info's Subtitles until it
+  arrives, by the reload below, or fails (assumption AG-651). A converted sidecar of the file's own embedded
   text tracks is kept for the rest of the app session, so content that
   carries it again neither downloads nor converts it (section 12.5,
   assumption AG-220). It is kept for the configured server's origin and
@@ -3980,7 +3998,7 @@ Subtitle sources:
 | Source | What the viewer gets | Cohorts | Evidence |
 | --- | --- | --- | --- |
 | External or downloaded SRT | The original file (`subrip_sidecar_v1`), downloaded to `tmp:/` with its cues moved onto the plan's timeline and their ASS override tags (`{\an8}`) removed, shown as a Roku SRT track | All | Roku TV: runs 1, 4, 6 (T3), 7 (T1d); tag removal headless only |
-| Embedded text on an original, or on a copy remux from a server without `hls_remux_subtitle_renditions_v1` | The server's WebVTT sidecar, shifted with `timestamp_offset` and converted to SRT; "Loading subtitles…" until the server's first extraction ends (assumption A-15), then one reload at the position carries it (section 9.7). Roku never draws the container's own copy of the track (`suppressCaptions`, section 9.7), so Off shows none under any caption mode | All | Roku TV: runs 1 (first extraction about 65 s), 4; run 16 (T2l) failed before `suppressCaptions`, not yet re-run; run 19 (T6) stopped when the sidecar came, before the reload (AG-201), not yet re-run |
+| Embedded text on an original, or on a copy remux from a server without `hls_remux_subtitle_renditions_v1` | The server's WebVTT sidecar, shifted with `timestamp_offset` and converted to SRT; "Loading subtitles…" while new content waits for it, up to 10 seconds, and "Loading…" in Options once the content plays, until the server's first extraction ends (assumption A-15; asked for again after each 120-second timeout for up to 5 minutes, AG-651), then one reload at the position carries it (section 9.7). Roku never draws the container's own copy of the track (`suppressCaptions`, section 9.7), so Off shows none under any caption mode | All | Roku TV: runs 1 (first extraction about 65 s), 4; run 16 (T2l) failed before `suppressCaptions`, not yet re-run; run 19 (T6) stopped when the sidecar came, before the reload (AG-201), not yet re-run |
 | Embedded text on a transcode, or on a copy remux from a server that advertises `hls_remux_subtitle_renditions_v1` | The WebVTT rendition inside the HLS stream (`hls_subtitle_renditions_v1`, with `hls_remux_subtitle_renditions_v1` for a remux), which Roku shows while captions are on | All | Roku TV: run 4 fetched a transcode's rendition; its cues were not checked. Ultra: a remux's rendition played (assumption AG-316); its cues were not checked |
 | ASS/SSA | As a sidecar, the raw `.ass` (assumption AG-216), converted to SRT on the device: text and timing only; styling, positions, effects, and drawings are dropped, and a sign repeated per frame or layer is one cue. An embedded track on a transcode, or on a copy remux from a server that advertises `hls_remux_subtitle_renditions_v1`, arrives instead as the stream's WebVTT rendition, converted by the server (row above) | All | Roku TV: runs 24 (T1, a 10.24 MiB typeset track converted on all 16 starts and picks, cues drawn as plain text) and 26 (T2, reused in the session and converted again after a relaunch); runs 22 and 23 refused that track by size before converting it |
 | Bitmap (PGS, VobSub) | Burned in by a server transcode, following captions as Off or On only (section 9.7) | All | Roku TV: runs 4, 6 (T3) |
