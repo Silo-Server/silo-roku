@@ -1,0 +1,159 @@
+import "pkg:/source/diagnostics/scrub.bs"
+import "pkg:/source/util/redact.bs"
+
+' One logs.jsonl line of the client-diagnostics v1 contract
+' (logline.schema.json): ts, run, lvl, cat, tag, msg, and attrs. A log call's
+' fields that the attribute registry (attr-registry.json) lists for its
+' category, with the listed type, become attrs; the collector refuses a
+' report with any other attribute. The rest follow the message as key=value.
+' A field the collector reserves for identities and credentials (IDs,
+' tokens, URLs, servers, ...) is left out, as it would refuse the line.
+' Every string passes diag.scrub.
+namespace diag.line
+    ' A field's value in the message is cut to this many characters first.
+    const MAX_VALUE = 300
+
+    ' entry: { level, tag, message, fields, seconds, ms } as source/util/log.bs
+    ' posts it; runId is the launch's UUID.
+    function build(entry as Object, runId as String) as String
+        category = categoryOf(entry.tag)
+        line = { ts: timestamp(entry.seconds, entry.ms), run: runId, lvl: levelOf(entry.level), cat: category, tag: tagOf(entry.tag), msg: "" }
+        text = redact.text(entry.message)
+        attrs = {}
+        registered = tables().attributes[category]
+        fields = entry.fields
+        if type(fields) = "roAssociativeArray"
+            for each key in fields
+                value = fields[key]
+                if not attribute(attrs, registered, key, value)
+                    pair = pairText(key, value)
+                    if pair <> "" then text = text + " " + pair
+                end if
+            end for
+        else if fields <> invalid
+            text = text + " " + valueText(fields)
+        end if
+        line.msg = diag.scrub.text(text)
+        if line.msg = "" then line.msg = "-"
+        if not attrs.IsEmpty() then line.attrs = attrs
+        return FormatJson(line)
+    end function
+
+    ' The category for a tag: by its name, or by the word before a dot or
+    ' colon ("player.tracks").
+    function categoryOf(tag as Dynamic) as String
+        name = LCase(redact.text(tag))
+        for each sep in [".", ":", "/"]
+            at = Instr(1, name, sep)
+            if at > 1 then name = Left(name, at - 1)
+        end for
+        category = tables().categories[name]
+        if category = invalid then return "other"
+        return category
+    end function
+
+    function levelOf(level as Dynamic) as String
+        letter = tables().levels[redact.text(level)]
+        if letter = invalid then return "I"
+        return letter
+    end function
+
+    function tagOf(tag as Dynamic) as String
+        text = diag.scrub.text(Left(redact.text(tag), 64))
+        if text = "" then return "app"
+        return text
+    end function
+
+    ' ISO 8601 UTC with milliseconds.
+    function timestamp(seconds as Dynamic, ms as Dynamic) as String
+        clock = CreateObject("roDateTime")
+        if redact.isNumber(seconds) then clock.FromSeconds(seconds)
+        iso = clock.ToISOString()
+        millis = 0
+        if redact.isNumber(ms) then millis = ms
+        digits = (1000 + millis).ToStr()
+        return Left(iso, 19) + "." + Right(digits, 3) + "Z"
+    end function
+
+    ' Puts a registered field in attrs with its registered type; false when
+    ' the field is not one, or its value has another type.
+    function attribute(attrs as Object, registered as Dynamic, key as String, value as Dynamic) as Boolean
+        if registered = invalid then return false
+        kind = registered[key]
+        if kind = invalid then return false
+        name = LCase(key)
+        if kind = "i"
+            if not redact.isNumber(value) then return false
+            if Abs(value) >= 2000000000 or value <> Int(value) then return false
+            attrs[name] = Int(value)
+            return true
+        end if
+        if not redact.isString(value) then return false
+        text = diag.scrub.text(Left(value, MAX_VALUE))
+        if text = "" then return false
+        attrs[name] = text
+        return true
+    end function
+
+    ' "key=value" for the message, or "" for a field the collector reserves:
+    ' a key that holds a reserved word takes only a small number or a
+    ' boolean, and one that is reserved outright nothing.
+    function pairText(key as String, value as Dynamic) as String
+        kind = diag.scrub.keyClass(key)
+        if kind = "exact" then return ""
+        text = valueText(value)
+        if kind = "contains" and not diag.scrub.isSafeScalarText(text) then return ""
+        return key + "=" + text
+    end function
+
+    ' A value as message text: numbers and booleans as they are (none for
+    ' invalid), a string quoted when it holds a space, and objects as JSON.
+    function valueText(value as Dynamic) as String
+        if value = invalid then return "none"
+        t = type(value)
+        if t = "Boolean" or t = "roBoolean"
+            if value then return "true"
+            return "false"
+        end if
+        if t = "Integer" or t = "roInt" or t = "roInteger" or t = "LongInteger" or t = "roLongInteger" then return value.ToStr()
+        if redact.isNumber(value)
+            if Abs(value) >= 2000000000 then return Str(value).Trim()
+            if value = Int(value) then return Int(value).ToStr()
+            whole = Fix(value)
+            fraction = Abs(value - whole)
+            digits = Int(fraction * 1000 + 0.5).ToStr()
+            while Len(digits) < 3
+                digits = "0" + digits
+            end while
+            while Len(digits) > 1 and Right(digits, 1) = "0"
+                digits = Left(digits, Len(digits) - 1)
+            end while
+            sign = ""
+            if value < 0 and whole = 0 then sign = "-"
+            return sign + Int(whole).ToStr() + "." + digits
+        end if
+        if redact.isString(value)
+            text = Left(value, MAX_VALUE)
+            if text = "" or Instr(1, text, " ") > 0 then return Chr(34) + text.Replace(Chr(34), "'") + Chr(34)
+            return text
+        end if
+        if t = "roAssociativeArray" or t = "roArray"
+            return Left(FormatJson(value), MAX_VALUE)
+        end if
+        return redact.typeTag(value)
+    end function
+    ' levels: log level to logline lvl. categories: a tag's logline cat; other
+    ' tags are "other". attributes: attr-registry.json without session_id and
+    ' attempt, which the hosted collector refuses as identities ("i" integer,
+    ' "s" string). Built once per thread.
+    function tables() as Object
+        if m.diagLineTables = invalid
+            m.diagLineTables = {
+                levels: { debug: "D", info: "I", warn: "W", error: "E" },
+                categories: { api: "network", connection: "network", speedtest: "network", control: "network", silocontrol: "network", companion: "network", session: "lifecycle", storage: "lifecycle", platform: "lifecycle", memory: "lifecycle", launch: "lifecycle", deeplink: "lifecycle", diagnostics: "lifecycle", app: "lifecycle", player: "playback", playback: "playback", media: "playback", probe: "playback", voice: "playback", subtitles: "playback", trickplay: "playback", thememusic: "playback", shuffle: "playback", nav: "browse", home: "browse", detail: "browse", browse: "browse", search: "browse", library: "browse", settings: "browse", requests: "browse", key: "focus", focus: "focus", crash: "crash" },
+                attributes: { playback: { sink: "s", fmt: "s", decoder: "s", width: "i", height: "i", hdr_mode: "s", bitrate_kbps: "i", dropped_frames: "i", audio_underruns: "i", play_method: "s", reason: "s", position_ms: "i" }, focus: { target: "s", action: "s" }, network: { method: "s", path: "s", status: "i", duration_ms: "i", outcome: "s", error_code: "s" }, lifecycle: { state: "s", phase: "s", duration_ms: "i", outcome: "s", reason: "s", launch_type: "s" }, crash: { fingerprint: "s", source: "s" } }
+            }
+        end if
+        return m.diagLineTables
+    end function
+end namespace

@@ -4,7 +4,14 @@ import "pkg:/source/util/redact.bs"
 ' redact first. Debug and info output is compiled out unless the manifest's
 ' bs_const sets debug=true. Each call returns the line it printed, or invalid
 ' when the level is compiled out.
+'
+' Every level, printed or not, is also posted to the render thread for the
+' diagnostics log (components/AppSceneDiagnostics.bs), which keeps it for a
+' report the viewer chooses to send (source/diagnostics/line.bs).
 namespace log
+    ' The roRenderThreadQueue message ID the diagnostics log listens on.
+    const DIAGNOSTICS_MESSAGE = "silo.diagnostics.log"
+
     #if debug
         function debug(tag as String, message as String, fields = invalid as Dynamic) as Dynamic
             return write("DEBUG", tag, message, fields)
@@ -14,11 +21,13 @@ namespace log
             return write("INFO", tag, message, fields)
         end function
     #else
-        function debug(_tag as String, _message as String, _fields = invalid as Dynamic) as Dynamic
+        function debug(tag as String, message as String, fields = invalid as Dynamic) as Dynamic
+            record("debug", tag, message, fields)
             return invalid
         end function
 
-        function info(_tag as String, _message as String, _fields = invalid as Dynamic) as Dynamic
+        function info(tag as String, message as String, fields = invalid as Dynamic) as Dynamic
+            record("info", tag, message, fields)
             return invalid
         end function
     #end if
@@ -42,6 +51,24 @@ namespace log
         line = format(level, tag, message, fields)
         ' bs:disable-next-line: LINT3012
         print line
+        record(LCase(level), tag, message, fields)
         return line
     end function
+
+    ' Posts the call to the diagnostics log: its own copy of the fields with
+    ' secrets masked (PostMessage moves what it sends), and the time. The
+    ' diagnostics Task turns it into a contract line. Posting never blocks
+    ' and never waits for the render thread.
+    sub record(level as String, tag as String, message as String, fields as Dynamic)
+        if m.logQueue = invalid
+            m.logQueue = CreateObject("roRenderThreadQueue")
+            m.logClock = CreateObject("roDateTime")
+            if m.logQueue = invalid then m.logQueue = false
+        end if
+        if type(m.logQueue) <> "roRenderThreadQueue" then return
+        m.logClock.Mark()
+        entry = { level: level, tag: tag, message: message, seconds: m.logClock.AsSeconds(), ms: m.logClock.GetMilliseconds() }
+        if not redact.isInvalid(fields) then entry.fields = redact.value(fields)
+        m.logQueue.PostMessage(DIAGNOSTICS_MESSAGE, entry)
+    end sub
 end namespace

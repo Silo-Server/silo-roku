@@ -1,0 +1,101 @@
+namespace tests
+
+    @suite("diag.bundle")
+    class DiagnosticsBundleTests extends rooibos.BaseTestSuite
+
+        ' An roByteArray's values as an roArray (brs-node misreads for each
+        ' over an roByteArray; see util.qr.crc32).
+        function values(bytes as Object, first as Integer, count as Integer) as Object
+            out = []
+            for i = first to first + count - 1
+                out.Push(bytes[i])
+            end for
+            return out
+        end function
+
+        function text(bytes as Object, first as Integer, count as Integer) as String
+            out = ""
+            for i = first to first + count - 1
+                if bytes[i] <> 0 then out = out + Chr(bytes[i])
+            end for
+            return out
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("header")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("writes a canonical USTAR header with its checksum")
+        sub _()
+            block = diag.bundle.header("logs.jsonl", 1234)
+            m.assertEqual(block.Count(), 512)
+            m.assertEqual(m.text(block, 0, 100), "logs.jsonl")
+            m.assertEqual(m.text(block, 100, 8), "0000644")
+            m.assertEqual(block[107], 0)
+            m.assertEqual(m.text(block, 108, 8), "0000000")
+            m.assertEqual(m.text(block, 124, 12), "00000002322")
+            m.assertEqual(m.text(block, 136, 12), "00000000000")
+            m.assertEqual(block[156], 48)
+            m.assertEqual(m.text(block, 257, 6), "ustar")
+            m.assertEqual(m.text(block, 263, 2), "00")
+            m.assertEqual(block[154], 0)
+            m.assertEqual(block[155], 32)
+            ' The checksum: every byte, its own field counted as spaces.
+            sum = 0
+            for i = 0 to 511
+                if i >= 148 and i < 156 then sum = sum + 32 else sum = sum + block[i]
+            end for
+            m.assertEqual(m.text(block, 148, 6), diag.bundle.octal(sum, 6))
+        end sub
+
+        @it("pads octal to its width")
+        sub _()
+            m.assertEqual(diag.bundle.octal(0, 6), "000000")
+            m.assertEqual(diag.bundle.octal(420, 7), "0000644")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("write")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("writes one gzip member of stored blocks around the archive")
+        sub _()
+            entries = [{ name: "manifest.json", bytes: diag.bundle.utf8("{}") }, { name: "logs.jsonl", bytes: diag.bundle.utf8("x" + Chr(10)) }]
+            CreateDirectory("tmp:/diag-test")
+            out = diag.bundle.write(entries, "tmp:/diag-test/a.tar", "tmp:/diag-test/a.tar.gz")
+            m.assertNotInvalid(out)
+            ' Two entries of a header and one padded block each, then two zero blocks.
+            m.assertEqual(out.uncompressedBytes, 6 * 512)
+            ' Header, one stored block (5), the archive, CRC-32 and size.
+            m.assertEqual(out.bytes, 10 + 5 + out.uncompressedBytes + 8)
+            m.assertEqual(Len(out.sha256), 64)
+            gz = CreateObject("roByteArray")
+            m.assertTrue(gz.ReadFile("tmp:/diag-test/a.tar.gz"))
+            m.assertEqual(m.values(gz, 0, 10), [&h1F, &h8B, 8, 0, 0, 0, 0, 0, 0, 3])
+            ' The final stored block: 3072 bytes, and their one's complement.
+            m.assertEqual(m.values(gz, 10, 5), [1, 0, 12, 255, 243])
+            tar = CreateObject("roByteArray")
+            m.assertTrue(tar.ReadFile("tmp:/diag-test/a.tar"))
+            ' roByteArray's CRC-32. brs-node's differs from zlib's, so this
+            ' checks the framing; on a Roku the collector inflates the bundle,
+            ' which checks the CRC (hardware run, docs/spec.md section 11.1).
+            crc = tar.GetCRC32()
+            last = out.bytes - 8
+            m.assertEqual(m.values(gz, last, 8), [crc and 255, (crc >> 8) and 255, (crc >> 16) and 255, (crc >> 24) and 255, 0, 12, 0, 0])
+        end sub
+
+        @it("splits an archive over 65,535 bytes into stored blocks")
+        sub _()
+            CreateDirectory("tmp:/diag-test")
+            tar = diag.bundle.zeros(70000)
+            tar.WriteFile("tmp:/diag-test/big.tar")
+            gz = diag.bundle.gzip(tar, "tmp:/diag-test/big.tar")
+            m.assertEqual(m.values(gz, 10, 5), [0, 255, 255, 0, 0])
+            ' The second block holds the rest and is final.
+            m.assertEqual(m.values(gz, 15 + 65535, 5), [1, 113, 17, 142, 238])
+            m.assertEqual(gz.Count(), 10 + 5 + 65535 + 5 + 4465 + 8)
+        end sub
+
+    end class
+
+end namespace

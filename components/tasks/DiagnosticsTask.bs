@@ -1,0 +1,469 @@
+import "pkg:/source/diagnostics/bundle.bs"
+import "pkg:/source/diagnostics/line.bs"
+import "pkg:/source/diagnostics/report.bs"
+import "pkg:/source/diagnostics/state.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' The diagnostics log and its hosted reports (spec section 11.1). Every log
+' call, at every level and in every build, arrives here from AppScene as an
+' entry, becomes a contract line (source/diagnostics/line.bs), and is
+' appended to this launch's file. The files live in cachefs:, which Roku
+' keeps across launches until it needs the room, so the launch before this
+' one, the one a crash ended, can be sent too; where cachefs: is missing
+' they live in tmp:, which an exit clears. Each launch's lines are capped at
+' two files of MAX_FILE_BYTES; past that the oldest go.
+'
+' A report goes only to the Silo-operated collector, only when the viewer
+' sends it (Settings, or the prompt after Roku ended Silo), and carries no
+' Silo account, server, profile, or credential: the collector gives this
+' Roku a pseudonymous installation credential of its own. One report goes at
+' a time; while it goes, entries wait in the port.
+
+const COLLECTOR = "https://diagnostics.siloserver.org"
+' The collector identity this build's consent notice names.
+const COLLECTOR_ID = "silo-public-diagnostics-v1"
+const APP_ID = "org.siloserver.silo"
+const CA_BUNDLE = "common:/certs/ca-bundle.crt"
+const MAX_FILE_BYTES = 524288
+const REQUEST_MS = 20000
+const UPLOAD_MS = 180000
+' How long a sent report is watched for the collector's checks.
+const PROCESSING_MS = 30000
+const POLL_MS = 2000
+const WORK_DIR = "tmp:/diagnostics"
+
+sub init()
+    m.top.functionName = "serve"
+end sub
+
+sub serve()
+    setup()
+    while true
+        msg = wait(0, m.port)
+        if type(msg) = "roSGNodeEvent"
+            field = msg.getField()
+            if field = "entries"
+                append(msg.getData())
+            else if field = "command"
+                command(msg.getData())
+            else if field = "config"
+                configure(msg.getData())
+            else if field = "launch"
+                m.launchReason = launchReason(msg.getData())
+                readExit()
+            end if
+        end if
+    end while
+end sub
+
+sub setup()
+    m.port = CreateObject("roMessagePort")
+    for each field in ["entries", "command", "config", "launch"]
+        m.top.observeField(field, m.port)
+    end for
+    m.run = LCase(CreateObject("roDeviceInfo").GetRandomUUID())
+    m.collector = COLLECTOR
+    m.files = CreateObject("roFileSystem")
+    m.section = CreateObject("roRegistrySection", diag.state.SECTION_NAME)
+    m.record = diag.state.read(m.section)
+    m.launchReason = launchReason(m.top.launch)
+    m.dir = logDir()
+    rotateRuns()
+    m.fileBytes = 0
+    m.fileLines = 0
+    m.olderLines = 0
+    m.dropped = 0
+    m.status = { stage: "idle", reference: "", processing: "", error: "", consent: "" }
+    m.crash = invalid
+    m.exitStamp = ""
+    logLaunch()
+    readExit()
+    m.top.ready = true
+    publish()
+end sub
+
+function launchReason(launch as Dynamic) as String
+    if not util.isObject(launch) then return ""
+    return util.text(launch.reason)
+end function
+
+' cachefs: when Roku has it for this app, else tmp:.
+function logDir() as String
+    for each dir in ["cachefs:/silo-diagnostics", "tmp:/silo-diagnostics"]
+        CreateDirectory(dir)
+        if m.files.Exists(dir) then return dir
+    end for
+    return "tmp:/silo-diagnostics"
+end function
+
+' The last launch's files become previous, replacing the launch before it.
+sub rotateRuns()
+    for each name in ["previous.jsonl", "previous.1.jsonl"]
+        DeleteFile(m.dir + "/" + name)
+    end for
+    MoveFile(m.dir + "/current.jsonl", m.dir + "/previous.jsonl")
+    MoveFile(m.dir + "/current.1.jsonl", m.dir + "/previous.1.jsonl")
+end sub
+
+sub logLaunch()
+    app = CreateObject("roAppInfo")
+    info = CreateObject("roDeviceInfo")
+    os = info.GetOSVersion()
+    fields = { version: app.GetVersion(), build: buildOf(app), sideloaded: app.IsDev(), osVersion: os.major + "." + os.minor + "." + os.revision, osBuild: os.build, model: info.GetModel(), modelType: info.GetModelType(), logs: m.dir }
+    log.info("diagnostics", "launch", fields)
+end sub
+
+' Roku's record of how the last launch ended: a failure becomes the crash
+' to offer (state.crash) unless it was already reported or dismissed. Logged
+' either way, so every report says how the launch before it ended.
+sub readExit()
+    info = invalid
+    manager = CreateObject("roAppManager")
+    if manager <> invalid then info = manager.GetLastExitInfo()
+    crash = diag.report.crashOf(info, m.launchReason)
+    ' Not "code": redact masks a field named so (assumption AG-14).
+    fields = { exit: "none", appState: "", mediaState: "" }
+    if type(info) = "roAssociativeArray"
+        fields.exit = util.text(info.exit_code)
+        fields.appState = util.text(info.app_state)
+        fields.mediaState = util.text(info.media_player_state)
+        if util.isNumber(info.mem_limit) then fields.memLimitMb = info.mem_limit
+        m.exitStamp = util.text(info.timestamp)
+    end if
+    if m.launchReason <> "" then fields.reason = m.launchReason
+    if m.loggedExit <> true
+        log.info("diagnostics", "last exit", fields)
+        m.loggedExit = true
+    end if
+    if crash <> invalid
+        ' Roku reports the time of the exit; without one, the code stands in.
+        key = crash.code + "@" + m.exitStamp
+        if key = m.record.handledExit then crash = invalid
+        if crash <> invalid then crash.key = key
+    end if
+    m.crash = crash
+    publish()
+end sub
+
+' Appends AppScene's batch of log calls to this launch's file as lines.
+sub append(data as Dynamic)
+    if type(data) <> "roAssociativeArray" or type(data.entries) <> "roArray" then return
+    if util.isNumber(data.dropped) then m.dropped = m.dropped + data.dropped
+    text = ""
+    count = 0
+    for each entry in data.entries
+        if type(entry) = "roAssociativeArray"
+            text = text + diag.line.build(entry, m.run) + Chr(10)
+            count = count + 1
+        end if
+    end for
+    if count = 0 then return
+    bytes = diag.bundle.utf8(text)
+    path = m.dir + "/current.jsonl"
+    if not bytes.AppendFile(path)
+        ' Roku can take cachefs: back: start the file again.
+        m.fileBytes = 0
+        m.fileLines = 0
+        bytes.WriteFile(path)
+    end if
+    m.fileBytes = m.fileBytes + bytes.Count()
+    m.fileLines = m.fileLines + count
+    if m.fileBytes > MAX_FILE_BYTES
+        DeleteFile(m.dir + "/current.1.jsonl")
+        MoveFile(path, m.dir + "/current.1.jsonl")
+        m.dropped = m.dropped + m.olderLines
+        m.olderLines = m.fileLines
+        m.fileLines = 0
+        m.fileBytes = 0
+    end if
+end sub
+
+sub configure(config as Dynamic)
+    if type(config) <> "roAssociativeArray" then return
+    #if debug
+        if util.isString(config.collector) and config.collector <> ""
+            m.collector = config.collector
+            log.info("diagnostics", "collector changed for this launch")
+        end if
+    #end if
+end sub
+
+sub command(input as Dynamic)
+    if type(input) <> "roAssociativeArray" then return
+    action = util.text(input.action)
+    if action = "send"
+        consent = util.text(input.consent)
+        if consent <> "prompt" then consent = "manual"
+        send(consent)
+    else if action = "dismiss"
+        handleCrash()
+    else if action = "erase"
+        erase()
+    end if
+end sub
+
+' The last exit no longer offered: reported, or dismissed at the prompt.
+sub handleCrash()
+    if m.crash = invalid then return
+    m.record.handledExit = m.crash.key
+    saveRecord()
+    m.crash = invalid
+    publish()
+end sub
+
+' Captures this launch's and the last launch's lines with the device's
+' facts, and sends them: the collector's identity is checked, this Roku's
+' installation registered once, the report created, its bundle uploaded,
+' and its checks watched for PROCESSING_MS.
+sub send(consent as String)
+    if m.status.stage = "sending" then return
+    m.status = { stage: "sending", reference: "", processing: "", error: "", consent: consent }
+    publish()
+    log.info("diagnostics", "sending a report", { consent: consent })
+    failure = ""
+    capabilities = request("GET", "/v1/capabilities", invalid, false, REQUEST_MS)
+    if capabilities.status <> 200 or not isCollector(capabilities.json)
+        failure = "unavailable"
+    else if not ensureInstallation()
+        failure = "registration"
+    end if
+    if failure = ""
+        report = capture(consent)
+        if report = invalid
+            failure = "capture"
+        else
+            failure = deliver(report)
+        end if
+    end if
+    if failure <> ""
+        m.status.stage = "failed"
+        m.status.error = failure
+        log.warn("diagnostics", "report not sent", { reason: failure })
+    end if
+    publish()
+end sub
+
+function isCollector(capabilities as Dynamic) as Boolean
+    if type(capabilities) <> "roAssociativeArray" then return false
+    if util.text(capabilities.status) <> "available" or util.text(capabilities.collector_id) <> COLLECTOR_ID then return false
+    if capabilities.consent_notice_version <> diag.report.NOTICE_VERSION then return false
+    if not util.contains(capabilities.accepted_schema_versions, diag.report.SCHEMA_VERSION) then return false
+    m.limitBytes = capabilities.max_bundle_bytes
+    return true
+end function
+
+' A pseudonymous installation credential for this Roku, registered the
+' first time; false when the collector would not register one.
+function ensureInstallation() as Boolean
+    if m.record.token <> "" then return true
+    app = CreateObject("roAppInfo")
+    body = { platform: diag.report.PLATFORM_NAME, app_id: APP_ID, app_version: app.GetVersion(), app_build: buildOf(app) }
+    answer = request("POST", "/v1/installations", body, false, REQUEST_MS)
+    if answer.status <> 201 or type(answer.json) <> "roAssociativeArray" then return false
+    id = util.text(answer.json.installation_id)
+    token = util.text(answer.json.installation_token)
+    if id = "" or token = "" then return false
+    m.record.installationId = id
+    m.record.token = token
+    saveRecord()
+    log.info("diagnostics", "installation registered")
+    return true
+end function
+
+function buildOf(app as Object) as String
+    build = util.text(app.GetValue("build_version"))
+    if build = "" then build = "0"
+    return build
+end function
+
+' The bundle on tmp: and the envelope that describes it, or invalid.
+function capture(consent as String) as Dynamic
+    CreateDirectory(WORK_DIR)
+    logs = CreateObject("roByteArray")
+    for each name in ["previous.1.jsonl", "previous.jsonl", "current.1.jsonl", "current.jsonl"]
+        path = m.dir + "/" + name
+        if m.files.Exists(path)
+            part = CreateObject("roByteArray")
+            if part.ReadFile(path) then logs.Append(part)
+        end if
+    end for
+    text = logs.ToAsciiString()
+    lines = 0
+    at = Instr(1, text, Chr(10))
+    while at > 0
+        lines = lines + 1
+        at = Instr(at + 1, text, Chr(10))
+    end while
+    capturedAt = now()
+    crash = invalid
+    provenance = "pre_failure"
+    if m.crash <> invalid
+        crash = m.crash
+        provenance = "post_restart"
+    end if
+    facts = diag.report.device(capturedAt, provenance)
+    app = CreateObject("roAppInfo")
+    manifest = diag.report.manifest({ capturedAt: capturedAt, run: m.run, appVersion: app.GetVersion(), appBuild: buildOf(app), osVersion: facts.osVersion, collectorId: COLLECTOR_ID, consent: consent, crash: crash, summary: facts.summary, lines: lines, logBytes: logs.Count(), dropped: m.dropped, categories: diag.report.categories(text) })
+    names = ["manifest.json", "device.json", "logs.jsonl"]
+    entries = [{ name: names[0], bytes: diag.bundle.utf8(FormatJson(manifest)) }, { name: names[1], bytes: diag.bundle.utf8(FormatJson(facts.device)) }, { name: names[2], bytes: logs }]
+    archive = diag.bundle.write(entries, WORK_DIR + "/report.tar", WORK_DIR + "/report.tar.gz")
+    DeleteFile(WORK_DIR + "/report.tar")
+    if archive = invalid then return invalid
+    manifest.archive = { entries: names, bytes: archive.bytes, uncompressed_bytes: archive.uncompressedBytes, sha256: archive.sha256 }
+    return { id: LCase(CreateObject("roDeviceInfo").GetRandomUUID()), manifest: manifest, path: WORK_DIR + "/report.tar.gz", crash: crash, lines: lines }
+end function
+
+' Creates the report, uploads its bundle, and watches its checks. "" when
+' the collector took it, else why not.
+function deliver(report as Object) as String
+    if util.isNumber(m.limitBytes) and report.manifest.archive.bytes > m.limitBytes
+        DeleteFile(report.path)
+        return "too_large"
+    end if
+    body = { report_id: report.id, manifest: report.manifest, bundle_bytes: report.manifest.archive.bytes, bundle_sha256: report.manifest.archive.sha256 }
+    created = request("POST", "/v1/reports", body, true, REQUEST_MS)
+    if created.status = 401
+        ' The collector revoked this installation: register again, once.
+        m.record.token = ""
+        m.record.installationId = ""
+        if not ensureInstallation() then return "registration"
+        created = request("POST", "/v1/reports", body, true, REQUEST_MS)
+    end if
+    if created.status <> 201 or type(created.json) <> "roAssociativeArray"
+        DeleteFile(report.path)
+        return "create_" + created.status.ToStr() + errorOf(created.json)
+    end if
+    reference = util.text(created.json.short_id)
+    uploaded = upload(report, util.text(created.json.upload_token))
+    DeleteFile(report.path)
+    if uploaded.status <> 202 then return "upload_" + uploaded.status.ToStr() + errorOf(uploaded.json)
+    diag.state.addSent(m.record, report.id, reference)
+    if report.crash <> invalid and m.crash <> invalid then m.record.handledExit = m.crash.key
+    saveRecord()
+    if report.crash <> invalid then m.crash = invalid
+    m.status.stage = "sent"
+    m.status.reference = reference
+    m.status.processing = "processing"
+    publish()
+    log.info("diagnostics", "report sent", { lines: report.lines, bytes: report.manifest.archive.bytes })
+    m.status.processing = watch(report.id)
+    if m.status.processing = "rejected" then log.warn("diagnostics", "the collector rejected the report", { code: m.status.error })
+    return ""
+end function
+
+function upload(report as Object, uploadToken as String) as Object
+    headers = { "Content-Type": "application/gzip", "X-Upload-Token": uploadToken }
+    return request("PUT", "/v1/reports/" + report.id + "/bundle", { file: report.path, headers: headers }, true, UPLOAD_MS)
+end function
+
+' The report's state once the collector's checks end, or after
+' PROCESSING_MS: ready, rejected, or processing.
+function watch(id as String) as String
+    clock = CreateObject("roTimespan")
+    state = "processing"
+    while clock.TotalMilliseconds() < PROCESSING_MS
+        sleep(POLL_MS)
+        answer = request("GET", "/v1/reports/" + id, invalid, true, REQUEST_MS)
+        if answer.status = 200 and type(answer.json) = "roAssociativeArray"
+            state = util.text(answer.json.state)
+            if state = "rejected" then m.status.error = util.text(answer.json.error_code)
+            if state = "ready" or state = "rejected" then return state
+            m.status.processing = state
+        end if
+    end while
+    return state
+end function
+
+' Deletes every sent report the collector still holds for this Roku. A
+' report the collector no longer knows (404) is forgotten too; one it could
+' not answer for is kept to try again.
+sub erase()
+    if m.status.stage = "sending" then return
+    kept = []
+    for each item in m.record.sent
+        answer = request("DELETE", "/v1/reports/" + item.id, invalid, true, REQUEST_MS)
+        if answer.status <> 204 and answer.status <> 404 then kept.Push(item)
+    end for
+    m.record.sent = kept
+    saveRecord()
+    m.status = { stage: "idle", reference: "", processing: "", error: "", consent: "" }
+    if kept.Count() > 0 then m.status.error = "erase"
+    log.info("diagnostics", "sent reports deleted", { kept: kept.Count() })
+    publish()
+end sub
+
+' One request to the collector, waiting at most ms: { status, json }, with
+' status 0 when it did not answer. body is JSON for a POST, { file,
+' headers } for an upload, or invalid. withToken adds this Roku's
+' installation credential; the collector takes no other credential, and no
+' Silo header goes to it.
+function request(method as String, path as String, body as Dynamic, withToken as Boolean, ms as Integer) as Object
+    port = CreateObject("roMessagePort")
+    transfer = CreateObject("roUrlTransfer")
+    transfer.SetMessagePort(port)
+    transfer.SetUrl(m.collector + path)
+    transfer.SetCertificatesFile(CA_BUNDLE)
+    transfer.RetainBodyOnError(true)
+    headers = { "Accept": "application/json" }
+    if withToken then headers["Authorization"] = "Bearer " + m.record.token
+    if type(body) = "roAssociativeArray" and util.isString(body.file)
+        headers.Append(body.headers)
+    else if body <> invalid
+        headers["Content-Type"] = "application/json"
+    end if
+    transfer.SetHeaders(headers)
+    if method <> "GET" and method <> "POST" then transfer.SetRequest(method)
+    if method = "GET"
+        issued = transfer.AsyncGetToString()
+    else if type(body) = "roAssociativeArray" and util.isString(body.file)
+        issued = transfer.AsyncPostFromFile(body.file)
+    else if body <> invalid
+        issued = transfer.AsyncPostFromString(FormatJson(body))
+    else
+        issued = transfer.AsyncPostFromString("")
+    end if
+    answer = { status: 0, json: invalid }
+    if not issued then return answer
+    clock = CreateObject("roTimespan")
+    while clock.TotalMilliseconds() < ms
+        msg = wait(ms - clock.TotalMilliseconds(), port)
+        if type(msg) = "roUrlEvent" and msg.GetInt() = 1
+            answer.status = msg.GetResponseCode()
+            text = msg.GetString()
+            if text <> "" then answer.json = ParseJson(text)
+            if answer.status < 200 or answer.status >= 300 then log.warn("diagnostics", "collector answered", { method: method, status: answer.status, error_code: errorOf(answer.json), reason: msg.GetFailureReason() })
+            return answer
+        end if
+    end while
+    transfer.AsyncCancel()
+    log.warn("diagnostics", "collector did not answer", { method: method, ms: ms })
+    return answer
+end function
+
+' "_" and the collector's error code, or "".
+function errorOf(json as Dynamic) as String
+    if type(json) = "roAssociativeArray" and util.isString(json.error) then return "_" + json.error
+    return ""
+end function
+
+sub saveRecord()
+    if not diag.state.write(m.section, m.record) then log.warn("diagnostics", "the registry refused the diagnostics record")
+end sub
+
+sub publish()
+    state = {}
+    state.Append(m.status)
+    sent = []
+    for each item in m.record.sent
+        sent.Push(item.ref)
+    end for
+    state.sent = sent
+    if m.crash <> invalid then state.crash = { type: m.crash.type, code: m.crash.code }
+    m.top.status = state
+end sub
+
+function now() as String
+    clock = CreateObject("roDateTime")
+    return clock.ToISOString()
+end function
