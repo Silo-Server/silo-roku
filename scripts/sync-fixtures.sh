@@ -38,6 +38,11 @@ ROOTS = ["PlaybackStartBody", "PlaybackReplanBody", "PlaybackProgressBody", "Pla
          "PlaybackCapabilities", "PlaybackConnection", "PlaybackProbeResultsInputBody",
          # The player's subtitle search and download (source/playback/subtitleSearch.bs).
          "SubtitleSearchBody", "SubtitleDownloadBody"]
+# Response shapes the client reads that scripts/validate-contract.py writes
+# by hand (PROPOSED_RESPONSE) until the server publishes them; kept with
+# their references once the commit has them, which tells the validator to
+# drop its copies.
+RESPONSE_ROOTS = ["SubtitleInventoryHLSRenditionV3", "HLSSubtitleRenditionV3"]
 OPERATIONS = {
     "getPlaybackCapabilities", "startPlayback", "replanPlayback", "updatePlaybackProgress", "stopPlayback", "reportPlaybackRouteEvent",
     # Server setup, sign-in, and profiles (source/auth/).
@@ -132,7 +137,8 @@ def dump(value):
 openapi = json.loads(show(OPENAPI))
 schemas = openapi["components"]["schemas"]
 kept = {}
-pending = list(ROOTS)
+roots = ROOTS + [name for name in RESPONSE_ROOTS if name in schemas]
+pending = list(roots)
 while pending:
     name = pending.pop()
     if name in kept:
@@ -196,7 +202,7 @@ lines = [
     f"date: {date}",
     "synced by: scripts/sync-fixtures.sh",
     "files:",
-    f"  {OPENAPI} -> tests/fixtures/{SCHEMA_OUT} (schemas {', '.join(ROOTS)} and their references)",
+    f"  {OPENAPI} -> tests/fixtures/{SCHEMA_OUT} (schemas {', '.join(roots)} and their references)",
     f"  {OPENAPI} -> tests/fixtures/{OPERATIONS_OUT} (method, path, and query parameters of {', '.join(sorted(CATALOG))})",
     f"  {FIXTURES}/index.json -> tests/fixtures/{FIXTURE_OUT}/index.json (entries for {', '.join(sorted(OPERATIONS))})",
 ]
