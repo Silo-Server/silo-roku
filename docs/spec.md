@@ -451,7 +451,8 @@ their existing HD/FHD assets.
     them out. A menu open before the read lands is built again when it
     does, keeping its highlighted row. History always shows.
   - A divider separates groups only.
-  - Sign Out asks for confirmation (Sign Out / Cancel).
+  - Sign Out asks for confirmation (Cancel / Sign Out / Sign Out & Remove
+    Server).
 - **For You menu** (tvOS's `TVForYouDropdown`). The avatar menu's panel,
   460 px wide at y 132, centred under the tab within the side insets,
   headed "FOR YOU" in the library list's header style, then
@@ -632,7 +633,8 @@ their existing HD/FHD assets.
     (a white capsule with black text, top right).
   - Change server and Sign out, compact buttons 20 px apart, are pinned 60 px
     above the bottom edge, centred. The heading and grid are centred in the
-    space above them. Sign out asks for confirmation (Sign out / Cancel).
+    space above them. Sign out asks for confirmation (Sign out / Sign Out & Remove
+    Server / Cancel).
   - A list that fails to load shows the error as section 5.8 does, with Try
     again.
   - Focus starts on the profile last opened on this device, else the first.
@@ -2144,7 +2146,6 @@ Roku as it is, and the work package that builds the change deletes the row.
 | "This server isn't ready" marks its server card with a server glyph on a dark tile | The host's initial on the warm tile, as on sign-in | No icon art ships for it |
 | First-run headlines and the picker's title are set 2 px and 1.6 px tighter than the font | Inter at its own spacing | Roku `Label` has no letter-spacing field |
 | Compact buttons (the picker's buttons, PIN's Cancel, the address chips) are 57 px tall | 56 px, the top bar's tab capsule | Even heights scale to HD without half pixels, and the art is shared |
-| Sign Out's confirmation also offers "Sign Out & Remove Server" | Sign out and Cancel, in the avatar menu and on the picker alike; servers are removed from the saved servers list (section 5.4) | One place removes a server, and it names the server that takes its place |
 | Manage Servers has a trash button beside each server | A compact plain Remove beside each row, and Options (*) on the row | Roku has no trash icon art; Options is the remote's usual way to act on an item |
 | Change Server always opens the server list | It opens the saved servers only when another server is saved, otherwise address entry | A list holding only the current server would add a step before typing a new address |
 | The picker loads behind the wordmark, a spinner, and "Loading profiles…" on black | The 128 px spinner over the brand light | One spinner serves loading the list and reopening the last profile, so the screen does not change between them |
