@@ -870,7 +870,7 @@ sub scheduleWake()
     wake = sooner(wake, playback.slot.wakeAt(m.slot))
     item = m.current
     if item <> invalid and not item.assigned then wake = sooner(wake, playback.sidecars.waitUntil(item.sidecars, item.sidecarsAt))
-    if item <> invalid then wake = sooner(wake, playback.sidecars.nextRetryAt(item.sidecars))
+    if item <> invalid and not m.leaving then wake = sooner(wake, playback.sidecars.nextRetryAt(item.sidecars))
     m.wakeTimer.control = "stop"
     if wake = invalid then return
     delay = (wake - now) / 1000
@@ -1130,16 +1130,7 @@ sub playItem(item as Object, waitedMs as Dynamic)
     ' native subtitle) or by the playlist's DEFAULT (an HLS rendition), and
     ' checked once the content settles (confirmSubtitle).
     if playback.sidecars.isFile(item.track) then setSubtitleTrack(item.track)
-    ' A plan with no sidecar or stream track to check (Off, burned in, a
-    ' single HLS rendition, or one Roku lists no name for) leaves no
-    ' subtitle for the player to find not drawn (subtitleShows); an
-    ' embedded track Roku cannot be told to draw is not drawn.
-    if playback.media.unnamedEmbedded(item.plan)
-        log.warn(LOG_TAG, "the plan's embedded subtitle is no track Roku can be told to draw", invalid)
-        subtitleShows(false)
-    else if playback.media.subtitleArtifact(item.plan) = invalid and item.track = ""
-        subtitleShows(true)
-    end if
+    uncheckedShows(item.plan, item.track)
     m.video.control = "play"
     ' The load's startup stall clock starts now (playback.session).
     dispatch({ type: "assigned", load: item.load })
@@ -1403,8 +1394,10 @@ sub offerSidecars(item as Object, base as String)
 end sub
 
 ' Starts each lane's next queued sidecar while the lane has no download
-' running.
+' running. A player on its way out starts none: leavePlayer cancelled the
+' running ones, and a retry still waiting is not due any more.
 sub fetchSidecar(item as Object)
+    if m.leaving then return
     now = m.env.now()
     for each lane in [playback.sidecars.LANE_SELECTED, playback.sidecars.LANE_OTHERS]
         track = invalid
@@ -1773,6 +1766,19 @@ sub confirmSubtitle()
     m.recheckAt = m.env.now() + SUBTITLE_CHECK_MS
 end sub
 
+' A plan with no sidecar or stream track to check at path (Off, burned
+' in, a single HLS rendition, or one Roku lists no name for) leaves no
+' subtitle for the player to find not drawn (subtitleShows); an embedded
+' track Roku cannot be told to draw is not drawn.
+sub uncheckedShows(plan as Object, path as String)
+    if playback.media.unnamedEmbedded(plan)
+        log.warn(LOG_TAG, "the plan's embedded subtitle is no track Roku can be told to draw", invalid)
+        subtitleShows(false)
+    else if playback.media.subtitleArtifact(plan) = invalid and path = ""
+        subtitleShows(true)
+    end if
+end sub
+
 function subtitleDrawn() as Boolean
     return playback.sidecars.drawn(m.activeTrack, util.text(m.video.subtitleTrack), util.text(m.video.currentSubtitleTrack))
 end function
@@ -1892,10 +1898,12 @@ sub relistRenditions(listed as Dynamic)
     if check <> invalid and check.path = item.track
         if path = "" then m.subtitleCheck = invalid else check.path = path
     end if
-    ' One that gains a name after the settle check found none is checked
-    ' again at the next position report, and selected by it if Roku shows
-    ' another, as after a reload of a plan switched in place.
-    if item.track = "" and m.subtitleConfirmed
+    ' Any other is checked again at the next position report, and selected
+    ' by it if Roku shows another: one that gains a name after the settle
+    ' check found none, as after a reload of a plan switched in place, and
+    ' one Roku lists under another name than the one the settle check
+    ' confirmed.
+    if m.subtitleCheck = invalid and m.subtitleConfirmed
         m.subtitleConfirmed = false
         m.recheckAt = invalid
     end if
@@ -1981,7 +1989,13 @@ sub retrack(command as Object)
     if artifact <> invalid then selectedId = artifact.trackId
     for each track in item.sidecars
         track.selected = track.trackId = selectedId
+        ' Only the selected sidecar waits to be asked for again
+        ' (retryDelayMs); one no longer selected downloads in the others'
+        ' lane in its turn, which a wait the lane cannot start would spin
+        ' the wake timer on (nextRetryAt).
+        if not track.selected then track.retryAt = invalid
     end for
+    fetchSidecar(item)
     ' The file is the same, and so are the tracks Roku draws from it, as
     ' the new plan marks them.
     tracks = []
@@ -1999,12 +2013,7 @@ sub retrack(command as Object)
     end if
     item.track = path
     m.activeTrack = path
-    if playback.media.unnamedEmbedded(item.plan)
-        log.warn(LOG_TAG, "the plan's embedded subtitle is no track Roku can be told to draw", invalid)
-        subtitleShows(false)
-    else if path = "" and selectedId = ""
-        subtitleShows(true)
-    end if
+    uncheckedShows(item.plan, path)
     ' The viewer's choice, made whenever it comes; its own check replaces
     ' the one after the content settles. A rendition Roku lists no name for
     ' gets no write, which would leave Roku to pick its own.

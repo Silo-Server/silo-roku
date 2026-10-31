@@ -3713,8 +3713,8 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   reloads as for a sidecar. An `mkv/<id>` picked in Roku's `*` overlay is
   a `track_change` for the embedded row with that `container_track_id`:
   in place when the content plays it natively, else a reload, and Roku
-  draws its own copy until the plan arrives; one no row names is written
-  back.
+  draws its own copy until the plan arrives; one no row names, and the
+  plan's own row drawn from its sidecar, is written back.
 - Against a server that advertises `hls_subtitle_renditions_all_v1`, and
   only then, every start and replan sends that client feature too (beside
   `hls_subtitle_renditions_v1`, which every request sends, and
