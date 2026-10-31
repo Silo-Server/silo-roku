@@ -2132,6 +2132,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | tvOS's keyboard is full screen; Android TV's rises over the lower screen | A `DynamicKeyboard` panel covers the screen, with the address chips, Show/Hide, and Done below it | Roku sizes `DynamicKeyboard` itself; the panel keeps the text, voice entry, and shortcuts together |
 | The address keyboard has no shortcuts | Chips `https://`, `http://`, and `.com` under the keyboard (Android TV) | Typing a scheme on a Roku remote's keyboard is slow; the chips are one press each |
 | "Connect without encryption?" appears once the HTTP address has answered (Android TV) | It appears before the first plain-HTTP request | The setup check stores a server as soon as it answers, so the viewer agrees first |
+| "Connect without encryption?" is the system alert, with Connect first and highlighted (tvOS) | The app's own card (the sign-out dialog's) with Cancel and Connect side by side and Cancel highlighted; Back answers Cancel | Roku's stock dialog stacks the buttons and cannot be styled. Cancel is the safe default for a prompt about sending a password unencrypted |
 | An older server is an inline error on address entry | A "Server update required" screen, whose Change server returns to the typed address | Section 7.1 |
 | A server with neither password sign-in nor device sign-in offers only "Continue as" (network sign-in) | An explanation with Try again and Change server | No network sign-in on Roku (above) |
 | "Open {name} automatically?" is an alert over the picker, before Home | A dialog over Home, once Home has rendered | Choosing a profile moves the app to Home at once (section 6.2), and Home's loading and `AppLaunchComplete` never wait for the answer (AG-574) |
@@ -4014,7 +4015,8 @@ is):
 
 | Behaviour | Cohorts | Evidence |
 | --- | --- | --- |
-| Roku's keyboards, PIN pad, and the "Connect without encryption?" dialog speak themselves | All | None |
+| Roku's keyboards and PIN pad speak themselves | All | None |
+| The "Connect without encryption?" dialog says its title and message, then the highlighted button, and each button as the highlight moves, through `roAudioGuide` (as the sign-out dialog does) | All | None; not yet heard on a device |
 | Lists read each card's `audioGuideText` (title, season and episode, rating, year, runtime) and each profile's name, PIN, and Kids marks | All | None |
 | Custom controls say their label when focused, through `roAudioGuide`: setup and sign-in fields, the top bar and avatar menu, the library list, sort, alphabet rail, Search filter and result count, Detail's buttons (Versions, Audio Tracks, and Subtitles with their values), seasons, and menus, the player's controls with the position, Options tabs and rows (with "selected"), Skip Intro, Skip Recap, Skip Credits, Up Next, and the player error's buttons | All | None |
 | Setup, sign-in, the profile picker, and PIN say their inline errors as they appear | All | None |
