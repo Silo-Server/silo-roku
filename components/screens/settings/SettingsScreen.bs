@@ -84,7 +84,9 @@ sub init()
     styleLabel("footer", theme.textStyle.SETTINGS_BODY, theme.color.TEXT_TERTIARY)
     styleLabel("scrollHint", theme.textStyle.SETTINGS_BODY, theme.color.TEXT_TERTIARY)
     styleLabel("version", theme.textStyle.SETTINGS_BODY, theme.color.TEXT_TERTIARY)
-    m.railKeys = ["profile", "general", "playback", "subtitles", "server", "signOut"]
+    m.railKeys = ["profile", "general", "playback", "subtitles", "server", "diagnostics", "signOut"]
+    ' DiagnosticsTask's state as AppScene publishes it (AppSceneDiagnostics.bs).
+    m.diagnostics = {}
     for i = 0 to m.railKeys.Count() - 1
         m.rail.Push(makeRailRow(m.top.findNode("rail"), m.railKeys[i], i))
     end for
@@ -189,7 +191,8 @@ sub onShow(event as Object)
     scene = m.top.getScene()
     m.connection = scene.playbackConnection
     ' AppScene unsubscribes the screen's owner when it goes.
-    platform.subscribe(m.top.owner, [platform.topic.CONNECTION_STATUS], "onConnectionStatus")
+    platform.subscribe(m.top.owner, [platform.topic.CONNECTION_STATUS, platform.topic.DIAGNOSTICS_STATUS], "onConnectionStatus")
+    if util.isObject(scene.diagnosticsState) then m.diagnostics = scene.diagnosticsState
     ' The Connection rows read the connection again each visit.
     scene.callFunc("connectionRefresh")
     ' A pending save that was never confirmed belongs to an earlier visit.
@@ -296,6 +299,10 @@ end function
 
 ' AppScene's connection state changed: the Connection rows follow it.
 sub onConnectionStatus(event as Object)
+    if event.type = platform.topic.DIAGNOSTICS_STATUS
+        onDiagnosticsStatus(event.status)
+        return
+    end if
     m.connection = event.status
     if m.category <> "playback" then return
     if not sameConnectionRows()
@@ -536,6 +543,18 @@ sub showCategory()
             m.rowSections.Push("connection")
         end for
     end if
+    if m.category = "diagnostics"
+        row = makeRow(group, "diagnostics.send", false)
+        row.title.text = i18n.text("settings.diagnostics.send")
+        row.section.text = UCase(i18n.text("settings.section.diagnosticsReport"))
+        m.rows.Push(row)
+        row = makeRow(group, "diagnostics.erase", false)
+        row.title.text = i18n.text("settings.diagnostics.erase")
+        row.section.text = UCase(i18n.text("settings.section.diagnosticsSent"))
+        m.rows.Push(row)
+        m.rowSections.Append(["diagnosticsReport", "diagnosticsSent"])
+        diagnosticsValues()
+    end if
     if m.category = "server"
         row = makeRow(group, "server.address", false)
         row.title.text = i18n.text("settings.address")
@@ -651,6 +670,10 @@ function lastVisible(first as Integer) as Integer
 end function
 
 sub describeFocus()
+    if m.category = "diagnostics"
+        m.top.findNode("footer").setFields({ text: diagnosticsFooter(), color: theme.color.TEXT_TERTIARY })
+        return
+    end if
     if focusedLocalRow() = LAUNCH_ROW
         m.top.findNode("footer").setFields({ text: i18n.text(onboarding.launch.descriptionKey(launchBehavior())), color: theme.color.TEXT_TERTIARY })
         return
@@ -720,7 +743,7 @@ function onKeyEvent(key as String, press as Boolean) as Boolean
             if m.railAt < 0 then m.railAt = 0
             if m.railAt >= m.rail.Count() then m.railAt = m.rail.Count() - 1
             selected = m.railKeys[m.railAt]
-            if util.contains(["general", "playback", "subtitles", "server"], selected)
+            if util.contains(["general", "playback", "subtitles", "server", "diagnostics"], selected)
                 m.category = selected
                 showCategory()
             end if
@@ -758,6 +781,8 @@ function activate() as Boolean
     else if m.category = "server" and m.at = 1
         nav.changeServer()
         return true
+    else if m.category = "diagnostics"
+        return diagnosticsActivate()
     else if focusedLocalRow() = LAUNCH_ROW
         openLaunchPicker()
         return true
@@ -910,3 +935,88 @@ sub closeDialog()
     focusScreen()
     m.top.removeChild(dialog)
 end sub
+
+' Diagnostics (spec section 11.1): Send Diagnostics Now asks first, with the
+' consent notice, then AppScene's DiagnosticsTask sends the report; Delete
+' Sent Reports asks, then deletes this Roku's reports from the collector.
+' Each row's value follows the Task's state.
+
+function diagnosticsActivate() as Boolean
+    if m.diagnostics.stage = "sending" then return false
+    if m.at = 0
+        diagnosticsDialog("diagnostics.consent", false, "onDiagnosticsSend")
+        return true
+    end if
+    sent = m.diagnostics.sent
+    if type(sent) <> "roArray" or sent.Count() = 0 then return false
+    diagnosticsDialog("diagnostics.erase", true, "onDiagnosticsErase")
+    return true
+end function
+
+sub diagnosticsDialog(prefix as String, destructive as Boolean, callback as String)
+    m.dialog = m.top.createChild("SignOutDialog")
+    m.dialog.copy = { title: i18n.text(prefix + ".title"), message: i18n.text(prefix + ".message"), confirm: i18n.text(prefix + ".confirm"), cancel: i18n.text("diagnostics.cancel"), destructive: destructive }
+    m.dialog.observeField("choice", callback)
+    m.dialog.setFocus(true)
+end sub
+
+sub onDiagnosticsSend()
+    confirmed = m.dialog.choice = "confirm"
+    closeDialog()
+    if confirmed then m.top.getScene().callFunc("diagnosticsCommand", { action: "send", consent: "manual" })
+    diagnosticsRefresh()
+end sub
+
+sub onDiagnosticsErase()
+    confirmed = m.dialog.choice = "confirm"
+    closeDialog()
+    if confirmed then m.top.getScene().callFunc("diagnosticsCommand", { action: "erase" })
+    diagnosticsRefresh()
+end sub
+
+' platform.topic.DIAGNOSTICS_STATUS, through onConnectionStatus.
+sub onDiagnosticsStatus(status as Dynamic)
+    if not util.isObject(status) then return
+    m.diagnostics = status
+    if m.category <> "diagnostics" then return
+    diagnosticsRefresh()
+    if m.inPane and m.at = 0 then speak(m.rows[0].value.text, false)
+end sub
+
+sub diagnosticsRefresh()
+    if m.category <> "diagnostics" then return
+    diagnosticsValues()
+    paint()
+    describeFocus()
+end sub
+
+' Send's value: the report on its way, its reference once sent, or why it
+' was not; with nothing under way, whether the last exit goes with it.
+' Delete's value: how many sent reports this Roku can still delete.
+sub diagnosticsValues()
+    if m.rows.Count() < 2 then return
+    state = m.diagnostics
+    stage = util.text(state.stage)
+    sendText = ""
+    if stage = "sending"
+        sendText = i18n.text("settings.diagnostics.sending")
+    else if stage = "sent"
+        sendText = i18n.text("settings.diagnostics.sent", { reference: util.text(state.reference) })
+    else if stage = "failed"
+        sendText = i18n.text("settings.diagnostics.failed")
+    else if util.isObject(state.crash)
+        sendText = i18n.text("settings.diagnostics.withCrash")
+    end if
+    m.rows[0].value.text = sendText
+    count = 0
+    if type(state.sent) = "roArray" then count = state.sent.Count()
+    eraseText = i18n.text("settings.diagnostics.none")
+    if count > 0 then eraseText = i18n.text("settings.diagnostics.count", { count: count.ToStr() })
+    m.rows[1].value.text = eraseText
+end sub
+
+' The consent notice, or the last report's reference once one is sent.
+function diagnosticsFooter() as String
+    if util.text(m.diagnostics.stage) = "sent" then return i18n.text("settings.diagnostics.reference", { reference: util.text(m.diagnostics.reference) })
+    return i18n.text("settings.diagnostics.footer")
+end function

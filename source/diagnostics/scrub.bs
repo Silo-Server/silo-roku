@@ -1,0 +1,639 @@
+import "pkg:/source/util/redact.bs"
+
+' Makes log text safe for the hosted diagnostics collector, which refuses a
+' whole report when any string in it reads as an address, identifier,
+' credential, or private route (silo-diagnostics src/privacy.ts, the rules
+' each comment below names). redact.text() masks secrets first; what it keeps
+' is rewritten so no rule's pattern is left, keeping as much of the line as
+' the collector allows:
+'
+'   URLs and paths  https://redacted.invalid and the path; a path segment that
+'                   is a number or an ID becomes {id}; ? and # end the path
+'   addresses       IPv4, IPv6, MAC, and host:port become {ip}, {mac}, and
+'                   {addr}; @ becomes " at "
+'   identifiers     UUIDs and hex runs of 12 or more become {id}, as do words
+'                   like item_123 or session-ab12cd34; item_watched becomes
+'                   "item watched"
+'   assignments     a key the collector reserves (id, token, url, server, ...)
+'                   loses its value: "server: x" becomes "server {redacted}"
+'   numbers         7 or more digits are grouped (7_200_000), leading zeros
+'                   go, and a decimal's point becomes p (0p75)
+'   dotted words    main.bs becomes main·bs, which no longer reads as a host;
+'                   a middle dot, not _, so no new item_123-like word forms
+'   context words   server, url, connected, ... are shortened where the word
+'                   after them would read as a host or an address
+'   other           non-ASCII characters become ~
+'
+' Patterns are compiled once per thread, in m.diagScrub.
+namespace diag.scrub
+    ' Longer input is cut before it is rewritten, and the result after, at a
+    ' space, so the cut never splits a URL or a path (logline.schema msg).
+    const MAX_INPUT = 1600
+    const MAX_OUTPUT = 2000
+    ' privacy.ts PRIVATE_ID_IN_TEXT: these words, then _ or -, then digits or
+    ' eight or more word characters, read as an identifier.
+    const ID_PREFIXES = "(?:ps|playback|session|file|item|media|plan|attempt|profile|account|user|device|content|library|request|req|correlation|server|subtitle|track|run)"
+    ' The tokens of that shape the collector lets through (FORBIDDEN_KEYS and
+    ' SAFE_SEMANTIC_PREFIX_TOKENS).
+    const ID_EXCEPTIONS = "(?!(?:playback_session_ids?|plan_attempt_(?:id|key)|playback_attempt_id|(?:content|library|request|req|correlation|device)_identifier|server_instance(?:_id)?|file_not_found|plan_invalidated|playback_unavailable|request_cancelled|request_completed|session_unavailable)(?![A-Za-z0-9_-]))"
+    ' privacy.ts FORBIDDEN_KEYS: a key holding one of these, at word
+    ' boundaries, takes no value but a small number or a boolean.
+    const FORBIDDEN_KEYS = "|account|account_id|user|user_id|email|profile|profile_id|profile_token|cookie|authorization|auth|bearer|password|passwords|pass|passwd|passphrase|pwd|secret|secrets|api_key|apikey|credential|credentials|passcode|pin|otp|private_key|auth_token|access_token|refresh_token|client_secret|upload_token|server_url|base_url|origin_url|hostname|device_id|device_name|device_token|device_identifier|serial|serial_number|imei|meid|android_id|advertising_id|advertising_identifier|ad_id|aaid|gaid|vendor_id|vendor_identifier|identifier_for_vendor|idfa|idfv|mac|mac_address|ip|ip_address|ssid|bssid|uid_hash|route_hash|route_hashes|capture_session_id|session|session_id|playback|playback_id|playback_session|playback_session_id|playback_session_ids|plan|plan_id|plan_attempt|plan_attempt_id|plan_attempt_key|attempt|attempt_id|playback_attempt|playback_attempt_id|server|server_id|server_instance|server_instance_id|file|file_id|selected_file_id|effective_file_id|requested_file_id|media|media_id|media_file|media_file_id|selected_media_file_id|effective_media_file_id|requested_media_file_id|item|item_id|content_id|content_identifier|library_id|library_identifier|request_id|req_id|request_identifier|req_identifier|request_uuid|req_uuid|correlation_id|correlation_identifier|correlation_uuid|trace|trace_id|traceparent|trace_parent|span|span_id|transaction_id|transaction_identifier|subtitle|subtitle_id|track|track_id|host|jwt|key|login|origin|endpoint|address|sig|signature|token|tokens|url|username|"
+    ' privacy.ts CREDENTIAL_KEY_SEGMENTS, and the identifier segments of
+    ' hasIdentifierKeySemantics.
+    const CREDENTIAL_SEGMENTS = "|auth|authorization|bearer|credential|credentials|jwt|key|login|otp|pass|passcode|passphrase|passwd|password|passwords|pin|secret|secrets|sig|signature|token|tokens|username|"
+    const IDENTIFIER_SEGMENTS = "|id|ids|identifier|identifiers|uuid|uuids|"
+    ' privacy.ts hasBareNetworkIdentity: after one of these words, within
+    ' three words (CONNECTORS skipped), a word reads as a host; after a
+    ' NUMERIC_CONTEXT word, a number reads as an address. Each is renamed.
+    const CONTEXT_WORDS = "|address|backend|connect|connected|connecting|dns|endpoint|host|hostname|origin|peer|resolved|resolving|server|socket|url|"
+    const NUMERIC_CONTEXT_WORDS = "|destination|gateway|ip|ipv4|network|proxy|remote|target|upstream|"
+    const CONNECTORS = "|at|from|http|https|is|on|the|to|via|was|ws|wss|"
+    const NON_HOST_WORDS = "|aborted|because|closed|complete|completed|error|failed|failure|refused|reset|success|successfully|timeout|unavailable|unknown|without|with|"
+    const SERVER_STATE_WORDS = "|active|available|changed|changing|current|now|reachable|ready|returned|running|started|stopped|switched|unreachable|"
+    const SAFE_BACKENDS = "|avplayerhls|avplayernativedirect|playercoredirect|siloplayerloopback|"
+    ' Dotted names the collector accepts as they are (isAllowedDottedIdentifier).
+    const ALLOWED_DOTTED = "|redacted.invalid|manifest.json|device.json|logs.jsonl|breadcrumbs.jsonl|init.mp4|master.m3u8|playlist.m3u8|"
+
+    ' Any value as collector-safe text; non-strings become a type tag
+    ' (redact.text).
+    function text(input as Dynamic) as String
+        s = redact.text(input)
+        if Len(s) > MAX_INPUT then s = Left(s, MAX_INPUT)
+        if s = "" then return s
+        re = patterns()
+        s = re.nonAscii.ReplaceAll(s, "~")
+        ' Before paths: /123@x would otherwise keep a number segment.
+        s = s.Replace("@", " at ")
+        s = paths(s)
+        s = re.collectorToken.ReplaceAll(s, "{token}")
+        s = re.queryMarker.ReplaceAll(s, " {query} ")
+        s = re.bearer.ReplaceAll(s, "bearer-")
+        s = re.hardwareAddress.ReplaceAll(s, "{mac}")
+        s = re.ipv4.ReplaceAll(s, "{ip}")
+        s = re.ipv6Bracketed.ReplaceAll(s, "{ip}")
+        s = re.ipv6Expanded.ReplaceAll(s, "{ip}")
+        while Instr(1, s, "::") > 0
+            s = s.Replace("::", ":")
+        end while
+        s = re.uuid.ReplaceAll(s, "{id}")
+        s = re.hexRun.ReplaceAll(s, "{id}")
+        s = re.privateServer.ReplaceAll(s, "{id}")
+        s = re.privateId.ReplaceAll(s, "{id}")
+        s = privateWords(s)
+        s = re.hostPort.ReplaceAll(s, "{addr}")
+        s = assignments(s)
+        s = words(s)
+        ' Grouping digits can turn x:1234567 into a host and port.
+        s = re.hostPort.ReplaceAll(s, "{addr}")
+        if Len(s) > MAX_OUTPUT
+            cut = MAX_OUTPUT
+            while cut > 1 and Mid(s, cut, 1) <> " "
+                cut = cut - 1
+            end while
+            s = Left(s, cut - 1)
+        end if
+        return s
+    end function
+
+    ' Whether a key name is one the collector reserves for identities and
+    ' credentials (privacy.ts isForbiddenFieldKey), which then takes no value
+    ' but a small number or a boolean, and only when not reserved outright.
+    function isReservedKey(key as String) as Boolean
+        return keyClass(key) <> ""
+    end function
+
+    ' "" for an ordinary key; "contains" when the key contains a reserved word
+    ' (then a small number or boolean may follow); "exact" when it may hold no
+    ' value at all.
+    function keyClass(key as String) as String
+        normalized = normalizeKey(key)
+        if normalized = "" then return ""
+        segments = normalized.Split("_")
+        compact = normalized.Replace("_", "")
+        exact = Instr(1, FORBIDDEN_KEYS, "|" + normalized + "|") > 0 or isCompactForbidden(compact)
+        for each segment in segments
+            if Instr(1, CREDENTIAL_SEGMENTS, "|" + segment + "|") > 0 or Instr(1, IDENTIFIER_SEGMENTS, "|" + segment + "|") > 0 then exact = true
+        end for
+        if exact then return "exact"
+        ' Every run of whole segments, as containsNormalizedKey matches them.
+        count = segments.Count()
+        for first = 0 to count - 1
+            joined = ""
+            for last = first to count - 1
+                if last > first then joined = joined + "_"
+                joined = joined + segments[last]
+                if Instr(1, FORBIDDEN_KEYS, "|" + joined + "|") > 0 then return "contains"
+            end for
+        end for
+        return ""
+    end function
+
+    ' privacy.ts normalizeKey: camelCase to snake_case (aB, a1B, and ABc split
+    ' before the B), other runs to _, lower case.
+    function normalizeKey(key as String) as String
+        bytes = CreateObject("roByteArray")
+        bytes.FromAsciiString(key)
+        total = bytes.Count()
+        out = ""
+        gap = false
+        for i = 0 to total - 1
+            c = bytes[i]
+            if isAlnum(c)
+                if out <> "" and (gap or (isUpper(c) and i > 0 and (isLower(bytes[i - 1]) or isDigit(bytes[i - 1]) or (isUpper(bytes[i - 1]) and i + 1 < total and isLower(bytes[i + 1]))))) then out = out + "_"
+                out = out + Chr(c)
+                gap = false
+            else
+                gap = true
+            end if
+        end for
+        return LCase(out)
+    end function
+
+    function isUpper(c as Integer) as Boolean
+        return c >= 65 and c <= 90
+    end function
+
+    function isLower(c as Integer) as Boolean
+        return c >= 97 and c <= 122
+    end function
+
+    function isDigit(c as Integer) as Boolean
+        return c >= 48 and c <= 57
+    end function
+
+    function isAlnum(c as Integer) as Boolean
+        return isUpper(c) or isLower(c) or isDigit(c)
+    end function
+
+    ' A value the collector accepts after a key that merely contains a
+    ' reserved word (isSafeScalarCompoundPrivateAssignment): a number of up to
+    ' six digits, true, false, or none, followed by nothing or by another
+    ' assignment.
+    function isSafeScalarText(tail as String) as Boolean
+        re = patterns()
+        found = re.scalar.Match(tail)
+        if found.Count() = 0 then return false
+        return re.remainder.IsMatch(Mid(tail, Len(found[0]) + 1))
+    end function
+
+    function isCompactForbidden(compact as String) as Boolean
+        if m.diagCompactKeys = invalid
+            keys = {}
+            for each key in FORBIDDEN_KEYS.Split("|")
+                if key <> "" then keys[key.Replace("_", "")] = true
+            end for
+            m.diagCompactKeys = keys
+        end if
+        return m.diagCompactKeys.DoesExist(compact)
+    end function
+
+    ' URLs become https://redacted.invalid with their path made safe; a path
+    ' anywhere in the text keeps its plain segments. "//" outside a URL
+    ' becomes "/" (AUTHORITY_URI, PATH_IN_TEXT).
+    function paths(s as String) as String
+        slash = Instr(1, s, "/")
+        if slash = 0 then return s
+        out = ""
+        done = 1
+        total = Len(s)
+        while slash > 0
+            if slash > 1 and Mid(s, slash - 1, 1) = ":" and Mid(s, slash + 1, 1) = "/"
+                first = slash - 1
+                while first > done and redact.isSchemeChar(Asc(Mid(s, first - 1, 1)))
+                    first = first - 1
+                end while
+                last = runEnd(s, slash + 2, total)
+                rest = Mid(s, slash + 2, last - slash - 2)
+                cut = Instr(1, rest, "/")
+                path = ""
+                if cut > 0 then path = Mid(rest, cut)
+                out = out + Mid(s, done, first - done)
+                ' The URL starts its own run: glued to the text before it, it
+                ' would read as part of that word's scheme or path.
+                if out <> "" and runEnd(Right(out, 1), 1, 1) > 1 then out = out + " "
+                out = out + "https://redacted.invalid" + safePath(path)
+                done = last
+            else if Mid(s, slash + 1, 1) = "/"
+                out = out + Mid(s, done, slash - done)
+                done = slash + 1
+            else
+                last = schemeStart(s, slash, runEnd(s, slash, total))
+                out = out + Mid(s, done, slash - done) + safePath(Mid(s, slash, last - slash))
+                done = last
+            end if
+            if done > total then exit while
+            slash = Instr(done, s, "/")
+        end while
+        return out + Mid(s, done)
+    end function
+
+    ' Where a path run from start to last stops instead: at the scheme of a URL
+    ' inside it, which the next step rewrites as a URL.
+    function schemeStart(s as String, start as Integer, last as Integer) as Integer
+        sep = Instr(start + 1, s, "://")
+        if sep = 0 or sep >= last then return last
+        first = sep
+        while first > start + 1 and redact.isSchemeChar(Asc(Mid(s, first - 1, 1)))
+            first = first - 1
+        end while
+        return first
+    end function
+
+    ' The first position at or after start that ends a path or URL: white
+    ' space, quotes, angle brackets, or a backslash.
+    function runEnd(s as String, start as Integer, total as Integer) as Integer
+        at = start
+        while at <= total
+            c = Asc(Mid(s, at, 1))
+            if c <= 32 or c = 34 or c = 39 or c = 60 or c = 62 or c = 92 then return at
+            at = at + 1
+        end while
+        return total + 1
+    end function
+
+    ' A path whose segments the collector accepts (hasPrivatePathSegment):
+    ' the query and fragment are dropped, and a segment that is or holds a
+    ' number, a UUID, a hex or opaque run, or an ID word becomes {id}.
+    function safePath(path as String) as String
+        if path = "" then return ""
+        re = patterns()
+        cut = Instr(1, path, "?")
+        hash = Instr(1, path, "#")
+        if hash > 0 and (cut = 0 or hash < cut) then cut = hash
+        if cut > 0 then path = Left(path, cut - 1)
+        lower = LCase(path)
+        for each root in ["/users/", "/private/", "/var/mobile/", "/data/user/"]
+            if Left(lower, Len(root)) = root then return "/{path}"
+        end for
+        out = ""
+        segments = path.Split("/")
+        for i = 0 to segments.Count() - 1
+            if i > 0 then out = out + "/"
+            out = out + safeSegment(segments[i], re)
+        end for
+        ' An empty segment would leave // , which reads as a URL's authority.
+        while Instr(1, out, "//") > 0
+            out = out.Replace("//", "/")
+        end while
+        return out
+    end function
+
+    function safeSegment(segment as String, re as Object) as String
+        if segment = "" or re.template.IsMatch(segment) or re.version.IsMatch(segment) then return segment
+        ' A % would be decoded first, or refused when it does not decode.
+        segment = segment.Replace("%", "pct")
+        bare = re.segmentEdges.ReplaceAll(segment, "")
+        if bare = "" then return segment
+        candidates = [bare]
+        for each part in re.segmentSplit.Split(bare)
+            candidates.Push(part)
+        end for
+        for each candidate in candidates
+            if candidate <> "" and (re.uuid.IsMatch(candidate) or re.digits.IsMatch(candidate) or re.idSegment.IsMatch(candidate) or re.hexSegment.IsMatch(candidate) or re.opaqueSegment.IsMatch(candidate)) then return "{id}"
+        end for
+        return segment
+    end function
+
+    ' "key: value" or "key=value" where the key is reserved (hasPrivateAssignment):
+    ' the delimiter and the value become " {redacted}", unless the value is a
+    ' small number or a boolean the collector accepts after that key.
+    function assignments(s as String) as String
+        if Instr(1, s, ":") = 0 and Instr(1, s, "=") = 0 then return s
+        bytes = CreateObject("roByteArray")
+        bytes.FromAsciiString(s)
+        total = bytes.Count()
+        out = ""
+        done = 0
+        i = 0
+        while i < total
+            c = bytes[i]
+            nextAt = i + 1
+            if c = 58 or c = 61
+                keyEnd = i
+                while keyEnd > 0 and isSpace(bytes[keyEnd - 1])
+                    keyEnd = keyEnd - 1
+                end while
+                if keyEnd > 0 and (bytes[keyEnd - 1] = 34 or bytes[keyEnd - 1] = 39) then keyEnd = keyEnd - 1
+                keyStart = keyEnd
+                lowest = keyEnd - 96
+                if lowest < 0 then lowest = 0
+                while keyStart > lowest and isAssignmentChar(bytes[keyStart - 1])
+                    keyStart = keyStart - 1
+                end while
+                valueStart = i + 1
+                while valueStart < total and isSpace(bytes[valueStart])
+                    valueStart = valueStart + 1
+                end while
+                quote = 0
+                if valueStart < total and (bytes[valueStart] = 34 or bytes[valueStart] = 39)
+                    quote = bytes[valueStart]
+                    valueStart = valueStart + 1
+                end if
+                if keyStart < keyEnd and not (keyStart > 0 and isAssignmentChar(bytes[keyStart - 1])) and valueStart < total
+                    key = Mid(s, keyStart + 1, keyEnd - keyStart)
+                    kind = keyClass(key)
+                    if kind = "exact" or (kind = "contains" and not isSafeScalarText(Mid(s, valueStart + 1)))
+                        valueEnd = valueStart
+                        if quote <> 0
+                            while valueEnd < total and bytes[valueEnd] <> quote
+                                valueEnd = valueEnd + 1
+                            end while
+                            if valueEnd < total then valueEnd = valueEnd + 1
+                        else
+                            while valueEnd < total and not isValueEnd(bytes[valueEnd])
+                                valueEnd = valueEnd + 1
+                            end while
+                        end if
+                        out = out + Mid(s, done + 1, i - done) + " {redacted}"
+                        done = valueEnd
+                        nextAt = valueEnd
+                    end if
+                end if
+            end if
+            i = nextAt
+        end while
+        return out + Mid(s, done + 1)
+    end function
+
+    function isSpace(c as Integer) as Boolean
+        return c = 32 or (c >= 9 and c <= 13)
+    end function
+
+    ' privacy.ts ASSIGNMENT_CHARACTER: [A-Za-z0-9_.-]
+    function isAssignmentChar(c as Integer) as Boolean
+        return (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c = 95 or c = 46 or c = 45
+    end function
+
+    function isValueEnd(c as Integer) as Boolean
+        return isSpace(c) or c = 44 or c = 59 or c = 41 or c = 93 or c = 125 or c = 34 or c = 39
+    end function
+
+    ' The collector's words (NETWORK_TOKEN), rewritten one by one, then the
+    ' context words before a word that would read as a host renamed.
+    function words(s as String) as String
+        re = patterns()
+        found = re.word.MatchAll(s)
+        if found.Count() = 0 then return s
+        pieces = []
+        cursor = 1
+        for each match in found
+            raw = match[0]
+            at = Instr(cursor, s, raw)
+            pieces.Push(Mid(s, cursor, at - cursor))
+            pieces.Push(rewriteWord(raw, re))
+            cursor = at + Len(raw)
+        end for
+        pieces.Push(Mid(s, cursor))
+        out = ""
+        for each piece in pieces
+            out = out + piece
+        end for
+        ' The middle dots split words, so the context walk reads the result.
+        return context(out)
+    end function
+
+    function context(s as String) as String
+        found = patterns().word.MatchAll(s)
+        if found.Count() = 0 then return s
+        pieces = []
+        cursor = 1
+        for each match in found
+            raw = match[0]
+            at = Instr(cursor, s, raw)
+            pieces.Push(Mid(s, cursor, at - cursor))
+            pieces.Push(raw)
+            cursor = at + Len(raw)
+        end for
+        pieces.Push(Mid(s, cursor))
+        renameContext(pieces)
+        out = ""
+        for each piece in pieces
+            out = out + piece
+        end for
+        return out
+    end function
+
+    ' One word: dots become middle dots unless the name is allowed (a
+    ' decimal's point becomes p), and each part between them loses its
+    ' leading zeros, has 0x become hex, and has 7 or more digits grouped
+    ' (isDnsHostname, isBareLegacyNetworkAddress).
+    function rewriteWord(raw as String, re as Object) as String
+        core = raw
+        tail = ""
+        while core <> "" and (Right(core, 1) = "." or Right(core, 1) = "-")
+            tail = Right(core, 1) + tail
+            core = Left(core, Len(core) - 1)
+        end while
+        if core = "" then return raw
+        lower = LCase(core)
+        if Instr(1, ALLOWED_DOTTED, "|" + lower + "|") > 0 or re.segmentFile.IsMatch(lower) then return raw
+        parts = core.Split(".")
+        if parts.Count() = 2 and re.digits.IsMatch(parts[0]) and re.digits.IsMatch(parts[1]) then return number(parts[0]) + "p" + parts[1] + tail
+        out = ""
+        for i = 0 to parts.Count() - 1
+            if i > 0 then out = out + Chr(183)
+            out = out + number(parts[i])
+        end for
+        return out + tail
+    end function
+
+    ' A part of a word as the collector cannot read it as an address: digits
+    ' lose their leading zeros and 7 or more are grouped; 0x becomes hex.
+    ' The collector's word starts at the first letter or digit and drops
+    ' trailing hyphens, so those stay around the part it reads.
+    function number(part as String) as String
+        re = patterns()
+        lead = ""
+        while part <> "" and (Left(part, 1) = "_" or Left(part, 1) = "+" or Left(part, 1) = "-")
+            lead = lead + Left(part, 1)
+            part = Mid(part, 2)
+        end while
+        trail = ""
+        while part <> "" and Right(part, 1) = "-"
+            trail = "-" + trail
+            part = Left(part, Len(part) - 1)
+        end while
+        if re.digits.IsMatch(part)
+            while Len(part) > 1 and Left(part, 1) = "0"
+                part = Mid(part, 2)
+            end while
+            if Len(part) >= 7 then part = grouped(part)
+        else if re.hexNumber.IsMatch(part)
+            part = "hex" + Mid(part, 3)
+        end if
+        return lead + part + trail
+    end function
+
+    ' 7200000 as 7_200_000.
+    function grouped(digits as String) as String
+        out = ""
+        rest = digits
+        while Len(rest) > 3
+            out = "_" + Right(rest, 3) + out
+            rest = Left(rest, Len(rest) - 3)
+        end while
+        return rest + out
+    end function
+
+    ' The scanner's walk over the words (hasBareNetworkIdentity): a context
+    ' word followed by a host-like word, or a numeric context word followed by
+    ' a number, is renamed so neither reads as an address.
+    ' A renamed word is no longer a context word, so the walk repeats until
+    ' it renames nothing: "host is server x" renames server, then host.
+    sub renameContext(pieces as Object)
+        for pass = 1 to 8
+            state = { netLeft: 0, netAt: -1, netWord: "", numLeft: 0, numAt: -1, renamed: false }
+            for i = 1 to pieces.Count() - 1 step 2
+                word = scannerWord(pieces[i])
+                if word = "redacted.invalid"
+                    state.netLeft = 0
+                    state.numLeft = 0
+                else if word <> ""
+                    contextWord(pieces, i, word, state)
+                end if
+            end for
+            if not state.renamed then return
+        end for
+    end sub
+
+    sub contextWord(pieces as Object, at as Integer, word as String, state as Object)
+        if Instr(1, NUMERIC_CONTEXT_WORDS, "|" + word + "|") > 0
+            state.numLeft = 3
+            state.numAt = at
+            return
+        end if
+        isConnector = Instr(1, CONNECTORS, "|" + word + "|") > 0
+        if state.numLeft > 0
+            if isConnector
+                state.numLeft = state.numLeft - 1
+                return
+            end if
+            if patterns().digits.IsMatch(word) then rename(pieces, state.numAt, state)
+            state.numLeft = 0
+        end if
+        if Instr(1, CONTEXT_WORDS, "|" + word + "|") > 0
+            state.netLeft = 3
+            state.netAt = at
+            state.netWord = word
+            return
+        end if
+        if state.netLeft = 0 then return
+        if isConnector
+            state.netLeft = state.netLeft - 1
+            return
+        end if
+        quiet = Instr(1, NON_HOST_WORDS, "|" + word + "|") > 0
+        if state.netWord = "server" and Instr(1, SERVER_STATE_WORDS, "|" + word + "|") > 0 then quiet = true
+        if state.netWord = "backend" and Instr(1, SAFE_BACKENDS, "|" + word + "|") > 0 then quiet = true
+        if not quiet then rename(pieces, state.netAt, state)
+        state.netLeft = 0
+    end sub
+
+    ' Words like playback_completed, which read as an identifier, become
+    ' "playback completed" (PRIVATE_ID_IN_TEXT); identifiers with digits were
+    ' already {id}. A word may hold several, so the walk repeats.
+    function privateWords(s as String) as String
+        re = patterns()
+        for pass = 1 to 4
+            found = re.privateWord.MatchAll(s)
+            if found.Count() = 0 then return s
+            out = ""
+            cursor = 1
+            for each match in found
+                word = match[0]
+                at = locate(s, word, cursor)
+                if at = 0 then exit for
+                sep = 1
+                while sep <= Len(word) and Mid(word, sep, 1) <> "_" and Mid(word, sep, 1) <> "-"
+                    sep = sep + 1
+                end while
+                out = out + Mid(s, cursor, at - cursor) + Left(word, sep - 1) + " " + Mid(word, sep + 1)
+                cursor = at + Len(word)
+            end for
+            s = out + Mid(s, cursor)
+        end for
+        return s
+    end function
+
+    ' Where a whole word starts at or after start: not after a letter or
+    ' digit, and not before a letter, digit, _ or -. 0 when it does not occur.
+    function locate(s as String, word as String, start as Integer) as Integer
+        at = Instr(start, s, word)
+        while at > 0
+            before = 0
+            if at > 1 then before = Asc(Mid(s, at - 1, 1))
+            after = 0
+            if at + Len(word) <= Len(s) then after = Asc(Mid(s, at + Len(word), 1))
+            if not isAlnum(before) and not (isAlnum(after) or after = 95 or after = 45) then return at
+            at = Instr(at + 1, s, word)
+        end while
+        return 0
+    end function
+
+    sub rename(pieces as Object, at as Integer, state as Object)
+        pieces[at] = renamed(pieces[at])
+        state.renamed = true
+    end sub
+
+    ' A word as the scanner compares it: trailing dots and hyphens dropped,
+    ' lower case.
+    function scannerWord(piece as String) as String
+        core = piece
+        while core <> "" and (Right(core, 1) = "." or Right(core, 1) = "-")
+            core = Left(core, Len(core) - 1)
+        end while
+        return LCase(core)
+    end function
+
+    ' The short form of a context word, keeping its capital and its trailing
+    ' punctuation.
+    function renamed(piece as String) as String
+        names = { address: "addr", backend: "back-end", connect: "conn", connected: "linked", connecting: "linking", dns: "name-service", endpoint: "end-point", host: "hst", hostname: "host-name", origin: "orig", peer: "peer-node", resolved: "looked-up", resolving: "looking-up", server: "srv", socket: "sock", url: "link", destination: "dest", gateway: "gw", ip: "ip-addr", ipv4: "ipv4-addr", network: "net", proxy: "prx", remote: "rmt", target: "tgt", upstream: "up-stream" }
+        core = piece
+        tail = ""
+        while core <> "" and (Right(core, 1) = "." or Right(core, 1) = "-")
+            tail = Right(core, 1) + tail
+            core = Left(core, Len(core) - 1)
+        end while
+        short = names[LCase(core)]
+        if short = invalid then return piece
+        first = Asc(core)
+        if first >= 65 and first <= 90 then short = UCase(Left(short, 1)) + Mid(short, 2)
+        return short + tail
+    end function
+
+    function patterns() as Object
+        if m.diagScrub <> invalid then return m.diagScrub
+        m.diagScrub = {
+            nonAscii: CreateObject("roRegex", "[^\x00-\x7F]", ""),
+            collectorToken: CreateObject("roRegex", "sid[tu]_[A-Za-z0-9_-]{8,}", "i"),
+            queryMarker: CreateObject("roRegex", "[?&](?:token|signature|x-amz-credential|x-amz-signature)=", "i"),
+            bearer: CreateObject("roRegex", "(?<![A-Za-z0-9_])bearer[ \t]+(?=[A-Za-z0-9._~+/-]{6})", "i"),
+            hardwareAddress: CreateObject("roRegex", "(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])", ""),
+            ipv4: CreateObject("roRegex", "(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]{1,5})?(?![0-9])", ""),
+            ipv6Bracketed: CreateObject("roRegex", "\[[0-9A-Fa-f:]{2,}\](?::[0-9]{1,5})?", ""),
+            ipv6Expanded: CreateObject("roRegex", "(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![A-Za-z0-9_:])", ""),
+            uuid: CreateObject("roRegex", "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", ""),
+            hexRun: CreateObject("roRegex", "(?<![0-9A-Fa-f])[0-9A-Fa-f]{12,}(?![0-9A-Fa-f])", ""),
+            privateId: CreateObject("roRegex", "(?<![A-Za-z0-9])" + ID_EXCEPTIONS + ID_PREFIXES + "[_-](?=[A-Za-z0-9_-]*[0-9])(?:[0-9]+|[A-Za-z0-9][A-Za-z0-9_-]{7,})(?![A-Za-z0-9_-])", "i"),
+            privateWord: CreateObject("roRegex", "(?<![A-Za-z0-9])" + ID_EXCEPTIONS + ID_PREFIXES + "[_-][A-Za-z][A-Za-z_-]{7,}(?![A-Za-z0-9_-])", "i"),
+            hostPort: CreateObject("roRegex", "(?<![A-Za-z0-9_.-])(?!(?:line|status|width|height|duration_ms|bitrate_kbps|dropped_frames|audio_underruns):)[A-Za-z][A-Za-z0-9-]{0,62}:[0-9]{1,5}(?![0-9])", ""),
+            privateServer: CreateObject("roRegex", "(?<![A-Za-z0-9_])(?:host|server|srv)_[A-Za-z0-9_-]{8,}", "i"),
+            word: CreateObject("roRegex", "[A-Za-z0-9][A-Za-z0-9._+-]*", ""),
+            digits: CreateObject("roRegex", "^[0-9]+$", ""),
+            hexNumber: CreateObject("roRegex", "^0[xX][0-9A-Fa-f]+$", ""),
+            template: CreateObject("roRegex", "^\{[a-z][a-z0-9_]*\}$", ""),
+            version: CreateObject("roRegex", "^v[0-9]+$", "i"),
+            segmentEdges: CreateObject("roRegex", "^[(\[\]" + Chr(34) + "'.,;!:]+|[)\]" + Chr(34) + "'.,;!:]+$", ""),
+            segmentSplit: CreateObject("roRegex", "[.,;:()\[\]]+", ""),
+            segmentFile: CreateObject("roRegex", "^seg_[0-9]{6}\.m4s$", ""),
+            idSegment: CreateObject("roRegex", "^" + ID_PREFIXES + "[_-][a-z0-9_-]{4,}$", "i"),
+            hexSegment: CreateObject("roRegex", "^[a-f0-9]{16,}$", "i"),
+            opaqueSegment: CreateObject("roRegex", "^[a-z0-9_-]{20,}$", "i"),
+            scalar: CreateObject("roRegex", "^(?:-?[0-9]{1,6}|false|none|true)", "i"),
+            remainder: CreateObject("roRegex", "^[" + Chr(34) + "']?(?:[)\]}]+(?:\s*$|(?:[,;]\s*|\s*)[" + Chr(34) + "']?[A-Za-z][A-Za-z0-9_.-]{0,95}[" + Chr(34) + "']?\s*[:=]\s*\S)|\s*$|(?:\s+|[,;]\s*)[" + Chr(34) + "']?[A-Za-z][A-Za-z0-9_.-]{0,95}[" + Chr(34) + "']?\s*[:=]\s*\S)", "")
+        }
+        return m.diagScrub
+    end function
+end namespace

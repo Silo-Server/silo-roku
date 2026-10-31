@@ -1,0 +1,187 @@
+import "pkg:/source/diagnostics/scrub.bs"
+import "pkg:/source/util/redact.bs"
+
+' What a hosted diagnostics report says about itself and the device
+' (client-diagnostics v1 manifest.schema.json and device.schema.json), and
+' how Roku's record of the last exit becomes one. Pure but for the device
+' reads in device(), which run on the diagnostics Task.
+namespace diag.report
+    const PLATFORM_NAME = "roku"
+    const SCHEMA_VERSION = 1
+    ' The consent notice the Settings and crash prompt copy shows
+    ' (diagnostics.consent.* in locale/), which the collector must accept.
+    const NOTICE_VERSION = 1
+
+    ' The report type for a Roku exit code (roAppManager.GetLastExitInfo and
+    ' Main's lastExitOrTerminationReason), or "" for an exit that was not a
+    ' failure: the viewer left, the device slept or updated, or Roku records
+    ' no exit since it started.
+    function typeForExit(code as Dynamic) as String
+        name = UCase(redact.text(code))
+        if name = "EXIT_BRIGHTSCRIPT_CRASH" or name = "EXIT_BRIGHTSCRIPT_STOP" then return "crash"
+        if name = "EXIT_BRIGHTSCRIPT_TIMEOUT" or name = "EXIT_SIGNAL_TIMEOUT" then return "hang"
+        if Instr(1, "|EXIT_CHANNEL_MEM_LIMIT_FG|EXIT_CHANNEL_MEM_LIMIT_BG|EXIT_OUT_OF_MEMORY|EXIT_AM_LOWRESOURCE|EXIT_SYSTEM_KILL|EXIT_APP_ERROR|EXIT_NOT_RESUMED|EXIT_RUNNING_AFTER_SUSPEND|", "|" + name + "|") > 0 then return "abnormal_exit"
+        return ""
+    end function
+
+    ' The last exit as the report's crash object (manifest crash), or invalid
+    ' when it was not a failure. info is GetLastExitInfo()'s answer, reason
+    ' Main's lastExitOrTerminationReason, used when info has no code.
+    function crashOf(info as Dynamic, reason as Dynamic) as Dynamic
+        code = ""
+        if type(info) = "roAssociativeArray" then code = redact.text(info.exit_code)
+        if code = "" or UCase(code) = "EXIT_UNKNOWN" then code = redact.text(reason)
+        kind = typeForExit(code)
+        if kind = "" then return invalid
+        summary = "Roku ended Silo with " + UCase(code)
+        crash = { type: kind, code: UCase(code), summary: summary, source: "exit_info", provenance: "post_restart", occurred_at: "", foreground: true }
+        if type(info) = "roAssociativeArray"
+            stamp = redact.text(info.timestamp)
+            if isTimestamp(stamp) then crash.occurred_at = stamp
+            if LCase(redact.text(info.app_state)) = "background" then crash.foreground = false
+            if redact.isNumber(info.mem_limit) then crash.summary = crash.summary + " over its " + info.mem_limit.ToStr() + " MB memory limit"
+            if redact.isString(info.media_player_state) and info.media_player_state <> "" then crash.summary = crash.summary + ", media " + LCase(info.media_player_state)
+            console = redact.text(info.console_log)
+            if console <> "" then crash.stack_excerpt = Left(diag.scrub.text(console), 4000)
+        end if
+        crash.summary = diag.scrub.text(crash.summary)
+        return crash
+    end function
+
+    ' RFC 3339 UTC, as the schema's date-time asks.
+    function isTimestamp(text as String) as Boolean
+        return CreateObject("roRegex", "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?Z$", "").IsMatch(text)
+    end function
+
+    ' The manifest without archive: what manifest.json in the bundle holds.
+    ' facts: { capturedAt, run, appVersion, appBuild, osVersion, collectorId,
+    ' consent ("manual" or "prompt"), crash (crashOf, or invalid), summary
+    ' (device().summary), lines, logBytes, dropped, categories }.
+    function manifest(facts as Object) as Object
+        kind = "manual"
+        if facts.crash <> invalid then kind = facts.crash.type
+        out = {
+            schema_version: SCHEMA_VERSION,
+            report: { type: kind, captured_at: facts.capturedAt, capture_session_id: facts.run, app_version: facts.appVersion, app_build: facts.appBuild, platform: PLATFORM_NAME, os_version: facts.osVersion },
+            destination: { server_instance_id: facts.collectorId },
+            consent: { mode: facts.consent, notice_version: NOTICE_VERSION },
+            device_summary: facts.summary,
+            playback_session_ids: [],
+            log_summary: { lines: facts.lines, bytes_gz: facts.logBytes, dropped_lines: facts.dropped, categories: facts.categories, debug_logging: true }
+        }
+        if facts.crash <> invalid
+            crash = { summary: facts.crash.summary, source: facts.crash.source, provenance: facts.crash.provenance, occurred_at: facts.crash.occurred_at, foreground: facts.crash.foreground, thread: "main" }
+            if crash.occurred_at = "" then crash.occurred_at = facts.capturedAt
+            if facts.crash.stack_excerpt <> invalid then crash.stack_excerpt = facts.crash.stack_excerpt
+            out.crash = crash
+        end if
+        return out
+    end function
+
+    ' The log_summary categories present in logs.jsonl text.
+    function categories(text as String) as Object
+        found = []
+        for each name in ["playback", "focus", "network", "lifecycle", "browse", "cast", "download", "crash", "other"]
+            if Instr(1, text, Chr(34) + "cat" + Chr(34) + ":" + Chr(34) + name + Chr(34)) > 0 then found.Push(name)
+        end for
+        return found
+    end function
+
+    ' This Roku and its display as device.json (device.schema.json) and the
+    ' manifest's device_summary: { device, summary, osVersion }. No serial,
+    ' advertising ID, user-set device name, network names, or addresses.
+    ' provenance is "pre_failure" for a manual report, "post_restart" for one
+    ' about the last exit.
+    function device(capturedAt as String, provenance as String) as Object
+        info = CreateObject("roDeviceInfo")
+        os = info.GetOSVersion()
+        osVersion = os.major + "." + os.minor + "." + os.revision
+        details = info.GetModelDetails()
+        vendor = ""
+        modelNumber = ""
+        if type(details) = "roAssociativeArray"
+            vendor = redact.text(details.VendorName)
+            modelNumber = redact.text(details.ModelNumber)
+        end if
+        if vendor = "" then vendor = "Roku"
+        model = info.GetModel()
+        if modelNumber <> "" and modelNumber <> model then model = modelNumber + " (" + model + ")"
+        formFactor = "streaming player"
+        if info.GetModelType() = "TV" then formFactor = "tv"
+        summary = { manufacturer: safe(vendor), model: safe(model), os: osVersion, form_factor: formFactor }
+
+        identity = { manufacturer: safe(vendor), model: safe(model), model_name: safe(info.GetModelDisplayName()), model_type: safe(info.GetModelType()), os_version: osVersion, os_build: safe(os.build), graphics: safe(info.GetGraphicsPlatform()), locale: safe(info.GetCurrentLocale()), country: safe(info.GetCountryCode()) }
+        app = CreateObject("roAppInfo")
+        identity.app_version = safe(app.GetVersion())
+        identity.sideloaded = app.IsDev()
+        memoryMonitor = CreateObject("roAppMemoryMonitor")
+        if memoryMonitor <> invalid
+            limits = memoryMonitor.GetChannelMemoryLimit()
+            if type(limits) = "roAssociativeArray" then identity.memory_limits = numbersOf(limits)
+            identity.memory_used_percent = memoryMonitor.GetMemoryLimitPercent()
+            identity.memory_available_kb = memoryMonitor.GetChannelAvailableMemory()
+        end if
+        identity.general_memory = safe(info.GetGeneralMemoryLevel())
+
+        properties = info.GetDisplayProperties()
+        ui = info.GetUIResolution()
+        displaySize = info.GetDisplaySize()
+        display = { type: safe(info.GetDisplayType()), video_mode: safe(info.GetVideoMode()), display_mode: safe(info.GetDisplayMode()), aspect: safe(info.GetDisplayAspectRatio()), ui_resolution: safe(ui.name) }
+        if type(displaySize) = "roAssociativeArray" and redact.isNumber(displaySize.w) and redact.isNumber(displaySize.h) then display.size = displaySize.w.ToStr() + "x" + displaySize.h.ToStr()
+        if type(properties) = "roAssociativeArray"
+            hdr = []
+            for each name in ["Hdr10", "Hdr10Plus", "HLG", "DolbyVision"]
+                if properties[name] = true then hdr.Push(name)
+            end for
+            display.hdr_types = hdr
+            if redact.isNumber(properties.Width) then display.width_cm = properties.Width
+            if redact.isNumber(properties.Height) then display.height_cm = properties.Height
+        end if
+        display.caption_mode = safe(info.GetCaptionsMode())
+
+        audio = { output_channel: safe(info.GetAudioOutputChannel()), audio_guide: info.IsAudioGuideEnabled() }
+        decoders = {}
+        for each codec in ["aac", "ac3", "eac3", "dts", "truehd", "mp3", "flac", "opus", "vorbis", "alac", "lpcm"]
+            answer = info.CanDecodeAudio({ Codec: codec })
+            if type(answer) = "roAssociativeArray" then decoders[codec] = answer.result = true
+        end for
+        audio.decoders = decoders
+
+        codecs = []
+        for each codec in [{ name: "mpeg4 avc", profiles: ["main", "high"] }, { name: "hevc", profiles: ["main", "main 10"] }, { name: "vp9", profiles: ["profile 0", "profile 2"] }, { name: "av1", profiles: ["main"] }, { name: "mpeg2", profiles: ["main"] }]
+            entry = { codec: codec.name }
+            answer = info.CanDecodeVideo({ Codec: codec.name })
+            entry.supported = type(answer) = "roAssociativeArray" and answer.result = true
+            supported = []
+            for each profile in codec.profiles
+                answer = info.CanDecodeVideo({ Codec: codec.name, Profile: profile })
+                if type(answer) = "roAssociativeArray" and answer.result = true then supported.Push(profile)
+            end for
+            entry.profiles = supported
+            codecs.Push(entry)
+        end for
+
+        transport = "other"
+        connection = info.GetConnectionType()
+        if connection = "WiredConnection" then transport = "ethernet"
+        if connection = "WiFiConnection" then transport = "wifi"
+        network = { transport: transport, link: info.GetLinkStatus() }
+
+        snapshot = { captured_at: capturedAt, provenance: provenance, identity: identity, display: display, audio: audio, video_codecs: codecs, network: network }
+        return { device: snapshot, summary: summary, osVersion: osVersion }
+    end function
+
+    function safe(value as Dynamic) as String
+        text = diag.scrub.text(Left(redact.text(value), 120))
+        if text = "" then return "unknown"
+        return text
+    end function
+
+    function numbersOf(values as Object) as Object
+        out = {}
+        for each key in values
+            if redact.isNumber(values[key]) then out[LCase(key)] = values[key]
+        end for
+        return out
+    end function
+end namespace
