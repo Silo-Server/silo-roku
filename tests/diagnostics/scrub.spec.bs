@@ -1,0 +1,118 @@
+namespace tests
+
+    @suite("diag.scrub")
+    class DiagnosticsScrubTests extends rooibos.BaseTestSuite
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("text")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("keeps plain words and small numbers")
+        sub _()
+            m.assertEqual(diag.scrub.text("start failed status=404 ms=120"), "start failed status=404 ms=120")
+        end sub
+
+        @it("points URLs at redacted.invalid and keeps their plain path words")
+        sub _()
+            m.assertEqual(diag.scrub.text("GET https://silo.example:8096/api/v2/items/0f6b1c2e-3d4a-4b5c-8d9e-0a1b2c3d4e5f/playback?x=1 done"), "GET https://redacted.invalid/api/v2/items/<redacted> done")
+            m.assertEqual(diag.scrub.text("at https://silo.example/api/v2/catalog/items/12/seasons?x=1 done"), "at https://redacted.invalid/api/v2/catalog/items/<redacted> done")
+            m.assertEqual(diag.scrub.text("/a#x https://h.example/b"), "/a https://redacted.invalid/b")
+            m.assertEqual(diag.scrub.text("see //cdn.example/a"), "see /cdn·example/a")
+        end sub
+
+        @it("replaces number and ID segments in bare paths")
+        sub _()
+            m.assertEqual(diag.scrub.text("/api/v2/catalog/items/123/seasons"), "/api/v2/catalog/items/{id}/seasons")
+            m.assertEqual(diag.scrub.text("episode 1/2"), "episode 1/{id}")
+            m.assertEqual(diag.scrub.text("/Users/someone/file"), "/{path}")
+        end sub
+
+        @it("replaces addresses")
+        sub _()
+            m.assertEqual(diag.scrub.text("from 10.0.0.145:8060 now"), "from {ip} now")
+            m.assertEqual(diag.scrub.text("mac 00:1a:2b:3c:4d:5e"), "mac {mac}")
+            m.assertEqual(diag.scrub.text("v6 [fe80::1]:80 and fe80::1"), "v6 {ip} and {addr}")
+            m.assertEqual(diag.scrub.text("nas:8096 up"), "{addr} up")
+            m.assertEqual(diag.scrub.text("status:200 line:4"), "status:200 line:4")
+            m.assertEqual(diag.scrub.text("mail me@example.com"), "mail me at example·com")
+        end sub
+
+        @it("replaces identifiers and splits identifier-shaped words")
+        sub _()
+            m.assertEqual(diag.scrub.text("item 0f6b1c2e-3d4a-4b5c-8d9e-0a1b2c3d4e5f gone"), "item {id} gone")
+            m.assertEqual(diag.scrub.text("hash 0123456789abcdef0123"), "hash {id}")
+            m.assertEqual(diag.scrub.text("track_2 and session-ab12cd34ef"), "{id} and {id}")
+            m.assertEqual(diag.scrub.text("playback_session_expired"), "playback session_expired")
+            m.assertEqual(diag.scrub.text("request_completed file_not_found"), "request_completed file_not_found")
+        end sub
+
+        @it("drops the values of reserved keys")
+        sub _()
+            m.assertEqual(diag.scrub.text("server: home lane=a"), "srv {redacted} lane=a")
+            m.assertEqual(diag.scrub.text(`{"requestId":"r1","status":200}`), `{"requestId" {redacted},"status":200}`)
+            m.assertEqual(diag.scrub.text("playbackPosition=1200"), "playbackPosition=1200")
+            m.assertEqual(diag.scrub.text("playbackPosition=1200 ms"), "playbackPosition {redacted} ms")
+            m.assertEqual(diag.scrub.text("attempt=2"), "attempt {redacted}")
+        end sub
+
+        @it("rewrites numbers and dotted words")
+        sub _()
+            m.assertEqual(diag.scrub.text("took 7200000 ms"), "took 7_200_000 ms")
+            m.assertEqual(diag.scrub.text("ratio 0.75 at 05"), "ratio 0p75 at 5")
+            m.assertEqual(diag.scrub.text("Roku OS 15.3.4 in main.bs"), "Roku OS 15·3·4 in main·bs")
+            m.assertEqual(diag.scrub.text("code 0x1F"), "code hex1F")
+            m.assertEqual(diag.scrub.text("loaded master.m3u8"), "loaded master.m3u8")
+        end sub
+
+        @it("shortens context words before a word that reads as a host")
+        sub _()
+            m.assertEqual(diag.scrub.text("server too old"), "srv too old")
+            m.assertEqual(diag.scrub.text("Server changed"), "Server changed")
+            m.assertEqual(diag.scrub.text("connected to Silo"), "linked to Silo")
+            m.assertEqual(diag.scrub.text("connection failed"), "connection failed")
+            m.assertEqual(diag.scrub.text("network 2 up"), "net 2 up")
+        end sub
+
+        @it("masks secrets and non-ASCII text")
+        sub _()
+            m.assertEqual(diag.scrub.text("Bearer abcdef123456"), "Bearer <redacted>")
+            m.assertEqual(diag.scrub.text("Müller"), "M~ller")
+        end sub
+
+        @it("cuts long input before it rewrites it")
+        sub _()
+            text = ""
+            for i = 1 to 400
+                text = text + "word "
+            end for
+            out = diag.scrub.text(text)
+            m.assertEqual(Len(out), diag.scrub.MAX_INPUT)
+            m.assertEqual(Left(out, 5), "word ")
+        end sub
+
+        @it("keeps the scanner's words apart after rewriting dots")
+        sub _()
+            ' url·session reads as "url session", where session would be a host.
+            m.assertEqual(diag.scrub.text("url.session"), "link" + Chr(183) + "session")
+            m.assertEqual(diag.scrub.text("m3u8._05 0x1f-ab"), "m3u8" + Chr(183) + "_5 0x1f-ab")
+            m.assertEqual(diag.scrub.text("/123@x"), "/{id} at x")
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("keyClass")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("sorts keys as the collector does")
+        sub _()
+            m.assertEqual(diag.scrub.keyClass("status"), "")
+            m.assertEqual(diag.scrub.keyClass("requestId"), "exact")
+            m.assertEqual(diag.scrub.keyClass("url"), "exact")
+            m.assertEqual(diag.scrub.keyClass("refreshToken"), "exact")
+            m.assertEqual(diag.scrub.keyClass("playbackPosition"), "contains")
+            m.assertEqual(diag.scrub.keyClass("HTTPServerName"), "contains")
+            m.assertEqual(diag.scrub.normalizeKey("HTTPServerName"), "http_server_name")
+        end sub
+
+    end class
+
+end namespace

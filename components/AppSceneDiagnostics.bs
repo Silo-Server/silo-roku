@@ -1,0 +1,143 @@
+import "pkg:/source/nav/stack.bs"
+import "pkg:/source/platform/topics.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' AppScene's diagnostics side (spec section 11.1). Every thread's log calls
+' arrive here through the roRenderThreadQueue (source/util/log.bs), without
+' a rendezvous; this keeps them in order and hands them to DiagnosticsTask
+' every half second, at once for a warning or an error, and when
+' FLUSH_ENTRIES wait: a crash loses what still waits here. Until the Task
+' observes its fields they wait here, the oldest dropped past MAX_PENDING.
+' The Task's state reaches subscribers as platform.topic.DIAGNOSTICS_STATUS
+' and AppScene.diagnosticsState; diagnosticsCommand() carries Settings' and
+' the crash prompt's choices to it.
+
+const FLUSH_ENTRIES = 64
+const MAX_PENDING = 2000
+' A heartbeat line every this many flushes (half seconds): memory, the screen on
+' top, and how many are built, so the log before an exit Roku forced shows
+' how memory went.
+const HEARTBEAT_FLUSHES = 120
+
+' First in init, so the log hears every screen's start.
+sub diagnosticsInit()
+    m.diagPending = []
+    m.diagDropped = 0
+    m.diagQueue = CreateObject("roRenderThreadQueue")
+    if m.diagQueue <> invalid then m.diagHandler = m.diagQueue.AddMessageHandler(log.DIAGNOSTICS_MESSAGE, "onDiagnosticsLog")
+    m.diagTask = CreateObject("roSGNode", "DiagnosticsTask")
+    m.diagTimer = m.top.findNode("diagnosticsTimer")
+    m.diagTimer.observeField("fire", "onDiagnosticsTick")
+    m.diagTicks = 0
+    m.diagCommand = invalid
+    m.diagCommandTimer = m.top.findNode("diagnosticsCommandTimer")
+    m.diagCommandTimer.observeField("fire", "onDiagnosticsCommandDue")
+end sub
+
+sub onDiagnosticsTick()
+    m.diagTicks = m.diagTicks + 1
+    if m.diagTicks mod HEARTBEAT_FLUSHES = 0 then diagnosticsHeartbeat()
+    diagnosticsFlush()
+end sub
+
+sub diagnosticsHeartbeat()
+    fields = { screens: m.navScreens.Count(), route: "" }
+    top = nav.stack.topEntry(m.navStack)
+    if top <> invalid then fields.route = top.route
+    if m.diagMemory = invalid then m.diagMemory = CreateObject("roAppMemoryMonitor")
+    if m.diagMemory <> invalid
+        fields.memoryPercent = m.diagMemory.GetMemoryLimitPercent()
+        fields.availableKb = m.diagMemory.GetChannelAvailableMemory()
+    end if
+    log.info("app", "heartbeat", fields)
+end sub
+
+' Last in init: the Task's state goes to subscribers (AppScenePlatform.bs).
+sub diagnosticsStart()
+    m.diagTask.observeField("ready", "onDiagnosticsReady")
+    m.diagTask.observeField("status", "onDiagnosticsState")
+    m.diagTask.control = "run"
+end sub
+
+' roRenderThreadQueue handler for each log call. Kept short: it runs on the
+' render thread between frames.
+sub onDiagnosticsLog(entry as Object, _info as Object)
+    m.diagPending.Push(entry)
+    if m.diagPending.Count() > MAX_PENDING
+        m.diagPending.Shift()
+        m.diagDropped = m.diagDropped + 1
+    end if
+    if m.diagPending.Count() >= FLUSH_ENTRIES or entry.level = "warn" or entry.level = "error" then diagnosticsFlush()
+end sub
+
+sub onDiagnosticsReady()
+    if m.diagTask.ready then m.diagTimer.control = "start"
+    diagnosticsFlush()
+end sub
+
+sub diagnosticsFlush()
+    if not m.diagTask.ready or m.diagPending.Count() = 0 then return
+    batch = { entries: m.diagPending }
+    if m.diagDropped > 0 then batch.dropped = m.diagDropped
+    m.diagPending = []
+    m.diagDropped = 0
+    m.diagTask.entries = batch
+end sub
+
+' Main's lastExitOrTerminationReason, for a Roku that keeps no exit record.
+sub diagnosticsLaunch(event as Object)
+    m.diagTask.launch = { reason: event.lastExitOrTerminationReason }
+end sub
+
+' callFunc("diagnosticsCommand", { action, consent }). The command waits
+' a moment: lines logged in the same call as the request reach the queue's
+' handler only after it returns, and a report should hold them. Then the
+' lines waiting here go first (DiagnosticsTask.command).
+sub diagnosticsCommand(input as Object)
+    m.diagCommand = input
+    m.diagCommandTimer.control = "start"
+end sub
+
+sub onDiagnosticsCommandDue()
+    if m.diagCommand = invalid then return
+    command = m.diagCommand
+    m.diagCommand = invalid
+    diagnosticsFlush()
+    m.diagTask.command = command
+end sub
+
+sub onDiagnosticsState()
+    state = m.diagTask.status
+    if not util.isObject(state) or state.IsEmpty() then return
+    previous = m.top.diagnosticsState
+    m.top.diagnosticsState = state
+    ' A report the crash prompt sent says so over every screen.
+    if util.isObject(previous) and previous.stage = "sending" and state.consent = "prompt"
+        if state.stage = "sent"
+            showNotice(i18n.text("diagnostics.notice.sent", { reference: util.text(state.reference) }))
+        else if state.stage = "failed"
+            showNotice(i18n.text("diagnostics.notice.failed"))
+        end if
+    end if
+    event = { type: platform.topic.DIAGNOSTICS_STATUS, status: state }
+    platformPublish(event)
+end sub
+
+#if debug
+    ' Development builds: ECP launch or input parameters
+    ' diagnosticsCollector=<base URL> send this launch's reports to a local
+    ' collector, diagnosticsSend=manual or prompt sends one now, and
+    ' diagnosticsCrash=1 stops the app on a runtime error, for the crash
+    ' report the next launch offers (README, Diagnostics).
+    sub diagnosticsDevConfig(event as Object)
+        if util.isString(event.diagnosticsCollector) then m.diagTask.config = { collector: event.diagnosticsCollector }
+        if util.isString(event.diagnosticsSend) then diagnosticsCommand({ action: "send", consent: event.diagnosticsSend })
+        if util.isString(event.diagnosticsCrash)
+            log.error("diagnostics", "stopping on a runtime error for a test crash")
+            missing = invalid
+            missing.crash()
+        end if
+    end sub
+#end if

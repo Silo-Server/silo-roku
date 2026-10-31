@@ -54,7 +54,7 @@ SHARDS = [
     ("player-captions", ["player/captions.spec.bs"]),
     ("detail-personal", ["views/detailPersonal.spec.bs"]),
     ("player-sidecars", ["player/captionSidecars.spec.bs", "api", "deeplink", "dev", "memory", "nav", "platform"]),
-    ("detail", ["views/detailScreen.spec.bs", "onboarding", "storage", "theme", "util", "smoke.spec.bs"]),
+    ("detail", ["views/detailScreen.spec.bs", "onboarding", "storage", "theme", "util", "diagnostics", "smoke.spec.bs"]),
     ("detail-tracks", ["views/detailTracks.spec.bs", "auth", "control"]),
     ("views", ["views"]),
     ("player", ["player"]),
