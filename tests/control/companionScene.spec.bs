@@ -2,12 +2,19 @@ namespace tests
 
     ' AppScene's companion receiver (components/AppSceneCompanion.bs)
     ' through CompanionProbe: what it does when the session changes under a
-    ' phone's sign-in.
+    ' phone's sign-in, and how it follows the sign-in screen's code.
     @suite("companion receiver")
     class CompanionReceiverTests extends rooibos.BaseTestSuite
 
         function server() as Object
             return { url: "https://silo.example", name: "Home", identity: "srv-1", endpoints: [] }
+        end function
+
+        ' The sign-in screen's report (SignInScreen reportCode).
+        function code(status as String, userCode as String) as Object
+            matchCode = ""
+            if userCode <> "" then matchCode = "warm pony"
+            return { status: status, userCode: userCode, matchCode: matchCode }
         end function
 
         function gone() as Object
@@ -48,13 +55,13 @@ namespace tests
             m.assertEqual([state.stage, state.routes, state.phone, state.consented], ["idle", [nav.route.SIGN_IN], "", false])
         end sub
 
-        @describe("a password sign-in that finished first")
+        @describe("a session published while the server screen's poll is in flight")
 
         @it("keeps the receiver for the poll in flight, and takes no other push")
         sub _()
             probe = CreateObject("roSGNode", "CompanionProbe")
             m.assertEqual(probe.callFunc("probeWaiting").sent, ["companionPoll"])
-            m.assertEqual(probe.callFunc("probeSignedIn").mode, "login")
+            m.assertEqual(probe.callFunc("probeSignedIn").mode, "setup")
             state = probe.callFunc("probePush", m.server())
             m.assertEqual(state.sent, ["companionPoll"])
             m.assertEqual(state.routes, [nav.route.PROFILE])
@@ -62,8 +69,8 @@ namespace tests
             m.assertEqual([state.mode, state.stage, state.routes], ["", "idle", [nav.route.PROFILE]])
         end sub
 
-        ' The server answered before the sign-in, and the answer arrived
-        ' after the session that sign-in published.
+        ' The server answered before the session changed, and the answer
+        ' arrived after it.
         @it("stops the receiver on any other answer that poll gives, without showing it")
         sub _()
             answers = [{ status: "denied", pollAfter: 0 }, { status: "expired", pollAfter: 0 }, { status: "pending", pollAfter: 0 }]
@@ -92,7 +99,71 @@ namespace tests
             probe.callFunc("probeWaiting")
             probe.callFunc("probeSignedIn")
             state = probe.callFunc("probePolled", { requestId: "c1", ok: true, status: 200, headers: {}, body: { status: "approved", pollAfter: 0 } })
-            m.assertEqual([state.mode, state.stage], ["login", "signedIn"])
+            m.assertEqual([state.mode, state.stage], ["setup", "signedIn"])
+        end sub
+
+        @describe("the sign-in screen's code, which the phone confirms")
+
+        @it("sends the phone the code on screen and starts no login of its own")
+        sub _()
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            state = probe.callFunc("probeRelay", m.code("waiting", "4821-7730"))
+            m.assertEqual([state.stage, state.sent], ["code", []])
+            m.assertEqual([state.heard.type, state.heard.userCode, state.heard.matchCode], ["deviceStarted", "4821-7730", "warm pony"])
+            ' A code the screen is still getting is sent once it arrives.
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            m.assertEqual(probe.callFunc("probeRelay", invalid).stage, "preparing")
+            m.assertEqual(probe.callFunc("probeCode", m.code("gettingCode", "")).stage, "preparing")
+            state = probe.callFunc("probeCode", m.code("opened", "4821-7730"))
+            m.assertEqual([state.stage, state.heard.userCode], ["code", "4821-7730"])
+            ' None in time: the phone hears expired.
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeRelay", m.code("gettingCode", ""))
+            state = probe.callFunc("probeTimer")
+            m.assertEqual([state.stage, state.heard.error], ["failed", "expired"])
+        end sub
+
+        ' The phone's approval or a browser's: the screen's poll collects it,
+        ' and its session can arrive before or after the screen hears so.
+        @it("tells the phone the Roku signed in once that code is approved, in either order")
+        sub _()
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeRelay", m.code("waiting", "4821-7730"))
+            state = probe.callFunc("probeSignedIn")
+            m.assertEqual([state.mode, state.stage, state.heard.status], ["login", "signedIn", "signedIn"])
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeRelay", m.code("waiting", "4821-7730"))
+            m.assertEqual(probe.callFunc("probeCode", m.code("approved", "4821-7730")).stage, "signedIn")
+            state = probe.callFunc("probeSignedIn")
+            m.assertEqual([state.mode, state.stage, state.heard.status], ["login", "signedIn", "signedIn"])
+        end sub
+
+        @it("leaves the code on screen when the phone goes or the viewer cancels")
+        sub _()
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeRelay", m.code("waiting", "4821-7730"))
+            state = probe.callFunc("probeLeft")
+            m.assertEqual([state.stage, state.sent, state.routes], ["idle", [], [nav.route.SIGN_IN]])
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeRelay", m.code("waiting", "4821-7730"))
+            state = probe.callFunc("probeAct", "cancel")
+            m.assertEqual([state.stage, state.sent], ["idle", []])
+        end sub
+
+        ' The screen clears a code that ended before it reports the state.
+        @it("fails the phone's attempt when the code ends or is replaced")
+        sub _()
+            cases = [{ code: m.code("denied", ""), error: "denied" }, { code: m.code("couldNotFinish", ""), error: "auth_failed" }, { code: m.code("paused", ""), error: "expired" }, { code: m.code("gettingCode", ""), error: "expired" }, { code: m.code("waiting", "5512-0904"), error: "expired" }]
+            for each item in cases
+                probe = CreateObject("roSGNode", "CompanionProbe")
+                probe.callFunc("probeRelay", m.code("waiting", "4821-7730"))
+                state = probe.callFunc("probeCode", item.code)
+                m.assertEqual([state.stage, state.heard.error, state.sent], ["failed", item.error, []], item.code.status)
+            end for
+            ' Still pending, unreachable a while: the phone keeps waiting.
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeRelay", m.code("waiting", "4821-7730"))
+            m.assertEqual(probe.callFunc("probeCode", m.code("unreachable", "4821-7730")).stage, "code")
         end sub
 
     end class

@@ -133,10 +133,16 @@ one, and a card on the right for each step.
      `cancel` `receiver_cancelled`.
    - **Sign-in screen (`login`).** The push must carry `serverIdentity`
      (else `update_required`: the phone predates sign-in TVs) equal to the
-     Roku's server's identity (else `identity_mismatch`), and runs at the
-     Roku's saved address.
-3. **Start.** `POST /api/v2/auth/device/start` with `device_name` and
-   `device_platform: "roku"`. The Roku sends `deviceStarted` and shows the
+     Roku's server's identity (else `identity_mismatch`). Nothing else is
+     checked: that server is already confirmed.
+3. **Start.** On the server screen, `POST /api/v2/auth/device/start` with
+   `device_name` and `device_platform: "roku"`. On the sign-in screen
+   there is no second request: the phone confirms the code that screen
+   shows, as on tvOS and Android TV. The sign-in screen keeps polling it
+   under the Companion screen and reports it to the receiver on each
+   change; the receiver waits up to 15 seconds for one, and a code that
+   ended (paused, declined, or approved but unusable) is replaced once
+   when a phone asks. The Roku sends `deviceStarted` and shows the
    chip "Waiting for your phone" over "Confirm on your phone", "Check that
    your phone or tablet shows this code, then approve."; the card holds
    "Sign-in code", the `user_code` grouped 4+4 in 72 px, "Older phones show
@@ -144,17 +150,21 @@ one, and a card on the right for each step.
    server's mark and name under a divider.
 4. **Poll.** `POST /api/v2/auth/device/poll` at `poll_after` (else
    `interval`) until `expires_in` runs out. `denied` fails `denied`;
-   `expired`, `consumed`, `canceled`, or the deadline fail `expired`.
+   `expired`, `consumed`, `canceled`, or the deadline fail `expired`. On
+   the sign-in screen that screen polls, so its code signs the Roku in
+   whoever approves it first, the phone or a browser; a new code on that
+   screen (an expired one replaced) fails the phone's attempt `expired`.
 5. **Signed in.** On `approved`, the tokens go into the registry exactly as
    after a password sign-in, with the server saved as the Roku's server, the
    phone gets `serverResult signedIn`, and after the phone's `done`, its
    close, or 3 seconds, the Roku goes on to the profile picker.
-6. **Abandoned.** A request the Roku opened and did not collect (the phone
-   cancelled, pushed again, or left; the person pressed Cancel or Back) is
-   withdrawn with `POST /api/v2/auth/device/cancel`, best effort: a server
-   without that route answers 404, which changes nothing. A password sign-in
-   on the Roku that finishes first, a sign-out, or a server change ends the
-   attempt the same way, and an approval collected after it is dropped.
+6. **Abandoned.** A request the Roku opened for the phone and did not
+   collect (the phone cancelled, pushed again, or left; the person pressed
+   Cancel or Back) is withdrawn with `POST /api/v2/auth/device/cancel`,
+   best effort: a server without that route answers 404, which changes
+   nothing. A sign-out or a server change ends the attempt the same way,
+   and an approval collected after it is dropped. On the sign-in screen
+   the code belongs to that screen and stays on it, still valid.
 
 A failure stays on screen ("Sign-in didn't finish", or "Setup didn't
 finish", with its reason in tvOS's words and a "Not finished" card) with
@@ -177,7 +187,8 @@ and outcomes. Nothing logs codes or tokens.
 | Pairing frames and validation | `source/control/pairing.bs` |
 | Socket, framing, mDNS | `components/tasks/ControlTask.bs`, started with `service: "pairing"` |
 | mDNS records for either service | `source/control/mdns.bs` (`config.service`) |
-| Device sign-in operations | `source/auth/companion.bs` (auth coordinator) |
+| Device sign-in operations (server screen) | `source/auth/companion.bs` (auth coordinator) |
+| The sign-in screen's code | `components/screens/setup/SignInScreen.bs` (`reportCode`) |
 | Flow | `components/AppSceneCompanion.bs` |
 | Companion screen (route `companion`) | `components/screens/companion/CompanionScreen.*` |
 | A phone's part, for development | `npm run silocontrol -- --pairing` (README) |
