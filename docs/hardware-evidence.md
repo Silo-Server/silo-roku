@@ -2303,7 +2303,7 @@ library files (a WEB-DL with a full and an SDH SRT track; a Blu-ray remux
 with three PGS and four SRT tracks), their audio re-encoded to AAC. The
 first loads failed with "Failed to create decoder" while the Ultra was in
 its Suspend power mode; ECP `keypress/PowerOn` fixed that, and it was not a
-subtitle issue. Assumptions AG-643 and AG-644 follow from it.
+subtitle issue. Assumptions AG-652 and AG-653 follow from it.
 
 | # | Case | Result |
 | --- | --- | --- |
@@ -2340,15 +2340,15 @@ Media: the release fixtures and the sandbox's library. The start requests
 carried `embedded_subtitles_v1` and the `native_embedded` entry with its
 three limitations, which the app sent because the server advertised
 `native_embedded_limitations_v1`. Screenshots and the console stay in the
-tester's private evidence folder. Assumptions AG-643 and AG-644.
+tester's private evidence folder. Assumptions AG-652 and AG-653.
 
 | Test | Date | Device / OS | Sink | File class | Harness settings | Result | Observed facts |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| T1 native SRT (AG-643) | 2026-10-30 | 55R625 / 15.3.4 | TV | FX-003, MKV with one English SRT, `original_http` | English picked on Detail | PASS | A direct plan; no subtitle request and no extraction on the server; Roku drew the MKV's own cues. The first native drawing on OS 15.3.4 (the spike ran on 16.0.4). |
-| T2 a file Roku would override (AG-644) | 2026-10-30 | 55R625 / 15.3.4 | TV | FX-026, MKV with a default-flagged Forced English track, a full English SRT, and PGS; English audio | the full English track picked | PASS | Not planned native (`hidden_track_preemption`): direct play with a sidecar. The server read the full track through the Matroska Cues index in 1.9 s (1,996 reads, 4.2 MB), kept it, and served it in 1.95 s; the forced track in 0.5 s. Roku drew the full track's dialogue, not the Forced track. |
+| T1 native SRT (AG-652) | 2026-10-30 | 55R625 / 15.3.4 | TV | FX-003, MKV with one English SRT, `original_http` | English picked on Detail | PASS | A direct plan; no subtitle request and no extraction on the server; Roku drew the MKV's own cues. The first native drawing on OS 15.3.4 (the spike ran on 16.0.4). |
+| T2 a file Roku would override (AG-653) | 2026-10-30 | 55R625 / 15.3.4 | TV | FX-026, MKV with a default-flagged Forced English track, a full English SRT, and PGS; English audio | the full English track picked | PASS | Not planned native (`hidden_track_preemption`): direct play with a sidecar. The server read the full track through the Matroska Cues index in 1.9 s (1,996 reads, 4.2 MB), kept it, and served it in 1.95 s; the forced track in 0.5 s. Roku drew the full track's dialogue, not the Forced track. |
 
 - Not covered: an in-place switch between two `mkv/N` tracks. After an early
   quality lowering on the relay path (about 6 Mbps), every later start was
   planned as a 720p transcode, as the app keeps the estimate across launches.
   The switch itself was proven in the 2026-10-29 spike and is unit-tested.
-  The sidecar retry (AG-642) was not provoked: every sidecar came within 2 s.
+  The sidecar retry (AG-651) was not provoked: every sidecar came within 2 s.

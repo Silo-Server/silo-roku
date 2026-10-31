@@ -580,7 +580,7 @@ passthrough, client transformations.
 `subrip_sidecar_v1`, and `hls_subtitle_renditions_v1`, plus
 `hls_remux_subtitle_renditions_v1` and, for `native_embedded_limitations_v1`,
 `embedded_subtitles_v1`, each when the capabilities `features` list it
-(assumption AG-643). Not
+(assumption AG-652). Not
 `header_authenticated_media_v1` or `authorized_media_origins_v1`: the client
 uses signed-URL media mode so plans can use proxy nodes (decision D-1, section
 6.4). Never `plan_invalidated_v1` (it needs the realtime socket; when the server's
@@ -792,8 +792,8 @@ every build sends the request below (spec section 9.7).
   `hls_remux_subtitle_renditions_v1` when the server advertises it; when the
   server advertises `native_embedded_limitations_v1`, `embedded_subtitles_v1`
   and `original_http`'s one `native_embedded` entry (MKV SubRip by
-  `container_track_id`, with Roku's limitations; assumptions AG-643 and
-  AG-644).
+  `container_track_id`, with Roku's limitations; assumptions AG-652 and
+  AG-653).
 - **What arrives:** original SRT for external and downloaded SRT tracks; a WebVTT
   rendition inside the HLS stream for embedded text on a transcode (already
   `DEFAULT=YES`, no `LANGUAGE`), and on a copy remux from a server that
