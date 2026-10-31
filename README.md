@@ -294,6 +294,29 @@ The console logs each link's validity and outcome, never its values;
 `AppLaunchComplete` fires once per launch: for a deep-link launch, when
 playback starts or the player shows an error.
 
+### Diagnostics
+
+Every log call, at every level, goes into the diagnostics log as well as the
+console (docs/spec.md section 11.1); Settings > Diagnostics sends it to Silo
+Diagnostics, and Home offers to after a crash. Development builds take three
+ECP parameters, at launch or while running, so a report can go to a local
+collector instead (`npm run dev` in a `Silo-Server/silo-diagnostics`
+checkout with `roku` in its platforms, started with `--ip 0.0.0.0` on a
+host the Roku reaches):
+
+```sh
+npm run roku -- input diagnosticsCollector=http://<host>:8787   # this launch's reports go there
+npm run roku -- input diagnosticsSend=manual                     # send one now (or prompt)
+npm run roku -- input diagnosticsCrash=1                         # stop on a runtime error
+npm run roku -- launch dev diagnosticsCollector=http://<host>:8787   # relaunch: Home offers the crash report
+```
+
+Set the collector before anything sends: release builds, and a launch without
+the parameter, send to `https://diagnostics.siloserver.org`. The local
+collector's `/admin/api/reports` lists what arrived (development Access
+bypass), and `/admin/api/reports/<id>/artifact?name=logs.jsonl` returns the
+log.
+
 ### Phone remote (SiloControl)
 
 Every build runs the SiloControl receiver (`docs/silocontrol.md`), since
