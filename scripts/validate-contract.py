@@ -37,7 +37,7 @@ SCHEMAS = json.loads((FIXTURES / "openapi" / "playback-v3.json").read_text())["c
 # from silo-server roku/dv8-bl-compat-ids (2110cf8ac, not on main yet); and a
 # native_embedded entry's limitations under native_embedded_limitations_v1,
 # from the instant-subtitles contract (C2, 2026-10-29; the server change is
-# not on main yet, assumption AG-643), written here from the contract until
+# not on main yet, assumption AG-652), written here from the contract until
 # scripts/sync-fixtures.sh can bring the server's schema in. Drop an entry
 # once the sync brings the member in.
 PROPOSED = {
@@ -56,7 +56,7 @@ for _schema, _members in PROPOSED.items():
 # Response shapes the client reads that the pinned server does not publish
 # yet, from the instant-subtitles contract C3 as silo-server
 # feat-subtitle-renditions-all defines them in contracts/api/v2/openapi.json
-# (not on main yet; assumption AG-645): an inventory row's hls_rendition, and
+# (not on main yet; assumption AG-654): an inventory row's hls_rendition, and
 # subtitle.hls_rendition with its index. The sync vendors request bodies
 # only, so these schemas are added whole and checked against the plans in
 # tests/fixtures/proposed/ (proposed_problems), which the client's tests
@@ -134,7 +134,7 @@ NEVER_FEATURES = {"header_authenticated_media_v1", "authorized_media_origins_v1"
 NEVER_AUDIO = re.compile(r"^(truehd|mlp|dtshd|dts-hd|dts_hd|dtsx|dts:x|mat|pcm)$")
 DELIVERIES = {"original_http", "progressive", "hls"}
 DV8_CLAIM = "client_dv8_base_layer_fallback_v1"
-# Natively drawn embedded subtitles (contract C2, assumption AG-643): the
+# Natively drawn embedded subtitles (contract C2, assumption AG-652): the
 # client feature that asks for them, and the server feature that must
 # have been advertised for it and for a native_embedded entry's limitations.
 NATIVE_FEATURE = "embedded_subtitles_v1"
