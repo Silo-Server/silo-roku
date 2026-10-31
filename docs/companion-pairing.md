@@ -157,7 +157,10 @@ one, and a card on the right for each step.
 5. **Signed in.** On `approved`, the tokens go into the registry exactly as
    after a password sign-in, with the server saved as the Roku's server, the
    phone gets `serverResult signedIn`, and after the phone's `done`, its
-   close, or 3 seconds, the Roku goes on to the profile picker.
+   close, or 3 seconds, the screen says "You're all set" ("Signed in to
+   {server}. Taking you to your profiles…", tvOS's completed state) with
+   Continue. The Roku goes on to the profile picker at Continue or after 2
+   seconds.
 6. **Abandoned.** A request the Roku opened for the phone and did not
    collect (the phone cancelled, pushed again, or left; the person pressed
    Cancel or Back) is withdrawn with `POST /api/v2/auth/device/cancel`,
