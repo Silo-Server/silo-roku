@@ -187,8 +187,8 @@ Play:
 - Skip Intro, Skip Recap, and Skip Credits using server markers, with the
   profile's recap and credits auto-skip (`playback.auto_skip_recap`,
   `playback.auto_skip_credits`);
-- Up Next near the end of every movie and episode, with autoplay of the
-  next episode and On Deck;
+- Up Next near the end of every movie and episode, which autoplays the
+  next episode and offers On Deck items for the viewer to choose;
 - Shuffle of a library from Browse, of a collection from its page, and of
   a series or the season shown from a series' More menu, when the server
   offers it
