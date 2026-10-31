@@ -34,11 +34,18 @@ SCHEMAS = json.loads((FIXTURES / "openapi" / "playback-v3.json").read_text())["c
 # Members newer than the pinned schema, which the client sends only when the
 # server advertises the feature that honors them (assumption AG-171):
 # dv8_base_layer_compatibility_ids under dv8_base_layer_compatibility_ids_v1,
-# from silo-server roku/dv8-bl-compat-ids (2110cf8ac, not on main yet). Drop an
-# entry once scripts/sync-fixtures.sh brings the member in.
+# from silo-server roku/dv8-bl-compat-ids (2110cf8ac, not on main yet); and a
+# native_embedded entry's limitations under native_embedded_limitations_v1,
+# from the instant-subtitles contract (C2, 2026-10-29; the server change is
+# not on main yet, assumption AG-652), written here from the contract until
+# scripts/sync-fixtures.sh can bring the server's schema in. Drop an entry
+# once the sync brings the member in.
 PROPOSED = {
     "DeliveryCapabilityV3": {
         "dv8_base_layer_compatibility_ids": {"type": "array", "maxItems": 16, "items": {"type": "integer", "minimum": 0, "maximum": 15}},
+    },
+    "NativeEmbeddedSubtitleCapabilityV3": {
+        "limitations": {"type": "array", "maxItems": 16, "items": {"type": "string", "enum": ["forced_unlisted", "hidden_track_preemption", "literal_override_tags"]}},
     },
 }
 for _schema, _members in PROPOSED.items():
@@ -96,6 +103,12 @@ NEVER_FEATURES = {"header_authenticated_media_v1", "authorized_media_origins_v1"
 NEVER_AUDIO = re.compile(r"^(truehd|mlp|dtshd|dts-hd|dts_hd|dtsx|dts:x|mat|pcm)$")
 DELIVERIES = {"original_http", "progressive", "hls"}
 DV8_CLAIM = "client_dv8_base_layer_fallback_v1"
+# Natively drawn embedded subtitles (contract C2, assumption AG-652): the
+# client feature that asks for them, and the server feature that must
+# have been advertised for it and for a native_embedded entry's limitations.
+NATIVE_FEATURE = "embedded_subtitles_v1"
+NATIVE_ENTRY = {"container": "mkv", "codecs": ["subrip"], "track_identity": "container_track_id", "ass_styling": False,
+                "font_attachments": False, "limitations": ["forced_unlisted", "hidden_track_preemption", "literal_override_tags"]}
 FAILURE_OPERATIONS = {"failure_recovery", "seek_failure_recovery"}
 INTENT_OPERATIONS = {"track_change", "quality_change", "output_change"}
 # internal/api/handlers/playback_v3.go diagnosticKeysV3; other keys are dropped.
@@ -392,6 +405,24 @@ def client_problems(body):
         for codec in codecs:
             if NEVER_AUDIO.match(codec):
                 errors.append(f"{where} must never claim {codec}")
+    # Roku draws a container's tracks only on original_http, and only with
+    # the server honoring its limitations, which embedded_subtitles_v1 asks
+    # for: the feature and the one entry come together or not at all.
+    native = NATIVE_FEATURE in body.get("client_features", [])
+    for name, delivery in context["deliveries"].items():
+        entries = delivery["subtitles"].get("native_embedded")
+        if entries is None:
+            if native and name == "original_http":
+                errors.append(f"{NATIVE_FEATURE} is sent only with original_http's native_embedded entry")
+            continue
+        if name != "original_http":
+            errors.append(f"deliveries.{name}.subtitles.native_embedded is sent only on original_http")
+        elif entries != [NATIVE_ENTRY]:
+            errors.append(f"deliveries.original_http.subtitles.native_embedded must be exactly {[NATIVE_ENTRY]}")
+        if not native:
+            errors.append(f"deliveries.{name}.subtitles.native_embedded is sent only with {NATIVE_FEATURE}")
+        if delivery["subtitles"]["embedded_text"]:
+            errors.append(f"deliveries.{name}.subtitles.embedded_text stays false beside native_embedded")
     return errors
 
 
@@ -442,6 +473,11 @@ def self_test(sample):
         "HLS Dolby Vision level claim": lambda b: b["client_playback_context"]["deliveries"]["hls"]["hdr_details"].update(dolby_vision_profile_levels=[{"profile": 8, "max_level": 9}]),
         "changed HLS HDR10 support": lambda b: b["client_playback_context"]["deliveries"]["hls"]["hdr_details"].update(hdr10=not b["client_playback_context"]["output"]["hdr_details"]["hdr10"]),
         "changed HLS HLG support": lambda b: b["client_playback_context"]["deliveries"]["hls"]["hdr_details"].update(hlg=not b["client_playback_context"]["output"]["hdr_details"]["hlg"]),
+        "native embedded without its feature": lambda b: b["client_playback_context"]["deliveries"]["original_http"]["subtitles"].update(native_embedded=[copy.deepcopy(NATIVE_ENTRY)]),
+        "native embedded on hls": lambda b: (b["client_features"].append(NATIVE_FEATURE), b["client_playback_context"]["deliveries"]["original_http"]["subtitles"].update(native_embedded=[copy.deepcopy(NATIVE_ENTRY)]), b["client_playback_context"]["deliveries"]["hls"]["subtitles"].update(native_embedded=[copy.deepcopy(NATIVE_ENTRY)])),
+        "the native feature without its entry": lambda b: b["client_features"].append(NATIVE_FEATURE),
+        "an unknown native limitation": lambda b: (b["client_features"].append(NATIVE_FEATURE), b["client_playback_context"]["deliveries"]["original_http"]["subtitles"].update(native_embedded=[dict(NATIVE_ENTRY, limitations=["bogus"])])),
+        "a native entry without Roku's limitations": lambda b: (b["client_features"].append(NATIVE_FEATURE), b["client_playback_context"]["deliveries"]["original_http"]["subtitles"].update(native_embedded=[dict(NATIVE_ENTRY, limitations=["forced_unlisted"])])),
     }
     failed = [name for name, change in cases.items() if not problems(mutate(change), "start")]
     session_cases = {

@@ -2291,3 +2291,64 @@ package sideloaded, signed in to a lab sandbox built from silo-server
   ways (Playback has eleven rows with Connection); "↓" draws.
 - The lab relay throttles each connection separately, so HLS over
   parallel connections is not held to the rate.
+
+## 2026-10-29 native embedded spike (Ultra, OS 16.0.4)
+
+2026-10-29, physical Ultra 4850X on Roku OS 16.0.4 build 842, with a
+throwaway channel rather than this app: it set content and wrote the
+`Video` node's subtitle fields on ECP commands, and played files from a
+Range-capable HTTP server on a LAN host. Media: SYNTHETIC MKVs and an MP4
+whose every cue names its track and time, and 3-minute copy cuts of two
+library files (a WEB-DL with a full and an SDH SRT track; a Blu-ray remux
+with three PGS and four SRT tracks), their audio re-encoded to AAC. The
+first loads failed with "Failed to create decoder" while the Ultra was in
+its Suspend power mode; ECP `keypress/PowerOn` fixed that, and it was not a
+subtitle issue. Assumptions AG-652 and AG-653 follow from it.
+
+| # | Case | Result |
+| --- | --- | --- |
+| 1 | Listing | `availableSubtitleTracks` arrived 35–90 ms after `buffering`, before the first frame. `TrackName` is `mkv/<Matroska TrackNumber>` (a subtitle muxed before the audio was `mkv/2` and `mkv/5`, where ffmpeg's stream indexes would be 1 and 4); `Description` is the track's title and `Language` its ISO 639-2 code. Audio tracks are named the same way ("3", "4"). |
+| 2 | Hidden tracks | Not listed: tracks flagged Forced, PGS tracks, and every MP4 `mov_text` track (an MP4 lists no subtitle at all). The SDH flag is not reported (`HasAccessibilityCaption` false). |
+| 3 | Preselect | Content `SubtitleConfig: {TrackName: "mkv/N"}` selects the track before play: `subtitleTrack` and `currentSubtitleTrack` read `mkv/N` before the first frame, and cues drew from the first one, also with `PlayStart` 100 s (the cue at 101 s on the first screenshot). |
+| 4 | Switching mid-play | Writing `subtitleTrack = "mkv/N"` switched at once; the next cue came from the new track. Each switch was a 150–250 ms rebuffer at the same position (a brief spinner), with no reload. |
+| 5 | Off | Writing `subtitleTrack = ""` made Roku fall back to its own pick by the caption language. `suppressCaptions = true` hid native cues and `false` brought them back. Caption mode Off drew nothing, Forced tracks included. |
+| 6 | Seek | After a seek to 150 s, the cue at 149 s drew right away. |
+| 7 | Audio switch | `audioTrack` "3" to "4": a brief rebuffer, and the selected subtitle kept drawing. |
+| 8 | Rendering | SRT drew in Roku's caption style. `{\an8}` printed literally at the bottom; `<i>` was stripped and drawn upright. ASS drew as plain text, its styles ignored. The library cuts' full and SDH SRT tracks drew correctly. |
+| 9 | Override by a hidden track | A file with a Forced track in the playing audio's language made Roku draw that Forced track and never the selected one, however it was selected (`SubtitleConfig`, Roku's own pick, or a mid-play write), even with the default flag on the full track. A Forced track in another language, or audio in another language, did not trigger it. A default-flagged PGS track did the same (the remux cut drew nothing with Danish selected, and drew Danish once the PGS default flag was cleared). A default-flagged text track did not override the selection, and a side-loaded sidecar was never overridden (it drew on the Forced file). Roku's reports did not show the override: after a mid-play write of `mkv/3` on the Forced file, every position report read `mkv/3` as both `subtitleTrack` and `currentSubtitleTrack` while the Forced track drew. |
+
+- Library prevalence (shared dev, a 5 % sample of 61,243 MKVs): 67 % carry
+  embedded text subtitles and 60 % embedded SRT. Of the SRT files, 8.0 %
+  have an override track (2,853 a Forced track in an audio language, 142 a
+  default-flagged bitmap track), so about 92 % can be drawn natively. Of 51
+  sampled files with an English SRT track, 11 (22 %) carry ASS position
+  tags (`{\an8}` almost always) on 2–31 % of its lines, mostly streaming
+  WEB-DLs; together about 72 % of embedded-SRT files can be drawn natively
+  without a visible defect.
+- Not tested: the TCL Roku TV (OS 15.3.4); native tracks listed beside
+  carried sidecars inside this app, where hardware run 20 saw content stop
+  after a write at the second listing (the spike's listing came once, before
+  the first frame, with no sidecars); full-length files over the Silo
+  server.
+
+## 2026-10-30 instant subtitles end to end (TCL, OS 15.3.4)
+
+2026-10-30, the TCL 55R625 Roku TV on Roku OS 15.3.4, this app with the
+native route, signed in to a lab sandbox built from the stacked
+silo-server branches through the header probe's lab relay.
+Media: the release fixtures and the sandbox's library. The start requests
+carried `embedded_subtitles_v1` and the `native_embedded` entry with its
+three limitations, which the app sent because the server advertised
+`native_embedded_limitations_v1`. Screenshots and the console stay in the
+tester's private evidence folder. Assumptions AG-652 and AG-653.
+
+| Test | Date | Device / OS | Sink | File class | Harness settings | Result | Observed facts |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| T1 native SRT (AG-652) | 2026-10-30 | 55R625 / 15.3.4 | TV | FX-003, MKV with one English SRT, `original_http` | English picked on Detail | PASS | A direct plan; no subtitle request and no extraction on the server; Roku drew the MKV's own cues. The first native drawing on OS 15.3.4 (the spike ran on 16.0.4). |
+| T2 a file Roku would override (AG-653) | 2026-10-30 | 55R625 / 15.3.4 | TV | FX-026, MKV with a default-flagged Forced English track, a full English SRT, and PGS; English audio | the full English track picked | PASS | Not planned native (`hidden_track_preemption`): direct play with a sidecar. The server read the full track through the Matroska Cues index in 1.9 s (1,996 reads, 4.2 MB), kept it, and served it in 1.95 s; the forced track in 0.5 s. Roku drew the full track's dialogue, not the Forced track. |
+
+- Not covered: an in-place switch between two `mkv/N` tracks. After an early
+  quality lowering on the relay path (about 6 Mbps), every later start was
+  planned as a 720p transcode, as the app keeps the estimate across launches.
+  The switch itself was proven in the 2026-10-29 spike and is unit-tested.
+  The sidecar retry (AG-651) was not provoked: every sidecar came within 2 s.

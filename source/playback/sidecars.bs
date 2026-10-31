@@ -9,7 +9,12 @@ import "pkg:/source/playback/values.bs"
 ' content carries, up front, the plan's selected sidecar and the other text
 ' sidecars its inventory offers, and a track_change whose plan streams the
 ' same media switches the Video node's subtitleTrack instead, to the
-' TrackName Roku lists for the sidecar (listedName). Pure.
+' TrackName Roku lists for the sidecar (listedName). An MKV original's own
+' text tracks need no sidecar: Roku lists them as "mkv/<container_track_id>"
+' and draws the one selected (2026-10-29 native embedded spike), so a plan
+' whose subtitle is native embedded (playback.media.nativeSubtitle), and
+' the inventory rows it marks native_selectable (nativeTracks), switch in
+' place by that name, and are never downloaded (assumption AG-652). Pure.
 namespace playback.sidecars
     ' Sidecars per content, the selected one included; each is at most
     ' api.response.MAX_SIDECAR_BYTES as downloaded and
@@ -74,7 +79,9 @@ namespace playback.sidecars
     ' sidecars come only when the plan renders subtitles itself or has none,
     ' and, with none selected, only while captionMode is "Off": with captions
     ' on, Roku shows a track by the viewer's caption language whenever the
-    ' player selects none.
+    ' player selects none. A native embedded subtitle, the plan's or a row
+    ' the content plays natively (nativeRow), is none of them: Roku draws it
+    ' from the stream.
     function offered(plan as Object, baseUrl as String, captionMode as String) as Object
         out = []
         offset = 0
@@ -86,11 +93,13 @@ namespace playback.sidecars
             selectedId = selected.trackId
             selected.cacheKey = cacheKey(plan, playback.media.inventoryEntry(subtitle, selectedId), selected.format, offset, baseUrl)
             add(out, selected, true, baseUrl, offset)
+        else if playback.media.nativeSubtitle(plan) <> ""
+            selectedId = util.text(subtitle.track_id)
         end if
         if not util.isObject(subtitle) or not playback.values.isArray(subtitle.inventory) or not clientRendered(plan) or not mayCarry(plan, captionMode) then return out
         for each entry in subtitle.inventory
             if out.Count() >= MAX_TRACKS then exit for
-            if util.isObject(entry) and util.text(entry.delivery) = "sidecar" and playback.values.isText(entry.track_id) and entry.track_id <> selectedId
+            if util.isObject(entry) and util.text(entry.delivery) = "sidecar" and playback.values.isText(entry.track_id) and entry.track_id <> selectedId and nativeRow(plan, entry) = ""
                 format = formatOf(entry.url)
                 language = "und"
                 if playback.values.isText(entry.language) then language = entry.language
@@ -102,18 +111,81 @@ namespace playback.sidecars
 
     ' Whether content for plan may carry sidecars while Roku's caption mode
     ' is captionMode: not when the plan selects none and captions are on,
-    ' since Roku would then show one by the viewer's caption language. The
-    ' mode can change while content waits for its headers, sidecars, or the
-    ' Video node's stop, so the player asks again before it hands content
-    ' over.
+    ' since Roku would then show one by the viewer's caption language. A
+    ' native embedded subtitle is a selection. The mode can change while
+    ' content waits for its headers, sidecars, or the Video node's stop, so
+    ' the player asks again before it hands content over.
     function mayCarry(plan as Object, captionMode as String) as Boolean
-        return captionMode = "Off" or playback.media.subtitleArtifact(plan) <> invalid
+        return captionMode = "Off" or playback.media.subtitleArtifact(plan) <> invalid or playback.media.nativeSubtitle(plan) <> ""
+    end function
+
+    ' The tracks of an MKV original Roku draws itself, which the content
+    ' plays without carrying them, as { trackId, path, native, state,
+    ' selected, language, label }: path the TrackName Roku lists
+    ' ("mkv/<container_track_id>"), state "ready". The plan's own native
+    ' subtitle (playback.media.nativeSubtitle) and each inventory row the
+    ' server marks native_selectable (nativeRow): one the player can select
+    ' on the playing content, then report with a track_change whose plan
+    ' streams the same media (instant-subtitles contract C1). None for
+    ' another stream.
+    function nativeTracks(plan as Object) as Object
+        out = []
+        subtitle = plan.subtitle
+        if not util.isObject(subtitle) then return out
+        selectedId = ""
+        selectedName = playback.media.nativeSubtitle(plan)
+        if selectedName <> ""
+            selectedId = util.text(subtitle.track_id)
+            out.Push(nativeTrack(playback.media.inventoryEntry(subtitle, selectedId), selectedId, selectedName, true))
+        end if
+        if not playback.values.isArray(subtitle.inventory) then return out
+        for each entry in subtitle.inventory
+            name = nativeRow(plan, entry)
+            if name <> "" and util.text(entry.track_id) <> selectedId and name <> selectedName then out.Push(nativeTrack(entry, util.text(entry.track_id), name, false))
+        end for
+        return out
+    end function
+
+    function nativeTrack(entry as Dynamic, trackId as String, name as String, selected as Boolean) as Object
+        language = "und"
+        label = ""
+        if util.isObject(entry)
+            if playback.values.isText(entry.language) then language = entry.language
+            label = util.text(entry.label)
+        end if
+        return { trackId: trackId, path: name, native: true, state: "ready", selected: selected, language: language, label: label }
+    end function
+
+    ' The TrackName Roku lists an inventory row under when the content plays
+    ' it natively: "mkv/<container_track_id>" for an embedded row the server
+    ' marks native_selectable on an MKV original's plan, else "".
+    function nativeRow(plan as Object, entry as Dynamic) as String
+        if not util.isObject(entry) or not util.isTrue(entry.native_selectable) or util.text(entry.source) <> "embedded" or not playback.values.isText(entry.track_id) then return ""
+        if playback.media.streamFormat(plan.stream) <> "mkv" then return ""
+        return playback.media.nativeName(entry.container_track_id)
+    end function
+
+    ' The track name the content shows plan's subtitle by, among tracks (the
+    ' content's ready sidecars and native tracks), or "" for none: a native
+    ' embedded subtitle's TrackName from the plan itself, since the content
+    ' plays the file it names, or the path of the sidecar the content
+    ' carries for the plan's artifact. "" for a sidecar it does not carry.
+    function planPath(tracks as Dynamic, plan as Object) as String
+        name = playback.media.nativeSubtitle(plan)
+        if name <> "" then return name
+        artifact = playback.media.subtitleArtifact(plan)
+        if artifact = invalid or type(tracks) <> "roArray" then return ""
+        for each track in tracks
+            if track.trackId = artifact.trackId and track.state = "ready" and not util.isTrue(track.native) then return track.path
+        end for
+        return ""
     end function
 
     ' Whether the Video node draws no subtitle (Video.suppressCaptions, which
     ' leaves Roku's caption mode alone, assumption AG-75): true unless the
-    ' plan's subtitle is the sidecar the content carries at path (the
-    ' TrackName the player selects) or the HLS rendition in its stream. With
+    ' plan's subtitle is the track the content shows at path (the sidecar it
+    ' carries, or the MKV's own track Roku draws for a native embedded
+    ' subtitle, planPath) or the HLS rendition in its stream. With
     ' captions on and nothing selected that it can draw, Roku draws a track
     ' it picks by the caption language (Video.currentSubtitleTrack), and
     ' content cannot leave out a text track embedded in an original's
@@ -390,10 +462,11 @@ namespace playback.sidecars
     end function
 
     ' Whether a track_change to selection ({ audio, subtitle }) can switch on
-    ' a content that carries tracks (ready sidecars): subtitles off, or one
-    ' the content has and Roku lists (listedName in listed,
-    ' Video.availableSubtitleTracks), since only a listed TrackName selects
-    ' a track on playing content (hardware run 17). Any other reloads.
+    ' a content that carries tracks (ready sidecars, and the native tracks
+    ' it plays): subtitles off, or one the content has and Roku lists
+    ' (listedName in listed, Video.availableSubtitleTracks), since only a
+    ' listed TrackName selects a track on playing content (hardware run
+    ' 17). Any other reloads.
     function inPlace(tracks as Object, selection as Object, listed as Dynamic) as Boolean
         if not util.isObject(selection) or not util.isObject(selection.subtitle) then return true
         return listedName(listed, pathOf(tracks, util.text(selection.subtitle.id))) <> ""
@@ -421,17 +494,20 @@ namespace playback.sidecars
     end function
 
     ' Whether a track name Roku reports (a listed TrackName, subtitleTrack,
-    ' or currentSubtitleTrack) is the sidecar the player gave it at path:
-    ' the path itself or a name that contains it. Roku reported subtitleTrack
-    ' as the bare path after the player wrote the listed name, and the
-    ' listed name later (hardware run 20).
+    ' or currentSubtitleTrack) is the track the player gave it at path: for
+    ' a sidecar the path itself or a name that contains it, since Roku
+    ' reported subtitleTrack as the bare path after the player wrote the
+    ' listed name, and the listed name later (hardware run 20); for an MKV's
+    ' own track that name alone, as mkv/3 is not mkv/30.
     function isTrack(name as String, path as String) as Boolean
+        if playback.media.isNative(path) then return name = path
         return path <> "" and Instr(1, name, path) > 0
     end function
 
-    ' The path of the sidecar among tracks (the content's ready sidecars)
-    ' that name is, or "" for none: a track Roku found in the stream, such
-    ' as an MKV's own (mkv/3), or no track.
+    ' The path of the track among tracks (the content's ready sidecars and
+    ' native tracks) that name is, or "" for none: a track Roku found in the
+    ' stream that the plan does not play natively, such as an MKV's own
+    ' (mkv/3) beside a sidecar, or no track.
     function trackPath(tracks as Object, name as String) as String
         if name = "" then return ""
         for each track in tracks
@@ -454,8 +530,9 @@ namespace playback.sidecars
         return isTrack(selected, path) and (playing = "" or isTrack(playing, path))
     end function
 
-    ' The path of the ready sidecar for trackId among tracks, or "" when
-    ' there is none (trackId "" selects none).
+    ' The path of the ready track for trackId among tracks (a sidecar's, or
+    ' a native track's TrackName), or "" when there is none (trackId ""
+    ' selects none).
     function pathOf(tracks as Object, trackId as String) as String
         for each track in tracks
             if track.trackId = trackId and track.state = "ready" then return track.path
