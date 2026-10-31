@@ -75,7 +75,10 @@ import "pkg:/source/util/values.bs"
 ' One the plan names (a native embedded subtitle on an MKV original,
 ' playback.media.nativeSubtitle) is selected by the content's
 ' SubtitleConfig, and switched to by its TrackName, mkv/<container_track_id>
-' (playback.sidecars.nativeTracks; assumption AG-652).
+' (playback.sidecars.nativeTracks; assumption AG-652). An HLS stream that
+' lists every embedded text track as a rendition starts on the plan's own
+' (its playlist's DEFAULT) and is switched by the TrackName Roku lists for
+' each (playback.sidecars.renditionTracks, relistRenditions; AG-654).
 ' A sidecar is selected by the TrackName Roku lists for it
 ' (Video.availableSubtitleTracks, playback.sidecars.listedName), and an
 ' in-place switch Roku does not follow reloads (checkSubtitle). Roku
@@ -971,8 +974,9 @@ end sub
 ' carries every ready sidecar, so the viewer can switch between them in
 ' place (playback.sidecars), but none for a plan without a subtitle once
 ' captions have come on (playback.sidecars.mayCarry). An MKV original's
-' own tracks that the plan plays natively (playback.sidecars.nativeTracks)
-' join its tracks without being carried, and the plan's native subtitle is
+' own tracks that the plan plays natively, and an HLS stream's subtitle
+' renditions (playback.sidecars.streamTracks), join its tracks without
+' being carried, and the plan's native subtitle is
 ' selected before the content opens by its SubtitleConfig TrackName, which
 ' Roku applied before the first frame, with PlayStart too, on the Ultra
 ' (2026-10-29 native embedded spike; assumption AG-652).
@@ -997,18 +1001,16 @@ sub tryAssign(item as Object)
     item.track = ""
     if playback.sidecars.mayCarry(item.plan, m.captionMode)
         for each track in item.sidecars
-            if track.state = "ready"
-                item.tracks.Push(track)
-                if track.selected then item.track = track.path
-            end if
+            if track.state = "ready" then item.tracks.Push(track)
         end for
     end if
     carried = subtitleTracks(item.tracks)
     if carried.Count() > 0 then content.subtitleTracks = carried
-    item.tracks.Append(playback.sidecars.nativeTracks(item.plan))
+    ' Roku lists the renditions once the content opens (relistRenditions).
+    item.tracks.Append(playback.sidecars.streamTracks(item.plan, invalid))
+    item.track = playback.sidecars.planPath(item.tracks, item.plan)
     native = playback.media.nativeSubtitle(item.plan)
     if native <> ""
-        item.track = native
         content.SubtitleConfig = { TrackName: native }
         log.info(LOG_TAG, "the subtitle is the file's own track", { track: native, carried: carried.Count() })
     end if
@@ -1108,7 +1110,7 @@ sub playItem(item as Object, waitedMs as Dynamic)
     ' load, or the player may have left or shown an error meanwhile.
     if m.leaving or m.errorVisible or not isCurrent(item.load) then return
     if subtitleTracks(item.tracks).Count() > 0 and not playback.sidecars.mayCarry(item.plan, m.captionMode)
-        item.tracks = playback.sidecars.nativeTracks(item.plan)
+        item.tracks = playback.sidecars.streamTracks(item.plan, invalid)
         item.content.subtitleTracks = []
     end if
     m.activeLoad = item.load
@@ -1124,16 +1126,18 @@ sub playItem(item as Object, waitedMs as Dynamic)
     m.subtitleSuppressed = playback.sidecars.suppressed(item.plan, item.track)
     drawCaptions()
     m.video.content = item.content
-    ' A native subtitle is selected by the content's SubtitleConfig.
-    if item.track <> "" and not playback.media.isNative(item.track) then setSubtitleTrack(item.track)
-    ' A plan with no sidecar or native subtitle (Off, burned in, or an HLS
-    ' rendition) leaves no subtitle for the player to find not drawn
-    ' (subtitleShows); an embedded track Roku cannot be told to draw is not
-    ' drawn.
+    ' A track of the stream is selected by the content's SubtitleConfig (a
+    ' native subtitle) or by the playlist's DEFAULT (an HLS rendition), and
+    ' checked once the content settles (confirmSubtitle).
+    if playback.sidecars.isFile(item.track) then setSubtitleTrack(item.track)
+    ' A plan with no sidecar or stream track to check (Off, burned in, a
+    ' single HLS rendition, or one Roku lists no name for) leaves no
+    ' subtitle for the player to find not drawn (subtitleShows); an
+    ' embedded track Roku cannot be told to draw is not drawn.
     if playback.media.unnamedEmbedded(item.plan)
         log.warn(LOG_TAG, "the plan's embedded subtitle is no track Roku can be told to draw", invalid)
         subtitleShows(false)
-    else if playback.media.subtitleArtifact(item.plan) = invalid and playback.media.nativeSubtitle(item.plan) = ""
+    else if playback.media.subtitleArtifact(item.plan) = invalid and item.track = ""
         subtitleShows(true)
     end if
     m.video.control = "play"
@@ -1846,11 +1850,57 @@ sub onVideoSubtitles()
     listed = m.video.availableSubtitleTracks
     log.info(LOG_TAG, "Roku lists subtitle tracks", { tracks: listed })
     logRokuSubtitle("listed")
+    relistRenditions(listed)
     path = m.activeTrack
-    ' A native subtitle was selected before the content opened
-    ' (SubtitleConfig); the check once the content settles covers it.
-    if m.activeStarted or playback.media.isNative(path) or playback.sidecars.listedName(listed, path) = "" or playback.sidecars.isTrack(util.text(m.video.subtitleTrack), path) then return
+    ' A track of the stream was selected before the content opened
+    ' (SubtitleConfig, or the playlist's DEFAULT); the check once the
+    ' content settles covers it.
+    if m.activeStarted or not playback.sidecars.isFile(path) or playback.sidecars.listedName(listed, path) = "" or playback.sidecars.isTrack(util.text(m.video.subtitleTrack), path) then return
     selectSubtitle(path)
+end sub
+
+' The active content's HLS subtitle renditions take the TrackNames Roku
+' lists for them (playback.sidecars.renditionTracks): by NAME, else
+' webvtt/<index> in the row's language. How Roku numbers several
+' renditions is not yet seen on a device, so each match is logged for the
+' hardware runs to confirm (assumption AG-654). The plan's own rendition
+' is the one the player then checks and switches to.
+sub relistRenditions(listed as Dynamic)
+    item = m.current
+    if item = invalid or not item.assigned or m.activeLoad <> item.load or not playback.sidecars.listsRenditions(item.plan) then return
+    tracks = []
+    for each track in item.tracks
+        if not util.isTrue(track.rendition) then tracks.Push(track)
+    end for
+    renditions = playback.sidecars.renditionTracks(item.plan, listed)
+    tracks.Append(renditions)
+    item.tracks = tracks
+    matched = []
+    for each rendition in renditions
+        matched.Push({ index: rendition.index, track: rendition.path, by: rendition.by })
+    end for
+    log.info(LOG_TAG, "Roku's names for the stream's subtitle renditions", { renditions: matched })
+    if not playback.sidecars.selectsRendition(item.plan) then return
+    path = playback.sidecars.planPath(tracks, item.plan)
+    ' Without a name the player writes nothing for it, the settle check
+    ' included, and the stream's DEFAULT shows it.
+    if path = "" then log.info(LOG_TAG, "Roku lists no name for the plan's subtitle rendition; it is left to the stream", invalid)
+    if path = item.track then return
+    ' A check of an in-place switch follows the rendition to its new name,
+    ' or ends without one.
+    check = m.subtitleCheck
+    if check <> invalid and check.path = item.track
+        if path = "" then m.subtitleCheck = invalid else check.path = path
+    end if
+    ' One that gains a name after the settle check found none is checked
+    ' again at the next position report, and selected by it if Roku shows
+    ' another, as after a reload of a plan switched in place.
+    if item.track = "" and m.subtitleConfirmed
+        m.subtitleConfirmed = false
+        m.recheckAt = invalid
+    end if
+    item.track = path
+    m.activeTrack = path
 end sub
 
 ' Roku reports the track it plays (Video.currentSubtitleTrack, "the
@@ -1861,11 +1911,12 @@ end sub
 ' which draws it. Only once per switch, and never while content starts: a
 ' switch in place needs content that has played (playback.session's
 ' retrackRefusals), so its check comes after the settle time (holdsSubtitle).
-' One of the content's own native tracks (playback.sidecars.nativeTracks)
-' reported there reloads the same way. A track Roku found in the stream
-' that is none of the content's (hardware run 20's mkv/3 beside a sidecar)
-' is not: Roku draws it instead (hardware runs 21 and 22), so it is left
-' and the viewer is told (subtitleShows), with no reload. While another
+' One of the content's own stream tracks (a native track, an HLS rendition,
+' playback.sidecars.streamTracks) reported there reloads the same way. A
+' track Roku found in the stream that is none of the content's (hardware
+' run 20's mkv/3 beside a sidecar) is not: Roku draws it instead (hardware
+' runs 21 and 22), so it is left and the viewer is told (subtitleShows),
+' with no reload. While another
 ' track change is on its way the check waits for it (W11-3): its plan
 ' checks its own selection (retrack) or loads new content, which ends the
 ' check, and a refusal leaves this one to the next report.
@@ -1915,7 +1966,9 @@ end sub
 ' until the reducer reloads it into the plan's, and shows the plan's subtitle
 ' from the sidecars it carries, the MKV's own track the plan names for a
 ' native embedded subtitle (written as Video.subtitleTrack "mkv/<id>",
-' which switched at once with a 150-250 ms rebuffer on the Ultra), or none,
+' which switched at once with a 150-250 ms rebuffer on the Ultra), the HLS
+' rendition Roku lists for the plan's subtitle (the server keeps the
+' stream, contract C3; its playlist's DEFAULT still names the first), or none,
 ' with Roku's caption mode as the viewer's choice set it. Off clears Roku's
 ' selection too; if captions are on by then, the plan reloads without the
 ' carried tracks (followCaptions).
@@ -1933,9 +1986,9 @@ sub retrack(command as Object)
     ' the new plan marks them.
     tracks = []
     for each track in item.tracks
-        if not util.isTrue(track.native) then tracks.Push(track)
+        if not util.isTrue(track.stream) then tracks.Push(track)
     end for
-    tracks.Append(playback.sidecars.nativeTracks(item.plan))
+    tracks.Append(playback.sidecars.streamTracks(item.plan, m.video.availableSubtitleTracks))
     item.tracks = tracks
     m.flags.subtitlesLoading = false
     path = playback.sidecars.planPath(item.tracks, item.plan)
@@ -1953,8 +2006,15 @@ sub retrack(command as Object)
         subtitleShows(true)
     end if
     ' The viewer's choice, made whenever it comes; its own check replaces
-    ' the one after the content settles.
-    selectSubtitle(path)
+    ' the one after the content settles. A rendition Roku lists no name for
+    ' gets no write, which would leave Roku to pick its own.
+    if path = "" and playback.sidecars.selectsRendition(item.plan)
+        log.info(LOG_TAG, "Roku lists no name for the plan's subtitle rendition; it is left to the stream", invalid)
+        m.subtitleSuppressed = playback.sidecars.suppressed(item.plan, path)
+        drawCaptions()
+    else
+        selectSubtitle(path)
+    end if
     m.subtitleConfirmed = true
     m.recheckAt = invalid
     m.subtitleCheck = invalid
@@ -1990,11 +2050,12 @@ end function
 ' The content's SubtitleTracks, the selected sidecar first: Roku draws a
 ' track it picks by the caption language until it lists the content's tracks
 ' and the selected one is selected by its listed name (onVideoSubtitles).
-' The MKV's own tracks are the stream's, not carried.
+' The stream's own tracks (an MKV's, an HLS stream's renditions) are not
+' carried.
 function subtitleTracks(tracks as Object) as Object
     out = []
     for each track in tracks
-        if util.isTrue(track.native) then continue for
+        if util.isTrue(track.stream) then continue for
         entry = { Language: track.language, TrackName: track.path, Description: track.label }
         if track.selected
             out.Unshift(entry)
