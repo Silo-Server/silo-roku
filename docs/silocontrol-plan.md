@@ -71,7 +71,7 @@ Each spike is a throwaway branch with a written result in
 | C1-2 | `source/control/policy.bs`: hello negotiation, authorization, eviction, rate limit, close-reason rules; tests |
 | C1-3 | `components/tasks/ControlTask`: listener with port fallback, peer check, framing with the 64 KiB cap, hello watchdog, heartbeat, `close`; starts and stops with the session (R10) |
 | C1-4 | `source/control/mdns.bs` and the mDNS socket in `ControlTask` (R5.1): query parsing with name compression, the four records, announce and goodbye; Rooibos tests on packets captured from macOS and Android queries |
-| C1-5 | `scripts/silocontrol-phone.mjs`: a Node controller that plays the phone role (hello, ping, control, launch, and later handoff and `sealed`) against `host:port` from `.env`; documented in the README's Development section |
+| C1-5 | `scripts/silocontrol-phone.mjs`: a Node controller that plays the phone role (hello, ping, control, launch, and later handoff and `sealed`) against `host:port` from `.env`; documented in `docs/development.md` |
 
 Exit: `dns-sd` on a Mac finds and resolves the Roku; the Node controller
 finds it, connects, negotiates v2, sees idle `state`, survives an hour of

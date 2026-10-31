@@ -3866,7 +3866,7 @@ with `platform` `roku` (section 14), hosted only:
   installation credential, the last five reports for Delete Sent Reports,
   and the last exit already reported or declined. Development builds take
   `diagnosticsCollector`, `diagnosticsSend`, and `diagnosticsCrash` ECP
-  parameters (README).
+  parameters ([`development.md`](development.md)).
 - **Hardware, 2026-10-31 (TCL 55R625, Roku OS 15.3.4).** Reports from
   Settings and from the crash prompt reached `ready` on a local collector
   with every validation check passing and no privacy flags; the bundle
