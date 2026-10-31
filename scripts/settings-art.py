@@ -7,6 +7,8 @@
   server.png     server.rack: two stacked rounded units, each with a light
   sign_out.png   rectangle.portrait.and.arrow.right: an open frame with an
                  arrow leaving it to the right
+  diagnostics.png  waveform.path.ecg.rectangle: a rounded frame around a
+                 heartbeat trace
 
 Each glyph has a logical 40 px square canvas, rasterized at 2x by player-art
 for aligned bilinear minification, white on transparent for blendColor:
@@ -96,12 +98,21 @@ def sign_out():
     )
 
 
+def diagnostics():
+    return player.glyph(
+        SIZE,
+        frame(5, 9, 43, 39, 6),
+        line((10, 25), (17, 25), (20.5, 17), (25.5, 32), (29.5, 21), (32, 25), (38, 25)),
+    )
+
+
 def images():
     yield "general.png", general()
     yield "playback.png", playback()
     yield "subtitles.png", subtitles()
     yield "server.png", server()
     yield "sign_out.png", sign_out()
+    yield "diagnostics.png", diagnostics()
 
 
 def main():

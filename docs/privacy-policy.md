@@ -21,8 +21,9 @@ you type its address into the app.
   what you watch **only to the Silo server you entered**, and to the media and
   image hosts that server tells it to use.
 - The app sends nothing to the Silo project, to [the publisher], or to any
-  other company. It contains no analytics, crash reporting, advertising, or
-  tracking software.
+  other company, except a diagnostics report when you choose to send one
+  (see "To Silo Diagnostics" below). It contains no analytics, advertising,
+  or tracking software, and it never sends a report on its own.
 - On the Roku device the app keeps the addresses of the servers you saved, a
   random installation ID, and the sign-in tokens each server issued. It never stores your
   password or PIN. Signing out removes the tokens at once, even when the
@@ -37,7 +38,9 @@ you type its address into the app.
   handle data. This policy covers only what the Roku app does.
 - **Roku** runs the device and its operating system. Roku's own collection is
   covered by Roku's privacy policy, not this one (see "Roku" below).
-- **The publisher** of this app receives no data from it.
+- **The publisher** of this app receives no data from it, except a
+  diagnostics report you choose to send, which the Silo project receives
+  through Silo Diagnostics.
 
 ## What the app stores on your Roku
 
@@ -55,6 +58,12 @@ the other servers you saved. They hold:
 | The profile last chosen on this device | To reopen it at launch |
 | Up to six profile tokens your server issued after a correct PIN | So a PIN-locked profile does not ask for its PIN every time |
 
+A third area holds what diagnostics reports need: the pseudonymous
+installation credential Silo Diagnostics issued to this device (not your
+Silo installation ID), the IDs and references of the last five reports you
+sent, so you can delete them, and a note of the last unexpected exit you
+already reported or declined.
+
 The app does **not** store your password, your PIN, your username, your
 search history, your watch history, or your settings. Your server keeps your
 watch progress and settings; the app reads them when it needs them.
@@ -64,6 +73,14 @@ storage: server responses while they download (deleted once read),
 downloaded subtitle files (at most a few, deleted as playback moves on), and
 playback requests in transit. Roku clears this storage when the app exits.
 Artwork, catalog details, and your choices on screen stay in memory only.
+
+The app also keeps a diagnostics log of this launch and the one before it
+in Roku's cache storage (`cachefs:`), at most about 1 MB per launch, so a
+report about a crash can include what happened before it. It holds the
+lines described under "To Silo Diagnostics", with the same parts removed.
+Roku clears this storage when the device restarts or needs the space; the
+app replaces the older launch's log at each start. The log leaves the
+device only in a report you send.
 
 ## What the app sends, and where
 
@@ -123,10 +140,45 @@ The app never changes your settings on the server.
 - The app reads and changes Roku's own caption setting when you turn captions
   on or off in the app.
 
+### To Silo Diagnostics, when you send a report
+
+Silo Diagnostics is a service the Silo project runs to help fix problems in
+the app. The app sends it a report only when you choose to: from Settings >
+Diagnostics > Send Diagnostics Now, or by choosing Send Report when the app
+asks after it closed unexpectedly. Each time it first shows what a report
+contains. Choosing Don't Send, or Back, sends nothing.
+
+- **Who you are to it:** the first report registers this device with a
+  pseudonymous credential that Silo Diagnostics issues. It is not linked to
+  your Silo account, your server, or your Roku account.
+- **What a report contains:** the app's version and build; the Roku OS
+  version; the device maker and model; the display's type, resolution, and
+  HDR support; which audio and video formats the device decodes; the
+  language and country set on the Roku; the app's memory limits and use;
+  whether the device is on Wi-Fi or Ethernet; how the previous launch ended
+  (Roku's exit reason and time, and the last line Roku wrote to its console);
+  and the app's log of this launch and the one before it. The log records
+  what the app did: the screens it opened, the server requests it made
+  (method, path, status, and timing), playback states, media segment timing
+  and bitrates, the memory level, and errors.
+- **What is removed first:** the app rewrites each line before it is stored
+  so that it carries no username, email, profile, account, server address,
+  IP or MAC address, title or library ID, session or request ID, token, PIN,
+  or signed address. Text a server sent, such as an error message, is
+  rewritten the same way. Silo Diagnostics also checks each report and flags
+  anything that still looks like one of these.
+- **What is never in a report:** your password, PIN, or sign-in tokens; your
+  playback session IDs; the Roku serial number, advertising ID, or device
+  name you chose; and your Wi-Fi network's name.
+- **How long it is kept:** up to 30 days. Settings > Diagnostics > Delete
+  Sent Reports asks Silo Diagnostics to delete the reports this device sent;
+  their reference IDs then stop working.
+
 ### What the app never does
 
-- It contains no analytics, crash reporting, advertising, or tracking
-  software, and sends nothing to the publisher or any third party.
+- It contains no analytics, advertising, or tracking software, and sends
+  nothing to the publisher or any third party except a diagnostics report
+  you choose to send.
 - It does not read the Roku advertising ID, the device serial number, or your
   Roku account details, and it uses no Roku billing.
 - It attaches your sign-in token and profile details only to requests
@@ -134,8 +186,10 @@ The app never changes your settings on the server.
   Roku follows a server's redirects on its own, so a server set up to
   redirect those requests to another host would pass them on; Silo servers
   are expected not to.
-- It does not upload logs. Diagnostic messages stay in the Roku device's
-  local debug console, with tokens, PINs, and signed addresses removed.
+- It uploads logs only inside a diagnostics report you choose to send.
+  Otherwise its messages stay on the Roku: in the local debug console, with
+  tokens, PINs, and signed addresses removed, and in the diagnostics log
+  described above.
 
 ## Signing out, changing servers, and removing the app
 
@@ -146,7 +200,8 @@ The app never changes your settings on the server.
 | Remove a saved server | That server's address, sign-in tokens, profile PIN tokens, account identifier, and remembered profile. Removing the server in use also signs it out, as Sign out does | The installation ID and the other saved servers |
 | Switch profile | Nothing is cleared; the new profile becomes the remembered one | Other profiles' PIN tokens for this sign-in |
 | The server ends your session (for example, it was revoked) | Sign-in tokens and profile PIN tokens | The server address, the installation ID, the account identifier, and the remembered profile, so signing in to the same account reopens it |
-| Remove the app from the Roku | Roku deletes the app's stored data | Nothing on the device. Your server keeps its own records until its operator removes them |
+| Delete Sent Reports (Settings > Diagnostics) | Asks Silo Diagnostics to delete every report this device sent; the device forgets the ones it confirmed | The diagnostics credential, and any report Silo Diagnostics could not confirm, which the next Delete tries again |
+| Remove the app from the Roku | Roku deletes the app's stored data | Nothing on the device. Your server keeps its own records until its operator removes them. Reports already sent to Silo Diagnostics stay until they expire after 30 days, unless deleted first |
 
 On every sign-out, server change, or profile change the app also closes its
 screens, so artwork and details loaded for one account or profile are not
@@ -255,3 +310,19 @@ policy depends on something not yet confirmed. Paths are repository-relative.
     inference; Roku does not name beta apps there).
 12. **Placeholders to fill:** publisher, effective date, policy URL, support
     email and URL, and whether a terms-of-use document exists.
+13. **Diagnostics reports go to a service the Silo project runs**
+    (`components/tasks/DiagnosticsTask.bs`, collector
+    `https://diagnostics.siloserver.org`). The "publisher receives no data"
+    statements now carry that exception; confirm who operates Silo
+    Diagnostics and name them here. The collector's own retention (30 days)
+    and its Access-protected review inbox are described in the
+    silo-diagnostics repository, not here.
+14. **What the log rewrite removes is best effort** for free text a server
+    sends (error messages, problem titles). The rewrite
+    (`source/diagnostics/scrub.bs`) removes everything the collector's
+    privacy check looks for, and the collector flags any line that still
+    matches; a title or a name in plain words is not something either can
+    recognise. The app does not log titles, search terms, or names itself.
+15. **The diagnostics log uses `cachefs:`**, which Roku shares among apps
+    signed with the same developer key and clears on restart or when it
+    needs the space (<https://developer.roku.com/docs/developer-program/getting-started/architecture/file-system.md>).

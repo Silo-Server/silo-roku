@@ -52,10 +52,17 @@ namespace playback.sidecars
     ' HTTP statuses a proxy in front of the server answers when it gives up
     ' on a response that is slow to start (502, 504, and Cloudflare's 524):
     ' the extraction behind it runs on as after a timeout, so they are
-    ' asked for again too (retryMs).
+    ' asked for again too (retryDelayMs).
     const RETRY_STATUSES = "|502|504|524|"
     ' A retry with less time than this left is not started.
     const MIN_ATTEMPT_MS = 5000
+    ' The least time between the starts of two downloads of the selected
+    ' sidecar: RETRY_BASE_MS before the second, doubling to RETRY_MAX_MS.
+    ' A download that timed out took longer than that, so it is asked for
+    ' again at once; a proxy that answers an error at once is asked a dozen
+    ' times or so in the 5 minutes, not continually (retryDelayMs).
+    const RETRY_BASE_MS = 2000
+    const RETRY_MAX_MS = 30000
     ' The download lanes: one for the selected sidecar and one the others
     ' share, so a selected sidecar the server is still extracting holds up
     ' none of the others, and at most two of ApiTask's transfers go to
@@ -380,25 +387,69 @@ namespace playback.sidecars
     end function
 
     ' The next sidecar among tracks (offered, with their states) to download
-    ' in lane: its first queued one, or invalid.
-    function nextDownload(tracks as Dynamic, lane as String) as Dynamic
+    ' in lane at now: its first queued one whose retry, if it waits for one
+    ' (track.retryAt), is due; or invalid.
+    function nextDownload(tracks as Dynamic, lane as String, now = invalid as Dynamic) as Dynamic
         if type(tracks) <> "roArray" then return invalid
         for each track in tracks
-            if track.state = "queued" and laneOf(track) = lane then return track
+            if track.state = "queued" and laneOf(track) = lane and retryDue(track, now) then return track
         end for
         return invalid
     end function
 
-    ' The deadline of the next download of a sidecar whose download failed
-    ' with kind and HTTP status, or 0 when it fails: only the selected one
-    ' is downloaded again, from the same URL, after a timeout or a proxy's
-    ' RETRY_STATUSES, while at least MIN_ATTEMPT_MS of SELECTED_TOTAL_MS is
-    ' left at now, counted from its first download (track.startedAt).
-    ' ATTEMPT_MS, or what is left of the total when that is less.
-    function retryMs(track as Object, kind as String, status as Dynamic, now as Dynamic) as Integer
-        if not retries(kind, status) or not util.isTrue(track.selected) or not util.isNumber(track.startedAt) or not util.isNumber(now) then return 0
+    function retryDue(track as Object, now as Dynamic) as Boolean
+        if not util.isNumber(track.retryAt) then return true
+        return util.isNumber(now) and now >= track.retryAt
+    end function
+
+    ' When the first retry waiting among tracks is due (track.retryAt), or
+    ' invalid when none waits. By index: the player asks whenever it
+    ' schedules its wake, which can be inside its own for each over the
+    ' same array, and the two would share the array's iterator.
+    function nextRetryAt(tracks as Dynamic) as Dynamic
+        if type(tracks) <> "roArray" then return invalid
+        soonest = invalid
+        for i = 0 to tracks.Count() - 1
+            track = tracks[i]
+            if track.state = "queued" and util.isNumber(track.retryAt)
+                if soonest = invalid or track.retryAt < soonest then soonest = track.retryAt
+            end if
+        end for
+        return soonest
+    end function
+
+    ' The pause before the next download of a sidecar whose download failed
+    ' at now with kind and HTTP status, or -1 when it fails: only the
+    ' selected one is downloaded again, from the same URL, after a timeout or
+    ' a proxy's RETRY_STATUSES. The next download starts RETRY_BASE_MS after
+    ' the one before started (track.attemptAt), doubling with each download
+    ' (track.attempts) to RETRY_MAX_MS, and only while at least
+    ' MIN_ATTEMPT_MS of SELECTED_TOTAL_MS will be left then, counted from its
+    ' first download (track.startedAt).
+    function retryDelayMs(track as Object, kind as String, status as Dynamic, now as Dynamic) as Integer
+        if not retries(kind, status) or not util.isTrue(track.selected) or not util.isNumber(track.startedAt) or not util.isNumber(now) then return -1
+        attempts = 1
+        if util.isNumber(track.attempts) and track.attempts > 1 then attempts = track.attempts
+        gap = RETRY_BASE_MS
+        for i = 2 to attempts
+            gap = gap * 2
+            if gap >= RETRY_MAX_MS then exit for
+        end for
+        if gap > RETRY_MAX_MS then gap = RETRY_MAX_MS
+        last = track.startedAt
+        if util.isNumber(track.attemptAt) then last = track.attemptAt
+        delay = gap - (now - last)
+        if delay < 0 then delay = 0
+        if attemptMs(track, now + delay) < MIN_ATTEMPT_MS then return -1
+        return Int(delay)
+    end function
+
+    ' The deadline of a download of track that starts at now: ATTEMPT_MS, or
+    ' what is left of SELECTED_TOTAL_MS from its first download
+    ' (track.startedAt) when that is less.
+    function attemptMs(track as Object, now as Dynamic) as Integer
+        if not util.isNumber(track.startedAt) or not util.isNumber(now) then return ATTEMPT_MS
         left = SELECTED_TOTAL_MS - (now - track.startedAt)
-        if left < MIN_ATTEMPT_MS then return 0
         if left > ATTEMPT_MS then return ATTEMPT_MS
         return Int(left)
     end function

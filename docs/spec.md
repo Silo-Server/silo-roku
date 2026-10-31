@@ -231,7 +231,6 @@ Not decided yet, and deferred until the owner chooses:
 - Home row editing (Android TV);
 - an edition picker (Android TV); the Version menu names each version's
   edition (section 5.6);
-- hosted diagnostics upload (tvOS, Android TV);
 - Home's hero line for the focused item's air date and cast, which costs an
   item read per card the viewer rests on.
 
@@ -2002,7 +2001,8 @@ stay usable.
 
 Settings opens from the avatar menu. It follows `TVSettingsView` on tvOS and
 `SettingsSplitLayout` on Android TV: a left rail with the active profile,
-General, Playback, Subtitles, Server, Sign Out, and the app version; the right
+General, Playback, Subtitles, Server, Diagnostics, Sign Out, and the app
+version; the right
 pane shows the selected category. Entry focuses General. Up/Down changes the
 rail selection or the focused setting; Right/OK enters the pane; Left/Back
 returns to the rail; Back from the rail restores the originating avatar.
@@ -2067,6 +2067,16 @@ seven-row scrolling window.
 - Server: the connected server address and Change Server (section 5.4's
   saved servers when another is saved); app version is
   always visible in the rail. No server administration controls.
+- Diagnostics (section 11.1): Send Diagnostics Now under Report, whose OK
+  asks first with the consent notice (Cancel, Send), and whose value is
+  "Sending…", "Sent: SILO-XXXXXXXX", "Couldn't send", or, with nothing
+  under way, "Includes the last crash" when the last launch ended in one;
+  and Delete Sent Reports under Sent Reports ("2 sent" or "None"), which
+  asks before it deletes. The footer is the consent notice, or the last
+  report's reference once one is sent. Android TV's destination choice,
+  debug-logging switch, timed capture, and per-report review are not
+  offered: Roku reports go only to Silo Diagnostics, its log always holds
+  every level, and a report is short enough to send whole.
 
 Platform differences: Roku exposes only controls already consumed by its
 player and shell. It does not expose Apple/Android decoder switches, caches,
@@ -3530,7 +3540,10 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   from the same URL, which joins the extraction or gets the kept copy (a 3.1 GB MKV
   on the shared dev server's CephFS took 116 seconds cold and 1 second
   once cached, 2026-10-28), until 5 minutes have passed since its first
-  download; then the notice "Subtitles are not available." shows. The
+  download; then the notice "Subtitles are not available." shows. Each
+  download starts at least 2 seconds after the one before, doubling to 30
+  seconds, so a proxy that answers an error at once is not asked
+  continually. The
   busy capsule says "Loading subtitles…" only until the content's first
   frame, since it holds every notice back: once the content plays without
   its sidecar, the sidecar loads quietly, and Options keeps its row
@@ -3835,9 +3848,83 @@ Questions for Roku before public submission:
 - Do not use the Roku serial number, advertising identifier, or household
   account identity as Silo's installation ID.
 - Do not add analytics, crash reporting, advertising, or third-party tracking
-  SDKs without a separate privacy and dependency review.
+  SDKs without a separate privacy and dependency review. Diagnostics reports
+  (section 11.1) go only to the Silo project's own collector, only when the
+  viewer sends one.
 - Images and metadata remain bounded in memory and are dropped on account,
   profile, or server changes so one identity cannot see another's cache.
+
+### 11.1 Diagnostics log and reports
+
+Android TV and tvOS send diagnostics reports to Silo Diagnostics
+(`https://diagnostics.siloserver.org`, the `Silo-Server/silo-diagnostics`
+collector) under the client-diagnostics v1 contract. Roku does the same,
+with `platform` `roku` (section 14), hosted only:
+
+- **The log.** Every `log.*` call, at every level and in release builds
+  too, is posted from its thread to the render thread on an
+  `roRenderThreadQueue`, without a rendezvous (`source/util/log.bs`).
+  AppScene hands the calls to `DiagnosticsTask` every half second, at once
+  for a warning or an error (`components/AppSceneDiagnostics.bs`). The Task
+  writes them as contract lines (`source/diagnostics/line.bs`): the
+  category follows the tag, registered fields become `attrs` with their
+  registered type, the rest follow the message as `key=value`, and a field
+  named for an identity or credential is left out. It appends them to this
+  launch's file in `cachefs:`, which Roku keeps across launches, so the
+  launch a crash ended can be reported from the next; each launch keeps at
+  most two 512 KB files. Lines still waiting on the render thread when the
+  app stops are lost.
+- **Privacy rewrite.** The collector flags a report when any string in it
+  reads as an address, an identifier, a credential, or a private route
+  (`silo-diagnostics` `src/privacy.ts`). `source/diagnostics/scrub.bs`
+  rewrites each string so none of its patterns is left: URLs become
+  `https://redacted.invalid` and their path; numbers, UUIDs, and opaque or
+  hex runs in a path become `{id}`; IP, IPv6, MAC, and host:port become
+  `{ip}`, `{mac}`, and `{addr}`; a key reserved for identities loses its
+  value; dotted words use a middle dot; long numbers are grouped;
+  context words such as "server" before a word that would read as a host
+  are shortened ("srv"); non-ASCII text becomes `~`. A corpus of every log
+  message in the app, targeted cases, and 3,000 random strings passed the
+  collector's own check after the rewrite (2026-10-31).
+- **Instrumentation.** Besides each component's own lines: every API
+  request with its method, path, status, duration, and outcome; each screen
+  shown and its route; the player's `Video` states, downloaded segments
+  (timing, size, bitrate; never the URL), and buffering start and end; how
+  the last launch ended (`roAppManager.GetLastExitInfo`, Roku OS 13); the
+  launch's app, OS, and model; platform events; and a heartbeat with memory
+  use every minute.
+- **Reports.** Settings > Diagnostics (section 5.8.1) sends a report after
+  the consent notice (`consent.mode` `manual`). When the last launch ended in
+  a crash, a timeout, or an exit Roku forced (memory, low resources), Home
+  asks once, two seconds after launch completes, as Android TV does ("Silo
+  Closed Unexpectedly", Don't Send or Send Report; `prompt`); Back counts as
+  Don't Send. The report then has `report.type` `crash`, `hang`, or
+  `abnormal_exit` and a `crash` object from the exit record (`source`
+  `exit_info`, `provenance` `post_restart`). Each report holds
+  `manifest.json`, `device.json` (model, display, HDR, codec and audio
+  support, memory, locale, network type; no serial, advertising ID, device
+  name, or network name), and `logs.jsonl` with this launch's and the last
+  launch's lines.
+- **Transport.** `DiagnosticsTask` checks the collector's capabilities
+  (`collector_id` and notice version), registers a pseudonymous installation
+  once (`POST /v1/installations`; no Silo credential or header goes to the
+  collector), creates the report, uploads the bundle with `PUT`, and watches
+  it for 30 seconds. The bundle is a canonical USTAR archive in one gzip
+  member of stored deflate blocks, since Roku has no compressor
+  (`source/diagnostics/bundle.bs`); the collector inflates it like any
+  other. Its own registry section (`silo.diagnostics`, 1 KB) keeps the
+  installation credential, the last five reports for Delete Sent Reports,
+  and the last exit already reported or declined. Development builds take
+  `diagnosticsCollector`, `diagnosticsSend`, and `diagnosticsCrash` ECP
+  parameters (README).
+- **Hardware, 2026-10-31 (TCL 55R625, Roku OS 15.3.4).** Reports from
+  Settings and from the crash prompt reached `ready` on a local collector
+  with every validation check passing and no privacy flags; the bundle
+  upload sent its length; `cachefs:` kept the last launch's log across a
+  relaunch; `GetLastExitInfo` gave `EXIT_BRIGHTSCRIPT_CRASH` and its time.
+  Its `console_log` held only Roku's own "Exiting" line, with or without
+  `run_as_process=1`, so the crash object carries no BrightScript error
+  text.
 
 ## 12. Testing and release evidence
 
@@ -4063,8 +4150,10 @@ allowlist. The following follow-ups are tracked with the server:
 - add `roku` to the v2 migration ledger's consumers, with `silo-roku` as its
   source tree;
 - add `roku` to the settings manifest's platform list (advisory only);
-- add `roku` to the hosted-diagnostics platform allowlist before diagnostics
-  upload is in scope;
+- add `roku` to the client-diagnostics contract's platforms and the hosted
+  collector's allowlist (section 11.1): silo-server and silo-diagnostics
+  changes prepared 2026-10-31, to merge and deploy before a release sends
+  reports;
 - decide the media and subtitle authentication fallback if section 9.4 or
   9.7 fails on hardware;
 - keep a resume point from moving backwards across sessions: a stop for a

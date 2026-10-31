@@ -849,7 +849,11 @@ end sub
 
 sub onWakeTimer()
     runSlot(playback.slot.tick(m.slot, m.env.now()))
-    if m.current <> invalid then tryAssign(m.current)
+    if m.current <> invalid
+        ' A selected sidecar's retry that waited may be due.
+        if type(m.current.sidecars) = "roArray" then fetchSidecar(m.current)
+        tryAssign(m.current)
+    end if
     dispatch({ type: "wake" })
 end sub
 
@@ -861,6 +865,7 @@ sub scheduleWake()
     wake = sooner(wake, playback.slot.wakeAt(m.slot))
     item = m.current
     if item <> invalid and not item.assigned then wake = sooner(wake, playback.sidecars.waitUntil(item.sidecars, item.sidecarsAt))
+    if item <> invalid then wake = sooner(wake, playback.sidecars.nextRetryAt(item.sidecars))
     m.wakeTimer.control = "stop"
     if wake = invalid then return
     delay = (wake - now) / 1000
@@ -1162,6 +1167,7 @@ end function
 
 sub onVideoState()
     videoState = m.video.state
+    log.info(LOG_TAG, "video state", { state: videoState, position_ms: Int(m.video.position * 1000), loaded: m.activeLoad <> invalid })
     ' The state belongs to the content the node had; an idle state may let
     ' the slot assign newer content, which has reported nothing yet.
     load = m.activeLoad
@@ -1266,19 +1272,32 @@ sub onVideoFormat()
     logFormats("video")
 end sub
 
+' A downloaded segment for the diagnostics log: its timing and size, never
+' its URL, which carries the session's path token.
+sub logSegment(segment as Dynamic)
+    if not util.isObject(segment) then return
+    fields = { status: segment.Status, type: segment.SegType, seq: segment.SegSequence, ms: segment.DownloadDuration, bytes: segment.SegSize }
+    if util.isNumber(segment.BitrateBps) then fields.bitrate_kbps = Int(segment.BitrateBps / 1000)
+    log.debug(LOG_TAG, "segment", fields)
+end sub
+
 ' Media data arrived. The stall clock tells a buffer that still fills (the
 ' network) from a decoder that has its media and shows nothing
 ' (playback.recovery.noteMedia). A segment whose download failed is not
 ' media.
 sub onVideoSegment()
     if m.leaving or m.activeLoad = invalid then return
+    logSegment(m.video.downloadedSegment)
     reducerEvent = playback.video.segmentEvent(m.video.downloadedSegment, m.activeLoad)
     if reducerEvent <> invalid then dispatch(reducerEvent)
 end sub
 
 sub onVideoBuffer()
     if m.leaving or m.activeLoad = invalid then return
-    reducerEvent = playback.video.bufferEvent(m.video.bufferingStatus, m.activeLoad)
+    status = m.video.bufferingStatus
+    ' Its start and end, not each step of the percentage.
+    if util.isObject(status) and util.isNumber(status.percentage) and (status.percentage = 0 or status.percentage >= 100) then log.debug(LOG_TAG, "buffering", { percent: status.percentage, underrun: util.isTrue(status.isUnderrun), position_ms: Int(m.video.position * 1000) })
+    reducerEvent = playback.video.bufferEvent(status, m.activeLoad)
     if reducerEvent <> invalid then dispatch(reducerEvent)
 end sub
 
@@ -1336,8 +1355,9 @@ end sub
 ' converts each to SRT. One the session's cache keeps is ready at once
 ' (playback.sidecarCache). Each download has ATTEMPT_MS; the selected one
 ' downloads again after a timeout or a proxy's 502, 504, or 524, within
-' SELECTED_TOTAL_MS (retryMs),
-' since the server goes on extracting it and keeps the result.
+' SELECTED_TOTAL_MS and with a growing pause between fast failures
+' (retryDelayMs), since the server goes on extracting it and keeps the
+' result.
 ' "Loading subtitles…" shows while new content waits for it and until the
 ' content's first frame; after that it loads quietly (subtitleStarted).
 sub startSidecars(item as Object)
@@ -1376,13 +1396,18 @@ end sub
 ' Starts each lane's next queued sidecar while the lane has no download
 ' running.
 sub fetchSidecar(item as Object)
+    now = m.env.now()
     for each lane in [playback.sidecars.LANE_SELECTED, playback.sidecars.LANE_OTHERS]
         track = invalid
-        if m.subtitleHandles[lane] = invalid then track = playback.sidecars.nextDownload(item.sidecars, lane)
+        if m.subtitleHandles[lane] = invalid then track = playback.sidecars.nextDownload(item.sidecars, lane, now)
         if track <> invalid
-            if not util.isNumber(track.startedAt) then track.startedAt = m.env.now()
-            timeoutMs = playback.sidecars.ATTEMPT_MS
-            if util.isNumber(track.retryMs) then timeoutMs = track.retryMs
+            if not util.isNumber(track.startedAt) then track.startedAt = now
+            attempts = 0
+            if util.isNumber(track.attempts) then attempts = track.attempts
+            track.attempts = attempts + 1
+            track.attemptAt = now
+            track.retryAt = invalid
+            timeoutMs = playback.sidecars.attemptMs(track, now)
             track.state = "loading"
             handle = handleFor("onSubtitleDownloaded")
             m.subtitleHandles[lane] = handle
@@ -1428,13 +1453,16 @@ sub onSubtitleDownloaded(event as Object)
             kind = util.text(result.error.kind)
             status = result.error.status
         end if
-        retryMs = playback.sidecars.retryMs(track, kind, status, m.env.now())
-        if retryMs > 0
+        now = m.env.now()
+        delayMs = playback.sidecars.retryDelayMs(track, kind, status, now)
+        if delayMs >= 0
             ' The server's extraction goes on and keeps its result: the same
-            ' URL again joins it or gets the kept copy.
-            log.info(LOG_TAG, "the subtitle download timed out; it is asked for again", { format: track.format, kind: kind, status: status, ms: retryMs, waitedMs: m.env.now() - track.startedAt })
+            ' URL again joins it or gets the kept copy, after a pause when
+            ' the failure came back at once (the wake timer's fetchSidecar).
+            log.info(LOG_TAG, "the subtitle download failed while the server may still extract it; it is asked for again", { format: track.format, kind: kind, status: status, inMs: delayMs, attempts: track.attempts, waitedMs: now - track.startedAt })
             track.state = "queued"
-            track.retryMs = retryMs
+            track.retryAt = now + delayMs
+            if m.state <> invalid then scheduleWake()
         else
             sidecarFailed(track, kind)
         end if

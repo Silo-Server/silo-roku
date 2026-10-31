@@ -1,0 +1,134 @@
+' A diagnostics bundle as the hosted collector accepts it
+' (silo-diagnostics src/archive.ts): a USTAR archive whose every header field
+' is canonical (mode 0644, owner and times zero, no link, user, or group
+' names) and that ends with exactly two zero blocks, in one gzip member with
+' no optional header fields and a zero modification time. Roku has no
+' compressor, so the deflate stream is stored blocks; the collector inflates
+' them like any other. CRC-32 and SHA-256 come from roByteArray and
+' roEVPDigest.
+namespace diag.bundle
+    const BLOCK = 512
+    ' The largest stored deflate block.
+    const STORED_MAX = 65535
+
+    ' Writes the archive of entries, [{ name, bytes }] in order with
+    ' manifest.json first, to tarPath and its gzip to gzPath (both tmp:/).
+    ' Returns { bytes, uncompressedBytes, sha256 }, or invalid when a write
+    ' fails.
+    function write(entries as Object, tarPath as String, gzPath as String) as Dynamic
+        tar = CreateObject("roByteArray")
+        for each entry in entries
+            size = entry.bytes.Count()
+            tar.Append(header(entry.name, size))
+            tar.Append(entry.bytes)
+            pad = (BLOCK - size mod BLOCK) mod BLOCK
+            if pad > 0 then tar.Append(zeros(pad))
+        end for
+        tar.Append(zeros(2 * BLOCK))
+        if not tar.WriteFile(tarPath) then return invalid
+        gz = gzip(tar, tarPath)
+        tarSize = tar.Count()
+        if gz = invalid or not gz.WriteFile(gzPath) then return invalid
+        digest = CreateObject("roEVPDigest")
+        digest.Setup("sha256")
+        return { bytes: gz.Count(), uncompressedBytes: tarSize, sha256: LCase(digest.Process(gz)) }
+    end function
+
+    ' One 512-byte USTAR header for a regular file of size bytes.
+    function header(name as String, size as Integer) as Object
+        fields = zeros(BLOCK)
+        put(fields, 0, name)
+        put(fields, 100, "0000644")
+        put(fields, 108, "0000000")
+        put(fields, 116, "0000000")
+        put(fields, 124, octal(size, 11))
+        put(fields, 136, "00000000000")
+        ' The checksum counts its own field as eight spaces.
+        put(fields, 148, "        ")
+        fields[156] = 48
+        put(fields, 257, "ustar")
+        put(fields, 263, "00")
+        sum = 0
+        for i = 0 to BLOCK - 1
+            sum = sum + fields[i]
+        end for
+        put(fields, 148, octal(sum, 6))
+        fields[154] = 0
+        fields[155] = 32
+        return fields
+    end function
+
+    ' The tar as one gzip member of stored deflate blocks: header (no flags,
+    ' zero time, OS 3), blocks of at most STORED_MAX bytes read back from
+    ' tarPath, then CRC-32 and size, little-endian.
+    function gzip(tar as Object, tarPath as String) as Dynamic
+        total = tar.Count()
+        out = CreateObject("roByteArray")
+        out.Append(bytesOf([&h1F, &h8B, 8, 0, 0, 0, 0, 0, 0, 3]))
+        offset = 0
+        chunk = CreateObject("roByteArray")
+        while true
+            length = total - offset
+            if length > STORED_MAX then length = STORED_MAX
+            final = offset + length >= total
+            flag = 0
+            if final then flag = 1
+            out.Append(bytesOf([flag, length and 255, (length >> 8) and 255, (65535 - length) and 255, ((65535 - length) >> 8) and 255]))
+            if length > 0
+                if not chunk.ReadFile(tarPath, offset, length) or chunk.Count() <> length then return invalid
+                out.Append(chunk)
+            end if
+            offset = offset + length
+            if final then exit while
+        end while
+        out.Append(littleEndian(tar.GetCRC32()))
+        out.Append(littleEndian(total))
+        return out
+    end function
+
+    function littleEndian(value as Integer) as Object
+        return bytesOf([value and 255, (value >> 8) and 255, (value >> 16) and 255, (value >> 24) and 255])
+    end function
+
+    ' value in octal, zero-padded to width digits.
+    function octal(value as Integer, width as Integer) as String
+        digits = ""
+        rest = value
+        while rest > 0
+            digits = (rest mod 8).ToStr() + digits
+            rest = rest \ 8
+        end while
+        while Len(digits) < width
+            digits = "0" + digits
+        end while
+        return digits
+    end function
+
+    ' Writes an ASCII string's bytes into block from offset.
+    sub put(target as Object, offset as Integer, text as String)
+        for i = 1 to Len(text)
+            target[offset + i - 1] = Asc(Mid(text, i, 1))
+        end for
+    end sub
+
+    function zeros(count as Integer) as Object
+        bytes = CreateObject("roByteArray")
+        bytes[count - 1] = 0
+        return bytes
+    end function
+
+    function bytesOf(values as Object) as Object
+        bytes = CreateObject("roByteArray")
+        for each value in values
+            bytes.Push(value)
+        end for
+        return bytes
+    end function
+
+    ' A string as UTF-8 bytes.
+    function utf8(text as String) as Object
+        bytes = CreateObject("roByteArray")
+        bytes.FromAsciiString(text)
+        return bytes
+    end function
+end namespace

@@ -259,7 +259,9 @@ transport and refresh still in `ApiTask`.
 ### 4.3 Storage
 
 `Main()` reads a registry snapshot before creating the scene and passes it in.
-After that `ApiTask` is the only writer, and it writes and flushes rotated tokens
+After that `ApiTask` is the only writer of the session's sections (the
+diagnostics Task writes its own small section, spec section 11.1), and it
+writes and flushes rotated tokens
 before releasing requests queued behind a refresh. When the registry refuses a
 write, delete, or flush, the session goes on from memory and `ApiTask` saves the
 current record again 1 s later, doubling to a minute, until a save succeeds. The
@@ -894,6 +896,11 @@ mode on HLS, the recorded audio probe results, and `IsPassthruCodecActive()`.
 These do not prove DV or Atmos: `videoFormat` has no DV value, `audioFormat` has
 no JOC flag, and `streamingSegment` is meaningless for originals. H3 and H9 also
 record the TV's and AVR's info panels.
+
+The diagnostics log and the reports a viewer sends to Silo Diagnostics are spec
+section 11.1: every log level is kept in release builds, rewritten for the
+collector's privacy rules, persisted across one launch in `cachefs:`, and sent
+only from Settings or the prompt after a crash.
 
 ## 7. Launch, deep links, certification
 
