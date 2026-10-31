@@ -606,8 +606,9 @@ their existing HD/FHD assets.
     symbol in place of the QR code. Section 7.2 runs the code.
   - A declined or paused code has none on screen, so the lead reads "Show a
     new code to try again, or sign in with a password." ("Show a new code to
-    try again." when the server takes no passwords) and the status "Sign-in
-    was declined." (the TV cannot tell a phone's decline from a browser's).
+    try again." when the server takes no passwords). A declined code's
+    status is "Sign-in was declined." (the TV cannot tell a phone's decline
+    from a browser's); a paused one keeps "Sign-in paused."
     With Show a new code, Sign in with a password, and Change server in one
     row, the row is drawn in the compact button size when it would reach
     the card, so a focused Change server stays clear of it (a Roku fit
