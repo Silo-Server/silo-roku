@@ -1,5 +1,6 @@
 import "pkg:/source/util/values.bs"
 import "pkg:/source/playback/media.bs"
+import "pkg:/source/playback/tracks.bs"
 import "pkg:/source/playback/values.bs"
 
 ' Which subtitle sidecars a content carries, and when a new plan can switch
@@ -14,7 +15,11 @@ import "pkg:/source/playback/values.bs"
 ' and draws the one selected (2026-10-29 native embedded spike), so a plan
 ' whose subtitle is native embedded (playback.media.nativeSubtitle), and
 ' the inventory rows it marks native_selectable (nativeTracks), switch in
-' place by that name, and are never downloaded (assumption AG-652). Pure.
+' place by that name, and are never downloaded (assumption AG-652). An HLS
+' plan that lists every embedded text track as a rendition of its stream
+' (rows with hls_rendition, contract C3) switches among them, and to Off,
+' in place too, by the TrackName Roku lists for each (renditionTracks),
+' and downloads none of them (assumption AG-654). Pure.
 namespace playback.sidecars
     ' Sidecars per content, the selected one included; each is at most
     ' api.response.MAX_SIDECAR_BYTES as downloaded and
@@ -69,6 +74,9 @@ namespace playback.sidecars
     ' sidecars (assumption AG-651).
     const LANE_SELECTED = "selected"
     const LANE_OTHERS = "others"
+    ' Roku's name for an HLS stream's n-th WebVTT subtitle rendition,
+    ' "webvtt/<n>" (renditionName).
+    const RENDITION_PREFIX = "webvtt/"
     ' The sidecars to download for a plan's content, the selected one first,
     ' as { trackId, url, format, language, label, shiftSeconds, selected,
     ' cacheKey }: url resolved against baseUrl and asking for the plan's
@@ -80,8 +88,9 @@ namespace playback.sidecars
     ' and, with none selected, only while captionMode is "Off": with captions
     ' on, Roku shows a track by the viewer's caption language whenever the
     ' player selects none. A native embedded subtitle, the plan's or a row
-    ' the content plays natively (nativeRow), is none of them: Roku draws it
-    ' from the stream.
+    ' the content plays natively (nativeRow), and an HLS rendition, the
+    ' plan's or a row the stream lists (renditionRow), are none of them:
+    ' Roku draws them from the stream.
     function offered(plan as Object, baseUrl as String, captionMode as String) as Object
         out = []
         offset = 0
@@ -93,13 +102,13 @@ namespace playback.sidecars
             selectedId = selected.trackId
             selected.cacheKey = cacheKey(plan, playback.media.inventoryEntry(subtitle, selectedId), selected.format, offset, baseUrl)
             add(out, selected, true, baseUrl, offset)
-        else if playback.media.nativeSubtitle(plan) <> ""
+        else if playback.media.nativeSubtitle(plan) <> "" or (util.isObject(subtitle) and util.isObject(subtitle.hls_rendition))
             selectedId = util.text(subtitle.track_id)
         end if
         if not util.isObject(subtitle) or not playback.values.isArray(subtitle.inventory) or not clientRendered(plan) or not mayCarry(plan, captionMode) then return out
         for each entry in subtitle.inventory
             if out.Count() >= MAX_TRACKS then exit for
-            if util.isObject(entry) and util.text(entry.delivery) = "sidecar" and playback.values.isText(entry.track_id) and entry.track_id <> selectedId and nativeRow(plan, entry) = ""
+            if util.isObject(entry) and util.text(entry.delivery) = "sidecar" and playback.values.isText(entry.track_id) and entry.track_id <> selectedId and nativeRow(plan, entry) = "" and renditionRow(plan, entry) = invalid
                 format = formatOf(entry.url)
                 language = "und"
                 if playback.values.isText(entry.language) then language = entry.language
@@ -112,9 +121,12 @@ namespace playback.sidecars
     ' Whether content for plan may carry sidecars while Roku's caption mode
     ' is captionMode: not when the plan selects none and captions are on,
     ' since Roku would then show one by the viewer's caption language. A
-    ' native embedded subtitle is a selection. The mode can change while
-    ' content waits for its headers, sidecars, or the Video node's stop, so
-    ' the player asks again before it hands content over.
+    ' native embedded subtitle is a selection. An HLS rendition is not: the
+    ' player selects it only once the content settles, so until then Roku
+    ' might show a carried sidecar by the caption language instead. The
+    ' mode can change while content waits for its headers, sidecars, or the
+    ' Video node's stop, so the player asks again before it hands content
+    ' over.
     function mayCarry(plan as Object, captionMode as String) as Boolean
         return captionMode = "Off" or playback.media.subtitleArtifact(plan) <> invalid or playback.media.nativeSubtitle(plan) <> ""
     end function
@@ -153,7 +165,127 @@ namespace playback.sidecars
             if playback.values.isText(entry.language) then language = entry.language
             label = util.text(entry.label)
         end if
-        return { trackId: trackId, path: name, native: true, state: "ready", selected: selected, language: language, label: label }
+        return { trackId: trackId, path: name, native: true, stream: true, state: "ready", selected: selected, language: language, label: label }
+    end function
+
+    ' The tracks of the content's own stream, which it plays without
+    ' carrying them (stream: true): an MKV original's (nativeTracks) and an
+    ' HLS stream's subtitle renditions under the names Roku lists in listed
+    ' (renditionTracks).
+    function streamTracks(plan as Object, listed as Dynamic) as Object
+        out = nativeTracks(plan)
+        out.Append(renditionTracks(plan, listed))
+        return out
+    end function
+
+    ' The subtitle renditions of an HLS plan's stream, one per inventory row
+    ' with an hls_rendition (renditionRow), as { trackId, path, rendition,
+    ' stream, state, selected, language, label, index, by }: path the
+    ' TrackName Roku lists for it in listed (Video.availableSubtitleTracks)
+    ' and by how it was matched (renditionName), state "ready", selected
+    ' for the plan's own. The server keeps the stream for a track_change
+    ' among them or to Off (contract C3), so each is a track the player can
+    ' select on the playing content. None for another stream.
+    function renditionTracks(plan as Object, listed as Dynamic) as Object
+        out = []
+        subtitle = plan.subtitle
+        if not util.isObject(subtitle) or not playback.values.isArray(subtitle.inventory) then return out
+        selectedId = ""
+        if util.isObject(subtitle.hls_rendition) and clientMode(subtitle) then selectedId = util.text(subtitle.track_id)
+        names = {}
+        names.SetModeCaseSensitive()
+        for each entry in subtitle.inventory
+            rendition = renditionRow(plan, entry)
+            if rendition <> invalid then names[util.text(rendition.name)] = true
+        end for
+        for each entry in subtitle.inventory
+            rendition = renditionRow(plan, entry)
+            if rendition <> invalid
+                found = renditionName(listed, rendition, entry.language, names)
+                language = "und"
+                if playback.values.isText(entry.language) then language = entry.language
+                out.Push({ trackId: entry.track_id, path: found.name, rendition: true, stream: true, state: "ready", selected: entry.track_id = selectedId, language: language, label: util.text(entry.label), index: rendition.index, by: found.by })
+            end if
+        end for
+        return out
+    end function
+
+    ' An inventory row's rendition in an HLS plan's stream,
+    ' { group_id, name, index }, or invalid: a row with a name and a
+    ' 1-based index in its group (contract C3) on a plan whose stream is
+    ' HLS.
+    function renditionRow(plan as Object, entry as Dynamic) as Dynamic
+        if not util.isObject(entry) or not playback.values.isText(entry.track_id) or not util.isObject(entry.hls_rendition) then return invalid
+        rendition = entry.hls_rendition
+        if not playback.values.isText(rendition.name) or not util.isNumber(rendition.index) or rendition.index < 1 then return invalid
+        if playback.media.streamFormat(plan.stream) <> "hls" then return invalid
+        return rendition
+    end function
+
+    ' Whether an HLS plan's stream lists its embedded text tracks as
+    ' renditions (renditionRow).
+    function listsRenditions(plan as Object) as Boolean
+        subtitle = plan.subtitle
+        if not util.isObject(subtitle) or not playback.values.isArray(subtitle.inventory) then return false
+        for each entry in subtitle.inventory
+            if renditionRow(plan, entry) <> invalid then return true
+        end for
+        return false
+    end function
+
+    ' The TrackName Roku lists a subtitle rendition under, as { name, by }:
+    ' the one track in listed (Video.availableSubtitleTracks) whose
+    ' Description is the rendition's NAME, which the server makes unique in
+    ' its group, by "name"; else "webvtt/<index>", Roku's documented name
+    ' for the stream's index-th WebVTT rendition, by "index", but only when
+    ' Roku lists it with the row's language (its primary subtag,
+    ' playback.tracks.languageKey), so that a numbering of Roku's own cannot
+    ' put another language on the plan's track, and not with a Description
+    ' naming another of the stream's renditions (names, every rendition's
+    ' NAME), which makes it that rendition's; else "" by "unlisted",
+    ' before Roku lists the tracks too: a rendition with no name the player
+    ' selects, writes, or switches to, which the stream's DEFAULT shows if
+    ' it is the plan's. A carried sidecar's name (a path, isFile) never
+    ' matches. Earlier runs saw "webvtt/1" for a single rendition, but how
+    ' Roku numbers several is not yet seen on a device, so the player logs
+    ' which way each matched (assumption AG-654).
+    function renditionName(listed as Dynamic, rendition as Object, language as Dynamic, names = {} as Object) as Object
+        unlisted = { name: "", by: "unlisted" }
+        if type(listed) <> "roArray" then return unlisted
+        fallback = RENDITION_PREFIX + Int(rendition.index).ToStr()
+        rowLanguage = playback.tracks.languageKey(language)
+        found = ""
+        matches = 0
+        indexed = false
+        for each track in listed
+            if util.isObject(track)
+                trackName = util.text(track.TrackName)
+                if trackName <> "" and not isFile(trackName) and util.text(track.Description) = util.text(rendition.name)
+                    matches = matches + 1
+                    found = trackName
+                end if
+                description = util.text(track.Description)
+                another = description <> "" and description <> util.text(rendition.name) and names.DoesExist(description)
+                if trackName = fallback and rowLanguage <> "" and playback.tracks.languageKey(track.Language) = rowLanguage and not another then indexed = true
+            end if
+        end for
+        if matches = 1 then return { name: found, by: "name" }
+        if indexed then return { name: fallback, by: "index" }
+        return unlisted
+    end function
+
+    ' Whether a plan's subtitle is a rendition of its HLS stream that the
+    ' client shows.
+    function selectsRendition(plan as Object) as Boolean
+        subtitle = plan.subtitle
+        return util.isObject(subtitle) and util.isObject(subtitle.hls_rendition) and clientMode(subtitle)
+    end function
+
+    ' Whether a subtitle decision's mode is one whose hls_rendition the
+    ' client shows.
+    function clientMode(subtitle as Object) as Boolean
+        mode = util.text(subtitle.mode)
+        return mode = "render" or mode = "convert"
     end function
 
     ' The TrackName Roku lists an inventory row under when the content plays
@@ -166,17 +298,29 @@ namespace playback.sidecars
     end function
 
     ' The track name the content shows plan's subtitle by, among tracks (the
-    ' content's ready sidecars and native tracks), or "" for none: a native
+    ' content's ready sidecars and stream tracks), or "" for none: a native
     ' embedded subtitle's TrackName from the plan itself, since the content
-    ' plays the file it names, or the path of the sidecar the content
-    ' carries for the plan's artifact. "" for a sidecar it does not carry.
+    ' plays the file it names; the name Roku lists for the plan's HLS
+    ' rendition (renditionTracks), "" for one it lists no name for and for
+    ' a single rendition, which the stream alone selects; or the path of
+    ' the sidecar the content carries for the
+    ' plan's artifact. "" for a sidecar it does not carry.
     function planPath(tracks as Dynamic, plan as Object) as String
         name = playback.media.nativeSubtitle(plan)
         if name <> "" then return name
+        subtitle = plan.subtitle
+        if type(tracks) <> "roArray" then return ""
+        if util.isObject(subtitle) and util.isObject(subtitle.hls_rendition)
+            if not clientMode(subtitle) then return ""
+            for each track in tracks
+                if util.isTrue(track.rendition) and track.trackId = util.text(subtitle.track_id) then return track.path
+            end for
+            return ""
+        end if
         artifact = playback.media.subtitleArtifact(plan)
-        if artifact = invalid or type(tracks) <> "roArray" then return ""
+        if artifact = invalid then return ""
         for each track in tracks
-            if track.trackId = artifact.trackId and track.state = "ready" and not util.isTrue(track.native) then return track.path
+            if track.trackId = artifact.trackId and track.state = "ready" and not util.isTrue(track.stream) then return track.path
         end for
         return ""
     end function
@@ -185,7 +329,8 @@ namespace playback.sidecars
     ' leaves Roku's caption mode alone, assumption AG-75): true unless the
     ' plan's subtitle is the track the content shows at path (the sidecar it
     ' carries, or the MKV's own track Roku draws for a native embedded
-    ' subtitle, planPath) or the HLS rendition in its stream. With
+    ' subtitle, planPath) or the HLS rendition in its stream, one of many
+    ' or the only one. With
     ' captions on and nothing selected that it can draw, Roku draws a track
     ' it picks by the caption language (Video.currentSubtitleTrack), and
     ' content cannot leave out a text track embedded in an original's
@@ -195,10 +340,7 @@ namespace playback.sidecars
     function suppressed(plan as Dynamic, path as String) as Boolean
         if not util.isObject(plan) then return true
         subtitle = plan.subtitle
-        if util.isObject(subtitle) and util.isObject(subtitle.hls_rendition)
-            mode = util.text(subtitle.mode)
-            if mode = "render" or mode = "convert" then return false
-        end if
+        if util.isObject(subtitle) and util.isObject(subtitle.hls_rendition) and clientMode(subtitle) then return false
         return path = ""
     end function
 
@@ -497,11 +639,19 @@ namespace playback.sidecars
     ' or currentSubtitleTrack) is the track the player gave it at path: for
     ' a sidecar the path itself or a name that contains it, since Roku
     ' reported subtitleTrack as the bare path after the player wrote the
-    ' listed name, and the listed name later (hardware run 20); for an MKV's
-    ' own track that name alone, as mkv/3 is not mkv/30.
+    ' listed name, and the listed name later (hardware run 20); for a track
+    ' of the stream (an MKV's mkv/3, an HLS rendition's webvtt/1) that name
+    ' alone, as mkv/3 is not mkv/30.
     function isTrack(name as String, path as String) as Boolean
-        if playback.media.isNative(path) then return name = path
-        return path <> "" and Instr(1, name, path) > 0
+        if path = "" then return false
+        if not isFile(path) then return name = path
+        return Instr(1, name, path) > 0
+    end function
+
+    ' Whether a track path is a file the player gave Roku (a sidecar's
+    ' tmp:/ path), not a track of the stream.
+    function isFile(path as String) as Boolean
+        return Instr(1, path, ":/") > 0
     end function
 
     ' The path of the track among tracks (the content's ready sidecars and

@@ -1,0 +1,222 @@
+namespace tests
+
+    ' The player on an HLS stream that lists every embedded text track as a
+    ' WebVTT rendition (contract C3; assumption AG-654), through a
+    ' PlayerProbe (tests/components/PlayerProbe.bs): a transcode of
+    ' tests.renditionPlan's inventory, English (rendition 1), Español (2),
+    ' English (2) (3), an external English SRT, and a Japanese PGS.
+    @suite("player HLS subtitle renditions")
+    class PlayerHlsRenditionsTests extends tests.PlayerCaptionsSuite
+
+        function inventory() as Object
+            return tests.renditionPlan().subtitle.inventory
+        end function
+
+        ' Roku's list of the stream's renditions: names in playlist order
+        ' unless names says otherwise, described by NAME unless bare, in
+        ' the languages of the playlist unless languages says otherwise.
+        function listing(names = ["webvtt/1", "webvtt/2", "webvtt/3"] as Object, bare = false as Boolean, languages = ["en", "es", "en"] as Object) as Object
+            descriptions = ["English", "Español", "English (2)"]
+            out = []
+            for i = 0 to 2
+                description = descriptions[i]
+                if bare then description = ""
+                out.Push({ TrackName: names[i], Language: languages[i], Description: description })
+            end for
+            return out
+        end function
+
+        ' Español started on the stream, Roku listing its renditions, then
+        ' reporting it selected (the playlist's DEFAULT); with settled, its
+        ' first frame came and the settle time is over.
+        function startedSpanish(settled as Boolean) as Object
+            node = m.player()
+            node.callFunc("probeStart", { hls: true, inventory: m.inventory(), subtitle: tests.renditionOf(1), captionMode: "On", carried: [] })
+            node.callFunc("probeRokuReports", { listed: "", stream: m.listing() })
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "webvtt/2", current: "webvtt/2" })
+            m.assertEqual([view.activeTrack, view.suppressed, view.subtitleTrack], ["webvtt/2", false, "webvtt/2"])
+            node.callFunc("probeFirstFrame")
+            if settled then node.callFunc("probeElapse", 3000)
+            return node
+        end function
+
+        function showingSpanish() as Object
+            return m.startedSpanish(true)
+        end function
+
+        function paths(node as Object) as Object
+            out = []
+            for each track in node.callFunc("probeTracks")
+                out.Push([track.trackId, track.path, track.by])
+            end for
+            return out
+        end function
+
+        @describe("a stream that lists every rendition at load")
+
+        @it("starts on the plan's rendition without writing a subtitle, and takes Roku's names for the renditions by NAME")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { hls: true, inventory: m.inventory(), subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            view = node.callFunc("probeNewLoad", { subtitle: tests.renditionOf(1), captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.activeLoad, view.activeTrack, view.suppressed, view.carried, view.subtitleTrack], [2, "", false, 0, ""], "the playlist's DEFAULT selects it; no name until Roku lists one")
+            m.assertEqual(node.callFunc("probeDownloads").states, {}, "nothing to download")
+            view = node.callFunc("probeRokuReports", { listed: "", stream: m.listing(["webvtt/3", "webvtt/1", "webvtt/2"]) })
+            m.assertEqual(view.activeTrack, "webvtt/1", "Español by its NAME, whatever Roku numbers it")
+            m.assertEqual(view.subtitleTrack, "", "no write at Roku's listing")
+            m.assertEqual(m.paths(node), [["file:42:subtitle:0", "webvtt/3", "name"], ["file:42:subtitle:1", "webvtt/1", "name"], ["file:42:subtitle:2", "webvtt/2", "name"]])
+        end sub
+
+        @it("falls back to webvtt/<index> when Roku's descriptions do not name the renditions, for tracks in the row's language")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { hls: true, inventory: m.inventory(), subtitle: tests.renditionOf(1), captionMode: "On", carried: [] })
+            view = node.callFunc("probeRokuReports", { listed: "", stream: m.listing(["webvtt/1", "webvtt/2", "webvtt/3"], true) })
+            m.assertEqual(view.activeTrack, "webvtt/2")
+            m.assertEqual(m.paths(node), [["file:42:subtitle:0", "webvtt/1", "index"], ["file:42:subtitle:1", "webvtt/2", "index"], ["file:42:subtitle:2", "webvtt/3", "index"]])
+        end sub
+
+        @it("writes nothing for a rendition Roku lists no name for, and leaves it to the stream")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { hls: true, inventory: m.inventory(), subtitle: tests.renditionOf(1), captionMode: "On", carried: [] })
+            node.callFunc("probeFirstFrame")
+            ' Roku numbers its own way: its second track is English. It
+            ' reports the playlist's DEFAULT as the content settles.
+            view = node.callFunc("probeRokuReports", { listed: "", stream: m.listing(["webvtt/1", "webvtt/2", "webvtt/3"], true, ["es", "en", "en"]), subtitleTrack: "webvtt/1", current: "webvtt/1", overlay: true })
+            m.assertEqual([view.activeTrack, view.suppressed, view.subtitleTrack], ["", false, "webvtt/1"], "not webvtt/2, which Roku lists in English")
+            m.assertInvalid(view.queued)
+            m.assertEqual(m.paths(node), [["file:42:subtitle:0", "", "unlisted"], ["file:42:subtitle:1", "", "unlisted"], ["file:42:subtitle:2", "webvtt/3", "index"]])
+            node.callFunc("probeElapse", 3000)
+            view = node.callFunc("probePosition")
+            m.assertEqual(view.subtitleTrack, "webvtt/1", "the settle check writes nothing")
+            m.assertEqual(node.callFunc("probeStatus"), "", "and says nothing")
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            m.assertEqual(view.queued.inPlace, false, "nor is a switch to one in place")
+        end sub
+
+        @it("draws nothing for a start with subtitles Off under captions On, though every rendition is AUTOSELECT")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { hls: true, inventory: m.inventory(), subtitle: { mode: "off" }, captionMode: "On", carried: [] })
+            view = node.callFunc("probeNewLoad", { subtitle: { mode: "off" }, captionMode: "On", sidecarState: "ready", headers: true, videoState: "stopped" })
+            m.assertEqual([view.activeLoad, view.activeTrack, view.suppressed, view.carried, view.subtitleTrack], [2, "", true, 0, ""])
+            node.callFunc("probeRokuReports", { listed: "", stream: m.listing(), current: "webvtt/1" })
+            node.callFunc("probeFirstFrame")
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "webvtt/1", overlay: true })
+            m.assertInvalid(view.queued, "Roku's AUTOSELECT pick as the content settles is not the viewer's")
+            node.callFunc("probeElapse", 3000)
+            view = node.callFunc("probePosition")
+            m.assertEqual([view.suppressed, view.subtitleTrack], [true, "webvtt/1"], "Roku's own pick stays hidden, and the player selects nothing")
+            m.assertInvalid(view.queued)
+        end sub
+
+        @it("selects the plan's rendition once the content settles if Roku shows another, as after a reload whose playlist names the first")
+        sub _()
+            node = m.showingSpanish()
+            node.callFunc("probeRokuReports", { subtitleTrack: "webvtt/1", current: "webvtt/1" })
+            view = node.callFunc("probePosition")
+            m.assertEqual(view.subtitleTrack, "webvtt/2", "selected by the name Roku lists")
+        end sub
+
+        @it("checks the plan's rendition again when Roku names it only after the content settled")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { hls: true, inventory: m.inventory(), subtitle: tests.renditionOf(1), captionMode: "On", carried: [] })
+            node.callFunc("probeFirstFrame")
+            ' Roku reports the playlist's DEFAULT as the content settles.
+            node.callFunc("probeRokuReports", { subtitleTrack: "webvtt/1", current: "webvtt/1", overlay: true })
+            node.callFunc("probeElapse", 3000)
+            view = node.callFunc("probePosition")
+            m.assertEqual([view.activeTrack, view.subtitleTrack], ["", "webvtt/1"], "no name yet: nothing written")
+            node.callFunc("probeRokuReports", { listed: "", stream: m.listing() })
+            view = node.callFunc("probePosition")
+            m.assertEqual([view.activeTrack, view.subtitleTrack], ["webvtt/2", "webvtt/2"], "named now: selected, as the playlist's DEFAULT named another")
+        end sub
+
+        @it("takes a rendition Roku picks as the content settles for its own, and selects the plan's once it has settled")
+        sub _()
+            node = m.startedSpanish(false)
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "webvtt/1", overlay: true })
+            m.assertInvalid(view.queued, "no track_change")
+            node.callFunc("probeElapse", 3000)
+            node.callFunc("probeRokuReports", { current: "webvtt/1" })
+            view = node.callFunc("probePosition")
+            m.assertEqual(view.subtitleTrack, "webvtt/2")
+            m.assertInvalid(view.queued)
+        end sub
+
+        @describe("switching in place (AG-654)")
+
+        @it("switches between renditions, and to Off and back, on the playing stream")
+        sub _()
+            node = m.showingSpanish()
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(0), inPlace: true })
+            view = node.callFunc("probeRetrack", tests.renditionOf(0))
+            m.assertEqual([view.subtitleTrack, view.activeTrack, view.suppressed], ["webvtt/1", "webvtt/1", false])
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.audioOnly(), inPlace: true })
+            view = node.callFunc("probeRetrack", { mode: "off" })
+            m.assertEqual([view.subtitleTrack, view.activeTrack, view.suppressed], ["", "", true])
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:2" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(2), inPlace: true }, "from Off too")
+            view = node.callFunc("probeRetrack", tests.renditionOf(2))
+            m.assertEqual([view.subtitleTrack, view.activeTrack, view.suppressed], ["webvtt/3", "webvtt/3", false])
+            m.assertEqual(m.checkedSubtitles(node), ["file:42:subtitle:2"])
+        end sub
+
+        @it("switches by the name Roku lists, not the rendition's place")
+        sub _()
+            node = m.player()
+            node.callFunc("probeStart", { hls: true, inventory: m.inventory(), subtitle: tests.renditionOf(1), captionMode: "On", carried: [] })
+            node.callFunc("probeRokuReports", { listed: "", stream: m.listing(["webvtt/3", "webvtt/1", "webvtt/2"]) })
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            view = node.callFunc("probeRetrack", tests.renditionOf(0))
+            m.assertEqual(view.subtitleTrack, "webvtt/3")
+        end sub
+
+        @it("reloads when Roku still plays the rendition before after a switch, and not when it plays the new one")
+        sub _()
+            node = m.showingSpanish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            node.callFunc("probeRetrack", tests.renditionOf(0))
+            view = node.callFunc("probeRokuPlays", { name: "webvtt/2", elapsedMs: 3000 })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(0), inPlace: false })
+            node = m.showingSpanish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            node.callFunc("probeRetrack", tests.renditionOf(0))
+            m.assertInvalid(node.callFunc("probeRokuPlays", { name: "webvtt/1", elapsedMs: 3000 }).queued)
+        end sub
+
+        @it("follows a switched rendition's new name when Roku lists the tracks again, so its check reloads nothing")
+        sub _()
+            node = m.showingSpanish()
+            node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:0" })
+            node.callFunc("probeRetrack", tests.renditionOf(0))
+            view = node.callFunc("probeRokuReports", { listed: "", stream: m.listing(["webvtt/5", "webvtt/2", "webvtt/3"]) })
+            m.assertEqual(view.activeTrack, "webvtt/5")
+            m.assertInvalid(node.callFunc("probeRokuPlays", { name: "webvtt/5", elapsedMs: 3000 }).queued)
+        end sub
+
+        @it("reloads for the external SRT, which content under captions On does not carry")
+        sub _()
+            node = m.showingSpanish()
+            view = node.callFunc("probeChoose", { kind: "subtitle", value: "file:42:subtitle:3" })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(3), inPlace: false })
+        end sub
+
+        @describe("Roku's overlay (AG-654)")
+
+        @it("follows a rendition picked in Roku's overlay in place, and puts back one no row names")
+        sub _()
+            node = m.showingSpanish()
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "webvtt/3", overlay: true })
+            m.assertEqual(view.queued, { op: "track_change", tracks: m.trackTo(2), inPlace: true })
+            node = m.showingSpanish()
+            view = node.callFunc("probeRokuReports", { subtitleTrack: "webvtt/9", overlay: true })
+            m.assertInvalid(view.queued)
+            m.assertEqual(view.subtitleTrack, "webvtt/2")
+        end sub
+    end class
+end namespace

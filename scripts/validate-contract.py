@@ -53,6 +53,37 @@ for _schema, _members in PROPOSED.items():
         if _name in SCHEMAS[_schema]["properties"]:
             sys.exit(f"validate-contract: the pinned schema now has {_schema}.{_name}; drop it from PROPOSED")
         SCHEMAS[_schema]["properties"][_name] = _member
+# Response shapes the client reads that the pinned server does not publish
+# yet, from the instant-subtitles contract C3 as silo-server
+# feat-subtitle-renditions-all defines them in contracts/api/v2/openapi.json
+# (not on main yet; assumption AG-654): an inventory row's hls_rendition, and
+# subtitle.hls_rendition with its index. The sync vendors request bodies
+# only, so these schemas are added whole and checked against the plans in
+# tests/fixtures/proposed/ (proposed_problems), which the client's tests
+# play. Drop an entry once the server's schema is pinned and vendored.
+PROPOSED_RESPONSE = {
+    "SubtitleInventoryHLSRenditionV3": {
+        "additionalProperties": False, "type": "object", "required": ["group_id", "name", "index"],
+        "properties": {"group_id": {"type": "string"}, "name": {"type": "string"}, "index": {"type": "integer", "minimum": 1}},
+    },
+    "HLSSubtitleRenditionV3": {
+        "additionalProperties": False, "type": "object", "required": ["group_id", "name", "format", "mime_type"],
+        "properties": {"format": {"type": "string"}, "group_id": {"type": "string"}, "index": {"type": "integer", "minimum": 1},
+                       "mime_type": {"type": "string"}, "name": {"type": "string"}},
+    },
+}
+for _schema, _definition in PROPOSED_RESPONSE.items():
+    if _schema in SCHEMAS:
+        sys.exit(f"validate-contract: the pinned schema now has {_schema}; drop it from PROPOSED_RESPONSE")
+    SCHEMAS[_schema] = _definition
+# Client features newer than the pinned server, each with the features the
+# server needs beside it in the same request (client_problems):
+# hls_subtitle_renditions_all_v1 needs hls_subtitle_renditions_v1 (contract
+# C3; a copy remux also needs hls_remux_subtitle_renditions_v1, which the
+# server then leaves out of the remux's plans rather than refusing).
+PROPOSED_FEATURES = {
+    "hls_subtitle_renditions_all_v1": ["hls_subtitle_renditions_v1"],
+}
 GOLDEN = {
     "start": "PlaybackStartBody",
     "replan": "PlaybackReplanBody",
@@ -408,6 +439,11 @@ def client_problems(body):
     # Roku draws a container's tracks only on original_http, and only with
     # the server honoring its limitations, which embedded_subtitles_v1 asks
     # for: the feature and the one entry come together or not at all.
+    for feature, needs in PROPOSED_FEATURES.items():
+        if feature in body.get("client_features", []):
+            for need in needs:
+                if need not in body["client_features"]:
+                    errors.append(f"{feature} is sent only with {need}")
     native = NATIVE_FEATURE in body.get("client_features", [])
     for name, delivery in context["deliveries"].items():
         entries = delivery["subtitles"].get("native_embedded")
@@ -423,6 +459,30 @@ def client_problems(body):
             errors.append(f"deliveries.{name}.subtitles.native_embedded is sent only with {NATIVE_FEATURE}")
         if delivery["subtitles"]["embedded_text"]:
             errors.append(f"deliveries.{name}.subtitles.embedded_text stays false beside native_embedded")
+    return errors
+
+
+def proposed_problems(decision):
+    """A proposed plan's subtitle renditions against PROPOSED_RESPONSE and
+    contract C3: rows listed in inventory order, numbered 1 to n in one group
+    under unique names, and the plan's own rendition naming its row."""
+    errors = []
+    subtitle = decision["playback_plan"]["subtitle"]
+    listed = [row for row in subtitle.get("inventory", []) if "hls_rendition" in row]
+    for i, row in enumerate(listed):
+        walk({"$ref": "#/components/schemas/SubtitleInventoryHLSRenditionV3"}, row["hls_rendition"], f"inventory[{row['track_id']}].hls_rendition", errors)
+        if row["hls_rendition"].get("index") != i + 1:
+            errors.append(f"{row['track_id']}: rendition index {row['hls_rendition'].get('index')} where its place is {i + 1}")
+    if len({row["hls_rendition"].get("name") for row in listed}) != len(listed):
+        errors.append("rendition names repeat")
+    if len({row["hls_rendition"].get("group_id") for row in listed}) > 1:
+        errors.append("renditions in more than one group")
+    selected = subtitle.get("hls_rendition")
+    if selected is not None:
+        walk({"$ref": "#/components/schemas/HLSSubtitleRenditionV3"}, selected, "subtitle.hls_rendition", errors)
+        row = next((r for r in listed if r["track_id"] == subtitle.get("track_id")), None)
+        if listed and (row is None or {k: row["hls_rendition"][k] for k in ("group_id", "name", "index")} != {k: selected.get(k) for k in ("group_id", "name", "index")}):
+            errors.append("subtitle.hls_rendition does not name the selected row's rendition")
     return errors
 
 
@@ -478,6 +538,7 @@ def self_test(sample):
         "the native feature without its entry": lambda b: b["client_features"].append(NATIVE_FEATURE),
         "an unknown native limitation": lambda b: (b["client_features"].append(NATIVE_FEATURE), b["client_playback_context"]["deliveries"]["original_http"]["subtitles"].update(native_embedded=[dict(NATIVE_ENTRY, limitations=["bogus"])])),
         "a native entry without Roku's limitations": lambda b: (b["client_features"].append(NATIVE_FEATURE), b["client_playback_context"]["deliveries"]["original_http"]["subtitles"].update(native_embedded=[dict(NATIVE_ENTRY, limitations=["forced_unlisted"])])),
+        "all renditions without single renditions": lambda b: (b["client_features"].remove("hls_subtitle_renditions_v1"), b["client_features"].append("hls_subtitle_renditions_all_v1")),
     }
     failed = [name for name, change in cases.items() if not problems(mutate(change), "start")]
     session_cases = {
@@ -487,6 +548,11 @@ def self_test(sample):
         "an unlisted diagnostics key": ("route-event", {"installation_id": sample["installation_id"], "event_id": "55555555-5555-4555-8555-555555555555", "protocol_version": 3, "playback_attempt_id": "attempt-0123456789", "event": "first_frame", "diagnostics": {"bogus": "1"}}),
     }
     failed += [name for name, (kind, body) in session_cases.items() if not problems(body, kind)]
+    rendition = {"playback_plan": {"subtitle": {"mode": "render", "track_id": "a", "hls_rendition": {"group_id": "subs", "name": "B", "format": "vtt", "mime_type": "text/vtt", "index": 2},
+                                                "inventory": [{"track_id": "a", "hls_rendition": {"group_id": "subs", "name": "A", "index": 1}},
+                                                              {"track_id": "b", "hls_rendition": {"group_id": "subs", "name": "B", "index": 3}}]}}}
+    if not proposed_problems(rendition):
+        failed.append("a proposed plan with a misnumbered rendition naming another row")
     replan_errors = []
     walk({"$ref": "#/components/schemas/PlaybackReplanBody"}, {"operation": "rewind"}, "replan", replan_errors)
     if not any("not one of" in e for e in replan_errors):
@@ -524,6 +590,17 @@ def main():
         if errors:
             failures += 1
             print(f"FAIL server fixture {entry['name']}: {errors}", file=sys.stderr)
+
+    for path in sorted((FIXTURES / "proposed").glob("*.json")):
+        errors = proposed_problems(json.loads(path.read_text()))
+        name = path.relative_to(ROOT)
+        if errors:
+            failures += 1
+            print(f"FAIL {name}", file=sys.stderr)
+            for error in errors:
+                print(f"  {error}", file=sys.stderr)
+        else:
+            print(f"ok   {name} (proposed plan)")
 
     start = next(body for _, kind, body in goldens if kind == "start")
     missed = self_test(start)
