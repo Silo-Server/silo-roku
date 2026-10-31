@@ -45,7 +45,12 @@ PROPOSED = {
         "dv8_base_layer_compatibility_ids": {"type": "array", "maxItems": 16, "items": {"type": "integer", "minimum": 0, "maximum": 15}},
     },
     "NativeEmbeddedSubtitleCapabilityV3": {
-        "limitations": {"type": "array", "maxItems": 16, "items": {"type": "string", "enum": ["forced_unlisted", "hidden_track_preemption", "literal_override_tags"]}},
+        "limitations": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
+    },
+    # A response member (contract C3, assumption AG-654): the plan's own
+    # rendition's index, which proposed_problems checks.
+    "HLSSubtitleRenditionV3": {
+        "index": {"type": "integer", "minimum": 1},
     },
 }
 for _schema, _members in PROPOSED.items():
@@ -53,23 +58,19 @@ for _schema, _members in PROPOSED.items():
         if _name in SCHEMAS[_schema]["properties"]:
             sys.exit(f"validate-contract: the pinned schema now has {_schema}.{_name}; drop it from PROPOSED")
         SCHEMAS[_schema]["properties"][_name] = _member
-# Response shapes the client reads that the pinned server does not publish
+# Response schemas the client reads that the pinned server does not publish
 # yet, from the instant-subtitles contract C3 as silo-server
 # feat-subtitle-renditions-all defines them in contracts/api/v2/openapi.json
-# (not on main yet; assumption AG-654): an inventory row's hls_rendition, and
-# subtitle.hls_rendition with its index. The sync vendors request bodies
-# only, so these schemas are added whole and checked against the plans in
-# tests/fixtures/proposed/ (proposed_problems), which the client's tests
-# play. Drop an entry once the server's schema is pinned and vendored.
+# (not on main yet; assumption AG-654): an inventory row's hls_rendition
+# (and, in PROPOSED, subtitle.hls_rendition's index). They are added whole
+# and checked against the plans in tests/fixtures/proposed/
+# (proposed_problems), which the client's tests play.
+# scripts/sync-fixtures.sh vendors them once the pinned server has them (its
+# RESPONSE_ROOTS); drop an entry then.
 PROPOSED_RESPONSE = {
     "SubtitleInventoryHLSRenditionV3": {
         "additionalProperties": False, "type": "object", "required": ["group_id", "name", "index"],
         "properties": {"group_id": {"type": "string"}, "name": {"type": "string"}, "index": {"type": "integer", "minimum": 1}},
-    },
-    "HLSSubtitleRenditionV3": {
-        "additionalProperties": False, "type": "object", "required": ["group_id", "name", "format", "mime_type"],
-        "properties": {"format": {"type": "string"}, "group_id": {"type": "string"}, "index": {"type": "integer", "minimum": 1},
-                       "mime_type": {"type": "string"}, "name": {"type": "string"}},
     },
 }
 for _schema, _definition in PROPOSED_RESPONSE.items():
@@ -135,8 +136,9 @@ NEVER_AUDIO = re.compile(r"^(truehd|mlp|dtshd|dts-hd|dts_hd|dtsx|dts:x|mat|pcm)$
 DELIVERIES = {"original_http", "progressive", "hls"}
 DV8_CLAIM = "client_dv8_base_layer_fallback_v1"
 # Natively drawn embedded subtitles (contract C2, assumption AG-652): the
-# client feature that asks for them, and the server feature that must
-# have been advertised for it and for a native_embedded entry's limitations.
+# client feature that asks for them, which comes with the one
+# native_embedded entry the client sends, Roku's (the server feature
+# native_embedded_limitations_v1 gates both in source/playback/capabilities.bs).
 NATIVE_FEATURE = "embedded_subtitles_v1"
 NATIVE_ENTRY = {"container": "mkv", "codecs": ["subrip"], "track_identity": "container_track_id", "ass_styling": False,
                 "font_attachments": False, "limitations": ["forced_unlisted", "hidden_track_preemption", "literal_override_tags"]}
@@ -548,11 +550,19 @@ def self_test(sample):
         "an unlisted diagnostics key": ("route-event", {"installation_id": sample["installation_id"], "event_id": "55555555-5555-4555-8555-555555555555", "protocol_version": 3, "playback_attempt_id": "attempt-0123456789", "event": "first_frame", "diagnostics": {"bogus": "1"}}),
     }
     failed += [name for name, (kind, body) in session_cases.items() if not problems(body, kind)]
-    rendition = {"playback_plan": {"subtitle": {"mode": "render", "track_id": "a", "hls_rendition": {"group_id": "subs", "name": "B", "format": "vtt", "mime_type": "text/vtt", "index": 2},
-                                                "inventory": [{"track_id": "a", "hls_rendition": {"group_id": "subs", "name": "A", "index": 1}},
-                                                              {"track_id": "b", "hls_rendition": {"group_id": "subs", "name": "B", "index": 3}}]}}}
-    if not proposed_problems(rendition):
-        failed.append("a proposed plan with a misnumbered rendition naming another row")
+    # Each breaks one rule of proposed_problems, so that each rule is shown
+    # to catch it alone.
+    def rendition(selected, b_index):
+        return {"playback_plan": {"subtitle": {"mode": "render", "track_id": "a", "hls_rendition": dict(selected, group_id="subs", format="vtt", mime_type="text/vtt"),
+                                               "inventory": [{"track_id": "a", "hls_rendition": {"group_id": "subs", "name": "A", "index": 1}},
+                                                             {"track_id": "b", "hls_rendition": {"group_id": "subs", "name": "B", "index": b_index}}]}}}
+    if proposed_problems(rendition({"name": "A", "index": 1}, 2)):
+        failed.append("a proposed plan that keeps every rule")
+    rendition_cases = {
+        "a proposed plan with a misnumbered rendition": rendition({"name": "A", "index": 1}, 3),
+        "a proposed plan whose rendition names another row": rendition({"name": "B", "index": 2}, 2),
+    }
+    failed += [name for name, plan in rendition_cases.items() if not proposed_problems(plan)]
     replan_errors = []
     walk({"$ref": "#/components/schemas/PlaybackReplanBody"}, {"operation": "rewind"}, "replan", replan_errors)
     if not any("not one of" in e for e in replan_errors):
