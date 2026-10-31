@@ -191,7 +191,7 @@ and outcomes. Nothing logs codes or tokens.
 | The sign-in screen's code | `components/screens/setup/SignInScreen.bs` (`reportCode`) |
 | Flow | `components/AppSceneCompanion.bs` |
 | Companion screen (route `companion`) | `components/screens/companion/CompanionScreen.*` |
-| A phone's part, for development | `npm run silocontrol -- --pairing` (README) |
+| A phone's part, for development | `npm run silocontrol -- --pairing` ([`development.md`](development.md)) |
 
 ## 7. Verified on hardware
 

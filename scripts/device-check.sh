@@ -3,7 +3,7 @@
 # timed by the port 8085 beacon report, ECP performance snapshots, and the
 # deep-link matrix. Writes raw files and summary.md, rows for
 # docs/hardware-evidence.md, to --out. Reads ROKU_HOST, ROKU_DEPLOY_VIA,
-# ROKU_IDLE_INPUT, and ROKU_IDLE_CHECK from .env; see the README's Device check.
+# ROKU_IDLE_INPUT, and ROKU_IDLE_CHECK from .env; see Device check in docs/development.md.
 #
 #   device-check.sh [--launches N] [--await-reboot | --no-reboot] [--perf]
 #                   [--deeplinks] [--ids FILE] [--out DIR]

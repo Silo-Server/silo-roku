@@ -48,7 +48,7 @@ wire behavior, platform floor, or certification plan.
 
 ## Development workflow
 
-- The README's Development section is the procedure for building, sideloading,
+- `docs/development.md` is the procedure for building, sideloading,
   the debug console, and remote control (`npm run roku`). Device address,
   password, and relay come from the gitignored `.env`; see `.env.example`.
 - Run `npm run lint` before committing. After `npm run sideload`, confirm the

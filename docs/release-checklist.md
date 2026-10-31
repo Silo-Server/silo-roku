@@ -296,7 +296,7 @@ beta environment "for internal testing only".
   `build_version` stamped, debug and test components excluded
   (`scripts/hygiene.sh`), then packaged and signed with the key. The Package
   workflow (`.github/workflows/package.yml`) does this for beta and release
-  packages; see the README's "Signed packages".
+  packages; see "Signed packages" in `docs/development.md`.
 - [ ] Uploaded to a beta app; dashboard Static Analysis run and its
   authentication findings triaged (section 3).
 - [ ] Install-over-existing-data rehearsal: a newer package signed with the
