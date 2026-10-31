@@ -311,6 +311,10 @@ sub init()
     m.mediaTask = invalid
     m.mediaQueue = []
     m.awaitedMediaTask = invalid
+    ' Downloaded sidecars waiting to convert, and whether MediaTask has one
+    ' (sendConversion).
+    m.conversions = []
+    m.converting = false
 
     ' What each pending request's answer is for, by request ID.
     m.requests = {}
@@ -1474,9 +1478,29 @@ sub onSubtitleDownloaded(event as Object)
             track.output = playback.sidecarCache.newPath(cache)
             keepCache(cache)
         end if
-        sendMedia({ id: track.load, track: track.trackId, input: result.body.path, format: track.format, shiftSeconds: track.shiftSeconds, output: track.output, cacheKey: track.cacheKey })
+        sendConversion({ id: track.load, track: track.trackId, input: result.body.path, format: track.format, shiftSeconds: track.shiftSeconds, output: track.output, cacheKey: track.cacheKey }, util.isTrue(track.selected))
     end if
     fetchSidecar(m.current)
+end sub
+
+' Hands MediaTask a downloaded sidecar to convert. MediaTask converts in
+' the order it is asked, a large ASS for seconds, and the others' lane can
+' finish before the selected sidecar's, which content waits for: so it
+' gets one conversion at a time, the selected sidecar's before any other
+' still waiting (assumption AG-651).
+sub sendConversion(request as Object, selected as Boolean)
+    if selected
+        m.conversions.Unshift(request)
+    else
+        m.conversions.Push(request)
+    end if
+    nextConversion()
+end sub
+
+sub nextConversion()
+    if m.converting or m.conversions.Count() = 0 then return
+    m.converting = true
+    sendMedia(m.conversions.Shift())
 end sub
 
 ' MediaTask takes requests once it observes its field, and starts once
@@ -1531,6 +1555,11 @@ end sub
 sub onMediaResult(event as Object)
     result = event.getData()
     if not util.isObject(result) then return
+    ' A conversion's answer (any but a kept file's): the next one goes.
+    if not result.DoesExist("kept")
+        m.converting = false
+        nextConversion()
+    end if
     if cacheResult(result) then return
     if m.closed then return
     track = sidecarOf(result.id, result.track)
@@ -1749,6 +1778,14 @@ sub confirmSubtitle()
     if m.settleUntil = invalid or holdsSubtitle() then return
     m.subtitleConfirmed = true
     path = m.activeTrack
+    if path = "" and isCurrent(m.activeLoad) and anotherRenditionPlays()
+        ' The plan's rendition has no name Roku lists, so nothing selects
+        ' it, and Roku plays another of the stream's: the playlist's
+        ' DEFAULT, which a reload on the same stream keeps (AG-654).
+        log.warn(LOG_TAG, "Roku plays another subtitle rendition than the plan's, which it lists no name for", { playing: trackLabel(util.text(m.video.currentSubtitleTrack)) })
+        subtitleShows(false)
+        return
+    end if
     if path = "" or not isCurrent(m.activeLoad) then return
     logRokuSubtitle("settled")
     if subtitleDrawn()
@@ -1778,6 +1815,19 @@ sub uncheckedShows(plan as Object, path as String)
         subtitleShows(true)
     end if
 end sub
+
+' Whether Roku plays a rendition of the active content's stream that is
+' another row's than the plan's (playback.sidecars.renditionTracks).
+function anotherRenditionPlays() as Boolean
+    item = m.current
+    if item = invalid or not playback.sidecars.selectsRendition(item.plan) or type(item.tracks) <> "roArray" then return false
+    playing = util.text(m.video.currentSubtitleTrack)
+    if playing = "" then return false
+    for each track in item.tracks
+        if util.isTrue(track.rendition) and track.path = playing and track.trackId <> util.text(item.plan.subtitle.track_id) then return true
+    end for
+    return false
+end function
 
 function subtitleDrawn() as Boolean
     return playback.sidecars.drawn(m.activeTrack, util.text(m.video.subtitleTrack), util.text(m.video.currentSubtitleTrack))
@@ -2035,7 +2085,15 @@ end sub
 ' Its tracks are deleted when the player stops (plan section 4.8); a Task
 ' that has not started yet clears what is left when the next one starts.
 sub stopMediaTask()
+    ' The conversions still waiting go to the task before it finishes, as
+    ' they would have without the wait (sendConversion).
+    waiting = m.conversions
+    m.conversions = []
+    m.converting = false
     if m.mediaTask = invalid then return
+    for each request in waiting
+        sendMedia(request)
+    end for
     if m.mediaTask.ready
         m.mediaTask.request = { finish: true }
         if not m.global.hasField("retiringMediaTask") then m.global.addField("retiringMediaTask", "node", false)
