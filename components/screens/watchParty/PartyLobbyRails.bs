@@ -1,0 +1,183 @@
+import "pkg:/source/api/session.bs"
+import "pkg:/source/catalog/art.bs"
+
+' The lobby's ballot and suggestion strip (docs/watch-party.md sections
+' 4.5 and 4.6), one RowList of PartyCards: the ballot under a vote
+' lobby's question, its candidates in server order and the Suggest a
+' title card last; the strip to the right of a host-pick lobby's hero
+' while it has suggestions, under "SUGGESTIONS · {n}" and its caption.
+' OK on a ballot card toggles this member's vote, on the add card opens
+' the picker to suggest, on a strip card queues it for a manager. Its
+' content is rebuilt only when what it shows changes, keeping the focused
+' card. Part of PartyLobby.
+
+' Above the ballot's posters: tvOS's 20 after the caption and 20 inside
+' its scroll view; the strip's 12 under its header and 14 inside.
+const BALLOT_TOP = 40
+const STRIP_HEADER_GAP = 12
+const STRIP_TOP = 14
+' A card's text block under its poster: the title's and the line's
+' lines.
+const BALLOT_TEXT_HEIGHT = 62
+const STRIP_TEXT_HEIGHT = 25
+
+sub railInit()
+    m.rail = m.top.findNode("rail")
+    m.rail.observeField("rowItemSelected", "onRailSelected")
+    m.rail.observeField("rowItemFocused", "onRailFocused")
+    m.stripHeader = m.top.findNode("stripHeader")
+    m.stripTitle = m.top.findNode("stripTitle")
+    m.stripTitle.setFields({ font: theme.font(theme.textStyle.WP_EYEBROW), color: theme.color.TEXT_TERTIARY })
+    m.stripCaption = m.top.findNode("stripCaption")
+    m.stripCaption.setFields({ font: theme.font(theme.textStyle.WP_CAPTION), color: theme.color.TEXT_TERTIARY })
+    ' "ballot", "strip", or "" for none; the suggestions it shows, in its
+    ' cards' order; what it was built from; the focused card.
+    m.railKind = ""
+    m.railRows = []
+    m.railSignature = ""
+    m.railIndex = 0
+end sub
+
+sub railRelease()
+    m.rail.content = invalid
+    m.railSignature = ""
+end sub
+
+' Lays out the ballot (under the hero) or the strip (right of it), and
+' gives the bottom of what it drew, heroBottom without a ballot.
+function layoutRail(room as Object, vote as Boolean, heroBottom as Integer) as Integer
+    rows = watchparty.page.suggestionRows(m.state.suggestions)
+    kind = ""
+    if vote
+        kind = "ballot"
+    else if room.phase = "lobby" and room.selectionMode = "host_pick" and rows.Count() > 0
+        kind = "strip"
+    end if
+    if kind <> m.railKind
+        m.railKind = kind
+        m.railIndex = 0
+        m.railSignature = ""
+    end if
+    m.rail.visible = kind <> ""
+    m.stripHeader.visible = kind = "strip"
+    if kind = "" then return heroBottom
+    pad = theme.watchParty.CARD_ROOM
+    if kind = "ballot"
+        height = theme.watchParty.BALLOT_HEIGHT + 2 * pad + theme.watchParty.BALLOT_TEXT_GAP + BALLOT_TEXT_HEIGHT
+        top = heroBottom + BALLOT_TOP
+        m.rail.setFields({ translation: [0, top - pad], itemSize: [1920, height], rowHeights: [height], rowItemSize: [[theme.watchParty.BALLOT_WIDTH, height]], rowItemSpacing: [[theme.watchParty.BALLOT_GAP, 0]], focusXOffset: [theme.watchParty.INSET] })
+        fillRail(room, rows, true)
+        return top + height - 2 * pad
+    end if
+    ' The strip: 820 wide at the right inset, its top on the hero's.
+    stripWidth = theme.watchParty.STRIP_MAX_WIDTH
+    x = 1920 - theme.watchParty.INSET - stripWidth
+    heroTop = theme.watchParty.TOP + theme.watchParty.BUTTON_HEIGHT + theme.watchParty.HERO_GAP
+    m.stripHeader.translation = [x, heroTop]
+    m.stripTitle.text = theme.tracked(UCase(i18n.text("watchParty.strip.title", { count: rows.Count() })))
+    caption = "watchParty.strip.guest"
+    if room.selfCanManageRoom then caption = "watchParty.strip.manager"
+    m.stripCaption.setFields({ text: i18n.text(caption), width: stripWidth })
+    headerHeight = Int(m.stripCaption.boundingRect().height)
+    height = theme.watchParty.STRIP_HEIGHT + 2 * pad + theme.watchParty.STRIP_TEXT_GAP + STRIP_TEXT_HEIGHT
+    top = heroTop + headerHeight + STRIP_HEADER_GAP + STRIP_TOP
+    m.rail.setFields({ translation: [x, top - pad], itemSize: [stripWidth, height], rowHeights: [height], rowItemSize: [[theme.watchParty.STRIP_WIDTH, height]], rowItemSpacing: [[theme.watchParty.STRIP_GAP, 0]], focusXOffset: [0] })
+    fillRail(room, rows, false)
+    return heroBottom
+end function
+
+' Builds the rail's cards when what they show changed, and keeps the
+' focused card where it was.
+sub fillRail(room as Object, rows as Object, ballot as Boolean)
+    connection = connectionState()
+    winnerId = ""
+    if util.isObject(m.state.suggestions) then winnerId = util.text(m.state.suggestions.winnerId)
+    origin = ""
+    session = api.session.current()
+    if util.isObject(session) then origin = util.text(session.origin)
+    cards = []
+    for each row in rows
+        line = watchparty.page.ballotLine(row)
+        lineText = line.text
+        if line.key <> "" then lineText = i18n.text(line.key, line.values)
+        active = true
+        if not ballot then active = watchparty.page.canQueue(row, room, connection) or watchparty.lobby.canRemove(row, room)
+        cards.Push({
+            kind: "suggestion",
+            suggestionId: row.id,
+            title: row.title,
+            posterUri: catalog.art.uri(row.posterUrl, origin),
+            hidePoster: row.contentType = "episode",
+            line: lineText,
+            ballot: ballot,
+            votes: row.voteCount,
+            votesLabel: i18n.text(watchparty.lobby.votesKey(row.voteCount), { count: "" }).Trim(),
+            leader: row.id = winnerId,
+            voted: row.votedByMe,
+            active: active
+        })
+    end for
+    if ballot then cards.Push({ kind: "add", title: i18n.text("watchParty.ballot.addTitle"), line: i18n.text("watchParty.ballot.addCaption"), ballot: true, active: true })
+    signature = FormatJson(cards)
+    m.railRows = rows
+    if signature = m.railSignature then return
+    m.railSignature = signature
+    content = CreateObject("roSGNode", "ContentNode")
+    strip = content.createChild("ContentNode")
+    for each card in cards
+        node = strip.createChild("PartyCardContent")
+        node.setFields(card)
+    end for
+    index = m.railIndex
+    if index >= cards.Count() then index = cards.Count() - 1
+    if index < 0 then index = 0
+    m.rail.content = content
+    if index > 0 then m.rail.jumpToRowItem = [0, index]
+end sub
+
+' The ballot always takes focus (its add card at least); the strip while
+' a card in it queues or can be removed.
+function railFocusable() as Boolean
+    if m.railKind = "ballot" then return true
+    if m.railKind = "strip" then return watchparty.page.stripFocusable(m.railRows, m.room, connectionState())
+    return false
+end function
+
+sub onRailFocused()
+    focused = m.rail.rowItemFocused
+    if type(focused) = "roArray" and focused.Count() > 1 then m.railIndex = focused[1]
+end sub
+
+' The suggestion at index, or invalid for the add card.
+function railRow(index as Integer) as Dynamic
+    if index < 0 or index >= m.railRows.Count() then return invalid
+    return m.railRows[index]
+end function
+
+sub onRailSelected()
+    selected = m.rail.rowItemSelected
+    if type(selected) <> "roArray" or selected.Count() < 2 then return
+    row = railRow(selected[1])
+    if m.railKind = "ballot"
+        if row = invalid
+            openPicker(watchparty.picker.SUGGEST)
+        else if watchparty.page.canVote(m.state.suggestions, connectionState())
+            kind = "vote"
+            if row.votedByMe then kind = "unvote"
+            send({ kind: kind, suggestionId: row.id })
+        end if
+    else if m.railKind = "strip" and row <> invalid
+        if watchparty.page.canQueue(row, m.room, connectionState()) then send({ kind: "select", contentId: row.contentId, title: row.title })
+    end if
+end sub
+
+' Options on the focused card: its menu when it offers anything.
+function railOptions() as Boolean
+    row = railRow(m.railIndex)
+    if row = invalid then return false
+    items = watchparty.page.stripMenu(row, m.room)
+    if m.railKind = "ballot" then items = watchparty.page.ballotMenu(row, m.room, m.ctx.features)
+    if items.Count() = 0 then return true
+    openCardMenu(row, items)
+    return true
+end function

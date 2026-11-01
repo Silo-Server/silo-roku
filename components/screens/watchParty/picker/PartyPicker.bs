@@ -1,0 +1,210 @@
+import "pkg:/components/screens/watchParty/room.bs"
+import "pkg:/components/theme/browse.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/theme/watchParty.bs"
+import "pkg:/components/views/controls.bs"
+import "pkg:/components/views/spoilers.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/cards.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/catalog/spoilers.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/page.bs"
+import "pkg:/source/watchparty/picker.bs"
+
+' The picker's pages and the requests they read. Each page's script
+' (PartyPickerShelves, PartyPickerSearch, PartyPickerEpisodes,
+' PartyPickerConfirm) defines its <page>Init, <page>Shown, <page>Left,
+' <page>Focus, and <page>Key, and its answers' handlers.
+
+sub init()
+    m.top.findNode("background").color = theme.color.BACKGROUND
+    m.anchor = m.top.findNode("focusAnchor")
+    i18n.install()
+    m.copy = catalog.cards.words(m.global.strings)
+    m.state = partyState()
+    ' The page stack, "shelves" at the bottom.
+    m.pages = []
+    ' Requests out: handles, cancelled on release.
+    m.handles = []
+    m.released = false
+    shelvesInit()
+    searchInit()
+    episodesInit()
+    confirmInit()
+end sub
+
+sub start()
+    if m.pages.Count() > 0 then return
+    partyObserve("onPickerParty")
+    m.pages = ["shelves"]
+    showPage()
+    shelvesStart()
+    focusPicker()
+end sub
+
+sub release()
+    m.released = true
+    partyUnobserve()
+    for each handle in m.handles
+        api.cancel(handle)
+    end for
+    m.handles = []
+    searchLeft()
+    episodesLeft()
+    confirmLeft()
+    m.top.findNode("shelves").content = invalid
+end sub
+
+' ---- The room ---------------------------------------------------------------
+
+sub onPickerParty(event as Object)
+    if m.released then return
+    change = partyChange(event)
+    field = change.field
+    data = change.data
+    if field = "result"
+        if partyOwnResult(data) then confirmResult(data)
+        return
+    end if
+    if field = "notice" then return
+    m.state[field] = data
+    if field = "picker" then shelvesPicker()
+    if field = "memberState" or field = "room" then confirmMemberState()
+end sub
+
+function pickerFeatures() as Object
+    support = m.state.support
+    if util.isObject(support) and util.isObject(support.features) then return support.features
+    return {}
+end function
+
+' ---- Requests ---------------------------------------------------------------
+
+' Sends request; entry ({ kind, ... }) comes back to onPickerAnswer.
+function pickerRequest(request as Object, entry as Object) as Object
+    handle = api.newHandle(m.top.owner)
+    handle.addFields({ entry: entry })
+    handle.observeField("status", "onPickerAnswer")
+    m.handles.Push(handle)
+    api.send(request, handle)
+    return handle
+end function
+
+sub onPickerAnswer(event as Object)
+    handle = event.getRoSGNode()
+    result = api.resultOf(handle)
+    if m.released or result = invalid then return
+    kept = []
+    for each pending in m.handles
+        if not pending.isSameNode(handle) then kept.Push(pending)
+    end for
+    m.handles = kept
+    entry = handle.entry
+    content = handle.content
+    kind = util.text(entry.kind)
+    if Left(kind, 7) = "shelves"
+        shelvesAnswer(entry, result, content)
+    else if kind = "searchCapabilities"
+        onSearchCapabilities(result)
+    else if kind = "seasons" or kind = "episodes"
+        episodesAnswer(entry, result, content)
+    else if kind = "confirm"
+        confirmAnswer(entry, result)
+    end if
+end sub
+
+' ---- Pages ------------------------------------------------------------------
+
+function currentPage() as String
+    if m.pages.Count() = 0 then return ""
+    return m.pages[m.pages.Count() - 1]
+end function
+
+sub showPage()
+    page = currentPage()
+    for each name in ["shelves", "search", "episodes", "confirm"]
+        m.top.findNode(name + "Page").visible = name = page
+    end for
+end sub
+
+sub pushPage(name as String)
+    m.pages.Push(name)
+    showPage()
+    focusPicker()
+end sub
+
+' Back closes the top page, returning to the one under it; false at the
+' shelves.
+function backPressed() as Boolean
+    ' Back from Search's results returns to its keyboard first, as on the
+    ' Search page.
+    if currentPage() = "search" and m.searchZone = "results"
+        m.searchZone = "keyboard"
+        searchFocus()
+        return true
+    end if
+    if m.pages.Count() <= 1 then return false
+    leaving = m.pages.Pop()
+    if leaving = "search" then searchLeft()
+    if leaving = "episodes" then episodesLeft()
+    if leaving = "confirm" then confirmLeft()
+    showPage()
+    focusPicker()
+    return true
+end function
+
+sub focusPicker()
+    page = currentPage()
+    if page = "shelves"
+        shelvesFocus()
+    else if page = "search"
+        searchFocus()
+    else if page = "episodes"
+        episodesFocus()
+    else if page = "confirm"
+        confirmFocus()
+    end if
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if key = "back"
+        if not backPressed() then m.top.closed = true
+        return true
+    end if
+    page = currentPage()
+    if page = "shelves"
+        shelvesKey(key)
+    else if page = "search"
+        searchKey(key)
+    else if page = "episodes"
+        episodesKey(key)
+    else if page = "confirm"
+        confirmKey(key)
+    end if
+    ' The picker covers the lobby: no key passes to it.
+    return true
+end function
+
+' ---- Choosing ---------------------------------------------------------------
+
+' A card chosen on the shelves or in search: a movie or episode, or a series
+' with the group's next episode, opens confirm; another series its
+' episodes.
+sub choose(card as Dynamic)
+    target = watchparty.picker.route(card, watchparty.picker.nextUps(m.state.picker))
+    if target = invalid then return
+    if target.kind = "confirm"
+        openConfirm(target.contentId, card)
+    else
+        openEpisodes(target.seriesId, target.title, card)
+    end if
+end sub
+
+' Lays a node out of focus without moving it: focus goes to the anchor,
+' whose keys reach onKeyEvent.
+sub focusAnchor()
+    if not m.anchor.hasFocus() then m.anchor.setFocus(true)
+end sub

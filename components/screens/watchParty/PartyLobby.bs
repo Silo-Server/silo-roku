@@ -1,0 +1,687 @@
+import "pkg:/components/screens/watchParty/room.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/theme/watchParty.bs"
+import "pkg:/components/views/controls.bs"
+import "pkg:/components/views/spoilers.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/catalog/spoilers.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/lobby.bs"
+import "pkg:/source/watchparty/page.bs"
+import "pkg:/source/watchparty/picker.bs"
+
+' tvOS's lobby in px: the hero's parts 0.28 of the title apart, 30 to the
+' overview and banner; facts 25 px with 8 between parts; the overview's
+' 24 px lines; the seats' header 0.25 of a seat above them, the hint 16
+' under the buttons; at least 40 between the seats and the buttons.
+const HERO_PART = 0.28
+const HERO_BLOCK_GAP = 30
+const FACT_GAP = 8
+const CHIP_HEIGHT = 26
+const CHIP_PADDING = 6
+const HINT_GAP = 16
+const SEATS_BUTTONS_GAP = 40
+const HINT_WIDTH = 900
+const CAPTION_OPACITY = 0.7
+
+sub init()
+    m.backdrop = m.top.findNode("backdrop")
+    m.anchor = m.top.findNode("focusAnchor")
+    m.roomTitle = m.top.findNode("roomTitle")
+    m.roomTitle.setFields({ font: theme.font(theme.textStyle.WP_SECONDARY), color: theme.color.TEXT, text: i18n.text("watchParty.title") })
+    m.dot = m.top.findNode("dot")
+    m.dot.uri = theme.firstRunArt.AVATAR_DISC
+    m.dotLabel = m.top.findNode("dotLabel")
+    m.dotLabel.setFields({ font: theme.font(theme.textStyle.WP_CAPTION), color: theme.color.TEXT_TERTIARY })
+    m.codePill = m.top.findNode("codePill")
+    m.codeFill = m.top.findNode("codeFill")
+    m.codeFill.uri = theme.watchPartyArt.CAPSULE
+    m.codeLabel = m.top.findNode("codeLabel")
+    m.codeLabel.setFields({ font: theme.font(theme.textStyle.WP_CODE_LABEL), text: theme.tracked(UCase(i18n.text("watchParty.codePill.label"))) })
+    m.code = m.top.findNode("code")
+    m.code.font = theme.font(theme.textStyle.WP_CODE_PILL)
+    m.codeGlyph = m.top.findNode("codeGlyph")
+    m.codeGlyph.uri = theme.watchPartyArt.QR_GLYPH
+    m.optionsButton = m.top.findNode("options")
+    m.optionsButton.setFields({ icon: theme.watchPartyArt.MORE, text: i18n.text("watchParty.options.button") })
+    m.eyebrow = m.top.findNode("eyebrow")
+    m.eyebrow.setFields({ font: theme.font(theme.textStyle.WP_EYEBROW), color: theme.color.TEXT_TERTIARY })
+    m.heroTitle = m.top.findNode("heroTitle")
+    m.facts = m.top.findNode("facts")
+    m.caption = m.top.findNode("caption")
+    m.overview = m.top.findNode("overview")
+    m.overview.setFields({ font: theme.font(theme.textStyle.WP_OVERVIEW), color: theme.color.TEXT_TERTIARY, width: theme.watchParty.HERO_WIDTH })
+    m.banner = m.top.findNode("banner")
+    m.banner.width = theme.watchParty.HERO_WIDTH
+    m.seatsTitle = m.top.findNode("seatsTitle")
+    m.seatsTitle.setFields({ font: theme.font(theme.textStyle.WP_EYEBROW), color: theme.color.TEXT_TERTIARY, text: theme.tracked(UCase(i18n.text("watchParty.seats.title"))) })
+    m.presence = m.top.findNode("presence")
+    m.presence.setFields({ font: theme.font(theme.textStyle.WP_CAPTION), color: theme.color.TEXT_TERTIARY, opacity: CAPTION_OPACITY })
+    m.seatLayer = m.top.findNode("seats")
+    m.secondary = m.top.findNode("secondary")
+    m.primary = m.top.findNode("primary")
+    m.hint = m.top.findNode("hint")
+    m.hint.setFields({ font: theme.font(theme.textStyle.WP_CAPTION), color: theme.color.TEXT_TERTIARY, opacity: CAPTION_OPACITY, width: HINT_WIDTH })
+    m.overlayLayer = m.top.findNode("overlays")
+    railInit()
+    m.state = partyState()
+    ' The selected title as the catalog read it (catalog.detail.fromItem),
+    ' or invalid, and the read under way.
+    m.item = invalid
+    m.itemFor = ""
+    m.itemHandle = invalid
+    ' The last error's text, until the next action.
+    m.error = ""
+    ' Where focus is: a control key ("code", "options", "rail", "invite",
+    ' "secondary", "primary"), and the rows of controls (lobbyMove).
+    m.focus = "primary"
+    m.rows = []
+    m.actions = { primary: invalid, secondary: invalid }
+    m.started = false
+    m.released = false
+end sub
+
+sub start()
+    if m.started then return
+    m.started = true
+    partyObserve("onParty")
+    overlaysInit()
+    refresh()
+end sub
+
+sub release()
+    m.released = true
+    partyUnobserve()
+    closeOverlays()
+    if m.itemHandle <> invalid then api.cancel(m.itemHandle)
+    m.backdrop.uri = ""
+    railRelease()
+end sub
+
+' A room Task output changed.
+sub onParty(event as Object)
+    if m.released then return
+    change = partyChange(event)
+    field = change.field
+    data = change.data
+    if field = "notice"
+        if util.isObject(data) and util.text(data.scope) = "lobby"
+            m.error = partyText(util.text(data.key), data.values, util.text(data.text))
+            refresh()
+        end if
+        return
+    end if
+    if field = "result"
+        if partyOwnResult(data) then onResult(data)
+        return
+    end if
+    m.state[field] = data
+    if field = "room" and not partyEngaged(m.state)
+        closeOverlays()
+        m.top.left = true
+        return
+    end if
+    refresh()
+end sub
+
+' One of this lobby's commands ended: a failure shows in the banner.
+sub onResult(result as Object)
+    if result.ok then return
+    text = partyText(util.text(result.errorKey))
+    if text = "" then return
+    m.error = text
+    refresh()
+end sub
+
+' Sends a command; the last error and message go with the next action.
+sub send(command as Object)
+    m.error = ""
+    if m.top.message <> "" then m.top.message = ""
+    partySend(command)
+end sub
+
+' ---- Layout -----------------------------------------------------------------
+
+sub refresh()
+    if not m.started or m.released then return
+    room = watchparty.page.displayRoom(m.state.room, m.state.sync)
+    if room = invalid then return
+    readSelection(room)
+    errorText = m.error
+    if errorText = "" and m.top.message <> "" then errorText = partyText(m.top.message)
+    m.ctx = watchparty.page.context(m.state, itemNote(), m.top.playbackEnded, errorText)
+    m.room = room
+    showBackdrop(room)
+    layoutTop(room)
+    vote = room.selectionMode = "vote" and room.phase = "lobby"
+    heroBottom = layoutHero(room, vote)
+    railBottom = layoutRail(room, vote, heroBottom)
+    bannerTop = heroBottom
+    if vote then bannerTop = railBottom
+    layoutBanner(room, bannerTop)
+    layoutBottom(room, vote)
+    updateRows()
+    overlayRefresh()
+end sub
+
+' ---- The selected title -----------------------------------------------------
+
+' Reads the selection's catalog item once per selection; the room hears its
+' name, or that this profile cannot see it (403 or 404).
+sub readSelection(room as Object)
+    id = room.selectedContentId
+    if id = m.itemFor then return
+    m.itemFor = id
+    m.item = invalid
+    if m.itemHandle <> invalid then api.cancel(m.itemHandle)
+    m.itemHandle = invalid
+    if id = "" then return
+    m.itemHandle = api.newHandle(m.top.owner)
+    m.itemHandle.addFields({ contentId: id })
+    m.itemHandle.observeField("status", "onSelection")
+    api.send(catalog.request.item(id, util.text(room.selectedLibraryId), m.top.lowTier), m.itemHandle)
+end sub
+
+sub onSelection(event as Object)
+    handle = event.getRoSGNode()
+    result = api.resultOf(handle)
+    if m.released or result = invalid or handle.contentId <> m.itemFor then return
+    m.itemHandle = invalid
+    if result.ok and util.isObject(result.body)
+        m.item = result.body
+        partySend({ kind: "noteTitle", contentId: handle.contentId, title: util.text(m.item.title), unavailable: false })
+    else if result.status = 403 or result.status = 404
+        m.item = { id: handle.contentId, unavailable: true }
+        partySend({ kind: "noteTitle", contentId: handle.contentId, title: "", unavailable: true })
+    end if
+    refresh()
+end sub
+
+' The read title for watchparty.page.context, or invalid.
+function itemNote() as Dynamic
+    if m.item = invalid then return invalid
+    return { contentId: m.itemFor, title: util.text(m.item.title), unavailable: util.isTrue(m.item.unavailable) }
+end function
+
+' What the hero and backdrop show of the selection: the read item, else the
+' page's preview of it, else invalid.
+function shownItem(room as Object) as Dynamic
+    if m.item <> invalid and not util.isTrue(m.item.unavailable) then return m.item
+    preview = m.top.preview
+    if util.isObject(preview) and util.text(preview.contentId) = room.selectedContentId and room.selectedContentId <> ""
+        return { id: preview.contentId, title: util.text(preview.title), backdropUri: util.text(preview.backdropUri), posterUri: util.text(preview.posterUri), spoilers: { spoilerBackdrop: util.isTrue(preview.hideBackdrop) }, played: false }
+    end if
+    return invalid
+end function
+
+sub showBackdrop(room as Object)
+    item = shownItem(room)
+    uri = ""
+    isPoster = false
+    hidden = false
+    if item <> invalid
+        uri = util.text(item.backdropUri)
+        poster = util.text(item.posterUri)
+        if uri = "" then uri = poster
+        isPoster = uri <> "" and uri = poster
+        spoilers = item.spoilers
+        if util.isObject(spoilers) then hidden = catalog.spoilers.hidesBackdrop({ spoilerBackdrop: spoilers.spoilerBackdrop, played: item.played }, spoilerSettings())
+    else if room.selectionMode = "vote"
+        lead = leadingSuggestion()
+        if lead <> invalid and lead.posterUrl <> ""
+            uri = lead.posterUrl
+            isPoster = true
+        end if
+    end if
+    m.backdrop.setFields({ lowTier: m.top.lowTier, isPoster: isPoster, hidden: hidden, uri: uri })
+end sub
+
+' The vote winner, else the first suggestion, else invalid.
+function leadingSuggestion() as Dynamic
+    if m.ctx.winner <> invalid then return m.ctx.winner
+    rows = watchparty.page.suggestionRows(m.state.suggestions)
+    if rows.Count() > 0 then return rows[0]
+    return invalid
+end function
+
+' ---- Top row ----------------------------------------------------------------
+
+sub layoutTop(room as Object)
+    top = theme.watchParty.TOP
+    height = theme.watchParty.BUTTON_HEIGHT
+    inset = theme.watchParty.INSET
+    m.roomTitle.setFields({ translation: [inset, 0], height: height, vertAlign: "center" })
+    titleWidth = Int(m.roomTitle.boundingRect().width + 0.999)
+    dot = watchparty.lobby.connectionDot(room, connectionState())
+    x = inset + titleWidth + theme.watchParty.TITLE_DOT_GAP
+    size = theme.watchParty.DOT
+    m.dot.setFields({ width: size, height: size, translation: [x, (height - size) \ 2], blendColor: theme.watchParty.toneColor(dot.tone) })
+    m.dotLabel.setFields({ text: i18n.text(dot.key, dot.values), translation: [x + size + theme.watchParty.DOT_GAP, 0], height: height, vertAlign: "center" })
+    m.top.findNode("topRow").translation = [0, top]
+    ' Options at the right inset, the code pill 22 to its left.
+    m.optionsButton.highlighted = m.focus = "options" and focusedHere()
+    endX = 1920 - inset
+    m.optionsButton.translation = [endX - m.optionsButton.measuredWidth, 0]
+    layoutCodePill(room.code, endX - m.optionsButton.measuredWidth - theme.watchParty.TOP_ROW_GAP)
+end sub
+
+' "JOIN WITH", the code, and the QR glyph in a secondary pill ending at
+' endX; focused, white with the label at black 50% and the glyph at 60%.
+sub layoutCodePill(code as String, endX as Integer)
+    lit = m.focus = "code" and focusedHere()
+    height = theme.watchParty.BUTTON_HEIGHT
+    padding = theme.watchParty.SECONDARY_PADDING
+    gap = theme.watchParty.CODE_GAP
+    m.code.text = theme.tracked(code)
+    m.codeLabel.width = 0
+    m.code.width = 0
+    labelWidth = Int(m.codeLabel.boundingRect().width + 0.999)
+    codeWidth = Int(m.code.boundingRect().width + 0.999)
+    glyph = theme.watchParty.CODE_GLYPH
+    width = padding + labelWidth + gap + codeWidth + gap + glyph + padding
+    m.codePill.translation = [endX - width, 0]
+    m.codeFill.setFields({ width: width, height: height })
+    m.codeLabel.setFields({ translation: [padding, 0], width: labelWidth + 2, height: height, vertAlign: "center" })
+    m.code.setFields({ translation: [padding + labelWidth + gap, 0], width: codeWidth + 2, height: height, vertAlign: "center" })
+    m.codeGlyph.setFields({ width: glyph, height: glyph, translation: [padding + labelWidth + gap + codeWidth + gap, (height - glyph) \ 2] })
+    if lit
+        m.codeFill.blendColor = theme.color.PILL_FOCUS
+        m.codeFill.opacity = 1
+        m.code.color = theme.color.ON_FOCUS
+        m.codeLabel.color = theme.color.ON_FOCUS
+        m.codeLabel.opacity = 0.5
+        m.codeGlyph.blendColor = theme.color.ON_FOCUS
+        m.codeGlyph.opacity = 0.6
+    else
+        m.codeFill.blendColor = theme.color.BACKGROUND
+        m.codeFill.opacity = theme.watchParty.SECONDARY_REST_OPACITY
+        m.code.color = theme.color.WHITE
+        m.codeLabel.color = theme.color.TEXT_TERTIARY
+        m.codeLabel.opacity = 1
+        m.codeGlyph.blendColor = theme.color.TEXT_TERTIARY
+        m.codeGlyph.opacity = 1
+    end if
+end sub
+
+function connectionState() as String
+    if util.isObject(m.state.connection) then return util.text(m.state.connection.state)
+    return "idle"
+end function
+
+' ---- Hero -------------------------------------------------------------------
+
+' Lays the hero out at its place and gives its bottom (before the banner).
+function layoutHero(room as Object, vote as Boolean) as Integer
+    hero = watchparty.lobby.hero(room, m.ctx)
+    host = watchparty.room.hostName(room)
+    if host = "" then host = i18n.text("watchParty.theHost")
+    titleSize = 88
+    titleStyle = theme.textStyle.WP_HERO_TITLE
+    top = theme.watchParty.TOP + theme.watchParty.BUTTON_HEIGHT + theme.watchParty.HERO_GAP
+    if vote
+        titleSize = 60
+        titleStyle = theme.textStyle.WP_VOTE_TITLE
+        top = theme.watchParty.TOP + theme.watchParty.BUTTON_HEIGHT + theme.watchParty.VOTE_HERO_GAP
+    end if
+    part = Int(titleSize * HERO_PART + 0.5)
+    m.top.findNode("hero").translation = [theme.watchParty.INSET, top]
+    width = theme.watchParty.HERO_WIDTH
+    m.eyebrow.text = theme.tracked(UCase(i18n.text(hero.eyebrowKey, withHost(hero.eyebrowValues, host))))
+    y = Int(m.eyebrow.boundingRect().height) + part
+    title = hero.title
+    if title = "" then title = i18n.text(hero.titleKey, withHost(hero.titleValues, host))
+    m.heroTitle.setFields({ font: theme.font(titleStyle), text: title, width: width, translation: [0, y] })
+    m.heroTitle.color = theme.color.TEXT
+    if hero.kind = "pending" then m.heroTitle.color = theme.color.TEXT_TERTIARY
+    y = y + Int(m.heroTitle.boundingRect().height) + part
+    item = shownItem(room)
+    m.facts.visible = hero.kind = "item" and item <> invalid
+    if m.facts.visible
+        m.facts.translation = [0, y]
+        y = y + layoutFacts(item) + part
+    end if
+    captionStyle = theme.textStyle.WP_BODY
+    opacity = 1.0
+    if hero.kind = "item" or hero.kind = "pending"
+        captionStyle = theme.textStyle.WP_CAPTION
+        opacity = CAPTION_OPACITY
+    end if
+    m.caption.setFields({ font: theme.font(captionStyle), color: theme.color.TEXT_TERTIARY, opacity: opacity, width: width, translation: [0, y], text: i18n.text(hero.captionKey, withHost(hero.captionValues, host)) })
+    y = y + Int(m.caption.boundingRect().height)
+    ' The overview shows under an item, hidden for an unwatched episode
+    ' while the profile hides them.
+    overview = ""
+    if hero.kind = "item" and item <> invalid and not vote
+        overview = util.text(item.synopsis)
+        spoilers = item.spoilers
+        if util.isObject(spoilers) and catalog.spoilers.hidesOverview({ spoilerText: spoilers.spoilerText, played: item.played }, spoilerSettings()) then overview = ""
+    end if
+    m.overview.visible = overview <> ""
+    if overview <> ""
+        y = y + HERO_BLOCK_GAP
+        m.overview.setFields({ text: overview, translation: [0, y] })
+        y = y + Int(m.overview.boundingRect().height)
+    end if
+    return top + y
+end function
+
+' values with the host's name for {host}, "The host" when the room names
+' none.
+function withHost(values as Dynamic, host as String) as Object
+    out = {}
+    if util.isObject(values) then out.Append(values)
+    if out.DoesExist("host") then out.host = host
+    return out
+end function
+
+' The facts line: an episode's series and code, the year and runtime, and
+' the quality chips; gives its height.
+function layoutFacts(item as Object) as Integer
+    m.facts.removeChildrenIndex(m.facts.getChildCount(), 0)
+    parts = []
+    if util.text(item.itemType) = "episode"
+        series = util.text(item.seriesTitle)
+        if series <> "" then parts.Push(series)
+        if util.isNumber(item.seasonNumber) and util.isNumber(item.episodeNumber) and item.seasonNumber >= 0 and item.episodeNumber > 0 then parts.Push(i18n.text("watchParty.episodes.line", { season: item.seasonNumber, episode: item.episodeNumber }))
+    end if
+    if util.isObject(item.metadata) and type(item.metadata.items) = "roArray"
+        for i = 0 to item.metadata.items.Count() - 1
+            if i < 2 then parts.Push(item.metadata.items[i])
+        end for
+    end if
+    font = theme.font(theme.textStyle.WP_FACTS)
+    lineHeight = Int(font.size * 1.3)
+    x = 0
+    text = m.facts.createChild("Label")
+    text.setFields({ font: font, color: theme.color.TEXT_TERTIARY, text: parts.Join(" · "), height: lineHeight, vertAlign: "center" })
+    x = Int(text.boundingRect().width + 0.999)
+    for each chip in watchparty.picker.qualityChips(item.badges)
+        x = x + FACT_GAP
+        label = m.facts.createChild("Label")
+        label.setFields({ font: theme.font(theme.textStyle.WP_CHIP), color: theme.color.TEXT_TERTIARY, text: chip })
+        width = Int(label.boundingRect().width + 0.999) + 2 * CHIP_PADDING
+        frame = m.facts.createChild("Poster")
+        frame.setFields({ uri: theme.firstRunArt.FIELD_LINE, width: width, height: CHIP_HEIGHT, translation: [x, (lineHeight - CHIP_HEIGHT) \ 2], blendColor: theme.color.TEXT_TERTIARY, opacity: 0.5 })
+        label.setFields({ width: width, height: CHIP_HEIGHT, horizAlign: "center", vertAlign: "center", translation: [x, (lineHeight - CHIP_HEIGHT) \ 2] })
+        x = x + width
+    end for
+    return lineHeight
+end function
+
+sub layoutBanner(room as Object, top as Integer)
+    banner = watchparty.lobby.banner(room, m.ctx)
+    if banner = invalid
+        m.banner.text = ""
+        return
+    end if
+    host = watchparty.room.hostName(room)
+    if host = "" then host = i18n.text("watchParty.theHost")
+    text = banner.text
+    if text = "" then text = i18n.text(banner.key, withHost(banner.values, host))
+    m.banner.tone = banner.tone
+    m.banner.text = text
+    m.banner.translation = [theme.watchParty.INSET, top + HERO_BLOCK_GAP]
+end sub
+
+' ---- Seats and buttons ------------------------------------------------------
+
+sub layoutBottom(room as Object, vote as Boolean)
+    foot = 1080 - theme.watchParty.BOTTOM
+    inset = theme.watchParty.INSET
+    ' Buttons and hint at the bottom right.
+    hint = watchparty.lobby.hint(room, m.ctx)
+    hintText = ""
+    if hint <> invalid
+        host = watchparty.room.hostName(room)
+        if host = "" then host = i18n.text("watchParty.theHost")
+        hintText = i18n.text(hint.key, withHost(hint.values, host))
+    end if
+    m.hint.text = hintText
+    m.hint.visible = hintText <> ""
+    buttonsBottom = foot
+    if m.hint.visible
+        hintHeight = Int(m.hint.boundingRect().height)
+        m.hint.translation = [1920 - inset - HINT_WIDTH, foot - hintHeight]
+        buttonsBottom = foot - hintHeight - HINT_GAP
+    end if
+    primary = watchparty.lobby.primary(room, m.ctx)
+    secondary = watchparty.lobby.secondary(room, m.ctx)
+    m.actions = { primary: primary, secondary: secondary }
+    host = watchparty.room.hostName(room)
+    if host = "" then host = i18n.text("watchParty.theHost")
+    endX = 1920 - inset
+    buttonsTop = buttonsBottom - theme.watchParty.BUTTON_HEIGHT
+    m.primary.visible = primary.action <> "none"
+    if m.primary.visible
+        detail = ""
+        if primary.undoKey <> "" then detail = i18n.text(primary.undoKey)
+        icon = ""
+        if primary.action = "start" or primary.action = "returnToPlayback" then icon = theme.watchPartyArt.PLAY
+        kind = "primary"
+        if primary.outlined then kind = "secondary"
+        m.primary.setFields({ kind: kind, icon: icon, text: i18n.text(primary.key, withHost(primary.values, host)), detail: detail, enabled: primary.enabled, highlighted: m.focus = "primary" and focusedHere() })
+        endX = endX - m.primary.measuredWidth
+        m.primary.translation = [endX, buttonsTop]
+        endX = endX - theme.watchParty.BUTTON_GAP
+    end if
+    m.secondary.visible = secondary <> invalid
+    if m.secondary.visible
+        m.secondary.setFields({ text: i18n.text(secondary.key), highlighted: m.focus = "secondary" and focusedHere() })
+        endX = endX - m.secondary.measuredWidth
+        m.secondary.translation = [endX, buttonsTop]
+    end if
+    layoutSeats(room, vote, foot, endX - SEATS_BUTTONS_GAP)
+end sub
+
+' The seats under "HERE NOW", ending at foot, as many as fit before
+' maxX with the Invite seat after them.
+sub layoutSeats(room as Object, vote as Boolean, foot as Integer, maxX as Integer)
+    size = theme.watchParty.SEAT
+    if vote then size = theme.watchParty.SEAT_VOTE
+    column = Int(size * 1.4 + 0.5)
+    seatHeight = Int(size * 1.81 + 0.5)
+    gap = theme.watchParty.SEAT_GAP
+    inset = theme.watchParty.INSET
+    fits = (maxX - inset + gap) \ (column + gap) - 1
+    if fits < 0 then fits = 0
+    seats = watchparty.lobby.seats(room)
+    m.seatLayer.removeChildrenIndex(m.seatLayer.getChildCount(), 0)
+    top = foot - seatHeight
+    m.seatLayer.translation = [inset, top]
+    x = 0
+    shown = 0
+    for each seat in seats
+        if shown < fits
+            node = m.seatLayer.createChild("PartySeat")
+            line = []
+            for each key in watchparty.page.seatLine(seat)
+                line.Push(i18n.text(key))
+            end for
+            node.setFields({ size: size, seat: { initial: seat.initial, name: seat.member.displayName, line: line.Join(" · "), palette: seat.palette, state: seat.state, check: seat.check } })
+            node.translation = [x, 0]
+            x = x + column + gap
+            shown = shown + 1
+        end if
+    end for
+    m.inviteSeat = m.seatLayer.createChild("PartySeat")
+    m.inviteSeat.setFields({ size: size, invite: true, highlighted: m.focus = "invite" and focusedHere() })
+    m.inviteSeat.translation = [x, 0]
+    presence = watchparty.lobby.presence(room)
+    headerTop = top - Int(size * 0.25 + 0.5) - 26
+    m.top.findNode("seatsHeader").translation = [inset, headerTop]
+    titleWidth = Int(m.seatsTitle.boundingRect().width + 0.999)
+    m.seatsTitle.setFields({ height: 26, vertAlign: "bottom" })
+    m.presence.setFields({ text: i18n.text(presence.key, presence.values), translation: [titleWidth + Int(size * 0.2 + 0.5), 0], height: 26, vertAlign: "bottom" })
+end sub
+
+' ---- Focus ------------------------------------------------------------------
+
+' Whether focus is on the lobby itself, not an overlay over it.
+function focusedHere() as Boolean
+    return m.top.isInFocusChain() and not overlayOpen()
+end function
+
+' The rows of controls for lobbyMove, and focus kept on a control that is
+' still there, else the primary button, else what is left.
+sub updateRows()
+    bottom = ["invite"]
+    if m.secondary.visible then bottom.Push("secondary")
+    if m.primary.visible then bottom.Push("primary")
+    m.bottomKeys = bottom
+    rail = 0
+    if railFocusable() then rail = 1
+    kind = watchparty.page.ROW_STRIP
+    if m.railKind = "ballot" then kind = watchparty.page.ROW_BALLOT
+    m.rows = [{ kind: watchparty.page.ROW_TOP, count: 2 }, { kind: kind, count: rail }, { kind: watchparty.page.ROW_BOTTOM, count: bottom.Count() }]
+    if not controlShown(m.focus)
+        m.focus = bottom[bottom.Count() - 1]
+        if m.top.isInFocusChain() and not overlayOpen() then applyFocus()
+    end if
+    restyleFocus()
+end sub
+
+function controlShown(key as String) as Boolean
+    if key = "code" or key = "options" then return true
+    if key = "rail" then return railFocusable()
+    for each shown in m.bottomKeys
+        if shown = key then return true
+    end for
+    return false
+end function
+
+' { row, col } of the focused control in m.rows.
+function focusPosition() as Object
+    if m.focus = "code" then return { row: 0, col: 0 }
+    if m.focus = "options" then return { row: 0, col: 1 }
+    if m.focus = "rail" then return { row: 1, col: 0 }
+    for i = 0 to m.bottomKeys.Count() - 1
+        if m.bottomKeys[i] = m.focus then return { row: 2, col: i }
+    end for
+    return { row: 2, col: 0 }
+end function
+
+function keyAt(position as Object) as String
+    if position.row = 0
+        if position.col = 0 then return "code"
+        return "options"
+    end if
+    if position.row = 1 then return "rail"
+    return m.bottomKeys[position.col]
+end function
+
+sub focusLobby()
+    if overlayOpen()
+        focusOverlay()
+        return
+    end if
+    applyFocus()
+end sub
+
+' Gives SceneGraph focus to the rail when it holds the lobby's focus, else
+' to the anchor, whose keys reach onKeyEvent.
+sub applyFocus()
+    if m.focus = "rail" and railFocusable()
+        m.rail.setFocus(true)
+    else
+        m.anchor.setFocus(true)
+    end if
+    restyleFocus()
+end sub
+
+sub restyleFocus()
+    here = focusedHere()
+    m.optionsButton.highlighted = here and m.focus = "options"
+    m.primary.highlighted = here and m.focus = "primary"
+    m.secondary.highlighted = here and m.focus = "secondary"
+    if m.inviteSeat <> invalid then m.inviteSeat.highlighted = here and m.focus = "invite"
+    if m.room <> invalid then layoutTop(m.room)
+end sub
+
+sub moveTo(key as String)
+    m.focus = key
+    applyFocus()
+    sayFocus()
+end sub
+
+sub sayFocus()
+    if m.focus = "primary"
+        speak(m.primary.text)
+    else if m.focus = "secondary"
+        speak(m.secondary.text)
+    else if m.focus = "options"
+        speak(m.optionsButton.text)
+    else if m.focus = "code"
+        speak(i18n.text("watchParty.codePill.label") + " " + m.code.text)
+    else if m.focus = "invite"
+        speak(i18n.text("watchParty.seat.invite"))
+    end if
+end sub
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press or overlayOpen() then return false
+    if key = "play" or key = "playonly"
+        primary = m.actions.primary
+        if primary <> invalid and primary.action = "start" and primary.startsOnPlay
+            send({ kind: "start" })
+            return true
+        end if
+        return false
+    end if
+    if key = "options"
+        if m.focus = "rail" then return railOptions()
+        return false
+    end if
+    if key = "OK"
+        activate(m.focus)
+        return true
+    end if
+    if key = "back" then return false
+    target = watchparty.page.lobbyMove(m.rows, focusPosition(), key)
+    if target = invalid then return key = "up" or key = "down" or key = "left" or key = "right"
+    moveTo(keyAt(target))
+    return true
+end function
+
+' OK on a control (the rail's OK comes from its own event).
+sub activate(key as String)
+    if key = "code" or key = "invite"
+        openInvite()
+    else if key = "options"
+        openOptions()
+    else if key = "primary"
+        runAction(m.actions.primary)
+    else if key = "secondary"
+        runAction(m.actions.secondary)
+    end if
+end sub
+
+' A button's action (watchparty.lobby.primary and secondary).
+sub runAction(action as Dynamic)
+    if action = invalid then return
+    kind = action.action
+    if action.DoesExist("enabled") and not action.enabled then return
+    if kind = "start"
+        send({ kind: "start" })
+    else if kind = "returnToLobby"
+        send({ kind: "stop" })
+    else if kind = "returnToPlayback"
+        m.top.returnToPlayback = true
+    else if kind = "chooseTitle"
+        openPicker(watchparty.picker.SELECT)
+    else if kind = "suggest"
+        openPicker(watchparty.picker.SUGGEST)
+    else if kind = "ready"
+        member = watchparty.room.selfMember(m.room)
+        if member <> invalid then send({ kind: "lobbyReady", ready: not member.lobbyReady })
+    end if
+end sub
+
+function backPressed() as Boolean
+    if overlayOpen()
+        closeTopOverlay()
+        return true
+    end if
+    return false
+end function
