@@ -321,7 +321,7 @@ series, and episodes only:
    favorites, activity, because you watched, recommended for you, similar
    users, taste match, forgotten favorites);
 4. "Recently Added Movies" and "Recently Added Series":
-   `GET /api/v2/catalog?type={movie|series}&limit=24&sort=added_at&order=desc`.
+   `GET /api/v2/catalog?type={movie|series}&limit=24&sort=-added_at`.
 
 Empty: "Nothing to pick from yet" / "Search for a title, or add something
 to a watchlist.", focus on Search. Search uses the app's Search page
