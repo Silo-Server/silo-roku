@@ -61,6 +61,9 @@ SHARDS = [
     ("detail-tracks", ["views/detailTracks.spec.bs", "auth", "control"]),
     ("views", ["views"]),
     ("player", ["player"]),
+    # The party player's specs outgrew the player shard's heap once main's
+    # rendition and native-subtitle specs joined it.
+    ("player-party", ["player/party.spec.bs"]),
     ("player-remote", ["player/shuffle.spec.bs", "player/remote.spec.bs", "player/voice.spec.bs"]),
     ("screens", ["library", "people", "personal", "search", "settings", "calendar"]),
     # Home's screens and the row page outgrew the screens shard's heap on CI.
