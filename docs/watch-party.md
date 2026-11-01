@@ -546,8 +546,10 @@ never when it arrives. Positions are source positions
   most 3 s).
 - `ready` (and `state_report {is_ready: true, command_id}`) every 500 ms
   while the room waits on a seek this member must acknowledge, or while
-  this member catches up (`self_ignore_wait`, or its own buffering).
-  Never otherwise: a `ready` in a playing room causes another sync seek.
+  this member catches up (`self_ignore_wait`, or its own buffering), and
+  only while the player is playable: never while it seeks, loads, or
+  stalls, which would tell the room it recovered. Never otherwise: a
+  `ready` in a playing room causes another sync seek.
 - `buffering` once per stall, after 2 s without progress while the room
   plays. The 2 s restarts after each seek and command.
 
