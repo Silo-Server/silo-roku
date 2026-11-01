@@ -87,6 +87,15 @@ namespace tests
             return node
         end function
 
+        ' The catalog item reads sent so far.
+        function itemReads() as Integer
+            count = 0
+            for each path in tests.scene.paths()
+                if Left(path, 22) = "/api/v2/catalog/items/" then count = count + 1
+            end for
+            return count
+        end function
+
         function keys(controls as Object) as Object
             out = []
             for each control in controls
@@ -124,6 +133,52 @@ namespace tests
             m.assertNotInvalid(node.callFunc("probeKeypad"))
             m.assertTrue(node.callFunc("probeKey", "back"), "Back closes the keypad first")
             m.assertInvalid(node.callFunc("probeKeypad"))
+        end sub
+
+        @it("lets Back close the keypad after the room refuses a join at once")
+        sub _()
+            room = m.task()
+            node = m.screen()
+            node.callFunc("probeKey", "down")
+            node.callFunc("probeKey", "down")
+            node.callFunc("probeKey", "OK")
+            keypad = node.callFunc("probeKeypad")
+            keypad.code = "ABCDEFGH"
+            keypad.join = "ABCDEFGH"
+            m.assertEqual(room.command.kind, "join")
+            m.assertTrue(keypad.busy)
+            ' The Task refuses it before it sends anything, so its busy
+            ' output never changes.
+            m.emit("result", { kind: "join", tag: room.command.tag, ok: false, errorKey: "watchParty.error.alreadyInParty", detail: "watchParty.error.alreadyInParty" })
+            m.assertFalse(keypad.busy)
+            m.assertEqual(keypad.error, i18n.text("watchParty.error.alreadyInParty"))
+            node.callFunc("probeKey", "back")
+            m.assertInvalid(node.callFunc("probeKeypad"))
+        end sub
+
+        @it("gives back its lobby's art and stops redrawing while covered")
+        sub _()
+            room = m.lobbyRoom({ selectionMode: "vote" })
+            suggestions = { items: [tests.party.makeSuggestion("a", 1, 1#, { posterUrl: "https://img.example/a.jpg" })], winnerId: "a", loading: false }
+            m.task({ room: room, connection: { state: "connected" }, suggestions: suggestions })
+            node = m.screen({})
+            lobby = node.callFunc("probeLobby")
+            backdrop = lobby.findNode("backdrop")
+            rail = lobby.findNode("rail")
+            m.assertEqual(backdrop.uri, "https://img.example/a.jpg")
+            node.visible = false
+            node.callFunc("onHide")
+            m.assertEqual(backdrop.uri, "", "the backdrop lets go of its art")
+            m.assertInvalid(rail.content, "and the ballot of its cards")
+            suggestions = { items: [tests.party.makeSuggestion("b", 2, 2#, { posterUrl: "https://img.example/b.jpg" })], winnerId: "b", loading: false }
+            m.emit("suggestions", suggestions)
+            m.assertEqual(backdrop.uri, "", "a change under the player draws nothing")
+            m.assertInvalid(rail.content)
+            node.callFunc("onPressure", nav.pressure.DETACH)
+            node.visible = true
+            node.callFunc("onShow", { restore: invalid, first: false, refresh: false, played: invalid })
+            m.assertEqual(backdrop.uri, "https://img.example/b.jpg", "shown again, it draws what the room says now")
+            m.assertNotInvalid(rail.content)
         end sub
 
         @it("shows the ended message it was opened with")
@@ -291,6 +346,83 @@ namespace tests
             node = m.lobby(m.lobbyRoom())
             m.emit("room", {})
             m.assertTrue(node.left)
+        end sub
+
+        @it("leaves focus where it is when something it no longer holds closes")
+        sub _()
+            node = m.lobby(m.lobbyRoom())
+            node.callFunc("probeKey", "up")
+            node.callFunc("probeKey", "OK")
+            options = node.callFunc("probeOverlay")
+            ' The party player opens over the page and takes focus.
+            player = m.top.createChild("Group")
+            player.setFocus(true)
+            options.chosen = "close"
+            m.assertEqual(node.callFunc("probeView").overlay, "")
+            m.assertTrue(player.hasFocus(), "the player keeps focus")
+            m.top.removeChild(player)
+        end sub
+
+        @it("keeps Party options as they are while the room changes nothing in them")
+        sub _()
+            node = m.lobby(m.lobbyRoom())
+            node.callFunc("probeKey", "up")
+            node.callFunc("probeKey", "OK")
+            options = node.callFunc("probeOverlay")
+            first = options.findNode("list").getChild(0)
+            m.emit("connection", { state: "connected" })
+            m.assertTrue(first.isSameNode(options.findNode("list").getChild(0)), "not rebuilt")
+            m.emit("room", m.lobbyRoom({ guestControlPolicy: "guest_play_pause" }))
+            m.assertFalse(first.isSameNode(options.findNode("list").getChild(0)), "rebuilt when a row changes")
+        end sub
+
+        @it("reads the selected title again after a failed read, three times at most")
+        sub _()
+            node = m.lobby(m.lobbyRoom({ selectedContentId: "movie:heat" }))
+            m.assertEqual(m.itemReads(), 1)
+            for attempt = 1 to 3
+                tests.scene.fail(tests.scene.sent()[tests.scene.sent().Count() - 1])
+                node.callFunc("probeRetryTitle")
+            end for
+            m.assertEqual(m.itemReads(), 3, "the first read and two more")
+            m.assertEqual(node.callFunc("probeView").title, i18n.text("watchParty.hero.loading"))
+        end sub
+
+        @it("names the title once a read after a failed one lands")
+        sub _()
+            node = m.lobby(m.lobbyRoom({ selectedContentId: "movie:heat" }))
+            tests.scene.fail(tests.scene.sent()[tests.scene.sent().Count() - 1])
+            node.callFunc("probeRetryTitle")
+            entry = tests.scene.sent()[tests.scene.sent().Count() - 1]
+            tests.scene.answer(entry, tests.catalogData.item(1, { content_id: "movie:heat", title: "Heat" }))
+            m.assertEqual(node.callFunc("probeView").title, "Heat")
+            m.assertEqual(m.global.roomTask.command.kind, "noteTitle")
+        end sub
+
+        @it("resolves the leading suggestion's poster for the vote lobby's backdrop")
+        sub _()
+            room = m.lobbyRoom({ selectionMode: "vote" })
+            suggestions = { items: [tests.party.makeSuggestion("a", 1, 1#, { posterUrl: "/art/a.jpg" })], winnerId: "a", loading: false }
+            node = m.lobby(room, { suggestions: suggestions })
+            m.top.callFunc("sceneSession", { origin: "https://silo.example" })
+            m.emit("suggestions", suggestions)
+            m.assertEqual(node.findNode("backdrop").uri, "https://silo.example/art/a.jpg")
+        end sub
+
+        @it("draws the invitation's QR code at its own size")
+        sub _()
+            room = m.lobbyRoom({ invitePath: "/watch-party/join/K7PQ2M4X" })
+            node = m.lobby(room)
+            m.top.callFunc("sceneSession", { origin: "https://silo.example" })
+            node.callFunc("probeKey", "up")
+            node.callFunc("probeKey", "left")
+            node.callFunc("probeKey", "OK")
+            m.assertEqual(node.callFunc("probeView").overlay, "invite")
+            node.callFunc("probeOverlay").callFunc("release")
+            task = m.global.retiringQrTask
+            m.assertNotInvalid(task, "a QrTask draws the code")
+            m.assertEqual([task.request.size, task.request.quiet], [560, 2], "the page's 560 px, 2 quiet modules")
+            m.global.retiringQrTask = invalid
         end sub
 
         '----------------------------------------------------------------------
