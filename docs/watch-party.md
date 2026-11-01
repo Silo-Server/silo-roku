@@ -1,10 +1,11 @@
 # Watch Party for Roku
 
 **Status:** Specified. The room core (section 11: the room task, its
-rules, and the routes), AppScene's wiring, and the player's part are built
-and tested headless; the screens are not. Spike W0-1 (section 12.1) ran on
-the Roku Ultra and settled the transport (section 2.1); the player's part
-has not run on a device.
+rules, and the routes), AppScene's wiring, the player's part, and the
+screens (section 4: the page, lobby, ballot, invitation, options, picker,
+the room panel, and the entry points) are built and tested headless.
+Spike W0-1 (section 12.1) ran on the Roku Ultra and settled the transport
+(section 2.1); nothing else has run on a device yet.
 
 **Last updated:** 2026-11-01
 
@@ -649,8 +650,15 @@ reason}`. The room moves every member to a new revision.
 | The ended and replaced messages show only if the Watch Party page is on the stack | The app opens the Watch Party page with the message | Otherwise the viewer lands on Home with no explanation |
 | Without a clock the player waits silently | "Waiting for party timing. If this continues, leave and rejoin." after 3 s, as Android TV | Same |
 | The background keeps the party player | Home closes the app and leaves the party; a host's room holds 2 minutes | No background execution without Instant Resume |
-| The code in monospaced type | Tabular Inter, as the sign-in code (spec section 5.9) | No monospaced face ships |
+| The code in monospaced type | Inter Bold, as letter sign-in codes are (spec section 5.9), with hair spaces between its characters | No monospaced face ships, and the tabular face holds only timecode characters (`fonts/SOURCE`), while a party code is letters and digits |
 | Blurred episode stills | The small-decode blur (spec section 5.9) | SceneGraph has no blur |
+| A poster standing in for the lobby's backdrop is blurred at radius 28 | The small-decode blur, at 70% | Same |
+| The picker's confirm page scrolls, Who's Seen It under the buttons | Who's Seen It sits to the right of the overview; the page does not scroll | Nothing on the page takes focus but its buttons, so a scroll could not be reached |
+| A guest's strip shows only their own suggestions as focusable | The strip takes focus when any card in it can be queued or removed; OK does nothing on the others | A RowList cannot skip items |
+| A suggestion of an episode shows its poster unless the profile's spoiler setting hides it by its watch state | Blurred whenever the profile hides unwatched episode images | A suggestion carries no watch state |
+| Pill buttons carry SF Symbols (play, plus, checkmark) | Play on Start and Return to playback, a check or plus on the confirm button; the others none | The app's glyph set (`images/detail`, `images/firstrun`) |
+| The picker's shelves sit under a Skyline hero | The shelves alone, under the top strip | The hero belongs to Home's feed; section 4.8 names the shelves only |
+| The lobby shows every member's seat | As many seats as fit left of the buttons | tvOS's row has no scroll on a TV either; a Roku draws no overflow |
 
 ## 11. Components
 
@@ -662,8 +670,12 @@ reason}`. The room moves every member to a new revision.
 | Room logic | `source/watchparty/` | `time` (RFC 3339 to epoch milliseconds, the anchored clock), `clock` (offset estimator), `wire` (frames, messages, IDs, snapshots, capabilities), `room` (snapshot acceptance, derived facts), `sync` (attach, command timing, readiness, stalls, reports, corrections), `catchup` (seek-only decisions, reload budget), `connection` (reconnect pacing, endings), `lobby` and `votes` (section 4's rules as locale keys), `recent` (section 4.3), `socket` (the `roWebSocket` adapter) |
 | REST | `source/api/watchParty.bs` | The routes in section 5 as requests for the shared client |
 | Room session owner | `components/AppSceneWatchParty.bs`, rules in `source/watchparty/app.bs` | One `RoomTask` and one `RoomApiBridge` per app run, the Task published as `m.global.roomTask`; sets `identity` on every session change; forgets a removed server's recent party; opens, replaces, and closes the party player; shows the Watch Party page when the party ends; hosts the room panel (Hooks, below) |
-| Watch Party page, lobby, ballot, invite, options | `components/screens/watchParty/` | Section 4 |
+| Watch Party page, lobby, ballot, invite, options | `components/screens/watchParty/` | Section 4: `WatchPartyScreen` (route `watchParty`), `PartyLobby` (and its rails and overlays scripts), `PartyKeypad`, `PartyInvite`, `PartyOptions`, `PartySeat`, `PartyCard`, `PartyButton`, `PartyBanner`, `PartyBackdrop`; `room.bs` reads the room Task for them |
+| Room panel | `components/screens/watchParty/WatchPartyPanel` | Section 4.10: the lobby over the player (Hooks below) |
+| Screen rules | `source/watchparty/page.bs`, `keypad.bs`, `picker.bs` | The page's controls, entering from a title, the lobby's focus and context, menus, the invitation's link, options, the confirm button, Who's Seen It, the keypad, and the picker's shelves and routing, as pure functions |
+| Entry points | `source/home/shell.bs` and `components/screens/home/shell.bs`; `source/catalog/personal.bs` and `components/screens/detail/DetailPersonal.bs` | The avatar menu's Watch Party row and the detail page's More row (section 4.1) |
 | Picker | `components/screens/watchParty/picker/` | Section 4.8, reusing Home rows, Search, and the episode rail |
+| Art | `scripts/watch-party-art.py` into `images/watchparty/` | The seat shade and rings, the ballot's add card, and the backdrop's gradients |
 | Player | `components/player/PlayerParty.bs`, rules in `source/watchparty/player.bs`; the session reducer's party mode in `source/playback/session.bs` | Room start, Back to the panel, status pill, permissions, and executing `playerCommand` on the render thread |
 | SiloControl in a party | `source/control/policy.bs` (`partyControl`, `partyOffer`), `components/player/PlayerRemote.bs`, `components/AppSceneControl.bs` | Section 9 |
 | Recent party | `source/watchparty/recent.bs` | Section 4.3, in its own 1 KB registry section `silo.party`, which only the room task writes. The session's own section keeps to 15 KB, above its largest record, so the app's five sections fit Roku's 32 KB |
@@ -724,7 +736,7 @@ shown ping activity (event types 4 or 7) and then none for 50 s
 never judged by it, so a Roku OS that raises no event for a ping without
 a payload keeps its sockets (the rig is confirming which it does).
 
-**Hooks** (the screens' interfaces, from AppScene and the player):
+**Hooks as AppScene and the player built them:**
 
 - `m.global.roomTask`: the `RoomTask`, for every screen to set `command`
   and observe its outputs (`observeFieldScoped`, unobserved when the
@@ -755,6 +767,45 @@ a payload keeps its sockets (the rig is confirming which it does).
   lobby").
 - `sync.atEnd` (added to the Task's `sync` output): this member's player
   is parked at the end of the file.
+
+**Hooks as the screens built them** (to reconcile with the above: the panel's name and its `open`, `close`, and `dismissed` against `watchPartyPanel`, the relay against AppScene's observer, and `watchPartyIntent`):
+
+- *The room Task.* Screens read `m.global.roomTask` (a `RoomTask` node);
+  without it, or before it is set, Watch Party shows nowhere (no avatar
+  row, no More row, the page says it is unavailable). One render-thread
+  `PartyRelay` (kept in `m.global.roomRelay`, made on first use) observes
+  the Task's outputs with `observeField` and hands each change to the
+  `PartyFeed` node of each screen that subscribed; a screen observes only
+  its own feed and unsubscribes it as it goes, so no screen observes the
+  Task and nothing unobserves a shared field (implementation plan section
+  4.2). Screens send commands on the Task's `command` field with tags of
+  their own (`components/screens/watchParty/room.bs`). The relay is a
+  second observer beside AppScene's, against `RoomTask.bs`'s "AppScene is
+  the only observer": AppScene may take its place by forwarding the same
+  `{ field, data }` changes to the subscribed feeds.
+- *The page.* `nav.route.WATCH_PARTY` with `{}`, `{ entry }` (a title's
+  More item, `WatchPartyScreen.xml` lists its fields), or `{ message }`:
+  the ended or replaced message, `ended.messageKey` as it is, for the app
+  to open the page with when a party ends for this device (section 4.11).
+  "Return to playback" on the page (a guest in a playing room whose
+  player is not open) sets `m.global.watchPartyIntent` (assocarray,
+  alwaysNotify, added on first use) to `{ kind: "returnToPlayback" }`;
+  the app opens the room's player.
+- *The room panel.* `WatchPartyPanel` is a node the player (or AppScene)
+  creates over the player, once, with `owner` (the player's screen owner,
+  for its catalog reads) and `lowTier`. Setting `open` to `{
+  playbackEnded }` shows it and gives it focus (setting it again updates
+  playbackEnded); `close = true` hides it from outside, and is set before
+  the owner removes it, so its lobby lets the room Task's relay go. It sets
+  `dismissed` once per close: `"returnToPlayback"` (the viewer's choice,
+  or Back with nothing open over the lobby), `"left"` (the room output
+  emptied: a leave, an end, a replacement), or `"closed"`; `active` says
+  whether it shows. On `dismissed` the owner gives focus back to the
+  player. The panel builds its lobby on open and releases it on close.
+- *The detail page.* The More row sends nothing itself: it pushes the
+  page with `{ entry }`, and the page decides with
+  `watchparty.lobby.entryAction` against the room it sees then.
+
 
 **Decisions made while building.** A reconnect that gives up (six
 failures and 150 s without a healthy socket) ends the party with the
