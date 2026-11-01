@@ -637,8 +637,8 @@ never from the target the node echoes first (section 7.4), so the lead
 learns the keyframe shortfall as well as the seek's time.
 
 **Overshoot, then hold** (owner's decision, 2026-11-01). A direct-play
-file's keyframes may sit far apart: FX-007's are 1.3 to 12.4 s apart, so
-a seek lands up to 12 s short, far past what a 2 s lead can absorb, and
+file's keyframes may sit far apart: FX-007's are 0.9 to 12.5 s apart
+(ffprobe; 5.9 s on average), so a seek lands up to 12 s short, far past what a 2 s lead can absorb, and
 a late joiner stayed 1 to 8 s behind for over two minutes while the
 server corrected it every 10 s (bug 5 of the Streaming Stick's
 end-to-end run). A Roku member cannot play faster to close that, so it
@@ -672,8 +672,10 @@ seeks past the room and waits, paused, for the room to reach it:
   would trigger the server's pause-mismatch correction at once. The task
   then plays it, sound restored, when the room position reaches the
   paused position, less 100 ms for the resume (`HOLD_PLAY_LEAD_MS`),
-  timed on the task like a command. Holds are at most 15 s, since the
-  aim is.
+  timed on the task like a command. A hold lasts at most about 15 s,
+  since the aim is that far ahead at most; a landing on the keyframe
+  past the aim (below) can add up to a gap, and the player's own 20 s
+  limit bounds that.
 - **Past the aim.** A seek that lands more than 0.25 s past its aim
   landed on the keyframe after it (on the Streaming Stick, FX-007 now
   and then): the hold seeks once more, to 0.1 s past that keyframe, so
