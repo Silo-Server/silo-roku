@@ -886,11 +886,11 @@ message.
 **Requests.** Start, selection, and promote carry `once` (source/api/
 request.bs): the account session still refreshes the token on a `401`
 but answers the request with it instead of sending it again, and the
-room session reads the room back after an uncertain answer. Writes whose
-answer carries the room proof or a ticket, and the join, whose body
-carries the code, never pass through a file. The room read is a `GET`,
-whose answer passes through ApiTask's temporary response file like any
-other; it is deleted as soon as it is read.
+room session reads the room back after an uncertain answer. The room
+read and the writes whose answer carries the room proof or a ticket, and
+the join, whose body carries the code, are marked `secret` and never pass
+through a file: ApiTask reads a secret `GET`'s answer as a string
+(`AsyncGetToString`) and sends a secret write's body from one.
 
 **Socket.** `source/watchparty/socket.bs` follows W0-1 (section 2.1): it
 sets the subprotocols with `SetProtocols` only, leaves
