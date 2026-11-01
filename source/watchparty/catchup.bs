@@ -1,0 +1,231 @@
+' How a Roku member keeps its playhead on the room without a playback rate
+' (docs/watch-party.md section 7.5). Roku's Video node cannot play faster
+' or slower, so drift is closed only by seeks, as on Apple TV and on
+' Android players that ignore rate: these are Android's RoomCatchup
+' (decideCommand, loopDecision, fallbackAfterSeek with rateCapable false)
+' and RoomReloadBudget, and tvOS's realignFollowUp, with their constants.
+'
+' Drift is the room position minus the local position: positive means
+' this member is behind. "In place" is an input: Roku reports no buffered
+' range, so the player says whether a Video.seek on its current plan is
+' served where it lands (direct play, transcode) or rebuilds the stream (a
+' copy remux's seek_reanchor), and a correction on the latter counts as a
+' reload.
+namespace watchparty.catchup
+    ' The server's own band: nothing within it is corrected.
+    const DEADBAND_SECONDS = 0.4
+    ' Only beyond this drift does a playing member reload.
+    const HARD_SEEK_SECONDS = 5
+    ' The host executing a command seeks beyond this instead: a server takes
+    ' a host report more than 2 s off as the host's decision and moves the
+    ' room to it.
+    const HOST_COMMAND_SEEK_SECONDS = 2
+    ' A member at rest, or one that cannot nudge, seeks beyond this when the
+    ' seek is in place.
+    const PAUSED_SEEK_SECONDS = 1
+    ' The drift loop waits this long after a command or seek, then checks
+    ' every LOOP_INTERVAL_MS.
+    const LOOP_SETTLE_MS = 1000
+    const LOOP_INTERVAL_MS = 500
+    ' Correction seeks aim at most this far ahead (the host band), and
+    ' seeks that keep missing back off up to MAX_INTERVAL_MS.
+    const MAX_LEAD_SECONDS = 2
+    const MAX_INTERVAL_MS = 16000
+    ' The reload budget (reload*): the next reload waits RELOAD_MIN_MS after
+    ' the last one played, doubling to RELOAD_MAX_MS; one that never lands
+    ' is stale after RELOAD_STALE_MS; each aims ahead by the previous load's
+    ' time, at most RELOAD_MAX_LEAD_SECONDS; landed means within
+    ' -DEADBAND_SECONDS to +RELOAD_LANDED_AHEAD_SECONDS of its target.
+    const RELOAD_MIN_MS = 10000
+    const RELOAD_MAX_MS = 60000
+    const RELOAD_STALE_MS = 30000
+    const RELOAD_MAX_LEAD_SECONDS = 10
+    const RELOAD_LANDED_AHEAD_SECONDS = 2
+
+    ' ---- The room's position
+
+    ' The reference a member follows: the last command it executed,
+    ' { positionSeconds, executeAtMs (server epoch ms), playing }. Never a
+    ' snapshot (section 7.2).
+    function reference(positionSeconds as Dynamic, executeAtMs as Dynamic, playing as Boolean) as Object
+        return { positionSeconds: positionSeconds, executeAtMs: executeAtMs, playing: playing }
+    end function
+
+    ' The room position at server time serverNowMs: the reference's, plus
+    ' the time since it executed while the room plays, never before it.
+    function positionAt(ref as Object, serverNowMs as Dynamic) as Dynamic
+        elapsed = 0
+        if ref.playing and serverNowMs > ref.executeAtMs then elapsed = (serverNowMs - ref.executeAtMs) / 1000#
+        out = ref.positionSeconds + elapsed
+        if out < 0 then return 0
+        return out
+    end function
+
+    ' ---- Decisions
+
+    ' How to apply a command when it executes: "seek" (to the target now),
+    ' "reload" (a correction that goes through the reload budget), or
+    ' "none". driftSeconds is the projected room position minus the local
+    ' position then. memberPlaying: the player is advancing.
+    ' intendsToPlay: it wants to play but may not be advancing yet
+    ' (buffering, a seek in flight). commandPlays: the command leaves the
+    ' room playing. inPlace: a seek on this plan is served in place. host:
+    ' this member is the room's host.
+    function decideCommand(action as String, driftSeconds as Dynamic, memberPlaying as Boolean, commandPlays as Boolean, inPlace as Boolean, intendsToPlay as Boolean, host as Boolean) as String
+        ' A room seek is a barrier: everyone lands on the same frame.
+        if action = "seek" then return "seek"
+        drift = Abs(driftSeconds)
+        hard = HARD_SEEK_SECONDS
+        if host then hard = HOST_COMMAND_SEEK_SECONDS
+        inPlaceSeek = drift > PAUSED_SEEK_SECONDS and inPlace
+        if action = "play" and commandPlays and memberPlaying
+            if drift <= DEADBAND_SECONDS then return "none"
+            if drift > hard then return "reload"
+            if inPlaceSeek then return "seek"
+            ' Without a rate or an in-place seek nothing else would ever
+            ' converge it: the budget paces a rebuild.
+            if drift > PAUSED_SEEK_SECONDS then return "reload"
+            return "none"
+        end if
+        ' Wants to play but is not advancing yet: a large gap still goes
+        ' through the budget, never an unpaced stream rebuild.
+        if action = "play" and commandPlays and intendsToPlay
+            if drift > hard then return "reload"
+            if inPlaceSeek then return "seek"
+            return "none"
+        end if
+        ' A pause, or a play this member starts from rest: the loop corrects
+        ' any residual once playing, so only a large or cheap gap seeks.
+        if drift > hard or inPlaceSeek then return "seek"
+        return "none"
+    end function
+
+    ' The drift loop's step between commands: "seek" in place beyond
+    ' PAUSED_SEEK_SECONDS, else "none". It never reloads; the server's
+    ' correction commands handle what an in-place seek cannot reach.
+    function loopDecision(driftSeconds as Dynamic, inPlace as Boolean) as String
+        if inPlace and Abs(driftSeconds) > PAUSED_SEEK_SECONDS then return "seek"
+        return "none"
+    end function
+
+    ' After a correction seek landed and settled, driftSeconds is the
+    ' shortfall it left while the room played on. The next seek aims ahead
+    ' by the lead so far plus that shortfall, between 0 and
+    ' MAX_LEAD_SECONDS. One that left more than PAUSED_SEEK_SECONDS doubles
+    ' the wait before the next, up to MAX_INTERVAL_MS; one that converged
+    ' resets it to LOOP_SETTLE_MS. Gives { leadSeconds, intervalMs }.
+    function fallbackAfterSeek(leadSeconds as Dynamic, intervalMs as Integer, driftSeconds as Dynamic) as Object
+        lead = leadSeconds + driftSeconds
+        if lead < 0 then lead = 0
+        if lead > MAX_LEAD_SECONDS then lead = MAX_LEAD_SECONDS
+        nextMs = LOOP_SETTLE_MS
+        if Abs(driftSeconds) > PAUSED_SEEK_SECONDS
+            nextMs = intervalMs * 2
+            if nextMs > MAX_INTERVAL_MS then nextMs = MAX_INTERVAL_MS
+        end if
+        return { leadSeconds: lead, intervalMs: nextMs }
+    end function
+
+    ' A member at rest that joined a playing room seeks to the room, which
+    ' plays on while the seek takes seekTookMs. Where to seek once more
+    ' before it plays, aimed ahead by that time (at most MAX_LEAD_SECONDS),
+    ' or invalid when the first seek landed within DEADBAND_SECONDS of the
+    ' room position roomSeconds (tvOS realignFollowUp).
+    function realignFollowUp(roomSeconds as Dynamic, landedSeconds as Dynamic, seekTookMs as Integer) as Dynamic
+        if Abs(roomSeconds - landedSeconds) <= DEADBAND_SECONDS then return invalid
+        lead = seekTookMs / 1000#
+        if lead < 0 then lead = 0
+        if lead > MAX_LEAD_SECONDS then lead = MAX_LEAD_SECONDS
+        return roomSeconds + lead
+    end function
+
+    ' ---- The reload budget (Android RoomReloadBudget)
+
+    ' Times are the caller's monotonic milliseconds.
+    function reloadBudget() as Object
+        return { target: invalid, loadStarted: false, startedAt: 0, nextAllowedAt: invalid, attempts: 0, leadSeconds: 0 }
+    end function
+
+    function reloadInFlight(budget as Object) as Boolean
+        return budget.target <> invalid
+    end function
+
+    ' A reload that has not landed within RELOAD_STALE_MS.
+    function reloadStale(budget as Object, now as Integer) as Boolean
+        return budget.target <> invalid and now - budget.startedAt >= RELOAD_STALE_MS
+    end function
+
+    function reloadAllowed(budget as Object, now as Integer) as Boolean
+        if budget.target <> invalid then return now - budget.startedAt >= RELOAD_STALE_MS
+        return budget.nextAllowedAt = invalid or now >= budget.nextAllowedAt
+    end function
+
+    ' Records a reload toward roomSeconds and gives where to aim it: ahead
+    ' by the last load's time, never past durationSeconds (when known).
+    function reloadBegin(budget as Object, roomSeconds as Dynamic, now as Integer, durationSeconds = 0 as Dynamic) as Dynamic
+        aim = roomSeconds + budget.leadSeconds
+        if durationSeconds > 0
+            ceiling = durationSeconds
+            if roomSeconds > ceiling then ceiling = roomSeconds
+            if aim > ceiling then aim = ceiling
+        end if
+        budget.target = aim
+        budget.loadStarted = false
+        budget.startedAt = now
+        budget.attempts = budget.attempts + 1
+        budget.nextAllowedAt = now + RELOAD_STALE_MS
+        return aim
+    end function
+
+    ' The reload's own seek was issued.
+    sub reloadLoading(budget as Object)
+        if budget.target <> invalid then budget.loadStarted = true
+    end sub
+
+    ' Whether playback at localSeconds is the reload playing.
+    function reloadLanded(budget as Object, localSeconds as Dynamic) as Boolean
+        if budget.target = invalid or not budget.loadStarted then return false
+        offset = localSeconds - budget.target
+        return offset >= -DEADBAND_SECONDS and offset <= RELOAD_LANDED_AHEAD_SECONDS
+    end function
+
+    ' The reload plays: remember its load time and space the next one.
+    sub reloadLand(budget as Object, now as Integer)
+        if budget.target = invalid then return
+        lead = (now - budget.startedAt) / 1000#
+        if lead < 0 then lead = 0
+        if lead > RELOAD_MAX_LEAD_SECONDS then lead = RELOAD_MAX_LEAD_SECONDS
+        budget.leadSeconds = lead
+        budget.target = invalid
+        budget.nextAllowedAt = now + backoffMs(budget)
+    end sub
+
+    ' The reload was refused or superseded; space the next one.
+    sub reloadAbandon(budget as Object, now as Integer)
+        budget.target = invalid
+        budget.nextAllowedAt = now + backoffMs(budget)
+    end sub
+
+    ' The reload went stale without landing: a replacement may start at
+    ' once, but the attempt count stands, so later backoffs keep growing.
+    sub reloadExpire(budget as Object, now as Integer)
+        budget.target = invalid
+        budget.loadStarted = false
+        budget.nextAllowedAt = now
+    end sub
+
+    ' The member reached the room: the next drift starts a fresh backoff.
+    sub reloadSettle(budget as Object)
+        budget.attempts = 0
+        budget.nextAllowedAt = invalid
+    end sub
+
+    function backoffMs(budget as Object) as Integer
+        interval = RELOAD_MIN_MS
+        for i = 2 to budget.attempts
+            interval = interval * 2
+            if interval > RELOAD_MAX_MS then interval = RELOAD_MAX_MS
+        end for
+        return interval
+    end function
+end namespace

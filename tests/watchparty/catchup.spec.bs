@@ -1,0 +1,193 @@
+import "pkg:/source/watchparty/catchup.bs"
+
+namespace tests
+
+    ' Ported from Android's RoomCatchupTest with rateCapable false: where
+    ' Android nudges, a Roku seeks in place or reloads.
+    @suite("watch party catch-up")
+    class WatchPartyCatchupTests extends rooibos.BaseTestSuite
+
+        function decide(action as String, drift as Dynamic, fields = {} as Object) as String
+            o = { memberPlaying: true, commandPlays: action = "play", inPlace: false, intendsToPlay: invalid, host: false }
+            o.Append(fields)
+            if o.intendsToPlay = invalid then o.intendsToPlay = o.memberPlaying
+            return watchparty.catchup.decideCommand(action, drift, o.memberPlaying, o.commandPlays, o.inPlace, o.intendsToPlay, o.host)
+        end function
+
+        @describe("room position")
+
+        @it("advances a playing reference from execute_at and projects a late execution")
+        sub _()
+            ref = watchparty.catchup.reference(100, 10000#, true)
+            m.assertEqual(watchparty.catchup.positionAt(ref, 9000#), 100, "never before execute_at")
+            m.assertEqual(watchparty.catchup.positionAt(ref, 10000#), 100)
+            m.assertTrue(watchparty.catchup.positionAt(ref, 13500#) = 103.5)
+        end sub
+
+        @it("holds a paused reference")
+        sub _()
+            ref = watchparty.catchup.reference(42, 10000#, false)
+            m.assertEqual(watchparty.catchup.positionAt(ref, 60000#), 42)
+        end sub
+
+        @describe("commands")
+
+        @it("always seeks for a room seek, even without drift")
+        sub _()
+            m.assertEqual(m.decide("seek", 0), "seek")
+            m.assertEqual(m.decide("seek", 0, { memberPlaying: false }), "seek")
+        end sub
+
+        @it("seeks in place beyond one second for a playing member, where Android nudges")
+        sub _()
+            m.assertEqual(m.decide("play", 0.8, { inPlace: true }), "none")
+            m.assertEqual(m.decide("play", 0.8), "none")
+            m.assertEqual(m.decide("play", 1.5, { inPlace: true }), "seek")
+            ' Out of reach in place: only a paced rebuild would converge it.
+            m.assertEqual(m.decide("play", 3.0), "reload")
+            m.assertEqual(m.decide("play", -3.0), "reload")
+            m.assertEqual(m.decide("play", 6.0), "reload")
+            m.assertEqual(m.decide("play", 0.4, { inPlace: true }), "none", "the deadband")
+            m.assertEqual(m.decide("play", 5.01, { inPlace: true }), "reload", "past the hard limit even in place")
+        end sub
+
+        @it("seeks a member at rest only for a large gap or a cheap one")
+        sub _()
+            m.assertEqual(m.decide("play", 1.0, { memberPlaying: false, inPlace: true }), "none")
+            m.assertEqual(m.decide("play", 1.1, { memberPlaying: false, inPlace: true }), "seek")
+            m.assertEqual(m.decide("play", 4.9, { memberPlaying: false }), "none")
+            m.assertEqual(m.decide("play", -5.1, { memberPlaying: false }), "seek")
+        end sub
+
+        @it("applies the rest rule to a pause")
+        sub _()
+            m.assertEqual(m.decide("pause", 0.9, { inPlace: true }), "none")
+            m.assertEqual(m.decide("pause", -1.5, { inPlace: true }), "seek")
+            m.assertEqual(m.decide("pause", 3.0), "none")
+            m.assertEqual(m.decide("pause", 40.0), "seek")
+        end sub
+
+        @it("reloads a large gap through the budget for a member buffering toward play")
+        sub _()
+            buffering = { memberPlaying: false, intendsToPlay: true }
+            m.assertEqual(m.decide("play", 5.1, buffering), "reload")
+            inPlace = { memberPlaying: false, intendsToPlay: true, inPlace: true }
+            m.assertEqual(m.decide("play", -40.0, inPlace), "reload")
+            m.assertEqual(m.decide("play", 2.0, inPlace), "seek")
+            m.assertEqual(m.decide("play", 2.0, buffering), "none")
+            ' Truly stopped: the rest rule seeks a large gap directly.
+            m.assertEqual(m.decide("play", 40.0, { memberPlaying: false, intendsToPlay: false }), "seek")
+        end sub
+
+        @it("uses the two-second band for the host")
+        sub _()
+            m.assertEqual(m.decide("play", 2.5, { host: true }), "reload")
+            m.assertEqual(m.decide("play", -2.5, { inPlace: true, host: true }), "reload")
+            m.assertEqual(m.decide("play", 1.9, { inPlace: true, host: true }), "seek")
+            m.assertEqual(m.decide("play", 2.5, { memberPlaying: false, intendsToPlay: true, host: true }), "reload")
+            m.assertEqual(m.decide("play", 2.5, { memberPlaying: false, host: true }), "seek")
+            m.assertEqual(m.decide("pause", 2.5, { host: true }), "seek")
+            m.assertEqual(m.decide("pause", 2.5), "none")
+        end sub
+
+        @it("leaves a playing member alone for a play that leaves the room waiting")
+        sub _()
+            m.assertEqual(m.decide("play", 2.0, { commandPlays: false }), "none")
+        end sub
+
+        @describe("drift loop")
+
+        @it("seeks in place beyond one second and never otherwise")
+        sub _()
+            m.assertEqual(watchparty.catchup.loopDecision(0.6, true), "none")
+            m.assertEqual(watchparty.catchup.loopDecision(1.0, true), "none")
+            m.assertEqual(watchparty.catchup.loopDecision(-1.2, true), "seek")
+            m.assertEqual(watchparty.catchup.loopDecision(8.0, false), "none")
+        end sub
+
+        @it("aims correction seeks ahead by the measured shortfall and backs off until they converge")
+        sub _()
+            ' A seek that took 1.5 s left the member 1.5 s behind.
+            result = watchparty.catchup.fallbackAfterSeek(0, 1000, 1.5)
+            m.assertEqual(result, { leadSeconds: 1.5, intervalMs: 2000 })
+            ' Still 1.2 s short: the lead grows, no further than the host band.
+            result = watchparty.catchup.fallbackAfterSeek(result.leadSeconds, result.intervalMs, 1.2)
+            m.assertEqual(result, { leadSeconds: 2, intervalMs: 4000 })
+            result = watchparty.catchup.fallbackAfterSeek(result.leadSeconds, 16000, 2.0)
+            m.assertEqual(result, { leadSeconds: 2, intervalMs: 16000 })
+            ' Overshooting shrinks the lead, never below zero; converging resets the interval.
+            result = watchparty.catchup.fallbackAfterSeek(0.5, 8000, -0.8)
+            m.assertEqual(result, { leadSeconds: 0, intervalMs: 1000 })
+        end sub
+
+        @describe("late join")
+
+        @it("seeks once more, aimed ahead by the first seek's time, when it left more than 0.4 s")
+        sub _()
+            m.assertTrue(watchparty.catchup.realignFollowUp(101.5, 100, 1500) = 103)
+            m.assertInvalid(watchparty.catchup.realignFollowUp(100.3, 100, 1500))
+            m.assertTrue(watchparty.catchup.realignFollowUp(110, 100, 9000) = 112, "lead capped at 2 s")
+        end sub
+
+        @describe("reload budget")
+
+        @it("runs one reload at a time with doubling backoff and a capped lead")
+        sub _()
+            budget = watchparty.catchup.reloadBudget()
+            m.assertTrue(watchparty.catchup.reloadAllowed(budget, 0))
+            m.assertEqual(watchparty.catchup.reloadBegin(budget, 100, 0, 5000), 100)
+            m.assertFalse(watchparty.catchup.reloadAllowed(budget, 1000))
+            watchparty.catchup.reloadLoading(budget)
+            m.assertTrue(watchparty.catchup.reloadLanded(budget, 100.5))
+            watchparty.catchup.reloadLand(budget, 4000)
+            m.assertFalse(watchparty.catchup.reloadAllowed(budget, 13999))
+            m.assertTrue(watchparty.catchup.reloadAllowed(budget, 14000))
+            ' The next aims ahead by the last load time, capped at the duration.
+            m.assertTrue(watchparty.catchup.reloadBegin(budget, 200, 14000, 5000) = 204)
+            watchparty.catchup.reloadAbandon(budget, 15000)
+            m.assertFalse(watchparty.catchup.reloadAllowed(budget, 34999))
+            m.assertTrue(watchparty.catchup.reloadAllowed(budget, 35000))
+            m.assertEqual(watchparty.catchup.reloadBegin(budget, 203, 35000, 203), 203)
+        end sub
+
+        @it("admits a replacement at once after an expired reload and keeps growing the backoff")
+        sub _()
+            budget = watchparty.catchup.reloadBudget()
+            watchparty.catchup.reloadBegin(budget, 10, 0)
+            watchparty.catchup.reloadExpire(budget, 30000)
+            m.assertFalse(watchparty.catchup.reloadInFlight(budget))
+            m.assertTrue(watchparty.catchup.reloadAllowed(budget, 30000))
+            ' The attempt count stood: the second attempt backs off 20 s.
+            watchparty.catchup.reloadBegin(budget, 20, 30000)
+            watchparty.catchup.reloadAbandon(budget, 31000)
+            m.assertFalse(watchparty.catchup.reloadAllowed(budget, 50999))
+            m.assertTrue(watchparty.catchup.reloadAllowed(budget, 51000))
+        end sub
+
+        @it("stops blocking after thirty seconds unlanded, and settling resets the backoff")
+        sub _()
+            budget = watchparty.catchup.reloadBudget()
+            watchparty.catchup.reloadBegin(budget, 10, 0)
+            m.assertFalse(watchparty.catchup.reloadLanded(budget, 10), "its seek was never issued")
+            m.assertFalse(watchparty.catchup.reloadStale(budget, 29999))
+            m.assertTrue(watchparty.catchup.reloadStale(budget, 30000))
+            m.assertTrue(watchparty.catchup.reloadAllowed(budget, 30000))
+            watchparty.catchup.reloadAbandon(budget, 30000)
+            watchparty.catchup.reloadSettle(budget)
+            m.assertTrue(watchparty.catchup.reloadAllowed(budget, 30000))
+        end sub
+
+        @it("counts a landing from 0.4 s short to 2 s past the target")
+        sub _()
+            budget = watchparty.catchup.reloadBudget()
+            watchparty.catchup.reloadBegin(budget, 50, 0)
+            watchparty.catchup.reloadLoading(budget)
+            m.assertFalse(watchparty.catchup.reloadLanded(budget, 49.5))
+            m.assertTrue(watchparty.catchup.reloadLanded(budget, 49.6))
+            m.assertTrue(watchparty.catchup.reloadLanded(budget, 52))
+            m.assertFalse(watchparty.catchup.reloadLanded(budget, 52.1))
+        end sub
+
+    end class
+
+end namespace

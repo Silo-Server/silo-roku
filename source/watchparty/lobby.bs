@@ -1,0 +1,470 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/room.bs"
+
+' The Watch Party page's and lobby's rules (docs/watch-party.md section 4),
+' as tvOS's WatchPartyLobbyPolicy, WatchPartyHubView, and WatchPartyEntry
+' decide them at silo-apple 15f4153e. Each gives data and string keys
+' (locale/en_US/strings.json, "watchParty.*"), never text, so screens map
+' them with i18n.text(key, values). values hold only names, titles, and
+' counts the screen fills in; {host} is the host's name, which the screen
+' replaces with "watchParty.theHost" when it is "".
+'
+' ctx, where a rule takes one, is what the session knows beside the room:
+'   features         watchparty.wire.evaluate's features
+'   winner           the vote winner (winner()), or invalid
+'   suggestionCount  rows in the suggestion list
+'   itemTitle        the selected title's name once read, else ""
+'   selectionUnavailable  the profile cannot see the selected title
+'   selectionPending a pick the server has not confirmed yet
+'   playbackEnded    this device's player is parked at the end of the file
+'   connection       the session's connection state
+'   error            the last error's text or key, else ""
+namespace watchparty.lobby
+    const SEAT_PALETTE_SIZE = 6
+    ' 2^32, for the 64-bit hash's halves (paletteIndex).
+    const TWO_32 = 4294967296#
+
+    ' ---- Entry points (section 4.1)
+
+    ' The More item on a title: "Watch Party" when not in a party or while
+    ' managing a host-pick room, else "Suggest to Party".
+    function entryTitleKey(room as Dynamic) as String
+        if not util.isObject(room) then return "watchParty.entry.watchParty"
+        if room.selfCanManageRoom and room.selectionMode = "host_pick" then return "watchParty.entry.watchParty"
+        return "watchParty.entry.suggest"
+    end function
+
+    ' What a title's More item does: "create" (a host-pick room, then select
+    ' it), "select" (stage it, or play it for everyone during playback),
+    ' "suggest", or "lobbyOnly" (a suggestion during playback, which the
+    ' Roku explains rather than dropping; section 10).
+    function entryAction(room as Dynamic) as String
+        if not util.isObject(room) then return "create"
+        if room.selfCanManageRoom and room.selectionMode = "host_pick" then return "select"
+        if room.phase = "lobby" then return "suggest"
+        return "lobbyOnly"
+    end function
+
+    ' The avatar menu's item.
+    function menuTitleKey(room as Dynamic) as String
+        if util.isObject(room) then return "watchParty.menu.return"
+        return "watchParty.menu.open"
+    end function
+
+    ' ---- Votes and suggestions
+
+    ' The vote winner: the most votes above zero, ties to the earliest
+    ' created, then the lowest ID. invalid when nobody voted.
+    function winner(suggestions as Dynamic) as Dynamic
+        best = invalid
+        if type(suggestions) <> "roArray" then return invalid
+        for each row in suggestions
+            if row.voteCount > 0
+                if best = invalid or beats(row, best) then best = row
+            end if
+        end for
+        return best
+    end function
+
+    function beats(row as Object, best as Object) as Boolean
+        if row.voteCount <> best.voteCount then return row.voteCount > best.voteCount
+        a = row.createdAtMs
+        b = best.createdAtMs
+        if a <> invalid and b <> invalid and a <> b then return a < b
+        if a <> invalid and b = invalid then return true
+        if a = invalid and b <> invalid then return false
+        return row.id < best.id
+    end function
+
+    ' A manager, or the member who suggested it (same account and profile).
+    function canRemove(suggestion as Object, room as Dynamic) as Boolean
+        if not util.isObject(room) or room.roomId <> suggestion.roomId or room.phase = "ended" then return false
+        if room.selfCanManageRoom then return true
+        member = watchparty.room.selfMember(room)
+        return member <> invalid and member.userId = suggestion.suggesterUserId and member.profileId = suggestion.suggesterProfileId
+    end function
+
+    ' A manager in the lobby may start a suggestion: any one with
+    ' vote_host_override, else in a vote room only the winner.
+    function canPromote(suggestion as Object, room as Dynamic, ctx as Object) as Boolean
+        if not util.isObject(room) or not room.selfCanManageRoom or room.phase <> "lobby" then return false
+        if room.selectionMode <> "vote" or ctx.features.voteHostOverride then return true
+        return ctx.winner <> invalid and ctx.winner.id = suggestion.id
+    end function
+
+    ' Whether Start can go now: a vote room with a winner, or a staged pick
+    ' on a server with staged_selection.
+    function canStart(room as Dynamic, ctx as Object) as Boolean
+        if not util.isObject(room) or not room.selfCanManageRoom or room.phase <> "lobby" then return false
+        if room.selectionMode = "vote" then return ctx.winner <> invalid
+        return ctx.features.stagedSelection and room.selectedContentId <> ""
+    end function
+
+    ' "{n} VOTE" or "{n} VOTES" on a ballot card.
+    function votesKey(count as Integer) as String
+        if count = 1 then return "watchParty.ballot.votes.one"
+        return "watchParty.ballot.votes.other"
+    end function
+
+    ' The suggestion IDs worth a member-state query: each once, none empty,
+    ' at most maximum and 200 (tvOS memberStateIDs).
+    function memberStateIds(ids as Dynamic, maximum as Integer) as Object
+        out = []
+        if type(ids) <> "roArray" or maximum <= 0 then return out
+        limit = maximum
+        if limit > 200 then limit = 200
+        seen = {}
+        for each id in ids
+            text = util.text(id)
+            if text <> "" and not seen.DoesExist(text)
+                seen[text] = true
+                out.Push(text)
+                if out.Count() = limit then return out
+            end if
+        end for
+        return out
+    end function
+
+    ' Who's Seen It's line for one member: { key, watchlist } with key
+    ' "watchParty.whoSeen.watched", ".inProgress", ".notWatched", or
+    ' ".noHistory"; watchlist adds " · Watchlist".
+    function whoSeen(state as Dynamic, onWatchlist as Boolean) as Object
+        key = "watchParty.whoSeen.noHistory"
+        if state = "watched" then key = "watchParty.whoSeen.watched"
+        if state = "in_progress" then key = "watchParty.whoSeen.inProgress"
+        if state = "unseen" then key = "watchParty.whoSeen.notWatched"
+        return { key: key, watchlist: onWatchlist }
+    end function
+
+    ' ---- Seats (section 4.4)
+
+    ' A seat's state: the host never has to mark ready.
+    function seatState(member as Object, phase as String) as String
+        if not member.connected then return "away"
+        if phase = "lobby"
+            if member.isHost or member.lobbyReady then return "ready"
+            return "notReady"
+        end if
+        if member.isBuffering then return "buffering"
+        if member.isSyncing then return "syncing"
+        if member.isReady then return "watching"
+        return "joining"
+    end function
+
+    ' The seats in order, host first, then this member, then by name: each
+    ' { member, state, check, stateKey, roleKey, initial, palette }. check
+    ' marks ready or watching; stateKey names any other state ("" for
+    ' none); roleKey is "watchParty.seat.host", ".you", or "".
+    function seats(room as Dynamic) as Object
+        out = []
+        if not util.isObject(room) or type(room.members) <> "roArray" then return out
+        ordered = []
+        for each member in room.members
+            ordered.Push(member)
+        end for
+        ' Insertion sort: a lobby holds a few members.
+        for i = 1 to ordered.Count() - 1
+            j = i
+            while j > 0 and seatBefore(ordered[j], ordered[j - 1])
+                swap = ordered[j]
+                ordered[j] = ordered[j - 1]
+                ordered[j - 1] = swap
+                j = j - 1
+            end while
+        end for
+        for each member in ordered
+            state = seatState(member, room.phase)
+            roleKey = ""
+            if member.isHost
+                roleKey = "watchParty.seat.host"
+            else if member.isSelf
+                roleKey = "watchParty.seat.you"
+            end if
+            stateKey = ""
+            if state = "away" then stateKey = "watchParty.seat.reconnecting"
+            if state = "notReady" then stateKey = "watchParty.seat.notReady"
+            if state = "buffering" then stateKey = "watchParty.seat.buffering"
+            if state = "syncing" then stateKey = "watchParty.seat.syncing"
+            if state = "joining" then stateKey = "watchParty.seat.joining"
+            out.Push({ member: member, state: state, check: state = "ready" or state = "watching", stateKey: stateKey, roleKey: roleKey, initial: initial(member.displayName), palette: paletteIndex(member.userId + ":" + member.profileId) })
+        end for
+        return out
+    end function
+
+    function seatBefore(a as Object, b as Object) as Boolean
+        if a.isHost <> b.isHost then return a.isHost
+        if a.isSelf <> b.isSelf then return a.isSelf
+        return LCase(a.displayName) < LCase(b.displayName)
+    end function
+
+    ' The seat's letter: the name's first character, uppercased.
+    function initial(name as String) as String
+        return UCase(Left(name.Trim(), 1))
+    end function
+
+    ' The seat's gradient pair, 0 to 5: tvOS's djb2 hash of
+    ' "{user_id}:{profile_id}" over Swift's wrapping 64-bit Int, its
+    ' absolute value mod 6. The hash is kept as two 32-bit halves in
+    ' Doubles, which hold every value the steps make exactly.
+    function paletteIndex(key as String) as Integer
+        hi = 0#
+        lo = 5381#
+        for i = 1 to Len(key)
+            lo = lo * 33 + Asc(Mid(key, i, 1))
+            carry = Int(lo / TWO_32)
+            lo = lo - carry * TWO_32
+            hi = hi * 33 + carry
+            hi = hi - Int(hi / TWO_32) * TWO_32
+        end for
+        ' (hi * 2^32 + lo) mod 6, with 2^32 mod 6 = 4 and 2^64 mod 6 = 4.
+        unsigned = (modSix(hi) * 4 + modSix(lo)) mod SEAT_PALETTE_SIZE
+        if hi < 2147483648# then return unsigned
+        ' A negative Int: its absolute value is 2^64 minus the unsigned.
+        return (4 - unsigned + SEAT_PALETTE_SIZE) mod SEAT_PALETTE_SIZE
+    end function
+
+    function modSix(value as Double) as Integer
+        return Int(value - Int(value / 6#) * 6#)
+    end function
+
+    ' "HERE NOW"'s summary: { key, values } with ready or watching counts.
+    function presence(room as Dynamic) as Object
+        here = []
+        if util.isObject(room) and type(room.members) = "roArray"
+            for each member in room.members
+                if member.connected then here.Push(member)
+            end for
+        end if
+        if here.Count() = 0 then return { key: "watchParty.presence.nobody", values: {} }
+        if here.Count() = 1 then return { key: "watchParty.presence.onlyYou", values: {} }
+        count = 0
+        if room.phase = "lobby"
+            for each member in here
+                if seatState(member, room.phase) = "ready" then count = count + 1
+            end for
+            return { key: "watchParty.presence.ready", values: { ready: count, total: here.Count() } }
+        end if
+        for each member in here
+            if seatState(member, room.phase) = "watching" then count = count + 1
+        end for
+        return { key: "watchParty.presence.watching", values: { watching: count, total: here.Count() } }
+    end function
+
+    ' The top row's connection dot: { key, values, tone } with tone
+    ' "positive", "caution", "neutral", or "negative".
+    function connectionDot(room as Dynamic, connection as String) as Object
+        if connection = "connected"
+            if util.isObject(room) and not room.hostConnected and room.selfRole <> "host" then return { key: "watchParty.connection.hostAway", values: {}, tone: "caution" }
+            here = watchparty.room.connectedCount(room)
+            if here <= 1 then return { key: "watchParty.connection.open", values: {}, tone: "positive" }
+            return { key: "watchParty.connection.here", values: { count: here }, tone: "positive" }
+        end if
+        if connection = "connecting" then return { key: "watchParty.connection.connecting", values: {}, tone: "neutral" }
+        if connection = "reconnecting" then return { key: "watchParty.connection.reconnecting", values: {}, tone: "caution" }
+        return { key: "watchParty.connection.disconnected", values: {}, tone: "negative" }
+    end function
+
+    ' ---- Hero, banner, buttons, hint (section 4.4)
+
+    ' The hero's eyebrow, title, and caption: { kind, eyebrowKey,
+    ' eyebrowValues, titleKey, title, titleValues, captionKey,
+    ' captionValues }. kind is "vote", "item" (title is the item's name),
+    ' "pending" (selected, not yet read or not visible), or "open".
+    function hero(room as Object, ctx as Object) as Object
+        host = watchparty.room.hostName(room)
+        out = { kind: "open", eyebrowKey: "", eyebrowValues: {}, titleKey: "", title: "", titleValues: {}, captionKey: "", captionValues: {} }
+        if room.selectionMode = "vote" and room.phase = "lobby"
+            out.kind = "vote"
+            out.eyebrowKey = "watchParty.hero.voting.other"
+            if ctx.suggestionCount = 1 then out.eyebrowKey = "watchParty.hero.voting.one"
+            out.eyebrowValues = { count: ctx.suggestionCount }
+            out.titleKey = "watchParty.hero.voteTitle"
+            if room.selfCanManageRoom
+                out.captionKey = "watchParty.hero.voteCaption.manager"
+            else
+                out.captionKey = "watchParty.hero.voteCaption.guest"
+                out.captionValues = { host: host }
+            end if
+            return out
+        end if
+        if room.selectedContentId <> ""
+            out.eyebrowKey = "watchParty.hero.upNext"
+            if room.phase = "playing" then out.eyebrowKey = "watchParty.hero.nowWatching"
+            if room.selfRole = "host"
+                out.captionKey = "watchParty.hero.youChose"
+            else
+                out.captionKey = "watchParty.hero.hostChose"
+                out.captionValues = { host: host }
+            end if
+            if util.text(ctx.itemTitle) <> ""
+                out.kind = "item"
+                out.title = ctx.itemTitle
+            else
+                out.kind = "pending"
+                out.titleKey = "watchParty.hero.loading"
+                if ctx.selectionUnavailable then out.titleKey = "watchParty.hero.hidden"
+            end if
+            return out
+        end if
+        out.eyebrowKey = "watchParty.hero.open"
+        if room.selfCanManageRoom
+            out.titleKey = "watchParty.hero.pick"
+            out.captionKey = "watchParty.hero.pickCaption"
+        else
+            out.titleKey = "watchParty.hero.waiting"
+            out.titleValues = { host: host }
+            out.captionKey = "watchParty.hero.waitingCaption"
+            out.captionValues = { host: host }
+        end if
+        return out
+    end function
+
+    ' The lobby's status banner, first match: { key, values, text, tone }
+    ' or invalid. text carries the last error as it is (its own message or
+    ' the server's), else key names the banner.
+    function banner(room as Object, ctx as Object) as Dynamic
+        host = watchparty.room.hostName(room)
+        if util.text(ctx.error) <> "" then return { key: "", values: {}, text: ctx.error, tone: "warning" }
+        if ctx.selectionUnavailable
+            if room.selfCanManageRoom then return { key: "watchParty.banner.unavailable.manager", values: {}, text: "", tone: "warning" }
+            return { key: "watchParty.banner.unavailable.guest", values: { host: host }, text: "", tone: "warning" }
+        end if
+        if not room.hostConnected and room.selfRole <> "host" then return { key: "watchParty.banner.hostAway", values: { host: host }, text: "", tone: "warning" }
+        if ctx.connection = "reconnecting" then return { key: "watchParty.banner.reconnecting", values: {}, text: "", tone: "neutral" }
+        return invalid
+    end function
+
+    ' The primary button: { action, key, values, enabled, outlined,
+    ' undoKey, startsOnPlay }, action one of "returnToPlayback",
+    ' "returnToLobby", "start", "suggest", "chooseTitle", "ready", or
+    ' "none". startsOnPlay: the remote's Play/Pause presses it.
+    function primary(room as Object, ctx as Object) as Object
+        out = { action: "none", key: "", values: {}, enabled: true, outlined: false, undoKey: "", startsOnPlay: false }
+        manager = room.selfCanManageRoom
+        if room.phase = "playing"
+            ' A finished player has nothing to return to.
+            if ctx.playbackEnded
+                if manager and ctx.features.stopPlayback then return button(out, "returnToLobby", "watchParty.button.returnToLobby")
+                return out
+            end if
+            if ctx.selectionUnavailable and not manager then return out
+            return button(out, "returnToPlayback", "watchParty.button.returnToPlayback")
+        end if
+        if room.phase <> "lobby" then return out
+        ' A guest who cannot see the title has nothing to ready up for.
+        if ctx.selectionUnavailable and not manager then return out
+        connected = ctx.connection = "connected"
+        if manager
+            if room.selectionMode = "vote"
+                if ctx.winner = invalid then return button(out, "suggest", "watchParty.button.suggestTitle")
+                button(out, "start", "watchParty.button.startWinner")
+                out.values = { title: ctx.winner.title }
+                out.enabled = connected
+                out.startsOnPlay = connected
+                return out
+            end if
+            if room.selectedContentId = "" then return button(out, "chooseTitle", "watchParty.button.chooseTitle")
+            if not canStart(room, ctx) then return button(out, "chooseTitle", "watchParty.button.changeTitle")
+            button(out, "start", "watchParty.button.startForEveryone")
+            out.enabled = connected and not ctx.selectionPending
+            out.startsOnPlay = out.enabled
+            return out
+        end if
+        if ctx.features.lobbyReady
+            member = watchparty.room.selfMember(room)
+            if member = invalid then return out
+            if member.lobbyReady
+                button(out, "ready", "watchParty.button.youreReady")
+                out.undoKey = "watchParty.button.tapToUndo"
+                out.outlined = true
+            else
+                button(out, "ready", "watchParty.button.imReady")
+            end if
+            out.enabled = connected
+        end if
+        return out
+    end function
+
+    ' The secondary button beside the primary: { action, key } or invalid.
+    ' action is "chooseTitle" or "suggest".
+    function secondary(room as Object, ctx as Object) as Dynamic
+        first = primary(room, ctx).action
+        if room.phase = "lobby"
+            if room.selfCanManageRoom and room.selectionMode = "host_pick" and room.selectedContentId <> "" and first = "start" then return { action: "chooseTitle", key: "watchParty.button.changeTitle" }
+            if room.selectionMode = "vote" and first = "start" then return { action: "suggest", key: "watchParty.button.suggest" }
+            if room.selectionMode = "vote" and not room.selfCanManageRoom then return { action: "suggest", key: "watchParty.button.suggestTitle" }
+            return invalid
+        end if
+        if room.phase = "playing" and room.selfCanManageRoom and room.selectionMode = "host_pick" then return { action: "chooseTitle", key: "watchParty.button.chooseSomethingElse" }
+        return invalid
+    end function
+
+    ' The hint under the buttons (lobby only): { key, values } or invalid.
+    function hint(room as Object, ctx as Object) as Dynamic
+        if room.phase <> "lobby" then return invalid
+        host = watchparty.room.hostName(room)
+        if room.selfCanManageRoom
+            if room.selectionMode = "vote" and ctx.winner = invalid
+                if ctx.suggestionCount = 0 then return { key: "watchParty.hint.suggestToStart", values: {} }
+                return { key: "watchParty.hint.noVotes", values: {} }
+            end if
+            if room.selectedContentId = "" and room.selectionMode = "host_pick" then return invalid
+            names = waitingNames(room)
+            if names.Count() = 0
+                if watchparty.room.connectedCount(room) > 1 then return { key: "watchParty.hint.everyoneReady", values: {} }
+                return invalid
+            end if
+            if names.Count() = 1 then return { key: "watchParty.hint.notReady.one", values: { first: names[0] } }
+            if names.Count() = 2 then return { key: "watchParty.hint.notReady.two", values: { first: names[0], second: names[1] } }
+            return { key: "watchParty.hint.notReady.more", values: { first: names[0], second: names[1] } }
+        end if
+        if room.selectionMode = "vote"
+            if ctx.winner <> invalid then return { key: "watchParty.hint.hostStartsWinner", values: { host: host, title: ctx.winner.title } }
+            return { key: "watchParty.hint.hostStartsTheWinner", values: { host: host } }
+        end if
+        if room.selectedContentId = "" then return invalid
+        return { key: "watchParty.hint.hostStarts", values: { host: host } }
+    end function
+
+    ' Connected guests who have not marked ready, in the room's order.
+    function waitingNames(room as Object) as Object
+        out = []
+        for each member in room.members
+            if member.connected and not member.isHost and not member.lobbyReady then out.Push(member.displayName)
+        end for
+        return out
+    end function
+
+    ' ---- The page without a party (sections 4.2 and 4.3)
+
+    ' The Rejoin row for a recent party (watchparty.recent's entry):
+    ' { key, values, captionKey }.
+    function rejoin(entry as Object) as Object
+        if util.isTrue(entry.replaced) then return { key: "watchParty.rejoin.continueHere", values: {}, captionKey: "watchParty.rejoin.takeOver" }
+        if util.text(entry.title) <> "" then return { key: "watchParty.rejoin.title", values: { title: entry.title }, captionKey: "" }
+        return { key: "watchParty.rejoin.recent", values: {}, captionKey: "" }
+    end function
+
+    ' The page's banner: the last error (warning), else the support check's
+    ' state (neutral), else invalid. support is watchparty.wire.evaluate's
+    ' state, or "checking".
+    function pageBanner(support as String, errorText as String) as Dynamic
+        if errorText <> "" then return { key: "", text: errorText, tone: "warning" }
+        if support = "checking" or support = "unknown" then return { key: "watchParty.page.checking", text: "", tone: "neutral" }
+        if support = "unsupported" or support = "notAllowed" then return { key: "watchParty.page.unavailable", text: "", tone: "neutral" }
+        return invalid
+    end function
+
+    ' Check Again shows while support is unknown or refused.
+    function showsCheckAgain(support as String) as Boolean
+        return support <> "available" and support <> "checking"
+    end function
+
+    ' ---- Helpers
+
+    function button(out as Object, action as String, key as String) as Object
+        out.action = action
+        out.key = key
+        return out
+    end function
+end namespace

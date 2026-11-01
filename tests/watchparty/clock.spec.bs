@@ -1,0 +1,109 @@
+import "pkg:/source/watchparty/clock.bs"
+
+namespace tests
+
+    ' Ported from Android's WatchPartyWireTest clock cases. Their times are
+    ' small millisecond counts; the estimator only takes differences.
+    @suite("watch party clock")
+    class WatchPartyClockTests extends rooibos.BaseTestSuite
+
+        function sample(estimate as Object, sent as Integer, received as Integer, replied as Integer, arrived as Integer) as Boolean
+            return watchparty.clock.record(estimate, sent * 1#, received * 1#, replied * 1#, arrived * 1#)
+        end function
+
+        @describe("samples")
+
+        @it("keeps the lowest round trip sample")
+        sub _()
+            estimate = watchparty.clock.create()
+            ' Offset 200, round trip 300 (queued).
+            m.assertTrue(m.sample(estimate, 0, 350, 350, 300))
+            ' Offset 200, round trip 40.
+            m.assertTrue(m.sample(estimate, 1000, 1220, 1220, 1040))
+            m.assertTrue(watchparty.clock.offsetMs(estimate) = 200)
+            m.assertTrue(watchparty.clock.rttMs(estimate) = 40)
+        end sub
+
+        @it("uses only the last eight samples")
+        sub _()
+            estimate = watchparty.clock.create()
+            ' Offset 500, round trip 10: the best sample.
+            m.assertTrue(m.sample(estimate, 0, 505, 505, 10))
+            ' Seven at offset 450, round trip 100: within both error bounds.
+            for i = 1 to 7
+                t = i * 1000
+                m.assertTrue(m.sample(estimate, t, t + 500, t + 500, t + 100))
+            end for
+            m.assertTrue(watchparty.clock.offsetMs(estimate) = 500)
+            ' An eighth newer sample pushes the best one out.
+            m.assertTrue(m.sample(estimate, 8000, 8500, 8500, 8100))
+            m.assertTrue(watchparty.clock.offsetMs(estimate) = 450)
+            m.assertTrue(watchparty.clock.rttMs(estimate) = 100)
+        end sub
+
+        @it("rejects impossible or implausible samples")
+        sub _()
+            estimate = watchparty.clock.create()
+            m.assertFalse(m.sample(estimate, 100, 0, 0, 50), "negative round trip")
+            m.assertFalse(m.sample(estimate, 0, 10, 5, 20), "server sent before it received")
+            m.assertFalse(m.sample(estimate, 0, 3000, 3000, 6000), "round trip over 5 s")
+            m.assertInvalid(watchparty.clock.offsetMs(estimate))
+            m.assertInvalid(watchparty.clock.serverMs(estimate, 1000#))
+        end sub
+
+        @it("drops the older samples when a sample cannot agree with the best one")
+        sub _()
+            estimate = watchparty.clock.create()
+            ' Offset 200 round trip 40, then offset 260 round trip 100: 60 ms
+            ' apart is within (40 + 100) / 2 + 50 = 120 ms, so both stay.
+            m.assertTrue(m.sample(estimate, 0, 220, 220, 40))
+            m.assertTrue(m.sample(estimate, 1000, 1310, 1310, 1100))
+            m.assertTrue(watchparty.clock.offsetMs(estimate) = 200)
+            generation = estimate.generation
+            ' Offset 5000 round trip 100: a clock stepped.
+            m.assertTrue(m.sample(estimate, 2000, 7050, 7050, 2100))
+            m.assertTrue(watchparty.clock.offsetMs(estimate) = 5000)
+            m.assertTrue(watchparty.clock.rttMs(estimate) = 100)
+            m.assertEqual(estimate.samples.Count(), 1)
+            m.assertTrue(estimate.generation > generation)
+            ' Later agreeing samples are kept alongside it.
+            m.assertTrue(m.sample(estimate, 3000, 8020, 8020, 3040))
+            m.assertTrue(watchparty.clock.offsetMs(estimate) = 5000)
+            m.assertTrue(watchparty.clock.rttMs(estimate) = 40)
+        end sub
+
+        @it("counts a round trip truncated just below zero as zero and prefers the newer of equals")
+        sub _()
+            estimate = watchparty.clock.create()
+            m.assertTrue(m.sample(estimate, 1000, 1201, 1201, 999))
+            m.assertTrue(watchparty.clock.rttMs(estimate) = 0)
+            m.assertFalse(m.sample(estimate, 2000, 2201, 2201, 1997), "-3 ms is not truncation")
+            m.assertTrue(m.sample(estimate, 3000, 3240, 3240, 3000))
+            m.assertTrue(watchparty.clock.offsetMs(estimate) = 240)
+        end sub
+
+        @it("projects server time from the offset")
+        sub _()
+            estimate = watchparty.clock.create()
+            m.sample(estimate, 0, 220, 220, 40)
+            m.assertTrue(watchparty.clock.serverMs(estimate, 1790272800000#) = 1790272800200#)
+        end sub
+
+        @describe("ping cadence")
+
+        @it("pings every 2 s until four samples, then every 15 s, and warms up again after a step")
+        sub _()
+            estimate = watchparty.clock.create()
+            m.assertEqual(watchparty.clock.pingIntervalMs(estimate, 0), 2000)
+            for i = 0 to 3
+                m.sample(estimate, i * 1000, i * 1000 + 220, i * 1000 + 220, i * 1000 + 40)
+            end for
+            m.assertEqual(watchparty.clock.pingIntervalMs(estimate, 3), 2000, "the connection has three")
+            m.assertEqual(watchparty.clock.pingIntervalMs(estimate, 4), 15000)
+            m.sample(estimate, 9000, 19000, 19000, 9040)
+            m.assertEqual(watchparty.clock.pingIntervalMs(estimate, 5), 2000, "a step left one sample")
+        end sub
+
+    end class
+
+end namespace

@@ -1,0 +1,252 @@
+import "pkg:/source/watchparty/wire.bs"
+import "pkg:/source/tests/helpers/watchparty.bs"
+
+namespace tests
+
+    ' Ported from Android's WatchPartyWireTest, with the server's own
+    ' frame and body shapes (tests/helpers/watchparty.bs).
+    @suite("watch party wire")
+    class WatchPartyWireTests extends rooibos.BaseTestSuite
+
+        function frame(name as String) as Dynamic
+            return watchparty.wire.parseFrame(tests.party.text(name))
+        end function
+
+        @describe("socket frames")
+
+        @it("reads a socket snapshot's numeric IDs as strings")
+        sub _()
+            parsed = m.frame("socket_snapshot")
+            m.assertEqual(parsed.type, "snapshot")
+            room = parsed.room
+            m.assertEqual(room.selectedFileId, "57")
+            m.assertEqual(room.selectedLibraryId, "7")
+            m.assertEqual(room.members[0].userId, "12")
+            m.assertEqual(room.members[1].userId, "31")
+            m.assertFalse(room.hostConnected)
+            m.assertTrue(room.selfIgnoreWait)
+            m.assertTrue(room.members[1].isBuffering)
+            m.assertFalse(room.members[0].isBuffering, "an absent flag is false")
+            m.assertEqual(room.generation, 14)
+            m.assertEqual(room.anchorPositionSeconds, 95.5)
+        end sub
+
+        @it("reads an HTTP room's string IDs the same way")
+        sub _()
+            body = watchparty.wire.roomResponse(tests.party.fixture("room_http"))
+            m.assertEqual(body.room.selectedFileId, "42")
+            m.assertEqual(body.room.members[0].userId, "12")
+            m.assertTrue(body.room.members[1].isSyncing)
+            m.assertEqual(body.room.attachedSessionId, "ps_7d1f0c")
+            m.assertEqual(body.room.invitePath, "/rooms/join?token=Zq8vN3kR5tW1yB6cD9fG2hJ4")
+            m.assertTrue(body.room.anchorUpdatedAtMs = 1790272931482#)
+            m.assertEqual(Left(body.proof, 7), "eyJhbGc")
+        end sub
+
+        @it("reads a transport command and its schedule")
+        sub _()
+            parsed = m.frame("socket_transport_command")
+            command = parsed.command
+            m.assertEqual(command.commandId, "cmd_5b2e")
+            m.assertEqual(command.action, "seek")
+            m.assertEqual(command.playbackState, "waiting")
+            m.assertEqual(command.positionSeconds, 1203.75)
+            m.assertTrue(command.executeAtMs = 1790273462250#)
+            m.assertTrue(command.issuedAtMs = 1790273461750#)
+        end sub
+
+        @it("reads suggestion broadcasts with numeric suggester IDs")
+        sub _()
+            items = m.frame("socket_suggestions_update").items
+            m.assertEqual(items.Count(), 2)
+            m.assertEqual(items[0].suggesterUserId, "31")
+            m.assertEqual(items[1].suggesterUserId, "12")
+            m.assertFalse(items[0].votedByMe)
+            m.assertEqual(items[0].voteCount, 2)
+        end sub
+
+        @it("tells connection_replaced from room_closed")
+        sub _()
+            replaced = m.frame("socket_connection_replaced")
+            m.assertEqual(replaced.type, "replaced")
+            m.assertEqual(replaced.reason, "This profile joined the Watch Party on another device.")
+            closed = m.frame("socket_room_closed")
+            m.assertEqual(closed.type, "closed")
+            m.assertEqual(closed.reason, "host_left")
+            failure = m.frame("socket_error")
+            m.assertEqual(failure.code, "bad_request")
+        end sub
+
+        @it("reads a pong's three stamps")
+        sub _()
+            pong = m.frame("socket_pong")
+            m.assertTrue(pong.clientSentAtMs = 1790272800000#)
+            m.assertTrue(pong.serverReceivedAtMs = 1790272800240#)
+            m.assertTrue(pong.serverSentAtMs = 1790272800241#)
+        end sub
+
+        @it("ignores unknown frames and reports malformed known ones")
+        sub _()
+            m.assertInvalid(watchparty.wire.parseFrame("{""type"":""reaction"",""emoji"":""x""}"))
+            m.assertInvalid(watchparty.wire.parseFrame("not json"))
+            for each bad in ["{""type"":""snapshot"",""room"":""nope""}", "{""type"":""snapshot"",""room"":{""room_id"":""""}}", "{""type"":""transport_command""}", "{""type"":""suggestions_update"",""suggestions"":[{}]}", "{""type"":""pong"",""client_sent_at"":""x""}"]
+                m.assertEqual(watchparty.wire.parseFrame(bad).type, "malformed", bad)
+            end for
+        end sub
+
+        @it("refuses commands without an ID, with an unknown action, or a bad position")
+        sub _()
+            good = tests.party.fixture("socket_transport_command").command
+            m.assertNotInvalid(watchparty.wire.command(good))
+            for each change in [{ command_id: "" }, { action: "rewind" }, { playback_state: "idle" }, { position_seconds: -1 }, { position_seconds: "12" }]
+                raw = {}
+                raw.Append(good)
+                raw.Append(change)
+                m.assertInvalid(watchparty.wire.command(raw), FormatJson(change))
+            end for
+            raw = {}
+            raw.Append(good)
+            raw.execute_at = "soon"
+            m.assertInvalid(watchparty.wire.command(raw).executeAtMs, "runs on arrival")
+        end sub
+
+        @describe("client messages")
+
+        @it("names a command in a state report only when it has one, and is_ready only when ready")
+        sub _()
+            plain = ParseJson(watchparty.wire.stateReport("ps", 1.5, false, "", false))
+            m.assertEqual(plain.Keys(), ["is_paused", "position_seconds", "session_id", "type"])
+            m.assertEqual(plain.type, "state_report")
+            named = ParseJson(watchparty.wire.stateReport("ps", 1.5, false, "c1", false))
+            m.assertEqual(named.command_id, "c1")
+            m.assertFalse(named.DoesExist("is_ready"))
+            acknowledging = ParseJson(watchparty.wire.stateReport("ps", 1.5, true, "c1", true))
+            m.assertTrue(acknowledging.is_ready)
+            m.assertTrue(acknowledging.is_paused)
+        end sub
+
+        @it("builds the other messages as the server's structs read them")
+        sub _()
+            m.assertEqual(ParseJson(watchparty.wire.attach("ps_1")), { type: "attach_session", session_id: "ps_1" })
+            ready = ParseJson(watchparty.wire.ready("ps_1", "c9", 12, true))
+            m.assertEqual(ready, { type: "ready", session_id: "ps_1", command_id: "c9", position_seconds: 12, is_paused: true })
+            m.assertFalse(ParseJson(watchparty.wire.ready("ps_1", "", 12, true)).DoesExist("command_id"))
+            m.assertEqual(ParseJson(watchparty.wire.buffering("ps_1", 3, false)), { type: "buffering", session_id: "ps_1", position_seconds: 3, is_paused: false })
+            m.assertEqual(ParseJson(watchparty.wire.transportRequest("seek", 600, true)), { type: "transport_request", action: "seek", position_seconds: 600, is_paused: true })
+            m.assertFalse(ParseJson(watchparty.wire.transportRequest("play", invalid, false)).DoesExist("position_seconds"))
+            m.assertEqual(ParseJson(watchparty.wire.lobbyReady(true)), { type: "lobby_ready", ready: true })
+            m.assertEqual(ParseJson(watchparty.wire.ping(1790272800240#)), { type: "ping", client_sent_at: "2026-09-24T18:00:00.240Z" })
+        end sub
+
+        @describe("socket admission")
+
+        @it("accepts tickets within the server's bounds that fit a header")
+        sub _()
+            ok = tests.party.fixture("ws_ticket")
+            m.assertEqual(watchparty.wire.ticket(ok), "wpt_Kq3v9Zr0aL5mN2bX7cY4")
+            for each change in [{ expires_in: 31 }, { expires_in: -1 }, { max_connection_seconds: 0 }, { max_connection_seconds: 301 }, { protocol: "silo.events.v2" }, { ticket: "" }, { ticket: "a b" }, { ticket: "a,b" }]
+                body = {}
+                body.Append(ok)
+                body.Append(change)
+                m.assertEqual(watchparty.wire.ticket(body), "", FormatJson(change))
+            end for
+            body = {}
+            body.Append(ok)
+            body.expires_in = 0
+            m.assertNotEqual(watchparty.wire.ticket(body), "")
+        end sub
+
+        @it("opens ws on http and wss on https, keeping a base path")
+        sub _()
+            m.assertEqual(watchparty.wire.socketUrl("https://silo.example", "9f3c"), "wss://silo.example/api/v2/watch-together/rooms/9f3c/ws")
+            m.assertEqual(watchparty.wire.socketUrl("http://10.0.0.5:8080/silo", "9f3c"), "ws://10.0.0.5:8080/silo/api/v2/watch-together/rooms/9f3c/ws")
+            m.assertEqual(watchparty.wire.socketUrl("ftp://x", "9f3c"), "")
+            m.assertEqual(watchparty.wire.protocols("t1"), "silo.room.v2, silo.ticket.t1")
+        end sub
+
+        @describe("suggestion pages")
+
+        @it("reads a page with its cursor")
+        sub _()
+            page = watchparty.wire.suggestionsPage(tests.party.fixture("suggestions_page"))
+            m.assertEqual(page.items.Count(), 1)
+            m.assertTrue(page.items[0].votedByMe)
+            m.assertTrue(page.hasMore)
+            m.assertEqual(page.nextCursor, "c2VlZDoy")
+            m.assertInvalid(watchparty.wire.suggestionsPage({ items: [{}] }))
+        end sub
+
+        @describe("capabilities")
+
+        function input(room = invalid as Dynamic, play = invalid as Dynamic) as Object
+            caps = tests.party.fixture("capabilities")
+            caps.allowed = true
+            if room <> invalid then caps.Append(room)
+            doc = tests.party.fixture("playback_capabilities")
+            if play <> invalid then doc.Append(play)
+            return { webSocket: true, borrowed: false, room: caps, playback: doc }
+        end function
+
+        @it("makes every optional feature available on a fully capable server")
+        sub _()
+            out = watchparty.wire.evaluate(m.input())
+            m.assertEqual(out.state, "available")
+            m.assertEqual(out.missing, [])
+            features = out.features
+            m.assertTrue(features.stagedSelection and features.stopPlayback and features.selectionModeSwitch)
+            m.assertTrue(features.lobbyReady and features.picker and features.memberState and features.voteHostOverride)
+            m.assertTrue(features.sourceFallback)
+            m.assertEqual(features.maxMemberStateIds, 200)
+        end sub
+
+        @it("needs roWebSocket, the v2 socket, replacement, the coordinator, and fixed files")
+        sub _()
+            m.assertEqual(watchparty.wire.evaluate({ webSocket: false, borrowed: false, room: invalid, playback: invalid }).missing, ["websocket"])
+            m.assertEqual(watchparty.wire.evaluate(m.input({ socket_protocol: "" })).missing, ["room_socket"])
+            m.assertEqual(watchparty.wire.evaluate(m.input({ connection_replaced: false })).missing, ["connection_replaced"])
+            m.assertEqual(watchparty.wire.evaluate(m.input({ state: "not_configured" })).missing, ["rooms"])
+            m.assertEqual(watchparty.wire.evaluate(m.input(invalid, { features: ["fixed_media_file_v1"] })).missing, ["watch_party_coordinator_v1"])
+            m.assertEqual(watchparty.wire.evaluate(m.input(invalid, { features: ["watch_party_coordinator_v1"] })).missing, ["fixed_media_file_v1"])
+            m.assertEqual(watchparty.wire.evaluate(m.input({ socket_protocol: "" })).state, "unsupported")
+        end sub
+
+        @it("is not allowed for a refused account or a handoff's borrowed session")
+        sub _()
+            m.assertEqual(watchparty.wire.evaluate(m.input({ allowed: false })).state, "notAllowed")
+            m.assertEqual(watchparty.wire.evaluate(m.input(invalid, { allowed: false })).state, "notAllowed")
+            borrowed = m.input()
+            borrowed.borrowed = true
+            m.assertEqual(watchparty.wire.evaluate(borrowed).state, "notAllowed")
+        end sub
+
+        @it("is unknown until both documents are read")
+        sub _()
+            m.assertEqual(watchparty.wire.evaluate({ webSocket: true, borrowed: false, room: invalid, playback: tests.party.fixture("playback_capabilities") }).state, "unknown")
+        end sub
+
+        @it("gates optional flags independently")
+        sub _()
+            out = watchparty.wire.evaluate(m.input({ stop_playback: false, vote_host_override: false, member_state: false, max_member_state_ids: 0 }, { features: ["fixed_media_file_v1", "watch_party_coordinator_v1"] }))
+            m.assertEqual(out.state, "available")
+            m.assertFalse(out.features.stopPlayback)
+            m.assertFalse(out.features.voteHostOverride)
+            m.assertFalse(out.features.memberState)
+            m.assertEqual(out.features.maxMemberStateIds, 0)
+            m.assertFalse(out.features.sourceFallback)
+            m.assertTrue(out.features.stagedSelection)
+        end sub
+
+        @describe("IDs")
+
+        @it("normalizes numbers and strings to strings")
+        sub _()
+            m.assertEqual(watchparty.wire.idText(57), "57")
+            m.assertEqual(watchparty.wire.idText("57"), "57")
+            m.assertEqual(watchparty.wire.idText(57.0), "57")
+            m.assertEqual(watchparty.wire.idText(invalid), "")
+            m.assertEqual(watchparty.wire.idText(true), "")
+        end sub
+
+    end class
+
+end namespace

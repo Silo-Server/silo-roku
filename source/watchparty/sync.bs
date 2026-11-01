@@ -1,0 +1,595 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/catchup.bs"
+import "pkg:/source/watchparty/room.bs"
+import "pkg:/source/watchparty/wire.bs"
+
+' One member's playback in step with the room (docs/watch-party.md
+' sections 7.2 to 7.5 and 8.2): Android's RoomPlaybackBinding on a mount
+' that cannot change rate, as pure rules the room Task runs. It attaches
+' the playback session, schedules each accepted command on the server
+' clock and applies it only when it executes, acknowledges readiness at a
+' barrier or while catching up, reports a stall once, reports what the
+' player actually does, and keeps a playing member on the room with
+' in-place seeks and budgeted reloads (watchparty.catchup).
+'
+' The render thread only executes what this decides. Its samples are
+'   { sessionId, revision, position, duration, playing, wantsPlay,
+'     playable, stalled, seeking, atEnd, planInPlace, commandSeq,
+'     receivedAt }
+' (components/tasks/RoomTask.bs lists their meaning; receivedAt is the
+' Task's monotonic time when the sample arrived). Each decision for the
+' player is { kind: "player", command: { seq, commandId, seek, reload,
+' playing } }: seek a source position or invalid, reload true for a
+' budgeted correction, playing the play state to leave it in, or invalid
+' to leave it. Messages for the socket are { kind: "send", text }.
+'
+' ctx, given to each call, is { now, serverNow, room, sample, writable }:
+' the Task's monotonic milliseconds, the server's epoch milliseconds (or
+' invalid without a clock), the held snapshot, the last sample (or
+' invalid), and whether the socket is open.
+namespace watchparty.sync
+    const REPORT_INTERVAL_MS = 1500
+    const READY_RETRY_MS = 500
+    const ATTACH_RETRY_MS = 1500
+    ' A stall shorter than this stays local.
+    const STALL_GRACE_MS = 2000
+    ' No ordinary report within this of a pending command's execution, and
+    ' none until at least this after one executed.
+    const COMMAND_QUIET_MS = 250
+    ' Reports held after a command resume after this even when the player
+    ' never shows its play state.
+    const REPORT_HOLD_MAX_MS = 3000
+    ' A command is never scheduled further ahead than this.
+    const MAX_LEAD_MS = 5000
+    ' A command that executes while a seek or load is in flight waits for
+    ' it up to this long.
+    const MOUNT_DEFER_MS = 5000
+    ' Without a clock the member waits paused; after this the viewer is
+    ' told (section 7.1).
+    const CLOCK_WAIT_MS = 3000
+    ' How near a waiting seek's target a member acknowledges it. The
+    ' server applies 1 s to a room seek and 5 s to a stalled guest's own
+    ' (section 7.4); the client cannot tell them apart and lets the server
+    ' decide.
+    const GUEST_SEEK_TOLERANCE_SECONDS = 5
+    const HOST_SEEK_TOLERANCE_SECONDS = 15
+    ' This member's seek request holds the scrubber until the room's seek to
+    ' it runs, at most PENDING_SEEK_TIMEOUT_MS; a room seek within
+    ' PENDING_SEEK_MATCH_SECONDS answers it.
+    const PENDING_SEEK_TIMEOUT_MS = 5000
+    const PENDING_SEEK_MATCH_SECONDS = 1
+    ' A playing sample is projected forward at most this far.
+    const MAX_PROJECTION_MS = 1000
+    ' A late joiner's realigning seek that never shows as landed is given
+    ' up on after this, and the member plays.
+    const REALIGN_TIMEOUT_MS = 5000
+    ' Command IDs remembered per epoch, so a repeat is dropped.
+    const SEEN_LIMIT = 64
+    ' How often the Task runs advance while the room plays.
+    const TICK_MS = 250
+
+    function create() as Object
+        out = { seq: 0, revision: invalid }
+        reset(out)
+        out.reloads = watchparty.catchup.reloadBudget()
+        return out
+    end function
+
+    ' Forgets the playback epoch: a new selection revision or phase, or
+    ' the room's end.
+    sub reset(state as Object)
+        state.seen = []
+        state.newestIssuedMs = invalid
+        state.attachSent = ""
+        state.lastAttachAt = invalid
+        state.pending = invalid
+        state.applied = invalid
+        state.appliedAt = invalid
+        state.ref = invalid
+        state.readiness = invalid
+        state.lastCatchUpAckAt = invalid
+        state.stallStartedAt = invalid
+        state.stallReported = false
+        state.hold = invalid
+        state.reportedCommandId = ""
+        state.lastReportAt = invalid
+        state.reloadDeferred = false
+        state.lead = 0
+        state.intervalMs = watchparty.catchup.LOOP_SETTLE_MS
+        state.toMeasure = false
+        state.lastLoopAt = invalid
+        state.lastLoopSeekAt = invalid
+        state.lastBusyAt = invalid
+        state.realign = invalid
+        state.pendingSeek = invalid
+        state.clockWaitSince = invalid
+    end sub
+
+    ' The socket closed: a pending command dies with it, and the next
+    ' socket attaches again; the server answers that with a sync command
+    ' (section 6.4), which may repeat a command ID this one saw.
+    sub socketClosed(state as Object)
+        state.seen = []
+        state.newestIssuedMs = invalid
+        state.pending = invalid
+        state.attachSent = ""
+        state.lastAttachAt = invalid
+        state.readiness = invalid
+        state.pendingSeek = invalid
+        state.clockWaitSince = invalid
+    end sub
+
+    ' A command from the socket. Gives the decisions to run now: a pause
+    ' while there is no clock, so the member waits paused. A command for
+    ' another revision or session, a repeat, or one issued before the newest
+    ' accepted is dropped.
+    function accept(state as Object, command as Object, ctx as Object) as Object
+        room = ctx.room
+        if not util.isObject(room) or room.phase <> "playing" or command.selectionRevision <> room.selectionRevision then return []
+        if command.sessionId <> "" and command.sessionId <> sessionOf(ctx) then return []
+        for each id in state.seen
+            if id = command.commandId then return []
+        end for
+        if command.issuedAtMs <> invalid and state.newestIssuedMs <> invalid and command.issuedAtMs < state.newestIssuedMs then return []
+        if command.issuedAtMs <> invalid then state.newestIssuedMs = command.issuedAtMs
+        state.seen.Push(command.commandId)
+        while state.seen.Count() > SEEN_LIMIT
+            state.seen.Shift()
+        end while
+        ' Play state and position change only when the command executes. A
+        ' held or running reload is superseded by the newer room position.
+        state.reloadDeferred = false
+        if watchparty.catchup.reloadInFlight(state.reloads) then watchparty.catchup.reloadAbandon(state.reloads, ctx.now)
+        state.realign = invalid
+        if state.pendingSeek <> invalid and seeksTo(command, state.pendingSeek.target) then state.pendingSeek.arrived = true
+        state.pending = { command: command, dueAt: invalid, deferredSince: invalid }
+        state.readiness = invalid
+        state.stallStartedAt = invalid
+        if ctx.serverNow = invalid
+            if state.clockWaitSince = invalid then state.clockWaitSince = ctx.now
+            return [player(state, command.commandId, invalid, false, false)]
+        end if
+        return []
+    end function
+
+    ' Everything due now, in Android's order: attach, execute, readiness,
+    ' catching up, stalls, reload pacing, the drift loop, and reports.
+    function advance(state as Object, ctx as Object) as Object
+        out = []
+        room = ctx.room
+        now = ctx.now
+        if not util.isObject(room) or room.phase <> "playing"
+            if state.revision <> invalid
+                state.revision = invalid
+                reset(state)
+            end if
+            return out
+        end if
+        if room.selectionRevision <> state.revision
+            state.revision = room.selectionRevision
+            reset(state)
+            ' A new title is a new stream: the old one's backoff says
+            ' nothing about it.
+            state.reloads = watchparty.catchup.reloadBudget()
+        end if
+        if state.pendingSeek <> invalid and now - state.pendingSeek.at >= PENDING_SEEK_TIMEOUT_MS then state.pendingSeek = invalid
+        sessionId = sessionOf(ctx)
+        sample = ctx.sample
+        if sessionId = "" or not ctx.writable
+            if not ctx.writable then state.pendingSeek = invalid
+            return out
+        end if
+        if not attached(state, ctx) and (state.attachSent <> sessionId or since(state.lastAttachAt, now) >= ATTACH_RETRY_MS)
+            state.attachSent = sessionId
+            state.lastAttachAt = now
+            out.Push(send(watchparty.wire.attach(sessionId)))
+        end if
+        if not attached(state, ctx) then return out
+
+        if state.pending <> invalid then out.Append(executeIfDue(state, ctx))
+        playable = not sample.seeking and (sample.playable or sample.atEnd)
+        executedLatest = state.pending = invalid
+        stalled = sample.stalled and not sample.seeking
+        paused = sample.atEnd or not sample.wantsPlay
+        member = watchparty.room.selfMember(room)
+        selfReady = member <> invalid and member.isReady
+
+        ' Readiness for the waiting command.
+        waiting = state.readiness
+        if waiting <> invalid
+            if room.playbackState <> "waiting" or (room.generation > waiting.armedGeneration and selfReady)
+                state.readiness = invalid
+            else if executedLatest and playable and positionOk(waiting, ctx) and since(waiting.lastSentAt, now) >= READY_RETRY_MS
+                waiting.lastSentAt = now
+                out.Push(send(watchparty.wire.ready(sessionId, waiting.commandId, sample.position, paused)))
+                out.Push(send(watchparty.wire.stateReport(sessionId, sample.position, paused, waiting.commandId, true)))
+                state.lastReportAt = now
+            end if
+        end if
+
+        ' Catching up after the room stopped waiting for this member.
+        catchingUp = watchparty.room.isCatchingUp(room)
+        if catchingUp and state.readiness = invalid and not selfReady and executedLatest and playable and since(state.lastCatchUpAckAt, now) >= READY_RETRY_MS
+            state.lastCatchUpAckAt = now
+            out.Push(send(watchparty.wire.ready(sessionId, appliedId(state), sample.position, paused)))
+        end if
+
+        ' A stall under the grace stays local; a longer one is reported
+        ' once, and only while the room plays.
+        if sample.seeking then state.stallStartedAt = invalid
+        if stalled and room.playbackState = "playing"
+            if state.stallStartedAt = invalid then state.stallStartedAt = now
+            if not state.stallReported and now - state.stallStartedAt >= STALL_GRACE_MS
+                state.stallReported = true
+                out.Push(send(watchparty.wire.buffering(sessionId, sample.position, false)))
+            end if
+        else if not stalled and not sample.seeking
+            state.stallStartedAt = invalid
+            state.stallReported = false
+        end if
+
+        if sample.seeking then state.lastBusyAt = now
+        budget = state.reloads
+        if watchparty.catchup.reloadInFlight(budget) and sample.playing and watchparty.catchup.reloadLanded(budget, sample.position) then watchparty.catchup.reloadLand(budget, now)
+        ' A reload that never lands must not hold corrections off for good.
+        if watchparty.catchup.reloadStale(budget, now) then watchparty.catchup.reloadExpire(budget, now)
+        out.Append(realignStep(state, ctx))
+        out.Append(retryDeferredReload(state, ctx))
+        out.Append(driftLoop(state, ctx, stalled))
+
+        ' Ordinary reports: only positions that are decisions, never while
+        ' stalled, seeking, loading, or about to execute a command.
+        quiet = false
+        if state.pending <> invalid and state.pending.dueAt <> invalid then quiet = Abs(state.pending.dueAt - now) <= COMMAND_QUIET_MS
+        if not stalled and playable and not quiet and not holdingReports(state, now, sample, paused) and since(state.lastReportAt, now) >= REPORT_INTERVAL_MS
+            state.lastReportAt = now
+            out.Push(send(watchparty.wire.stateReport(sessionId, sample.position, paused, state.reportedCommandId, false)))
+        end if
+        return out
+    end function
+
+    ' The pending command, executed when its time has come (section 7.2):
+    ' at execute_at in local time, at once when that has passed, and a late
+    ' Play projected forward.
+    function executeIfDue(state as Object, ctx as Object) as Object
+        pending = state.pending
+        now = ctx.now
+        if ctx.serverNow = invalid
+            if state.clockWaitSince = invalid then state.clockWaitSince = now
+            return []
+        end if
+        state.clockWaitSince = invalid
+        if pending.dueAt = invalid
+            ahead = 0
+            if pending.command.executeAtMs <> invalid then ahead = pending.command.executeAtMs - ctx.serverNow
+            if ahead < 0 then ahead = 0
+            if ahead > MAX_LEAD_MS then ahead = MAX_LEAD_MS
+            pending.dueAt = now + Int(ahead)
+        end if
+        if now < pending.dueAt then return []
+        sample = ctx.sample
+        room = ctx.room
+        ' A command that lands while media is mounting or seeking would act
+        ' on media being replaced: hold it until that settles. A late Play
+        ' still advances by the full elapsed server time.
+        if sample.seeking
+            if pending.deferredSince = invalid then pending.deferredSince = now
+            if now - pending.deferredSince < MOUNT_DEFER_MS then return []
+        end if
+        command = pending.command
+        state.pending = invalid
+        if command.selectionRevision <> room.selectionRevision or sample.revision <> room.selectionRevision then return []
+        if command.sessionId <> "" and command.sessionId <> sample.sessionId then return []
+        action = command.action
+        commandPlays = (action = "play" and command.playbackState <> "waiting") or (action = "seek" and command.playbackState = "playing")
+        executeAt = command.executeAtMs
+        if executeAt = invalid then executeAt = ctx.serverNow
+        ref = watchparty.catchup.reference(command.positionSeconds, executeAt, action <> "pause" and command.playbackState = "playing")
+        target = watchparty.catchup.positionAt(ref, ctx.serverNow)
+        memberPlaying = sample.playing and not sample.seeking
+        drift = target - localPosition(sample, now)
+        host = watchparty.room.isHost(room)
+        decision = watchparty.catchup.decideCommand(action, drift, memberPlaying, commandPlays, sample.planInPlace, sample.wantsPlay, host)
+        seek = invalid
+        reload = false
+        playing = commandPlays
+        if decision = "seek"
+            if memberPlaying and commandPlays and ref.playing and action <> "seek"
+                ' An in-place correction lands late by the seek's time while
+                ' the room plays on: aim ahead by the last shortfall.
+                seek = fallbackTarget(state, target, now)
+            else
+                seek = target
+                if action <> "seek" and commandPlays and not memberPlaying
+                    ' A member at rest joining a playing room: stay paused
+                    ' until the seek lands, then seek once more if the room
+                    ' moved meanwhile (realignStep).
+                    playing = false
+                    state.realign = { seq: state.seq + 1, at: now, ref: ref }
+                end if
+            end if
+        else if decision = "reload"
+            if watchparty.catchup.reloadAllowed(state.reloads, now)
+                seek = watchparty.catchup.reloadBegin(state.reloads, target, now, sample.duration)
+                watchparty.catchup.reloadLoading(state.reloads)
+                reload = true
+            else
+                ' Held until the budget allows (retryDeferredReload).
+                state.reloadDeferred = true
+            end if
+        else if memberPlaying and Abs(drift) <= watchparty.catchup.DEADBAND_SECONDS
+            watchparty.catchup.reloadSettle(state.reloads)
+        end if
+        out = [player(state, command.commandId, seek, reload, playing)]
+        state.applied = command
+        state.appliedAt = now
+        state.lastBusyAt = now
+        state.ref = ref
+        state.stallStartedAt = invalid
+        if state.pendingSeek <> invalid and (state.pendingSeek.arrived or seeksTo(command, state.pendingSeek.target)) then state.pendingSeek = invalid
+        state.hold = { commandId: command.commandId, playing: commandPlays, since: now, released: false }
+        if command.playbackState = "waiting"
+            seekTarget = invalid
+            if action = "seek" then seekTarget = target
+            state.readiness = { commandId: command.commandId, seekTarget: seekTarget, armedGeneration: room.generation, lastSentAt: invalid }
+        end if
+        return out
+    end function
+
+    ' A late joiner's first seek landed: seek again aimed ahead by its
+    ' duration when the room moved more than the deadband meanwhile, then
+    ' play (tvOS realignFollowUp).
+    function realignStep(state as Object, ctx as Object) as Object
+        realign = state.realign
+        if realign = invalid then return []
+        sample = ctx.sample
+        now = ctx.now
+        landed = sample.commandSeq >= realign.seq and not sample.seeking
+        if not landed and now - realign.at < REALIGN_TIMEOUT_MS then return []
+        state.realign = invalid
+        follow = invalid
+        if landed and ctx.serverNow <> invalid and sample.planInPlace
+            follow = watchparty.catchup.realignFollowUp(watchparty.catchup.positionAt(realign.ref, ctx.serverNow), sample.position, now - realign.at)
+        end if
+        state.lastBusyAt = now
+        return [player(state, appliedId(state), follow, false, true)]
+    end function
+
+    ' A held Play correction runs once the budget allows, aimed at where the
+    ' room is now, unless the member came within reach first or a newer
+    ' command replaced it.
+    function retryDeferredReload(state as Object, ctx as Object) as Object
+        if not state.reloadDeferred then return []
+        sample = ctx.sample
+        now = ctx.now
+        if sample.seeking or not (sample.playing or sample.wantsPlay) or ctx.serverNow = invalid then return []
+        ref = state.ref
+        if ref = invalid or not ref.playing
+            state.reloadDeferred = false
+            return []
+        end if
+        expected = watchparty.catchup.positionAt(ref, ctx.serverNow)
+        drift = expected - localPosition(sample, now)
+        decision = watchparty.catchup.decideCommand("play", drift, sample.playing, true, sample.planInPlace, true, watchparty.room.isHost(ctx.room))
+        if decision = "none"
+            state.reloadDeferred = false
+            if Abs(drift) <= watchparty.catchup.DEADBAND_SECONDS then watchparty.catchup.reloadSettle(state.reloads)
+            return []
+        end if
+        if decision = "seek"
+            state.reloadDeferred = false
+            state.lastBusyAt = now
+            return [player(state, appliedId(state), expected, false, invalid)]
+        end if
+        if not watchparty.catchup.reloadAllowed(state.reloads, now) then return []
+        state.reloadDeferred = false
+        aimed = watchparty.catchup.reloadBegin(state.reloads, expected, now, sample.duration)
+        watchparty.catchup.reloadLoading(state.reloads)
+        state.lastBusyAt = now
+        return [player(state, appliedId(state), aimed, true, invalid)]
+    end function
+
+    ' Between commands, keeps a playing member on the reference with
+    ' in-place seeks every LOOP_INTERVAL_MS once the last command or seek
+    ' settled (Android driftLoop with rateCapable false).
+    function driftLoop(state as Object, ctx as Object, stalled as Boolean) as Object
+        if state.pending <> invalid then return []
+        sample = ctx.sample
+        now = ctx.now
+        ref = state.ref
+        reloading = watchparty.catchup.reloadInFlight(state.reloads) and not watchparty.catchup.reloadStale(state.reloads, now)
+        holds = ctx.room.playbackState = "playing" and sample.playing and sample.playable and not sample.seeking and not stalled and not reloading and not state.reloadDeferred and state.realign = invalid
+        if ref = invalid or not ref.playing or ctx.serverNow = invalid or not holds then return []
+        settledAt = latest(latest(state.appliedAt, state.lastBusyAt), state.lastLoopSeekAt)
+        if since(settledAt, now) < watchparty.catchup.LOOP_SETTLE_MS then return []
+        if since(state.lastLoopAt, now) < watchparty.catchup.LOOP_INTERVAL_MS then return []
+        state.lastLoopAt = now
+        target = watchparty.catchup.positionAt(ref, ctx.serverNow)
+        drift = target - localPosition(sample, now)
+        if Abs(drift) <= watchparty.catchup.DEADBAND_SECONDS then watchparty.catchup.reloadSettle(state.reloads)
+        if state.toMeasure
+            ' The last correction seek landed and settled; at 1x its
+            ' shortfall stays put, so measure it now.
+            state.toMeasure = false
+            measured = watchparty.catchup.fallbackAfterSeek(state.lead, state.intervalMs, drift)
+            state.lead = measured.leadSeconds
+            state.intervalMs = measured.intervalMs
+        end if
+        if watchparty.catchup.loopDecision(drift, sample.planInPlace) <> "seek" then return []
+        if since(latest(state.lastBusyAt, state.lastLoopSeekAt), now) < state.intervalMs then return []
+        return [player(state, appliedId(state), fallbackTarget(state, target, now), false, invalid)]
+    end function
+
+    ' A correction seek to roomSeconds, aimed ahead by the measured lead. On
+    ' a Roku "in place" covers the whole plan, so the led target is as
+    ' reachable as the plain one.
+    function fallbackTarget(state as Object, roomSeconds as Dynamic, now as Integer) as Dynamic
+        state.lastLoopSeekAt = now
+        state.toMeasure = true
+        return roomSeconds + state.lead
+    end function
+
+    ' Whether ordinary reports wait after a command: until the player
+    ' shows the command's play state with nothing in flight, at least
+    ' COMMAND_QUIET_MS, so a stale sample never speaks for the new command.
+    ' From then on reports name it. A player slower than REPORT_HOLD_MAX_MS
+    ' reports again, naming only the last command it was seen to follow.
+    function holdingReports(state as Object, now as Integer, sample as Object, paused as Boolean) as Boolean
+        hold = state.hold
+        if hold = invalid then return false
+        if now - hold.since >= COMMAND_QUIET_MS and not sample.seeking and hold.playing = not paused
+            state.reportedCommandId = hold.commandId
+            state.hold = invalid
+            return false
+        end if
+        if now - hold.since >= REPORT_HOLD_MAX_MS then hold.released = true
+        return not hold.released
+    end function
+
+    ' ---- This member's transport requests
+
+    ' A play, pause, or seek the viewer asked for (section 4.10). Gives
+    ' { result, actions }: result "sent", "denied" (not this member's to
+    ' do), "reconnecting", "ignored" (nothing real to send yet), or
+    ' "notInRoom". The player never acts on it itself; the room's command
+    ' does.
+    function request(state as Object, ctx as Object, action as String, positionSeconds as Dynamic, isPaused as Boolean) as Object
+        out = { result: "notInRoom", actions: [] }
+        room = ctx.room
+        if not util.isObject(room) or room.phase <> "playing" then return out
+        if action = "seek"
+            allowed = watchparty.room.canSeek(room)
+        else
+            allowed = watchparty.room.canPlayPause(room)
+        end if
+        if not allowed
+            out.result = "denied"
+            return out
+        end if
+        if not ctx.writable or not attached(state, ctx)
+            out.result = "reconnecting"
+            return out
+        end if
+        sample = ctx.sample
+        out.result = "ignored"
+        position = positionSeconds
+        if action = "seek"
+            if not util.isNumber(position) or position < 0 then return out
+            state.pendingSeek = { target: position, at: ctx.now, arrived: false }
+        else
+            ' Play and pause carry the local position, which the room
+            ' adopts: before the media is playable it is not real. A play
+            ' from the end would anchor the room there.
+            if not sample.playable or (action = "play" and sample.atEnd) then return out
+            position = localPosition(sample, ctx.now)
+        end if
+        out.result = "sent"
+        out.actions.Push(send(watchparty.wire.transportRequest(action, position, isPaused)))
+        return out
+    end function
+
+    ' ---- Views
+
+    ' What the player and its pill read: { attached, catchingUp, syncing,
+    ' waitingForClock, pendingSeek, canPlayPause, canSeek }.
+    function view(state as Object, ctx as Object) as Object
+        room = ctx.room
+        member = watchparty.room.selfMember(room)
+        catchingUp = watchparty.room.isCatchingUp(room)
+        syncing = catchingUp or state.realign <> invalid or watchparty.catchup.reloadInFlight(state.reloads)
+        if util.isObject(room) and room.phase = "playing" and room.playbackState = "waiting" then syncing = true
+        if member <> invalid and member.isSyncing then syncing = true
+        pendingSeek = invalid
+        if state.pendingSeek <> invalid then pendingSeek = state.pendingSeek.target
+        return {
+            attached: attached(state, ctx),
+            catchingUp: catchingUp,
+            syncing: syncing,
+            waitingForClock: state.clockWaitSince <> invalid and ctx.now - state.clockWaitSince >= CLOCK_WAIT_MS,
+            pendingSeek: pendingSeek,
+            canPlayPause: watchparty.room.canPlayPause(room),
+            canSeek: watchparty.room.canSeek(room)
+        }
+    end function
+
+    ' Milliseconds until advance has something to do, or invalid while the
+    ' room is not playing.
+    function nextWakeMs(state as Object, ctx as Object) as Dynamic
+        room = ctx.room
+        if not util.isObject(room) or room.phase <> "playing" then return invalid
+        if state.pending <> invalid and state.pending.dueAt <> invalid
+            due = state.pending.dueAt - ctx.now
+            if due < 0 then due = 0
+            if due < TICK_MS then return due
+        end if
+        return TICK_MS
+    end function
+
+    ' ---- Helpers
+
+    ' The playback session the sample is for, when it belongs to the room's
+    ' current revision, else "".
+    function sessionOf(ctx as Object) as String
+        sample = ctx.sample
+        room = ctx.room
+        if not util.isObject(sample) or not util.isObject(room) then return ""
+        if sample.revision <> room.selectionRevision then return ""
+        return util.text(sample.sessionId)
+    end function
+
+    ' The server confirmed this socket's attach: a snapshot names the
+    ' session this socket sent.
+    function attached(state as Object, ctx as Object) as Boolean
+        sessionId = sessionOf(ctx)
+        return sessionId <> "" and state.attachSent = sessionId and ctx.room.attachedSessionId = sessionId
+    end function
+
+    ' The waiting seek's target, if any, is close enough to acknowledge.
+    function positionOk(waiting as Object, ctx as Object) as Boolean
+        if waiting.seekTarget = invalid or ctx.sample.atEnd then return true
+        tolerance = GUEST_SEEK_TOLERANCE_SECONDS
+        if watchparty.room.isHost(ctx.room) then tolerance = HOST_SEEK_TOLERANCE_SECONDS
+        return Abs(ctx.sample.position - waiting.seekTarget) <= tolerance
+    end function
+
+    ' The position now: a playing sample projected forward by the time
+    ' since it arrived, at most MAX_PROJECTION_MS.
+    function localPosition(sample as Object, now as Integer) as Dynamic
+        if not sample.playing or sample.seeking or sample.receivedAt = invalid then return sample.position
+        elapsed = now - sample.receivedAt
+        if elapsed < 0 then elapsed = 0
+        if elapsed > MAX_PROJECTION_MS then elapsed = MAX_PROJECTION_MS
+        return sample.position + elapsed / 1000#
+    end function
+
+    function seeksTo(command as Object, target as Dynamic) as Boolean
+        return command.action = "seek" and Abs(command.positionSeconds - target) <= PENDING_SEEK_MATCH_SECONDS
+    end function
+
+    function appliedId(state as Object) as String
+        if state.applied = invalid then return ""
+        return state.applied.commandId
+    end function
+
+    function player(state as Object, commandId as String, seek as Dynamic, reload as Boolean, playing as Dynamic) as Object
+        state.seq = state.seq + 1
+        return { kind: "player", command: { seq: state.seq, commandId: commandId, seek: seek, reload: reload, playing: playing } }
+    end function
+
+    function send(text as String) as Object
+        return { kind: "send", text: text }
+    end function
+
+    ' Milliseconds since at, or a long time for never.
+    function since(at as Dynamic, now as Integer) as Integer
+        if at = invalid then return 1000000000
+        return now - at
+    end function
+
+    ' The later of two times, either possibly never.
+    function latest(a as Dynamic, b as Dynamic) as Dynamic
+        if a = invalid then return b
+        if b = invalid or a > b then return a
+        return b
+    end function
+end namespace
