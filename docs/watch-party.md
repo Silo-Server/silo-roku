@@ -628,8 +628,9 @@ of settle from the last command or seek. Constants from
 "reachable in place" is a property of the plan: a `Video.seek` on a direct
 or transcode plan, which the server serves where it is asked. On a copy
 remux, where a seek outside the remuxed window becomes a `seek_reanchor`
-that replays up to a keyframe interval (hardware run 9: 0.7–4.1 s), a
-correction counts as a reload. W0-2 confirmed the direct-play case (the
+(the lead-in reanchor of spec section 5.7, which lands at the start of the
+target's segment: 0.9 to 1.1 s short on 2 s segments on the Streaming
+Stick, W0-2), a correction counts as a reload. W0-2 confirmed the direct-play case (the
 seek lands up to one GOP short, section 7.4); transcode plans are not
 measured yet. A correction seek's residual is read after its real landing,
 never from the target the node echoes first (section 7.4), so the lead
@@ -992,7 +993,7 @@ The player's part:
 | ID | Question | Pass |
 | --- | --- | --- |
 | W0-1 (ran; section 2.1) | `roWebSocket`: can the app send `Sec-WebSocket-Protocol: silo.room.v2, silo.ticket.{t}` and read the server's choice; does it answer ping frames; does `wss://` verify with the system CA bundle; how large a message arrives; does it run in a Task; what close events look like | A sandbox room socket stays open past 60 s and receives a snapshot; a 5 MB message arrives or fails cleanly |
-| W0-2 (ran for direct play; section 7.4) | Where `Video.seek` lands for direct, remux, and transcode plans, and how long it takes | Landing error per plan type, to set section 7.4's acknowledgement and 7.5's in-place rule. Direct play: 0.17 to 1.56 s short (2.002 s GOP), resumes in 209 to 721 ms, the target echoed first. Copy remux seeks through `seek_reanchor`. Transcode: not measured |
+| W0-2 (ran for direct play; section 7.4) | Where `Video.seek` lands for direct, remux, and transcode plans, and how long it takes | Landing error per plan type, to set section 7.4's acknowledgement and 7.5's in-place rule. Direct play: 0.17 to 1.56 s short (2.002 s GOP), resumes in 209 to 721 ms, the target echoed first. Copy remux seeks through `seek_reanchor`; on the Streaming Stick 27 of 28 landed 4 to 8 s past the target until the lead-in reanchor (spec section 5.7), then 14 of 14 within 1.06 s, playing 3.0 to 6.4 s after the seek. Transcode: not measured |
 | W0-3 | Delay from the task's field write at `execute_at` to the render thread's `Video` call, on the Ultra and a 1 GB device | Under 50 ms at the 95th percentile |
 | W0-4 | Memory with the room task, the lobby, and a 200-suggestion ballot open | Within the memory monitor's budget (spec section 4) |
 
