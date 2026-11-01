@@ -314,8 +314,7 @@ namespace watchparty.sync
         state.pending = invalid
         if command.selectionRevision <> room.selectionRevision or sample.revision <> room.selectionRevision then return []
         if command.sessionId <> "" and command.sessionId <> sample.sessionId then return []
-        ' The command's own play state ends any hold: the player ends it as
-        ' it runs the command.
+        held = state.overshoot
         state.overshoot = invalid
         action = command.action
         commandPlays = (action = "play" and command.playbackState <> "waiting") or (action = "seek" and command.playbackState = "playing")
@@ -323,6 +322,17 @@ namespace watchparty.sync
         if executeAt = invalid then executeAt = ctx.serverNow
         ref = watchparty.catchup.reference(command.positionSeconds, executeAt, action <> "pause" and command.playbackState = "playing")
         target = watchparty.catchup.positionAt(ref, ctx.serverNow)
+        if held <> invalid and commandPlays and ref.playing and action <> "seek" and Abs(target - watchparty.catchup.positionAt(held.ref, ctx.serverNow)) <= watchparty.catchup.PAUSED_SEEK_SECONDS
+            ' The server's correction of the timeline the hold follows, sent
+            ' for reports from before it: the hold goes on, and plays naming
+            ' this command. Any other command ends the hold, as the player
+            ' ends it on running the command.
+            held.ref = ref
+            held.commandId = command.commandId
+            state.overshoot = held
+            noteExecuted(state, command, ref, now, commandPlays)
+            return []
+        end if
         memberPlaying = sample.playing and not sample.seeking
         drift = target - localPosition(sample, now)
         host = watchparty.room.isHost(room)
@@ -372,13 +382,7 @@ namespace watchparty.sync
         if action = "seek" and command.playbackState = "waiting" and seek <> invalid then settle = settleTolerance(room)
         out = [player(state, command.commandId, seek, reload, playing, settle, hold <> invalid)]
         if hold <> invalid then state.overshoot.seq = state.seq
-        state.applied = command
-        state.appliedAt = now
-        state.lastBusyAt = now
-        state.ref = ref
-        state.stallStartedAt = invalid
-        if state.pendingSeek <> invalid and (state.pendingSeek.arrived or seeksTo(command, state.pendingSeek.target)) then state.pendingSeek = invalid
-        state.hold = { commandId: command.commandId, playing: commandPlays, since: now, released: false }
+        noteExecuted(state, command, ref, now, commandPlays)
         if command.playbackState = "waiting"
             seekTarget = invalid
             if action = "seek" then seekTarget = target
@@ -386,6 +390,18 @@ namespace watchparty.sync
         end if
         return out
     end function
+
+    ' The command ran: it is the reference from now on, and reports wait to
+    ' name it until the player shows its play state (holdingReports).
+    sub noteExecuted(state as Object, command as Object, ref as Object, now as Integer, commandPlays as Boolean)
+        state.applied = command
+        state.appliedAt = now
+        state.lastBusyAt = now
+        state.ref = ref
+        state.stallStartedAt = invalid
+        if state.pendingSeek <> invalid and (state.pendingSeek.arrived or seeksTo(command, state.pendingSeek.target)) then state.pendingSeek = invalid
+        state.hold = { commandId: command.commandId, playing: commandPlays, since: now, released: false }
+    end sub
 
     ' A late joiner's first seek landed: seek again aimed ahead by its
     ' duration when the room moved more than the deadband meanwhile, then
