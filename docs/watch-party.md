@@ -619,9 +619,9 @@ of settle from the last command or seek. Constants from
 | Situation | Action |
 | --- | --- |
 | Playing, drift ≤ 1 s | Nothing (the server's band is 1 s) |
-| Playing, drift > 1 s and ≤ 5 s (2 s for the host executing a command) | Seek in place to room + lead. Lead starts at 0; after each correction seek settles, lead = clamp(lead + residual, 0, 2 s). A residual over 1 s doubles the wait before the next seek, 1 s up to 16 s; a hit resets it to 1 s |
-| Playing, drift > 5 s, or an in-place seek is a reload on this plan | Budgeted reload aimed ahead (below) |
-| Command while paused or stopped | Seek first only if drift > 5 s, or > 1 s when an in-place seek is possible; joining a playing room, seek once more aimed ahead by the first seek's duration if it left more than 0.4 s |
+| Playing, drift > 1 s and ≤ 5 s (2 s for the host executing a command) | Seek in place to room + lead. Lead starts at 0; after each correction seek settles, lead = clamp(lead + residual, 0, 2 s). A residual over 1 s doubles the wait before the next seek, 1 s up to 16 s; a hit resets it to 1 s. Once this plan's landings fall short by more than 1 s: overshoot, then hold (below) |
+| Playing, drift > 5 s, or an in-place seek is a reload on this plan | Budgeted reload aimed ahead (below); on an in-place plan whose landings fall short by more than 1 s, and within 15 s, overshoot, then hold instead |
+| Command while paused or stopped | Seek first only if drift > 5 s, or > 1 s when an in-place seek is possible. Joining a playing room from behind on an in-place plan: overshoot, then hold (below). Otherwise (a copy remux, or a member ahead of the room), seek once more aimed ahead by the first seek's duration if it left more than 0.4 s |
 | Room `seek` command | Exactly to the target, no lead |
 
 **In place on Roku.** Roku reports no buffered range (spec section 9.6), so
@@ -636,6 +636,61 @@ measured yet. A correction seek's residual is read after its real landing,
 never from the target the node echoes first (section 7.4), so the lead
 learns the keyframe shortfall as well as the seek's time.
 
+**Overshoot, then hold** (owner's decision, 2026-11-01). A direct-play
+file's keyframes may sit far apart: FX-007's are 1.3 to 12.4 s apart, so
+a seek lands up to 12 s short, far past what a 2 s lead can absorb, and
+a late joiner stayed 1 to 8 s behind for over two minutes while the
+server corrected it every 10 s (bug 5 of the Streaming Stick's
+end-to-end run). A Roku member cannot play faster to close that, so it
+seeks past the room and waits, paused, for the room to reach it:
+
+- **When.** A member at rest joining a playing room from behind
+  (Continue here, a rejoin) on an in-place
+  plan; and any correction on an in-place plan once the plan's recent
+  landings fall short by more than 1 s (`PAUSED_SEEK_SECONDS`, the drift
+  at which an in-place seek starts), including a correction that would
+  otherwise be a reload, since a reload of an in-place plan lands on the
+  same keyframes. A room `seek` (the barrier, section 7.4) and a copy
+  remux keep their own rules.
+- **How far ahead.** No one knows where the next keyframe is, so the
+  member learns how short its seeks land: shortfall = where a seek aimed
+  − where it really landed (section 7.4's landing, never the echo), at
+  least 0, from every in-place seek it makes (barriers, corrections, and
+  holds). The estimate is the largest of the last 4, or 2 s (W0-2's GOP)
+  before any landing. A hold seeks to room + 1 s (the room plays on while
+  the seek resumes: 0.2 to 0.9 s on the Stick's direct plans) + the
+  estimate + 0.5 s, at most room + 15 s, and never within 1 s of the end
+  of the file (there it falls back to the rule above).
+- **Hold.** The player mutes, lets the node play after Roku's resume
+  while it measures where the seek landed (as for a barrier, section
+  7.4), and pauses at once on the landing report. Its sample says
+  seeking all along (and `holding` once paused), so no `state_report`,
+  `ready`, or `buffering` goes out: a paused report while the room plays
+  would trigger the server's pause-mismatch correction at once. The task
+  then plays it, sound restored, when the room position reaches the
+  paused position, less 100 ms for the resume (`HOLD_PLAY_LEAD_MS`),
+  timed on the task like a command. Holds are at most 15 s, since the
+  aim is.
+- **Behind anyway.** A landing more than 1 s behind the room teaches the
+  estimate and seeks again, at most 3 seeks a hold; after that, or for a
+  landing within 1 s behind, it plays at once and the rules above take
+  over. A hold seek that never shows a landing within 10 s plays.
+- **Ends.** A new room command ends the hold (its play state applies, so
+  a play resumes); so do an error and the end of the file (sound
+  restored; after an error the member wants to play again), the player
+  closing (Back's panel does not close it, so the hold goes on beneath
+  the panel), and a deep link or another title, which close the player.
+  If the task never plays it, the player ends the hold itself 20 s after
+  it paused, and plays.
+- **Host.** The host holds too. On the v2 room socket the server takes a
+  host's report as the room's decision only beyond 10 s
+  (`hostAuthorityDriftSeconds`; the 2 s band is the legacy v1 socket's),
+  inside it corrects the host like a guest, and does nothing on a
+  report-free stretch outside a barrier (it tracks no report times; only
+  a waiting room's 10 s deadline counts readiness). A holding host sends
+  nothing until it plays on the room position, so it can neither pull
+  the room to its frozen frame nor be paused by a mismatch.
+
 **Reload budget** (`RoomReloadBudget`): one at a time; the next 10 s after
 the last one played, doubling to 60 s; a reload that never lands is stale
 after 30 s; each aims ahead by the previous load's time, at most 10 s;
@@ -647,7 +702,12 @@ over 1 s off; executing one is idempotent.
 ### 7.6 Late join and background
 
 A member joining a playing room loads paused at the snapshot's anchor and
-attaches; the server's sync command does the rest. The Roku has no
+attaches; the server's sync command does the rest. That command finds
+the member at rest behind a playing room: on an in-place plan it
+overshoots and holds (section 7.5), so it starts playing on the room
+position instead of a seek's time plus a keyframe gap behind it; on a
+copy remux it seeks to the room (a `seek_reanchor`, which lands on the
+target) and realigns once. The Roku has no
 background: Home closes the app and the socket with it. Roku's own
 overlays over the player do not pause the room.
 
@@ -776,14 +836,17 @@ tag?, ...}`: `checkSupport`, `create`, `join`, `rejoin`, `leave`, `end`,
 `transportRequest`, `sourceFallback`, `noteTitle`, `forgetRecent`,
 `clearError`), `playerSample` (`{sessionId, revision, position,
 duration, playing, wantsPlay, playable, stalled, seeking (until a seek's
-real landing shows and a barrier's roll ends), atEnd, planInPlace,
-commandSeq}`), and `session` (`{sessionId, revision}` or
+real landing shows, a barrier's roll ends, and a hold plays), holding
+(paused in a hold, section 7.5), landed and landedSeq (where the last
+measured seek really landed, and its `playerCommand.seq`), atEnd,
+planInPlace, commandSeq}`), and `session` (`{sessionId, revision}` or
 `{}`). Outputs: `ready`, `room` (the normalized snapshot), `connection`,
 `support`, `sync` (the player's view: attached, catching up, syncing,
 waiting for a clock, the held seek target, permissions), `suggestions`,
 `memberState`, `picker`, `recent`, `busy`, and the one-shot
-`playerCommand` (`{seq, commandId, seek, reload, playing, settle?}`,
-`settle` only on a barrier's seek: section 7.4), `notice`,
+`playerCommand` (`{seq, commandId, seek, reload, playing, settle?,
+hold?}`, `settle` only on a barrier's seek: section 7.4; `hold` only on
+an overshoot's seek: section 7.5), `notice`,
 `result`, and `ended`. Strings are locale keys (`watchParty.*` in
 `locale/en_US/strings.json`), never text, except a server's own error
 message.
@@ -941,7 +1004,8 @@ The player's part:
   allows one, else a `seek_reanchor`). The room's play state is the
   reducer's play intent, so the loads it opens follow it. A Video node
   that plays while the room wants it paused (a seek Roku resumed) pauses
-  again, except while a barrier's settle plays it muted (section 7.4). A
+  again, except while a barrier's settle plays it muted (section 7.4) or a
+  hold's seek plays it muted to find its landing (section 7.5). A
   seek's sample says seeking until the node shows its real landing
   (`watchparty.landing`); a paused member's seek counts as landed when the
   node reports paused again, or 3 s after it ran. These need the device to
@@ -1003,7 +1067,11 @@ Rooibos specs for `source/watchparty/`, ported from Android
 `RoomCatchupTest`, the rate-unsupported cases of `RoomPlaybackBindingTest`
 (:667-1015), `WatchPartyWireTest`'s clock cases, and tvOS
 `WatchPartyStateTests` and `WatchPartyCatchupTests`, with server-shaped
-fixtures for snapshots, commands, and suggestions.
+fixtures for snapshots, commands, and suggestions. Section 7.5's
+overshoot and hold has its own cases in `catchup.spec.bs` (aim, estimate,
+hold decisions), `landing.spec.bs` (pausing on the landing, timeouts),
+`player.spec.bs` (the sample's holding), and `sync.spec.bs` (late join,
+corrections, retries, report silence, and interruptions).
 
 ### 12.3 Party matrix
 
@@ -1019,6 +1087,12 @@ room (`references/baseline-2026-10.md`).
 
 ### 12.4 Hardware
 
+Section 7.5's overshoot and hold on a long-GOP direct file (FX-007,
+keyframes 1.3 to 12.4 s apart): a late join (Continue here) into a
+playing room and a correction after a 10 s outage, with reported drift
+from the relay's tap and corrections from the server's log; and FX-001,
+a copy remux, a transcode, and a barrier unchanged.
+
 Every row of section 4 on the Ultra, hosting and as a guest, against a
 server on HTTPS and one on plain HTTP; the 1 GB device once it runs Roku
 OS 16.
@@ -1027,5 +1101,7 @@ OS 16.
 
 | Decision | Leaning | Needs |
 | --- | --- | --- |
+| The host's command threshold (`HOST_COMMAND_SEEK_SECONDS`, 2 s) follows the legacy v1 host band; the v2 socket's is 10 s | Keep it until a host is measured on v2; a holding host reports nothing either way (section 7.5) | A host run on a long-GOP file |
+| A member at rest or playing ahead of the room could hold where it is instead of seeking | Not built: it seeks as before | Device runs that show members ahead often |
 | A Roku without `roWebSocket` | No Watch Party | Roku OS 16's release and device list |
 | Children's profiles see suggestions' raw titles and posters, which the server does not filter | Show them, as tvOS does | Server owner's view |

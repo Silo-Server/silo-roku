@@ -41,6 +41,30 @@ namespace watchparty.catchup
     const RELOAD_STALE_MS = 30000
     const RELOAD_MAX_LEAD_SECONDS = 10
     const RELOAD_LANDED_AHEAD_SECONDS = 2
+    ' Overshoot, then hold (overshoot*, hold*): a seek on an in-place plan
+    ' lands on the keyframe at or before its target, as much as a whole
+    ' keyframe gap short (FX-007: up to 12.4 s), which no lead of at most
+    ' MAX_LEAD_SECONDS absorbs. A hold seeks past the room and waits paused
+    ' until the room reaches its landing. How short seeks land is learned
+    ' from the last SHORTFALL_WINDOW landings, DEFAULT_SHORTFALL_SECONDS (the
+    ' 2.002 s GOP of W0-2) before any. The aim is the room plus the seek's
+    ' resume while the room plays on (Streaming Stick direct: 0.2 to 0.9 s),
+    ' the estimate, and a margin, at most MAX_OVERSHOOT_SECONDS ahead, which
+    ' bounds the hold, and never into the last END_MARGIN_SECONDS of the
+    ' file.
+    const SHORTFALL_WINDOW = 4
+    const DEFAULT_SHORTFALL_SECONDS = 2
+    const OVERSHOOT_RESUME_SECONDS = 1
+    const OVERSHOOT_MARGIN_SECONDS = 0.5
+    const MAX_OVERSHOOT_SECONDS = 15
+    const END_MARGIN_SECONDS = 1
+    ' A hold seeks at most this many times before it plays where it is.
+    const HOLD_TRIES = 3
+    ' The play goes this long before the room reaches the landing: the
+    ' Task's write and a paused node's resume.
+    const HOLD_PLAY_LEAD_MS = 100
+    ' A hold's seek that shows no landing within this plays.
+    const HOLD_LAND_TIMEOUT_MS = 10000
 
     ' ---- The room's position
 
@@ -137,6 +161,65 @@ namespace watchparty.catchup
         if lead < 0 then lead = 0
         if lead > MAX_LEAD_SECONDS then lead = MAX_LEAD_SECONDS
         return roomSeconds + lead
+    end function
+
+    ' ---- Overshoot, then hold (section 7.5)
+
+    ' A seek aimed at aimSeconds landed at landedSeconds (its real landing,
+    ' never the echo): remembers how short, at least 0, among the last
+    ' SHORTFALL_WINDOW in samples.
+    sub noteShortfall(samples as Object, aimSeconds as Dynamic, landedSeconds as Dynamic)
+        short = aimSeconds - landedSeconds
+        if short < 0 then short = 0
+        samples.Push(short)
+        while samples.Count() > SHORTFALL_WINDOW
+            samples.Shift()
+        end while
+    end sub
+
+    ' How short a seek on this plan may land: the longest of the recent
+    ' landings, or DEFAULT_SHORTFALL_SECONDS before any.
+    function shortfallEstimate(samples as Object) as Dynamic
+        if samples.Count() = 0 then return DEFAULT_SHORTFALL_SECONDS
+        out = 0
+        for each short in samples
+            if short > out then out = short
+        end for
+        return out
+    end function
+
+    ' Whether this plan's seeks have been landing short by more than an
+    ' in-place seek's threshold, PAUSED_SEEK_SECONDS: then even a playing
+    ' member's corrections overshoot and hold.
+    function landsShort(samples as Object) as Boolean
+        return samples.Count() > 0 and shortfallEstimate(samples) > PAUSED_SEEK_SECONDS
+    end function
+
+    ' Where a hold seeks for the room at roomSeconds: ahead by the seek's
+    ' resume, the estimate, and the margin, at most MAX_OVERSHOOT_SECONDS;
+    ' invalid when that would reach into the last END_MARGIN_SECONDS of a
+    ' file of durationSeconds (0 for unknown).
+    function overshootTarget(roomSeconds as Dynamic, samples as Object, durationSeconds as Dynamic) as Dynamic
+        ahead = OVERSHOOT_RESUME_SECONDS + shortfallEstimate(samples) + OVERSHOOT_MARGIN_SECONDS
+        if ahead > MAX_OVERSHOOT_SECONDS then ahead = MAX_OVERSHOOT_SECONDS
+        aim = roomSeconds + ahead
+        if durationSeconds > 0 and aim > durationSeconds - END_MARGIN_SECONDS then return invalid
+        return aim
+    end function
+
+    ' A hold paused aheadSeconds past the room (negative: behind) after
+    ' seeks seeks: { action, inMs }. "wait" inMs before playing; "play" now
+    ' (the room has reached it, less HOLD_PLAY_LEAD_MS, or it landed less
+    ' than PAUSED_SEEK_SECONDS behind, or it is out of seeks); "retry" with
+    ' a seek aimed further.
+    function holdStep(aheadSeconds as Dynamic, seeks as Integer) as Object
+        if aheadSeconds < -PAUSED_SEEK_SECONDS
+            if seeks < HOLD_TRIES then return { action: "retry", inMs: 0 }
+            return { action: "play", inMs: 0 }
+        end if
+        untilMs = Int(aheadSeconds * 1000 - HOLD_PLAY_LEAD_MS)
+        if untilMs <= 0 then return { action: "play", inMs: 0 }
+        return { action: "wait", inMs: untilMs }
     end function
 
     ' ---- The reload budget (Android RoomReloadBudget)

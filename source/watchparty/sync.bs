@@ -14,8 +14,8 @@ import "pkg:/source/watchparty/wire.bs"
 '
 ' The render thread only executes what this decides. Its samples are
 '   { sessionId, revision, position, duration, playing, wantsPlay,
-'     playable, stalled, seeking, atEnd, planInPlace, commandSeq,
-'     receivedAt }
+'     playable, stalled, seeking, holding, landed, landedSeq, atEnd,
+'     planInPlace, commandSeq, receivedAt }
 ' (components/tasks/RoomTask.bs lists their meaning; receivedAt is the
 ' Task's monotonic time when the sample arrived). Each decision for the
 ' player is { kind: "player", command: { seq, commandId, seek, reload,
@@ -25,8 +25,10 @@ import "pkg:/source/watchparty/wire.bs"
 ' barrier), how short of the target the member may land and still
 ' acknowledge where it is (settleTolerance), else invalid: the player
 ' then plays muted from a shorter landing to the target before it reports
-' the seek landed (watchparty.landing, section 7.4). Messages for the
-' socket are { kind: "send", text }.
+' the seek landed (watchparty.landing, section 7.4); and hold, true for an
+' overshoot's seek (section 7.5): the player pauses on its landing and
+' says seeking (and holding) until a later command plays it. Messages for
+' the socket are { kind: "send", text }.
 '
 ' ctx, given to each call, is { now, serverNow, room, sample, writable,
 ' snapshotSeq }: the Task's monotonic milliseconds, the server's epoch
@@ -116,6 +118,12 @@ namespace watchparty.sync
         state.realign = invalid
         state.pendingSeek = invalid
         state.clockWaitSince = invalid
+        ' Overshoot, then hold (section 7.5): the hold in progress, how short
+        ' this plan's seeks have landed, and the last seek whose landing is
+        ' still to learn from.
+        state.overshoot = invalid
+        state.shortfalls = []
+        state.lastSeek = invalid
     end sub
 
     ' The socket closed: a pending command dies with it, and the next
@@ -189,6 +197,11 @@ namespace watchparty.sync
         if state.pendingSeek <> invalid and now - state.pendingSeek.at >= PENDING_SEEK_TIMEOUT_MS then state.pendingSeek = invalid
         sessionId = sessionOf(ctx)
         sample = ctx.sample
+        ' A hold plays on the room's time, socket or not.
+        if sessionId <> ""
+            learnLanding(state, sample)
+            out.Append(holdStep(state, ctx))
+        end if
         if sessionId = "" or not ctx.writable
             if not ctx.writable then state.pendingSeek = invalid
             return out
@@ -253,6 +266,7 @@ namespace watchparty.sync
         ' A reload that never lands must not hold corrections off for good.
         if watchparty.catchup.reloadStale(budget, now) then watchparty.catchup.reloadExpire(budget, now)
         out.Append(realignStep(state, ctx))
+        if state.overshoot <> invalid then state.lastBusyAt = now
         out.Append(retryDeferredReload(state, ctx))
         out.Append(driftLoop(state, ctx, stalled))
 
@@ -291,7 +305,8 @@ namespace watchparty.sync
         ' A command that lands while media is mounting or seeking would act
         ' on media being replaced: hold it until that settles. A late Play
         ' still advances by the full elapsed server time.
-        if sample.seeking
+        ' A hold paused on its landing is the room's to end at once.
+        if sample.seeking and not util.isTrue(sample.holding)
             if pending.deferredSince = invalid then pending.deferredSince = now
             if now - pending.deferredSince < MOUNT_DEFER_MS then return []
         end if
@@ -299,6 +314,9 @@ namespace watchparty.sync
         state.pending = invalid
         if command.selectionRevision <> room.selectionRevision or sample.revision <> room.selectionRevision then return []
         if command.sessionId <> "" and command.sessionId <> sample.sessionId then return []
+        ' The command's own play state ends any hold: the player ends it as
+        ' it runs the command.
+        state.overshoot = invalid
         action = command.action
         commandPlays = (action = "play" and command.playbackState <> "waiting") or (action = "seek" and command.playbackState = "playing")
         executeAt = command.executeAtMs
@@ -312,7 +330,18 @@ namespace watchparty.sync
         seek = invalid
         reload = false
         playing = commandPlays
-        if decision = "seek"
+        hold = invalid
+        if commandPlays and ref.playing and action <> "seek" and sample.planInPlace
+            ' Overshoot, then hold (section 7.5): a member at rest behind the
+            ' room, or any correction once this plan's seeks land short.
+            atRestBehind = decision = "seek" and not memberPlaying and drift > 0
+            correcting = memberPlaying and (decision = "seek" or decision = "reload")
+            if atRestBehind or (correcting and watchparty.catchup.landsShort(state.shortfalls)) then hold = beginHold(state, ctx, ref, command.commandId)
+        end if
+        if hold <> invalid
+            seek = hold
+            playing = false
+        else if decision = "seek"
             if memberPlaying and commandPlays and ref.playing and action <> "seek"
                 ' An in-place correction lands late by the seek's time while
                 ' the room plays on: aim ahead by the last shortfall.
@@ -341,7 +370,8 @@ namespace watchparty.sync
         end if
         settle = invalid
         if action = "seek" and command.playbackState = "waiting" and seek <> invalid then settle = settleTolerance(room)
-        out = [player(state, command.commandId, seek, reload, playing, settle)]
+        out = [player(state, command.commandId, seek, reload, playing, settle, hold <> invalid)]
+        if hold <> invalid then state.overshoot.seq = state.seq
         state.applied = command
         state.appliedAt = now
         state.lastBusyAt = now
@@ -397,6 +427,13 @@ namespace watchparty.sync
             if Abs(drift) <= watchparty.catchup.DEADBAND_SECONDS then watchparty.catchup.reloadSettle(state.reloads)
             return []
         end if
+        if sample.planInPlace and watchparty.catchup.landsShort(state.shortfalls)
+            aim = beginHold(state, ctx, ref, appliedId(state))
+            if aim <> invalid
+                state.reloadDeferred = false
+                return [holdSeek(state, aim)]
+            end if
+        end if
         if decision = "seek"
             state.reloadDeferred = false
             state.lastBusyAt = now
@@ -419,7 +456,7 @@ namespace watchparty.sync
         now = ctx.now
         ref = state.ref
         reloading = watchparty.catchup.reloadInFlight(state.reloads) and not watchparty.catchup.reloadStale(state.reloads, now)
-        holds = ctx.room.playbackState = "playing" and sample.playing and sample.playable and not sample.seeking and not stalled and not reloading and not state.reloadDeferred and state.realign = invalid
+        holds = ctx.room.playbackState = "playing" and sample.playing and sample.playable and not sample.seeking and not stalled and not reloading and not state.reloadDeferred and state.realign = invalid and state.overshoot = invalid
         if ref = invalid or not ref.playing or ctx.serverNow = invalid or not holds then return []
         settledAt = latest(latest(state.appliedAt, state.lastBusyAt), state.lastLoopSeekAt)
         if since(settledAt, now) < watchparty.catchup.LOOP_SETTLE_MS then return []
@@ -438,7 +475,90 @@ namespace watchparty.sync
         end if
         if watchparty.catchup.loopDecision(drift, sample.planInPlace) <> "seek" then return []
         if since(latest(state.lastBusyAt, state.lastLoopSeekAt), now) < state.intervalMs then return []
+        if watchparty.catchup.landsShort(state.shortfalls)
+            aim = beginHold(state, ctx, ref, appliedId(state))
+            if aim <> invalid then return [holdSeek(state, aim)]
+        end if
         return [player(state, appliedId(state), fallbackTarget(state, target, now), false, invalid)]
+    end function
+
+    ' ---- Overshoot, then hold (section 7.5)
+
+    ' Starts a hold toward the room of ref: where its seek aims, or invalid
+    ' when it would reach into the end of the file (the caller falls back to
+    ' its own rule). The caller sends the seek (holdSeek, or the command's
+    ' own player command, which records its seq).
+    function beginHold(state as Object, ctx as Object, ref as Object, commandId as String) as Dynamic
+        aim = watchparty.catchup.overshootTarget(watchparty.catchup.positionAt(ref, ctx.serverNow), state.shortfalls, ctx.sample.duration)
+        if aim = invalid then return invalid
+        state.overshoot = { seq: invalid, aim: aim, ref: ref, commandId: commandId, startedAt: ctx.now, seeks: 1, dueAt: invalid }
+        state.lastBusyAt = ctx.now
+        state.lastLoopSeekAt = ctx.now
+        return aim
+    end function
+
+    ' The player command for a hold's seek to aim: paused, measured, held.
+    function holdSeek(state as Object, aim as Dynamic) as Object
+        action = player(state, state.overshoot.commandId, aim, false, false, invalid, true)
+        state.overshoot.seq = state.seq
+        return action
+    end function
+
+    ' Remembers how short the last seek landed once the player shows its
+    ' real landing (an in-place plan's only).
+    sub learnLanding(state as Object, sample as Object)
+        last = state.lastSeek
+        if last = invalid or not util.isNumber(sample.landedSeq) or sample.landedSeq <> last.seq or not util.isNumber(sample.landed) then return
+        state.lastSeek = invalid
+        if sample.planInPlace then watchparty.catchup.noteShortfall(state.shortfalls, last.aim, sample.landed)
+    end sub
+
+    ' A hold's progress: once the player pauses on the landing, it plays
+    ' when the room reaches it (less the resume), seeks again from a landing
+    ' more than PAUSED_SEEK_SECONDS behind, or plays from there once out of
+    ' seeks; a seek that shows no landing plays after HOLD_LAND_TIMEOUT_MS.
+    ' One the player ended itself (an error, the end, its own limit) is
+    ' forgotten: it plays on its own.
+    function holdStep(state as Object, ctx as Object) as Object
+        o = state.overshoot
+        if o = invalid or o.seq = invalid then return []
+        sample = ctx.sample
+        now = ctx.now
+        o.dueAt = invalid
+        ran = sample.commandSeq >= o.seq
+        if ran and not util.isTrue(sample.holding) and not sample.seeking
+            state.overshoot = invalid
+            return []
+        end if
+        if not ran or not util.isTrue(sample.holding)
+            if now - o.startedAt >= watchparty.catchup.HOLD_LAND_TIMEOUT_MS then return [holdPlay(state)]
+            return []
+        end if
+        if ctx.serverNow = invalid then return []
+        room = watchparty.catchup.positionAt(o.ref, ctx.serverNow)
+        verdict = watchparty.catchup.holdStep(sample.position - room, o.seeks)
+        if verdict.action = "wait"
+            o.dueAt = now + verdict.inMs
+            return []
+        end if
+        if verdict.action = "retry"
+            aim = watchparty.catchup.overshootTarget(room, state.shortfalls, sample.duration)
+            if aim <> invalid
+                o.aim = aim
+                o.seeks = o.seeks + 1
+                o.startedAt = now
+                state.lastLoopSeekAt = now
+                return [holdSeek(state, aim)]
+            end if
+        end if
+        return [holdPlay(state)]
+    end function
+
+    ' The hold is over: play where it is.
+    function holdPlay(state as Object) as Object
+        commandId = state.overshoot.commandId
+        state.overshoot = invalid
+        return player(state, commandId, invalid, false, true)
     end function
 
     ' A correction seek to roomSeconds, aimed ahead by the measured lead. On
@@ -517,7 +637,7 @@ namespace watchparty.sync
         room = ctx.room
         member = watchparty.room.selfMember(room)
         catchingUp = watchparty.room.isCatchingUp(room)
-        syncing = catchingUp or state.realign <> invalid or watchparty.catchup.reloadInFlight(state.reloads)
+        syncing = catchingUp or state.realign <> invalid or state.overshoot <> invalid or watchparty.catchup.reloadInFlight(state.reloads)
         if util.isObject(room) and room.phase = "playing" and room.playbackState = "waiting" then syncing = true
         if member <> invalid and member.isSyncing then syncing = true
         pendingSeek = invalid
@@ -540,6 +660,12 @@ namespace watchparty.sync
         if not util.isObject(room) or room.phase <> "playing" then return invalid
         if state.pending <> invalid and state.pending.dueAt <> invalid
             due = state.pending.dueAt - ctx.now
+            if due < 0 then due = 0
+            if due < TICK_MS then return due
+        end if
+        o = state.overshoot
+        if o <> invalid and o.dueAt <> invalid
+            due = o.dueAt - ctx.now
             if due < 0 then due = 0
             if due < TICK_MS then return due
         end if
@@ -603,10 +729,14 @@ namespace watchparty.sync
         return state.applied.commandId
     end function
 
-    function player(state as Object, commandId as String, seek as Dynamic, reload as Boolean, playing as Dynamic, settle = invalid as Dynamic) as Object
+    ' A playerCommand. A seek (not a reload) is remembered until the
+    ' player shows where it really landed (learnLanding).
+    function player(state as Object, commandId as String, seek as Dynamic, reload as Boolean, playing as Dynamic, settle = invalid as Dynamic, hold = false as Boolean) as Object
         state.seq = state.seq + 1
         command = { seq: state.seq, commandId: commandId, seek: seek, reload: reload, playing: playing }
         if settle <> invalid then command.settle = settle
+        if hold then command.hold = true
+        if util.isNumber(seek) and not reload then state.lastSeek = { seq: state.seq, aim: seek }
         return { kind: "player", command: command }
     end function
 

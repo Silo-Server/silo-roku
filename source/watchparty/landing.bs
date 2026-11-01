@@ -25,12 +25,19 @@ import "pkg:/source/util/values.bs"
 ' player cannot roll (a reload plan, the end of the file, too little time
 ' left) is acknowledged as it lands.
 '
-' state, from begin: { target, tolerance, barrier, startedAt, phase
-' ("measuring", "rolling", "done"), echoes, settledAt, last, lastAt,
-' playingSince, landed, nudged, rolled }. Each step gives what the player
-' does: "none"; "play" (resume the node if it is paused, still muted); or
-' "stop" (the settle is over: pause where the room wants the member
-' paused, restore the sound, and report).
+' A hold (section 7.5: overshoot, then hold) is a seek past the room that
+' the player measures muted like a barrier's, then pauses on its landing
+' report and holds, the sample still seeking (and holding), until the
+' Task's next command plays it; HOLD_MAX_MS after it paused it ends on
+' its own.
+'
+' state, from begin: { target, tolerance, barrier, hold, startedAt, phase
+' ("measuring", "rolling", "holding", "done"), echoes, settledAt, last,
+' lastAt, playingSince, landed, heldAt, holdAt, nudged, rolled }. Each
+' step gives what the player does: "none"; "play" (resume the node if it
+' is paused, still muted); "hold" (pause the node where it landed, holdAt,
+' and report); or "stop" (the settle is over: pause where the room wants
+' the member paused, restore the sound, and report).
 namespace watchparty.landing
     ' A report this close to the target is Roku's echo of the request.
     const ECHO_SECONDS = 0.05
@@ -50,13 +57,17 @@ namespace watchparty.landing
     ' The roll stops this short of the target: the report's and the pause's
     ' own delay.
     const STOP_EARLY_SECONDS = 0.1
+    ' A hold the Task never plays ends this long after it paused: past the
+    ' longest hold (watchparty.catchup.MAX_OVERSHOOT_SECONDS) and a margin.
+    const HOLD_MAX_MS = 20000
 
     ' A seek to target that ran at now; tolerance (seconds) for a barrier,
-    ' invalid for any other seek.
-    function begin(target as Dynamic, now as Integer, tolerance = invalid as Dynamic) as Object
+    ' invalid for any other seek; hold for an overshoot's seek.
+    function begin(target as Dynamic, now as Integer, tolerance = invalid as Dynamic, hold = false as Boolean) as Object
         barrier = util.isNumber(tolerance)
         if not barrier then tolerance = invalid
-        return { target: target, tolerance: tolerance, barrier: barrier, startedAt: now, phase: "measuring", echoes: 0, settledAt: invalid, last: invalid, lastAt: invalid, playingSince: invalid, landed: invalid, nudged: false, rolled: false }
+        if barrier then hold = false
+        return { target: target, tolerance: tolerance, barrier: barrier, hold: hold, startedAt: now, phase: "measuring", echoes: 0, settledAt: invalid, last: invalid, lastAt: invalid, playingSince: invalid, landed: invalid, heldAt: invalid, holdAt: invalid, nudged: false, rolled: false }
     end function
 
     ' Whether the settle still runs: the sample says seeking until it ends.
@@ -64,10 +75,22 @@ namespace watchparty.landing
         return util.isObject(state) and state.phase <> "done"
     end function
 
-    ' Whether the node plays and is muted for it (a barrier's), so the
-    ' player's own hold on the room's pause waits.
+    ' Whether the node plays and is muted for it (a barrier's, or a hold's
+    ' while it measures), so the player's own hold on the room's pause
+    ' waits.
     function holdsNode(state as Dynamic) as Boolean
-        return active(state) and state.barrier
+        return active(state) and (state.barrier or (state.hold and state.phase = "measuring"))
+    end function
+
+    ' Whether the settle keeps the sound off: a barrier's, and a hold's
+    ' until it plays.
+    function mutes(state as Dynamic) as Boolean
+        return active(state) and (state.barrier or state.hold)
+    end function
+
+    ' Whether a hold is paused on its landing, waiting for the Task's play.
+    function holding(state as Dynamic) as Boolean
+        return util.isObject(state) and state.phase = "holding"
     end function
 
     ' A Video position report (source seconds) once the node has settled
@@ -78,6 +101,11 @@ namespace watchparty.landing
         if state.settledAt = invalid then state.settledAt = now
         state.last = position
         state.lastAt = now
+        if state.phase = "holding"
+            ' A paused node's late report says where it holds.
+            state.holdAt = position
+            return "none"
+        end if
         if state.phase = "rolling"
             if position >= state.target - STOP_EARLY_SECONDS then return finish(state)
             return "none"
@@ -93,6 +121,10 @@ namespace watchparty.landing
     ' settled from the seek, playing that it plays now.
     function tick(state as Object, now as Integer, settled as Boolean, playing as Boolean, canRoll as Boolean) as String
         if state.phase = "done" then return "none"
+        if state.phase = "holding"
+            if now - state.heldAt >= HOLD_MAX_MS then return finish(state)
+            return "none"
+        end if
         limit = MEASURE_MAX_MS
         if state.barrier then limit = DEADLINE_MS
         if now - state.startedAt >= limit then return finish(state)
@@ -116,22 +148,31 @@ namespace watchparty.landing
         quiet = state.settledAt
         if state.lastAt <> invalid and state.lastAt > quiet then quiet = state.lastAt
         if now - quiet < WAIT_MS then return "none"
-        ' A barrier's node that stays paused shows nothing: it plays, muted,
-        ' once to report where it is.
-        if state.barrier and not state.nudged and not playing
+        ' A barrier's or a hold's node that stays paused shows nothing: it
+        ' plays, muted, once to report where it is.
+        if (state.barrier or state.hold) and not state.nudged and not playing
             state.nudged = true
             state.lastAt = now
             return "play"
         end if
         position = state.last
         if position = invalid then position = state.target
-        return land(state, position, now, canRoll)
+        action = land(state, position, now, canRoll)
+        ' A playing node has moved on since its last report.
+        if action = "hold" and playing and state.lastAt <> invalid then state.holdAt = position + (now - state.lastAt) / 1000#
+        return action
     end function
 
     ' The landing is known: a barrier short by more than its tolerance rolls
     ' to the target when it can in time, else the settle is over.
     function land(state as Object, position as Dynamic, now as Integer, canRoll as Boolean) as String
         state.landed = position
+        if state.hold
+            state.phase = "holding"
+            state.heldAt = now
+            state.holdAt = position
+            return "hold"
+        end if
         if state.barrier and canRoll
             gap = state.target - position
             if gap > state.tolerance and (now - state.startedAt) + gap * 1000 + RESUME_MS <= DEADLINE_MS

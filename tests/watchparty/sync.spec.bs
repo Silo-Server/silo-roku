@@ -107,6 +107,16 @@ namespace tests
             end for
         end sub
 
+        ' The player measures a hold's seek: seeking, paused by intent.
+        sub measuring(h as Object)
+            m.update(h, { seeking: true, holding: false, playing: false, wantsPlay: false })
+        end sub
+
+        ' The hold's seek landed at landed and the node paused there.
+        sub holdAt(h as Object, landed as Dynamic)
+            m.update(h, { seeking: true, holding: true, playing: false, wantsPlay: false, position: landed, landed: landed, landedSeq: h.commands.Peek().seq })
+        end sub
+
         function kinds(h as Object, kind as String) as Object
             out = []
             for each message in h.sent
@@ -489,9 +499,9 @@ namespace tests
             m.assertTrue(h.seeks[1] >= 119, FormatJson(h.seeks))
         end sub
 
-        @it("realigns a late joiner once more, aimed ahead by its first seek's time")
+        @it("realigns a member at rest ahead of the room once more, aimed ahead by its first seek's time")
         sub _()
-            h = m.harness({}, { position: 0, playing: false, wantsPlay: false })
+            h = m.harness({}, { position: 610, playing: false, wantsPlay: false })
             h.sample.commandSeq = -1
             m.command(h, "sync", "play", 600, "playing")
             m.assertEqual(h.seeks, [600])
@@ -506,6 +516,219 @@ namespace tests
             m.assertEqual(h.seeks.Count(), 2)
             m.assertTrue(m.near(h.seeks[1], 601.55 + 1.55, 0.1), FormatJson(h.seeks))
             m.assertTrue(h.commands.Peek().playing)
+        end sub
+
+        @describe("overshoot, then hold (section 7.5)")
+
+        @it("overshoots a late joiner past the room, holds it silent, and plays it as the room reaches it")
+        sub _()
+            h = m.harness({}, { position: 0, playing: false, wantsPlay: false })
+            h.autoLand = false
+            m.command(h, "sync", "play", 600, "playing")
+            hold = h.commands.Peek()
+            m.assertTrue(hold.hold)
+            m.assertFalse(hold.playing, "paused until the room reaches it")
+            m.assertFalse(hold.reload)
+            m.assertTrue(m.near(hold.seek, 603.5, 0.01), "room + 1 s resume + 2 s (no landing yet) + 0.5 s")
+            h.sent.Clear()
+            m.measuring(h)
+            m.advance(h, 1000)
+            ' The keyframe 0.8 s short; the room is at 601.0.
+            m.holdAt(h, 602.7)
+            m.advance(h, 1500)
+            m.assertEqual(h.commands.Count(), 1, "plays at 602.6 s, 1.7 s less the resume after it paused")
+            m.advance(h, 150)
+            m.assertEqual(h.commands.Count(), 2)
+            play = h.commands.Peek()
+            m.assertTrue(play.playing)
+            m.assertEqual(play.seek, invalid)
+            m.assertEqual(play.commandId, "sync")
+            m.assertFalse(play.DoesExist("hold"))
+            m.assertTrue(m.near(600 + h.now / 1000#, 602.65, 0.06), "room position at the play")
+            m.assertEqual(h.sent.Count(), 0, "nothing reported while it held: " + FormatJson(h.sent))
+            m.assertTrue(m.near(h.sync.shortfalls[0], 0.8, 0.001), FormatJson(h.sync.shortfalls))
+            m.update(h, { seeking: false, holding: false, playing: true, wantsPlay: true, position: 602.7 })
+            m.advance(h, 1400)
+            reports = m.kinds(h, "report")
+            m.assertEqual(reports.Count(), 1, "reports again once it plays")
+            m.assertFalse(reports[0].is_paused)
+            m.assertEqual(reports[0].command_id, "sync")
+        end sub
+
+        @it("seeks again from a landing behind the room, aimed further by what it learned")
+        sub _()
+            h = m.harness({}, { position: 0, playing: false, wantsPlay: false })
+            h.autoLand = false
+            m.command(h, "sync", "play", 600, "playing")
+            m.measuring(h)
+            m.advance(h, 1000)
+            ' FX-007: the keyframe 12.3 s short, 9.8 s behind the room.
+            m.holdAt(h, 591.2)
+            m.advance(h, 50)
+            m.assertEqual(h.seeks.Count(), 2)
+            again = h.commands.Peek()
+            m.assertTrue(again.hold)
+            m.assertFalse(again.playing)
+            m.assertTrue(m.near(again.seek, 601.05 + 1 + 12.3 + 0.5, 0.06), FormatJson(h.seeks))
+            m.measuring(h)
+            m.advance(h, 1000)
+            m.holdAt(h, 612)
+            m.advance(h, 50)
+            m.assertEqual(h.seeks.Count(), 2, "ahead: holds")
+            while h.commands.Count() < 3 and h.now < 15000
+                m.advance(h, 50)
+            end while
+            m.assertTrue(h.commands.Peek().playing)
+            m.assertTrue(m.near(600 + h.now / 1000#, 611.9, 0.06), "plays as the room reaches 612, less the resume")
+        end sub
+
+        @it("plays after three seeks that all land behind, and leaves the rest to the corrections")
+        sub _()
+            h = m.harness({}, { position: 0, playing: false, wantsPlay: false })
+            h.autoLand = false
+            m.command(h, "sync", "play", 600, "playing")
+            for i = 1 to watchparty.catchup.HOLD_TRIES
+                m.measuring(h)
+                m.advance(h, 1000)
+                m.holdAt(h, 590 + i)
+                m.advance(h, 50)
+            end for
+            m.assertEqual(h.seeks.Count(), watchparty.catchup.HOLD_TRIES)
+            m.assertTrue(h.commands.Peek().playing)
+            m.assertEqual(h.commands.Peek().seek, invalid)
+            m.assertEqual(h.sync.overshoot, invalid)
+        end sub
+
+        @it("turns a playing member's corrections into holds once its landings fall short by more than a second")
+        sub _()
+            h = m.harness()
+            h.autoLand = false
+            m.update(h, { position: 97 })
+            m.command(h, "drift", "play", 100, "playing")
+            m.assertEqual(h.seeks, [100], "nothing learned: the lead rule")
+            m.assertFalse(h.commands.Peek().DoesExist("hold"))
+            m.measuring(h)
+            m.advance(h, 500)
+            ' Landed on a keyframe 2.5 s short of 100.
+            m.update(h, { seeking: false, holding: false, playing: true, wantsPlay: true, position: 97.5, landed: 97.5, landedSeq: h.commands.Peek().seq })
+            while h.seeks.Count() < 2 and h.now < 8000
+                m.follow(h, 3, 50)
+            end while
+            m.assertEqual(h.seeks.Count(), 2)
+            hold = h.commands.Peek()
+            m.assertTrue(hold.hold)
+            m.assertFalse(hold.playing)
+            room = 100 + h.now / 1000#
+            m.assertTrue(m.near(hold.seek - room, 1 + 2.5 + 0.5, 0.06), FormatJson(h.seeks))
+        end sub
+
+        @it("holds instead of reloading an in-place plan whose seeks land short, the host's too")
+        sub _()
+            h = m.harness()
+            h.sync.shortfalls.Push(3)
+            m.update(h, { position: 92 })
+            m.command(h, "far", "play", 100, "playing")
+            m.assertTrue(h.commands.Peek().hold)
+            m.assertFalse(h.commands.Peek().reload)
+            m.assertTrue(m.near(h.seeks[0], 104.5, 0.01))
+            host = m.harness({ selfRole: "host" })
+            host.sync.shortfalls.Push(3)
+            m.update(host, { position: 97 })
+            m.command(host, "far", "play", 100, "playing")
+            m.assertTrue(host.commands.Peek().hold, "a host 3 s off would reload")
+        end sub
+
+        @it("keeps the old rules for a copy remux and for seeks that land within a second")
+        sub _()
+            h = m.harness({}, { planInPlace: false })
+            h.sync.shortfalls.Push(3)
+            m.update(h, { position: 92 })
+            m.command(h, "far", "play", 100, "playing")
+            m.assertTrue(h.commands.Peek().reload)
+            m.assertFalse(h.commands.Peek().DoesExist("hold"))
+            near = m.harness()
+            near.sync.shortfalls.Push(0.6)
+            m.update(near, { position: 98 })
+            m.command(near, "drift", "play", 100, "playing")
+            m.assertEqual(near.seeks, [100])
+            m.assertFalse(near.commands.Peek().DoesExist("hold"))
+            remux = m.harness({}, { position: 0, playing: false, wantsPlay: false, planInPlace: false })
+            m.command(remux, "sync", "play", 600, "playing")
+            m.assertEqual(remux.seeks, [600], "a late joiner on a copy remux seeks to the room")
+        end sub
+
+        @it("runs the room's next command at once during a hold, and never plays the hold after it")
+        sub _()
+            h = m.harness({}, { position: 0, playing: false, wantsPlay: false })
+            h.autoLand = false
+            m.command(h, "sync", "play", 600, "playing")
+            m.measuring(h)
+            m.advance(h, 1000)
+            m.holdAt(h, 610)
+            m.advance(h, 100)
+            m.command(h, "pause", "pause", 601.2, "paused")
+            m.assertEqual(h.commands.Peek().commandId, "pause", "not deferred while the hold reports seeking")
+            m.assertFalse(h.commands.Peek().playing)
+            m.assertEqual(h.sync.overshoot, invalid)
+            count = h.commands.Count()
+            m.update(h, { seeking: false, holding: false })
+            m.advance(h, 12000)
+            m.assertEqual(h.commands.Count(), count, "the hold's play never came")
+        end sub
+
+        @it("plays a hold whose seek never shows a landing, and forgets one the player ended itself")
+        sub _()
+            h = m.harness({}, { position: 0, playing: false, wantsPlay: false })
+            h.autoLand = false
+            m.command(h, "sync", "play", 600, "playing")
+            m.measuring(h)
+            m.advance(h, watchparty.catchup.HOLD_LAND_TIMEOUT_MS - 100)
+            m.assertEqual(h.commands.Count(), 1)
+            m.advance(h, 150)
+            m.assertEqual(h.commands.Count(), 2)
+            m.assertTrue(h.commands.Peek().playing)
+            ended = m.harness({}, { position: 0, playing: false, wantsPlay: false })
+            ended.autoLand = false
+            m.command(ended, "sync", "play", 600, "playing")
+            m.measuring(ended)
+            m.advance(ended, 1000)
+            m.holdAt(ended, 605)
+            m.advance(ended, 100)
+            ' An error, or the player's own limit, ended the hold.
+            m.update(ended, { seeking: false, holding: false, playing: true, wantsPlay: true })
+            m.advance(ended, 100)
+            m.assertEqual(ended.sync.overshoot, invalid)
+            m.assertEqual(ended.commands.Count(), 1, "no play: the player plays on its own")
+        end sub
+
+        @it("plays a hold on time while the socket reconnects")
+        sub _()
+            h = m.harness({}, { position: 0, playing: false, wantsPlay: false })
+            h.autoLand = false
+            m.command(h, "sync", "play", 600, "playing")
+            m.measuring(h)
+            m.advance(h, 1000)
+            m.holdAt(h, 602)
+            h.writable = false
+            watchparty.sync.socketClosed(h.sync)
+            while h.commands.Count() < 2 and h.now < 5000
+                m.advance(h, 50)
+            end while
+            m.assertTrue(h.commands.Peek().playing)
+            m.assertTrue(m.near(600 + h.now / 1000#, 601.9, 0.06), FormatJson(h.now))
+        end sub
+
+        @it("wakes the Task when a hold's play is due")
+        sub _()
+            h = m.harness({}, { position: 0, playing: false, wantsPlay: false })
+            h.autoLand = false
+            m.command(h, "sync", "play", 600, "playing")
+            m.measuring(h)
+            m.advance(h, 1000)
+            m.holdAt(h, 601.2)
+            m.advance(h, 50)
+            due = watchparty.sync.nextWakeMs(h.sync, m.ctx(h))
+            m.assertTrue(due < watchparty.sync.TICK_MS and due >= 0, FormatJson(due))
         end sub
 
         @describe("stalls and catching up")
