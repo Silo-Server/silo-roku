@@ -16,12 +16,14 @@ import "pkg:/source/watchparty/time.bs"
 ' render thread. Nothing here logs a code, ticket, or room proof.
 '
 ' FIELD CONTRACT. AppScene creates one RoomTask and one RoomApiBridge
-' (bridge.task = roomTask) for the app run, runs the Task, and is the only
-' node that sets or observes its fields; screens and the player go through
-' AppScene. Every output is set only when it changes, except the one-shot
-' ones (alwaysNotify), which are set once per event; an observer reads
-' event.getData(), since the Task may set a field again before the render
-' thread runs.
+' (bridge.task = roomTask) for the app run, runs the Task, and publishes it
+' as m.global.roomTask (components/AppSceneWatchParty.bs). AppScene alone
+' sets identity; the Watch Party player alone sets playerSample and
+' session; screens, the player, and AppScene set command and observe the
+' outputs (observeFieldScoped, unobserved when they go). Every output is
+' set only when it changes, except the one-shot ones (alwaysNotify), which
+' are set once per event; an observer reads event.getData(), since the
+' Task may set a field again before the render thread runs.
 '
 ' Inputs
 '   identity      { server, account, profile, borrowed }: the session's
@@ -103,7 +105,8 @@ import "pkg:/source/watchparty/time.bs"
 '                 { attached, catchingUp, syncing, waitingForClock (show
 '                 "Waiting for party timing…"), pendingSeek (the scrubber's
 '                 held target, or invalid), canPlayPause, canSeek,
-'                 selectionPending, title: { contentId, title,
+'                 selectionPending, atEnd (this member's player is parked at
+'                 the end of the file), title: { contentId, title,
 '                 unavailable } }.
 '   suggestions   { items (watchparty.wire suggestions, votedByMe from the
 '                 last read), winnerId, loading }.
@@ -148,6 +151,9 @@ sub serve()
     saved = ""
     if m.section.Exists(watchparty.recent.KEY) then saved = m.section.Read(watchparty.recent.KEY)
     m.socket = invalid
+    ' Socket ID to the closed events still owed by sockets this Task
+    ' released (watchparty.socket.retire).
+    m.retired = {}
     m.room = watchparty.session.create(watchparty.socket.available(), saved, roomEnv())
     m.top.ready = true
     ' An identity set before the Task observed it.
@@ -159,9 +165,9 @@ sub serve()
         if msgType = "roSGNodeEvent"
             onField(msg.getField(), msg.getData())
         else if msgType = "roWebSocketEvent"
-            event = watchparty.socket.event(m.socket, msg)
-            if event <> invalid then execute(watchparty.session.onSocket(m.room, event, roomEnv()))
+            onSocketEvent(msg)
         end if
+        checkQuiet()
         execute(watchparty.session.onTick(m.room, roomEnv()))
     end while
 end sub
@@ -180,6 +186,37 @@ sub onField(field as String, data as Dynamic)
     end if
 end sub
 
+' One roWebSocketEvent: a released socket's closed is consumed; the
+' current socket's events go to the session, and its closed releases it.
+sub onSocketEvent(msg as Object)
+    if watchparty.socket.released(m.retired, msg.GetSocketId(), msg.GetType()) then return
+    handle = m.socket
+    event = watchparty.socket.event(handle, msg, roomNow())
+    if event = invalid then return
+    if event.kind = "close"
+        ' Roku keeps the connection until the object goes, and the object's
+        ' closed has come: release it without owing another.
+        m.socket = invalid
+        log.info("watchparty", "[WP] room socket closed", { epoch: event.epoch, code: event.code })
+    end if
+    execute(watchparty.session.onSocket(m.room, event, roomEnv()))
+end sub
+
+' A socket that showed ping activity and then went quiet is dead
+' (watchparty.socket's liveness): it is closed and reported closed, so the
+' session reconnects.
+sub checkQuiet()
+    handle = m.socket
+    if handle = invalid or not watchparty.socket.isQuiet(handle.live, roomNow()) then return
+    log.warn("watchparty", "[WP] room socket went quiet; reconnecting", { epoch: handle.epoch, quietMs: watchparty.socket.QUIET_MS })
+    closeSocket()
+    execute(watchparty.session.onSocket(m.room, { kind: "close", epoch: handle.epoch, text: "", protocol: "", code: 0 }, roomEnv()))
+end sub
+
+function roomNow() as Integer
+    return watchparty.time.monotonicMs(m.clock)
+end function
+
 ' What the session reads from this Task: the anchored clock, UUIDs, and
 ' jitter.
 function roomEnv() as Object
@@ -197,6 +234,10 @@ end function
 ' Milliseconds to the next due event, or 0 (wait for a message).
 function waitMs() as Integer
     due = watchparty.session.nextWakeMs(m.room, roomEnv())
+    if m.socket <> invalid
+        quiet = watchparty.socket.quietInMs(m.socket.live, roomNow())
+        if quiet <> invalid and (due = invalid or quiet < due) then due = quiet
+    end if
     if due = invalid then return 0
     if due < 1 then return 1
     return due
@@ -211,7 +252,7 @@ sub execute(actions as Object)
         else if kind = "open"
             openSocket(action)
         else if kind = "send"
-            if m.socket = invalid or not watchparty.socket.send(m.socket, action.text) then log.warn("watchparty", "a room message was not sent")
+            if m.socket = invalid or not watchparty.socket.send(m.socket, action.text) then log.warn("watchparty", "[WP] a room message was not sent")
         else if kind = "close"
             closeSocket()
         else if kind = "publish"
@@ -219,12 +260,16 @@ sub execute(actions as Object)
         else if kind = "persist"
             saveRecent(action.text)
         else if kind = "log"
+            ' [WP] marks the room's lines for the party matrix's console
+            ' reader (section 12.3); the session logs no code, ticket, or
+            ' proof.
+            message = "[WP] " + action.message
             if action.level = "warn"
-                log.warn("watchparty", action.message, action.fields)
+                log.warn("watchparty", message, action.fields)
             else if action.level = "info"
-                log.info("watchparty", action.message, action.fields)
+                log.info("watchparty", message, action.fields)
             else
-                log.debug("watchparty", action.message, action.fields)
+                log.debug("watchparty", message, action.fields)
             end if
         end if
     end for
@@ -234,16 +279,19 @@ end sub
 ' one that closed at once, so the session's reconnect rules apply.
 sub openSocket(action as Object)
     closeSocket()
-    m.socket = watchparty.socket.open(action.url, action.protocols, m.port, action.epoch)
+    m.socket = watchparty.socket.open(action.url, action.protocols, m.port, action.epoch, roomNow())
     if m.socket = invalid
-        log.warn("watchparty", "the room socket could not open", { epoch: action.epoch })
+        log.warn("watchparty", "[WP] the room socket could not open", { epoch: action.epoch })
         execute(watchparty.session.onSocket(m.room, { kind: "error", epoch: action.epoch, text: "", protocol: "", code: 0 }, roomEnv()))
     end if
 end sub
 
+' Closes and releases the socket, whose closed event is then owed.
 sub closeSocket()
-    if m.socket = invalid then return
-    watchparty.socket.close(m.socket)
+    handle = m.socket
+    if handle = invalid then return
+    watchparty.socket.close(handle)
+    watchparty.socket.retire(m.retired, handle.id)
     m.socket = invalid
 end sub
 
