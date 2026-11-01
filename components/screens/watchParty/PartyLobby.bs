@@ -25,6 +25,10 @@ const HINT_GAP = 16
 const SEATS_BUTTONS_GAP = 40
 const HINT_WIDTH = 900
 const CAPTION_OPACITY = 0.7
+' A selection's catalog read that fails (other than a 403 or 404) is
+' tried again after 2 s, three reads in all.
+const ITEM_READS = 3
+const ITEM_RETRY_SECONDS = 2
 
 sub init()
     m.backdrop = m.top.findNode("backdrop")
@@ -68,10 +72,19 @@ sub init()
     railInit()
     m.state = partyState()
     ' The selected title as the catalog read it (catalog.detail.fromItem),
-    ' or invalid, and the read under way.
+    ' or invalid, the read under way, the reads sent for it, and whether a
+    ' failed one waits on the retry timer.
     m.item = invalid
     m.itemFor = ""
+    m.itemLibrary = ""
     m.itemHandle = invalid
+    m.itemReads = 0
+    m.itemRetryDue = false
+    m.itemRetry = CreateObject("roSGNode", "Timer")
+    m.itemRetry.setFields({ duration: ITEM_RETRY_SECONDS, repeat: false })
+    m.itemRetry.observeField("fire", "onItemRetry")
+    ' Covered by another screen: refresh waits for revealLobby.
+    m.hidden = false
     ' The last error's text, until the next action.
     m.error = ""
     ' Where focus is: a control key ("code", "options", "rail", "invite",
@@ -95,9 +108,30 @@ sub release()
     m.released = true
     partyUnobserve()
     closeOverlays()
+    m.itemRetry.control = "stop"
+    m.itemRetryDue = false
     if m.itemHandle <> invalid then api.cancel(m.itemHandle)
     m.backdrop.uri = ""
     railRelease()
+end sub
+
+' The page went under another screen: the backdrop and the rail let go of
+' their art, and the room's changes wait for revealLobby.
+sub hideLobby()
+    m.hidden = true
+    m.backdrop.uri = ""
+    railRelease()
+end sub
+
+' Under memory pressure: what is open over the lobby closes too.
+sub detachLobby()
+    closeOverlays()
+end sub
+
+sub revealLobby()
+    if not m.hidden then return
+    m.hidden = false
+    refresh()
 end sub
 
 ' A room Task output changed.
@@ -145,7 +179,7 @@ end sub
 ' ---- Layout -----------------------------------------------------------------
 
 sub refresh()
-    if not m.started or m.released then return
+    if not m.started or m.released or m.hidden then return
     room = watchparty.page.displayRoom(m.state.room, m.state.sync)
     if room = invalid then return
     readSelection(room)
@@ -168,20 +202,30 @@ end sub
 
 ' ---- The selected title -----------------------------------------------------
 
-' Reads the selection's catalog item once per selection; the room hears its
-' name, or that this profile cannot see it (403 or 404).
+' Reads the selection's catalog item once per selection, and again after a
+' failed read (ITEM_READS in all); the room hears its name, or that this
+' profile cannot see it (403 or 404).
 sub readSelection(room as Object)
     id = room.selectedContentId
     if id = m.itemFor then return
     m.itemFor = id
+    m.itemLibrary = util.text(room.selectedLibraryId)
     m.item = invalid
+    m.itemReads = 0
+    m.itemRetry.control = "stop"
+    m.itemRetryDue = false
     if m.itemHandle <> invalid then api.cancel(m.itemHandle)
     m.itemHandle = invalid
     if id = "" then return
+    sendItemRead()
+end sub
+
+sub sendItemRead()
+    m.itemReads = m.itemReads + 1
     m.itemHandle = api.newHandle(m.top.owner)
-    m.itemHandle.addFields({ contentId: id })
+    m.itemHandle.addFields({ contentId: m.itemFor })
     m.itemHandle.observeField("status", "onSelection")
-    api.send(catalog.request.item(id, util.text(room.selectedLibraryId), m.top.lowTier), m.itemHandle)
+    api.send(catalog.request.item(m.itemFor, m.itemLibrary, m.top.lowTier), m.itemHandle)
 end sub
 
 sub onSelection(event as Object)
@@ -195,8 +239,17 @@ sub onSelection(event as Object)
     else if result.status = 403 or result.status = 404
         m.item = { id: handle.contentId, unavailable: true }
         partySend({ kind: "noteTitle", contentId: handle.contentId, title: "", unavailable: true })
+    else if m.itemReads < ITEM_READS
+        m.itemRetryDue = true
+        m.itemRetry.control = "start"
     end if
     refresh()
+end sub
+
+sub onItemRetry()
+    if m.released or not m.itemRetryDue or m.itemFor = "" then return
+    m.itemRetryDue = false
+    sendItemRead()
 end sub
 
 ' The read title for watchparty.page.context, or invalid.
@@ -230,10 +283,11 @@ sub showBackdrop(room as Object)
         if util.isObject(spoilers) then hidden = catalog.spoilers.hidesBackdrop({ spoilerBackdrop: spoilers.spoilerBackdrop, played: item.played }, spoilerSettings())
     else if room.selectionMode = "vote"
         lead = leadingSuggestion()
-        if lead <> invalid and lead.posterUrl <> ""
-            uri = lead.posterUrl
-            isPoster = true
-        end if
+        origin = ""
+        session = api.session.current()
+        if util.isObject(session) then origin = util.text(session.origin)
+        if lead <> invalid then uri = catalog.art.uri(lead.posterUrl, origin)
+        isPoster = uri <> ""
     end if
     m.backdrop.setFields({ lowTier: m.top.lowTier, isPoster: isPoster, hidden: hidden, uri: uri })
 end sub
