@@ -1,3 +1,4 @@
+import "pkg:/components/screens/watchParty/room.bs"
 import "pkg:/source/playback/skipIntro.bs"
 import "pkg:/source/watchparty/player.bs"
 
@@ -35,9 +36,11 @@ function inParty() as Boolean
 end function
 
 ' The entry's party, from onShow. The room Task is AppScene's
-' (m.global.roomTask) unless task names one.
-sub partyBegin(party as Object, task = invalid as Dynamic)
-    if task = invalid and m.global.hasField("roomTask") then task = m.global.roomTask
+' (m.global.roomTask); its changes arrive through a feed of the player's
+' own on the app's PartyRelay (components/screens/watchParty/room.bs), as
+' AppScene alone observes the Task.
+sub partyBegin(party as Object)
+    task = partyTask()
     m.party = {
         task: task,
         roomId: util.text(party.roomId),
@@ -59,15 +62,10 @@ sub partyBegin(party as Object, task = invalid as Dynamic)
         refusedStart: false
     }
     if task <> invalid
-        task.observeFieldScoped("playerCommand", "onPartyCommand")
-        task.observeFieldScoped("sync", "onPartySync")
-        task.observeFieldScoped("connection", "onPartyConnection")
-        task.observeFieldScoped("notice", "onPartyNotice")
+        partyObserve("onPartyFeed", ["playerCommand", "sync", "connection", "notice"])
         if util.isObject(task.sync) then m.party.sync = task.sync
         if util.isObject(task.connection) then m.party.connection = util.text(task.connection.state)
     end if
-    scene = m.top.getScene()
-    if scene.hasField("watchPartyPanel") then scene.observeFieldScoped("watchPartyPanel", "onPartyPanel")
     log.info(LOG_TAG, "[WP] party player", { roomId: m.party.roomId, revision: m.party.revision })
     m.partyTimer.control = "start"
 end sub
@@ -76,21 +74,26 @@ sub partyRelease()
     party = m.party
     if party = invalid then return
     m.partyTimer.control = "stop"
-    task = party.task
-    if task <> invalid
-        task.unobserveFieldScoped("playerCommand")
-        task.unobserveFieldScoped("sync")
-        task.unobserveFieldScoped("connection")
-        task.unobserveFieldScoped("notice")
-        ' The session closed with the player (section 7.3).
-        if party.sessionSent <> "" then task.session = {}
-    end if
+    partyUnobserve()
+    ' The session closed with the player (section 7.3).
+    if party.task <> invalid and party.sessionSent <> "" then party.task.session = {}
     scene = m.top.getScene()
-    if scene.hasField("watchPartyPanel")
-        scene.unobserveFieldScoped("watchPartyPanel")
-        if party.panelOpen then scene.watchPartyPanel = { open: false, reason: "closed" }
-    end if
+    if party.panelOpen and scene.hasField("watchPartyPanel") then scene.watchPartyPanel = { open: false, reason: "closed" }
     party.sessionSent = ""
+end sub
+
+' A room Task output, through the player's feed.
+sub onPartyFeed(event as Object)
+    change = partyChange(event)
+    if change.field = "playerCommand"
+        onPartyCommand(change.data)
+    else if change.field = "sync"
+        onPartySync(change.data)
+    else if change.field = "connection"
+        onPartyConnection(change.data)
+    else if change.field = "notice"
+        onPartyNotice(change.data)
+    end if
 end sub
 
 ' AppScene closes the player for the room (the lobby, or the end of the
@@ -109,9 +112,11 @@ function partyHoldsBack() as Boolean
 end function
 
 ' The room panel over the player (docs/watch-party.md section 11, Hooks):
-' AppScene's watchPartyPanel, which its owner shows over the player with
-' "Return to playback"; Back in it, or that button, closes it, and the
-' player takes focus back (onPartyPanel).
+' the player asks AppScene for it through AppScene.watchPartyPanel; AppScene
+' creates it over the player and gives it focus, and once it closes (Back,
+' "Return to playback", or the party leaving) calls partyPanelClosed,
+' which gives focus back to the player. While it is open the player takes
+' no focus.
 sub partyPanel(reason as String)
     log.info(LOG_TAG, "[WP] room panel", { reason: reason })
     scene = m.top.getScene()
@@ -120,15 +125,18 @@ sub partyPanel(reason as String)
     scene.watchPartyPanel = { open: true, reason: reason }
 end sub
 
-sub onPartyPanel(event as Object)
-    if m.party = invalid then return
-    data = event.getData()
-    if util.isObject(data) and util.isTrue(data.open) then return
-    if not m.party.panelOpen then return
+' AppScene closed the room panel.
+sub partyPanelClosed()
+    if m.party = invalid or not m.party.panelOpen then return
     m.party.panelOpen = false
-    if m.closed then return
+    if m.closed or m.leaving or m.released then return
     applyFocus()
 end sub
+
+' Whether the room panel covers the player, which keeps its focus off.
+function partyPanelOpen() as Boolean
+    return m.party <> invalid and m.party.panelOpen
+end function
 
 ' ---- Transport requests (section 4.10)
 
@@ -165,9 +173,8 @@ end function
 ' One playerCommand, executed now (watchparty.player.steps): the play state
 ' first, so a load the seek opens follows it, then the seek or reload,
 ' each through the session reducer as every seek goes.
-sub onPartyCommand(event as Object)
+sub onPartyCommand(command as Dynamic)
     if m.party = invalid or m.closed or m.leaving then return
-    command = event.getData()
     if not util.isObject(command) then return
     now = m.env.now()
     for each stepOf in watchparty.player.steps(command, { atEnd: partyAtEnd() })
@@ -274,17 +281,15 @@ end function
 
 ' ---- The room's view
 
-sub onPartySync(event as Object)
+sub onPartySync(data as Dynamic)
     if m.party = invalid then return
-    data = event.getData()
     if not util.isObject(data) then data = {}
     m.party.sync = data
     refreshChrome()
 end sub
 
-sub onPartyConnection(event as Object)
+sub onPartyConnection(data as Dynamic)
     if m.party = invalid then return
-    data = event.getData()
     state = ""
     if util.isObject(data) then state = util.text(data.state)
     if state <> m.party.connection then log.info(LOG_TAG, "[WP] room connection", { state: state })
@@ -294,9 +299,8 @@ end sub
 
 ' The Task's notices for the player: a request the room refused, or one
 ' that waits for the connection.
-sub onPartyNotice(event as Object)
+sub onPartyNotice(data as Dynamic)
     if m.party = invalid then return
-    data = event.getData()
     if not util.isObject(data) or data.scope <> "player" then return
     text = util.text(data.text)
     if util.text(data.key) <> "" then text = i18n.text(data.key, data.values)
