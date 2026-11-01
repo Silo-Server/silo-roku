@@ -6,8 +6,8 @@ and the routes), AppScene's wiring, the player's part, and the screens
 room panel, and the entry points) are tested headless (section 12.2) and
 on a Roku Ultra 4850X and a Streaming Stick 3840R (Roku OS 16.0.4),
 against a sandbox server with a web client as the other member. Spikes
-W0-1, W0-2, and W0-4 ran (section 12.1; W0-4's peak on the Stick was
-98 MB, about 34% of the app's limit). Every guest and host flow passed
+W0-1 to W0-4 ran (section 12.1; W0-4's peak on the Stick was 98 MB,
+about 34% of the app's limit). Every guest and host flow passed
 on both devices: joining by code, starts on direct, copy-remux, and
 transcode plans, pause, resume, and seek barriers, refusals, the room
 panel, a late join and Continue here on a long-GOP direct file, socket
@@ -1105,8 +1105,8 @@ The player's part:
 | --- | --- | --- |
 | W0-1 (ran; section 2.1) | `roWebSocket`: can the app send `Sec-WebSocket-Protocol: silo.room.v2, silo.ticket.{t}` and read the server's choice; does it answer ping frames; does `wss://` verify with the system CA bundle; how large a message arrives; does it run in a Task; what close events look like | A sandbox room socket stays open past 60 s and receives a snapshot; a 5 MB message arrives or fails cleanly |
 | W0-2 (ran for direct play; section 7.4) | Where `Video.seek` lands for direct, remux, and transcode plans, and how long it takes | Landing error per plan type, to set section 7.4's acknowledgement and 7.5's in-place rule. Direct play: 0.17 to 1.56 s short (2.002 s GOP), resumes in 209 to 721 ms, the target echoed first. Copy remux seeks through `seek_reanchor`; on the Streaming Stick 27 of 28 landed 4 to 8 s past the target until the lead-in reanchor (spec section 5.7), then 14 of 14 within 1.06 s, playing 3.0 to 6.4 s after the seek. Transcode: not measured |
-| W0-3 | Delay from the task's field write at `execute_at` to the render thread's `Video` call, on the Ultra and a 1 GB device | Under 50 ms at the 95th percentile |
-| W0-4 | Memory with the room task, the lobby, and a 200-suggestion ballot open | Within the memory monitor's budget (spec section 4) |
+| W0-3 (ran on the Stick) | Delay from the task's field write at `execute_at` to the render thread's `Video` call, on the Ultra and a 1 GB device | Under 50 ms at the 95th percentile. Stick, 200 samples a run: steady playback p95 0 to 11 ms (max 52); right after direct-play seeks, while the progressive download refills, p95 58 to 86 ms (max 118). The `Video` call itself takes 3 ms or less |
+| W0-4 (ran on the Stick) | Memory with the room task, the lobby, and a 200-suggestion ballot open | Within the memory monitor's budget (spec section 4) |
 
 ### 12.2 Unit tests
 
