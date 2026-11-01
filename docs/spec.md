@@ -3744,7 +3744,14 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   once it settles the client checks the plan's rendition as it checks a
   sidecar and selects it by that name if Roku shows another, as after a
   reload of a plan switched in place, whose playlist still names the first
-  track. A switch in place writes `Video.subtitleTrack` to the listed name.
+  track. Until that check, new content of such a stream draws nothing when
+  the plan selects a rendition or a sidecar (`suppressCaptions`): on the
+  Ultra, Roku opened new content on its own rendition in the caption
+  language, English, whether the playlist's `DEFAULT` named the plan's
+  Chinese track or the plan selected an Arabic sidecar, and kept it until
+  the check 3 seconds after the first frame (2026-10-31 regression run).
+  Subtitles there show from that check, on the plan's track. A switch in
+  place writes `Video.subtitleTrack` to the listed name.
   Off stays `suppressCaptions`: every rendition is `AUTOSELECT=YES`, and
   Roku would otherwise show one by the caption language, so a start with
   subtitles Off under caption mode On draws nothing. Content with a
