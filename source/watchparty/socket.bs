@@ -1,0 +1,100 @@
+import "pkg:/source/util/values.bs"
+
+' The room socket over Roku OS 16's roWebSocket (docs/watch-party.md
+' section 2), kept thin so spike W0-1's findings change only this file.
+' The room Task alone uses it; nothing here logs a ticket or a frame.
+'
+' What this assumes until W0-1 confirms it on a Roku Ultra (the names are
+' those of Roku's roWebSocket page as brs-node 2.6 implements it):
+'   - SetProtocols("silo.room.v2, silo.ticket.<t>") sends
+'     Sec-WebSocket-Protocol exactly so, and the opened event's Protocol
+'     (or GetSelectedProtocol) is the server's answer. PROTOCOLS_AS_HEADER
+'     sends the same value with ifHttpAgent's AddHeader instead.
+'   - SetAutoPingReply(true) answers the server's ping frames with pongs,
+'     which the server requires every 30 s (section 2.2).
+'   - wss:// verifies the server against the system CA bundle, as
+'     roUrlTransfer does.
+'   - Events are roWebSocketEvent with GetType() 1 opened, 2 closed,
+'     3 error, 5 text received; GetInfo() carries Protocol, Code, Reason,
+'     and Text.
+namespace watchparty.socket
+    const CA_BUNDLE = "common:/certs/ca-bundle.crt"
+    ' Whether the subprotocol goes as a header rather than through
+    ' SetProtocols; W0-1 decides.
+    const PROTOCOLS_AS_HEADER = false
+    const EVENT_OPENED = 1
+    const EVENT_CLOSED = 2
+    const EVENT_ERROR = 3
+    const EVENT_TEXT = 5
+
+    ' Whether this Roku has roWebSocket (Roku OS 16.0 and later). The app
+    ' tests the object, never the version (section 3). brighterscript 0.73
+    ' predates Roku OS 16 and does not know the component.
+    function available() as Boolean
+        ' bs:disable-next-line: 1129
+        return type(CreateObject("roWebSocket")) = "roWebSocket"
+    end function
+
+    ' Opens url with the room's subprotocols, its events going to port.
+    ' Gives { ws, epoch, id }, or invalid when the object or the open
+    ' failed; epoch marks the events (watchparty.session.onSocket).
+    function open(url as String, protocols as String, port as Object, epoch as Integer) as Dynamic
+        ' bs:disable-next-line: 1129
+        ws = CreateObject("roWebSocket")
+        if type(ws) <> "roWebSocket" then return invalid
+        ws.SetMessagePort(port)
+        if LCase(Left(url, 6)) = "wss://" then ws.SetCertificatesFile(CA_BUNDLE)
+        if PROTOCOLS_AS_HEADER
+            ws.AddHeader("Sec-WebSocket-Protocol", protocols)
+        else
+            ws.SetProtocols(protocols)
+        end if
+        ws.SetAutoPingReply(true)
+        if not ws.SetUrl(url) then return invalid
+        if not ws.Open() then return invalid
+        return { ws: ws, epoch: epoch, id: ws.GetSocketId() }
+    end function
+
+    ' Sends one text frame. Gives whether the socket took it.
+    function send(handle as Object, text as String) as Boolean
+        return handle.ws.Send(text) <> invalid
+    end function
+
+    sub close(handle as Object)
+        handle.ws.Close(1000, "")
+    end sub
+
+    ' A port message as the session's socket event, or invalid when it is
+    ' another socket's or an event the session does not use.
+    function event(handle as Dynamic, msg as Dynamic) as Dynamic
+        if handle = invalid or type(msg) <> "roWebSocketEvent" or msg.GetSocketId() <> handle.id then return invalid
+        info = msg.GetInfo()
+        mapped = mapEvent(msg.GetType(), info, handle.epoch)
+        if mapped <> invalid and mapped.kind = "open" and mapped.protocol = "" then mapped.protocol = util.text(handle.ws.GetSelectedProtocol())
+        return mapped
+    end function
+
+    ' roWebSocketEvent's type and info as { kind, epoch, text, protocol,
+    ' code }: kind "open", "close", "error", or "text"; invalid for sent,
+    ' binary, ping, pong, and timer events.
+    function mapEvent(eventType as Integer, info as Dynamic, epoch as Integer) as Dynamic
+        if not util.isObject(info) then info = {}
+        out = { kind: "", epoch: epoch, text: "", protocol: "", code: 0 }
+        if eventType = EVENT_OPENED
+            out.kind = "open"
+            out.protocol = util.text(info.Protocol)
+        else if eventType = EVENT_CLOSED
+            out.kind = "close"
+            if util.isNumber(info.Code) then out.code = info.Code
+        else if eventType = EVENT_ERROR
+            out.kind = "error"
+            if util.isNumber(info.Error) then out.code = info.Error
+        else if eventType = EVENT_TEXT
+            out.kind = "text"
+            out.text = util.text(info.Text)
+        else
+            return invalid
+        end if
+        return out
+    end function
+end namespace

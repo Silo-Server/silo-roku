@@ -1,0 +1,523 @@
+import "pkg:/source/watchparty/session.bs"
+import "pkg:/source/watchparty/time.bs"
+
+namespace tests
+
+    ' The room Task's logic driven as RoomTask runs it, with a fake server
+    ' answering its requests and a fake socket: what it sends, opens, and
+    ' publishes, in order, over simulated time.
+    @suite("watch party session")
+    class WatchPartySessionTests extends rooibos.BaseTestSuite
+
+        function wall() as Double
+            return 1790272800000#
+        end function
+
+        function harness() as Object
+            h = { now: 0, http: [], opens: [], sends: [], closes: 0, published: {}, publishes: [], persisted: [], logs: [] }
+            h.s = watchparty.session.create(true, "", m.env(h))
+            m.collect(h, watchparty.session.onIdentity(h.s, { server: "https://silo.example", account: "12", profile: "p-host" }, m.env(h)))
+            return h
+        end function
+
+        function env(h as Object) as Object
+            return { now: h.now, wallMs: m.wall() + h.now, uuid: tests.party.uuid, random: tests.party.noJitter }
+        end function
+
+        sub collect(h as Object, actions as Object)
+            for each action in actions
+                kind = action.kind
+                if kind = "http"
+                    h.http.Push(action)
+                else if kind = "open"
+                    h.opens.Push(action)
+                else if kind = "send"
+                    h.sends.Push(ParseJson(action.text))
+                else if kind = "close"
+                    h.closes = h.closes + 1
+                else if kind = "publish"
+                    h.published[action.field] = action.value
+                    h.publishes.Push(action)
+                else if kind = "persist"
+                    h.persisted.Push(action.text)
+                else if kind = "log"
+                    h.logs.Push(action)
+                end if
+            end for
+        end sub
+
+        sub command(h as Object, input as Object)
+            m.collect(h, watchparty.session.onCommand(h.s, input, m.env(h)))
+        end sub
+
+        ' The oldest request whose path ends with suffix (and method, when
+        ' given), taken off the queue; invalid when none.
+        function take(h as Object, suffix as String, method = "" as String) as Dynamic
+            for i = 0 to h.http.Count() - 1
+                req = h.http[i].request
+                path = req.path
+                if Right(path, Len(suffix)) = suffix and (method = "" or req.method = method)
+                    found = h.http[i]
+                    h.http.Delete(i)
+                    return found
+                end if
+            end for
+            return invalid
+        end function
+
+        ' Answers the request for suffix with status and body; status 0 is a
+        ' network failure.
+        function respond(h as Object, suffix as String, status as Integer, body = invalid as Dynamic, method = "" as String) as Object
+            pending = m.take(h, suffix, method)
+            m.assertNotInvalid(pending, "no request for " + suffix)
+            envelope = { requestId: pending.tag, ok: (status >= 200 and status < 300) or status = 304, status: status, headers: {}, body: body, error: invalid }
+            if not envelope.ok
+                kind = "http"
+                if status = 0 then kind = "network"
+                envelope.error = { kind: kind, status: status }
+            end if
+            m.collect(h, watchparty.session.onHttp(h.s, pending.tag, envelope, m.env(h)))
+            return pending.request
+        end function
+
+        sub socket(h as Object, kind as String, fields = {} as Object)
+            event = { kind: kind, epoch: h.opens.Peek().epoch }
+            event.Append(fields)
+            m.collect(h, watchparty.session.onSocket(h.s, event, m.env(h)))
+        end sub
+
+        sub frame(h as Object, text as String)
+            m.socket(h, "text", { text: text })
+        end sub
+
+        sub advance(h as Object, ms as Integer)
+            for i = 1 to ms \ 50
+                h.now = h.now + 50
+                m.collect(h, watchparty.session.onTick(h.s, m.env(h)))
+            end for
+        end sub
+
+        sub supported(h as Object)
+            m.command(h, { kind: "checkSupport" })
+            caps = tests.party.fixture("capabilities")
+            caps.allowed = true
+            m.respond(h, "/watch-together/capabilities", 200, caps)
+            m.respond(h, "/playback/capabilities", 200, tests.party.fixture("playback_capabilities"))
+        end sub
+
+        ' Joins room_http's room and opens its socket.
+        sub joined(h as Object)
+            m.supported(h)
+            m.command(h, { kind: "join", code: "k7pq-2m4x", tag: "t1" })
+            m.respond(h, "/watch-together/join", 200, tests.party.fixture("room_http"))
+            m.respond(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", 200, tests.party.fixture("room_http"), "GET")
+            m.respond(h, "/ws-ticket", 200, tests.party.fixture("ws_ticket"))
+            m.socket(h, "open", { protocol: "silo.room.v2" })
+        end sub
+
+        function sent(h as Object, kind as String) as Object
+            out = []
+            for each message in h.sends
+                if message.type = kind then out.Push(message)
+            end for
+            return out
+        end function
+
+        function published(h as Object, field as String) as Object
+            out = []
+            for each action in h.publishes
+                if action.field = field then out.Push(action.value)
+            end for
+            return out
+        end function
+
+        @describe("support")
+
+        @it("checks both capability documents and keeps the last answer when a check fails")
+        sub _()
+            ' Signing in to a profile starts the check.
+            h = m.harness()
+            m.assertEqual(h.published.support.state, "checking")
+            m.command(h, { kind: "checkSupport" })
+            m.assertEqual(h.http.Count(), 2, "one check at a time")
+            caps = tests.party.fixture("capabilities")
+            caps.allowed = true
+            m.respond(h, "/watch-together/capabilities", 200, caps)
+            m.respond(h, "/playback/capabilities", 200, tests.party.fixture("playback_capabilities"))
+            m.assertEqual(h.published.support.state, "available")
+            m.assertTrue(h.published.support.features.lobbyReady)
+            m.command(h, { kind: "checkSupport" })
+            m.respond(h, "/watch-together/capabilities", 0)
+            m.respond(h, "/playback/capabilities", 503)
+            m.assertEqual(h.published.support.state, "available")
+            m.assertEqual(h.published.notice.key, "watchParty.error.supportCheck")
+        end sub
+
+        @it("refuses a party before support is known")
+        sub _()
+            h = m.harness()
+            m.command(h, { kind: "join", code: "K7PQ2M4X", tag: "t" })
+            m.assertEqual(h.published.result, { kind: "join", tag: "t", ok: false, errorKey: "watchParty.error.unavailable", detail: "watchParty.error.unavailable" })
+            m.assertInvalid(m.take(h, "/watch-together/join"))
+        end sub
+
+        @describe("joining and the connection (section 6.1)")
+
+        @it("joins, reads the room, takes a ticket, and opens the socket with the proof only in headers")
+        sub _()
+            h = m.harness()
+            m.supported(h)
+            m.command(h, { kind: "join", code: "k7pq-2m4x", tag: "t1" })
+            join = m.respond(h, "/watch-together/join", 200, tests.party.fixture("room_http"))
+            m.assertEqual(join.body, { code: "K7PQ2M4X" })
+            m.assertTrue(h.published.result.ok)
+            m.assertEqual(h.published.connection.state, "connecting")
+            m.assertEqual(h.published.room.roomId, "9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10")
+            proof = tests.party.fixture("room_http").room_access_token
+            read = m.respond(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", 200, tests.party.fixture("room_http"), "GET")
+            m.assertEqual(read.headers["X-Room-Token"], proof)
+            ticket = m.respond(h, "/ws-ticket", 200, tests.party.fixture("ws_ticket"))
+            m.assertEqual(ticket.headers["X-Room-Token"], proof)
+            m.assertEqual(h.opens.Count(), 1)
+            m.assertEqual(h.opens[0].url, "wss://silo.example/api/v2/watch-together/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10/ws")
+            m.assertEqual(h.opens[0].protocols, "silo.room.v2, silo.ticket.wpt_Kq3v9Zr0aL5mN2bX7cY4")
+            m.socket(h, "open", { protocol: "silo.room.v2" })
+            m.assertEqual(h.published.connection.state, "connected")
+            m.assertEqual(m.sent(h, "ping").Count(), 1, "the clock starts at once")
+            m.advance(h, 50)
+            m.assertNotInvalid(m.take(h, "/suggestions"), "suggestions are read after each connect")
+        end sub
+
+        @it("never logs the code, the ticket, or the room proof")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.socket(h, "close")
+            m.advance(h, 1000)
+            text = FormatJson(h.logs)
+            for each secret in ["K7PQ2M4X", "wpt_Kq3v9Zr0aL5mN2bX7cY4", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"]
+                m.assertEqual(Instr(1, text, secret), 0, secret)
+            end for
+            m.assertTrue(h.logs.Count() > 0)
+        end sub
+
+        @it("remembers the party for Rejoin without its proof")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            saved = h.persisted.Peek()
+            m.assertTrue(Instr(1, saved, "K7PQ2M4X") > 0)
+            m.assertEqual(Instr(1, saved, "eyJhbGc"), 0)
+            m.assertEqual(Instr(1, saved, "wpt_"), 0)
+        end sub
+
+        @it("refuses a second party")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.command(h, { kind: "join", code: "ZZZZZZZZ" })
+            m.assertEqual(h.published.result.errorKey, "watchParty.error.alreadyInParty")
+        end sub
+
+        @it("reconnects at once after a routine rotation and backs off after a quick failure")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.advance(h, 40000)
+            m.socket(h, "close")
+            m.assertEqual(h.published.connection.state, "connected", "no Reconnecting for the 5-minute rotation")
+            m.respond(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", 200, tests.party.fixture("room_http"), "GET")
+            m.respond(h, "/ws-ticket", 200, tests.party.fixture("ws_ticket"))
+            m.assertEqual(h.opens.Count(), 2)
+            m.socket(h, "open", { protocol: "silo.room.v2" })
+            m.socket(h, "close")
+            m.assertEqual(h.published.connection.state, "reconnecting")
+            m.advance(h, 450)
+            m.assertInvalid(m.take(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", "GET"))
+            m.advance(h, 100)
+            m.assertNotInvalid(m.take(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", "GET"))
+        end sub
+
+        @it("counts an error followed by a close as one failure")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.socket(h, "error")
+            m.socket(h, "close")
+            m.assertEqual(h.s.party.conn.policy.failures, 1)
+            m.advance(h, 550)
+            m.assertNotInvalid(m.take(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", "GET"))
+            m.assertInvalid(m.take(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", "GET"))
+        end sub
+
+        @it("ignores events of a socket it replaced")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            old = h.opens.Peek().epoch
+            m.advance(h, 40000)
+            m.socket(h, "close")
+            m.respond(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", 200, tests.party.fixture("room_http"), "GET")
+            m.respond(h, "/ws-ticket", 200, tests.party.fixture("ws_ticket"))
+            m.collect(h, watchparty.session.onSocket(h.s, { kind: "text", epoch: old, text: tests.party.text("socket_room_closed") }, m.env(h)))
+            m.assertEqual(m.published(h, "ended").Count(), 0)
+        end sub
+
+        @describe("endings (section 4.11)")
+
+        @it("ends for room_closed and forgets the recent party")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.frame(h, tests.party.text("socket_room_closed"))
+            m.assertEqual(h.published.ended.reason, "ended")
+            m.assertEqual(h.published.ended.messageKey, "watchParty.ended.ended")
+            m.assertEqual(h.published.ended.rejoin, "none")
+            m.assertEqual(h.published.room, {})
+            m.assertEqual(h.published.connection.state, "ended")
+            m.assertEqual(h.published.recent, {})
+            m.assertEqual(h.closes, 1)
+        end sub
+
+        @it("offers Continue here after another device took the profile over")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.frame(h, tests.party.text("socket_connection_replaced"))
+            m.assertEqual(h.published.ended.rejoin, "continueHere")
+            m.assertTrue(h.published.recent.replaced)
+            m.assertEqual(h.published.recent.code, "K7PQ2M4X")
+        end sub
+
+        @it("ends on a 409 read and expires on a refused ticket")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.advance(h, 40000)
+            m.socket(h, "close")
+            m.respond(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", 409, invalid, "GET")
+            m.assertEqual(h.published.ended.reason, "ended")
+            h = m.harness()
+            m.joined(h)
+            m.advance(h, 40000)
+            m.socket(h, "close")
+            m.respond(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", 200, tests.party.fixture("room_http"), "GET")
+            m.respond(h, "/ws-ticket", 403)
+            m.assertEqual(h.published.ended.reason, "expired")
+            m.assertEqual(h.published.ended.rejoin, "rejoin")
+        end sub
+
+        @it("ends when the socket picks another protocol")
+        sub _()
+            h = m.harness()
+            m.supported(h)
+            m.command(h, { kind: "join", code: "K7PQ2M4X" })
+            m.respond(h, "/watch-together/join", 200, tests.party.fixture("room_http"))
+            m.respond(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", 200, tests.party.fixture("room_http"), "GET")
+            m.respond(h, "/ws-ticket", 200, tests.party.fixture("ws_ticket"))
+            m.socket(h, "open", { protocol: "silo.events.v2" })
+            m.assertEqual(h.published.ended.reason, "expired")
+        end sub
+
+        @it("leaves silently when the profile changes")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.collect(h, watchparty.session.onIdentity(h.s, { server: "https://silo.example", account: "12", profile: "p-other" }, m.env(h)))
+            m.assertEqual(m.published(h, "ended").Count(), 0)
+            m.assertEqual(h.published.room, {})
+            m.assertEqual(h.published.connection.state, "idle")
+            m.assertEqual(h.closes, 1)
+        end sub
+
+        @describe("rejoin (section 4.3)")
+
+        @it("rejoins with the stored code and forgets a party refused for good")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.command(h, { kind: "leave" })
+            m.assertEqual(h.published.recent.code, "K7PQ2M4X")
+            m.command(h, { kind: "rejoin" })
+            m.assertEqual(m.respond(h, "/watch-together/join", 404).body, { code: "K7PQ2M4X" })
+            m.assertEqual(h.published.result.errorKey, "watchParty.error.notFound")
+            m.assertEqual(h.published.recent, {})
+        end sub
+
+        @it("refuses a rejoin that lands in another room")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.command(h, { kind: "leave" })
+            m.command(h, { kind: "rejoin" })
+            other = tests.party.fixture("room_http")
+            other.room.room_id = "another-room"
+            m.respond(h, "/watch-together/join", 200, other)
+            m.assertFalse(h.published.result.ok)
+            m.assertEqual(h.published.room, {})
+        end sub
+
+        @describe("hosting")
+
+        @it("reuses the room ID after an uncertain create, then stages the title")
+        sub _()
+            h = m.harness()
+            m.supported(h)
+            selection = { contentId: "movie:heat-1995", fileId: "42", libraryId: "7" }
+            m.command(h, { kind: "create", mode: "host_pick", selection: selection, title: "Heat" })
+            first = m.respond(h, "/watch-together/rooms", 0, invalid, "POST")
+            m.assertFalse(h.published.result.ok)
+            m.command(h, { kind: "create", mode: "host_pick", selection: selection, title: "Heat" })
+            lobby = tests.party.fixture("room_lobby_vote")
+            lobby.room.selection_mode = "host_pick"
+            again = m.respond(h, "/watch-together/rooms", 201, lobby, "POST")
+            m.assertEqual(again.body.room_id, first.body.room_id)
+            staged = m.take(h, "/staged-selection", "PUT")
+            m.assertNotInvalid(staged, "the title is staged in the new lobby")
+            m.assertEqual(staged.request.body, { content_id: "movie:heat-1995", file_id: "42", library_id: "7" })
+            m.assertTrue(h.published.sync.selectionPending)
+        end sub
+
+        @it("never sends start twice: an uncertain start reads the room back")
+        sub _()
+            h = m.harness()
+            m.supported(h)
+            m.command(h, { kind: "create", mode: "host_pick" })
+            lobby = tests.party.fixture("room_lobby_vote")
+            lobby.room.selection_mode = "host_pick"
+            lobby.room.selected_content_id = "movie:heat-1995"
+            m.respond(h, "/watch-together/rooms", 201, lobby, "POST")
+            m.respond(h, "/rooms/5d0b7e21-8a44-4c2e-b9f6-0f3a1c2d4e5f", 200, lobby, "GET")
+            m.command(h, { kind: "start", tag: "go" })
+            start = m.respond(h, "/playback/start", 0)
+            m.assertTrue(start.once)
+            m.assertFalse(h.published.result.ok)
+            m.assertInvalid(m.take(h, "/playback/start"), "never resent")
+            m.assertNotInvalid(m.take(h, "/rooms/5d0b7e21-8a44-4c2e-b9f6-0f3a1c2d4e5f", "GET"), "read back instead")
+        end sub
+
+        @it("refuses a guest's host commands")
+        sub _()
+            h = m.harness()
+            m.supported(h)
+            m.command(h, { kind: "join", code: "Q2W8RT5N" })
+            guest = tests.party.fixture("socket_snapshot")
+            m.respond(h, "/watch-together/join", 200, { room: guest.room, room_access_token: "proof" })
+            for each kind in ["end", "start", "stop"]
+                m.command(h, { kind: kind })
+                m.assertEqual(h.published.result.errorKey, "watchParty.error.forbidden", kind)
+            end for
+            m.command(h, { kind: "select", contentId: "movie:1" })
+            m.assertEqual(h.published.result.errorKey, "watchParty.error.forbidden")
+            m.assertInvalid(m.take(h, "/watch-together/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", "DELETE"))
+        end sub
+
+        @describe("suggestions (section 4.5)")
+
+        @it("reads after a broadcast, follows pages, and keeps its own votes")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.advance(h, 50)
+            m.respond(h, "/suggestions", 200, { items: [], page: { has_more: false } })
+            m.frame(h, tests.party.text("socket_suggestions_update"))
+            m.assertEqual(h.published.suggestions.items.Count(), 2)
+            m.assertEqual(h.published.suggestions.winnerId, "b2a1")
+            m.advance(h, 150)
+            m.assertInvalid(m.take(h, "/suggestions"), "waits 200 ms")
+            m.advance(h, 100)
+            first = m.respond(h, "/suggestions", 200, tests.party.fixture("suggestions_page"))
+            m.assertEqual(first.query, { limit: 100 })
+            last = m.respond(h, "/suggestions", 200, { items: [tests.party.fixture("socket_suggestions_update").suggestions[0]], page: { has_more: false } })
+            m.assertEqual(last.query.cursor, "c2VlZDoy")
+            items = h.published.suggestions.items
+            m.assertEqual(items.Count(), 2)
+            m.assertTrue(items[0].votedByMe, "from the HTTP read")
+        end sub
+
+        @it("reads again rather than replaying a vote whose answer was lost")
+        sub _()
+            h = m.harness()
+            m.supported(h)
+            m.command(h, { kind: "join", code: "Q2W8RT5N" })
+            m.respond(h, "/watch-together/join", 200, tests.party.fixture("room_lobby_vote"))
+            m.respond(h, "/rooms/5d0b7e21-8a44-4c2e-b9f6-0f3a1c2d4e5f", 200, tests.party.fixture("room_lobby_vote"), "GET")
+            m.respond(h, "/ws-ticket", 200, tests.party.fixture("ws_ticket"))
+            m.socket(h, "open", { protocol: "silo.room.v2" })
+            m.advance(h, 50)
+            m.respond(h, "/suggestions", 200, tests.party.fixture("suggestions_page"))
+            m.respond(h, "/suggestions", 200, { items: [], page: { has_more: false } })
+            m.command(h, { kind: "vote", suggestionId: "a9f0" })
+            m.respond(h, "/suggestions/a9f0/vote", 0, invalid, "POST")
+            m.assertFalse(h.published.result.ok)
+            m.advance(h, 50)
+            m.assertInvalid(m.take(h, "/suggestions/a9f0/vote"), "never replayed")
+            m.assertNotInvalid(m.take(h, "/suggestions", "GET"))
+        end sub
+
+        @it("suggests only from the lobby")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.command(h, { kind: "suggest", contentId: "movie:1", title: "One" })
+            m.assertEqual(h.published.result.errorKey, "watchParty.entry.lobbyOnly")
+        end sub
+
+        @describe("playback (section 7)")
+
+        @it("attaches the committed session, keeps time from pongs, and executes a command at its time")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            ping = m.sent(h, "ping")[0]
+            ' The server's clock runs 500 ms ahead; a 40 ms round trip.
+            h.now = h.now + 40
+            sentAt = watchparty.time.parseMs(ping.client_sent_at)
+            pong = { type: "pong", client_sent_at: ping.client_sent_at, server_received_at: watchparty.time.formatMs(sentAt + 520), server_sent_at: watchparty.time.formatMs(sentAt + 520) }
+            m.frame(h, FormatJson(pong))
+            m.collect(h, watchparty.session.onPlaybackSession(h.s, { sessionId: "ps_7d1f0c", revision: 3 }, m.env(h)))
+            m.assertEqual(m.sent(h, "attach_session")[0].session_id, "ps_7d1f0c")
+            m.collect(h, watchparty.session.onSample(h.s, { sessionId: "ps_7d1f0c", revision: 3, position: 812, playing: false, wantsPlay: false, playable: true, planInPlace: true }, m.env(h)))
+            serverNow = m.wall() + h.now + 500
+            cmd = { type: "transport_command", command: { command_id: "c1", session_id: "", selection_revision: 3, action: "seek", position_seconds: 900.5, execute_at: watchparty.time.formatMs(serverNow + 300), issued_at: watchparty.time.formatMs(serverNow), playback_state: "waiting" } }
+            m.frame(h, FormatJson(cmd))
+            m.assertEqual(m.published(h, "playerCommand").Count(), 0, "not before execute_at")
+            m.advance(h, 250)
+            m.assertEqual(m.published(h, "playerCommand").Count(), 0)
+            m.advance(h, 100)
+            player = h.published.playerCommand
+            m.assertEqual(player.seek, 900.5)
+            m.assertEqual(player.commandId, "c1")
+            m.assertFalse(player.playing)
+        end sub
+
+        @it("says Only the host can seek for a guest's seek")
+        sub _()
+            h = m.harness()
+            m.supported(h)
+            m.command(h, { kind: "join", code: "K7PQ2M4X" })
+            guest = tests.party.fixture("socket_snapshot")
+            m.respond(h, "/watch-together/join", 200, { room: guest.room, room_access_token: "proof" })
+            m.respond(h, "/rooms/9f3c1a52-3c4e-4f7b-9a0e-6b2d8c1e7a10", 200, { room: guest.room, room_access_token: "proof" }, "GET")
+            m.respond(h, "/ws-ticket", 200, tests.party.fixture("ws_ticket"))
+            m.socket(h, "open", { protocol: "silo.room.v2" })
+            m.command(h, { kind: "transportRequest", action: "seek", position: 10, paused: true })
+            m.assertEqual(h.published.notice, { scope: "player", key: "watchParty.player.hostOnlySeek", values: {}, text: "" })
+            m.assertFalse(h.published.result.ok)
+        end sub
+
+        @it("shows a bad_request before the attach is confirmed, and only logs one after")
+        sub _()
+            h = m.harness()
+            m.joined(h)
+            m.frame(h, tests.party.text("socket_error"))
+            m.assertEqual(h.published.notice.text, "Attach a playback session for the current selection.")
+            m.collect(h, watchparty.session.onPlaybackSession(h.s, { sessionId: "ps_7d1f0c", revision: 3 }, m.env(h)))
+            notices = m.published(h, "notice").Count()
+            m.frame(h, tests.party.text("socket_error"))
+            m.assertEqual(m.published(h, "notice").Count(), notices)
+        end sub
+
+    end class
+
+end namespace
