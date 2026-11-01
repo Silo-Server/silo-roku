@@ -1,0 +1,150 @@
+import "pkg:/source/util/values.bs"
+
+' Where a party member's seek really lands, and a barrier's muted roll to
+' its target (docs/watch-party.md sections 7.4 and 7.5), as pure rules
+' components/player/PlayerParty.bs runs on the render thread.
+'
+' Spike W0-2 (Roku Ultra, Roku OS 16.0.4): on a direct-play plan Video.seek
+' lands on the keyframe at or before the target, 0.17 to 1.56 s short with
+' a 2.002 s GOP, and playback resumes 209 to 721 ms after the seek. Right
+' after it resumes the node first reports the requested position, then
+' the real keyframe position. So a seek's landing is measured from the
+' reports after the echo: until then the player's sample says it is still
+' seeking, and neither the room's acknowledgement nor a correction's
+' residual (sync.driftLoop) reads the echo. Copy-remux plans seek through
+' seek_reanchor, which the Task treats as a reload; a barrier there is
+' acknowledged as it lands.
+'
+' A barrier is a room seek that sets the room waiting; its playerCommand
+' carries settle, the tolerance it may land short by and still acknowledge
+' where it is (watchparty.sync.settleTolerance). The player mutes for it,
+' lets the node play after Roku's resume while it measures, and when the
+' landing is short by more than the tolerance and the plan seeks in place,
+' keeps playing muted to the target and pauses there; then it
+' acknowledges, well inside the server's 10 s wait (DEADLINE_MS). One the
+' player cannot roll (a reload plan, the end of the file, too little time
+' left) is acknowledged as it lands.
+'
+' state, from begin: { target, tolerance, barrier, startedAt, phase
+' ("measuring", "rolling", "done"), echoes, settledAt, last, lastAt,
+' playingSince, landed, nudged, rolled }. Each step gives what the player
+' does: "none"; "play" (resume the node if it is paused, still muted); or
+' "stop" (the settle is over: pause where the room wants the member
+' paused, restore the sound, and report).
+namespace watchparty.landing
+    ' A report this close to the target is Roku's echo of the request.
+    const ECHO_SECONDS = 0.05
+    ' At most this many leading echoes are skipped; the next report, even
+    ' at the target, is the landing.
+    const MAX_ECHOES = 2
+    ' A settled node that reports nothing new for this long has landed
+    ' where it last said (a paused node may report no more).
+    const WAIT_MS = 1200
+    ' A barrier's settle ends by this long after its seek ran, whatever it
+    ' reached, so the acknowledgement beats the server's 10 s wait.
+    const DEADLINE_MS = 7000
+    ' Any other seek's measurement ends by this long after it ran.
+    const MEASURE_MAX_MS = 10000
+    ' What a resume takes before the node plays (W0-2: up to 721 ms).
+    const RESUME_MS = 750
+    ' The roll stops this short of the target: the report's and the pause's
+    ' own delay.
+    const STOP_EARLY_SECONDS = 0.1
+
+    ' A seek to target that ran at now; tolerance (seconds) for a barrier,
+    ' invalid for any other seek.
+    function begin(target as Dynamic, now as Integer, tolerance = invalid as Dynamic) as Object
+        barrier = util.isNumber(tolerance)
+        if not barrier then tolerance = invalid
+        return { target: target, tolerance: tolerance, barrier: barrier, startedAt: now, phase: "measuring", echoes: 0, settledAt: invalid, last: invalid, lastAt: invalid, playingSince: invalid, landed: invalid, nudged: false, rolled: false }
+    end function
+
+    ' Whether the settle still runs: the sample says seeking until it ends.
+    function active(state as Dynamic) as Boolean
+        return util.isObject(state) and state.phase <> "done"
+    end function
+
+    ' Whether the node plays and is muted for it (a barrier's), so the
+    ' player's own hold on the room's pause waits.
+    function holdsNode(state as Dynamic) as Boolean
+        return active(state) and state.barrier
+    end function
+
+    ' A Video position report (source seconds) once the node has settled
+    ' from the seek (it plays or is paused again). canRoll: the plan seeks
+    ' in place and the member is not at the end.
+    function note(state as Object, position as Dynamic, now as Integer, canRoll as Boolean) as String
+        if state.phase = "done" or not util.isNumber(position) then return "none"
+        if state.settledAt = invalid then state.settledAt = now
+        state.last = position
+        state.lastAt = now
+        if state.phase = "rolling"
+            if position >= state.target - STOP_EARLY_SECONDS then return finish(state)
+            return "none"
+        end if
+        if Abs(position - state.target) <= ECHO_SECONDS and state.echoes < MAX_ECHOES
+            state.echoes = state.echoes + 1
+            return "none"
+        end if
+        return land(state, position, now, canRoll)
+    end function
+
+    ' The player's regular check (every 250 ms): settled says the node has
+    ' settled from the seek, playing that it plays now.
+    function tick(state as Object, now as Integer, settled as Boolean, playing as Boolean, canRoll as Boolean) as String
+        if state.phase = "done" then return "none"
+        limit = MEASURE_MAX_MS
+        if state.barrier then limit = DEADLINE_MS
+        if now - state.startedAt >= limit then return finish(state)
+        if not playing
+            state.playingSince = invalid
+        else if state.playingSince = invalid
+            state.playingSince = now
+        end if
+        if not settled then return "none"
+        if state.settledAt = invalid then state.settledAt = now
+        if state.phase = "rolling"
+            if not playing then return "play"
+            if state.lastAt = invalid then return "none"
+            ' Between reports, where the node is now: it has played since
+            ' the last one, or since it started playing if later.
+            fromAt = state.lastAt
+            if state.playingSince <> invalid and state.playingSince > fromAt then fromAt = state.playingSince
+            if state.last + (now - fromAt) / 1000# >= state.target - STOP_EARLY_SECONDS then return finish(state)
+            return "none"
+        end if
+        quiet = state.settledAt
+        if state.lastAt <> invalid and state.lastAt > quiet then quiet = state.lastAt
+        if now - quiet < WAIT_MS then return "none"
+        ' A barrier's node that stays paused shows nothing: it plays, muted,
+        ' once to report where it is.
+        if state.barrier and not state.nudged and not playing
+            state.nudged = true
+            state.lastAt = now
+            return "play"
+        end if
+        position = state.last
+        if position = invalid then position = state.target
+        return land(state, position, now, canRoll)
+    end function
+
+    ' The landing is known: a barrier short by more than its tolerance rolls
+    ' to the target when it can in time, else the settle is over.
+    function land(state as Object, position as Dynamic, now as Integer, canRoll as Boolean) as String
+        state.landed = position
+        if state.barrier and canRoll
+            gap = state.target - position
+            if gap > state.tolerance and (now - state.startedAt) + gap * 1000 + RESUME_MS <= DEADLINE_MS
+                state.phase = "rolling"
+                state.rolled = true
+                return "play"
+            end if
+        end if
+        return finish(state)
+    end function
+
+    function finish(state as Object) as String
+        state.phase = "done"
+        return "stop"
+    end function
+end namespace
