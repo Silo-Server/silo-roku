@@ -1,0 +1,183 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/util/values.bs"
+
+' Watch Party's routes (docs/watch-party.md section 5), as requests for the
+' shared client (source/api/request.bs). The room Task builds them and
+' sends them through components/tasks/RoomApiBridge, so every one carries
+' the account and profile headers, refreshes the token once on a 401, and
+' goes only to the configured origin. Room routes add the room proof as
+' X-Room-Token, never in a URL. Bodies are parsed by watchparty.wire.
+'
+' Start, selection, and promote are marked once: the server does not make
+' them idempotent, so a 401 or a timeout is answered as it is and the
+' session reads the room back instead of sending them again. Writes whose
+' answer carries the room proof or a ticket, and the join whose body
+' carries the code, are marked secret, so neither body nor answer passes
+' through a file (api.request.transport).
+namespace api.watchParty
+    const ROOT = "/api/v2/watch-together"
+    ' The owner every Watch Party request is sent and released under.
+    const OWNER = "watchParty"
+    ' A room snapshot with members stays small; suggestions come in pages.
+    const SUGGESTION_PAGE = 100
+
+    ' GET /capabilities, revalidated with its ETag.
+    function capabilities(etag = "" as String) as Object
+        req = build("GET", ROOT + "/capabilities", "", invalid)
+        req.responseHeaders = ["etag"]
+        if etag <> "" then req.headers["If-None-Match"] = etag
+        return req
+    end function
+
+    ' GET /api/v2/playback/capabilities: the coordinator and fixed-file
+    ' features (section 3).
+    function playbackCapabilities() as Object
+        return build("GET", "/api/v2/playback/capabilities", "", invalid)
+    end function
+
+    ' POST /rooms with a client UUID, reused when the outcome was uncertain:
+    ' the server replays the same room for the same ID.
+    function create(roomId as String, selectionMode as String) as Object
+        req = build("POST", ROOT + "/rooms", "", { room_id: roomId, selection_mode: selectionMode })
+        req.secret = true
+        return req
+    end function
+
+    ' POST /join with the 8-character code.
+    function join(code as String) as Object
+        req = build("POST", ROOT + "/join", "", { code: code })
+        req.secret = true
+        return req
+    end function
+
+    ' GET /rooms/{id}: the snapshot and a renewed proof.
+    function read(roomId as String, proof as String) as Object
+        return build("GET", room(roomId), proof, invalid)
+    end function
+
+    ' DELETE /rooms/{id}: ends the party for everyone (host).
+    function close(roomId as String, proof as String) as Object
+        return build("DELETE", room(roomId), proof, invalid)
+    end function
+
+    ' PATCH /rooms/{id}/policy: "host_only" or "guest_play_pause".
+    function policy(roomId as String, proof as String, guestControlPolicy as String) as Object
+        return write("PATCH", room(roomId) + "/policy", proof, { guest_control_policy: guestControlPolicy })
+    end function
+
+    ' PUT /rooms/{id}/staged-selection: the lobby's pick, not yet playing.
+    ' selection is { contentId, fileId, libraryId }, the last two optional.
+    function stage(roomId as String, proof as String, selection as Object) as Object
+        return write("PUT", room(roomId) + "/staged-selection", proof, selectionBody(selection))
+    end function
+
+    ' PUT /rooms/{id}/selection: plays at once for everyone. Never resent.
+    function selectNow(roomId as String, proof as String, selection as Object) as Object
+        req = write("PUT", room(roomId) + "/selection", proof, selectionBody(selection))
+        req.once = true
+        return req
+    end function
+
+    ' POST /rooms/{id}/playback/start: starts the staged pick. Never resent.
+    function start(roomId as String, proof as String) as Object
+        req = write("POST", room(roomId) + "/playback/start", proof, invalid)
+        req.once = true
+        return req
+    end function
+
+    ' POST /rooms/{id}/playback/stop: back to the lobby, the item kept.
+    function stop(roomId as String, proof as String) as Object
+        return write("POST", room(roomId) + "/playback/stop", proof, invalid)
+    end function
+
+    ' PATCH /rooms/{id}/selection-mode: "host_pick" or "vote", lobby only.
+    function mode(roomId as String, proof as String, selectionMode as String) as Object
+        return write("PATCH", room(roomId) + "/selection-mode", proof, { selection_mode: selectionMode })
+    end function
+
+    ' GET /rooms/{id}/suggestions, a page in creation order.
+    function suggestions(roomId as String, proof as String, cursor = "" as String) as Object
+        req = build("GET", room(roomId) + "/suggestions", proof, invalid)
+        req.query = { limit: SUGGESTION_PAGE }
+        if cursor <> "" then req.query.cursor = cursor
+        return req
+    end function
+
+    ' POST /rooms/{id}/suggestions. suggestion is { suggestionId (a client
+    ' UUID, reused when the outcome was uncertain), contentId, contentType
+    ' ("movie" or "episode"), title, subtitle, posterUrl, note }; empty
+    ' optional members are left out.
+    function suggest(roomId as String, proof as String, suggestion as Object) as Object
+        body = { suggestion_id: suggestion.suggestionId, content_id: suggestion.contentId, content_type: suggestion.contentType, title: suggestion.title }
+        if util.text(suggestion.subtitle) <> "" then body.subtitle = suggestion.subtitle
+        if util.text(suggestion.posterUrl) <> "" then body.poster_url = suggestion.posterUrl
+        if util.text(suggestion.note) <> "" then body.note = suggestion.note
+        return build("POST", room(roomId) + "/suggestions", proof, body)
+    end function
+
+    ' DELETE /rooms/{id}/suggestions/{sid} (a manager or the suggester).
+    function removeSuggestion(roomId as String, proof as String, suggestionId as String) as Object
+        return build("DELETE", room(roomId) + "/suggestions/" + api.request.escape(suggestionId), proof, invalid)
+    end function
+
+    ' POST (on) or DELETE (off) /rooms/{id}/suggestions/{sid}/vote.
+    function vote(roomId as String, proof as String, suggestionId as String, isOn as Boolean) as Object
+        method = "DELETE"
+        if isOn then method = "POST"
+        return build(method, room(roomId) + "/suggestions/" + api.request.escape(suggestionId) + "/vote", proof, invalid)
+    end function
+
+    ' POST /rooms/{id}/suggestions/promote: plays it. Never resent.
+    function promote(roomId as String, proof as String, suggestionId as String) as Object
+        req = write("POST", room(roomId) + "/suggestions/promote", proof, { suggestion_id: suggestionId })
+        req.once = true
+        return req
+    end function
+
+    ' POST /rooms/{id}/member-state with 1 to max_member_state_ids IDs.
+    function memberState(roomId as String, proof as String, contentIds as Object) as Object
+        return build("POST", room(roomId) + "/member-state", proof, { content_ids: contentIds })
+    end function
+
+    ' GET /rooms/{id}/picker.
+    function picker(roomId as String, proof as String) as Object
+        return build("GET", room(roomId) + "/picker", proof, invalid)
+    end function
+
+    ' POST /rooms/{id}/source-fallback after a start refused for reason.
+    function sourceFallback(roomId as String, proof as String, selectionRevision as Dynamic, failedFileId as String, reason as String) as Object
+        return write("POST", room(roomId) + "/source-fallback", proof, { selection_revision: selectionRevision, failed_file_id: failedFileId, reason: reason })
+    end function
+
+    ' POST /rooms/{id}/ws-ticket: a single-use ticket for the socket.
+    function ticket(roomId as String, proof as String) as Object
+        return write("POST", room(roomId) + "/ws-ticket", proof, invalid)
+    end function
+
+    ' ---- Helpers
+
+    function room(roomId as String) as String
+        return ROOT + "/rooms/" + api.request.escape(roomId)
+    end function
+
+    function selectionBody(selection as Object) as Object
+        body = { content_id: util.text(selection.contentId) }
+        if util.text(selection.fileId) <> "" then body.file_id = util.text(selection.fileId)
+        if util.text(selection.libraryId) <> "" then body.library_id = util.text(selection.libraryId)
+        return body
+    end function
+
+    ' A write whose answer carries the renewed room proof or a ticket.
+    function write(method as String, path as String, proof as String, body as Dynamic) as Object
+        req = build(method, path, proof, body)
+        req.secret = true
+        return req
+    end function
+
+    function build(method as String, path as String, proof as String, body as Dynamic) as Object
+        req = { method: method, path: path, auth: "profile", owner: OWNER, headers: {} }
+        if body <> invalid then req.body = body
+        if proof <> "" then req.headers["X-Room-Token"] = proof
+        return req
+    end function
+end namespace

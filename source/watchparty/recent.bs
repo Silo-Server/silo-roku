@@ -1,0 +1,115 @@
+import "pkg:/source/util/values.bs"
+
+' The recent party behind Rejoin (docs/watch-party.md section 4.3): one per
+' server, account, and profile, in its own registry section, which only the
+' room Task writes. An entry is
+'   { server, account, profile, roomId, code, title, replaced, at }
+' with at the wall-clock second it was written and replaced true after
+' another device took the profile over ("Continue here"). It never holds a
+' token, a ticket, or a room proof. An entry lasts LIFETIME_SECONDS, is
+' written again at most every RENEW_SECONDS while the party runs (or at
+' once when it changes), and is deleted when the party ends, a rejoin is
+' refused for good, the viewer signs out, or the server is removed.
+namespace watchparty.recent
+    const SECTION = "silo.party"
+    const KEY = "recent"
+    const LIFETIME_SECONDS = 86400
+    const RENEW_SECONDS = 3600
+    ' An entry stamped this far in the future is a clock that went back.
+    const FUTURE_SLACK_SECONDS = 60
+    ' The section's share of Roku's 32 KB registry; with the session's
+    ' sections (storage), Browse's (libraryPrefs), and diagnostics' it keeps
+    ' within it. Past it the oldest entries go.
+    const BUDGET_BYTES = 1024
+    const MAX_TITLE_BYTES = 128
+
+    ' The live entries a section's text holds, newest first.
+    function decode(text as Dynamic, now as Integer) as Object
+        out = []
+        if not util.isString(text) or Left(text, 1) <> "[" then return out
+        list = ParseJson(text)
+        if type(list) <> "roArray" then return out
+        for each raw in list
+            entry = entryOf(raw)
+            if entry <> invalid and now - entry.at < LIFETIME_SECONDS and entry.at - now < FUTURE_SLACK_SECONDS then out.Push(entry)
+        end for
+        return out
+    end function
+
+    ' The section's text for entries, newest first, within BUDGET_BYTES:
+    ' the oldest go first. "" for none.
+    function encode(entries as Object) as String
+        kept = []
+        for each entry in entries
+            kept.Push({ server: entry.server, account: entry.account, profile: entry.profile, room: entry.roomId, code: entry.code, title: entry.title, replaced: entry.replaced, at: entry.at })
+        end for
+        while kept.Count() > 0
+            text = FormatJson(kept)
+            if byteLength(KEY) + byteLength(text) <= BUDGET_BYTES then return text
+            kept.Pop()
+        end while
+        return ""
+    end function
+
+    ' The entry for identity { server, account, profile }, or invalid.
+    function find(entries as Object, identity as Object) as Dynamic
+        for each entry in entries
+            if matches(entry, identity) then return entry
+        end for
+        return invalid
+    end function
+
+    ' Records the party for identity: { entries, write }. write says the
+    ' section must be saved: the entry is new or changed, or its last write
+    ' is RENEW_SECONDS old.
+    function put(entries as Object, identity as Object, roomId as String, code as String, title as String, replaced as Boolean, now as Integer) as Object
+        if byteLength(title) > MAX_TITLE_BYTES then title = ""
+        previous = find(entries, identity)
+        if previous <> invalid and previous.roomId = roomId and previous.code = code and previous.title = title and previous.replaced = replaced and now - previous.at < RENEW_SECONDS and previous.at <= now
+            return { entries: entries, write: false }
+        end if
+        out = [{ server: identity.server, account: identity.account, profile: identity.profile, roomId: roomId, code: code, title: title, replaced: replaced, at: now }]
+        for each entry in entries
+            if not matches(entry, identity) then out.Push(entry)
+        end for
+        return { entries: out, write: true }
+    end function
+
+    ' The entries without identity's.
+    function remove(entries as Object, identity as Object) as Object
+        out = []
+        for each entry in entries
+            if not matches(entry, identity) then out.Push(entry)
+        end for
+        return out
+    end function
+
+    ' The entries without a server's, or only that account's on it when
+    ' account is not "" (a sign-out).
+    function forget(entries as Object, server as String, account as String) as Object
+        out = []
+        for each entry in entries
+            if entry.server <> server or (account <> "" and entry.account <> account) then out.Push(entry)
+        end for
+        return out
+    end function
+
+    function matches(entry as Object, identity as Object) as Boolean
+        return entry.server = util.text(identity.server) and entry.account = util.text(identity.account) and entry.profile = util.text(identity.profile)
+    end function
+
+    function entryOf(raw as Dynamic) as Dynamic
+        if not util.isObject(raw) then return invalid
+        entry = { server: util.text(raw.server), account: util.text(raw.account), profile: util.text(raw.profile), roomId: util.text(raw.room), code: util.text(raw.code), title: util.text(raw.title), replaced: util.isTrue(raw.replaced), at: 0 }
+        if util.isNumber(raw.at) then entry.at = raw.at
+        if entry.server = "" or entry.account = "" or entry.profile = "" or entry.roomId = "" or entry.code = "" or entry.at <= 0 then return invalid
+        return entry
+    end function
+
+    function byteLength(text as String) as Integer
+        if text = "" then return 0
+        buffer = CreateObject("roByteArray")
+        buffer.FromAsciiString(text)
+        return buffer.Count()
+    end function
+end namespace

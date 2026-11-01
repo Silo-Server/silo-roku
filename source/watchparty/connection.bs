@@ -1,0 +1,80 @@
+import "pkg:/source/util/values.bs"
+
+' Keeping the room socket up (docs/watch-party.md section 6.4) and what
+' ends a party for this device (section 4.11), as Android's
+' WatchTogetherRepository.socketLoop decides them. Times are the room
+' Task's monotonic milliseconds.
+namespace watchparty.connection
+    ' A socket that stayed open this long ended by the server's 5-minute
+    ' rotation: reconnect at once, without showing "Reconnecting".
+    const STABLE_MS = 30000
+    ' Waits between failed attempts, the last repeating, each plus up to a
+    ' quarter more at random.
+    const BACKOFF_MS = "500,1000,2000,5000"
+    ' Give up after this many failures in a row once this long has passed
+    ' since the last healthy socket, which covers the host's two-minute
+    ' grace.
+    const MAX_FAILURES = 6
+    const BUDGET_MS = 150000
+
+    ' A new engagement's reconnect state.
+    function create(now as Integer) as Object
+        return { failures: 0, step: 0, healthyAt: now }
+    end function
+
+    ' The socket of an attempt ended, or the attempt failed before it
+    ' opened (openedAt invalid). random is a number from 0 to 1. Gives
+    ' { kind, delayMs, quiet }: kind "now" (a routine rotation, quiet: no
+    ' "Reconnecting"), "wait" (delayMs, then try again), or "giveUp".
+    function closed(policy as Object, openedAt as Dynamic, now as Integer, random as Dynamic) as Object
+        if openedAt <> invalid and now - openedAt >= STABLE_MS
+            policy.failures = 0
+            policy.step = 0
+            policy.healthyAt = now
+            return { kind: "now", delayMs: 0, quiet: true }
+        end if
+        policy.failures = policy.failures + 1
+        if policy.failures >= MAX_FAILURES and now - policy.healthyAt >= BUDGET_MS then return { kind: "giveUp", delayMs: 0, quiet: false }
+        steps = BACKOFF_MS.Split(",")
+        index = policy.step
+        if index > steps.Count() - 1 then index = steps.Count() - 1
+        base = steps[index].ToInt()
+        policy.step = index + 1
+        jitter = 0
+        if util.isNumber(random) and random > 0 then jitter = Int(base / 4 * random)
+        return { kind: "wait", delayMs: base + jitter, quiet: false }
+    end function
+
+    ' What an HTTP failure of the room read or ticket means for the
+    ' connection: "ended" (409: the room closed), "expired" (401, 403, 404,
+    ' 410, or an unusable answer: stop reconnecting), "identity" (the
+    ' session has no account or profile for it; the party is left
+    ' silently), or "retry". A 401 reaches here only after the API client's
+    ' one refresh (spec section 6.4).
+    function classify(result as Object) as String
+        if result.ok then return "expired"
+        failure = result.error
+        if failure = invalid then return "retry"
+        kind = util.text(failure.kind)
+        if kind = "http" or (kind = "parse" and result.status > 0)
+            status = result.status
+            if status = 409 then return "ended"
+            if status = 401 or status = 403 or status = 404 or status = 410 then return "expired"
+            if kind = "parse" and status < 500 then return "expired"
+            return "retry"
+        end if
+        if kind = "signed_out" or kind = "profile_required" or kind = "pin_required" or kind = "identity_changed" or kind = "no_server" then return "identity"
+        return "retry"
+    end function
+
+    ' How a party ends for this device: { reason, messageKey, rejoin,
+    ' forgetRecent }. reason is "ended" (room_closed, phase ended, a 409, or
+    ' End party), "replaced" (connection_replaced), "expired" (a refused
+    ' read or ticket, or a wrong protocol), or "lost" (reconnecting gave
+    ' up). rejoin is "none", "rejoin", or "continueHere".
+    function ending(reason as String) as Object
+        if reason = "ended" then return { reason: reason, messageKey: "watchParty.ended.ended", rejoin: "none", forgetRecent: true }
+        if reason = "replaced" then return { reason: reason, messageKey: "watchParty.ended.replaced", rejoin: "continueHere", forgetRecent: false }
+        return { reason: reason, messageKey: "watchParty.ended.expired", rejoin: "rejoin", forgetRecent: false }
+    end function
+end namespace

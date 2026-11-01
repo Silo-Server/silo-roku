@@ -1,0 +1,78 @@
+import "pkg:/source/watchparty/connection.bs"
+
+namespace tests
+
+    ' Reconnect pacing and endings, after Android's socketLoop and tvOS's
+    ' terminal-error rules.
+    @suite("watch party connection")
+    class WatchPartyConnectionTests extends rooibos.BaseTestSuite
+
+        function failure(status as Integer, kind = "http" as String) as Object
+            return { ok: false, status: status, error: { kind: kind } }
+        end function
+
+        @describe("reconnect and endings")
+
+        @it("reconnects at once and quietly after a socket that stayed open 30 s")
+        sub _()
+            policy = watchparty.connection.create(0)
+            m.assertEqual(watchparty.connection.closed(policy, 1000, 31000, 0.5), { kind: "now", delayMs: 0, quiet: true })
+            m.assertEqual(policy.healthyAt, 31000)
+        end sub
+
+        @it("backs off 0.5, 1, 2, then 5 s with up to a quarter more")
+        sub _()
+            policy = watchparty.connection.create(0)
+            delays = []
+            for i = 1 to 5
+                delays.Push(watchparty.connection.closed(policy, invalid, i * 1000, 0).delayMs)
+            end for
+            m.assertEqual(delays, [500, 1000, 2000, 5000, 5000])
+            m.assertEqual(watchparty.connection.closed(watchparty.connection.create(0), 0, 100, 1).delayMs, 625)
+        end sub
+
+        @it("gives up only after six failures and 150 s without a healthy socket")
+        sub _()
+            policy = watchparty.connection.create(0)
+            for i = 1 to 5
+                m.assertEqual(watchparty.connection.closed(policy, invalid, 200000, 0).kind, "wait")
+            end for
+            m.assertEqual(watchparty.connection.closed(policy, invalid, 200000, 0).kind, "giveUp")
+            recent = watchparty.connection.create(100000)
+            for i = 1 to 8
+                m.assertEqual(watchparty.connection.closed(recent, invalid, 200000, 0).kind, "wait", "within 150 s of healthy")
+            end for
+        end sub
+
+        @it("ends on 409, expires on 401, 403, 404, and 410, and retries the rest")
+        sub _()
+            m.assertEqual(watchparty.connection.classify(m.failure(409)), "ended")
+            for each status in [401, 403, 404, 410]
+                m.assertEqual(watchparty.connection.classify(m.failure(status)), "expired", status.ToStr())
+            end for
+            for each status in [500, 502, 503, 429]
+                m.assertEqual(watchparty.connection.classify(m.failure(status)), "retry", status.ToStr())
+            end for
+            m.assertEqual(watchparty.connection.classify(m.failure(0, "network")), "retry")
+            m.assertEqual(watchparty.connection.classify(m.failure(0, "timeout")), "retry")
+            m.assertEqual(watchparty.connection.classify(m.failure(0, "auth_unavailable")), "retry")
+            m.assertEqual(watchparty.connection.classify(m.failure(0, "signed_out")), "identity")
+            m.assertEqual(watchparty.connection.classify(m.failure(0, "profile_required")), "identity")
+        end sub
+
+        @it("words each ending and says when Rejoin stays")
+        sub _()
+            ended = watchparty.connection.ending("ended")
+            m.assertEqual(ended.messageKey, "watchParty.ended.ended")
+            m.assertEqual(ended.rejoin, "none")
+            m.assertTrue(ended.forgetRecent)
+            replaced = watchparty.connection.ending("replaced")
+            m.assertEqual(replaced.rejoin, "continueHere")
+            m.assertFalse(replaced.forgetRecent)
+            m.assertEqual(watchparty.connection.ending("expired").rejoin, "rejoin")
+            m.assertEqual(watchparty.connection.ending("lost").messageKey, "watchParty.ended.expired")
+        end sub
+
+    end class
+
+end namespace
