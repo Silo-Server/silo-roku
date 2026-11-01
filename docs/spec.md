@@ -444,7 +444,9 @@ their existing HD/FHD assets.
   - Panel: 460 px wide, top at 132, right edge at the right inset, padding 14.
   - Header: a 44 px avatar; the profile's name in 24 px SemiBold; the
     server's display name in uppercase, 14 px, letter-spaced, at 38%.
-  - Rows: Switch Profile, Watchlist, Favorites, and History; then Settings;
+  - Rows: Switch Profile, Watchlist, Favorites, History, and Watch Party
+    ("Return to Watch Party" in a party, while the server offers one:
+    [`watch-party.md`](watch-party.md) section 4.1); then Settings;
     then Switch Server and Sign Out. They are 54 px tall (22 px SemiBold,
     16 px inset), 10 px apart. A focused row gets a white fill with radius
     14; resting labels are at 86%, and Sign Out is red at 90%.
