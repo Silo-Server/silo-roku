@@ -415,10 +415,12 @@ keeps the room open for two minutes.
 
 The player and panel close, and the Watch Party page shows the message
 (section 10). The page takes the place of whatever player is on top,
-the party's or a title the viewer played from the lobby (section 9),
-which stops, so no video plays on beneath it; a Watch Party page just
-beneath that player goes with it, so two never stack. A sign-out,
-profile switch, or server switch leaves the party silently.
+the party's or another title's (one opened before this device joined;
+playing another title in a party leaves it, section 9), which stops, so
+no video plays on beneath it; a Watch Party page just beneath that
+player goes with it, so two never stack. A sign-out, profile switch, or
+server switch leaves the party silently, and so does playing another
+title (section 9).
 
 ## 5. Server contract
 
@@ -689,17 +691,21 @@ reason}`. The room moves every member to a new revision.
   Roku requires a deep link to play at once (criterion 5.2), and the room
   cannot play another title for one member. tvOS has no equivalent to
   compare.
-- **A title played in the app.** A title the viewer plays from a detail
-  page, a card, or Shuffle while in a party's lobby keeps the
-  membership, as on tvOS (`AppRouter.presentWatchParty`): the room's
-  player takes its place when the room plays, and the party's end puts
-  the Watch Party page in its place (section 4.11), stopping it. Unlike
-  a deep link, it comes from inside the app, where the room can still
-  claim the screen.
+- **A title played in the app.** In a party, in any phase, every title
+  the viewer plays that is not the room's own leaves the party first and
+  then plays, as a deep link does: a detail page's Play, Resume, or
+  Start Over, an episode, Trailers & More, a card's Options Play or
+  Resume (Home, a library, Search, a person page), Shuffle, and Up
+  Next's next episode or On Deck item in a player opened before this
+  device joined. Trailers and extras are ordinary titles too. The leave
+  is silent, as an identity change's is; the room's own player is
+  unaffected. tvOS keeps the membership (section 10).
 - **Profile, server, sign-out.** Each leaves the party first. Room
-  updates the task published before a leave (a deep link's or an
-  identity change's) open no party player afterwards: AppScene ignores
-  their opens and replaces until the task's room names no room.
+  updates the task published before a leave (another title's, a deep
+  link's, or an identity change's) open no party player afterwards:
+  AppScene ignores their opens and replaces until the task's room names
+  no room, so a room that was playing cannot put its player over the new
+  title.
 - **Diagnostics.** The log records room ID, revision, command IDs, drift,
   corrections, and reconnects, never codes, tickets, or proofs (spec
   section 11.1).
@@ -729,6 +735,7 @@ reason}`. The room moves every member to a new revision.
 | Pill buttons carry SF Symbols (play, plus, checkmark) | Play on Start and Return to playback, a check or plus on the confirm button; the others none | The app's glyph set (`images/detail`, `images/firstrun`) |
 | The picker's shelves sit under a Skyline hero | The shelves alone, under the top strip | The hero belongs to Home's feed; section 4.8 names the shelves only |
 | The lobby shows every member's seat | As many seats as fit left of the buttons | tvOS's row has no scroll on a TV either; a Roku draws no overflow |
+| Playing another title in the app keeps the membership (`AppRouter.presentWatchParty`); the room's player takes its place when the room plays | Playing any title but the room's leaves the party first, then plays (section 9) | The owner chose that leaving the room's title for another one leaves the party, as a deep link does (2026-11-01) |
 
 ## 11. Components
 
@@ -964,7 +971,14 @@ The player's part:
   a handoff offer for another profile (`handoff_cancel handoff_failed`),
   since its borrowed identity would leave the party. Controls follow
   `silocontrol.policy.partyControl`.
-- A deep link sends `leave` before the player opens.
+- Every player that is not the room's sends `leave` before it opens:
+  AppScene's `navPush` and `navReplace` pass each `nav.route.PLAYER`
+  entry to `watchPartyBeforePlay` (a deep link's, a phone's launch, and
+  every screen's), and the player calls it for Up Next's next item,
+  which starts in the same entry. `watchparty.app.beforePlay` decides:
+  `leave` in a party, `guard` (no second leave, but the room's queued
+  updates open nothing) while a leave is under way or AppScene's last
+  room still names one, and `none` for the room's own player.
 - A phone's mute or volume during a barrier's roll is kept as the
   viewer's and applied when the roll ends; the phone's snapshot reports
   the viewer's mute, not the roll's.
