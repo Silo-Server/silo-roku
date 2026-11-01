@@ -579,8 +579,11 @@ never when it arrives. Positions are source positions
   `generation`, so any later snapshot counts), or while this member
   catches up (`self_ignore_wait`, or its own buffering), and only while
   the player is playable: never while it seeks, loads, or stalls, which
-  would tell the room it recovered. Never otherwise: a `ready` in a
-  playing room causes another sync seek.
+  would tell the room it recovered. Both wait for a sample that shows the
+  player ran the last command's `playerCommand` (its `commandSeq`): the
+  task decides on the last sample, so one from before the command, even
+  near a seek's target, would acknowledge where the member was. Never
+  otherwise: a `ready` in a playing room causes another sync seek.
 - `buffering` once per stall, after 2 s without progress while the room
   plays. The 2 s restarts after each seek and command.
 
@@ -884,8 +887,8 @@ duration, playing, wantsPlay, playable, stalled, seeking (until a seek's
 real landing shows, a barrier's roll ends, and a hold plays), holding
 (paused in a hold, section 7.5), landed and landedSeq (where the last
 measured seek really landed, and its `playerCommand.seq`), atEnd,
-planInPlace, commandSeq}`), and `session` (`{sessionId, revision}` or
-`{}`). Outputs: `ready`, `room` (the normalized snapshot), `connection`,
+planInPlace, commandSeq (the last `playerCommand.seq` it ran)}`), and
+`session` (`{sessionId, revision}` or `{}`). Outputs: `ready`, `room` (the normalized snapshot), `connection`,
 `support`, `sync` (the player's view: attached, catching up, syncing,
 waiting for a clock, the held seek target, permissions), `suggestions`,
 `memberState`, `picker`, `recent`, `busy`, and the one-shot
