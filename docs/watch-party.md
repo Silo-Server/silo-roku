@@ -1,9 +1,10 @@
 # Watch Party for Roku
 
 **Status:** Specified. The room core (section 11: the room task, its
-rules, and the routes) is built and tested headless; the screens, the
-player's part, and AppScene's wiring are not. The transport still needs
-spike W0-1 (section 12.1) on a device.
+rules, and the routes), AppScene's wiring, and the player's part are built
+and tested headless; the screens are not. Spike W0-1 (section 12.1) ran on
+the Roku Ultra and settled the transport (section 2.1); the player's part
+has not run on a device.
 
 **Last updated:** 2026-11-01
 
@@ -54,8 +55,26 @@ and shows no Watch Party until it updates.
 
 Roku's page does not say whether the app can set `Sec-WebSocket-Protocol`,
 whether the object answers the server's ping frames, how large a text
-message it accepts, or whether it offers compression. Spike W0-1 answers
-each; the design below assumes yes to the first two.
+message it accepts, or whether it offers compression. Spike W0-1 (Roku
+Ultra, Roku OS 16.0.4) found:
+
+- `SetProtocols("silo.room.v2, silo.ticket.{t}")` sends the header as the
+  server requires. `AddHeader` with the same header never reaches the
+  server.
+- `Open(0)` opens asynchronously and always returns `false`; the socket is
+  open only when event type 1 (opened) arrives, and the client then
+  requires `GetSelectedProtocol()` to be `silo.room.v2`.
+- Event types: 1 opened `{Protocol, TargetIPAddr, EffectiveUrl}`, 2 closed
+  `{Code, Reason, Error, ErrorMsg}`, 3 error, 4 message sent (also for the
+  automatic pongs), 5 text, 7 ping received (when the ping has a payload),
+  8 pong received, 9 timer.
+- Automatic pongs work with `SetAutoPingReply` left at its default.
+- Socket IDs are reused, and releasing a socket posts its closed event onto
+  the shared port. After `Close()` the TCP connection stays open until the
+  object is released.
+- A text message over 524,288 bytes closes the socket with code 1009.
+
+`source/watchparty/socket.bs` follows these (section 11).
 
 ### 2.2 What the server requires of the socket
 
@@ -82,8 +101,11 @@ From `internal/api/handlers/watch_together_socket_v2.go:74-166` and
   access token's or room proof's expiry, without a close frame or message.
   The client treats that as routine (section 6.4).
 - Client messages are at most 64 KiB. A server `suggestions_update` carries
-  the whole list and can approach 5 MB at the 200-suggestion cap; W0-1
-  measures what `roWebSocket` and a 1 GB Roku hold.
+  the whole list and can approach 5 MB at the 200-suggestion cap, over
+  `roWebSocket`'s 524,288 bytes. The client handles it (owner's decision):
+  a close with code 1009 reconnects at once, without back-off or
+  "Reconnecting", and reads the suggestions over HTTP. More than three such
+  closes in a minute take the ordinary back-off.
 
 ### 2.3 Credentials
 
@@ -572,10 +594,13 @@ overlays over the player do not pause the room.
 
 The room's playback uses the normal protocol v3 start
 (`source/playback/capabilities.bs`) with `file_id` = `selected_file_id`,
-`library_id` = `selected_library_id`, `start_position` = the anchor, no
-resume rewind, `allow_alternate_versions` false, mounted paused. A plan
-whose `effective_media_file_id` names another file fails with "The Watch
-Party's selected media version is unavailable." and stops its session.
+`start_position` = the anchor, no resume rewind, `allow_alternate_versions`
+false, mounted paused. `PlaybackStartBody` admits no `library_id`
+(`additionalProperties` false), so `selected_library_id` travels only in
+the player's entry. A plan whose `effective_media_file_id` names another
+file fails with "The Watch Party's selected media version is
+unavailable." and stops its session; so does a watch projection that does
+not list the room's file.
 
 ### 8.2 Sessions
 
@@ -636,10 +661,11 @@ reason}`. The room moves every member to a new revision.
 | Room session | `source/watchparty/session.bs` | Every rule the task runs, as pure functions over one state: support, entering, the connection order and reconnects, pings, frames, endings, host commands, suggestions, picker, Who's Seen It, and the outputs |
 | Room logic | `source/watchparty/` | `time` (RFC 3339 to epoch milliseconds, the anchored clock), `clock` (offset estimator), `wire` (frames, messages, IDs, snapshots, capabilities), `room` (snapshot acceptance, derived facts), `sync` (attach, command timing, readiness, stalls, reports, corrections), `catchup` (seek-only decisions, reload budget), `connection` (reconnect pacing, endings), `lobby` and `votes` (section 4's rules as locale keys), `recent` (section 4.3), `socket` (the `roWebSocket` adapter) |
 | REST | `source/api/watchParty.bs` | The routes in section 5 as requests for the shared client |
-| Room session owner | `AppScene` | One `RoomTask` and one `RoomApiBridge` per app run; sets `identity` on every session change and hands outputs to screens and the player |
+| Room session owner | `components/AppSceneWatchParty.bs`, rules in `source/watchparty/app.bs` | One `RoomTask` and one `RoomApiBridge` per app run, the Task published as `m.global.roomTask`; sets `identity` on every session change; forgets a removed server's recent party; opens, replaces, and closes the party player; shows the Watch Party page when the party ends; hosts the room panel (Hooks, below) |
 | Watch Party page, lobby, ballot, invite, options | `components/screens/watchParty/` | Section 4 |
 | Picker | `components/screens/watchParty/picker/` | Section 4.8, reusing Home rows, Search, and the episode rail |
-| Player | `components/player/` | Room start, Back to the panel, status pill, permissions, and executing `playerCommand` on the render thread |
+| Player | `components/player/PlayerParty.bs`, rules in `source/watchparty/player.bs`; the session reducer's party mode in `source/playback/session.bs` | Room start, Back to the panel, status pill, permissions, and executing `playerCommand` on the render thread |
+| SiloControl in a party | `source/control/policy.bs` (`partyControl`, `partyOffer`), `components/player/PlayerRemote.bs`, `components/AppSceneControl.bs` | Section 9 |
 | Recent party | `source/watchparty/recent.bs` | Section 4.3, in its own 1 KB registry section `silo.party`, which only the room task writes. The session's own section keeps to 15 KB, above its largest record, so the app's five sections fit Roku's 32 KB |
 
 The room task waits on its message port with a timeout to the next due
@@ -678,13 +704,57 @@ carries the code, never pass through a file. The room read is a `GET`,
 whose answer passes through ApiTask's temporary response file like any
 other; it is deleted as soon as it is read.
 
-**Socket assumptions until W0-1.** `source/watchparty/socket.bs` sets the
-subprotocols with `roWebSocket.SetProtocols` (the call Roku's page and
-brs-node 2.6 provide; `PROTOCOLS_AS_HEADER` switches to `AddHeader`),
-turns on `SetAutoPingReply`, verifies `wss://` with the system CA
-bundle, and maps event types 1 (opened), 2 (closed), 3 (error), and 5
-(text). An opened event without a protocol is accepted; one naming
-another protocol ends the attempt.
+**Socket.** `source/watchparty/socket.bs` follows W0-1 (section 2.1): it
+sets the subprotocols with `SetProtocols` only, leaves
+`SetAutoPingReply` at its default, verifies `wss://` with the system CA
+bundle, opens with `Open(0)` and waits for the opened event, and maps
+event types 1 (opened, with `GetSelectedProtocol()`), 2 (closed), 3
+(error), and 5 (text). An opened socket that names no protocol, or
+another, ends the attempt. Each socket's handle keeps its own state:
+events after its closed are ignored, and the room task releases a socket
+as soon as it closes. A socket the task closed itself still owes the
+closed event its release posts, which the task consumes by socket ID, so
+a new socket that reuses the ID never reads it as its own. This assumes
+Roku posts one closed per socket, on the server's close or on the
+release of a socket the task closed; the rig has not confirmed it.
+
+**Liveness.** The server pings every 20 s. A connected socket that has
+shown ping activity (event types 4 or 7) and then none for 50 s
+(`QUIET_MS`) is closed and reconnected. A socket that never shows any is
+never judged by it, so a Roku OS that raises no event for a ping without
+a payload keeps its sockets (the rig is confirming which it does).
+
+**Hooks** (the screens' interfaces, from AppScene and the player):
+
+- `m.global.roomTask`: the `RoomTask`, for every screen to set `command`
+  and observe its outputs (`observeFieldScoped`, unobserved when the
+  screen goes). AppScene alone sets `identity`; the party player alone
+  sets `playerSample` and `session`. Entry points show or hide by its
+  `support.state` (`"available"`). Commands set before its `ready` are
+  lost; AppScene queues its own.
+- Route `nav.route.WATCH_PARTY` (`"watchParty"`, `source/nav/routes.bs`),
+  component `nav.route.WATCH_PARTY_COMPONENT` (`WatchPartyScreen`), which
+  the screens register. AppScene pushes it with `{ message, rejoin }` when
+  the party ends for this device (`message` the `ended` event's locale
+  key, `rejoin` `"none"`, `"rejoin"`, or `"continueHere"`), in place of the
+  party player or a Watch Party page on top, else over what shows; and
+  with `{}` in place of the party player when the room returns to the
+  lobby and no Watch Party page lies beneath. A build without the
+  component shows the placeholder screen.
+- The room panel: `AppScene.watchPartyPanel` (`assocarray`,
+  `alwaysNotify`), `{ open, reason }`. The party player sets `{ open:
+  true, reason: "back" | "error" }` where its Back ladder would close it
+  and from the error screen's Go Back. AppScene then creates
+  `nav.route.WATCH_PARTY_PANEL_COMPONENT` (`WatchPartyRoomPanel`) in its
+  `watchPartyLayer` over the player, sets the panel's `reason` field when
+  it has one, and gives it focus. The panel closes by setting `{ open:
+  false }` (Back, "Return to playback"); Back the panel leaves unhandled
+  does the same; AppScene sets it when the player or the party closes.
+  The player takes focus back once it is false. The panel reads the room
+  from `m.global.roomTask` (`room`, `sync.atEnd` for "Return everyone to
+  lobby").
+- `sync.atEnd` (added to the Task's `sync` output): this member's player
+  is parked at the end of the file.
 
 **Decisions made while building.** A reconnect that gives up (six
 failures and 150 s without a healthy socket) ends the party with the
@@ -695,13 +765,66 @@ than 0.4 s, then plays; a seek that never shows as landed is given up
 after 5 s. Playing muted to a guest's short-landed seek target (section
 7.4) waits for W0-2.
 
+The player's part:
+
+- The room player is a `nav.route.PLAYER` entry whose params carry
+  `party` (`watchparty.app.playerParams`). AppScene opens it when the
+  room plays a file, over whatever shows (replacing a player on top), and
+  replaces it for a new selection revision; the new entry is a new
+  playback session (section 8.2).
+- The session reducer's party mode (`playback.session.create`'s `party`)
+  parks the end of the file: the Video node's finished leaves the session
+  open, paused at the end, and the player reports `atEnd`. A finished
+  short of the end reloads where it stopped (tvOS's premature end of
+  file). A room seek on a member at the end is a reload there, since the
+  finished content takes no seek; a play without a seek leaves it at the
+  end.
+- `planInPlace` is false for a `server_remux_*` delivery and true for
+  `original_http` and `server_transcode_hls` (section 7.5).
+- The player executes `playerCommand` at once, the play state first and
+  then the seek, through the session reducer (`seekTo`, or `partyReload`
+  for a correction reload: a local reload of the plan where the timeline
+  allows one, else a `seek_reanchor`). The room's play state is the
+  reducer's play intent, so the loads it opens follow it. A Video node
+  that plays while the room wants it paused (a seek Roku resumed) pauses
+  again. A paused member's seek counts as landed when the node reports
+  paused again, or 3 s after it ran. Both need the device to confirm.
+- Samples go to the task on every chrome refresh when what the task
+  decides from changed, and at least every 500 ms (a 250 ms timer).
+- Off in a party: Up Next, autoplay, On Deck, and the Auto-play next
+  toggle; auto-skip of recaps and credits; the intro's automatic skip
+  (tvOS's `introSkipMode`: the pill for a member who may seek, none for
+  one who may not); the buffering card and quality step-downs (the
+  reducer runs the buffering controller in `never` mode, which also sends
+  `learned_limit: "ignore"`). The Roku player has no network-change
+  replans or version menu to turn off; a party intent never shuffles.
+- Every seek (scrub, skips, Replay, chapters, voice, the skip pills)
+  passes `commitSeek`, and play and pause `togglePause`, so each becomes a
+  `transportRequest` the player checks against `sync.canSeek` and
+  `sync.canPlayPause` first. A refused press shows its notice for 3 s,
+  after the scrub UI it may have shown.
+- The status pill reads, in order, "Reconnecting to the party…" (the
+  task's connection is reconnecting), "Waiting for party timing…", and
+  "Syncing with the party…" (the room waits, this member catches up, or
+  the player seeks, loads, or stalls), each after it has held 500 ms.
+- A start refused for one of section 8.3's reasons sends `sourceFallback`
+  once per player.
+- SiloControl: a launch during a party answers `error command_failed`
+  with "This Watch Party does not allow this playback action."; so does
+  a handoff offer for another profile (`handoff_cancel handoff_failed`),
+  since its borrowed identity would leave the party. Controls follow
+  `silocontrol.policy.partyControl`.
+- A deep link sends `leave` before the player opens.
+- The diagnostics log's room lines start `[WP]` (the room task's, and
+  the player's commands, transport requests, sessions, and reloads).
+
 ## 12. Testing
 
 ### 12.1 Spikes (Roku Ultra 4850X, Roku OS 16.0.4)
 
 | ID | Question | Pass |
 | --- | --- | --- |
-| W0-1 | `roWebSocket`: can the app send `Sec-WebSocket-Protocol: silo.room.v2, silo.ticket.{t}` and read the server's choice; does it answer ping frames; does `wss://` verify with the system CA bundle; how large a message arrives; does it run in a Task; what close events look like | A sandbox room socket stays open past 60 s and receives a snapshot; a 5 MB message arrives or fails cleanly |
+| W0-1 (ran; section 2.1) | `roWebSocket`: can the app send `Sec-WebSocket-Protocol: silo.room.v2, silo.ticket.{t}` and read the server's choice; does it answer ping frames; does `wss://` verify with the system CA bundle; how large a message arrives; does it run in a Task; what close events look like | A sandbox room socket stays open past 60 s and receives a snapshot; a 5 MB message arrives or fails cleanly |
 | W0-2 | Where `Video.seek` lands for direct, remux, and transcode plans, and how long it takes | Landing error per plan type, to set section 7.4's acknowledgement and 7.5's in-place rule |
 | W0-3 | Delay from the task's field write at `execute_at` to the render thread's `Video` call, on the Ultra and a 1 GB device | Under 50 ms at the 95th percentile |
 | W0-4 | Memory with the room task, the lobby, and a 200-suggestion ballot open | Within the memory monitor's budget (spec section 4) |
@@ -737,6 +860,5 @@ OS 16.
 | Decision | Leaning | Needs |
 | --- | --- | --- |
 | A Roku without `roWebSocket` | No Watch Party | Roku OS 16's release and device list |
-| `roWebSocket` cannot answer pings or set the subprotocol | Ask the server to accept the ticket another way, or a JSON pong | W0-1 |
 | Guest seek landing outside 1 s | Play muted to the target | W0-2 |
 | Children's profiles see suggestions' raw titles and posters, which the server does not filter | Show them, as tvOS does | Server owner's view |
