@@ -1,0 +1,198 @@
+import "pkg:/source/util/values.bs"
+
+' The player's part in a Watch Party (docs/watch-party.md sections 4.10,
+' 7, and 8), as pure rules: components/player/PlayerParty.bs reads the
+' room's sync view and the playback session, and carries out what these
+' decide on the render thread. The room Task decides every correction;
+' the player only runs the playerCommand it is given (steps), tells the
+' Task what it does (sample), and turns the viewer's own play, pause, and
+' seek into transport requests (transport).
+namespace watchparty.player
+    ' The status pill shows once its state has held this long (section
+    ' 4.10).
+    const PILL_DELAY_MS = 500
+    ' A refused press's notice (section 10).
+    const NOTICE_MS = 3000
+    ' The player's sample reaches the Task at least this often, and at once
+    ' when what the Task decides from changes (changed).
+    const SAMPLE_MS = 500
+    ' A paused member's seek that never shows the Video node move counts as
+    ' landed after this.
+    const SEEK_SETTLE_MS = 3000
+    ' The start refusals the room's source fallback answers (section 8.3).
+    const FALLBACK_REASONS = "|no_alternate_version|hdr_transcode_unsupported|subtitle_conversion_unsupported|transcoding_disabled|"
+    ' The playback error's reason for a plan of another file (section 8.1).
+    const VERSION_REFUSED = "watch_party_version"
+    ' The pill's locale keys.
+    const PILL_RECONNECTING = "watchParty.player.reconnecting"
+    const PILL_CLOCK = "watchParty.player.waitingForClock"
+    const PILL_SYNCING = "watchParty.player.syncing"
+
+    ' Whether a Video.seek on plan is served in place (section 7.5): an
+    ' original or a transcode, which the server serves where it is asked;
+    ' not a server remux, where a seek outside the remuxed window is a
+    ' seek_reanchor that replays up to a keyframe interval. A plan of
+    ' unknown delivery counts as in place, the server's own default.
+    function planInPlace(plan as Dynamic) as Boolean
+        if not util.isObject(plan) then return true
+        return Left(util.text(plan.delivery), 13) <> "server_remux_"
+    end function
+
+    ' Whether plan plays another file than the room's (section 8.1): its
+    ' effective_media_file_id names one, and not fileId.
+    function versionRefused(plan as Dynamic, fileId as String) as Boolean
+        if not util.isObject(plan) then return false
+        playing = util.text(plan.effective_media_file_id)
+        return playing <> "" and fileId <> "" and playing <> fileId
+    end function
+
+    ' The source fallback reason for a start refused with reason, or "" when
+    ' the room has none for it (section 8.3).
+    function fallbackReason(reason as Dynamic) as String
+        text = util.text(reason)
+        if text = "" or Instr(1, FALLBACK_REASONS, "|" + text + "|") = 0 then return ""
+        return text
+    end function
+
+    ' Why the server refused a start, from ApiTask's answer to it
+    ' (playback.worker): the decision's terminal reason, else the reason
+    ' ApiTask did not send it; "" for none.
+    function refusalReason(body as Dynamic) as String
+        if not util.isObject(body) then return ""
+        decision = body.decision
+        if util.isObject(decision) and util.isObject(decision.terminal) and util.text(decision.terminal.reason) <> "" then return util.text(decision.terminal.reason)
+        return util.text(body.reason)
+    end function
+
+    ' The playerSample the Task reads (components/tasks/RoomTask.bs), from
+    ' the player's facts: { sessionId, revision, position (source seconds),
+    ' duration, videoState, wantsPlay (the room's play state, as the last
+    ' command left it), loadPlayed (the current load has played), loading (no
+    ' plan yet, or a start, replan, reanchor, or reload in flight),
+    ' playerSeeking (a local seek in flight), seekAgeMs (since the room's
+    ' last seek or reload ran), atEnd (parked at the end), planInPlace,
+    ' commandSeq }. A paused member's seek counts as landed SEEK_SETTLE_MS
+    ' after it ran, should the node never report it.
+    function sample(facts as Object) as Object
+        videoState = util.text(facts.videoState)
+        atEnd = util.isTrue(facts.atEnd)
+        loading = util.isTrue(facts.loading)
+        settled = videoState = "paused" and util.isNumber(facts.seekAgeMs) and facts.seekAgeMs >= SEEK_SETTLE_MS
+        seeking = loading or (util.isTrue(facts.playerSeeking) and not settled)
+        wantsPlay = util.isTrue(facts.wantsPlay) and not atEnd
+        commandSeq = 0
+        if util.isNumber(facts.commandSeq) then commandSeq = facts.commandSeq
+        return {
+            sessionId: util.text(facts.sessionId),
+            revision: facts.revision,
+            position: numberOr(facts.position, 0),
+            duration: numberOr(facts.duration, 0),
+            playing: videoState = "playing" and not seeking and not atEnd,
+            wantsPlay: wantsPlay,
+            playable: util.isTrue(facts.loadPlayed) and not loading,
+            stalled: videoState = "buffering" and wantsPlay,
+            seeking: seeking,
+            atEnd: atEnd,
+            planInPlace: util.isTrue(facts.planInPlace),
+            commandSeq: commandSeq
+        }
+    end function
+
+    ' Whether two samples differ in what the Task decides from: anything but
+    ' the position, which the player sends on its own pace.
+    function changed(previous as Dynamic, current as Object) as Boolean
+        if not util.isObject(previous) then return true
+        for each name in ["sessionId", "revision", "playing", "wantsPlay", "playable", "stalled", "seeking", "atEnd", "planInPlace", "commandSeq"]
+            if FormatJson(previous[name]) <> FormatJson(current[name]) then return true
+        end for
+        return false
+    end function
+
+    ' What the render thread does for one playerCommand ({ seq, commandId,
+    ' seek, reload, playing }), in order: [{ op, position }], op "seek" (a
+    ' seek through the session, local or a seek_reanchor), "reload" (a new
+    ' load at position, local or a seek_reanchor), "play", or "pause". facts:
+    ' { atEnd }. A member parked at the end takes no seek, so a seek there
+    ' reloads; a play without a seek leaves it paused at the end, for the
+    ' room's next seek to move it (tvOS). The play state goes first, so a
+    ' load the seek opens follows it.
+    function steps(command as Dynamic, facts as Object) as Object
+        out = []
+        if not util.isObject(command) then return out
+        atEnd = util.isTrue(facts.atEnd)
+        hasSeek = util.isNumber(command.seek) and command.seek >= 0
+        if util.isBoolean(command.playing)
+            if command.playing
+                if hasSeek or not atEnd then out.Push({ op: "play", position: invalid })
+            else
+                out.Push({ op: "pause", position: invalid })
+            end if
+        end if
+        if hasSeek
+            op = "seek"
+            if util.isTrue(command.reload) or atEnd then op = "reload"
+            out.Push({ op: op, position: command.seek })
+        end if
+        return out
+    end function
+
+    ' The viewer's press, play, pause, or seek (section 4.10), against the
+    ' room's sync view: { send, noticeKey }. Play and pause follow
+    ' canPlayPause, seeks canSeek (the host's alone); a refused press names
+    ' its notice. Outside a party nothing is sent.
+    function transport(action as String, sync as Dynamic) as Object
+        if not util.isObject(sync) or sync.IsEmpty() then return { send: false, noticeKey: "" }
+        if action = "seek"
+            if util.isTrue(sync.canSeek) then return { send: true, noticeKey: "" }
+            return { send: false, noticeKey: "watchParty.player.hostOnlySeek" }
+        end if
+        if util.isTrue(sync.canPlayPause) then return { send: true, noticeKey: "" }
+        return { send: false, noticeKey: "watchParty.player.hostOnlyPlayPause" }
+    end function
+
+    ' The press Play/Pause stands for: "pause" while the room wants this
+    ' member playing, else "play".
+    function toggleAction(wantsPlay as Boolean) as String
+        if wantsPlay then return "pause"
+        return "play"
+    end function
+
+    ' The status pill (section 4.10): its locale key once it has held for
+    ' PILL_DELAY_MS, else "". state ({ key, since }, from pillState) keeps
+    ' when the current key began. input: { connection (the Task's state),
+    ' waitingForClock, syncing (the room waits, this member catches up, or
+    ' the player seeks or loads for the room) }.
+    function pill(state as Object, input as Object, now as Integer) as String
+        key = ""
+        if util.text(input.connection) = "reconnecting"
+            key = PILL_RECONNECTING
+        else if util.isTrue(input.waitingForClock)
+            key = PILL_CLOCK
+        else if util.isTrue(input.syncing)
+            key = PILL_SYNCING
+        end if
+        if key <> state.key
+            state.key = key
+            state.since = now
+        end if
+        if key = "" or now - state.since < PILL_DELAY_MS then return ""
+        return key
+    end function
+
+    function pillState() as Object
+        return { key: "", since: 0 }
+    end function
+
+    ' Milliseconds until the pill's key shows, or invalid when none waits.
+    function pillDueMs(state as Object, now as Integer) as Dynamic
+        if state.key = "" then return invalid
+        due = state.since + PILL_DELAY_MS - now
+        if due <= 0 then return invalid
+        return due
+    end function
+
+    function numberOr(value as Dynamic, fallback as Dynamic) as Dynamic
+        if util.isNumber(value) then return value
+        return fallback
+    end function
+end namespace

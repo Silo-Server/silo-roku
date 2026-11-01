@@ -1,0 +1,175 @@
+namespace tests
+
+    ' A Watch Party's player (components/player/PlayerParty.bs) through a
+    ' PlayerProbe and a stand-in room Task: what the viewer's presses send,
+    ' how the room's commands move the Video node, and what the player
+    ' reports.
+    @suite("player in a watch party")
+    class PlayerPartyTests extends tests.PlayerCaptionsSuite
+
+        function guest() as Object
+            return { canPlayPause: true, canSeek: false, pendingSeek: invalid, syncing: false, waitingForClock: false }
+        end function
+
+        function host() as Object
+            return { canPlayPause: true, canSeek: true, pendingSeek: invalid, syncing: false, waitingForClock: false }
+        end function
+
+        @describe("reports")
+
+        @it("attaches its committed session and reports a sample")
+        sub _()
+            view = m.player().callFunc("probeParty", { sync: m.guest(), playing: false })
+            m.assertEqual(view.session, { sessionId: "s-1", revision: 3 })
+            m.assertEqual(view.sample.sessionId, "s-1")
+            m.assertEqual(view.sample.revision, 3)
+            m.assertFalse(view.sample.wantsPlay)
+            m.assertTrue(view.sample.playable)
+            m.assertTrue(view.sample.planInPlace)
+            m.assertFalse(view.upNext, "no Up Next in a party")
+        end sub
+
+        @describe("presses")
+
+        @it("sends Play/Pause as a transport request and leaves the Video node alone")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.guest(), playing: false })
+            node.callFunc("probeKey", "play", true)
+            node.callFunc("probeKey", "play", false)
+            view = node.callFunc("probePartyView")
+            m.assertEqual(view.command, { kind: "transportRequest", action: "play", paused: false })
+            m.assertEqual(view.control, "none")
+        end sub
+
+        @it("tells a guest of a host-only room that only the host can play or pause")
+        sub _()
+            node = m.player()
+            sync = m.guest()
+            sync.canPlayPause = false
+            node.callFunc("probeParty", { sync: sync, playing: true })
+            node.callFunc("probeKey", "play", true)
+            node.callFunc("probeKey", "play", false)
+            view = node.callFunc("probePartyView")
+            m.assertEqual(view.command, {})
+            m.assertEqual(view.status, "Only the host can play or pause.")
+            m.assertEqual(view.control, "none")
+        end sub
+
+        @it("refuses a guest's seek with its notice")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.guest(), playing: true })
+            view = node.callFunc("probePartySeek", 300)
+            m.assertEqual(view.command, {})
+            m.assertEqual(view.status, "Only the host can seek.")
+        end sub
+
+        @it("sends the host's seek and holds the scrubber on it until the room's seek runs")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.host(), playing: true })
+            view = node.callFunc("probePartySeek", 300)
+            m.assertEqual(view.command, { kind: "transportRequest", action: "seek", paused: false, position: 300 })
+            m.assertTrue(view.seek = 0, "the Video node does not move")
+            sync = m.host()
+            sync.pendingSeek = 300
+            view = node.callFunc("probePartySync", sync)
+            m.assertTrue(view.position = 300, "the scrubber holds the target")
+        end sub
+
+        @it("opens the room panel for Back instead of closing")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.guest(), playing: true })
+            node.callFunc("probeKey", "back", true)
+            node.callFunc("probeKey", "back", false)
+            view = node.callFunc("probePartyView")
+            m.assertEqual(view.panel, { open: true, reason: "back" })
+            m.assertFalse(view.leaving)
+        end sub
+
+        @describe("the room's commands")
+
+        @it("pauses the Video node for a pause and seeks for a seek")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.guest(), playing: true })
+            view = node.callFunc("probePartyCommand", { seq: 1, commandId: "c-1", seek: 42.5, reload: false, playing: false })
+            m.assertEqual(view.control, "pause")
+            m.assertFalse(view.wantsPlay)
+            m.assertTrue(view.paused, "loads it opens stay paused")
+            m.assertTrue(Abs(view.seek - 42.5) < 0.001, "seeks to the room's position")
+            m.assertEqual(view.sample.commandSeq, 1)
+        end sub
+
+        @it("resumes a paused member for a play")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.guest(), playing: false })
+            view = node.callFunc("probePartyCommand", { seq: 2, commandId: "c-2", seek: invalid, reload: false, playing: true })
+            m.assertEqual(view.control, "resume")
+            m.assertTrue(view.wantsPlay)
+            m.assertFalse(view.paused)
+        end sub
+
+        @describe("the end of the file")
+
+        @it("stays paused at the end with its session open, and tells the room")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.guest(), playing: true })
+            view = node.callFunc("probePartyFinished", 599)
+            m.assertFalse(view.done, "the session stays open")
+            m.assertFalse(view.leaving)
+            m.assertTrue(view.sample.atEnd)
+            m.assertFalse(view.sample.wantsPlay)
+        end sub
+
+        @it("reloads where an early end stopped")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.guest(), playing: true })
+            view = node.callFunc("probePartyFinished", 200)
+            m.assertFalse(view.done)
+            m.assertFalse(view.sample.atEnd)
+            m.assertTrue(view.sample.seeking, "a reload is under way")
+        end sub
+
+        @describe("starting")
+
+        @it("refuses a plan of another file with the version message")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.guest(), playing: false })
+            view = node.callFunc("probePartyLoad", "99")
+            m.assertTrue(view.errorVisible)
+            m.assertEqual(view.session, {}, "its session stopped")
+        end sub
+
+        @describe("phones")
+
+        @it("refuses a guest's phone seek, and lets its phone pause through the room")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.guest(), playing: true })
+            outcome = node.callFunc("remoteCommand", { name: "seek", seconds: 30 })
+            m.assertFalse(outcome.ok)
+            m.assertEqual(outcome.message, "This Watch Party does not allow this playback action.")
+            m.assertTrue(node.callFunc("remoteCommand", { name: "pause" }).ok)
+            m.assertEqual(node.callFunc("probePartyView").command, { kind: "transportRequest", action: "pause", paused: true })
+        end sub
+
+        @it("leaves the party for a phone's Stop")
+        sub _()
+            node = m.player()
+            node.callFunc("probeParty", { sync: m.guest(), playing: true })
+            m.assertTrue(node.callFunc("remoteCommand", { name: "stop" }).ok)
+            view = node.callFunc("probePartyView")
+            m.assertEqual(view.command, { kind: "leave" })
+            m.assertTrue(view.leaving)
+        end sub
+
+    end class
+
+end namespace

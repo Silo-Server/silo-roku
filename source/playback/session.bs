@@ -107,9 +107,19 @@ namespace playback.session
     ' context: identity {server, account, profile}; installationId and features
     ' from capabilities; multichannelAac from the audio probe; outputContextId;
     ' loads, the last load number a previous session of the same Video node
-    ' used, so its late callbacks never match this one's loads. All but
+    ' used, so its late callbacks never match this one's loads; party, true
+    ' for a Watch Party's player (partyFinished, onPartyReload). All but
     ' identity may be left out: each start result brings the context its body
     ' was built with (applyContext).
+    '
+    ' In a party (docs/watch-party.md sections 4.10 and 7) the room moves the
+    ' player: the end of the file parks it paused at the end, the session
+    ' still open, instead of ending it ("partyEnded"); a load that finishes
+    ' before the end reloads where it stopped; a seek or a reload
+    ' ("partyReload") from the end opens a new load there, since the
+    ' finished content takes no seek; a paused member's seek counts as landed
+    ' when the Video node is paused again; and a plan for another file than
+    ' the room's ("partyRefused") is the playback error, its session stopped.
     function create(context as Object) as Object
         features = context.features
         if not playback.values.isArray(features) then features = []
@@ -152,6 +162,7 @@ namespace playback.session
             resume: invalid,
             reachable: true,
             identityChanged: false,
+            party: util.isTrue(context.party),
             loads: loads
         }
     end function
@@ -173,6 +184,18 @@ namespace playback.session
             onTick(state, out)
         else if t = "seekTo"
             onSeekTo(state, event, env, out)
+        else if t = "partyReload"
+            onPartyReload(state, event, env, out)
+        else if t = "partyPlayIntent"
+            ' {playing}: the room's play state, which the loads a party
+            ' player opens follow (adopt, reload), as a viewer's pause does.
+            if state.party and state.player.paused = util.isTrue(event.playing)
+                state.player.paused = not util.isTrue(event.playing)
+                if not state.player.paused then playback.recovery.restartStall(state.stall, env.now(), invalid)
+            end if
+        else if t = "partyRefused"
+            ' {message}: the plan names another file than the room's.
+            if state.phase = "active" or state.phase = "starting" then showError(state, env, out, { reason: "watch_party_version", message: event.message, retryable: false })
         else if t = "skip"
             onSkip(state, event, env)
         else if t = "trackChange"
@@ -300,7 +323,8 @@ namespace playback.session
     ' bandwidthCapKbps are the profile's preferences (absent for Auto and no
     ' cap); startPosition is Resume's or Start Over's start_position in
     ' source seconds, absent to let the server resume; autoplay starts, such
-    ' as Up Next, report no first_frame_ms.
+    ' as Up Next, report no first_frame_ms; playIntent false opens the first
+    ' load paused (a Watch Party's start, watch-party.md section 8.1).
     sub onPlay(state as Object, event as Object, env as Object, out as Object)
         if state.phase = "leaving" then return
         quality = event.quality
@@ -308,6 +332,8 @@ namespace playback.session
         if util.isNumber(event.bandwidthCapKbps) and event.bandwidthCapKbps > 0 then state.bandwidthCap = Int(event.bandwidthCapKbps)
         request = { rank: RANK_PLAY, op: "play", intent: event.intent, quality: quality, autoplay: util.isTrue(event.autoplay), catalogRuntime: event.catalogRuntime, restarts: 0, requestedAt: invalid }
         if util.isNumber(event.startPosition) then request.startPosition = event.startPosition
+        ' A party's start mounts paused: the room's commands play it.
+        if util.isBoolean(event.playIntent) then request.playIntent = event.playIntent
         ' The connection's speed reading (playback.connection.freshEstimate),
         ' which an Auto start sends as a probe estimate.
         if util.isNumber(event.estimate) then request.estimate = Int(event.estimate)
@@ -321,6 +347,10 @@ namespace playback.session
     ' only the content playing (hardware run 9, T1e).
     sub onSeekTo(state as Object, event as Object, env as Object, out as Object)
         if state.phase <> "active" then return
+        if state.party and util.isTrue(state.player.ended)
+            onPartyReload(state, { position: event.position }, env, out)
+            return
+        end if
         if util.isTrue(event.resume) and state.player.paused
             ' The stall clock stood still while paused.
             state.player.paused = false
@@ -365,6 +395,30 @@ namespace playback.session
             request.tracks = tracks
         end if
         submit(state, request, env, out)
+    end sub
+
+    ' {position}: a party's reload at a source position: the room's
+    ' correction reload, or a room seek that moves the member off the end
+    ' of the file. A new load of the current plan there where the timeline
+    ' allows a local reload, else a seek_reanchor; it opens paused or
+    ' playing as the player says (the player's own load commands carry the
+    ' room's play state).
+    sub onPartyReload(state as Object, event as Object, env as Object, out as Object)
+        if state.phase <> "active" or not util.isNumber(event.position) then return
+        plan = state.plan
+        target = playback.seek.clamp(event.position, plan.runtime)
+        state.player.ended = false
+        playback.seek.cancelSkips(state.skips)
+        decision = playback.seek.decide(plan.timeline, target)
+        out.Push({ type: "log", level: "info", message: "[WP] party reload", fields: { position: playback.values.roundMs(target), kind: decision.kind } })
+        if decision.kind = "local"
+            state.seekTarget = invalid
+            state.player.position = playback.values.toDouble(target)
+            reload(state, env, out, decision.position)
+        else
+            state.seekTarget = target
+            submit(state, { rank: RANK_INTENT, op: "seek_reanchor", position: target }, env, out)
+        end if
     end sub
 
     ' {quality}: "auto" or a label from available_qualities. During a start it
@@ -685,6 +739,9 @@ namespace playback.session
             if state.reconnect = invalid then endOutage(state, out)
         else if event.state = "paused"
             p.paused = true
+            ' A party member paused for the room seeks while paused: the node
+            ' paused again is the seek landed (watch-party.md section 7.4).
+            if state.party then p.seeking = false
         else if event.state = "buffering"
             ' The seek back's own rebuffering, once it has been sent.
             if plan.seekBack <> invalid then plan.seekBack.buffered = true
@@ -698,6 +755,8 @@ namespace playback.session
             ' evidence, harness defect 3); only a load that has not failed ends.
             if util.isTrue(event.afterWrite) and not atEnd(state)
                 stoppedByClient(state, env, out)
+            else if state.party
+                partyFinished(state, env, out)
             else
                 endSession(state, env, out, "finished")
             end if
@@ -734,6 +793,22 @@ namespace playback.session
         else
             submit(state, { rank: RANK_RECOVERY, op: "seek_reanchor", position: position, planAttemptId: plan.attemptId }, env, out)
         end if
+    end sub
+
+    ' A party's load finished (watch-party.md section 4.10). At the end of
+    ' the file the member stays paused there with its session open, and the
+    ' room decides what follows; a load that ended early, as a dropped
+    ' connection's, reloads where it stopped, mounted as the player says
+    ' (tvOS's premature end of file).
+    sub partyFinished(state as Object, env as Object, out as Object)
+        if not atEnd(state)
+            out.Push({ type: "log", level: "warn", message: "[WP] the load ended before the end of the file; reloading where it stopped", fields: { position: playback.values.roundMs(state.player.position) } })
+            onPartyReload(state, { position: state.player.position }, env, out)
+            return
+        end if
+        state.player.paused = true
+        state.player.ended = true
+        out.Push({ type: "partyEnded" })
     end sub
 
     ' {load, position}: the Video node's position, in player seconds. Until
@@ -2070,7 +2145,7 @@ namespace playback.session
     end sub
 
     function newPlayer(position as Dynamic) as Object
-        return { state: "idle", position: playback.values.toDouble(position), paused: false, seeking: false }
+        return { state: "idle", position: playback.values.toDouble(position), paused: false, seeking: false, ended: false }
     end function
 
     ' Stop and event IDs must be lowercase canonical UUIDs (plan section 5).

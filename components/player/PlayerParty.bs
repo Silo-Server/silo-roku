@@ -1,0 +1,360 @@
+import "pkg:/source/playback/skipIntro.bs"
+import "pkg:/source/watchparty/player.bs"
+
+' The player in a Watch Party (docs/watch-party.md sections 4.10, 7, and
+' 8). A party player's entry has params.party (watchparty.app.playerParams):
+' AppScene opens it when the room plays and closes it (partyClose) when the
+' room returns to the lobby or the party ends. It starts the room's file,
+' pinned, at the anchor, mounted paused (begin); from then on it moves only
+' on the room Task's playerCommand, which it executes at once
+' (onPartyCommand: the Task already waited for the command's execute_at),
+' and it tells the Task what it does (partyReport: the playerSample, and
+' the session once committed). The viewer's play, pause, and seeks, from
+' the remote, voice, Options' chapters, the skip pills, or a phone, become
+' transport requests the room answers (partyTransport); the scrubber holds
+' a requested seek's target until the room's seek runs (sync.pendingSeek).
+' Back, wherever the ladder would close the player, and the error screen's
+' Go Back open the room panel instead (partyPanel). The rules are
+' watchparty.player's; the session reducer's party mode
+' (playback.session.create's party) parks the end of the file and reloads
+' an early end. Nothing here logs a code, ticket, or proof.
+
+' The pill's place: at the right inset, at the busy capsule's top.
+const PARTY_PILL_TOP = 124
+
+sub partyInitPlayer()
+    m.party = invalid
+    m.partyPill = m.top.findNode("partyPill")
+    m.partyTimer = m.top.findNode("partyTimer")
+    m.partyTimer.observeField("fire", "onPartyTimer")
+end sub
+
+' Whether this player plays for a party.
+function inParty() as Boolean
+    return m.party <> invalid
+end function
+
+' The entry's party, from onShow. The room Task is AppScene's
+' (m.global.roomTask) unless task names one.
+sub partyBegin(party as Object, task = invalid as Dynamic)
+    if task = invalid and m.global.hasField("roomTask") then task = m.global.roomTask
+    m.party = {
+        task: task,
+        roomId: util.text(party.roomId),
+        revision: party.revision,
+        fileId: util.text(party.fileId),
+        ' The room's play state as its last command left it; a party player
+        ' mounts paused (section 8.1).
+        wantsPlay: false,
+        commandSeq: 0,
+        seekAt: invalid,
+        sessionSent: "",
+        sample: invalid,
+        sampleAt: invalid,
+        sync: {},
+        connection: "",
+        pill: watchparty.player.pillState(),
+        panelOpen: false,
+        closing: false,
+        refusedStart: false
+    }
+    if task <> invalid
+        task.observeFieldScoped("playerCommand", "onPartyCommand")
+        task.observeFieldScoped("sync", "onPartySync")
+        task.observeFieldScoped("connection", "onPartyConnection")
+        task.observeFieldScoped("notice", "onPartyNotice")
+        if util.isObject(task.sync) then m.party.sync = task.sync
+        if util.isObject(task.connection) then m.party.connection = util.text(task.connection.state)
+    end if
+    scene = m.top.getScene()
+    if scene.hasField("watchPartyPanel") then scene.observeFieldScoped("watchPartyPanel", "onPartyPanel")
+    log.info(LOG_TAG, "[WP] party player", { roomId: m.party.roomId, revision: m.party.revision })
+    m.partyTimer.control = "start"
+end sub
+
+sub partyRelease()
+    party = m.party
+    if party = invalid then return
+    m.partyTimer.control = "stop"
+    task = party.task
+    if task <> invalid
+        task.unobserveFieldScoped("playerCommand")
+        task.unobserveFieldScoped("sync")
+        task.unobserveFieldScoped("connection")
+        task.unobserveFieldScoped("notice")
+        ' The session closed with the player (section 7.3).
+        if party.sessionSent <> "" then task.session = {}
+    end if
+    scene = m.top.getScene()
+    if scene.hasField("watchPartyPanel")
+        scene.unobserveFieldScoped("watchPartyPanel")
+        if party.panelOpen then scene.watchPartyPanel = { open: false, reason: "closed" }
+    end if
+    party.sessionSent = ""
+end sub
+
+' AppScene closes the player for the room (the lobby, or the end of the
+' party): its session stops as Back stops it, and the player leaves
+' instead of opening the panel.
+sub partyClose()
+    if m.party = invalid then return
+    m.party.closing = true
+    exitPlayer()
+end sub
+
+' Whether Back and Go Back open the room panel rather than close the
+' player.
+function partyHoldsBack() as Boolean
+    return m.party <> invalid and not m.party.closing
+end function
+
+' The room panel over the player (docs/watch-party.md section 11, Hooks):
+' AppScene's watchPartyPanel, which its owner shows over the player with
+' "Return to playback"; Back in it, or that button, closes it, and the
+' player takes focus back (onPartyPanel).
+sub partyPanel(reason as String)
+    log.info(LOG_TAG, "[WP] room panel", { reason: reason })
+    scene = m.top.getScene()
+    if not scene.hasField("watchPartyPanel") then return
+    m.party.panelOpen = true
+    scene.watchPartyPanel = { open: true, reason: reason }
+end sub
+
+sub onPartyPanel(event as Object)
+    if m.party = invalid then return
+    data = event.getData()
+    if util.isObject(data) and util.isTrue(data.open) then return
+    if not m.party.panelOpen then return
+    m.party.panelOpen = false
+    if m.closed then return
+    applyFocus()
+end sub
+
+' ---- Transport requests (section 4.10)
+
+' The viewer's play, pause, toggle, or seek: a transport request when the
+' room lets this member make it, else the refusal's notice for 3 s. The
+' player itself does not move; the room's command moves it.
+sub partyTransport(action as String, position = invalid as Dynamic)
+    if action = "toggle" then action = watchparty.player.toggleAction(m.party.wantsPlay)
+    decision = watchparty.player.transport(action, m.party.sync)
+    if not decision.send
+        if decision.noticeKey <> "" then notice(i18n.text(decision.noticeKey), playback.player.NOTICE_WARNING, watchparty.player.NOTICE_MS)
+        refreshChrome()
+        return
+    end if
+    paused = not m.party.wantsPlay
+    if action = "play" then paused = false
+    if action = "pause" then paused = true
+    command = { kind: "transportRequest", action: action, paused: paused }
+    if action = "seek" then command.position = position
+    log.info(LOG_TAG, "[WP] transport request", { action: action })
+    if m.party.task <> invalid then m.party.task.command = command
+end sub
+
+' The Skip Intro offer in a party (tvOS's introSkipMode): never automatic,
+' since the seek would move every member; an offer for a member who may
+' seek, none for one who may not.
+function partyIntroMode(profileMode as Dynamic) as String
+    if not util.isTrue(m.party.sync.canSeek) or playback.skipIntro.modeOf(profileMode) = playback.skipIntro.NEVER then return playback.skipIntro.NEVER
+    return playback.skipIntro.ASK
+end function
+
+' ---- The room's commands (section 7.2)
+
+' One playerCommand, executed now (watchparty.player.steps): the play state
+' first, so a load the seek opens follows it, then the seek or reload,
+' each through the session reducer as every seek goes.
+sub onPartyCommand(event as Object)
+    if m.party = invalid or m.closed or m.leaving then return
+    command = event.getData()
+    if not util.isObject(command) then return
+    now = m.env.now()
+    for each stepOf in watchparty.player.steps(command, { atEnd: partyAtEnd() })
+        op = stepOf.op
+        if op = "play" or op = "pause"
+            partyPlayState(op = "play")
+        else if op = "seek"
+            m.party.seekAt = now
+            dispatch({ type: "seekTo", position: stepOf.position, resume: false })
+        else if op = "reload"
+            m.party.seekAt = now
+            dispatch({ type: "partyReload", position: stepOf.position })
+        end if
+    end for
+    if util.isNumber(command.seq) then m.party.commandSeq = command.seq
+    log.info(LOG_TAG, "[WP] executed", { commandId: util.text(command.commandId), seq: command.seq, seek: command.seek, reload: util.isTrue(command.reload), playing: command.playing })
+    partyReport(true)
+end sub
+
+' The room's play state: the session's intent, which a load it opens
+' follows, then the Video node, unless a newer load is about to replace
+' its content (togglePause's rule).
+sub partyPlayState(playing as Boolean)
+    m.party.wantsPlay = playing
+    dispatch({ type: "partyPlayIntent", playing: playing })
+    item = m.current
+    pending = item <> invalid and m.activeLoad <> invalid and item.load <> m.activeLoad
+    if playing
+        if item <> invalid and m.pauseLoad <> invalid and m.pauseLoad = item.load then m.pauseLoad = invalid
+        if not pending and m.video.state = "paused" then m.video.control = "resume"
+    else
+        if item <> invalid and m.activeLoad <> item.load then m.pauseLoad = item.load
+        if not pending and (m.video.state = "playing" or m.video.state = "buffering") then m.video.control = "pause"
+    end if
+end sub
+
+' The Video node played while the room wants this member paused (a seek
+' Roku resumed, or content that opened playing): it pauses again.
+sub partyHoldPause(videoState as String)
+    if m.party = invalid or m.party.wantsPlay or videoState <> "playing" then return
+    m.video.control = "pause"
+end sub
+
+' The end of the file (playback.session's partyEnded): the member stays
+' there paused with its session open, and the room decides what follows.
+sub partyEnded()
+    log.info(LOG_TAG, "[WP] parked at the end of the file", {})
+    m.party.wantsPlay = false
+    partyReport(true)
+end sub
+
+function partyAtEnd() as Boolean
+    return m.state <> invalid and util.isTrue(m.state.player.ended)
+end function
+
+' ---- Reports (section 7.3)
+
+' The session once committed, and the sample: at once when what the Task
+' decides from changed (force, or watchparty.player.changed), else every
+' watchparty sample interval.
+sub partyReport(force = false as Boolean)
+    party = m.party
+    if party = invalid or party.task = invalid or m.closed then return
+    now = m.env.now()
+    current = watchparty.player.sample(partyFacts(now))
+    if current.sessionId <> party.sessionSent
+        party.sessionSent = current.sessionId
+        if current.sessionId = ""
+            party.task.session = {}
+        else
+            log.info(LOG_TAG, "[WP] session committed", { revision: party.revision })
+            party.task.session = { sessionId: current.sessionId, revision: party.revision }
+        end if
+    end if
+    due = party.sampleAt = invalid or now - party.sampleAt >= watchparty.player.SAMPLE_MS
+    if not force and not due and not watchparty.player.changed(party.sample, current) then return
+    party.sample = current
+    party.sampleAt = now
+    party.task.playerSample = current
+end sub
+
+' What watchparty.player.sample reads, from the session and the Video
+' node.
+function partyFacts(now as Integer) as Object
+    party = m.party
+    facts = { sessionId: "", revision: party.revision, position: 0, duration: 0, videoState: m.video.state, wantsPlay: party.wantsPlay, loadPlayed: false, loading: true, playerSeeking: false, seekAgeMs: invalid, atEnd: false, planInPlace: true, commandSeq: party.commandSeq }
+    if party.seekAt <> invalid then facts.seekAgeMs = now - party.seekAt
+    state = m.state
+    if state = invalid or m.errorVisible then return facts
+    if state.attempt <> invalid and util.isString(state.attempt.sessionId) then facts.sessionId = state.attempt.sessionId
+    facts.position = state.player.position
+    facts.playerSeeking = state.player.seeking
+    facts.atEnd = util.isTrue(state.player.ended)
+    plan = state.plan
+    if plan = invalid then return facts
+    if util.isNumber(plan.runtime) then facts.duration = plan.runtime
+    facts.loadPlayed = plan.loadPlayed
+    facts.planInPlace = watchparty.player.planInPlace(plan.data)
+    item = m.current
+    replacing = item = invalid or m.activeLoad = invalid or m.activeLoad <> item.load
+    facts.loading = state.phase <> "active" or state.mutation <> invalid or util.isNumber(state.seekTarget) or replacing
+    return facts
+end function
+
+' ---- The room's view
+
+sub onPartySync(event as Object)
+    if m.party = invalid then return
+    data = event.getData()
+    if not util.isObject(data) then data = {}
+    m.party.sync = data
+    refreshChrome()
+end sub
+
+sub onPartyConnection(event as Object)
+    if m.party = invalid then return
+    data = event.getData()
+    state = ""
+    if util.isObject(data) then state = util.text(data.state)
+    if state <> m.party.connection then log.info(LOG_TAG, "[WP] room connection", { state: state })
+    m.party.connection = state
+    refreshChrome()
+end sub
+
+' The Task's notices for the player: a request the room refused, or one
+' that waits for the connection.
+sub onPartyNotice(event as Object)
+    if m.party = invalid then return
+    data = event.getData()
+    if not util.isObject(data) or data.scope <> "player" then return
+    text = util.text(data.text)
+    if util.text(data.key) <> "" then text = i18n.text(data.key, data.values)
+    if text <> "" then notice(text, playback.player.NOTICE_WARNING, watchparty.player.NOTICE_MS)
+    refreshChrome()
+end sub
+
+sub onPartyTimer()
+    if m.party = invalid or m.closed then return
+    refreshChrome()
+end sub
+
+' The scrubber's held target: a seek this member asked for, until the
+' room's seek runs; else position.
+function partyPosition(position as Dynamic) as Dynamic
+    if m.party = invalid then return position
+    held = m.party.sync.pendingSeek
+    if util.isNumber(held) then return held
+    return position
+end function
+
+' The status pill at the top right (section 4.10), after 500 ms; it
+' stands where the buffering card would, which a party never shows.
+sub partyChrome()
+    party = m.party
+    if party = invalid then return
+    sync = party.sync
+    sample = party.sample
+    busy = sample <> invalid and (sample.seeking or sample.stalled)
+    key = watchparty.player.pill(party.pill, { connection: party.connection, waitingForClock: util.isTrue(sync.waitingForClock), syncing: util.isTrue(sync.syncing) or (busy and not m.errorVisible) }, m.env.now())
+    if m.errorVisible then key = ""
+    text = ""
+    if key <> "" then text = i18n.text(key)
+    if m.partyPill.text <> text then m.partyPill.text = text
+    shown = text <> ""
+    if m.partyPill.visible <> shown then m.partyPill.visible = shown
+    if shown then m.partyPill.translation = [theme.player.RIGHT - m.partyPill.drawnWidth, PARTY_PILL_TOP]
+end sub
+
+' ---- Starting (section 8)
+
+' Whether a plan plays another file than the room's: the start fails with
+' "The Watch Party's selected media version is unavailable." and its
+' session stops (section 8.1).
+function partyRefusesPlan(plan as Dynamic) as Boolean
+    if m.party = invalid or not watchparty.player.versionRefused(plan, m.party.fileId) then return false
+    log.warn(LOG_TAG, "[WP] the plan names another file than the room's", { revision: m.party.revision })
+    dispatch({ type: "partyRefused", message: i18n.text("watchParty.player.versionUnavailable") })
+    return true
+end function
+
+' A start the server refused for a reason the room's source fallback
+' answers: the room moves every member to a new revision (section 8.3).
+sub partyStartRefused(reason as Dynamic)
+    if m.party = invalid or m.party.refusedStart then return
+    fallback = watchparty.player.fallbackReason(reason)
+    if fallback = "" or m.party.task = invalid then return
+    m.party.refusedStart = true
+    log.info(LOG_TAG, "[WP] source fallback", { reason: fallback, revision: m.party.revision })
+    m.party.task.command = { kind: "sourceFallback", selectionRevision: m.party.revision, failedFileId: m.party.fileId, reason: fallback }
+end sub

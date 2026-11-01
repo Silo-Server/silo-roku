@@ -32,6 +32,7 @@ import "pkg:/source/util/i18n.bs"
 import "pkg:/source/util/log.bs"
 import "pkg:/source/util/redact.bs"
 import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/app.bs"
 
 ' The player. The session reducer decides; this file feeds it the Video
 ' node's state, position, and errors (playback.video), ApiTask's answers
@@ -190,6 +191,13 @@ import "pkg:/source/util/values.bs"
 ' (playback.upNext.leftFinished), which decides whether that page moves on
 ' (spec section 5.6). Once the chain moves to another title (On Deck), the
 ' notes stop at the last item of the first one (m.leftSeries).
+'
+' Watch Party (components/player/PlayerParty.bs, docs/watch-party.md
+' section 4.10): a player whose entry has params.party plays the room's
+' file and moves only on the room's commands. Its seeks (commitSeek) and
+' play and pause (togglePause) become transport requests, its exits open
+' the room panel (exitPlayer), and Up Next, auto-skips, and the buffering
+' card are off (begin).
 
 const LOG_TAG = "player"
 const NOTICE_MS = 4000
@@ -479,6 +487,7 @@ sub init()
     m.lastStopMs = invalid
     shuffleInitPlayer()
     subtitleSearchInitPlayer()
+    partyInitPlayer()
 end sub
 
 function newFlags() as Object
@@ -504,6 +513,9 @@ sub onShow(event as Object)
     ' (source/nav/player.bs); the test player entry passes the item ID and
     ' Start over directly.
     m.wanted = nav.player.intentOf(params)
+    ' A Watch Party's player (components/player/PlayerParty.bs).
+    party = watchparty.app.partyOf(params)
+    if party <> invalid then partyBegin(party)
     if m.wanted <> invalid
         m.itemId = m.wanted.contentId
         m.startOver = m.wanted.startPositionRule = nav.player.START_OVER
@@ -533,6 +545,7 @@ end sub
 ' screen's owner (playback.worker.cancel).
 sub onRelease()
     m.released = true
+    partyRelease()
     m.top.getScene().callFunc("connectionMedia", false)
     if m.state <> invalid and not m.done
         if identityChanged()
@@ -607,6 +620,9 @@ sub onBufferingMode(event as Object)
     if result = invalid or result.ok <> true then return
     mode = playback.preferences.bufferingMode(result.body)
     if mode = invalid then return
+    ' A party never shows the buffering card or steps quality down
+    ' (docs/watch-party.md section 4.10): it keeps "never".
+    if inParty() then return
     m.bufferingMode = mode
     if m.state <> invalid then dispatch({ type: "bufferingMode", mode: mode })
 end sub
@@ -675,6 +691,14 @@ sub onWatch(event as Object)
         showLocalError({ title: "Can't play this title", message: "The server lists no file for it." }, false)
         return
     end if
+    ' A party plays the room's file or nothing (docs/watch-party.md section
+    ' 8.1): a projection that does not list it cannot.
+    if inParty() and intent.fileId <> m.party.fileId
+        m.flags.starting = false
+        log.warn(LOG_TAG, "[WP] the room's file is not among the title's versions", { revision: m.party.revision })
+        showLocalError({ title: "Can't play this title", message: i18n.text("watchParty.player.versionUnavailable") }, false)
+        return
+    end if
     m.watch = result.body
     if m.preferencesRead
         begin(intent)
@@ -706,11 +730,17 @@ sub begin(intent as Object)
         end if
     end if
     readMarkers(intent.fileId)
-    m.skip = playback.skipIntro.create(m.preferences.introSkipMode, m.markers)
-    m.recap = playback.skipRecap.create(m.preferences.autoSkipRecap, m.markers)
-    m.credits = playback.skipCredits.create(m.preferences.autoSkipCredits, m.markers, intent.runtime, playback.skipCredits.carriedKey(carry))
+    ' A party skips nothing by itself, and has no Up Next, autoplay, or On
+    ' Deck (docs/watch-party.md section 4.10).
+    party = inParty()
+    introMode = m.preferences.introSkipMode
+    if party then introMode = partyIntroMode(introMode)
+    m.skip = playback.skipIntro.create(introMode, m.markers)
+    m.recap = playback.skipRecap.create(m.preferences.autoSkipRecap and not party, m.markers)
+    m.credits = playback.skipCredits.create(m.preferences.autoSkipCredits and not party, m.markers, intent.runtime, playback.skipCredits.carriedKey(carry))
     if not chained then carry = playback.upNext.newCarry()
-    m.upNext = playback.upNext.create({ promptSeconds: m.preferences.nextUpPromptSeconds, runtime: intent.runtime, lookup: intent.kind = "episode" or isShuffling(), autoPlayNext: m.autoplayNext, deviceAutoplay: CreateObject("roDeviceInfo").IsAutoplayEnabled(), carry: carry, shuffle: isShuffling() })
+    m.upNext = invalid
+    if not party then m.upNext = playback.upNext.create({ promptSeconds: m.preferences.nextUpPromptSeconds, runtime: intent.runtime, lookup: intent.kind = "episode" or isShuffling(), autoPlayNext: m.autoplayNext, deviceAutoplay: CreateObject("roDeviceInfo").IsAutoplayEnabled(), carry: carry, shuffle: isShuffling() })
     ' The Up Next button waits for the first plan (resolveNext).
     showUpNextButton(false)
     ' A phone's launch may play as its own profile, borrowed for this
@@ -727,7 +757,9 @@ sub begin(intent as Object)
         view = api.session.current()
         m.identity = { server: view.origin, account: view.accountId, profile: view.profile.id }
     end if
-    m.state = playback.session.create({ identity: m.identity, loads: m.loads, bufferingMode: m.bufferingMode })
+    bufferingMode = m.bufferingMode
+    if party then bufferingMode = "never"
+    m.state = playback.session.create({ identity: m.identity, loads: m.loads, bufferingMode: bufferingMode, party: party })
     m.titlePlayed = false
     current = platform.current()
     m.captionMode = util.text(current.captionMode)
@@ -751,7 +783,11 @@ sub begin(intent as Object)
     ' The profile's quality and bitrate cap, as read before the start or the
     ' defaults (Auto, no cap); an Options choice replaces the quality for
     ' this title's session.
-    dispatch({ type: "play", intent: playIntent, quality: m.preferences.preferredQuality, bandwidthCapKbps: m.preferences.maxBitrateKbps, autoplay: nav.player.isAutoStart(m.wanted), catalogRuntime: intent.runtime, startPosition: startPosition, estimate: estimate })
+    play = { type: "play", intent: playIntent, quality: m.preferences.preferredQuality, bandwidthCapKbps: m.preferences.maxBitrateKbps, autoplay: nav.player.isAutoStart(m.wanted), catalogRuntime: intent.runtime, startPosition: startPosition, estimate: estimate }
+    ' A party's start mounts paused at the room's anchor (section 8.1),
+    ' unless the room's command to play came first.
+    if party then play.playIntent = m.party.wantsPlay
+    dispatch(play)
 end sub
 
 ' --- The reducer ----------------------------------------------------------------
@@ -790,6 +826,7 @@ sub execute(command as Object)
         api.playback.job(command, api.newHandle(m.top.owner))
     else if t = "load"
         m.flags.starting = false
+        if partyRefusesPlan(command.plan) then return
         item = { load: command.load, plan: command.plan, playStart: command.playerStart, autoplay: command.autoplay, reopen: false, refresh: util.isTrue(command.refresh) }
         if util.isNumber(command.holdMs) then item.holdUntil = m.env.now() + command.holdMs
         prepare(item)
@@ -810,6 +847,8 @@ sub execute(command as Object)
         showReducerError(command, util.isTrue(command.retryable))
     else if t = "finished"
         endOfVideo()
+    else if t = "partyEnded"
+        partyEnded()
     else if t = "exit"
         ' Up Next's next episode follows the session it ends.
         if m.advance = invalid then leavePlayer()
@@ -861,6 +900,7 @@ sub onCommandAnswer(event as Object)
     body = invalid
     if result <> invalid and result.ok = true then body = result.body
     if command.type = "start" and util.isObject(body) and util.text(body.reason) <> "" then log.warn(LOG_TAG, "start refused", { reason: body.reason })
+    if command.type = "start" then partyStartRefused(watchparty.player.refusalReason(body))
     reducerEvent = playback.player.answerEvent(command, body)
     if reducerEvent <> invalid then dispatch(reducerEvent)
 end sub
@@ -1233,6 +1273,8 @@ sub onVideoState()
         m.pauseLoad = invalid
         m.video.control = "pause"
     end if
+    ' A party member plays only while the room wants it to.
+    partyHoldPause(videoState)
     afterWrite = false
     if videoState = "finished" and m.wroteAt <> invalid and m.state.plan <> invalid then afterWrite = m.env.now() - m.wroteAt <= WRITE_STOP_MS
     if afterWrite
@@ -2354,6 +2396,14 @@ end sub
 ' advance has already asked it to stop: the player leaves instead of
 ' starting the next episode.
 sub exitPlayer()
+    ' In a party every exit opens the room panel, until the room closes
+    ' the player (docs/watch-party.md section 4.10).
+    if partyHoldsBack()
+        reason = "back"
+        if m.errorVisible then reason = "error"
+        partyPanel(reason)
+        return
+    end if
     if m.state = invalid
         if not m.leaving then notePlayedLast()
         m.leaving = true
@@ -2544,6 +2594,10 @@ end sub
 ' decided, and resuming the old content would play its old position until
 ' then (hardware run 9, T1e).
 sub togglePause()
+    if inParty()
+        partyTransport("toggle")
+        return
+    end if
     if m.current <> invalid and m.activeLoad <> invalid and m.current.load <> m.activeLoad then return
     if m.video.state = "playing"
         m.video.control = "pause"
@@ -2606,7 +2660,8 @@ function optionsState() as Object
         captionMode: m.captionMode,
         modelType: m.modelType,
         autoplay: m.autoplayNext,
-        episode: m.intent.kind = "episode",
+        ' Auto-play next is Up Next's, which a party has not.
+        episode: m.intent.kind = "episode" and not inParty(),
         chapters: m.chapters,
         position: m.overlay.position,
         info: { series: m.overlay.series, title: m.overlay.title, tag: m.overlay.tag, year: m.intent.year, runtime: playback.options.runtimeText(m.intent.runtime, optionsWords().strings), overview: overview },
@@ -3024,6 +3079,12 @@ end function
 ' resume: Play committed the seek while paused, so a load the seek opens
 ' plays (playback.session.onSeekTo).
 sub commitSeek(position as Dynamic, resume = false as Boolean)
+    ' In a party a seek is the host's request; the room's command moves the
+    ' player (docs/watch-party.md section 4.10).
+    if inParty()
+        partyTransport("seek", position)
+        return
+    end if
     dispatch({ type: "seekTo", position: position, resume: resume })
 end sub
 
@@ -3325,6 +3386,11 @@ end sub
 
 ' Keep Watching after the end: the same item again from seconds.
 sub replayEnd(seconds as Dynamic)
+    ' A party has no end to replay: a spoken replay is a seek request.
+    if inParty()
+        commitSeek(seconds)
+        return
+    end if
     ' A replay stays with this item: a shuffle's advance still out is given
     ' up, as Keep Watching gives it up (upNextStay).
     shuffleAbandon()
@@ -3489,6 +3555,8 @@ sub refreshChrome()
         seeking = util.isNumber(m.state.seekTarget) or m.state.player.seeking
         if m.state.plan <> invalid then runtime = m.state.plan.runtime
     end if
+    ' A party's seek request holds the scrubber on its target.
+    position = partyPosition(position)
     if runtime = invalid and m.intent <> invalid then runtime = m.intent.runtime
     buffering = m.video.state = "buffering"
     paused = m.video.state = "paused"
@@ -3510,6 +3578,8 @@ sub refreshChrome()
     busy = seeking or buffering or m.flags.starting or m.flags.reconnecting
     dispatchControls({ type: "playback", position: position, runtime: runtime, paused: paused, busy: busy })
     refreshOptions()
+    partyReport()
+    partyChrome()
 end sub
 
 ' --- Requests ---------------------------------------------------------------------
