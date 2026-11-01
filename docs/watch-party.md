@@ -369,12 +369,18 @@ keeps the room open for two minutes.
   on room commands.
 - **Back:** every step of the player's Back ladder (spec section 5.7) that
   would close the player opens the room panel instead: the lobby over the
-  player with "Return to playback" as the primary. Back in the panel
-  returns to the player. The error screen's Go Back opens the panel too.
+  player, which stays mounted beneath, with "Return to playback" as the
+  primary. Back in the panel (with nothing open over its lobby) and
+  "Return to playback" close it and give focus back to the player; the
+  player takes no focus while it is open. The error screen's Go Back opens
+  the panel too. The panel closes by itself when the party goes (a leave,
+  an end, a replacement) or the room returns to the lobby, and the player
+  closes with it.
 - **Status pill** (top right, after 500 ms): "Reconnecting to the party…",
   or "Syncing with the party…" while the room waits, the player buffers or
-  seeks for the room, or this member is syncing. It replaces the
-  buffering-quality pill, which a party never shows.
+  seeks for the room (until the seek's real landing shows, and through a
+  barrier's muted roll, section 7.4), or this member is syncing. It
+  replaces the buffering-quality pill, which a party never shows.
 - **Off in a party:** Up Next, autoplay, On Deck, and next-episode
   controls; auto-skip of intros, recaps, and credits; the buffering-quality
   pill and every quality step-down; network-change replans; the version
@@ -387,8 +393,11 @@ keeps the room open for two minutes.
   room's command runs. A refused press shows "Only the host can seek." or
   "Only the host can play or pause." for 3 s (section 10).
 - **End of file:** the player pauses at the end with no Up Next; the
-  manager's panel offers "Return everyone to lobby". A load that ends
-  early reloads where it stopped.
+  manager's panel offers "Return everyone to lobby" (with `stop_playback`)
+  in place of "Return to playback", and a guest's offers neither. The room
+  returning to the lobby closes the panel and the player, and the Watch
+  Party page's lobby shows: the page beneath the player, else a new one in
+  the player's place. A load that ends early reloads where it stopped.
 - **Tracks:** audio, subtitles, and quality stay each member's own choice.
 - **Errors:** "The Watch Party's selected media version is unavailable."
   when the plan names another file; source fallback as section 8.3.
@@ -548,9 +557,38 @@ A room seek sets the room waiting. The member seeks exactly to the
 target and acknowledges. The server accepts a guest within 1 s of the
 target (5 s for a stalled guest's own seek naming the command), a host
 within 15 s, and after 10 s, once any member is ready, continues without
-the rest, who catch up alone. Roku seek precision (W0-2) decides whether a
-Roku guest makes the 1 s window. If it lands short, the member plays muted
-to the target and pauses there before it acknowledges.
+the rest, who catch up alone.
+
+**Landing on Roku (W0-2).** On a direct-play plan `Video.seek` lands on
+the keyframe at or before the target: 0.17 to 1.56 s short with a
+2.002 s GOP, playing again 209 to 721 ms after the seek. Right after it
+resumes, the Video node first reports the requested position, then the
+real keyframe position. So the player reports itself seeking until the
+node shows a position other than the target (at most two such echoes;
+then, or once the settled node has reported nothing new for 1.2 s, the
+last report is the landing), and nothing reads the echo as a landing:
+not the acknowledgement, not section 7.5's residual, not the late
+joiner's realigning seek (`source/watchparty/landing.bs`).
+
+**Rolling to the target.** A barrier's command carries the window the
+member may land short by and still acknowledge where it is: the
+server's own, 1 s for a guest and 15 s for the host
+(`watchparty.sync.settleTolerance`). The player mutes, lets the node play
+after Roku's resume while it measures, and then:
+
+- landed within the window (or ahead of the target): pauses there and
+  acknowledges as it is;
+- landed shorter, on a plan that seeks in place, with time left: plays on
+  muted to the target, pauses there (0.1 s early, for the pause's own
+  delay), then acknowledges;
+- a copy-remux plan (every seek a `seek_reanchor`), the end of the file,
+  or too little time left: acknowledges as it lands.
+
+The settle ends within 7 s of the seek, so the acknowledgement beats the
+server's 10 s wait; a paused node that reports nothing plays muted once
+to show where it is. The sound comes back as the settle ends, on the
+room's next command, on a failure or the end of the file, and when the
+player closes; a phone's mute meanwhile is the viewer's, and stands.
 
 ### 7.5 Correction without a rate
 
@@ -571,8 +609,11 @@ of settle from the last command or seek. Constants from
 or transcode plan, which the server serves where it is asked. On a copy
 remux, where a seek outside the remuxed window becomes a `seek_reanchor`
 that replays up to a keyframe interval (hardware run 9: 0.7–4.1 s), a
-correction counts as a reload. W0-2 measures each plan type and may change
-this.
+correction counts as a reload. W0-2 confirmed the direct-play case (the
+seek lands up to one GOP short, section 7.4); transcode plans are not
+measured yet. A correction seek's residual is read after its real landing,
+never from the target the node echoes first (section 7.4), so the lead
+learns the keyframe shortfall as well as the seek's time.
 
 **Reload budget** (`RoomReloadBudget`): one at a time; the next 10 s after
 the last one played, doubling to 60 s; a reload that never lands is stale
@@ -641,6 +682,7 @@ reason}`. The room moves every member to a new revision.
 | --- | --- | --- |
 | Watch Party is a per-device Extra Features toggle, off in Release | On in every build | Owner's decision (D-10) |
 | Drift of 0.4–5 s closes by rate on iOS; tvOS seeks | Seeks, as tvOS | `Video` has no rate |
+| A room seek lands on its target | It lands on the keyframe at or before it; a guest more than 1 s short plays muted to the target and pauses there before it acknowledges (section 7.4) | `Video.seek` has no exact mode (W0-2) |
 | Join field "Party code or invite link" on the system keyboard | "Join with a code" opens an 8-slot code keypad (`ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, 8 keys per row), as Android TV's `TvJoinCodeDialog` | Typing a URL on a remote is impractical, and a Roku cannot receive a link to paste |
 | Invitation links open the party | None | A Roku has no URL handler; Roku deep links carry only `contentId` and `mediaType` |
 | Episode-rail context item | Series detail More only | Roku's episode rail has no context menu (spec section 5.9) |
@@ -667,16 +709,17 @@ reason}`. The room moves every member to a new revision.
 | Room task | `components/tasks/RoomTask` | Runs the room session's decisions: the socket, HTTP through the bridge, the recent party's registry section, logs, and output fields. Its header comment is the field contract |
 | API bridge | `components/tasks/RoomApiBridge` | A render-thread node that sends the task's requests through `api.send` and returns each result envelope to the task, since a task cannot read a `RequestHandle`'s result |
 | Room session | `source/watchparty/session.bs` | Every rule the task runs, as pure functions over one state: support, entering, the connection order and reconnects, pings, frames, endings, host commands, suggestions, picker, Who's Seen It, and the outputs |
-| Room logic | `source/watchparty/` | `time` (RFC 3339 to epoch milliseconds, the anchored clock), `clock` (offset estimator), `wire` (frames, messages, IDs, snapshots, capabilities), `room` (snapshot acceptance, derived facts), `sync` (attach, command timing, readiness, stalls, reports, corrections), `catchup` (seek-only decisions, reload budget), `connection` (reconnect pacing, endings), `lobby` and `votes` (section 4's rules as locale keys), `recent` (section 4.3), `socket` (the `roWebSocket` adapter) |
+| Room logic | `source/watchparty/` | `time` (RFC 3339 to epoch milliseconds, the anchored clock), `clock` (offset estimator), `wire` (frames, messages, IDs, snapshots, capabilities), `room` (snapshot acceptance, derived facts), `sync` (attach, command timing, readiness, a barrier's tolerance, stalls, reports, corrections), `landing` (a seek's real landing and a barrier's roll, run by the player), `catchup` (seek-only decisions, reload budget), `connection` (reconnect pacing, endings), `lobby` and `votes` (section 4's rules as locale keys), `recent` (section 4.3), `socket` (the `roWebSocket` adapter) |
 | REST | `source/api/watchParty.bs` | The routes in section 5 as requests for the shared client |
-| Room session owner | `components/AppSceneWatchParty.bs`, rules in `source/watchparty/app.bs` | One `RoomTask` and one `RoomApiBridge` per app run, the Task published as `m.global.roomTask`; sets `identity` on every session change; forgets a removed server's recent party; opens, replaces, and closes the party player; shows the Watch Party page when the party ends; hosts the room panel (Hooks, below) |
-| Watch Party page, lobby, ballot, invite, options | `components/screens/watchParty/` | Section 4: `WatchPartyScreen` (route `watchParty`), `PartyLobby` (and its rails and overlays scripts), `PartyKeypad`, `PartyInvite`, `PartyOptions`, `PartySeat`, `PartyCard`, `PartyButton`, `PartyBanner`, `PartyBackdrop`; `room.bs` reads the room Task for them |
-| Room panel | `components/screens/watchParty/WatchPartyPanel` | Section 4.10: the lobby over the player (Hooks below) |
+| Room session owner | `components/AppSceneWatchParty.bs`, rules in `source/watchparty/app.bs` | One `RoomTask` and one `RoomApiBridge` per app run, the Task published as `m.global.roomTask`; the Task's only observer, publishing its changes to `m.global.roomRelay`; sets `identity` on every session change; forgets a removed server's recent party; opens, replaces, and closes the party player; shows the Watch Party page when the party ends; opens the room's player for the page's "Return to playback"; creates and closes the room panel (Hooks, below) |
+| Relay | `components/screens/watchParty/PartyRelay` and `PartyFeed`, `room.bs` | AppScene's changes of the Task's outputs to each subscribed feed that wants them (Hooks, below) |
+| Watch Party page, lobby, ballot, invite, options | `components/screens/watchParty/` | Section 4: `WatchPartyScreen` (route `watchParty`), `PartyLobby` (and its rails and overlays scripts), `PartyKeypad`, `PartyInvite`, `PartyOptions`, `PartySeat`, `PartyCard`, `PartyButton`, `PartyBanner`, `PartyBackdrop`; `room.bs` reads the room Task and subscribes their feeds |
+| Room panel | `components/screens/watchParty/WatchPartyPanel` | Section 4.10: the lobby over the player, which AppScene creates, starts, and closes (Hooks below) |
 | Screen rules | `source/watchparty/page.bs`, `keypad.bs`, `picker.bs` | The page's controls, entering from a title, the lobby's focus and context, menus, the invitation's link, options, the confirm button, Who's Seen It, the keypad, and the picker's shelves and routing, as pure functions |
 | Entry points | `source/home/shell.bs` and `components/screens/home/shell.bs`; `source/catalog/personal.bs` and `components/screens/detail/DetailPersonal.bs` | The avatar menu's Watch Party row and the detail page's More row (section 4.1) |
 | Picker | `components/screens/watchParty/picker/` | Section 4.8, reusing Home rows, Search, and the episode rail |
 | Art | `scripts/watch-party-art.py` into `images/watchparty/` | The seat shade and rings, the ballot's add card, and the backdrop's gradients |
-| Player | `components/player/PlayerParty.bs`, rules in `source/watchparty/player.bs`; the session reducer's party mode in `source/playback/session.bs` | Room start, Back to the panel, status pill, permissions, and executing `playerCommand` on the render thread |
+| Player | `components/player/PlayerParty.bs`, rules in `source/watchparty/player.bs` and `landing.bs`; the session reducer's party mode in `source/playback/session.bs` | Room start, Back to the panel, status pill, permissions, executing `playerCommand` on the render thread, and a seek's real landing and a barrier's muted roll (section 7.4) |
 | SiloControl in a party | `source/control/policy.bs` (`partyControl`, `partyOffer`), `components/player/PlayerRemote.bs`, `components/AppSceneControl.bs` | Section 9 |
 | Recent party | `source/watchparty/recent.bs` | Section 4.3, in its own 1 KB registry section `silo.party`, which only the room task writes. The session's own section keeps to 15 KB, above its largest record, so the app's five sections fit Roku's 32 KB |
 
@@ -696,13 +739,15 @@ tag?, ...}`: `checkSupport`, `create`, `join`, `rejoin`, `leave`, `end`,
 `refreshSuggestions`, `memberState`, `picker`, `lobbyReady`,
 `transportRequest`, `sourceFallback`, `noteTitle`, `forgetRecent`,
 `clearError`), `playerSample` (`{sessionId, revision, position,
-duration, playing, wantsPlay, playable, stalled, seeking, atEnd,
-planInPlace, commandSeq}`), and `session` (`{sessionId, revision}` or
+duration, playing, wantsPlay, playable, stalled, seeking (until a seek's
+real landing shows and a barrier's roll ends), atEnd, planInPlace,
+commandSeq}`), and `session` (`{sessionId, revision}` or
 `{}`). Outputs: `ready`, `room` (the normalized snapshot), `connection`,
 `support`, `sync` (the player's view: attached, catching up, syncing,
 waiting for a clock, the held seek target, permissions), `suggestions`,
 `memberState`, `picker`, `recent`, `busy`, and the one-shot
-`playerCommand` (`{seq, commandId, seek, reload, playing}`), `notice`,
+`playerCommand` (`{seq, commandId, seek, reload, playing, settle?}`,
+`settle` only on a barrier's seek: section 7.4), `notice`,
 `result`, and `ended`. Strings are locale keys (`watchParty.*` in
 `locale/en_US/strings.json`), never text, except a server's own error
 message.
@@ -736,76 +781,83 @@ shown ping activity (event types 4 or 7) and then none for 50 s
 never judged by it, so a Roku OS that raises no event for a ping without
 a payload keeps its sockets (the rig is confirming which it does).
 
-**Hooks as AppScene and the player built them:**
+**Hooks** (between AppScene, the room Task, the screens, the room panel,
+and the player):
 
-- `m.global.roomTask`: the `RoomTask`, for every screen to set `command`
-  and observe its outputs (`observeFieldScoped`, unobserved when the
-  screen goes). AppScene alone sets `identity`; the party player alone
-  sets `playerSample` and `session`. Entry points show or hide by its
-  `support.state` (`"available"`). Commands set before its `ready` are
-  lost; AppScene queues its own.
-- Route `nav.route.WATCH_PARTY` (`"watchParty"`, `source/nav/routes.bs`),
-  component `nav.route.WATCH_PARTY_COMPONENT` (`WatchPartyScreen`), which
-  the screens register. AppScene pushes it with `{ message, rejoin }` when
-  the party ends for this device (`message` the `ended` event's locale
-  key, `rejoin` `"none"`, `"rejoin"`, or `"continueHere"`), in place of the
-  party player or a Watch Party page on top, else over what shows; and
-  with `{}` in place of the party player when the room returns to the
-  lobby and no Watch Party page lies beneath. A build without the
-  component shows the placeholder screen.
-- The room panel: `AppScene.watchPartyPanel` (`assocarray`,
+- *The room Task.* `m.global.roomTask` is the app run's one `RoomTask`,
+  for every screen, the panel, and the player to set `command` on (with
+  tags of their own, `components/screens/watchParty/room.bs`) and to read
+  as it is now; without it, or before it is set, Watch Party shows
+  nowhere (no avatar row, no More row, the page says it is unavailable).
+  AppScene alone sets `identity`; the party player alone sets
+  `playerSample` and `session`. Commands set before its `ready` are lost;
+  AppScene queues its own.
+- *One observer.* AppScene alone observes the Task (implementation plan
+  section 4.2; `apiRequest` is its own `RoomApiBridge`'s). For each change
+  of an output but `ready` it acts first (`room`: open, replace, or close
+  the party player; `ended`: the page with the message), then publishes
+  `{ field, data }` to the app's `PartyRelay` (`m.global.roomRelay`). A
+  screen, the panel's lobby, the picker, and the player each subscribe a
+  `PartyFeed` of their own naming the outputs they want (`partyObserve`),
+  observe only that feed, and unsubscribe it as they go, so nothing else
+  observes the Task and nothing unobserves a shared field.
+- *Entry points.* The avatar menu and a title's More menu read the Task's
+  `support.state` (`"available"`) and `room` as they open. The More row
+  sends nothing itself: it pushes the page with `{ entry }`, and the page
+  decides with `watchparty.lobby.entryAction` against the room it sees
+  then.
+- *The page.* Route `nav.route.WATCH_PARTY` (`"watchParty"`), component
+  `nav.route.WATCH_PARTY_COMPONENT` (`WatchPartyScreen`), with:
+  - `{}` from the avatar menu, and from AppScene in place of the party
+    player when the room returns to the lobby with no Watch Party page
+    beneath (the page shows the lobby at once);
+  - `{ entry }` from a title's More item (`WatchPartyScreen.xml` lists its
+    fields);
+  - `{ message, rejoin }` from AppScene when the party ends for this
+    device (section 4.11), in place of the party player or a Watch Party
+    page on top, else over what shows: `message` the `ended` event's
+    locale key, `rejoin` `"none"` (no Rejoin row, whatever `recent` still
+    says), `"rejoin"`, or `"continueHere"` (the row reads "Continue
+    here"), until the viewer acts (`watchparty.page.recentFor`). Focus
+    goes to Rejoin as it appears until the viewer moves it.
+
+  A build without the component shows the placeholder screen.
+- *Return to playback on the page.* A member of a playing room whose
+  player is not open sees "Return to playback" on the page's lobby; it
+  calls `AppScene.watchPartyReturnToPlayback()`, which opens the room's
+  player over the page at the room's anchor (the room's sync command
+  aligns it, section 7.6), or pops the page when the party player lies
+  directly beneath it (`watchparty.app.returnToPlayback`).
+- *The room panel.* `AppScene.watchPartyPanel` (`assocarray`,
   `alwaysNotify`), `{ open, reason }`. The party player sets `{ open:
   true, reason: "back" | "error" }` where its Back ladder would close it
-  and from the error screen's Go Back. AppScene then creates
-  `nav.route.WATCH_PARTY_PANEL_COMPONENT` (`WatchPartyRoomPanel`) in its
-  `watchPartyLayer` over the player, sets the panel's `reason` field when
-  it has one, and gives it focus. The panel closes by setting `{ open:
-  false }` (Back, "Return to playback"); Back the panel leaves unhandled
-  does the same; AppScene sets it when the player or the party closes.
-  The player takes focus back once it is false. The panel reads the room
-  from `m.global.roomTask` (`room`, `sync.atEnd` for "Return everyone to
-  lobby").
-- `sync.atEnd` (added to the Task's `sync` output): this member's player
-  is parked at the end of the file.
-
-**Hooks as the screens built them** (to reconcile with the above: the panel's name and its `open`, `close`, and `dismissed` against `watchPartyPanel`, the relay against AppScene's observer, and `watchPartyIntent`):
-
-- *The room Task.* Screens read `m.global.roomTask` (a `RoomTask` node);
-  without it, or before it is set, Watch Party shows nowhere (no avatar
-  row, no More row, the page says it is unavailable). One render-thread
-  `PartyRelay` (kept in `m.global.roomRelay`, made on first use) observes
-  the Task's outputs with `observeField` and hands each change to the
-  `PartyFeed` node of each screen that subscribed; a screen observes only
-  its own feed and unsubscribes it as it goes, so no screen observes the
-  Task and nothing unobserves a shared field (implementation plan section
-  4.2). Screens send commands on the Task's `command` field with tags of
-  their own (`components/screens/watchParty/room.bs`). The relay is a
-  second observer beside AppScene's, against `RoomTask.bs`'s "AppScene is
-  the only observer": AppScene may take its place by forwarding the same
-  `{ field, data }` changes to the subscribed feeds.
-- *The page.* `nav.route.WATCH_PARTY` with `{}`, `{ entry }` (a title's
-  More item, `WatchPartyScreen.xml` lists its fields), or `{ message }`:
-  the ended or replaced message, `ended.messageKey` as it is, for the app
-  to open the page with when a party ends for this device (section 4.11).
-  "Return to playback" on the page (a guest in a playing room whose
-  player is not open) sets `m.global.watchPartyIntent` (assocarray,
-  alwaysNotify, added on first use) to `{ kind: "returnToPlayback" }`;
-  the app opens the room's player.
-- *The room panel.* `WatchPartyPanel` is a node the player (or AppScene)
-  creates over the player, once, with `owner` (the player's screen owner,
-  for its catalog reads) and `lowTier`. Setting `open` to `{
-  playbackEnded }` shows it and gives it focus (setting it again updates
-  playbackEnded); `close = true` hides it from outside, and is set before
-  the owner removes it, so its lobby lets the room Task's relay go. It sets
-  `dismissed` once per close: `"returnToPlayback"` (the viewer's choice,
-  or Back with nothing open over the lobby), `"left"` (the room output
-  emptied: a leave, an end, a replacement), or `"closed"`; `active` says
-  whether it shows. On `dismissed` the owner gives focus back to the
-  player. The panel builds its lobby on open and releases it on close.
-- *The detail page.* The More row sends nothing itself: it pushes the
-  page with `{ entry }`, and the page decides with
-  `watchparty.lobby.entryAction` against the room it sees then.
-
+  and from the error screen's Go Back. AppScene creates
+  `nav.route.WATCH_PARTY_PANEL_COMPONENT` (`WatchPartyPanel`) in its
+  `watchPartyLayer` over the player, sets its `owner` (the player's, so
+  its catalog reads go with the player) and `lowTier`, and calls its
+  `start()`, which builds the lobby (mode `"panel"`) and gives it focus.
+  The panel sets `dismissed` once: `"returnToPlayback"` (the button, or
+  Back with nothing open over the lobby) or `"left"` (the room output
+  emptied). AppScene then sets `{ open: false, reason }`; it also does for
+  Back that reaches it with the panel open, and when the player or the
+  party closes (`"closed"`). On `{ open: false }` AppScene calls the
+  panel's `release()`, removes it, and calls the player's
+  `partyPanelClosed()`, which takes focus back; the player takes no focus
+  while the panel is open. The panel's lobby offers "Return everyone to
+  lobby" instead of "Return to playback" once the Task's `sync.atEnd`
+  says this member's player is parked at the end of the file
+  (`watchparty.page.panelAtEnd`); the room's return to the lobby then
+  closes the panel and the player.
+- *The party player.* A `nav.route.PLAYER` entry whose params carry
+  `party` (`watchparty.app.playerParams`); AppScene opens it, replaces it
+  for a new selection revision, and closes it with its `partyClose()`.
+  It follows `playerCommand`, `sync`, `connection`, and `notice` through
+  its feed, and executes each `playerCommand` at once (below).
+- *Notices.* `notice.scope` `"page"` (the page without a party),
+  `"lobby"` (the page's lobby and the panel's), or `"player"` (the
+  player's 3 s notice).
+- *`sync.atEnd`* (in the Task's `sync` output): this member's player is
+  parked at the end of the file.
 
 **Decisions made while building.** A reconnect that gives up (six
 failures and 150 s without a healthy socket) ends the party with the
@@ -813,8 +865,7 @@ failures and 150 s without a healthy socket) ends the party with the
 late joiner waits paused while its first realigning seek lands, then
 seeks once more aimed ahead by that seek's time when the room moved more
 than 0.4 s, then plays; a seek that never shows as landed is given up
-after 5 s. Playing muted to a guest's short-landed seek target (section
-7.4) waits for W0-2.
+after 5 s.
 
 The player's part:
 
@@ -838,8 +889,11 @@ The player's part:
   allows one, else a `seek_reanchor`). The room's play state is the
   reducer's play intent, so the loads it opens follow it. A Video node
   that plays while the room wants it paused (a seek Roku resumed) pauses
-  again. A paused member's seek counts as landed when the node reports
-  paused again, or 3 s after it ran. Both need the device to confirm.
+  again, except while a barrier's settle plays it muted (section 7.4). A
+  seek's sample says seeking until the node shows its real landing
+  (`watchparty.landing`); a paused member's seek counts as landed when the
+  node reports paused again, or 3 s after it ran. These need the device to
+  confirm.
 - Samples go to the task on every chrome refresh when what the task
   decides from changed, and at least every 500 ms (a 250 ms timer).
 - Off in a party: Up Next, autoplay, On Deck, and the Auto-play next
@@ -857,7 +911,8 @@ The player's part:
 - The status pill reads, in order, "Reconnecting to the party…" (the
   task's connection is reconnecting), "Waiting for party timing…", and
   "Syncing with the party…" (the room waits, this member catches up, or
-  the player seeks, loads, or stalls), each after it has held 500 ms.
+  the player seeks, settles a seek's landing, loads, or stalls), each
+  after it has held 500 ms.
 - A start refused for one of section 8.3's reasons sends `sourceFallback`
   once per player.
 - SiloControl: a launch during a party answers `error command_failed`
@@ -866,6 +921,9 @@ The player's part:
   since its borrowed identity would leave the party. Controls follow
   `silocontrol.policy.partyControl`.
 - A deep link sends `leave` before the player opens.
+- A phone's mute or volume during a barrier's roll is kept as the
+  viewer's and applied when the roll ends; the phone's snapshot reports
+  the viewer's mute, not the roll's.
 - The diagnostics log's room lines start `[WP]` (the room task's, and
   the player's commands, transport requests, sessions, and reloads).
 
@@ -876,7 +934,7 @@ The player's part:
 | ID | Question | Pass |
 | --- | --- | --- |
 | W0-1 (ran; section 2.1) | `roWebSocket`: can the app send `Sec-WebSocket-Protocol: silo.room.v2, silo.ticket.{t}` and read the server's choice; does it answer ping frames; does `wss://` verify with the system CA bundle; how large a message arrives; does it run in a Task; what close events look like | A sandbox room socket stays open past 60 s and receives a snapshot; a 5 MB message arrives or fails cleanly |
-| W0-2 | Where `Video.seek` lands for direct, remux, and transcode plans, and how long it takes | Landing error per plan type, to set section 7.4's acknowledgement and 7.5's in-place rule |
+| W0-2 (ran for direct play; section 7.4) | Where `Video.seek` lands for direct, remux, and transcode plans, and how long it takes | Landing error per plan type, to set section 7.4's acknowledgement and 7.5's in-place rule. Direct play: 0.17 to 1.56 s short (2.002 s GOP), resumes in 209 to 721 ms, the target echoed first. Copy remux seeks through `seek_reanchor`. Transcode: not measured |
 | W0-3 | Delay from the task's field write at `execute_at` to the render thread's `Video` call, on the Ultra and a 1 GB device | Under 50 ms at the 95th percentile |
 | W0-4 | Memory with the room task, the lobby, and a 200-suggestion ballot open | Within the memory monitor's budget (spec section 4) |
 
@@ -911,5 +969,4 @@ OS 16.
 | Decision | Leaning | Needs |
 | --- | --- | --- |
 | A Roku without `roWebSocket` | No Watch Party | Roku OS 16's release and device list |
-| Guest seek landing outside 1 s | Play muted to the target | W0-2 |
 | Children's profiles see suggestions' raw titles and posters, which the server does not filter | Show them, as tvOS does | Server owner's view |
