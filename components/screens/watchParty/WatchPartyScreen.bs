@@ -1,0 +1,399 @@
+import "pkg:/components/screens/watchParty/room.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/theme/watchParty.bs"
+import "pkg:/components/views/controls.bs"
+import "pkg:/source/memory/policy.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/lobby.bs"
+import "pkg:/source/watchparty/page.bs"
+
+' tvOS's page in px: the headline's parts 0.6 of the body apart, the
+' captions under Rejoin 8 below it.
+const PART_GAP = 16
+const ROW_GAP = 16
+const CAPTION_GAP = 8
+
+sub init()
+    m.backdrop = m.top.findNode("backdrop")
+    m.page = m.top.findNode("pageGroup")
+    m.page.translation = [theme.watchParty.INSET, theme.watchParty.PAGE_TOP]
+    width = theme.watchParty.PAGE_LEFT_WIDTH
+    m.top.findNode("eyebrow").setFields({ font: theme.font(theme.textStyle.WP_EYEBROW), color: theme.color.TEXT_TERTIARY, text: theme.tracked(UCase(i18n.text("watchParty.page.eyebrow"))) })
+    m.top.findNode("headline").setFields({ font: theme.font(theme.textStyle.WP_HERO_TITLE), color: theme.color.TEXT, width: width, text: i18n.text("watchParty.page.headline") })
+    m.top.findNode("body").setFields({ font: theme.font(theme.textStyle.WP_BODY), color: theme.color.TEXT_TERTIARY, width: width, text: i18n.text("watchParty.page.body") })
+    m.banner = m.top.findNode("banner")
+    m.banner.width = width
+    m.controlLayer = m.top.findNode("controls")
+    m.spinner = m.top.findNode("spinner")
+    m.lobbyLayer = m.top.findNode("lobbyLayer")
+    m.keypadLayer = m.top.findNode("keypadLayer")
+    layoutHeadline()
+    m.state = partyState()
+    ' The page's controls (watchparty.page.controls), their buttons, and
+    ' the focused one's index (-1 for the page itself).
+    m.controls = []
+    m.buttons = []
+    m.at = -1
+    m.lobby = invalid
+    m.keypad = invalid
+    ' The last error's text, until the next action; a party starting from
+    ' a title (the hold) and its preview; the lobby's message from a
+    ' title's More item.
+    m.error = ""
+    m.starting = false
+    m.preview = invalid
+    m.entryMessage = invalid
+    m.lowTier = false
+    m.entryTag = ""
+end sub
+
+sub layoutHeadline()
+    y = 0
+    for each id in ["eyebrow", "headline", "body"]
+        label = m.top.findNode(id)
+        label.translation = [0, y]
+        y = y + Int(label.boundingRect().height) + PART_GAP
+    end for
+    m.bannerY = y - PART_GAP + theme.watchParty.PAGE_TEXT_GAP
+    m.banner.translation = [0, m.bannerY]
+end sub
+
+sub onShow(event as Object)
+    if event.first then start()
+    show()
+    takeFocus()
+end sub
+
+' Focus on what shows: the keypad, the lobby, or the page's control.
+sub takeFocus()
+    if m.keypad <> invalid
+        m.keypad.setFocus(true)
+    else if m.lobby <> invalid
+        m.lobby.callFunc("focusLobby")
+    else
+        applyFocus()
+    end if
+end sub
+
+sub start()
+    m.lowTier = platform.current().memory.tier = memory.tier.LOW
+    partyObserve("onParty")
+    params = m.top.entry.params
+    if not util.isObject(params) then params = {}
+    note = watchparty.page.message(params)
+    m.error = partyText(note.key, invalid, note.text)
+    if util.isObject(params.entry) then enter(params.entry)
+    ' Support is read again whenever the page opens without a party
+    ' (section 3).
+    if not partyEngaged(m.state) and not m.starting then partySend({ kind: "checkSupport" })
+    m.top.ready = true
+end sub
+
+' A title's More item (section 4.1): start a party with it, stage or play
+' it, suggest it, or say that suggestions wait for the lobby.
+sub enter(entry as Object)
+    room = invalid
+    if partyEngaged(m.state) then room = m.state.room
+    action = watchparty.lobby.entryAction(room)
+    m.preview = { contentId: util.text(entry.contentId), title: util.text(entry.title), backdropUri: util.text(entry.backdropUri), posterUri: util.text(entry.posterUrl), hideBackdrop: util.isTrue(entry.hideBackdrop) }
+    if action = "lobbyOnly"
+        m.entryMessage = "watchParty.entry.lobbyOnly"
+        return
+    end if
+    command = watchparty.page.entryCommand(action, entry)
+    if command = invalid then return
+    m.entryTag = partySend(command)
+    m.starting = action = "create" and m.entryTag <> ""
+end sub
+
+sub onRelease()
+    partyUnobserve()
+    if m.lobby <> invalid then m.lobby.callFunc("release")
+    closeKeypad()
+    m.backdrop.uri = ""
+end sub
+
+sub onHide()
+end sub
+
+sub onParty(event as Object)
+    change = partyChange(event)
+    field = change.field
+    data = change.data
+    if field = "notice"
+        if util.isObject(data) and util.text(data.scope) = "page" and not partyEngaged(m.state)
+            m.error = partyText(util.text(data.key), data.values, util.text(data.text))
+            show()
+        end if
+        return
+    end if
+    if field = "result"
+        if partyOwnResult(data) then onResult(data)
+        return
+    end if
+    m.state[field] = data
+    if field = "room" or field = "support" or field = "recent" or field = "busy" then show()
+end sub
+
+' The page's own commands: a failure shows in the banner, or in the keypad
+' for a join; a failed start from a title ends the hold.
+sub onResult(result as Object)
+    kind = util.text(result.kind)
+    if util.text(result.tag) = m.entryTag
+        m.entryTag = ""
+        m.starting = false
+    end if
+    if result.ok
+        if kind = "join" then closeKeypad()
+        show()
+        return
+    end if
+    text = partyText(util.text(result.errorKey))
+    if text = "" then return
+    if kind = "join" and m.keypad <> invalid
+        m.keypad.error = text
+        return
+    end if
+    if partyEngaged(m.state) and m.lobby <> invalid
+        m.lobby.message = text
+    else
+        m.error = text
+    end if
+    show()
+end sub
+
+' ---- What shows -------------------------------------------------------------
+
+' The lobby in a party, the hold while one starts from a title, else the
+' page.
+sub show()
+    engaged = partyEngaged(m.state)
+    if engaged and m.starting and util.text(m.state.busy.kind) <> "create" then m.starting = false
+    if engaged
+        showLobby()
+        return
+    end if
+    if m.lobby <> invalid
+        m.lobby.callFunc("release")
+        m.lobbyLayer.removeChild(m.lobby)
+        m.lobby = invalid
+    end if
+    m.page.visible = not m.starting
+    m.spinner.running = m.starting
+    if m.starting
+        showHold()
+        return
+    end if
+    m.backdrop.setFields({ uri: "", isPoster: false, hidden: false })
+    showPage()
+end sub
+
+sub showHold()
+    preview = m.preview
+    uri = ""
+    isPoster = false
+    if preview <> invalid
+        uri = preview.backdropUri
+        if uri = ""
+            uri = preview.posterUri
+            isPoster = true
+        end if
+    end if
+    m.backdrop.setFields({ lowTier: m.lowTier, isPoster: isPoster, hidden: preview <> invalid and preview.hideBackdrop, uri: uri })
+    m.at = -1
+    if m.top.isInFocusChain() and m.keypad = invalid then focusScreen()
+    speak(i18n.text("watchParty.page.starting"))
+end sub
+
+sub showLobby()
+    m.page.visible = false
+    m.spinner.running = false
+    m.backdrop.uri = ""
+    closeKeypad()
+    if m.lobby <> invalid then return
+    m.lobby = m.lobbyLayer.createChild("PartyLobby")
+    m.lobby.setFields({ mode: "page", owner: m.top.owner, lowTier: m.lowTier })
+    if m.preview <> invalid then m.lobby.preview = m.preview
+    if m.entryMessage <> invalid
+        m.lobby.message = m.entryMessage
+        m.entryMessage = invalid
+    end if
+    m.lobby.observeField("returnToPlayback", "onReturnToPlayback")
+    m.lobby.callFunc("start")
+    if m.top.isInFocusChain() or m.top.visible then m.lobby.callFunc("focusLobby")
+end sub
+
+' "Return to playback" on the page: the app's player for the room is asked
+' for (docs/watch-party.md section 11, Hooks).
+sub onReturnToPlayback()
+    if not m.global.hasField("watchPartyIntent") then m.global.addField("watchPartyIntent", "assocarray", true)
+    m.global.watchPartyIntent = { kind: "returnToPlayback" }
+end sub
+
+sub showPage()
+    support = util.text(m.state.support.state)
+    if util.isTrue(m.state.support.checking) and support = "unknown" then support = "checking"
+    banner = watchparty.lobby.pageBanner(support, m.error)
+    if banner = invalid
+        m.banner.text = ""
+    else
+        text = banner.text
+        if text = "" then text = i18n.text(banner.key)
+        m.banner.tone = banner.tone
+        m.banner.text = text
+    end if
+    buildControls(support)
+    if m.keypad <> invalid
+        m.keypad.busy = util.text(m.state.busy.kind) = "join"
+    else if m.top.isInFocusChain()
+        applyFocus()
+    end if
+end sub
+
+' The right column: HOST, its buttons and Rejoin's caption, then JOIN.
+sub buildControls(support as String)
+    previous = ""
+    if m.at >= 0 and m.at < m.controls.Count() then previous = m.controls[m.at].key
+    list = watchparty.page.controls(support, m.state.recent)
+    m.controlLayer.removeChildrenIndex(m.controlLayer.getChildCount(), 0)
+    m.controls = list
+    m.buttons = []
+    x = 1920 - 2 * theme.watchParty.INSET - theme.watchParty.PAGE_RIGHT_WIDTH
+    y = 0
+    column = ""
+    for each control in list
+        if control.column <> column
+            if column <> "" then y = y + theme.watchParty.PAGE_GROUP_GAP - ROW_GAP
+            column = control.column
+            eyebrow = m.controlLayer.createChild("Label")
+            key = "watchParty.page.host"
+            if column = "join" then key = "watchParty.page.join"
+            eyebrow.setFields({ font: theme.font(theme.textStyle.WP_EYEBROW), color: theme.color.TEXT_TERTIARY, text: theme.tracked(UCase(i18n.text(key))), translation: [x, y] })
+            y = y + Int(eyebrow.boundingRect().height) + theme.watchParty.PAGE_COLUMN_GAP
+        end if
+        button = m.controlLayer.createChild("PartyButton")
+        kind = "secondary"
+        if control.kind = "primary" then kind = "primary"
+        button.setFields({ kind: kind, text: i18n.text(control.labelKey, control.values), enabled: control.enabled, translation: [x, y] })
+        m.buttons.Push(button)
+        y = y + theme.watchParty.BUTTON_HEIGHT + ROW_GAP
+        if control.captionKey <> ""
+            caption = m.controlLayer.createChild("Label")
+            caption.setFields({ font: theme.font(theme.textStyle.WP_CAPTION), color: theme.color.TEXT_TERTIARY, width: theme.watchParty.PAGE_RIGHT_WIDTH, wrap: true, text: i18n.text(control.captionKey), translation: [x, y - ROW_GAP + CAPTION_GAP] })
+            y = y + Int(caption.boundingRect().height) + CAPTION_GAP
+        end if
+    end for
+    ' Focus stays on the same control while it still acts, else goes where
+    ' the page starts it.
+    m.at = -1
+    for i = 0 to list.Count() - 1
+        if previous <> "" and list[i].key = previous and list[i].enabled then m.at = i
+    end for
+    if m.at < 0 then m.at = watchparty.page.initialFocus(list)
+    restyle()
+end sub
+
+sub restyle()
+    focused = m.top.isInFocusChain() and m.keypad = invalid and m.lobby = invalid
+    for i = 0 to m.buttons.Count() - 1
+        m.buttons[i].highlighted = focused and i = m.at
+    end for
+end sub
+
+sub applyFocus()
+    focusScreen()
+    restyle()
+end sub
+
+' ---- Keys -------------------------------------------------------------------
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if key = "back"
+        if m.keypad <> invalid
+            if not m.keypad.busy then closeKeypad()
+            return true
+        end if
+        if m.lobby <> invalid then return m.lobby.callFunc("backPressed")
+        return false
+    end if
+    if m.lobby <> invalid or m.keypad <> invalid or m.starting then return false
+    if key = "up" or key = "down"
+        stepBy = 1
+        if key = "up" then stepBy = -1
+        target = watchparty.page.nextEnabled(m.controls, m.at, stepBy)
+        if target >= 0
+            m.at = target
+            restyle()
+            speakControl()
+        end if
+        return true
+    end if
+    if key = "OK" and m.at >= 0 and m.at < m.controls.Count()
+        activate(m.controls[m.at].key)
+        return true
+    end if
+    return false
+end function
+
+sub speakControl()
+    if m.at < 0 or m.at >= m.buttons.Count() then return
+    spoken = m.buttons[m.at].text
+    caption = m.controls[m.at].captionKey
+    if caption <> "" then spoken = spoken + ". " + i18n.text(caption)
+    speak(spoken)
+end sub
+
+sub activate(key as String)
+    m.error = ""
+    if key = watchparty.page.START
+        partySend({ kind: "create", mode: "host_pick" })
+    else if key = watchparty.page.START_VOTE
+        partySend({ kind: "create", mode: "vote" })
+    else if key = watchparty.page.REJOIN
+        partySend({ kind: "rejoin" })
+    else if key = watchparty.page.JOIN_CODE
+        openKeypad()
+    else if key = watchparty.page.CHECK_AGAIN
+        partySend({ kind: "checkSupport" })
+    end if
+    show()
+end sub
+
+' ---- The code keypad --------------------------------------------------------
+
+sub openKeypad()
+    if m.keypad <> invalid then return
+    m.keypad = m.keypadLayer.createChild("PartyKeypad")
+    m.keypad.observeField("join", "onKeypadJoin")
+    m.keypad.observeField("closed", "onKeypadClosed")
+    m.keypad.setFocus(true)
+    restyle()
+end sub
+
+sub onKeypadJoin()
+    if m.keypad = invalid then return
+    m.keypad.error = ""
+    m.keypad.busy = true
+    partySend({ kind: "join", code: m.keypad.join })
+end sub
+
+sub onKeypadClosed()
+    closeKeypad()
+end sub
+
+sub closeKeypad()
+    if m.keypad = invalid then return
+    keypad = m.keypad
+    m.keypad = invalid
+    m.keypadLayer.removeChild(keypad)
+    if m.top.isInFocusChain() or m.top.visible
+        if m.lobby <> invalid
+            m.lobby.callFunc("focusLobby")
+        else
+            applyFocus()
+        end if
+    end if
+end sub

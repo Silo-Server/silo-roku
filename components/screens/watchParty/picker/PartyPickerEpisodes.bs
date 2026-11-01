@@ -1,0 +1,226 @@
+import "pkg:/source/catalog/series.bs"
+
+' The picker's episode browser (docs/watch-party.md section 4.8; tvOS's
+' WatchPartyEpisodePicker): over the series' backdrop dimmed, "WATCH PARTY
+' · CHOOSE AN EPISODE" (or "SUGGEST AN EPISODE"), the series' title, the
+' focused episode's line and overview under the spoiler rules, the season
+' pills (SeasonRow), and the episode rail (EpisodeRail), as the series
+' page reads them. It opens on the season and episode it was given, else
+' where the viewer left off. "No episodes in this season" with "Reload
+' episodes" when a season has none or a read fails. OK on an episode opens
+' confirm. Part of PartyPicker.
+
+' From the foot up: the rail 40 above it, the pills 24 above the rail,
+' the text 36 above the pills; the overview's three 26 px lines.
+const RAIL_Y = 740
+const SEASONS_Y = 664
+const OVERVIEW_BOTTOM = 628
+const OVERVIEW_HEIGHT = 101
+const TEXT_WIDTH = 1000
+const EPISODES_DIM = "0x00000047"
+
+sub episodesInit()
+    m.top.findNode("episodesDim").color = EPISODES_DIM
+    m.top.findNode("episodesEyebrow").setFields({ font: theme.font(theme.textStyle.WP_EYEBROW), color: theme.color.TEXT_TERTIARY, translation: [theme.watchParty.INSET, 48] })
+    m.seriesTitle = m.top.findNode("seriesTitle")
+    m.seriesTitle.setFields({ font: theme.font(theme.textStyle.WP_SERIES_TITLE), color: theme.color.TEXT, width: TEXT_WIDTH })
+    m.episodeLine = m.top.findNode("episodeLine")
+    m.episodeLine.setFields({ font: theme.font(theme.textStyle.INFO_LINE), color: theme.color.TEXT_TERTIARY, width: TEXT_WIDTH })
+    m.episodeOverview = m.top.findNode("episodeOverview")
+    m.episodeOverview.setFields({ font: theme.font(theme.textStyle.WP_BODY), color: theme.color.TEXT_TERTIARY, width: TEXT_WIDTH, translation: [theme.watchParty.INSET, OVERVIEW_BOTTOM - OVERVIEW_HEIGHT] })
+    m.seasons = m.top.findNode("seasons")
+    m.seasons.setFields({ translation: [theme.watchParty.INSET, SEASONS_Y], span: 1920 - 2 * theme.watchParty.INSET })
+    m.seasons.observeField("chosen", "onEpisodeSeason")
+    m.rail = m.top.findNode("rail")
+    m.rail.translation = [0, RAIL_Y]
+    m.rail.observeField("focusedIndex", "onEpisodeFocused")
+    m.rail.observeField("selectedIndex", "onEpisodeSelected")
+    m.rail.observeField("retry", "loadSeasons")
+    m.episodesSpinner = m.top.findNode("episodesSpinner")
+    m.episodesSpinner.centre = [960, RAIL_Y + 100]
+    m.episodesBackdrop = m.top.findNode("episodesBackdrop")
+    ' The series ({ id, title, overview }), its seasons in tvOS's order
+    ' (season cards and rollups), the season shown, its episode cards, the
+    ' season and episode to open on, and the read each answer is for.
+    m.epSeries = invalid
+    m.epSeasonNodes = []
+    m.epRollups = []
+    m.epSeason = -1
+    m.epCards = []
+    m.epWanted = { season: -1, episode: "" }
+    m.epRead = 0
+    m.epZone = "rail"
+end sub
+
+' Opens the browser for a series: card is what was chosen (a series card,
+' or the confirm page's episode), for its backdrop and overview.
+sub openEpisodes(seriesId as String, title as String, card as Dynamic, seasonNumber = -1 as Integer, episodeId = "" as String)
+    overview = ""
+    backdrop = ""
+    if card <> invalid
+        overview = util.text(card.synopsis)
+        backdrop = util.text(card.backdropUri)
+    end if
+    m.epSeries = { id: seriesId, title: title, overview: overview }
+    m.epWanted = { season: seasonNumber, episode: episodeId }
+    m.episodesBackdrop.setFields({ lowTier: m.top.lowTier, hidden: false, isPoster: false, uri: backdrop })
+    eyebrow = "watchParty.episodes.choose"
+    if m.top.purpose = watchparty.picker.SUGGEST then eyebrow = "watchParty.episodes.suggest"
+    m.top.findNode("episodesEyebrow").text = theme.tracked(UCase(i18n.text(eyebrow)))
+    m.seriesTitle.text = title
+    m.episodeLine.text = ""
+    m.episodeOverview.text = overview
+    layoutEpisodeText()
+    m.epZone = "rail"
+    m.epCards = []
+    m.rail.callFunc("present", [], -1, false)
+    if currentPage() = "episodes"
+        focusPicker()
+    else
+        pushPage("episodes")
+    end if
+    loadSeasons()
+end sub
+
+sub layoutEpisodeText()
+    lineHeight = Int(m.episodeLine.font.size * 1.3)
+    m.episodeLine.translation = [theme.watchParty.INSET, OVERVIEW_BOTTOM - OVERVIEW_HEIGHT - 10 - lineHeight]
+    titleHeight = Int(m.seriesTitle.boundingRect().height)
+    m.seriesTitle.translation = [theme.watchParty.INSET, OVERVIEW_BOTTOM - OVERVIEW_HEIGHT - 10 - lineHeight - 10 - titleHeight]
+end sub
+
+sub episodesLeft()
+    m.rail.callFunc("release")
+    m.episodesBackdrop.uri = ""
+    m.epCards = []
+    m.epRead = m.epRead + 1
+end sub
+
+sub loadSeasons()
+    if m.epSeries = invalid then return
+    m.epRead = m.epRead + 1
+    m.rail.setFields({ message: "", action: "", loading: true })
+    m.seasons.loading = true
+    m.episodesSpinner.running = m.epSeasonNodes.Count() = 0
+    pickerRequest(catalog.request.seasons(m.epSeries.id, ""), { kind: "seasons", read: m.epRead })
+end sub
+
+sub episodesAnswer(entry as Object, result as Object, content as Dynamic)
+    if entry.read <> m.epRead then return
+    m.episodesSpinner.running = false
+    if entry.kind = "seasons"
+        seasonsAnswer(result, content)
+    else
+        seasonEpisodes(result, content)
+    end if
+end sub
+
+sub seasonsAnswer(result as Object, content as Dynamic)
+    m.seasons.loading = false
+    if result.ok <> true or content = invalid or content.getChildCount() = 0 or not util.isObject(result.body)
+        m.epSeasonNodes = []
+        m.epRollups = []
+        m.seasons.labels = { items: [] }
+        showNoEpisodes()
+        return
+    end if
+    nodes = content.getChildren(-1, 0)
+    rollups = result.body.seasons
+    m.epSeasonNodes = []
+    m.epRollups = []
+    labels = []
+    for each at in catalog.series.ordered(rollups)
+        m.epSeasonNodes.Push(nodes[at])
+        m.epRollups.Push(rollups[at])
+        labels.Push(catalog.series.seasonLabel(nodes[at].title, nodes[at].seasonNumber, m.global.strings))
+    end for
+    index = catalog.series.initialSeason(m.epRollups, m.epWanted.season)
+    m.seasons.labels = { items: labels }
+    m.seasons.selected = index
+    loadEpisodes(index)
+end sub
+
+sub loadEpisodes(index as Integer)
+    if index < 0 or index >= m.epSeasonNodes.Count() then return
+    m.epSeason = index
+    m.seasons.selected = index
+    m.epRead = m.epRead + 1
+    m.rail.setFields({ message: "", action: "", loading: true })
+    pickerRequest(catalog.request.episodes(m.epSeries.id, m.epSeasonNodes[index].seasonNumber, ""), { kind: "episodes", read: m.epRead })
+end sub
+
+sub seasonEpisodes(result as Object, content as Dynamic)
+    m.rail.loading = false
+    if result.ok <> true or content = invalid or content.getChildCount() = 0
+        m.epCards = []
+        m.rail.callFunc("present", [], -1, false)
+        showNoEpisodes()
+        return
+    end if
+    m.epCards = content.getChildren(-1, 0)
+    index = catalog.series.indexOf(m.epCards, m.epWanted.episode)
+    if index < 0 then index = catalog.series.suggested(m.epCards)
+    m.epWanted.episode = ""
+    m.rail.callFunc("present", m.epCards, index, false)
+    describeEpisode(index)
+    if currentPage() = "episodes" and m.epZone = "rail" then episodesFocus()
+end sub
+
+' "No episodes in this season" and "Reload episodes", which reads the
+' seasons again.
+sub showNoEpisodes()
+    m.rail.setFields({ loading: false, message: i18n.text("watchParty.episodes.empty"), action: i18n.text("watchParty.episodes.reload") })
+    m.episodeLine.text = ""
+    if m.epSeries <> invalid then m.episodeOverview.text = m.epSeries.overview
+    if currentPage() = "episodes" then episodesFocus()
+end sub
+
+sub onEpisodeSeason()
+    index = m.seasons.chosen
+    if index <> m.epSeason then loadEpisodes(index)
+end sub
+
+sub onEpisodeFocused()
+    describeEpisode(m.rail.focusedIndex)
+end sub
+
+' The focused episode's line ("S1 · E2 · Title · 45 min") and overview,
+' left blank while the profile hides an unwatched episode's.
+sub describeEpisode(index as Integer)
+    if index < 0 or index >= m.epCards.Count() then return
+    card = m.epCards[index]
+    parts = [i18n.text("watchParty.episodes.line", { season: card.seasonNumber, episode: card.episodeNum })]
+    if card.title <> "" then parts.Push(card.title)
+    if card.runtimeLabel <> "" then parts.Push(card.runtimeLabel)
+    m.episodeLine.text = parts.Join(" · ")
+    overview = card.synopsis
+    if catalog.spoilers.hidesOverview(card, spoilerSettings()) then overview = ""
+    m.episodeOverview.text = overview
+end sub
+
+sub onEpisodeSelected()
+    index = m.rail.selectedIndex
+    if index < 0 or index >= m.epCards.Count() then return
+    openConfirm(m.epCards[index].id, m.epCards[index])
+end sub
+
+sub episodesFocus()
+    if m.epZone = "seasons" and m.epSeasonNodes.Count() > 0
+        if not m.seasons.isInFocusChain() then m.seasons.setFocus(true)
+    else
+        m.epZone = "rail"
+        if not m.rail.isInFocusChain() then m.rail.setFocus(true)
+    end if
+end sub
+
+' Up from the rail reaches the season pills, Down from them the rail.
+function episodesKey(key as String) as Boolean
+    if key = "up" and m.epZone = "rail" and m.epSeasonNodes.Count() > 0
+        m.epZone = "seasons"
+        episodesFocus()
+    else if key = "down" and m.epZone = "seasons"
+        m.epZone = "rail"
+        episodesFocus()
+    end if
+    return true
+end function

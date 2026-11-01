@@ -1,0 +1,148 @@
+import "pkg:/source/catalog/grid.bs"
+import "pkg:/source/search/search.bs"
+
+' The picker's Search (docs/watch-party.md section 4.8), the Search page's
+' own keyboard and grid (components/screens/search/SearchScreen) without
+' its segments: the voice-enabled keyboard on the left, four posters across
+' to its right, a query 300 ms after typing stops (source/search/search.bs),
+' movies and series (and episodes where the server searches them), never
+' audiobooks. Right from the keyboard's edge or Play reaches the results,
+' Left from their first column the keyboard. OK on a result chooses it.
+' "No results" / "Try a different search term" when it finds nothing. Part
+' of PartyPicker.
+
+' As SearchScreen: from y 232, clear of Roku's keyboard banner; the
+' results column at x 760, 1080 wide.
+const SEARCH_TOP = 232
+const RESULTS_X = 760
+const RESULTS_WIDTH = 1080
+
+sub searchInit()
+    m.keyboard = m.top.findNode("keyboard")
+    m.keyboard.domain = "generic"
+    m.keyboard.translation = [theme.size.CONTENT_INSET, SEARCH_TOP]
+    editBox = m.keyboard.textEditBox
+    editBox.maxTextLength = catalog.request.MAX_QUERY
+    editBox.hintText = i18n.text("watchParty.picker.searchPrompt")
+    editBox.clearOnDownKey = false
+    editBox.voiceEnabled = true
+    editBox.voiceEntryType = "generic"
+    m.keyboard.observeField("text", "onSearchTyped")
+    m.grid = m.top.findNode("grid")
+    m.grid.columns = theme.browse.GRID_SEARCH_COLUMNS
+    m.grid.cardSize = [theme.browse.GRID_SEARCH_CARD_WIDTH, theme.browse.GRID_SEARCH_CARD_HEIGHT]
+    m.grid.translation = [RESULTS_X, SEARCH_TOP]
+    m.grid.observeField("state", "onSearchState")
+    m.grid.observeField("selectedItem", "onSearchSelected")
+    m.gridList = m.grid.findNode("grid")
+    m.searchStatus = m.top.findNode("searchStatus")
+    m.searchStatus.centre = [RESULTS_X + RESULTS_WIDTH \ 2, 600]
+    m.searchSpinner = m.top.findNode("searchSpinner")
+    m.searchSpinner.centre = [RESULTS_X + RESULTS_WIDTH \ 2, 600]
+    m.debounce = m.top.findNode("debounce")
+    m.debounce.observeField("fire", "onSearchDebounce")
+    m.searchClock = CreateObject("roTimespan")
+    m.query = search.create()
+    m.searchZone = "keyboard"
+    m.searchStarted = false
+end sub
+
+' The page opens on the keyboard; the search capability is read once.
+sub searchFocus()
+    if not m.searchStarted
+        m.searchStarted = true
+        m.grid.owner = m.top.owner
+        pickerRequest(catalog.request.searchCapabilities(), { kind: "searchCapabilities" })
+    end if
+    if m.searchZone = "results" and m.grid.state = "ready"
+        if not m.gridList.isInFocusChain() then m.gridList.setFocus(true)
+    else
+        m.searchZone = "keyboard"
+        if not m.keyboard.isInFocusChain() then m.keyboard.setFocus(true)
+    end if
+end sub
+
+' Leaving the page drops the query and its results.
+sub searchLeft()
+    m.debounce.control = "stop"
+    m.grid.callFunc("clear")
+    m.keyboard.text = ""
+    m.query = search.create()
+    m.searchZone = "keyboard"
+    m.searchStarted = false
+    showSearchState()
+end sub
+
+sub onSearchCapabilities(result as Object)
+    body = result.body
+    videoWithEpisodes = result.ok = true and util.isObject(body) and util.isTrue(body.available) and util.isTrue(body.videoWithEpisodes)
+    searchApply(search.capabilities(m.query, videoWithEpisodes))
+end sub
+
+sub onSearchTyped()
+    searchApply(search.typed(m.query, m.keyboard.text, m.searchClock.TotalMilliseconds()))
+end sub
+
+sub onSearchDebounce()
+    searchApply(search.tick(m.query, m.searchClock.TotalMilliseconds()))
+end sub
+
+' Carries out a search.step decision. Search's segments are left out: a
+' query searches All.
+sub searchApply(decision as Object)
+    action = decision.action
+    if action = search.step.WAIT
+        m.debounce.control = "stop"
+        m.debounce.duration = decision.delayMs / 1000
+        m.debounce.control = "start"
+    else if action = search.step.RUN
+        m.debounce.control = "stop"
+        m.grid.callFunc("load", { request: catalog.request.search(decision.q, catalog.searchScope.ALL, decision.videoWithEpisodes, "", catalog.grid.PAGE_SIZE, m.top.lowTier), lowTier: m.top.lowTier })
+    else if action = search.step.CLEAR
+        m.debounce.control = "stop"
+        m.grid.callFunc("clear")
+    end if
+    showSearchState()
+end sub
+
+sub showSearchState()
+    gridState = m.grid.state
+    hasQuery = m.query.text <> ""
+    m.grid.visible = hasQuery
+    m.searchSpinner.running = hasQuery and gridState = "loading"
+    message = ""
+    detail = ""
+    if hasQuery and (gridState = "empty" or gridState = "error")
+        message = i18n.text("watchParty.picker.noResults")
+        detail = i18n.text("watchParty.picker.noResultsBody")
+    end if
+    m.searchStatus.setFields({ message: message, detail: detail })
+    m.searchStatus.visible = message <> ""
+end sub
+
+sub onSearchState()
+    showSearchState()
+    if m.searchZone = "results" and m.grid.state <> "ready" and m.grid.state <> "loading" and currentPage() = "search"
+        m.searchZone = "keyboard"
+        searchFocus()
+    end if
+end sub
+
+sub onSearchSelected()
+    card = m.grid.selectedItem
+    if card <> invalid and watchparty.picker.playable(card.itemType) then choose(card)
+end sub
+
+function searchKey(key as String) as Boolean
+    if m.searchZone = "keyboard"
+        if key = "play" then searchApply(search.submit(m.query))
+        if (key = "right" or key = "play") and (m.grid.state = "ready" or m.grid.state = "loading")
+            m.searchZone = "results"
+            searchFocus()
+        end if
+    else if key = "left"
+        m.searchZone = "keyboard"
+        searchFocus()
+    end if
+    return true
+end function

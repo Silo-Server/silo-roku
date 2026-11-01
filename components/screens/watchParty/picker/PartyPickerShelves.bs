@@ -1,0 +1,258 @@
+' The picker's shelves (docs/watch-party.md section 4.8): its top strip,
+' "Choose a title" or "Suggest a title" with Search and Close as the top
+' bar's circles, over Home's rows of posters. The shelves follow
+' watchparty.picker.shelves as each source lands: the room's picker rows
+' (or the catalog's watchlist without the picker capability), up to four
+' Home rows, and the recently added movies and series. Focus starts on
+' the first card once there is one, and goes back to the card it was on
+' when the shelves change; Up from the first row reaches the strip. Part
+' of PartyPicker.
+
+' The strip as the top bar lays it out: 56 from the top, 64 tall, its
+' buttons 8 apart at the side inset (Watch Party's 76 px circles, whose
+' label shows while focused); the rows 40 under it.
+const BAR_TOP = 56
+const BAR_HEIGHT = 64
+const CIRCLE_GAP = 8
+const SHELVES_TOP = 160
+
+sub shelvesInit()
+    m.shelves = m.top.findNode("shelves")
+    m.shelves.setFields({ rowLabelFont: theme.font(theme.textStyle.ROW_TITLE), rowLabelColor: theme.color.TEXT, itemSpacing: [0, theme.size.ROW_GAP], translation: [0, SHELVES_TOP] })
+    m.shelves.observeField("rowItemSelected", "onShelfSelected")
+    m.shelves.observeField("rowItemFocused", "onShelfFocused")
+    title = m.top.findNode("pickerTitle")
+    title.setFields({ font: theme.font(theme.textStyle.TAB_LABEL), color: theme.color.WHITE, translation: [theme.size.SIDE_INSET, BAR_TOP], height: BAR_HEIGHT, vertAlign: "center" })
+    m.searchButton = m.top.findNode("searchButton")
+    m.closeButton = m.top.findNode("closeButton")
+    m.searchButton.setFields({ icon: theme.watchPartyArt.SEARCH, text: i18n.text("watchParty.picker.search") })
+    m.closeButton.setFields({ icon: theme.watchPartyArt.CLOSE, text: i18n.text("watchParty.picker.close") })
+    m.empty = m.top.findNode("empty")
+    m.empty.setFields({ message: i18n.text("watchParty.picker.emptyTitle"), detail: i18n.text("watchParty.picker.emptyBody"), centre: [960, 600] })
+    m.spinner = m.top.findNode("spinner")
+    m.spinner.centre = [960, 600]
+    ' Each source's cards, as CardContent nodes, and the reads still out.
+    m.sources = { together: [], watchlist: [], home: [], recentMovies: [], recentSeries: [] }
+    m.shelfLoads = {}
+    ' Where focus is on the page: "list", "search", or "close"; the card it
+    ' was on ({ row, card } IDs); whether the viewer has moved it.
+    m.shelfZone = "list"
+    m.shelfFocus = invalid
+    m.shelfMoved = false
+    m.shelfRows = []
+end sub
+
+sub shelvesStart()
+    m.top.findNode("pickerTitle").text = i18n.text(watchparty.picker.titleKey(m.top.purpose))
+    layoutStrip()
+    lowTier = m.top.lowTier
+    if util.isTrue(pickerFeatures().picker)
+        m.shelfLoads.picker = true
+        partySend({ kind: "picker" })
+    else
+        m.shelfLoads.watchlist = true
+        pickerRequest(watchparty.picker.watchlistRequest(lowTier), { kind: "shelves.watchlist" })
+    end if
+    m.shelfLoads.home = true
+    pickerRequest(catalog.request.homeSections(lowTier), { kind: "shelves.home" })
+    m.shelfLoads.recentMovies = true
+    pickerRequest(watchparty.picker.recentRequest("movie", lowTier), { kind: "shelves.recentMovies" })
+    m.shelfLoads.recentSeries = true
+    pickerRequest(watchparty.picker.recentRequest("series", lowTier), { kind: "shelves.recentSeries" })
+    rebuildShelves()
+end sub
+
+' Search and Close at the right inset: circles at rest, Search showing its
+' label while focused, as the bar's own.
+sub layoutStrip()
+    endX = 1920 - theme.size.SIDE_INSET
+    m.closeButton.translation = [endX - m.closeButton.measuredWidth, BAR_TOP + (BAR_HEIGHT - theme.watchParty.BUTTON_HEIGHT) \ 2]
+    endX = endX - m.closeButton.measuredWidth - CIRCLE_GAP
+    m.searchButton.translation = [endX - m.searchButton.measuredWidth, BAR_TOP + (BAR_HEIGHT - theme.watchParty.BUTTON_HEIGHT) \ 2]
+end sub
+
+' The room's picker output landed: its rows as cards.
+sub shelvesPicker()
+    picker = m.state.picker
+    if not util.isObject(picker) or util.isTrue(picker.loading) or m.shelfLoads.picker <> true then return
+    m.shelfLoads.picker = false
+    m.sources.together = pickerCards(picker.continueTogether)
+    m.sources.watchlist = pickerCards(picker.watchlistUnion)
+    rebuildShelves()
+end sub
+
+' The picker output's rows ({ item, members, nextUp }) as poster cards.
+function pickerCards(rows as Dynamic) as Object
+    out = []
+    if type(rows) <> "roArray" then return out
+    for each row in rows
+        fields = catalog.cards.fromItem(row.item, catalog.shape.POSTER, m.copy)
+        if fields <> invalid
+            card = CreateObject("roSGNode", "CardContent")
+            card.setFields(fields)
+            out.Push(card)
+        end if
+    end for
+    return out
+end function
+
+sub shelvesAnswer(entry as Object, result as Object, content as Dynamic)
+    source = Mid(entry.kind, 9)
+    m.shelfLoads[source] = false
+    if result.ok = true and content <> invalid
+        if source = "home"
+            rows = []
+            for each row in content.getChildren(-1, 0)
+                rows.Push({ id: row.id, title: row.title, sectionType: row.sectionType, cards: row.getChildren(-1, 0) })
+            end for
+            m.sources.home = rows
+        else
+            m.sources[source] = content.getChildren(-1, 0)
+        end if
+    end if
+    rebuildShelves()
+end sub
+
+function shelvesLoading() as Boolean
+    for each source in m.shelfLoads
+        if m.shelfLoads[source] = true then return true
+    end for
+    return false
+end function
+
+' The shelves from every source landed so far, focus kept on its card.
+sub rebuildShelves()
+    shelves = watchparty.picker.shelves(m.sources)
+    root = CreateObject("roSGNode", "ContentNode")
+    sizes = []
+    spacings = []
+    offsets = []
+    labels = []
+    heights = []
+    m.shelfRows = []
+    for each shelf in shelves
+        row = root.createChild("RowContent")
+        title = shelf.title
+        if shelf.titleKey <> "" then title = i18n.text(shelf.titleKey)
+        geometry = theme.browse.rowLayout(true, m.top.lowTier)
+        row.setFields({ id: shelf.id, title: title, shape: catalog.shape.POSTER, captionStyle: "row", lowTier: m.top.lowTier, cardRing: m.top.lowTier, cardRoom: geometry.room })
+        for each card in shelf.cards
+            ' A card moves from the tree it came in (or the last shelves).
+            row.appendChild(card)
+        end for
+        sizes.Push(geometry.itemSize)
+        spacings.Push(geometry.itemSpacing)
+        offsets.Push(geometry.focusXOffset)
+        labels.Push(geometry.labelOffset)
+        heights.Push(geometry.height)
+        m.shelfRows.Push(shelf.id)
+    end for
+    loading = shelvesLoading()
+    m.spinner.running = loading and shelves.Count() = 0
+    m.empty.visible = not loading and shelves.Count() = 0
+    m.shelves.visible = shelves.Count() > 0
+    if shelves.Count() = 0
+        m.shelves.content = invalid
+        if m.shelfZone = "list" then m.shelfZone = "search"
+        if currentPage() = "shelves" and m.top.isInFocusChain() then shelvesFocus()
+        if m.empty.visible then m.empty.callFunc("announce")
+        return
+    end if
+    m.shelves.setFields({ rowItemSize: sizes, rowItemSpacing: spacings, focusXOffset: offsets, rowLabelOffset: labels, rowHeights: heights })
+    m.shelves.content = root
+    target = shelfTarget(root)
+    if target[0] > 0 or target[1] > 0 then m.shelves.jumpToRowItem = target
+    if not m.shelfMoved and m.shelfZone <> "list"
+        ' Cards that arrive before the viewer moved take focus, as on tvOS.
+        m.shelfZone = "list"
+    end if
+    if currentPage() = "shelves" and m.top.isInFocusChain() then shelvesFocus()
+end sub
+
+' [row, item] of the card focus was on, else the first card.
+function shelfTarget(root as Object) as Object
+    if m.shelfFocus = invalid then return [0, 0]
+    for r = 0 to root.getChildCount() - 1
+        row = root.getChild(r)
+        if row.id = m.shelfFocus.row
+            for i = 0 to row.getChildCount() - 1
+                if row.getChild(i).id = m.shelfFocus.card then return [r, i]
+            end for
+            return [r, 0]
+        end if
+    end for
+    return [0, 0]
+end function
+
+sub onShelfFocused()
+    focused = m.shelves.rowItemFocused
+    root = m.shelves.content
+    if root = invalid or type(focused) <> "roArray" or focused.Count() < 2 then return
+    row = root.getChild(focused[0])
+    if row = invalid then return
+    card = row.getChild(focused[1])
+    if card = invalid then return
+    if m.shelfFocus <> invalid and (m.shelfFocus.row <> row.id or m.shelfFocus.card <> card.id) and m.shelves.hasFocus() then m.shelfMoved = true
+    m.shelfFocus = { row: row.id, card: card.id }
+end sub
+
+sub onShelfSelected()
+    selected = m.shelves.rowItemSelected
+    root = m.shelves.content
+    if root = invalid or type(selected) <> "roArray" or selected.Count() < 2 then return
+    row = root.getChild(selected[0])
+    if row = invalid then return
+    choose(row.getChild(selected[1]))
+end sub
+
+sub shelvesFocus()
+    if m.shelfZone = "list" and m.shelves.content <> invalid
+        m.shelves.setFocus(true)
+    else
+        if m.shelfZone = "list" then m.shelfZone = "search"
+        focusAnchor()
+    end if
+    restyleStrip()
+end sub
+
+sub restyleStrip()
+    here = currentPage() = "shelves" and m.top.isInFocusChain()
+    m.searchButton.highlighted = here and m.shelfZone = "search"
+    m.closeButton.highlighted = here and m.shelfZone = "close"
+    layoutStrip()
+end sub
+
+' Up from the first row reaches the strip; Down from the strip the
+' shelves; Left and Right move between Search and Close.
+function shelvesKey(key as String) as Boolean
+    if m.shelfZone = "list"
+        if key = "up"
+            m.shelfMoved = true
+            moveStrip("search")
+        end if
+        return true
+    end if
+    if key = "OK"
+        if m.shelfZone = "search"
+            pushPage("search")
+        else
+            m.top.closed = true
+        end if
+    else if key = "left" and m.shelfZone = "close"
+        moveStrip("search")
+    else if key = "right" and m.shelfZone = "search"
+        moveStrip("close")
+    else if key = "down" and m.shelves.content <> invalid
+        m.shelfMoved = true
+        m.shelfZone = "list"
+        shelvesFocus()
+    end if
+    return true
+end function
+
+sub moveStrip(zone as String)
+    m.shelfZone = zone
+    shelvesFocus()
+    if zone = "search" then speak(m.searchButton.text)
+    if zone = "close" then speak(m.closeButton.text)
+end sub
