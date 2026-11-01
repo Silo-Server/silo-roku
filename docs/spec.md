@@ -383,7 +383,7 @@ on 2026-10-25.
 | Landscape card | 360×200 px, for Continue Watching, in-progress, and "next" rows only (5.5) |
 | Card gap / row spacing | 40 px / 10 px between rows (each strip has 14 px padding above and below) |
 | Card corner radius | 12 px (detail episode stills 18) |
-| Card focus | A lift with no ring (D4) over a shadow, black 50% with tvOS's 20 px radius, 10 px lower: posters grow 38 px in height as tvOS's card lift does (1.14 in rows, 1.10 in Browse), landscape cards scale 1.20, detail episode stills 1.08, each side by whole px, every edge of the lifted card on a whole pixel (5.9). The low tier keeps the list's ring without scaling (5.9) |
+| Card focus | tvOS's outlined lift (silo-apple #973, `TVCardOutlineButtonStyle`): posters, landscape cards, episode stills, and cast portraits scale 1.05, each side by whole px, every edge of the lifted card on a whole pixel (5.9), over a shadow, black 50% with tvOS's 20 px radius, 10 px lower, with a 4 px white outline at 70% inside the card's edge (3 px in HD) that scales with it. Trailers & More cards outline without lifting. The low tier keeps the list's ring without scaling (5.9) |
 | Round button (detail, 76 px) | Rest white 10%, no ring; focused pure white fill with black content, no scale |
 | Pill focus | Pure white fill with black text; the Sort pill and first-run buttons use `#EDEDED`. Scale: Sort 1.04, first-run buttons 1.06, fields 1.04, others none |
 | Scaled text | Roku resamples a scaled Label's glyphs, which blurs Inter's hinted stems, so on the first-run buttons, fields, and server card, the focused profile tile, and the server mark, the art scales but the text is set at the scaled size, rounded down to a whole px (a 29 px label focused at 1.06 is set at 30 px), on whole pixels (`theme.placeUnscaled`). A focused label so grows slightly less than tvOS's, and never outgrows its box |
@@ -824,12 +824,15 @@ their existing HD/FHD assets.
     and any "next" section; every other row shows posters, including rows of
     episodes (section 5.9).
   - Captions sit 22 px under posters and 14 px under landscape cards. The
-    title is 24 px Medium at 45%, white SemiBold when focused. A second line,
+    title is 24 px Medium at 45%, white when focused. A second line,
     4 px below it, shows the year for movies and series, or "S01E02 · Pilot"
     beneath an episode's series name. Metadata is 20 px Regular at 32%, white
-    at 92% and Medium when focused. Both lines stay single-line and truncate
-    at the tail; they drop together clear of focused artwork. Rows and grids
-    reserve space for both lines and the focus drop. The low tier keeps both
+    at 92% when focused. Focus changes only the colour, so a truncated title
+    does not reflow (tvOS's `tvCardTitleFocus`). Both lines stay single-line
+    and truncate at the tail; where the lifted card reaches past the caption's
+    gap less 8 px they drop together by the difference (2 px under Browse's
+    posters, none under a row's). Rows and grids reserve space for both lines
+    and the focus drop. The low tier keeps both
     lines without scaling or dropping them.
     Focus does not change caption width, horizontal position, or font size.
     The vertical drop is 5 px under row posters and 13 px under landscape
@@ -1340,9 +1343,12 @@ their existing HD/FHD assets.
     until the last one is fully visible.
   - Played episodes are dimmed by black 35% and carry a 40 px check disc. A
     5 px progress bar shows the resume point.
-  - Captions, 18 px below: "S01E02 · Title" in 20 px SemiBold at 92% (100%
-    when focused or current), over "Feb 18, 2026 · 52m" in 17 px Medium at
-    60%.
+  - Captions, 18 px below: "S01E02 · Title" in 20 px SemiBold at 45%, over
+    "Feb 18, 2026 · 52m" in 17 px Medium at 32%, white and white 92% when
+    focused or current, as other card captions; they do not drop.
+  - The current episode, the one Play acts on, keeps the focus outline and
+    bright caption without the lift while focus is elsewhere, such as on Play
+    after opening an episode from Continue Watching (tvOS's `isCurrent`).
   - A focused episode updates the hero's metadata line (series rating · air
     date · runtime · ratings · Season N · Episode M) and synopsis. The air
     date and runtime come from its card at once; its ratings follow when
@@ -1360,17 +1366,18 @@ their existing HD/FHD assets.
     preserves server order and displays up to 24 people with 200 px
     portraits, names, and characters. Missing portraits use initials;
     entries without a person ID remain readable but cannot open a person.
-    Focus follows Home's card treatment: a centred 38 px lift with a round
-    shadow and highlighted captions, without an outline. The low tier uses
-    an outline without lifting. Names wrap to at most two lines, with the
+    Focus follows Home's card treatment: a centred 1.05 lift with a round
+    shadow, a 4 px white outline at 70% inside the circle, and highlighted
+    captions. The low tier uses the outline without lifting. Names wrap to at most two lines, with the
     character 6 px below; both captions stay clear of the lifted portrait.
     All supporting rails use floating focus: cards remain stationary until
     selection crosses the visible edge. Selection and viewport position
     survive Back and screen reconstruction. Poster cards use Home's
-    ringless lift and shadow, or an outline without lift on the low tier.
+    outlined lift and shadow, or the list's ring without lift on the low
+    tier.
   - Recommendations preserve server order, show up to 12 movie/series
     poster cards, and open the existing detail route. Their two-line captions
-    are centred 16 px under each poster, dropping 11 px with the Home-style
+    are centred 16 px under each poster, staying put under the Home-style
     focus lift. Their request starts
     900 ms after primary detail loading; placeholders are not focusable,
     and empty or failed responses remove the whole section. Up and Down
@@ -1393,8 +1400,8 @@ their existing HD/FHD assets.
     "Behind the Scenes"; "Extra" for a kind the client does not know), and
     5 px under it its runtime ("2:31", "1:02:03"; 17 px Medium at
     `#EDEDED` 60%).
-  - Focus draws a 3 px white ring at 90% inside the card's edge (2 px in
-    HD) and brightens the title to full `#EDEDED`, with Home's shadow; the
+  - Focus draws Home's 4 px white outline at 70% inside the card's edge (3 px
+    in HD) and brightens the title to full `#EDEDED`, with Home's shadow; the
     card does not lift and the caption does not drop, as both tvOS detail
     pages pass `TVTrailersRail` `focusScale: 1.0`. The same on every tier.
     Floating focus and the selection kept across Back and rebuilding, as
@@ -2196,9 +2203,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Letter-spaced small text (badge chips, uppercase headers) | Spacing approximated with hair spaces (`theme.tracked`) | Roku `Label` has no letter-spacing field |
 | System fonts cover every script | Titles in scripts outside Latin, Greek, Cyrillic, and Vietnamese (for example CJK and Arabic) render as boxes | Neither the packaged Inter subset nor Roku's system font covers them, and a CJK font does not fit the 4 MB package |
 | Panels, buttons, cards, and the hero's title cast soft shadows, and a focused card's caption glows; focused controls change over 120 ms or more | Cards use a shadow 9-patch (5.2) and lift with the list's own focus animation; panels open with tvOS's 0.12 s fade; panels, buttons, and the title have no shadow, captions no glow; detail action circles animate width and label reveal on the normal tier (5.6), while the low tier snaps | Roku has no blur, and animations cost frames on 512 MB devices |
-| Focused cards lift on every device | On the low tier, cards do not scale and the list draws a 9-patch ring | Plan section 4.6: frame rate on 512 MB and non-OpenGL devices |
-| Cast and recommendation cards use an outline and a smaller scale than Home | Detail supporting rails use Home's ringless lift and caption highlighting; cast retains round portraits and a round shadow. Low-tier cards keep an outline without lifting | Consistent focus treatment across Roku's Home and detail rails |
-| A focused card scales by one factor (a poster 1.14) about its centre | Each side grows by whole px, so the two axes differ slightly: a row's poster lifts to 202×302, Browse's to 286×428, Search's to 266×398, a landscape card to 432×240, a detail episode still to 388×216. The card scales about its top-left corner and moves back by that lift (a landscape card 36 and 20 px), so its left and top edges are whole px exactly | At a fractional edge Roku drew the art a pixel past the 9-patch frame that rounds the corners, a white line down a lifted card's right edge (hardware run 26). Scaled about its centre, a float's 1.2 put the first Continue Watching card's left edge at x 43.99998, and Roku drew its progress bar, a Rectangle, from x 43, a tick left of the frame's corner (runs 26 and 27) |
+| Focused cards lift on every device, with a white outline at 70% | On the low tier, cards do not scale and the list draws its 9-patch ring (`#EDEDED`, opaque) in place of the outline | Plan section 4.6: frame rate on 512 MB and non-OpenGL devices |
+| A focused card scales by one factor (1.05) about its centre | Each side grows by whole px, so the two axes differ slightly: a row's poster lifts to 184×278, Browse's to 274×410, Search's to 252×378, a landscape card or detail episode still to 378×210. The card and its outline scale about its top-left corner and move back by that lift (a landscape card 9 and 5 px), so their left and top edges are whole px exactly | At a fractional edge Roku drew the art a pixel past the 9-patch frame that rounds the corners, a white line down a lifted card's right edge (hardware run 26). Scaled about its centre, a float's 1.2 put the first Continue Watching card's left edge at x 43.99998, and Roku drew its progress bar, a Rectangle, from x 43, a tick left of the frame's corner (runs 26 and 27) |
 | The detail Subtitles menu leads with the profile's subtitle language; the player's list with the watch projection's effective subtitle language | Both lead with the projection's `effective_subtitle_language`, so the detail menu and Options' Subtitles list the same tracks in the same order and words. Each lists its own source, as on tvOS: the detail menu the version's tracks, Options the plan's inventory, so a sidecar only the plan names shows only in Options | The two lists disagreed on hardware run 27: Options listed the server's order and hid titles the detail menu showed. A detail pick is an ordinal into the projection's list, so the detail menu cannot offer a track the projection does not name |
 | A subtitle's title shows unless it is a release name, a format, a flag, or its language | A title that is a subtitle file's name ("Heat (1995).en.srt") is dropped too, on the detail menu and in Options | The server gives an untitled sidecar its file's name as its title and its inventory label (hardware run 6) |
 | Avatar menu rows, and the detail page's More menu rows, have an icon before the label | Labels without icons; More's rows keep the Versions menu's empty check column | No icon art ships for the menus; More reuses the Versions menu (section 5.6) |

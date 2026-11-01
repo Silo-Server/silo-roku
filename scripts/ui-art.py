@@ -10,9 +10,11 @@
   scrim_bottom.png           black, clear at the top and opaque at the bottom
   card_placeholder.png       a card without artwork: Android TV's default
                              artwork, three brand glows over #16171C
-  still_ring_{fhd,hd}.9.png  a 3 px white ring (2 px in HD) inside a radius-18
-                             card: a focused Trailers & More card, at 90%
-                             opacity (tvOS's tvFocusRing)
+  card_ring_{fhd,hd}.9.png   a 4 px white ring (3 px in HD) inside a radius-12
+                             card: a focused card's outline, at 70% opacity
+                             (tvOS's TVCardOutline)
+  still_ring_{fhd,hd}.9.png  the same ring inside a radius-18 card: a focused
+                             episode still or Trailers & More card
   search_glyph.png           the top bar's magnifier, white, for blendColor;
                              2x its logical 28 px canvas for display scaling
 
@@ -79,6 +81,8 @@ tvOS's shared art (spec section 5, silo-apple b90a86ea; AG-222):
   cast_shadow.png            circular portrait shadow using the card shadow blur
   circle_ring_3.png          the focused top bar avatar's ring: 3 px inside a 58 px
                              circle, white
+  cast_ring.png              a focused cast portrait's outline: 4 px inside a
+                             200 px circle, white, at 70% opacity
   rounded_{14,12}_{fhd,hd}.9.png
                              white rounded rectangles, for blendColor: the avatar
                              menu's and library list's row fills (radius 14) and
@@ -122,7 +126,8 @@ CIRCLE = 58  # top bar search and avatar circles, FHD px
 GLYPH = 28  # magnifier, FHD px: SF Symbols' magnifyingglass at 27 pt semibold
 GLYPH_SCALE = 2  # intrinsic pixels per logical FHD pixel; glyphs only
 AVATAR_RING = 3  # the focused avatar's ring, inside the circle
-EXTRA_RING = 3  # a focused Trailers & More card's ring (tvOS's tvFocusRing), inside the card
+OUTLINE = 4  # a focused card's outline (tvOS's TVCardOutline.lineWidth), inside the card
+CAST = 200  # a cast portrait, FHD px
 WHITE = (0xFF, 0xFF, 0xFF)
 INK = (0xED, 0xED, 0xED)
 # The backdrop box's vertical fade (TVBackdropArtworkFadeMask): (y, art alpha).
@@ -479,6 +484,7 @@ def images():
     for res, radius, width in (("fhd", CARD_RADIUS, RING_WIDTH), ("hd", hd(CARD_RADIUS), hd(RING_WIDTH))):
         yield f"card_frame_{res}.9.png", nine_patch(card_frame(radius), BACKGROUND)
         yield f"focus_ring_{res}.9.png", nine_patch(focus_ring(radius, width), FOCUS_RING)
+        yield f"card_ring_{res}.9.png", nine_patch(focus_ring(radius, width), WHITE)
     yield "scrim_left.png", scrim(RAMP, 2, lambda x, y: 255 - x)
     yield "scrim_bottom.png", scrim(2, RAMP, lambda x, y: y)
     yield "card_placeholder.png", placeholder(*PLACEHOLDER)
@@ -495,7 +501,7 @@ def images():
     yield "flat_fade_bottom.png", [[WHITE + (round(255 * (1 - piecewise(BACKDROP_STOPS, y + 0.5))),)] * 2 for y in range(BACKDROP_HEIGHT)]
     for res, scale in (("fhd", lambda px: px), ("hd", hd)):
         yield f"still_frame_{res}.9.png", nine_patch(card_frame(scale(STILL_RADIUS)), BACKGROUND)
-        yield f"still_ring_{res}.9.png", nine_patch(focus_ring(scale(STILL_RADIUS), scale(EXTRA_RING)), WHITE)
+        yield f"still_ring_{res}.9.png", nine_patch(focus_ring(scale(STILL_RADIUS), scale(OUTLINE)), WHITE)
         yield f"card_shadow_{res}.9.png", nine_patch_rgba(card_shadow(scale(SHADOW_SIGMA), scale(SHADOW_MARGIN)))
         yield f"chip_{res}.9.png", nine_patch_rgba(chip(scale(CHIP[0])))
         for radius in (22, 18):
@@ -507,6 +513,7 @@ def images():
     yield "check_disc.png", check_disc(CHECK_DISC)
     yield "explore_all.png", explore_all(*EXPLORE)
     yield "circle_ring_3.png", circle_ring(CIRCLE, AVATAR_RING)
+    yield "cast_ring.png", circle_ring(CAST, OUTLINE)
     yield "cast_shadow.png", cast_shadow()
     for res, scale in (("fhd", lambda px: px), ("hd", hd)):
         for radius in ROW_RADII:
