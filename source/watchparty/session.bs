@@ -1,0 +1,1288 @@
+import "pkg:/source/api/watchParty.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/clock.bs"
+import "pkg:/source/watchparty/connection.bs"
+import "pkg:/source/watchparty/lobby.bs"
+import "pkg:/source/watchparty/recent.bs"
+import "pkg:/source/watchparty/room.bs"
+import "pkg:/source/watchparty/sync.bs"
+import "pkg:/source/watchparty/votes.bs"
+import "pkg:/source/watchparty/wire.bs"
+
+' The room Task's logic (docs/watch-party.md sections 3 to 8), as pure
+' rules over one state: components/tasks/RoomTask.bs feeds it every event
+' and runs the decisions it returns, so the whole party (support checks,
+' joining, the connection, the clock, suggestions, and playback sync) is
+' testable without a socket or a server.
+'
+' Every entry point takes env { now, wallMs, uuid, random }: the Task's
+' monotonic milliseconds, epoch milliseconds from the anchored clock
+' (watchparty.time), and functions giving a fresh UUID and a number from
+' 0 to 1. Each gives a list of decisions, in order:
+'   { kind: "http", tag, request }   send through the shared API client;
+'                                    the answer comes back to onHttp()
+'   { kind: "open", epoch, url, protocols }   open the room socket; its
+'                                    events come back to onSocket() with
+'                                    that epoch
+'   { kind: "send", text }           a text frame on the open socket
+'   { kind: "close" }                close the socket
+'   { kind: "publish", field, value } set one of RoomTask's output fields
+'   { kind: "persist", text }        write the recent party's section
+'   { kind: "log", level, message, fields }
+' Nothing here logs or publishes a code, ticket, or room proof, except
+' the room's own code in its snapshot and recent entry, which the screens
+' show.
+namespace watchparty.session
+    ' A suggestions_update is followed by a read this much later, so a burst
+    ' of frames costs one read (tvOS).
+    const SUGGESTION_READ_DELAY_MS = 200
+    ' A read overtaken by a frame or mutation is tried this many times.
+    const SUGGESTION_READ_ATTEMPTS = 3
+    ' Suggestion pages are followed at most this far (200 suggestions).
+    const MAX_SUGGESTION_PAGES = 4
+    const FALLBACK_REASONS = "|no_alternate_version|hdr_transcode_unsupported|subtitle_conversion_unsupported|transcoding_disabled|"
+    ' Mutations one at a time, as tvOS's isBusy.
+    const BUSY_KINDS = "|create|join|rejoin|select|stage|playNow|start|stop|policy|mode|promote|end|suggest|vote|unvote|removeSuggestion|"
+    const HOST_KINDS = "|end|stop|policy|mode|"
+
+    ' The state for one app run. webSocket says CreateObject("roWebSocket")
+    ' gave an object; recentText is the recent party section's text.
+    function create(webSocket as Boolean, recentText as Dynamic, env as Object) as Object
+        s = {
+            identity: { server: "", account: "", profile: "", borrowed: false },
+            webSocket: webSocket,
+            support: { room: invalid, playback: invalid, etag: "", pending: 0, checking: false, evaluation: invalid, failed: false },
+            recent: watchparty.recent.decode(recentText, wallSeconds(env)),
+            party: invalid,
+            createDraft: invalid,
+            suggestDraft: invalid,
+            busy: "",
+            http: {},
+            nextTag: 0,
+            published: {},
+            dirty: {},
+            connection: "idle"
+        }
+        return s
+    end function
+
+    ' ---- Inputs
+
+    ' identity is { server (the base URL), account, profile, borrowed }. A
+    ' change leaves the party silently (section 4.11); a sign-out forgets
+    ' that account's recent parties.
+    function onIdentity(s as Object, input as Dynamic, env as Object) as Object
+        out = []
+        incoming = { server: "", account: "", profile: "", borrowed: false }
+        if util.isObject(input)
+            incoming.server = util.text(input.server)
+            incoming.account = util.text(input.account)
+            incoming.profile = util.text(input.profile)
+            incoming.borrowed = util.isTrue(input.borrowed)
+        end if
+        previous = s.identity
+        if previous.server = incoming.server and previous.account = incoming.account and previous.profile = incoming.profile and previous.borrowed = incoming.borrowed then return finish(s, out, env)
+        if s.party <> invalid
+            trace(out, "info", "identity changed; leaving the party silently", { roomId: s.party.roomId })
+            leaveParty(s, out)
+        end if
+        if previous.server <> "" and previous.account <> "" and incoming.account = "" and incoming.server = previous.server
+            s.recent = watchparty.recent.forget(s.recent, previous.server, previous.account)
+            persist(s, out)
+        end if
+        s.identity = incoming
+        ' Answers to the old identity's support checks and entries are dropped.
+        s.http = {}
+        s.busy = ""
+        s.support = { room: invalid, playback: invalid, etag: "", pending: 0, checking: false, evaluation: invalid, failed: false }
+        s.createDraft = invalid
+        s.suggestDraft = invalid
+        ' Support is read at sign-in and on a server or profile change
+        ' (section 3).
+        if s.webSocket and incoming.server <> "" and incoming.account <> "" and incoming.profile <> "" and not incoming.borrowed then checkSupport(s, out)
+        return finish(s, out, env)
+    end function
+
+    ' One command from the screens (components/tasks/RoomTask.bs lists
+    ' them). Each that ends gives a result publish with its tag.
+    function onCommand(s as Object, input as Dynamic, env as Object) as Object
+        out = []
+        if not util.isObject(input) then return out
+        kind = util.text(input.kind)
+        if Instr(1, BUSY_KINDS, "|" + kind + "|") > 0 and s.busy <> ""
+            result(out, input, false, "busy")
+            return finish(s, out, env)
+        end if
+        if kind = "checkSupport"
+            checkSupport(s, out)
+        else if kind = "create"
+            createParty(s, input, out, env)
+        else if kind = "join"
+            joinParty(s, input, out)
+        else if kind = "rejoin"
+            rejoinParty(s, input, out)
+        else if kind = "leave"
+            if s.party <> invalid then leaveParty(s, out)
+            result(out, input, true, "")
+        else if kind = "forgetRecent"
+            s.recent = watchparty.recent.forget(s.recent, util.text(input.server), util.text(input.account))
+            persist(s, out)
+        else if kind = "noteTitle"
+            noteTitle(s, input, out, env)
+        else if s.party = invalid
+            result(out, input, false, "watchParty.ended.expired")
+        else
+            partyCommand(s, kind, input, out, env)
+        end if
+        return finish(s, out, env)
+    end function
+
+    ' The player's sample (watchparty.sync), stamped with when it arrived.
+    function onSample(s as Object, input as Dynamic, env as Object) as Object
+        out = []
+        party = s.party
+        if party = invalid or not util.isObject(input) then return out
+        party.sample = normalizedSample(input, party.sample, env.now)
+        runSync(s, out, env)
+        return finish(s, out, env)
+    end function
+
+    ' The player committed a playback session ({ sessionId, revision }) or
+    ' closed it ({} or invalid). It is attached at once (section 7.3).
+    function onPlaybackSession(s as Object, input as Dynamic, env as Object) as Object
+        out = []
+        party = s.party
+        if party = invalid then return out
+        if not util.isObject(input) or util.text(input.sessionId) = ""
+            party.sample = invalid
+        else
+            party.sample = normalizedSample({ sessionId: input.sessionId, revision: input.revision }, party.sample, env.now)
+        end if
+        runSync(s, out, env)
+        return finish(s, out, env)
+    end function
+
+    ' A request's result envelope (source/api/response.bs).
+    function onHttp(s as Object, tag as String, envelope as Dynamic, env as Object) as Object
+        out = []
+        pending = s.http[tag]
+        if pending = invalid or not util.isObject(envelope) then return out
+        s.http.Delete(tag)
+        purpose = pending.purpose
+        if purpose = "roomCaps" or purpose = "playbackCaps"
+            supportAnswer(s, pending, envelope, out)
+        else if purpose = "create" or purpose = "join" or purpose = "rejoin"
+            entryAnswer(s, pending, envelope, out, env)
+        else if s.party = invalid or pending.engagement <> s.party.engagement
+            ' An answer for a party this device left.
+        else if purpose = "read" or purpose = "ticket"
+            connectAnswer(s, pending, envelope, out, env)
+        else if purpose = "refresh"
+            if envelope.ok then roomAnswer(s, envelope.body, out, env)
+        else if purpose = "suggestions"
+            suggestionsAnswer(s, envelope, out, env)
+        else if purpose = "suggestionChange"
+            suggestionChangeAnswer(s, pending, envelope, out, env)
+        else if purpose = "end"
+            s.busy = ""
+            ' 409: the room had already closed.
+            if envelope.ok or envelope.status = 409
+                result(out, pending.input, true, "")
+                endParty(s, "ended", out)
+            else
+                result(out, pending.input, false, errorKey(envelope))
+            end if
+        else if purpose = "memberState"
+            memberStateAnswer(s, pending, envelope, out)
+        else if purpose = "picker"
+            pickerAnswer(s, pending, envelope, out)
+        else if purpose = "sourceFallback"
+            if envelope.ok then roomAnswer(s, envelope.body, out, env)
+            result(out, pending.input, envelope.ok, errorKey(envelope))
+        else
+            mutationAnswer(s, pending, envelope, out, env)
+        end if
+        return finish(s, out, env)
+    end function
+
+    ' A socket event { kind: "open" | "text" | "close" | "error", epoch,
+    ' text, protocol } (watchparty.socket). Events of an older socket are
+    ' dropped.
+    function onSocket(s as Object, event as Object, env as Object) as Object
+        out = []
+        party = s.party
+        if party = invalid or event.epoch <> party.conn.epoch then return out
+        kind = event.kind
+        if kind = "open"
+            protocol = util.text(event.protocol)
+            ' The server answers with silo.room.v2; any other answer ends
+            ' the attempt (section 2.2). "" is a platform that does not say.
+            if protocol <> "" and protocol <> watchparty.wire.PROTOCOL
+                trace(out, "warn", "room socket chose another protocol", { roomId: party.roomId })
+                endParty(s, "expired", out)
+                return finish(s, out, env)
+            end if
+            party.conn.writable = true
+            party.conn.openedAt = env.now
+            party.conn.state = "connected"
+            party.conn.step = "open"
+            party.connectionSamples = 0
+            party.lastPingAt = invalid
+            party.error = ""
+            trace(out, "info", "room socket open", { roomId: party.roomId, epoch: party.conn.epoch })
+            ' Suggestions are not replayed on a new socket (section 4.5).
+            scheduleSuggestions(party, env.now, 0)
+            pingIfDue(s, out, env)
+            runSync(s, out, env)
+        else if kind = "text"
+            frame(s, watchparty.wire.parseFrame(util.text(event.text)), out, env)
+        else if kind = "close" or kind = "error"
+            ' An error is often followed by a close: the socket ends once.
+            if party.conn.step = "socket" or party.conn.step = "open" then socketEnded(s, out, env)
+        end if
+        return finish(s, out, env)
+    end function
+
+    ' Time passed: pings, retries, suggestion reads, and sync.
+    function onTick(s as Object, env as Object) as Object
+        out = []
+        party = s.party
+        if party <> invalid
+            if party.conn.retryAt <> invalid and env.now >= party.conn.retryAt
+                party.conn.retryAt = invalid
+                connect(s, out)
+            end if
+            pingIfDue(s, out, env)
+            if party.reads.dueAt <> invalid and env.now >= party.reads.dueAt and not party.reads.running then startSuggestionsRead(s, out)
+            runSync(s, out, env)
+        end if
+        return finish(s, out, env)
+    end function
+
+    ' Milliseconds until onTick has work, or invalid (wait for an event).
+    function nextWakeMs(s as Object, env as Object) as Dynamic
+        party = s.party
+        if party = invalid then return invalid
+        wake = invalid
+        if party.conn.retryAt <> invalid then wake = earliest(wake, party.conn.retryAt - env.now)
+        if party.reads.dueAt <> invalid and not party.reads.running then wake = earliest(wake, party.reads.dueAt - env.now)
+        if party.conn.writable
+            interval = watchparty.clock.pingIntervalMs(party.clock, party.connectionSamples)
+            if party.lastPingAt = invalid then return 0
+            wake = earliest(wake, party.lastPingAt + interval - env.now)
+        end if
+        wake = earliest(wake, watchparty.sync.nextWakeMs(party.sync, syncContext(s, env)))
+        if wake <> invalid and wake < 0 then wake = 0
+        return wake
+    end function
+
+    ' ---- Support (section 3)
+
+    sub checkSupport(s as Object, out as Object)
+        support = s.support
+        if support.pending > 0 then return
+        support.pending = 2
+        support.checking = true
+        support.failed = false
+        request(s, out, "roomCaps", api.watchParty.capabilities(support.etag), {})
+        request(s, out, "playbackCaps", api.watchParty.playbackCapabilities(), {})
+    end sub
+
+    ' A failed read keeps the last answer; a 304 keeps the cached document.
+    sub supportAnswer(s as Object, pending as Object, envelope as Object, out as Object)
+        support = s.support
+        support.pending = support.pending - 1
+        if envelope.ok and envelope.status <> 304 and util.isObject(envelope.body)
+            if pending.purpose = "roomCaps"
+                support.room = envelope.body
+                support.etag = util.text(envelope.headers.etag)
+            else
+                support.playback = envelope.body
+            end if
+        else if not envelope.ok
+            support.failed = true
+            trace(out, "warn", "watch party support check failed", { status: envelope.status })
+        end if
+        if support.pending > 0 then return
+        support.checking = false
+        support.evaluation = watchparty.wire.evaluate({ webSocket: s.webSocket, borrowed: s.identity.borrowed, room: support.room, playback: support.playback })
+        if support.failed then notice(out, "page", "watchParty.error.supportCheck", { error: "" }, "")
+    end sub
+
+    function supportView(s as Object) as Object
+        support = s.support
+        evaluation = support.evaluation
+        if evaluation = invalid
+            evaluation = watchparty.wire.evaluate({ webSocket: s.webSocket, borrowed: s.identity.borrowed, room: invalid, playback: invalid })
+        end if
+        state = evaluation.state
+        if support.checking and state = "unknown" then state = "checking"
+        return { state: state, missing: evaluation.missing, features: evaluation.features, checking: support.checking }
+    end function
+
+    function features(s as Object) as Object
+        return supportView(s).features
+    end function
+
+    ' ---- Entering a party (sections 4.2, 4.3, 6.1)
+
+    sub createParty(s as Object, input as Object, out as Object, env as Object)
+        if not canEnter(s, input, out) then return
+        selectionMode = util.text(input.mode)
+        if selectionMode <> "vote" then selectionMode = "host_pick"
+        ' An uncertain create is retried with the same room ID, which the
+        ' server answers with the same room.
+        draft = s.createDraft
+        if draft = invalid or draft.mode <> selectionMode
+            draft = { roomId: LCase(env.uuid()), mode: selectionMode }
+            s.createDraft = draft
+        end if
+        s.busy = "create"
+        request(s, out, "create", api.watchParty.create(draft.roomId, selectionMode), { input: input })
+    end sub
+
+    sub joinParty(s as Object, input as Object, out as Object)
+        if not canEnter(s, input, out) then return
+        code = normalizedCode(util.text(input.code))
+        if code = ""
+            result(out, input, false, "watchParty.error.notFound")
+            return
+        end if
+        s.busy = "join"
+        request(s, out, "join", api.watchParty.join(code), { input: input })
+    end sub
+
+    ' Rejoin sends the stored code and requires the stored room back.
+    sub rejoinParty(s as Object, input as Object, out as Object)
+        if not canEnter(s, input, out) then return
+        entry = watchparty.recent.find(s.recent, s.identity)
+        if entry = invalid
+            result(out, input, false, "watchParty.error.recentElsewhere")
+            return
+        end if
+        s.busy = "rejoin"
+        request(s, out, "rejoin", api.watchParty.join(entry.code), { input: input, roomId: entry.roomId })
+    end sub
+
+    function canEnter(s as Object, input as Object, out as Object) as Boolean
+        if s.party <> invalid
+            result(out, input, false, "watchParty.error.alreadyInParty")
+            return false
+        end if
+        if supportView(s).state <> "available"
+            result(out, input, false, "watchParty.error.unavailable")
+            return false
+        end if
+        return true
+    end function
+
+    sub entryAnswer(s as Object, pending as Object, envelope as Object, out as Object, env as Object)
+        s.busy = ""
+        input = pending.input
+        purpose = pending.purpose
+        body = invalid
+        if envelope.ok then body = watchparty.wire.roomResponse(envelope.body)
+        if body = invalid or s.party <> invalid or (purpose = "rejoin" and body.room.roomId <> pending.roomId)
+            key = errorKey(envelope)
+            if envelope.ok then key = "watchParty.error.generic"
+            if not envelope.ok and envelope.status = 404 and purpose <> "create" then key = "watchParty.error.notFound"
+            if not envelope.ok and envelope.status = 409 then key = "watchParty.ended.ended"
+            if purpose = "create" and not uncertain(envelope) then s.createDraft = invalid
+            ' A rejoin refused for good forgets the recent party.
+            if purpose = "rejoin" and (envelope.ok or watchparty.connection.classify(envelope) <> "retry")
+                s.recent = watchparty.recent.remove(s.recent, s.identity)
+                persist(s, out)
+            end if
+            trace(out, "warn", "could not enter the party", { purpose: purpose, status: envelope.status })
+            result(out, input, false, key)
+            return
+        end if
+        if purpose = "create" then s.createDraft = invalid
+        enter(s, body, out, env)
+        result(out, input, true, "")
+        if purpose = "create" and util.isObject(input.selection) and body.room.selectionMode = "host_pick" and s.party <> invalid
+            selection = input.selection
+            selectTitle(s, { kind: "select", contentId: selection.contentId, fileId: selection.fileId, libraryId: selection.libraryId, title: input.title }, out)
+        end if
+    end sub
+
+    sub enter(s as Object, body as Object, out as Object, env as Object)
+        s.nextTag = s.nextTag + 1
+        s.party = {
+            engagement: s.nextTag,
+            identity: { server: s.identity.server, account: s.identity.account, profile: s.identity.profile },
+            roomId: body.room.roomId,
+            proof: body.proof,
+            held: watchparty.room.holder(),
+            conn: { state: "connecting", step: "idle", epoch: 0, attempt: 0, openedAt: invalid, retryAt: invalid, writable: false, policy: watchparty.connection.create(env.now) },
+            clock: watchparty.clock.create(),
+            connectionSamples: 0,
+            lastPingAt: invalid,
+            sync: watchparty.sync.create(),
+            sample: invalid,
+            votes: watchparty.votes.create(),
+            reads: { running: false, again: false, dueAt: invalid, rows: [], cursors: {}, pages: 0, startedAt: 0, attempts: 0, context: "" },
+            title: { contentId: "", title: "", unavailable: false },
+            selectionPending: false,
+            memberState: { loading: false, contentIds: [], members: [], items: [], errorKey: "" },
+            picker: { loading: false, members: [], continueTogether: [], watchlistUnion: [], errorKey: "" },
+            error: ""
+        }
+        s.dirty.suggestions = true
+        s.dirty.memberState = true
+        s.dirty.picker = true
+        trace(out, "info", "entered the party", { roomId: body.room.roomId })
+        roomAnswer(s, { room: invalid }, out, env, body)
+        if s.party <> invalid then connect(s, out)
+    end sub
+
+    ' ---- The connection (sections 6.1 and 6.4)
+
+    ' Read the room, then a ticket, then open the socket.
+    sub connect(s as Object, out as Object)
+        party = s.party
+        conn = party.conn
+        conn.attempt = conn.attempt + 1
+        conn.step = "read"
+        conn.writable = false
+        conn.openedAt = invalid
+        request(s, out, "read", api.watchParty.read(party.roomId, party.proof), { engagement: party.engagement, attempt: conn.attempt })
+    end sub
+
+    sub connectAnswer(s as Object, pending as Object, envelope as Object, out as Object, env as Object)
+        party = s.party
+        conn = party.conn
+        if pending.attempt <> conn.attempt then return
+        if not envelope.ok
+            failed(s, watchparty.connection.classify(envelope), out, env)
+            return
+        end if
+        if pending.purpose = "read"
+            body = watchparty.wire.roomResponse(envelope.body)
+            if body = invalid
+                failed(s, "expired", out, env)
+                return
+            end if
+            roomAnswer(s, envelope.body, out, env, body)
+            if s.party = invalid then return
+            conn.step = "ticket"
+            request(s, out, "ticket", api.watchParty.ticket(party.roomId, party.proof), { engagement: party.engagement, attempt: conn.attempt })
+            return
+        end if
+        value = watchparty.wire.ticket(envelope.body)
+        url = watchparty.wire.socketUrl(party.identity.server, party.roomId)
+        if value = "" or url = ""
+            failed(s, "expired", out, env)
+            return
+        end if
+        conn.step = "socket"
+        conn.epoch = conn.epoch + 1
+        out.Push({ kind: "open", epoch: conn.epoch, url: url, protocols: watchparty.wire.protocols(value) })
+    end sub
+
+    ' A read or ticket failed: "ended", "expired", "identity", or "retry".
+    sub failed(s as Object, classified as String, out as Object, env as Object)
+        party = s.party
+        trace(out, "warn", "room connection attempt failed", { roomId: party.roomId, outcome: classified })
+        if classified = "ended" or classified = "expired"
+            endParty(s, classified, out)
+        else if classified = "identity"
+            leaveParty(s, out)
+        else
+            retry(s, invalid, out, env)
+        end if
+    end sub
+
+    ' The socket closed or failed. A pending command dies with it.
+    sub socketEnded(s as Object, out as Object, env as Object)
+        party = s.party
+        conn = party.conn
+        openedAt = conn.openedAt
+        conn.writable = false
+        conn.openedAt = invalid
+        conn.step = "idle"
+        watchparty.sync.socketClosed(party.sync)
+        party.reads.running = false
+        retry(s, openedAt, out, env)
+    end sub
+
+    sub retry(s as Object, openedAt as Dynamic, out as Object, env as Object)
+        party = s.party
+        decision = watchparty.connection.closed(party.conn.policy, openedAt, env.now, env.random())
+        trace(out, "info", "room socket ended", { roomId: party.roomId, outcome: decision.kind, delayMs: decision.delayMs })
+        if decision.kind = "giveUp"
+            endParty(s, "lost", out)
+        else if decision.kind = "now"
+            connect(s, out)
+        else
+            party.conn.state = "reconnecting"
+            party.conn.retryAt = env.now + decision.delayMs
+        end if
+    end sub
+
+    ' One parsed frame (watchparty.wire.parseFrame).
+    sub frame(s as Object, parsed as Dynamic, out as Object, env as Object)
+        if parsed = invalid then return
+        party = s.party
+        kind = parsed.type
+        if kind = "snapshot"
+            acceptRoom(s, parsed.room, true, out, env)
+        else if kind = "command"
+            cmd = parsed.command
+            trace(out, "info", "room command", { roomId: party.roomId, commandId: cmd.commandId, action: cmd.action, revision: cmd.selectionRevision, state: cmd.playbackState })
+            out.Append(watchparty.sync.accept(party.sync, cmd, syncContext(s, env)))
+            runSync(s, out, env)
+        else if kind = "pong"
+            if watchparty.clock.record(party.clock, parsed.clientSentAtMs, parsed.serverReceivedAtMs, parsed.serverSentAtMs, env.wallMs) then party.connectionSamples = party.connectionSamples + 1
+            runSync(s, out, env)
+        else if kind = "suggestions"
+            room = party.held.room
+            for each row in parsed.items
+                if room <> invalid and row.roomId <> room.roomId then return
+            end for
+            watchparty.votes.receive(party.votes, parsed.items)
+            s.dirty.suggestions = true
+            scheduleSuggestions(party, env.now, SUGGESTION_READ_DELAY_MS)
+        else if kind = "closed"
+            endParty(s, "ended", out)
+        else if kind = "replaced"
+            endParty(s, "replaced", out)
+        else if kind = "error"
+            ' A refusal before the attach is confirmed most likely refused
+            ' the attach and explains why the party is not syncing; later
+            ' ones give the viewer nothing to act on (section 6.3).
+            view = watchparty.sync.view(party.sync, syncContext(s, env))
+            if parsed.code = "bad_request" and view.attached
+                trace(out, "info", "room refused a message", { code: parsed.code })
+            else
+                party.error = parsed.message
+                notice(out, "lobby", "", {}, parsed.message)
+            end if
+        else if kind = "malformed"
+            trace(out, "warn", "malformed room frame", { frame: parsed.frame })
+            if parsed.frame = "snapshot" or parsed.frame = "transport_command"
+                request(s, out, "refresh", api.watchParty.read(party.roomId, party.proof), { engagement: party.engagement })
+            end if
+        end if
+    end sub
+
+    sub pingIfDue(s as Object, out as Object, env as Object)
+        party = s.party
+        if party = invalid or not party.conn.writable then return
+        interval = watchparty.clock.pingIntervalMs(party.clock, party.connectionSamples)
+        if party.lastPingAt <> invalid and env.now - party.lastPingAt < interval then return
+        party.lastPingAt = env.now
+        out.Push({ kind: "send", text: watchparty.wire.ping(env.wallMs) })
+    end sub
+
+    ' ---- Snapshots (sections 5 and 6.2)
+
+    ' A room route's answer: renews the proof and offers the snapshot.
+    ' parsed is the body's roomResponse when the caller has it.
+    sub roomAnswer(s as Object, body as Dynamic, out as Object, env as Object, parsed = invalid as Dynamic)
+        if parsed = invalid then parsed = watchparty.wire.roomResponse(body)
+        if parsed = invalid or s.party = invalid then return
+        if parsed.proof <> "" then s.party.proof = parsed.proof
+        acceptRoom(s, parsed.room, false, out, env)
+    end sub
+
+    sub acceptRoom(s as Object, incoming as Object, fromSocket as Boolean, out as Object, env as Object)
+        party = s.party
+        previous = party.held.room
+        if not watchparty.room.accept(party.held, incoming, fromSocket) then return
+        if incoming.phase = "ended"
+            endParty(s, "ended", out)
+            return
+        end if
+        if previous = invalid or previous.selectedContentId <> incoming.selectedContentId
+            if party.title.contentId <> incoming.selectedContentId then party.title = { contentId: incoming.selectedContentId, title: "", unavailable: false }
+        end if
+        if previous <> invalid and watchparty.room.isNewEpoch(previous, incoming)
+            trace(out, "info", "room epoch", { roomId: incoming.roomId, revision: incoming.selectionRevision, phase: incoming.phase })
+        end if
+        rememberRecent(s, out, env)
+        runSync(s, out, env)
+    end sub
+
+    ' The recent party for this identity, written when it changes or hourly.
+    sub rememberRecent(s as Object, out as Object, env as Object)
+        party = s.party
+        room = party.held.room
+        if room = invalid or room.code = "" then return
+        title = ""
+        if party.title.contentId = room.selectedContentId then title = party.title.title
+        put = watchparty.recent.put(s.recent, party.identity, room.roomId, room.code, title, false, wallSeconds(env))
+        s.recent = put.entries
+        if put.write then persist(s, out)
+    end sub
+
+    ' ---- Leaving and ending (section 4.11)
+
+    sub leaveParty(s as Object, out as Object)
+        party = s.party
+        if party = invalid then return
+        out.Push({ kind: "close" })
+        trace(out, "info", "left the party", { roomId: party.roomId })
+        s.party = invalid
+        s.connection = "idle"
+        s.busy = ""
+        s.suggestDraft = invalid
+        s.dirty.suggestions = true
+        s.dirty.memberState = true
+        s.dirty.picker = true
+        for each tag in s.http.Keys()
+            if s.http[tag].engagement <> invalid then s.http.Delete(tag)
+        end for
+    end sub
+
+    sub endParty(s as Object, reason as String, out as Object)
+        party = s.party
+        if party = invalid then return
+        ending = watchparty.connection.ending(reason)
+        owner = party.identity
+        room = party.held.room
+        if ending.forgetRecent
+            s.recent = watchparty.recent.remove(s.recent, owner)
+            persist(s, out)
+        else if reason = "replaced" and room <> invalid
+            ' Rejoin becomes "Continue here".
+            entry = watchparty.recent.find(s.recent, owner)
+            title = ""
+            if entry <> invalid then title = entry.title
+            s.recent = watchparty.recent.put(s.recent, owner, room.roomId, room.code, title, true, entryTime(entry)).entries
+            persist(s, out)
+        end if
+        trace(out, "info", "the party ended", { roomId: party.roomId, reason: reason })
+        leaveParty(s, out)
+        s.connection = "ended"
+        out.Push({ kind: "publish", field: "ended", value: ending })
+    end sub
+
+    ' ---- Party commands
+
+    sub partyCommand(s as Object, kind as String, input as Object, out as Object, env as Object)
+        party = s.party
+        room = party.held.room
+        caps = features(s)
+        ' The host's own routes; the server checks too (section 5).
+        if Instr(1, HOST_KINDS, "|" + kind + "|") > 0 and (room = invalid or not room.selfCanManageRoom)
+            result(out, input, false, "watchParty.error.forbidden")
+            return
+        end if
+        if kind = "end"
+            s.busy = "end"
+            request(s, out, "end", api.watchParty.close(party.roomId, party.proof), { engagement: party.engagement, input: input })
+        else if kind = "select" or kind = "stage" or kind = "playNow"
+            selectTitle(s, input, out)
+        else if kind = "start"
+            startParty(s, input, out)
+        else if kind = "stop"
+            if not caps.stopPlayback or room.phase <> "playing"
+                result(out, input, false, "watchParty.error.forbidden")
+                return
+            end if
+            mutate(s, input, api.watchParty.stop(party.roomId, party.proof), out)
+        else if kind = "policy"
+            mutate(s, input, api.watchParty.policy(party.roomId, party.proof, util.text(input.policy)), out)
+        else if kind = "mode"
+            if not caps.selectionModeSwitch or room.phase <> "lobby"
+                result(out, input, false, "watchParty.error.forbidden")
+                return
+            end if
+            mutate(s, input, api.watchParty.mode(party.roomId, party.proof, util.text(input.mode)), out)
+        else if kind = "promote"
+            promoteSuggestion(s, input, out)
+        else if kind = "suggest"
+            suggestTitle(s, input, out, env)
+        else if kind = "vote" or kind = "unvote" or kind = "removeSuggestion"
+            changeSuggestion(s, kind, input, out)
+        else if kind = "memberState"
+            queryMemberState(s, input, out)
+        else if kind = "picker"
+            if not caps.picker
+                result(out, input, false, "watchParty.error.unavailable")
+                return
+            end if
+            party.picker.loading = true
+            party.picker.errorKey = ""
+            s.dirty.picker = true
+            request(s, out, "picker", api.watchParty.picker(party.roomId, party.proof), { engagement: party.engagement, input: input })
+        else if kind = "lobbyReady"
+            if room = invalid or room.phase <> "lobby" or not caps.lobbyReady or not party.conn.writable
+                result(out, input, false, "watchParty.connection.reconnecting")
+                return
+            end if
+            out.Push({ kind: "send", text: watchparty.wire.lobbyReady(util.isTrue(input.ready)) })
+            result(out, input, true, "")
+        else if kind = "transportRequest"
+            transport(s, input, out, env)
+        else if kind = "refreshSuggestions"
+            scheduleSuggestions(party, env.now, 0)
+        else if kind = "sourceFallback"
+            fallback(s, input, out)
+        else if kind = "clearError"
+            party.error = ""
+        else
+            result(out, input, false, "watchParty.error.generic")
+        end if
+    end sub
+
+    ' A host's pick (section 4.1): staged in a lobby that supports it,
+    ' else played for everyone. "stage" and "playNow" force one or the
+    ' other. title, when given, is remembered for Rejoin.
+    sub selectTitle(s as Object, input as Object, out as Object)
+        party = s.party
+        room = party.held.room
+        kind = util.text(input.kind)
+        if room = invalid or not room.selfCanManageRoom or room.selectionMode <> "host_pick"
+            result(out, input, false, "watchParty.error.forbidden")
+            return
+        end if
+        selection = { contentId: util.text(input.contentId), fileId: util.text(input.fileId), libraryId: util.text(input.libraryId) }
+        if selection.contentId = ""
+            result(out, input, false, "watchParty.error.generic")
+            return
+        end if
+        stageIt = kind = "stage" or (kind = "select" and room.phase = "lobby" and features(s).stagedSelection)
+        if util.text(input.title) <> "" then party.title = { contentId: selection.contentId, title: input.title, unavailable: false }
+        party.selectionPending = true
+        if stageIt
+            mutate(s, input, api.watchParty.stage(party.roomId, party.proof, selection), out)
+        else
+            mutate(s, input, api.watchParty.selectNow(party.roomId, party.proof, selection), out)
+        end if
+    end sub
+
+    ' Start: a vote room promotes its winner; a host-pick room starts the
+    ' staged pick. Neither is ever sent twice.
+    sub startParty(s as Object, input as Object, out as Object)
+        party = s.party
+        room = party.held.room
+        ctx = lobbyContext(s)
+        if not watchparty.lobby.canStart(room, ctx)
+            result(out, input, false, "watchParty.error.forbidden")
+            return
+        end if
+        if room.selectionMode = "vote"
+            mutate(s, input, api.watchParty.promote(party.roomId, party.proof, ctx.winner.id), out)
+        else
+            mutate(s, input, api.watchParty.start(party.roomId, party.proof), out)
+        end if
+    end sub
+
+    sub promoteSuggestion(s as Object, input as Object, out as Object)
+        party = s.party
+        row = watchparty.votes.find(party.votes, util.text(input.suggestionId))
+        if row = invalid or not watchparty.lobby.canPromote(row, party.held.room, lobbyContext(s))
+            result(out, input, false, "watchParty.error.forbidden")
+            return
+        end if
+        mutate(s, input, api.watchParty.promote(party.roomId, party.proof, row.id), out)
+    end sub
+
+    ' A host mutation whose answer is the room and a renewed proof.
+    sub mutate(s as Object, input as Object, req as Object, out as Object)
+        s.busy = util.text(input.kind)
+        request(s, out, "mutation", req, { engagement: s.party.engagement, input: input })
+    end sub
+
+    sub mutationAnswer(s as Object, pending as Object, envelope as Object, out as Object, env as Object)
+        s.busy = ""
+        party = s.party
+        kind = util.text(pending.input.kind)
+        if kind = "select" or kind = "stage" or kind = "playNow" then party.selectionPending = false
+        if envelope.ok
+            roomAnswer(s, envelope.body, out, env)
+            result(out, pending.input, true, "")
+            return
+        end if
+        trace(out, "warn", "room change failed", { kind: kind, status: envelope.status })
+        if pending.request.once = true and uncertain(envelope)
+            ' Never sent again: read the room back to learn what happened.
+            request(s, out, "refresh", api.watchParty.read(party.roomId, party.proof), { engagement: party.engagement })
+        end if
+        result(out, pending.input, false, errorKey(envelope))
+    end sub
+
+    ' ---- Suggestions (sections 4.5 and 4.6)
+
+    sub suggestTitle(s as Object, input as Object, out as Object, env as Object)
+        party = s.party
+        room = party.held.room
+        if room = invalid or room.phase <> "lobby"
+            result(out, input, false, "watchParty.entry.lobbyOnly")
+            return
+        end if
+        contentId = util.text(input.contentId)
+        if contentId = ""
+            result(out, input, false, "watchParty.error.generic")
+            return
+        end if
+        ' An uncertain suggestion is retried with its ID; the server keeps
+        ' one row per ID.
+        draft = s.suggestDraft
+        if draft = invalid or draft.contentId <> contentId or draft.roomId <> party.roomId
+            draft = { contentId: contentId, roomId: party.roomId, suggestionId: LCase(env.uuid()) }
+            s.suggestDraft = draft
+        end if
+        contentType = util.text(input.contentType)
+        if contentType <> "episode" then contentType = "movie"
+        body = { suggestionId: draft.suggestionId, contentId: contentId, contentType: contentType, title: util.text(input.title), subtitle: input.subtitle, posterUrl: input.posterUrl, note: input.note }
+        s.busy = "suggest"
+        watchparty.votes.invalidate(party.votes)
+        request(s, out, "suggestionChange", api.watchParty.suggest(party.roomId, party.proof, body), { engagement: party.engagement, input: input })
+    end sub
+
+    sub changeSuggestion(s as Object, kind as String, input as Object, out as Object)
+        party = s.party
+        room = party.held.room
+        row = watchparty.votes.find(party.votes, util.text(input.suggestionId))
+        if row = invalid or room = invalid or room.phase <> "lobby"
+            result(out, input, false, "watchParty.error.generic")
+            return
+        end if
+        if kind = "removeSuggestion"
+            if not watchparty.lobby.canRemove(row, room)
+                result(out, input, false, "watchParty.error.forbidden")
+                return
+            end if
+            req = api.watchParty.removeSuggestion(party.roomId, party.proof, row.id)
+        else
+            ' A vote waits while the socket is down (section 4.5).
+            if not party.conn.writable
+                result(out, input, false, "watchParty.connection.reconnecting")
+                return
+            end if
+            req = api.watchParty.vote(party.roomId, party.proof, row.id, kind = "vote")
+        end if
+        s.busy = kind
+        watchparty.votes.invalidate(party.votes)
+        request(s, out, "suggestionChange", req, { engagement: party.engagement, input: input })
+    end sub
+
+    ' A change's answer: the list is read again either way, without
+    ' replaying the change (section 4.5).
+    sub suggestionChangeAnswer(s as Object, pending as Object, envelope as Object, out as Object, env as Object)
+        s.busy = ""
+        party = s.party
+        kind = util.text(pending.input.kind)
+        if envelope.ok
+            if kind = "suggest" then s.suggestDraft = invalid
+            scheduleSuggestions(party, env.now, 0, "saved")
+            result(out, pending.input, true, "")
+            return
+        end if
+        if kind = "suggest" and not uncertain(envelope) then s.suggestDraft = invalid
+        key = errorKey(envelope)
+        if kind = "suggest" and envelope.status = 409 then key = "watchParty.error.full"
+        scheduleSuggestions(party, env.now, 0)
+        result(out, pending.input, false, key)
+    end sub
+
+    ' Reads the list soon: delayMs from now, or after the read running.
+    ' context "saved" words a failure as a saved change.
+    sub scheduleSuggestions(party as Object, now as Integer, delayMs as Integer, context = "" as String)
+        reads = party.reads
+        if context <> "" then reads.context = context
+        if reads.running
+            reads.again = true
+            return
+        end if
+        due = now + delayMs
+        if reads.dueAt = invalid or due < reads.dueAt then reads.dueAt = due
+        reads.attempts = 0
+    end sub
+
+    sub startSuggestionsRead(s as Object, out as Object)
+        party = s.party
+        reads = party.reads
+        reads.dueAt = invalid
+        reads.running = true
+        reads.again = false
+        reads.rows = []
+        reads.cursors = {}
+        reads.pages = 0
+        reads.startedAt = party.votes.revision
+        request(s, out, "suggestions", api.watchParty.suggestions(party.roomId, party.proof), { engagement: party.engagement })
+    end sub
+
+    sub suggestionsAnswer(s as Object, envelope as Object, out as Object, env as Object)
+        party = s.party
+        reads = party.reads
+        if not reads.running then return
+        page = invalid
+        if envelope.ok then page = watchparty.wire.suggestionsPage(envelope.body)
+        if page = invalid
+            reads.running = false
+            key = "watchParty.error.suggestionsRefresh"
+            if reads.context = "saved" then key = "watchParty.error.suggestionsSaved"
+            reads.context = ""
+            notice(out, "lobby", key, { error: "" }, "")
+            if reads.again then scheduleSuggestions(party, env.now, SUGGESTION_READ_DELAY_MS)
+            return
+        end if
+        reads.rows.Append(page.items)
+        reads.pages = reads.pages + 1
+        if page.hasMore and not reads.cursors.DoesExist(page.nextCursor) and reads.pages < MAX_SUGGESTION_PAGES
+            reads.cursors[page.nextCursor] = true
+            request(s, out, "suggestions", api.watchParty.suggestions(party.roomId, party.proof, page.nextCursor), { engagement: party.engagement })
+            return
+        end if
+        reads.running = false
+        if watchparty.votes.reconcile(party.votes, reads.rows, reads.startedAt)
+            reads.context = ""
+            s.dirty.suggestions = true
+            if reads.again then scheduleSuggestions(party, env.now, SUGGESTION_READ_DELAY_MS)
+            return
+        end if
+        ' A frame or a change overtook the read: read again, a few times.
+        reads.attempts = reads.attempts + 1
+        if reads.attempts < SUGGESTION_READ_ATTEMPTS or reads.again
+            attempts = reads.attempts
+            scheduleSuggestions(party, env.now, SUGGESTION_READ_DELAY_MS)
+            reads.attempts = attempts
+        end if
+    end sub
+
+    function suggestionsView(s as Object) as Object
+        party = s.party
+        if party = invalid then return { items: [], winnerId: "", loading: false }
+        best = watchparty.lobby.winner(party.votes.rows)
+        winnerId = ""
+        if best <> invalid then winnerId = best.id
+        return { items: party.votes.rows, winnerId: winnerId, loading: party.reads.running }
+    end function
+
+    ' ---- Picker and Who's Seen It (section 4.8)
+
+    sub queryMemberState(s as Object, input as Object, out as Object)
+        party = s.party
+        caps = features(s)
+        if not caps.memberState
+            result(out, input, false, "watchParty.error.unavailable")
+            return
+        end if
+        ids = watchparty.lobby.memberStateIds(input.contentIds, caps.maxMemberStateIds)
+        party.memberState = { loading: ids.Count() > 0, contentIds: ids, members: [], items: [], errorKey: "" }
+        s.dirty.memberState = true
+        if ids.Count() = 0
+            result(out, input, true, "")
+            return
+        end if
+        request(s, out, "memberState", api.watchParty.memberState(party.roomId, party.proof, ids), { engagement: party.engagement, input: input, contentIds: ids })
+    end sub
+
+    sub memberStateAnswer(s as Object, pending as Object, envelope as Object, out as Object)
+        state = s.party.memberState
+        if FormatJson(state.contentIds) <> FormatJson(pending.contentIds) then return
+        state.loading = false
+        s.dirty.memberState = true
+        if envelope.ok and util.isObject(envelope.body)
+            state.members = members(envelope.body.members)
+            state.items = memberItems(envelope.body.items)
+            result(out, pending.input, true, "")
+        else
+            state.errorKey = "watchParty.whoSeen.error"
+            result(out, pending.input, false, errorKey(envelope))
+        end if
+    end sub
+
+    sub pickerAnswer(s as Object, pending as Object, envelope as Object, out as Object)
+        picker = s.party.picker
+        picker.loading = false
+        s.dirty.picker = true
+        if envelope.ok and util.isObject(envelope.body)
+            body = envelope.body
+            picker.members = members(body.members)
+            picker.continueTogether = pickerRows(body.continue_together)
+            picker.watchlistUnion = pickerRows(body.watchlist_union)
+            result(out, pending.input, true, "")
+        else
+            picker.errorKey = "watchParty.error.generic"
+            result(out, pending.input, false, errorKey(envelope))
+        end if
+    end sub
+
+    ' Members of a picker or member-state answer, IDs as strings.
+    function members(list as Dynamic) as Object
+        out = []
+        if type(list) <> "roArray" then return out
+        for each raw in list
+            if util.isObject(raw) then out.Push(watchparty.wire.member(raw))
+        end for
+        return out
+    end function
+
+    ' Member-state items: { contentId, members: [{ userId, profileId,
+    ' state, positionSeconds, durationSeconds, onWatchlist }] }.
+    function memberItems(list as Dynamic) as Object
+        out = []
+        if type(list) <> "roArray" then return out
+        for each raw in list
+            if util.isObject(raw)
+                rows = []
+                if type(raw.members) = "roArray"
+                    for each entry in raw.members
+                        if util.isObject(entry) then rows.Push({ userId: watchparty.wire.idText(entry.user_id), profileId: watchparty.wire.idText(entry.profile_id), state: util.text(entry.state), positionSeconds: entry.position_seconds, durationSeconds: entry.duration_seconds, onWatchlist: util.isTrue(entry.on_watchlist) })
+                    end for
+                end if
+                out.Push({ contentId: watchparty.wire.idText(raw.content_id), members: rows })
+            end if
+        end for
+        return out
+    end function
+
+    ' Picker rows: { item (the catalog card body, for the picker's mapping),
+    ' members, nextUp }.
+    function pickerRows(list as Dynamic) as Object
+        out = []
+        if type(list) <> "roArray" then return out
+        for each raw in list
+            if util.isObject(raw) and util.isObject(raw.item)
+                nextUp = invalid
+                if util.isObject(raw.next_up) then nextUp = { contentId: watchparty.wire.idText(raw.next_up.content_id), seasonNumber: raw.next_up.season_number, episodeNumber: raw.next_up.episode_number, title: util.text(raw.next_up.title), memberCount: raw.next_up.member_count }
+                out.Push({ item: raw.item, members: members(raw.members), nextUp: nextUp })
+            end if
+        end for
+        return out
+    end function
+
+    ' ---- Playback (sections 7 and 8)
+
+    sub transport(s as Object, input as Object, out as Object, env as Object)
+        party = s.party
+        action = util.text(input.action)
+        position = input.position
+        answer = watchparty.sync.request(party.sync, syncContext(s, env), action, position, util.isTrue(input.paused))
+        out.Append(answer.actions)
+        if answer.result = "denied"
+            key = "watchParty.player.hostOnlyPlayPause"
+            if action = "seek" then key = "watchParty.player.hostOnlySeek"
+            notice(out, "player", key, {}, "")
+        else if answer.result = "reconnecting"
+            notice(out, "player", "watchParty.player.reconnecting", {}, "")
+        end if
+        result(out, input, answer.result = "sent", answer.result)
+    end sub
+
+    ' Source fallback after a start refused for one of the server's
+    ' reasons, for the current revision (section 8.3).
+    sub fallback(s as Object, input as Object, out as Object)
+        party = s.party
+        room = party.held.room
+        reason = util.text(input.reason)
+        if not features(s).sourceFallback or room = invalid or Instr(1, FALLBACK_REASONS, "|" + reason + "|") = 0 or reason = ""
+            result(out, input, false, "watchParty.player.versionUnavailable")
+            return
+        end if
+        if not util.isNumber(input.selectionRevision) or input.selectionRevision <> room.selectionRevision
+            result(out, input, false, "watchParty.player.versionUnavailable")
+            return
+        end if
+        request(s, out, "sourceFallback", api.watchParty.sourceFallback(party.roomId, party.proof, room.selectionRevision, util.text(input.failedFileId), reason), { engagement: party.engagement, input: input })
+    end sub
+
+    sub runSync(s as Object, out as Object, env as Object)
+        party = s.party
+        if party = invalid then return
+        actions = watchparty.sync.advance(party.sync, syncContext(s, env))
+        for each action in actions
+            if action.kind = "player"
+                cmd = action.command
+                trace(out, "debug", "player command", { roomId: party.roomId, commandId: cmd.commandId, seek: cmd.seek, reload: cmd.reload, playing: cmd.playing })
+            end if
+            out.Push(action)
+        end for
+    end sub
+
+    function syncContext(s as Object, env as Object) as Object
+        party = s.party
+        return { now: env.now, serverNow: watchparty.clock.serverMs(party.clock, env.wallMs), room: party.held.room, sample: party.sample, writable: party.conn.writable }
+    end function
+
+    function normalizedSample(input as Object, previous as Dynamic, now as Integer) as Object
+        out = { sessionId: "", revision: -1, position: 0, duration: 0, playing: false, wantsPlay: false, playable: false, stalled: false, seeking: false, atEnd: false, planInPlace: true, commandSeq: 0 }
+        ' A sample leaving members out keeps their last value, but only
+        ' within one playback session.
+        if util.isObject(previous) and (not input.DoesExist("sessionId") or util.text(input.sessionId) = previous.sessionId) then out.Append(previous)
+        for each name in ["sessionId"]
+            if input.DoesExist(name) then out[name] = util.text(input[name])
+        end for
+        for each name in ["revision", "position", "duration", "commandSeq"]
+            if util.isNumber(input[name]) then out[name] = input[name]
+        end for
+        for each name in ["playing", "wantsPlay", "playable", "stalled", "seeking", "atEnd", "planInPlace"]
+            if util.isBoolean(input[name]) then out[name] = input[name]
+        end for
+        out.receivedAt = now
+        return out
+    end function
+
+    ' ---- Titles
+
+    ' The screens read the selected title's catalog item and tell the room
+    ' its name, or that this profile cannot see it (section 4.4).
+    sub noteTitle(s as Object, input as Object, out as Object, env as Object)
+        party = s.party
+        if party = invalid then return
+        contentId = util.text(input.contentId)
+        room = party.held.room
+        if room = invalid or room.selectedContentId <> contentId then return
+        party.title = { contentId: contentId, title: util.text(input.title), unavailable: util.isTrue(input.unavailable) }
+        rememberRecent(s, out, env)
+    end sub
+
+    ' ---- Outputs
+
+    ' Appends the publish decisions for every output that changed, merges a
+    ' batch's player commands into one, and returns the list.
+    function finish(s as Object, out as Object, env as Object) as Object
+        merged = []
+        playerCommand = invalid
+        for each action in out
+            if action.kind = "player"
+                if playerCommand = invalid
+                    playerCommand = action.command
+                else
+                    playerCommand.seq = action.command.seq
+                    playerCommand.commandId = action.command.commandId
+                    if action.command.seek <> invalid
+                        playerCommand.seek = action.command.seek
+                        playerCommand.reload = action.command.reload
+                    end if
+                    if action.command.playing <> invalid then playerCommand.playing = action.command.playing
+                end if
+            else
+                merged.Push(action)
+            end if
+        end for
+        if playerCommand <> invalid then merged.Push({ kind: "publish", field: "playerCommand", value: playerCommand })
+        party = s.party
+        if party <> invalid then s.connection = party.conn.state
+        if party = invalid and s.connection <> "ended" then s.connection = "idle"
+        room = {}
+        if party <> invalid and party.held.room <> invalid then room = party.held.room
+        changed(s, merged, "room", room)
+        changed(s, merged, "connection", { state: s.connection })
+        changed(s, merged, "support", supportView(s))
+        changed(s, merged, "busy", { kind: s.busy })
+        changed(s, merged, "recent", recentView(s))
+        if party <> invalid
+            view = watchparty.sync.view(party.sync, syncContext(s, env))
+            view.selectionPending = party.selectionPending
+            view.title = party.title
+            changed(s, merged, "sync", view)
+        else
+            changed(s, merged, "sync", {})
+        end if
+        if util.isTrue(s.dirty.suggestions) then merged.Push({ kind: "publish", field: "suggestions", value: suggestionsView(s) })
+        if util.isTrue(s.dirty.memberState) then merged.Push({ kind: "publish", field: "memberState", value: memberStateView(s) })
+        if util.isTrue(s.dirty.picker) then merged.Push({ kind: "publish", field: "picker", value: pickerView(s) })
+        s.dirty = {}
+        return merged
+    end function
+
+    sub changed(s as Object, out as Object, field as String, value as Object)
+        text = FormatJson(value)
+        if util.text(s.published[field]) = text then return
+        s.published[field] = text
+        out.Push({ kind: "publish", field: field, value: value })
+    end sub
+
+    function recentView(s as Object) as Object
+        entry = watchparty.recent.find(s.recent, s.identity)
+        if entry = invalid or s.party <> invalid then return {}
+        return { roomId: entry.roomId, code: entry.code, title: entry.title, replaced: entry.replaced }
+    end function
+
+    function memberStateView(s as Object) as Object
+        if s.party = invalid then return { loading: false, contentIds: [], members: [], items: [], errorKey: "" }
+        return s.party.memberState
+    end function
+
+    function pickerView(s as Object) as Object
+        if s.party = invalid then return { loading: false, members: [], continueTogether: [], watchlistUnion: [], errorKey: "" }
+        return s.party.picker
+    end function
+
+    ' What the lobby rules read (watchparty.lobby's ctx), from the session.
+    function lobbyContext(s as Object) as Object
+        party = s.party
+        return { features: features(s), winner: watchparty.lobby.winner(party.votes.rows), suggestionCount: party.votes.rows.Count(), itemTitle: party.title.title, selectionUnavailable: party.title.unavailable, selectionPending: party.selectionPending, playbackEnded: false, connection: party.conn.state, error: party.error }
+    end function
+
+    ' ---- Helpers
+
+    sub request(s as Object, out as Object, purpose as String, req as Object, extra as Object)
+        s.nextTag = s.nextTag + 1
+        tag = "wp" + s.nextTag.ToStr()
+        pending = { purpose: purpose, request: req, engagement: invalid }
+        pending.Append(extra)
+        s.http[tag] = pending
+        out.Push({ kind: "http", tag: tag, request: req })
+    end sub
+
+    sub result(out as Object, input as Dynamic, ok as Boolean, key as String)
+        kind = ""
+        tag = ""
+        if util.isObject(input)
+            kind = util.text(input.kind)
+            tag = util.text(input.tag)
+        end if
+        errorText = key
+        if ok then errorText = ""
+        out.Push({ kind: "publish", field: "result", value: { kind: kind, tag: tag, ok: ok, errorKey: errorText, detail: key } })
+    end sub
+
+    sub notice(out as Object, scope as String, key as String, values as Object, text as String)
+        out.Push({ kind: "publish", field: "notice", value: { scope: scope, key: key, values: values, text: text } })
+    end sub
+
+    sub trace(out as Object, level as String, message as String, fields as Object)
+        out.Push({ kind: "log", level: level, message: message, fields: fields })
+    end sub
+
+    sub persist(s as Object, out as Object)
+        out.Push({ kind: "persist", text: watchparty.recent.encode(s.recent) })
+    end sub
+
+    ' Whether a failed request may have reached the server: no answer, or
+    ' a gateway's.
+    function uncertain(envelope as Object) as Boolean
+        return envelope.status = 0 or envelope.status >= 500
+    end function
+
+    ' The viewer-facing key for a failed request, by status (spec 6.4:
+    ' never the Problem's detail).
+    function errorKey(envelope as Object) as String
+        if envelope.ok then return ""
+        status = envelope.status
+        if status = 0 then return "watchParty.error.network"
+        if status = 403 then return "watchParty.error.forbidden"
+        return "watchParty.error.generic"
+    end function
+
+    ' A typed code: uppercase, spaces and dashes removed.
+    function normalizedCode(text as String) as String
+        out = ""
+        for each part in UCase(text.Trim()).Split(" ")
+            out = out + part
+        end for
+        return out.Replace("-", "")
+    end function
+
+    function wallSeconds(env as Object) as Integer
+        return Int(env.wallMs / 1000#)
+    end function
+
+    function entryTime(entry as Dynamic) as Integer
+        if entry = invalid then return 1
+        return entry.at
+    end function
+
+    function earliest(a as Dynamic, b as Dynamic) as Dynamic
+        if a = invalid then return b
+        if b = invalid or a < b then return a
+        return b
+    end function
+end namespace

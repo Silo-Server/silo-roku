@@ -1,0 +1,258 @@
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/recent.bs"
+import "pkg:/source/watchparty/session.bs"
+import "pkg:/source/watchparty/socket.bs"
+import "pkg:/source/watchparty/time.bs"
+
+' Watch Party's room Task (docs/watch-party.md sections 2 to 8 and 11). One
+' loop waits on one port for its input fields, the room socket's events,
+' and the bridge's HTTP answers, until the next due event (a command's
+' execute_at, a report, a ping, a retry). The rules are
+' source/watchparty/session.bs and the modules it uses; this file only
+' runs their decisions: HTTP through the bridge, the socket through
+' source/watchparty/socket.bs, the recent party's registry section, logs,
+' and output fields. JSON is parsed here and in ApiTask, never on the
+' render thread. Nothing here logs a code, ticket, or room proof.
+'
+' FIELD CONTRACT. AppScene creates one RoomTask and one RoomApiBridge
+' (bridge.task = roomTask) for the app run, runs the Task, and is the only
+' node that sets or observes its fields; screens and the player go through
+' AppScene. Every output is set only when it changes, except the one-shot
+' ones (alwaysNotify), which are set once per event; an observer reads
+' event.getData(), since the Task may set a field again before the render
+' thread runs.
+'
+' Inputs
+'   identity      { server, account, profile, borrowed }: the session's
+'                 base URL, account ID, profile ID ("" when none), and
+'                 whether it is a SiloControl handoff's borrowed identity.
+'                 Set on every session change. A change leaves the party
+'                 silently; a sign-out forgets that account's recent
+'                 parties; a profile sign-in starts a support check.
+'   command       { kind, tag?, ... }, one per set; tag comes back in result:
+'     checkSupport                       read both capability documents
+'     create { mode: "host_pick"|"vote", selection?: { contentId, fileId,
+'              libraryId }, title? }     a new room (a fresh UUID, reused
+'                                        after an uncertain answer); with a
+'                                        selection, a host-pick room stages
+'                                        or plays it next
+'     join { code }                      the 8-character code (spaces and
+'                                        dashes ignored)
+'     rejoin                             the recent party's code; refused
+'                                        for good forgets it
+'     leave                              close the socket and forget the
+'                                        room (the recent party stays)
+'     end                                DELETE the room (host)
+'     select { contentId, fileId?, libraryId?, title? }  the host's pick:
+'                                        staged in a lobby with
+'                                        staged_selection, else played
+'     stage { ... } / playNow { ... }    force one or the other
+'     start                              start the staged pick, or promote
+'                                        the vote winner; never resent
+'     stop                               back to the lobby (host)
+'     policy { policy: "host_only"|"guest_play_pause" }      (host)
+'     mode { mode: "host_pick"|"vote" }  lobby only (host)
+'     promote { suggestionId }           (host); never resent
+'     suggest { contentId, contentType: "movie"|"episode", title,
+'               subtitle?, posterUrl?, note? }  lobby only
+'     vote / unvote / removeSuggestion { suggestionId }
+'     refreshSuggestions
+'     memberState { contentIds }         Who's Seen It
+'     picker                             the picker's shelves
+'     lobbyReady { ready }               a guest's "I'm ready"
+'     transportRequest { action: "play"|"pause"|"seek", position?, paused }
+'                                        a viewer's press in the player;
+'                                        never applied locally
+'     sourceFallback { selectionRevision, failedFileId, reason }
+'     noteTitle { contentId, title, unavailable }  the selected title's
+'                                        name once a screen read it, or
+'                                        that this profile cannot see it
+'     forgetRecent { server, account? }  a removed server, or a sign-out
+'     clearError
+'   playerSample  what the player is doing, on every Video position or
+'                 state change and at least every 500 ms while it plays:
+'                 { sessionId, revision (the room's selection_revision the
+'                 player was started for), position (source seconds),
+'                 duration, playing (advancing now), wantsPlay (not paused
+'                 by intent), playable (loaded with a real position),
+'                 stalled (buffering while it wants to play), seeking (a
+'                 seek or reload in flight), atEnd (parked at the end),
+'                 planInPlace (a Video.seek on this plan is served in place:
+'                 direct play or transcode, not a copy remux), commandSeq
+'                 (the last playerCommand.seq it executed) }. Members left
+'                 out keep their last value.
+'   session       { sessionId, revision } when the player commits a
+'                 playback session, {} when it closes one. Attached at once.
+'   apiResult     { tag, result }: RoomApiBridge only.
+'
+' Outputs
+'   ready         true once the inputs are observed; sets before it are lost.
+'   apiRequest    { tag, request }: RoomApiBridge only.
+'   room          the snapshot (watchparty.wire's normalized room: string
+'                 IDs, members, phase, permissions), or {} outside a party.
+'   connection    { state }: "idle", "connecting", "connected",
+'                 "reconnecting", or "ended" (after an ending, until the
+'                 next party). The server's 5-minute rotation stays
+'                 "connected".
+'   support       { state, missing, features, checking }: state "unknown",
+'                 "checking", "available", "unsupported" (missing names
+'                 what), or "notAllowed"; features as watchparty.wire.
+'                 evaluate gives them.
+'   sync          the player's view of the room, or {} outside a party:
+'                 { attached, catchingUp, syncing, waitingForClock (show
+'                 "Waiting for party timing…"), pendingSeek (the scrubber's
+'                 held target, or invalid), canPlayPause, canSeek,
+'                 selectionPending, title: { contentId, title,
+'                 unavailable } }.
+'   suggestions   { items (watchparty.wire suggestions, votedByMe from the
+'                 last read), winnerId, loading }.
+'   memberState   { loading, contentIds, members, items: [{ contentId,
+'                 members: [{ userId, profileId, state, positionSeconds,
+'                 durationSeconds, onWatchlist }] }], errorKey }.
+'   picker        { loading, members, continueTogether, watchlistUnion
+'                 (rows { item: the catalog card body, members, nextUp }),
+'                 errorKey }.
+'   recent        the Rejoin row's party for this identity outside a party:
+'                 { roomId, code, title, replaced }, or {}.
+'   busy          { kind }: the mutation in flight, "" for none; a command
+'                 of that group answers busy until it ends.
+'   playerCommand what the player executes now, one per set: { seq,
+'                 commandId, seek (source seconds, or invalid), reload
+'                 (seek as a correction reload), playing (the play state to
+'                 leave it in, or invalid to keep it) }. The render thread
+'                 applies it at once: the Task already waited for the
+'                 command's execute_at (section 7.2).
+'   notice        { scope: "page"|"lobby"|"player", key, values, text }: a
+'                 message to show; key is a locale key, or text the
+'                 server's own message (an error frame).
+'   result        { kind, tag, ok, errorKey, detail } for each command that
+'                 ends; errorKey is a locale key, or "busy".
+'   ended         { reason: "ended"|"replaced"|"expired"|"lost",
+'                 messageKey, rejoin: "none"|"rejoin"|"continueHere",
+'                 forgetRecent }: the party ended for this device (section
+'                 4.11). The player and panel close and the Watch Party
+'                 page shows messageKey. Not set for a silent leave.
+
+sub init()
+    m.top.functionName = "serve"
+end sub
+
+sub serve()
+    m.port = CreateObject("roMessagePort")
+    for each field in ["identity", "command", "playerSample", "session", "apiResult"]
+        m.top.observeFieldScopedEx(field, m.port)
+    end for
+    m.clock = watchparty.time.localClock(CreateObject("roTimespan"), CreateObject("roDateTime"))
+    m.section = CreateObject("roRegistrySection", watchparty.recent.SECTION)
+    saved = ""
+    if m.section.Exists(watchparty.recent.KEY) then saved = m.section.Read(watchparty.recent.KEY)
+    m.socket = invalid
+    m.room = watchparty.session.create(watchparty.socket.available(), saved, roomEnv())
+    m.top.ready = true
+    ' An identity set before the Task observed it.
+    if util.isObject(m.top.identity) then execute(watchparty.session.onIdentity(m.room, m.top.identity, roomEnv()))
+    execute(watchparty.session.onTick(m.room, roomEnv()))
+    while true
+        msg = wait(waitMs(), m.port)
+        msgType = type(msg)
+        if msgType = "roSGNodeEvent"
+            onField(msg.getField(), msg.getData())
+        else if msgType = "roWebSocketEvent"
+            event = watchparty.socket.event(m.socket, msg)
+            if event <> invalid then execute(watchparty.session.onSocket(m.room, event, roomEnv()))
+        end if
+        execute(watchparty.session.onTick(m.room, roomEnv()))
+    end while
+end sub
+
+sub onField(field as String, data as Dynamic)
+    if field = "identity"
+        execute(watchparty.session.onIdentity(m.room, data, roomEnv()))
+    else if field = "command"
+        execute(watchparty.session.onCommand(m.room, data, roomEnv()))
+    else if field = "playerSample"
+        execute(watchparty.session.onSample(m.room, data, roomEnv()))
+    else if field = "session"
+        execute(watchparty.session.onPlaybackSession(m.room, data, roomEnv()))
+    else if field = "apiResult"
+        if util.isObject(data) then execute(watchparty.session.onHttp(m.room, util.text(data.tag), data.result, roomEnv()))
+    end if
+end sub
+
+' What the session reads from this Task: the anchored clock, UUIDs, and
+' jitter.
+function roomEnv() as Object
+    return { now: watchparty.time.monotonicMs(m.clock), wallMs: watchparty.time.epochMs(m.clock), uuid: roomUuid, random: roomRandom }
+end function
+
+function roomUuid() as String
+    return CreateObject("roDeviceInfo").GetRandomUUID()
+end function
+
+function roomRandom() as Float
+    return Rnd(0)
+end function
+
+' Milliseconds to the next due event, or 0 (wait for a message).
+function waitMs() as Integer
+    due = watchparty.session.nextWakeMs(m.room, roomEnv())
+    if due = invalid then return 0
+    if due < 1 then return 1
+    return due
+end function
+
+' Runs the session's decisions in order.
+sub execute(actions as Object)
+    for each action in actions
+        kind = action.kind
+        if kind = "http"
+            m.top.apiRequest = { tag: action.tag, request: action.request }
+        else if kind = "open"
+            openSocket(action)
+        else if kind = "send"
+            if m.socket = invalid or not watchparty.socket.send(m.socket, action.text) then log.warn("watchparty", "a room message was not sent")
+        else if kind = "close"
+            closeSocket()
+        else if kind = "publish"
+            m.top.setField(action.field, action.value)
+        else if kind = "persist"
+            saveRecent(action.text)
+        else if kind = "log"
+            if action.level = "warn"
+                log.warn("watchparty", action.message, action.fields)
+            else if action.level = "info"
+                log.info("watchparty", action.message, action.fields)
+            else
+                log.debug("watchparty", action.message, action.fields)
+            end if
+        end if
+    end for
+end sub
+
+' Opens the room socket for an epoch; a socket that cannot open counts as
+' one that closed at once, so the session's reconnect rules apply.
+sub openSocket(action as Object)
+    closeSocket()
+    m.socket = watchparty.socket.open(action.url, action.protocols, m.port, action.epoch)
+    if m.socket = invalid
+        log.warn("watchparty", "the room socket could not open", { epoch: action.epoch })
+        execute(watchparty.session.onSocket(m.room, { kind: "error", epoch: action.epoch, text: "", protocol: "", code: 0 }, roomEnv()))
+    end if
+end sub
+
+sub closeSocket()
+    if m.socket = invalid then return
+    watchparty.socket.close(m.socket)
+    m.socket = invalid
+end sub
+
+' The recent party's section: one key, deleted when empty, then flushed.
+sub saveRecent(text as String)
+    if text = ""
+        m.section.Delete(watchparty.recent.KEY)
+    else
+        m.section.Write(watchparty.recent.KEY, text)
+    end if
+    if not m.section.Flush() then log.warn("watchparty", "could not save the recent party")
+end sub
