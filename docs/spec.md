@@ -204,7 +204,11 @@ Platform:
 - the SiloControl receiver: a Silo phone app on the network controls
   playback, launches titles, and hands off its profile
   ([`silocontrol.md`](silocontrol.md)), on in every build since 2026-10-25
-  (decision D-7, section 15).
+  (decision D-7, section 15);
+- Watch Party at tvOS parity: hosting and joining rooms, host-pick and
+  vote rooms, the party picker, and playback in step with the room, on
+  Roku OS 16 or later, on in every build (decision D-10,
+  [`watch-party.md`](watch-party.md)).
 
 Section 5 describes how each of these looks and behaves.
 
@@ -261,7 +265,6 @@ supported settings are available there (section 5.8.1).
 - downloads or offline playback;
 - Silo server first-run setup and administration;
 - library creation, scanning, metadata editing, or user management;
-- Watch Together;
 - plugin administration surfaces;
 - playback speed and the Aspect choice in the player's Options (tvOS,
   Android TV), which Roku has no supported way to draw (section 5.9);
@@ -2304,7 +2307,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Watchlist's empty state says "Tap the bookmark icon on any item to add it here", Favorites' "Tap the heart icon on any item to add it here" | "Add titles from a detail page and they will appear here." and "Add favorites from a detail page and they will appear here." (the iOS words), with a Back button | A remote has no tap, and a page without the bar needs a way out from its empty state |
 | A card's context menu (press and hold) offers Play or Resume on Continue Watching, Mark as Watched, Favorites, and Watchlist, and on Home Remove from Continue Watching or Next Up; a Watchlist or Favorites page drops a card whose flag turns off. History offers no removal | Options (*) on a focused card opens the same menu, in the same order, on Home, the library tabs, Browse, collections, Search, person pages, More Like This, and the Watchlist, Favorites, and History pages (`source/catalog/cardMenu.bs`); Favorites and Watchlist show only when the server offers the lists. History adds Remove from History (`POST /api/v2/history/remove`, the card's item, which for a series covers its episodes). A change shows on the card at once and goes back with the notice if refused; Home and Recommended read their rows again after one. A card read before another page's change takes the change when its menu opens | Roku has no press and hold: a list consumes OK on press. `*` is Roku's options key. Development builds keep `*` on Home's bar for the diagnostic screen |
 | An episode card's context menu marks that episode watched or unwatched | More on a series page has Mark Episode Watched or Unwatched for the episode Play plays (the active one) | Roku's episode rail has no context menu; the action row already names that episode |
-| More also offers Find Trailers, Show Series Info, and Watch Party where they apply | Shuffle, Favorites, the watched rows, and Translate Description while the page offers it (section 5.6) | Scope (sections 3.3 and 3.4); Find Trailers (`POST /api/v2/catalog/items/{id}/trailers/refresh`, offered by `GET /api/v2/capabilities/trailers`) fetches remote videos, which Roku leaves out (next row) |
+| More also offers Find Trailers, Show Series Info, and Watch Party where they apply | Shuffle, Favorites, the watched rows, Translate Description while the page offers it (section 5.6), and Watch Party where it applies ([`watch-party.md`](watch-party.md) section 4.1) | Scope (sections 3.3 and 3.4); Find Trailers (`POST /api/v2/catalog/items/{id}/trailers/refresh`, offered by `GET /api/v2/capabilities/trailers`) fetches remote videos, which Roku leaves out (next row) |
 | Trailers & More also lists the item's remote trailers and clips (`videos`, YouTube only), captioned "YouTube" with YouTube's still, which open in the YouTube app; tvOS drops them when the app is not installed | Only the local extras, which play in Silo's player | Certification criterion 5.3 forbids opening another app, and the server gives a remote video only as its site and key (`ItemVideoInfo`), with no stream it hosts or relays (silo-server `3e2d306b2`; assumption AG-361) |
 | A theme fades in to 35% of the volume over 300 ms and fades out as it stops | It plays at the TV's volume and starts and stops at once | Roku's `Audio` node has no volume or gain field, only `mute` (AG-363) |
 | A theme pauses while the app is in the background and resumes on return | Pressing Home closes the app, and the theme with it | Roku keeps no app running in the background without Instant Resume, which this client does not use |
@@ -2324,7 +2327,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The hero shows a request's stage on the four-step track, and the request page an eyebrow ("Not in your library", "Requested") | The hero shows the stage as its badge; the request page's status strip has the track; no eyebrow | The hero's badge line is the place for a short status; the library hero has no eyebrow (assumption AG-409) |
 | The request page finds the viewer's request among every page of `GET /api/v2/requests/mine` | It reads `GET /api/v2/requests/{id}`: the request the title names, or the one the opened card was | One small read in place of up to 100 pages; Request Again needs the ended request, which only a card of it names (assumption AG-407) |
 | Notify Me's notices end with a period (tvOS); Android TV says "Notify me when available" | tvOS's words | tvOS is the reference (section 5.1) |
-| People and the Audiobooks chip in search; Home row reordering; Watch Party in the avatar menu; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; the marker on AI-translated subtitle tracks | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
+| People and the Audiobooks chip in search; Home row reordering; Manage on the profile picker; Create Account on sign-in; the Home hero's air date and cast line; the marker on AI-translated subtitle tracks | Not in the first release | Scope (sections 3.3 and 3.4); deferred controls keep their positions when added |
 | The description translation's status ("Translating…", "Translated by AI") follows the translate symbol | The words alone, under the detail synopsis and leading Home's meta line | No symbol art ships for it; the words carry the meaning |
 | Each Featured card on the marquee runs its own translation, so several can run while focus moves along the row | One at a time: resting on another Featured card stops the run before it starts the next, which may start again when its card shows again | Keeps the requests and timers a 1 GB Roku holds to one run; the server's on-view budget per account is small (5 a second, 30 a minute) |
 | A metadata language change drops every cached item, section, and grid, and Home re-reads its rows | Home reads its rows again when it next shows; library pages and pages under Settings keep their text until they are read again | Roku keeps no item cache; a library page reads its rows each time it opens |
@@ -4308,6 +4311,7 @@ allowlist. The following follow-ups are tracked with the server:
 | Features after the first release | Section 3.3's planned list (D-8) | The order of the planned items, and a choice on each undecided one |
 | Roku Search feed | Not planned | Roku guidance if usage grows |
 | SiloControl receiver | Built behind bs_const `silocontrol` and `handoff`, on in every build since 2026-10-25; see [`silocontrol.md`](silocontrol.md) section 13 | Spikes C0-1 to C0-7, hardware tests HC-1 to HC-6, and Roku's confirmation |
+| Watch Party | Specified at tvOS parity over Roku OS 16's `roWebSocket`, on in every build (D-10); see [`watch-party.md`](watch-party.md) section 13 | Spike W0-1 (the socket's subprotocol and pings) before any other work, then W0-2 to W0-4 |
 
 ## 16. Definition of done for this draft
 
