@@ -1087,7 +1087,11 @@ The player's part:
 - SiloControl: a launch during a party answers `error command_failed`
   with "This Watch Party does not allow this playback action."; so does
   a handoff offer for another profile (`handoff_cancel handoff_failed`),
-  since its borrowed identity would leave the party. Controls follow
+  since its borrowed identity would leave the party. A handoff for
+  another profile begun before the party ends the same way when the room
+  names a party while it waits for the phone, or when the phone
+  approves it during one; only one whose `borrow` is already sent
+  finishes, and its identity leaves the party. Controls follow
   `silocontrol.policy.partyControl`.
 - Every player that is not the room's sends `leave` before it opens:
   AppScene's `navPush` and `navReplace` pass each `nav.route.PLAYER`
