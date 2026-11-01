@@ -81,6 +81,18 @@ namespace playback.session
     ' playing, is sought back there once (checkStart).
     const START_SLIP_SECONDS = 3
     const START_CHECK_SECONDS = 3
+    ' A seek_reanchor on a copy remux asks for its stream this many seconds
+    ' before the target and starts the load at the target (leadIn): Roku
+    ' opens a growing remux playlist up to 8 s past its origin and cannot
+    ' seek below that for the load's life (W0-2 on the Streaming Stick).
+    const REANCHOR_LEAD_SECONDS = 10
+    ' and the player assigns its content this long after the plan's answer,
+    ' with the node stopped: Roku starts a remux playlist at most three
+    ' segments before the end it reads first, so the playlist must have
+    ' grown past the target by then. 12 of 12 lead-in reanchors held 1.5 s
+    ' opened at the target's segment; without the hold, 5 of 12 opened up
+    ' to 10 s short and could not seek on.
+    const REANCHOR_HOLD_MS = 1500
     ' A "finished" this close to the runtime is the content's end, whatever
     ' the player changed just before (stoppedByClient).
     const END_SLACK_SECONDS = 5
@@ -762,10 +774,33 @@ namespace playback.session
             plan.startCheck = invalid
             return
         end if
+        fields = { start: plan.loadStart, position: playerSeconds }
+        if plan.leadIn and plan.loadStart - playerSeconds > START_SLIP_SECONDS
+            ' A lead-in load Roku opened where the stream starts, short of the
+            ' target: a seek forward within it (the stream's own opening point
+            ' and later are reachable).
+            plan.startCheck = invalid
+            out.Push({ type: "log", level: "info", message: "the load started short of its start; seeking to it", fields: fields })
+            sendStartSeek(state, playerSeconds, true, now, out)
+            return
+        end if
         if playerSeconds - plan.loadStart - elapsed <= START_SLIP_SECONDS then return
         plan.startCheck = invalid
-        out.Push({ type: "log", level: "warn", message: "the load started past its start; seeking back", fields: { start: plan.loadStart, position: playerSeconds } })
-        plan.seekBack = { from: playerSeconds, at: now, buffered: false, resumed: false }
+        if isCopyRemux(plan.data) and not plan.leadIn
+            ' Roku never seeks a growing remux playlist below where it opened
+            ' it (runs 9 and 10, W0-2 on the Stick): reanchor to the start with
+            ' a lead-in instead, once, as recovery.
+            out.Push({ type: "log", level: "warn", message: "the load started past its start; reanchoring there", fields: fields })
+            submit(state, { rank: RANK_RECOVERY, op: "seek_reanchor", position: playback.seek.sourcePosition(plan.timeline, plan.loadStart), planAttemptId: plan.attemptId }, env, out)
+            return
+        end if
+        out.Push({ type: "log", level: "warn", message: "the load started past its start; seeking back", fields: fields })
+        sendStartSeek(state, playerSeconds, false, now, out)
+    end sub
+
+    sub sendStartSeek(state as Object, playerSeconds as Dynamic, forward as Boolean, now as Dynamic, out as Object)
+        plan = state.plan
+        plan.seekBack = { from: playerSeconds, at: now, buffered: false, resumed: false, forward: forward }
         playback.recovery.restartStall(state.stall, now, invalid)
         out.Push({ type: "seek", load: plan.load, playerPosition: plan.loadStart })
     end sub
@@ -780,13 +815,18 @@ namespace playback.session
         plan = state.plan
         back = plan.seekBack
         if not back.resumed and (env.now() - back.at < START_CHECK_SECONDS * 1000 or state.player.state = "buffering") then return
-        landed = playerSeconds < back.from
+        ' Landed within START_SLIP_SECONDS of the start: moving at all is not
+        ' landing (W0-2 on the Stick: a seek back from 8.041 s to 0.168 s
+        ' played on from 7.959 s).
+        landed = Abs(playerSeconds - plan.loadStart) <= START_SLIP_SECONDS
         plan.seekBack = invalid
         fields = { start: plan.loadStart, position: playerSeconds }
+        what = "the seek back"
+        if util.isTrue(back.forward) then what = "the seek to the start"
         if landed
-            out.Push({ type: "log", level: "info", message: "the seek back landed", fields: fields })
+            out.Push({ type: "log", level: "info", message: what + " landed", fields: fields })
         else
-            out.Push({ type: "log", level: "warn", message: "the seek back did not land", fields: fields })
+            out.Push({ type: "log", level: "warn", message: what + " did not land", fields: fields })
         end if
     end sub
 
@@ -1277,6 +1317,13 @@ namespace playback.session
         fields.playback_attempt_id = a.id
         fields.replan_request_id = id
         fields.position_seconds = playback.values.roundMs(position)
+        if op = "seek_reanchor" and isCopyRemux(plan.data)
+            ' The stream starts before the target, and the load at it (leadIn).
+            request.leadTarget = playback.values.toDouble(position)
+            lead = position - REANCHOR_LEAD_SECONDS
+            if lead < 0 then lead = 0
+            fields.position_seconds = playback.values.roundMs(lead)
+        end if
         ' A viewer's pick asks for its own quality: a controller lowering
         ' adopted while it waited set the session's to the lowered one.
         if op = "quality_change" and not util.isTrue(request.buffering) and playback.values.isText(request.quality) then state.quality = request.quality
@@ -1460,6 +1507,13 @@ namespace playback.session
         ' A Double of its own: when loadStart shares playerStart's, brs-node
         ' hands the load command a Float.
         state.plan.loadStart = playback.values.toDouble(timeline.player_start_seconds)
+        if how = "reanchor" and util.isNumber(request.leadTarget)
+            ' A lead-in reanchor's load starts at the target, not where the
+            ' stream it asked for does.
+            state.plan.leadIn = true
+            playerStart = playback.seek.playerPosition(timeline, request.leadTarget)
+            state.plan.loadStart = playback.seek.playerPosition(timeline, request.leadTarget)
+        end if
         state.player.position = playback.seek.sourcePosition(timeline, playerStart)
         state.player.seeking = false
         state.player.state = "loading"
@@ -1481,7 +1535,11 @@ namespace playback.session
             if previous <> invalid then state.plan.renewedExpiry = previous.renewedExpiry
             renewed(state, 0)
         end if
-        out.Push({ type: "load", load: state.loads, plan: plan, playerStart: playerStart, autoplay: autoplay, refresh: renew })
+        loadCommand = { type: "load", load: state.loads, plan: plan, playerStart: playerStart, autoplay: autoplay, refresh: renew }
+        ' Roku honours PlayStart on a growing remux playlist only once the
+        ' playlist reaches past it at Roku's first read (W0-2 on the Stick).
+        if state.plan.leadIn then loadCommand.holdMs = REANCHOR_HOLD_MS
+        out.Push(loadCommand)
         if how = "reanchor" then out.Push(playback.seek.subtitleShift(timeline))
         adoptBuffering(state, plan, request, env, out)
         ' The output may have changed while this plan was being chosen.
@@ -1562,6 +1620,12 @@ namespace playback.session
         return util.isObject(plan.stream) and LCase(util.text(plan.stream.protocol)) = "hls"
     end function
 
+    ' A server copy remux (server_remux_hls and its kin), whose seeks and
+    ' reopens are seek_reanchors onto a playlist that grows as it plays.
+    function isCopyRemux(plan as Object) as Boolean
+        return Left(util.text(plan.delivery), 13) = "server_remux_"
+    end function
+
     function streamUrl(plan as Object) as String
         if not util.isObject(plan.stream) then return ""
         return util.text(plan.stream.url)
@@ -1618,10 +1682,13 @@ namespace playback.session
             ' Where the load should start, in player seconds, and while its
             ' first positions are checked against it, { at } (checkStart);
             ' then, until a reading shows where the seek back went,
-            ' { from, at, buffered, resumed } (checkSeekBack).
+            ' { from, at, buffered, resumed, forward } (checkSeekBack).
             loadStart: invalid,
             startCheck: invalid,
-            seekBack: invalid
+            seekBack: invalid,
+            ' The plan answers a reanchor asked for REANCHOR_LEAD_SECONDS
+            ' before its target, and its load starts at the target (leadIn).
+            leadIn: false
         }
         playOwnUrl(current)
         if playback.recovery.isProxyStream(plan)

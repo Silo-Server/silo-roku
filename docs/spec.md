@@ -1973,16 +1973,29 @@ Subtitles tab (criterion 4.8).
   by the rule the detail page's Resume shows (section 5.6), played or not,
   and sends it as `start_position`; Play on a saved position of 30 seconds or
   less starts there too, as both existing apps do. With no saved position, or
-  one within 5 seconds of the end, the start omits `start_position`. When
-  Roku starts an HLS load more than 3 seconds past the plan's
-  `player_start_seconds` (or a reload's position), the player seeks back
-  there once (hardware run 8) and logs whether it landed, from the first
-  position once the node plays again after the seek's rebuffering, or 3
-  seconds after the seek (Roku reports position 0 while it rebuffers, run
-  10). That seek is not the viewer's: playback does not count as seeking
-  meanwhile, and a seek the viewer makes replaces it. In hardware run 9 it
-  never landed (Roku rebuffered and played on from the late position); the
-  fix is the server's (a complete playlist at start, or `#EXT-X-START`).
+  one within 5 seconds of the end, the start omits `start_position`. Roku
+  treats a copy remux's playlist that is still growing (`EVENT`, no
+  `ENDLIST`) as live: given a `PlayStart` near the playlist's start (0.2 to
+  1.6 s, every `seek_reanchor`'s), it opens the load 4 to 8 s in, near the
+  end of the playlist as it first reads it, and no seek in the first
+  seconds goes below that (hardware runs 8 to 10; W0-2 on the Streaming
+  Stick, 27 of 28 reanchors 4 to 8 s late). It honours a `PlayStart` of 10
+  s or more at its segment once the playlist reaches past it. So a
+  `seek_reanchor` on a copy remux asks for its stream 10 s before the
+  target, starts the load at the target, and assigns the content 1.5 s
+  after the plan's answer with the node stopped (W0-2 again: 14 of 14
+  within 1.06 s of the target, the segment's start at or before it). When
+  Roku starts a copy remux's start or reload more than 3 seconds past its
+  start, the player reanchors there that way, once; another HLS load is
+  sought back there once, and a lead-in load Roku opened more than 3
+  seconds short of its start is sought forward to it once. Each seek logs
+  whether it landed within 3 seconds of the start, from the first position
+  once the node plays again after the seek's rebuffering, or 3 seconds
+  after the seek (Roku reports position 0 while it rebuffers, run 10).
+  These seeks are not the viewer's: playback does not count as seeking
+  meanwhile, and a seek the viewer makes replaces them. A complete
+  playlist at start, or `#EXT-X-START` that Roku honours, would make this
+  unnecessary: the server's fix.
 - **Waiting and errors.** The spinner shows while the player buffers, and
   the Reconnecting card while recovery (section 9.6) runs. A failure shows,
   centred, a 40 px warning triangle in `#B00020`, the message in 26 px
@@ -3151,14 +3164,11 @@ reloads the current plan at the current position, or sends a
 `seek_reanchor` there when the timeline does not allow a local reload (a
 copy remux) or the credential is a proxy's path token. It excludes no route,
 is not the plan's one transport reopen, and its rebuffering is not a stall
-for Auto quality (section 9.7). On a copy remux the reanchor replays up to
-one keyframe interval: the new load's `PlayStart` is the plan's
-`player_start_seconds`, but Roku starts it at its playlist's first segment
-(hardware run 9: 0.7–4.1 s replayed). A local reload of the playing
+for Auto quality (section 9.7). On a copy remux the reanchor is the
+lead-in one (section 5.7): its stream starts 10 s before the position and
+the load at the position's segment. A local reload of the playing
 remux's own playlist is not used instead: Roku's start on a playlist that
-is still growing is the unreliable case (8 s late in run 9), and the
-server's fix for it (`#EXT-X-START`, section 5.7) would serve the
-reanchor too. Renewed headers that are refused
+is still growing is the unreliable case (8 s late in run 9). Renewed headers that are refused
 again before they play show the playback error with Retry. A renewal counts
 as done only once a load with refreshed headers is scheduled: one needed
 while a replan is in flight is carried by the load that replan's answer

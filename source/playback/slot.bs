@@ -1,3 +1,5 @@
+import "pkg:/source/util/values.bs"
+
 ' The player's one Video node across loads (plan section 6.4). Content is
 ' assigned only to a node that is not playing: from "none", "stopped",
 ' "error", or "finished" at once; otherwise the player sets control "stop"
@@ -13,12 +15,15 @@
 '                                         invalid when nothing was stopped
 '   { action: "slow" }                    the first deadline passed
 '   { action: "stuck" }                   the second deadline passed
+' An item with holdUntil (a clock time) is not assigned before then: the
+' node stops at once and stays idle until it (playback.session's
+' REANCHOR_HOLD_MS).
 namespace playback.slot
     const FIRST_WAIT_MS = 3000
     const SECOND_WAIT_MS = 10000
 
     function create() as Object
-        return { pending: invalid, stopAt: invalid, slow: false }
+        return { pending: invalid, stopAt: invalid, slow: false, idle: false }
     end function
 
     function isIdle(videoState as String) as Boolean
@@ -27,7 +32,12 @@ namespace playback.slot
 
     ' item is ready to play; a newer item replaces one still waiting.
     function assign(slot as Object, videoState as String, item as Object, now as Integer) as Object
-        if isIdle(videoState) then return [play(slot, item, now)]
+        if isIdle(videoState)
+            if not held(item, now) then return [play(slot, item, now)]
+            slot.pending = item
+            slot.idle = true
+            return []
+        end if
         slot.pending = item
         if slot.stopAt <> invalid then return []
         slot.stopAt = now
@@ -43,13 +53,23 @@ namespace playback.slot
             clear(slot)
             return []
         end if
+        if held(item, now)
+            slot.idle = true
+            return []
+        end if
         return [play(slot, item, now)]
+    end function
+
+    ' Whether the item still waits for its holdUntil.
+    function held(item as Object, now as Integer) as Boolean
+        return util.isNumber(item.holdUntil) and now < item.holdUntil
     end function
 
     ' The player is leaving, or new content waits for its subtitle: stop
     ' the node and drop any item waiting.
     function halt(slot as Object, videoState as String, now as Integer) as Object
         slot.pending = invalid
+        slot.idle = false
         if isIdle(videoState) or slot.stopAt <> invalid then return []
         slot.stopAt = now
         return [{ action: "stop" }]
@@ -61,6 +81,11 @@ namespace playback.slot
     end function
 
     function tick(slot as Object, now as Integer) as Object
+        if slot.idle
+            ' The node is idle: only the held item's time is due.
+            if slot.pending = invalid or held(slot.pending, now) then return []
+            return [play(slot, slot.pending, now)]
+        end if
         if slot.stopAt = invalid then return []
         waited = now - slot.stopAt
         if waited >= SECOND_WAIT_MS
@@ -76,6 +101,10 @@ namespace playback.slot
 
     ' When tick next has something to say, or invalid.
     function wakeAt(slot as Object) as Dynamic
+        if slot.idle
+            if slot.pending = invalid then return invalid
+            return slot.pending.holdUntil
+        end if
         if slot.stopAt = invalid then return invalid
         if slot.slow then return slot.stopAt + SECOND_WAIT_MS
         return slot.stopAt + FIRST_WAIT_MS
@@ -92,5 +121,6 @@ namespace playback.slot
         slot.pending = invalid
         slot.stopAt = invalid
         slot.slow = false
+        slot.idle = false
     end sub
 end namespace
