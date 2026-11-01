@@ -3731,8 +3731,10 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   playlist's `DEFAULT` first and the others after it in playlist order
   (2026-11-01, the TCL). The client takes each row's name from Roku's
   list by `Description` = `NAME` first, then `webvtt/<n>` by that
-  numbering, from the rendition the stream marked `DEFAULT` when its
-  content opened (an in-place change keeps it), only when Roku lists that
+  numbering, from the rendition the stream marked `DEFAULT` when it
+  started (the plan's own on a new stream, kept through in-place changes,
+  reopens of the content for a credential renewal or a recovery, and
+  reloads that stream the same media), only when Roku lists that
   track in the row's language (its primary subtag) and not with a
   description that names another of the stream's renditions, so that a
   numbering of Roku's own cannot put another track on the plan's row. A
@@ -3756,8 +3758,10 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   `DEFAULT` named the plan's Chinese track or the plan selected an Arabic
   sidecar, and kept it until the check 3 seconds after the first frame
   (2026-10-31 regression run on the Ultra). So new content whose plan
-  selects a rendition opens on `webvtt/1` (content `SubtitleConfig`): the
-  server marks that rendition `DEFAULT=YES`, and on the TCL Roku named the
+  selects a rendition opens on it by Roku's number (content
+  `SubtitleConfig`): `webvtt/1` on a new stream, where the server marks
+  that rendition `DEFAULT=YES`, and its place after the stream's own
+  `DEFAULT` on a stream the server keeps; on the TCL Roku named the
   `DEFAULT` rendition `webvtt/1` and the others `webvtt/2` onwards in
   playlist order, and played the plan's Chinese rendition from the first
   frame (2026-11-01). When Roku's listing names the plan's rendition
