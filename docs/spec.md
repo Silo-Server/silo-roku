@@ -3744,14 +3744,21 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   once it settles the client checks the plan's rendition as it checks a
   sidecar and selects it by that name if Roku shows another, as after a
   reload of a plan switched in place, whose playlist still names the first
-  track. Until that check, new content of such a stream draws nothing when
-  the plan selects a rendition or a sidecar (`suppressCaptions`): on the
-  Ultra, Roku opened new content on its own rendition in the caption
-  language, English, whether the playlist's `DEFAULT` named the plan's
-  Chinese track or the plan selected an Arabic sidecar, and kept it until
-  the check 3 seconds after the first frame (2026-10-31 regression run).
-  Subtitles there show from that check, on the plan's track. A switch in
-  place writes `Video.subtitleTrack` to the listed name.
+  track. Left alone, Roku opened new content of such a stream on its own
+  rendition in the caption language, English, whether the playlist's
+  `DEFAULT` named the plan's Chinese track or the plan selected an Arabic
+  sidecar, and kept it until the check 3 seconds after the first frame
+  (2026-10-31 regression run on the Ultra). So new content whose plan
+  selects a rendition opens on `webvtt/1` (content `SubtitleConfig`): the
+  server marks that rendition `DEFAULT=YES`, and on the TCL Roku named the
+  `DEFAULT` rendition `webvtt/1` and the others `webvtt/2` onwards in
+  playlist order, and played the plan's Chinese rendition from the first
+  frame (2026-11-01). When Roku's listing names the plan's rendition
+  otherwise, as on a reload whose stream kept another plan's `DEFAULT`,
+  and when the plan selects a sidecar, which a `SubtitleConfig` naming it
+  did not keep Roku off English, the content draws nothing until the check
+  (`suppressCaptions`), and subtitles there show from it, on the plan's
+  track. A switch in place writes `Video.subtitleTrack` to the listed name.
   Off stays `suppressCaptions`: every rendition is `AUTOSELECT=YES`, and
   Roku would otherwise show one by the caption language, so a start with
   subtitles Off under caption mode On draws nothing. Content with a

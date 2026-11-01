@@ -364,6 +364,11 @@ sub init()
     ' Whether captions stay hidden on the active content until the check
     ' once it settles (playback.sidecars.holdsUntilChecked, confirmSubtitle).
     m.subtitleHeld = false
+    ' The TrackName the active content opened on for the plan's HLS
+    ' rendition (playback.sidecars.preselectName), until the check once it
+    ' settles: the listing holds captions when Roku names the rendition
+    ' otherwise (relistRenditions).
+    m.activePreselect = ""
     ' An in-place subtitle switch to check: { load, path, at } (checkSubtitle).
     m.subtitleCheck = invalid
     ' Whether the active content has started (the node left its stopped
@@ -1016,10 +1021,10 @@ sub tryAssign(item as Object)
     ' Roku lists the renditions once the content opens (relistRenditions).
     item.tracks.Append(playback.sidecars.streamTracks(item.plan, invalid))
     item.track = playback.sidecars.planPath(item.tracks, item.plan)
-    native = playback.media.nativeSubtitle(item.plan)
-    if native <> ""
-        content.SubtitleConfig = { TrackName: native }
-        log.info(LOG_TAG, "the subtitle is the file's own track", { track: native, carried: carried.Count() })
+    item.preselect = playback.sidecars.preselectName(item.plan)
+    if item.preselect <> ""
+        content.SubtitleConfig = { TrackName: item.preselect }
+        log.info(LOG_TAG, "the content opens on the plan's subtitle", { track: trackLabel(item.preselect), carried: carried.Count() })
     end if
     item.assigned = true
     runSlot(playback.slot.assign(m.slot, m.video.state, item, m.env.now()))
@@ -1131,12 +1136,15 @@ sub playItem(item as Object, waitedMs as Dynamic)
     m.recheckAt = invalid
     m.wroteAt = invalid
     m.subtitleSuppressed = playback.sidecars.suppressed(item.plan, item.track)
-    m.subtitleHeld = playback.sidecars.holdsUntilChecked(item.plan)
+    m.activePreselect = ""
+    if playback.sidecars.listsRenditions(item.plan) then m.activePreselect = util.text(item.preselect)
+    m.subtitleHeld = playback.sidecars.holdsUntilChecked(item.plan, util.text(item.preselect))
     drawCaptions()
     m.video.content = item.content
     ' A track of the stream is selected by the content's SubtitleConfig (a
-    ' native subtitle) or by the playlist's DEFAULT (an HLS rendition), and
-    ' checked once the content settles (confirmSubtitle).
+    ' native subtitle, or a rendition of a stream that lists every one) or
+    ' by the playlist's DEFAULT (a single HLS rendition), and checked once
+    ' the content settles (confirmSubtitle).
     if playback.sidecars.isFile(item.track) then setSubtitleTrack(item.track)
     uncheckedShows(item.plan, item.track)
     m.video.control = "play"
@@ -1781,6 +1789,7 @@ sub confirmSubtitle()
     end if
     if m.settleUntil = invalid or holdsSubtitle() then return
     m.subtitleConfirmed = true
+    m.activePreselect = ""
     ' Captions held since the content opened show from here, on the plan's
     ' subtitle once this check selects it, else on what Roku draws.
     held = m.subtitleHeld
@@ -1899,7 +1908,8 @@ end sub
 ' its own then (hardware run 20). Content whose stream lists every
 ' rendition is set to draw nothing before it opens and until the check
 ' once it settles (m.subtitleHeld, confirmSubtitle), since Roku opens it on
-' a rendition of its own.
+' a rendition of its own, unless it opens on the plan's rendition and Roku
+' lists it under that name (relistRenditions).
 sub drawCaptions()
     covered = m.overlay.shown and not m.controls.upNext and m.settleUntil <> invalid and m.env.now() >= m.settleUntil
     suppressed = m.subtitleSuppressed or m.subtitleHeld or covered
@@ -1935,10 +1945,10 @@ end sub
 
 ' The active content's HLS subtitle renditions take the TrackNames Roku
 ' lists for them (playback.sidecars.renditionTracks): by NAME, else
-' webvtt/<index> in the row's language. How Roku numbers several
-' renditions is not yet seen on a device, so each match is logged for the
-' hardware runs to confirm (assumption AG-654). The plan's own rendition
-' is the one the player then checks and switches to.
+' webvtt/<index> in the row's language. Roku listed them by NAME, and
+' numbered the playlist's DEFAULT first (2026-11-01 hardware run on the
+' TCL; assumption AG-654), so each match is logged. The plan's own
+' rendition is the one the player then checks and switches to.
 sub relistRenditions(listed as Dynamic)
     item = m.current
     if item = invalid or not item.assigned or m.activeLoad <> item.load or not playback.sidecars.listsRenditions(item.plan) then return
@@ -1956,6 +1966,15 @@ sub relistRenditions(listed as Dynamic)
     log.info(LOG_TAG, "Roku's names for the stream's subtitle renditions", { renditions: matched })
     if not playback.sidecars.selectsRendition(item.plan) then return
     path = playback.sidecars.planPath(tracks, item.plan)
+    ' Content opened on webvtt/1 for the plan's rendition draws from its
+    ' start when Roku lists that rendition under it, and else nothing until
+    ' the settle check selects it: a reload that keeps the stream keeps its
+    ' first plan's DEFAULT (playback.sidecars.preselectName).
+    if m.activePreselect <> ""
+        if path <> "" and path <> m.activePreselect and not m.subtitleHeld then log.info(LOG_TAG, "Roku lists the plan's subtitle rendition under another name than the content opened on; captions wait for the check", { track: trackLabel(path), opened: m.activePreselect })
+        m.subtitleHeld = path <> m.activePreselect
+        drawCaptions()
+    end if
     ' Without a name the player writes nothing for it, the settle check
     ' included, and the stream's DEFAULT shows it.
     if path = "" then log.info(LOG_TAG, "Roku lists no name for the plan's subtitle rendition; it is left to the stream", invalid)
@@ -2087,6 +2106,7 @@ sub retrack(command as Object)
     ' A rendition Roku lists no name for gets no write, which would leave
     ' Roku to pick its own.
     m.subtitleHeld = false
+    m.activePreselect = ""
     if path = "" and playback.sidecars.selectsRendition(item.plan)
         log.info(LOG_TAG, "Roku lists no name for the plan's subtitle rendition; it is left to the stream", invalid)
         m.subtitleSuppressed = playback.sidecars.suppressed(item.plan, path)
