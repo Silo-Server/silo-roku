@@ -1,0 +1,138 @@
+import "pkg:/source/watchparty/picker.bs"
+
+namespace tests
+
+    ' The party picker's shelves, routing, requests, and confirm page
+    ' (docs/watch-party.md section 4.8), as tvOS's WatchPartyMediaPicker
+    ' assembles them.
+    @suite("watch party picker")
+    class WatchPartyPickerTests extends rooibos.BaseTestSuite
+
+        function card(id as String, itemType as String, fields = {} as Object) as Object
+            out = { id: id, itemType: itemType, title: id, caption: id }
+            out.Append(fields)
+            return out
+        end function
+
+        function ids(shelves as Object) as Object
+            out = []
+            for each shelf in shelves
+                out.Push(shelf.id)
+            end for
+            return out
+        end function
+
+        '----------------------------------------------------------------------
+        @describe("shelves")
+
+        @it("orders Continue Together, the watchlists, Home's rows, then the recent shelves, leaving empty ones out")
+        sub _()
+            shelves = watchparty.picker.shelves({
+                continueTogether: [m.card("episode:a-s1e2", "episode")],
+                watchlist: [m.card("movie:b", "movie"), m.card("audiobook:c", "audiobook")],
+                home: [{ id: "trending", title: "Trending", sectionType: "trending", cards: [m.card("series:d", "series")] }],
+                recentMovies: [],
+                recentSeries: [m.card("series:e", "series")]
+            })
+            m.assertEqual(m.ids(shelves), ["together", "watchlist", "home.trending", "recentSeries"])
+            m.assertEqual([shelves[0].titleKey, shelves[1].titleKey, shelves[2].titleKey, shelves[3].titleKey], ["watchParty.picker.continueTogether", "watchParty.picker.watchlists", "", "watchParty.picker.recentSeries"])
+            m.assertEqual(shelves[2].title, "Trending")
+            m.assertEqual(shelves[1].cards.Count(), 1, "movies, series, and episodes only")
+        end sub
+
+        @it("borrows at most four Home rows, without tvOS's personal and recently added ones")
+        sub _()
+            home = []
+            for each kind in ["continue_watching", "empty", "trending", "recently_added", "genre", "next_up", "collection", "studio", "popular", "Forgotten_Favorites"]
+                cards = [m.card("movie:" + kind, "movie")]
+                if kind = "empty" then cards = []
+                home.Push({ id: kind, title: kind, sectionType: kind, cards: cards })
+            end for
+            shelves = watchparty.picker.shelves({ home: home })
+            m.assertEqual(m.ids(shelves), ["home.trending", "home.genre", "home.collection", "home.studio"])
+        end sub
+
+        @it("keeps Home's movies and series, and the other shelves' episodes too")
+        sub _()
+            episode = m.card("episode:x", "episode")
+            shelves = watchparty.picker.shelves({ home: [{ id: "h", title: "H", sectionType: "trending", cards: [episode] }], recentMovies: [episode] })
+            m.assertEqual(m.ids(shelves), ["recentMovies"])
+            m.assertFalse(watchparty.picker.homeShown("Next_Up"))
+            m.assertTrue(watchparty.picker.homeShown("trending"))
+        end sub
+
+        @it("is empty with nothing to pick from")
+        sub _()
+            m.assertEqual(watchparty.picker.shelves({}), [])
+            m.assertEqual(watchparty.picker.shelves({ watchlist: [m.card("", "movie")] }), [], "a placeholder card is not a title")
+        end sub
+
+        '----------------------------------------------------------------------
+        @describe("choosing")
+
+        @it("confirms a movie or an episode, and a series' group next episode")
+        sub _()
+            picker = tests.party.fixture("picker")
+            ups = watchparty.picker.nextUps({ continueTogether: [], watchlistUnion: [{ item: picker.watchlist_union[0].item, members: [], nextUp: { contentId: "episode:the-bear-s02e06", seasonNumber: 2, episodeNumber: 6 } }] })
+            m.assertEqual(ups["series:the-bear"].contentId, "episode:the-bear-s02e06")
+            m.assertEqual(watchparty.picker.route(m.card("movie:heat", "movie"), ups), { kind: "confirm", contentId: "movie:heat" })
+            m.assertEqual(watchparty.picker.route(m.card("episode:x", "Episode"), ups), { kind: "confirm", contentId: "episode:x" })
+            m.assertEqual(watchparty.picker.route(m.card("series:the-bear", "series"), ups), { kind: "confirm", contentId: "episode:the-bear-s02e06" })
+        end sub
+
+        @it("opens another series' episodes, and nothing for other kinds")
+        sub _()
+            m.assertEqual(watchparty.picker.route(m.card("series:sev", "series", { title: "Severance" }), {}), { kind: "episodes", seriesId: "series:sev", title: "Severance" })
+            m.assertEqual(watchparty.picker.route(m.card("series:sev", "series", { title: "", caption: "Severance" }), {}).title, "Severance")
+            m.assertInvalid(watchparty.picker.route(m.card("season:x", "season"), {}))
+            m.assertInvalid(watchparty.picker.route(invalid, {}))
+        end sub
+
+        @it("names the picker for its purpose")
+        sub _()
+            m.assertEqual(watchparty.picker.titleKey("select"), "watchParty.picker.select")
+            m.assertEqual(watchparty.picker.titleKey("suggest"), "watchParty.picker.suggest")
+        end sub
+
+        '----------------------------------------------------------------------
+        @describe("requests")
+
+        @it("reads the watchlist and the recently added shelves as single rows")
+        sub _()
+            request = watchparty.picker.watchlistRequest(false)
+            m.assertEqual(request.path, "/api/v2/catalog")
+            m.assertEqual([request.query.type, request.query.limit, request.query.source], ["video", 40, "watchlist"])
+            m.assertEqual(request.map.kind, catalog.kind.ROW)
+            request = watchparty.picker.recentRequest("series", false)
+            m.assertEqual([request.query.type, request.query.limit, request.query.sort, request.query.order], ["series", 24, "added_at", "desc"])
+            m.assertEqual(request.auth, "profile")
+            m.assertNotInvalid(request.query.poster_width, "with the shelves' artwork")
+        end sub
+
+        '----------------------------------------------------------------------
+        @describe("the confirm page")
+
+        @it("takes the title, its series, and its facts from the catalog read")
+        sub _()
+            detail = catalog.detail.fromItem({ content_id: "episode:bear-s02e06", type: "episode", title: "Fishes", series_title: "The Bear", series_id: "series:the-bear", season_number: 2, episode_number: 6, year: 2023, runtime: 66, poster_url: "/p.jpg", overview: "Christmas.", user_state: { is_in_progress: false } }, tests.catalogData.words())
+            choice = watchparty.picker.choice(detail)
+            m.assertEqual([choice.contentId, choice.contentType, choice.title, choice.subtitle], ["episode:bear-s02e06", "episode", "Fishes", "The Bear"])
+            m.assertEqual(choice.facts[0], "The Bear")
+            m.assertEqual(choice.facts[1], "2023")
+            m.assertEqual([choice.seriesId, choice.seasonNumber, choice.episode], ["series:the-bear", 2, true])
+            m.assertEqual([choice.posterUri, choice.overview], ["/p.jpg", "Christmas."])
+            m.assertTrue(choice.spoilerText, "an unwatched episode's overview is protected")
+            movie = watchparty.picker.choice(catalog.detail.fromItem({ content_id: "movie:heat", type: "movie", title: "Heat", year: 1995 }, tests.catalogData.words()))
+            m.assertEqual([movie.contentType, movie.subtitle, movie.facts[0], movie.episode], ["movie", "", "1995", false])
+            m.assertFalse(movie.spoilerText)
+        end sub
+
+        @it("shows the resolution, then HDR, as the hero's quality chips")
+        sub _()
+            m.assertEqual(watchparty.picker.qualityChips(["4K", "DOLBY VISION", "ATMOS"]), ["4K", "HDR"])
+            m.assertEqual(watchparty.picker.qualityChips(["1080p", "EAC3"]), ["1080p"])
+            m.assertEqual(watchparty.picker.qualityChips(["HDR10"]), ["HDR"])
+            m.assertEqual(watchparty.picker.qualityChips(invalid), [])
+        end sub
+    end class
+end namespace

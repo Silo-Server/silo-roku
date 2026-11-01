@@ -1,0 +1,371 @@
+import "pkg:/source/onboarding/focus.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/lobby.bs"
+import "pkg:/source/watchparty/room.bs"
+
+' The Watch Party screens' decisions beyond source/watchparty/lobby.bs
+' (docs/watch-party.md section 4): the page without a party, entering from
+' a title, the lobby's focus and context, the ballot's and strip's
+' menus, the invitation's link, party options, the picker's confirm
+' button, and Who's Seen It. Each gives data and locale keys, never text.
+' Pure: it reads the room Task's outputs (components/tasks/RoomTask.bs) as
+' values.
+namespace watchparty.page
+    ' The page's controls (section 4.2).
+    const START = "start"
+    const START_VOTE = "startVote"
+    const REJOIN = "rejoin"
+    const JOIN_CODE = "joinCode"
+    const CHECK_AGAIN = "checkAgain"
+
+    ' The lobby's rows of controls, top to bottom (lobbyMove).
+    const ROW_TOP = "top"
+    const ROW_BALLOT = "ballot"
+    const ROW_STRIP = "strip"
+    const ROW_BOTTOM = "bottom"
+
+    ' ---- The page without a party (sections 4.2 and 4.3)
+
+    ' The right column's controls in focus order: { key, labelKey, values,
+    ' captionKey, kind ("primary", "secondary", or "outlined"), enabled,
+    ' column ("host" or "join") }. Starting, Rejoin, and the keypad act only
+    ' while the server supports a party; Check again shows while its
+    ' support is unknown or refused (watchparty.lobby.showsCheckAgain).
+    ' recent is the room Task's recent output.
+    function controls(support as String, recent as Dynamic) as Object
+        supported = support = "available"
+        out = []
+        out.Push({ key: START, labelKey: "watchParty.page.start", values: {}, captionKey: "", kind: "primary", enabled: supported, column: "host" })
+        out.Push({ key: START_VOTE, labelKey: "watchParty.page.startVote", values: {}, captionKey: "", kind: "secondary", enabled: supported, column: "host" })
+        if util.isObject(recent) and util.text(recent.roomId) <> ""
+            rejoinRow = watchparty.lobby.rejoin(recent)
+            out.Push({ key: REJOIN, labelKey: rejoinRow.key, values: rejoinRow.values, captionKey: rejoinRow.captionKey, kind: "outlined", enabled: supported, column: "host" })
+        end if
+        out.Push({ key: JOIN_CODE, labelKey: "watchParty.page.joinWithCode", values: {}, captionKey: "", kind: "secondary", enabled: supported, column: "join" })
+        if watchparty.lobby.showsCheckAgain(support) then out.Push({ key: CHECK_AGAIN, labelKey: "watchParty.page.checkAgain", values: {}, captionKey: "", kind: "secondary", enabled: true, column: "join" })
+        return out
+    end function
+
+    ' The control focus starts on: Rejoin when there is a recent party,
+    ' else Start a party, else the first that acts; -1 for none (the page
+    ' keeps focus itself, so Back still leaves).
+    function initialFocus(list as Object) as Integer
+        for each key in [REJOIN, START]
+            for i = 0 to list.Count() - 1
+                if list[i].key = key and list[i].enabled then return i
+            end for
+        end for
+        return nextEnabled(list, -1, 1)
+    end function
+
+    ' The next control that acts from index in direction step (1 or -1),
+    ' or -1: disabled controls take no focus, as on tvOS.
+    function nextEnabled(list as Object, index as Integer, stepBy as Integer) as Integer
+        at = index + stepBy
+        while at >= 0 and at < list.Count()
+            if list[at].enabled then return at
+            at = at + stepBy
+        end while
+        return -1
+    end function
+
+    ' The message the page opens with: params.message, the ended or
+    ' replaced message the app navigates with (section 4.11), as
+    ' { key, text }: a "watchParty." locale key, or text as it is.
+    function message(params as Dynamic) as Object
+        if not util.isObject(params) then return { key: "", text: "" }
+        value = util.text(params.message)
+        if Left(value, 11) = "watchParty." then return { key: value, text: "" }
+        return { key: "", text: value }
+    end function
+
+    ' ---- Entering from a title (section 4.1)
+
+    ' Whether a title's More item and the avatar menu offer Watch Party:
+    ' the room Task's support says available.
+    function available(support as Dynamic) as Boolean
+        return util.isObject(support) and util.text(support.state) = "available"
+    end function
+
+    ' The command a title's More item sends for watchparty.lobby's
+    ' entryAction, or invalid for "lobbyOnly" (the page says so). entry is
+    ' the page's params.entry: { contentId, contentType ("movie" or
+    ' "episode"), title, subtitle, posterUrl, fileId, libraryId }.
+    function entryCommand(action as String, entry as Object) as Dynamic
+        contentId = util.text(entry.contentId)
+        if contentId = "" then return invalid
+        if action = "create"
+            return { kind: "create", mode: "host_pick", selection: { contentId: contentId, fileId: util.text(entry.fileId), libraryId: util.text(entry.libraryId) }, title: util.text(entry.title) }
+        end if
+        if action = "select" then return { kind: "select", contentId: contentId, fileId: util.text(entry.fileId), libraryId: util.text(entry.libraryId), title: util.text(entry.title) }
+        if action = "suggest"
+            contentType = util.text(entry.contentType)
+            if contentType <> "episode" then contentType = "movie"
+            return { kind: "suggest", contentId: contentId, contentType: contentType, title: util.text(entry.title), subtitle: util.text(entry.subtitle), posterUrl: util.text(entry.posterUrl) }
+        end if
+        return invalid
+    end function
+
+    ' ---- The lobby (section 4.4)
+
+    ' The room as laid out: a host pick the server has not confirmed yet
+    ' counts as chosen (tvOS's displayRoom), so a party started from a title
+    ' never passes through the empty lobby. sync is the room Task's sync
+    ' output.
+    function displayRoom(room as Dynamic, sync as Dynamic) as Dynamic
+        if not util.isObject(room) or util.text(room.roomId) = "" then return invalid
+        if room.selectedContentId <> "" or room.selectionMode <> "host_pick" then return room
+        if not util.isObject(sync) or not util.isTrue(sync.selectionPending) or not util.isObject(sync.title) then return room
+        pending = util.text(sync.title.contentId)
+        if pending = "" then return room
+        out = {}
+        out.Append(room)
+        out.selectedContentId = pending
+        return out
+    end function
+
+    ' watchparty.lobby's ctx from the room Task's outputs (state: { room,
+    ' connection, support, sync, suggestions }), the selected title once
+    ' a screen read it (item: { contentId, title, unavailable }, or
+    ' invalid), whether this device's player is parked at the end, and the
+    ' last error's text.
+    function context(state as Object, item as Dynamic, playbackEnded as Boolean, errorText as String) as Object
+        features = {}
+        if util.isObject(state.support) and util.isObject(state.support.features) then features = state.support.features
+        rows = suggestionRows(state.suggestions)
+        winner = invalid
+        winnerId = ""
+        if util.isObject(state.suggestions) then winnerId = util.text(state.suggestions.winnerId)
+        for each row in rows
+            if winnerId <> "" and row.id = winnerId then winner = row
+        end for
+        room = displayRoom(state.room, state.sync)
+        title = ""
+        unavailable = false
+        selected = ""
+        if room <> invalid then selected = room.selectedContentId
+        sync = state.sync
+        if util.isObject(item) and util.text(item.contentId) = selected and selected <> ""
+            title = util.text(item.title)
+            unavailable = util.isTrue(item.unavailable)
+        else if util.isObject(sync) and util.isObject(sync.title) and util.text(sync.title.contentId) = selected and selected <> ""
+            title = util.text(sync.title.title)
+            unavailable = util.isTrue(sync.title.unavailable)
+        end if
+        connection = "idle"
+        if util.isObject(state.connection) then connection = util.text(state.connection.state)
+        return {
+            features: features,
+            winner: winner,
+            suggestionCount: rows.Count(),
+            itemTitle: title,
+            selectionUnavailable: unavailable,
+            selectionPending: util.isObject(sync) and util.isTrue(sync.selectionPending),
+            playbackEnded: playbackEnded,
+            connection: connection,
+            error: errorText
+        }
+    end function
+
+    ' The suggestions output's rows, or [].
+    function suggestionRows(suggestions as Dynamic) as Object
+        if util.isObject(suggestions) and type(suggestions.items) = "roArray" then return suggestions.items
+        return []
+    end function
+
+    ' Where Up and Down go between the lobby's rows, as tvOS's focus
+    ' sections lay them out: the top row's code pill and Options (right),
+    ' the ballot (left) or the suggestion strip (right) as one control
+    ' each, and the bottom row's Invite seat (left) then the buttons
+    ' (right). rows lists { kind, count } top to bottom; a row of no
+    ' controls is skipped. Entering a row picks the control nearest the
+    ' side left: the bottom row's Invite seat from the ballot, else its
+    ' last button; the top row's code pill from the Invite seat or the
+    ' ballot, else Options. Left and Right move within a row; invalid at
+    ' an edge.
+    function lobbyMove(rows as Object, at as Object, key as String) as Dynamic
+        if key = "left" or key = "right"
+            sizes = []
+            for each row in rows
+                sizes.Push(row.count)
+            end for
+            return onboarding.focus.move(sizes, at, key)
+        end if
+        if key <> "up" and key <> "down" then return invalid
+        stepBy = 1
+        if key = "up" then stepBy = -1
+        fromRow = rows[at.row]
+        leftSide = fromRow.kind = ROW_BALLOT or (fromRow.kind = ROW_BOTTOM and at.col = 0)
+        target = at.row + stepBy
+        while target >= 0 and target < rows.Count()
+            row = rows[target]
+            if row.count > 0
+                col = row.count - 1
+                if leftSide then col = 0
+                if row.kind = ROW_BALLOT or row.kind = ROW_STRIP then col = 0
+                return { row: target, col: col }
+            end if
+            target = target + stepBy
+        end while
+        return invalid
+    end function
+
+    ' ---- Ballot and strip (sections 4.5 and 4.6)
+
+    ' Options on a ballot card: "Start this one" for a manager with
+    ' vote_host_override, and "Remove suggestion" for a manager or the
+    ' suggester. [{ key: "start" | "remove", labelKey }].
+    function ballotMenu(suggestion as Object, room as Dynamic, features as Object) as Object
+        out = []
+        if util.isObject(room) and room.selfCanManageRoom and room.phase = "lobby" and util.isTrue(features.voteHostOverride) then out.Push({ key: "start", labelKey: "watchParty.ballot.startThis" })
+        if watchparty.lobby.canRemove(suggestion, room) then out.Push({ key: "remove", labelKey: "watchParty.ballot.remove" })
+        return out
+    end function
+
+    ' Options on a strip card: "Remove suggestion" under the ballot's rule.
+    function stripMenu(suggestion as Object, room as Dynamic) as Object
+        out = []
+        if watchparty.lobby.canRemove(suggestion, room) then out.Push({ key: "remove", labelKey: "watchParty.ballot.remove" })
+        return out
+    end function
+
+    ' Whether OK on a strip card queues it: a connected manager, and not
+    ' the title already staged.
+    function canQueue(suggestion as Object, room as Dynamic, connection as String) as Boolean
+        if not util.isObject(room) or not room.selfCanManageRoom or room.phase <> "lobby" or connection <> "connected" then return false
+        return suggestion.contentId <> room.selectedContentId
+    end function
+
+    ' Whether the strip takes focus: some card queues or can be removed.
+    function stripFocusable(rows as Object, room as Dynamic, connection as String) as Boolean
+        for each row in rows
+            if canQueue(row, room, connection) or watchparty.lobby.canRemove(row, room) then return true
+        end for
+        return false
+    end function
+
+    ' Whether OK on a ballot card toggles the vote now: it waits while the
+    ' socket is down or a read of this member's votes is under way, since
+    ' only that read says which rows this member voted for (section 4.5).
+    function canVote(suggestions as Dynamic, connection as String) as Boolean
+        if connection <> "connected" then return false
+        return not (util.isObject(suggestions) and util.isTrue(suggestions.loading))
+    end function
+
+    ' A ballot card's second line: the note in quotes, else the subtitle.
+    function ballotLine(suggestion as Object) as Object
+        if util.text(suggestion.note) <> "" then return { key: "watchParty.ballot.note", values: { note: suggestion.note }, text: "" }
+        return { key: "", values: {}, text: util.text(suggestion.subtitle) }
+    end function
+
+    ' ---- Seats (section 4.4)
+
+    ' A seat's line under its name: "Host", "You", and its state, as keys
+    ' in order (the screen joins them with " · ").
+    function seatLine(seat as Object) as Object
+        out = []
+        if seat.member.isHost then out.Push("watchParty.seat.host")
+        if seat.member.isSelf then out.Push("watchParty.seat.you")
+        if seat.stateKey <> "" then out.Push(seat.stateKey)
+        return out
+    end function
+
+    ' ---- Invitation (section 4.7)
+
+    ' The invitation's link: invite_path on the configured server, as the
+    ' server's web app answers it there; an absolute http(s) link as it
+    ' is; "" without one (a guest's room has none).
+    function inviteLink(origin as String, invitePath as String) as String
+        path = invitePath.Trim()
+        if path = "" then return ""
+        lowered = LCase(path)
+        if Left(lowered, 7) = "http://" or Left(lowered, 8) = "https://" then return path
+        if Left(path, 1) <> "/" or Left(path, 2) = "//" then return ""
+        base = origin.Trim()
+        if LCase(Left(base, 7)) <> "http://" and LCase(Left(base, 8)) <> "https://" then return ""
+        while Right(base, 1) = "/"
+            base = Left(base, Len(base) - 1)
+        end while
+        return base + path
+    end function
+
+    ' ---- Party options (section 4.9)
+
+    ' The rows of "Party options" in order: [{ key, labelKey, valueKey,
+    ' destructive }], key one of "mode", "policy", "stop", "end", "leave",
+    ' "close".
+    function optionRows(room as Dynamic, features as Object) as Object
+        out = []
+        if util.isObject(room) and room.selfCanManageRoom
+            if room.phase = "lobby" and util.isTrue(features.selectionModeSwitch)
+                value = "watchParty.options.hostChooses"
+                if room.selectionMode = "vote" then value = "watchParty.options.everyoneVotes"
+                out.Push({ key: "mode", labelKey: "watchParty.options.whoChooses", valueKey: value, destructive: false })
+            end if
+            value = "watchParty.options.hostOnly"
+            if room.guestControlPolicy = "guest_play_pause" then value = "watchParty.options.guestsPlayPause"
+            out.Push({ key: "policy", labelKey: "watchParty.options.playbackControls", valueKey: value, destructive: false })
+            if room.phase = "playing" and util.isTrue(features.stopPlayback) then out.Push({ key: "stop", labelKey: "watchParty.options.returnToLobby", valueKey: "", destructive: false })
+            out.Push({ key: "end", labelKey: "watchParty.options.end", valueKey: "", destructive: true })
+        end if
+        out.Push({ key: "leave", labelKey: "watchParty.options.leave", valueKey: "", destructive: true })
+        out.Push({ key: "close", labelKey: "watchParty.options.close", valueKey: "", destructive: false })
+        return out
+    end function
+
+    ' The command an option row sends, or invalid for one that only opens
+    ' or closes something (end asks first; close; leave).
+    function optionCommand(key as String, room as Object) as Dynamic
+        if key = "mode"
+            mode = "vote"
+            if room.selectionMode = "vote" then mode = "host_pick"
+            return { kind: "mode", mode: mode }
+        end if
+        if key = "policy"
+            policy = "guest_play_pause"
+            if room.guestControlPolicy = "guest_play_pause" then policy = "host_only"
+            return { kind: "policy", policy: policy }
+        end if
+        if key = "stop" then return { kind: "stop" }
+        if key = "leave" then return { kind: "leave" }
+        return invalid
+    end function
+
+    ' ---- The picker's confirm page (section 4.8)
+
+    ' The confirm button for purpose ("select" or "suggest"): { labelKey,
+    ' kind }, kind the command it sends. "Choose for the party" stages a
+    ' lobby's pick on a server with staged_selection; otherwise a pick
+    ' plays for everyone.
+    function confirmAction(purpose as String, room as Dynamic, features as Object) as Object
+        if purpose = "suggest" then return { labelKey: "watchParty.confirm.addSuggestion", kind: "suggest" }
+        if util.isObject(room) and room.phase = "lobby" and util.isTrue(features.stagedSelection) then return { labelKey: "watchParty.confirm.choose", kind: "select" }
+        return { labelKey: "watchParty.confirm.playForEveryone", kind: "select" }
+    end function
+
+    ' Who's Seen It's rows for contentId: one per connected member, in the
+    ' room's order, { name, key, watchlist } (watchparty.lobby.whoSeen). A
+    ' member the answer leaves out has no viewing history.
+    function whoSeenRows(room as Dynamic, memberState as Dynamic, contentId as String) as Object
+        out = []
+        if not util.isObject(room) or type(room.members) <> "roArray" then return out
+        entries = []
+        if util.isObject(memberState) and type(memberState.items) = "roArray"
+            for each item in memberState.items
+                if util.text(item.contentId) = contentId and type(item.members) = "roArray" then entries = item.members
+            end for
+        end if
+        for each member in room.members
+            if member.connected
+                found = invalid
+                for each entry in entries
+                    if util.text(entry.userId) = member.userId and util.text(entry.profileId) = member.profileId then found = entry
+                end for
+                line = watchparty.lobby.whoSeen(invalid, false)
+                if found <> invalid then line = watchparty.lobby.whoSeen(found.state, util.isTrue(found.onWatchlist))
+                out.Push({ name: member.displayName, key: line.key, watchlist: line.watchlist })
+            end if
+        end for
+        return out
+    end function
+end namespace
