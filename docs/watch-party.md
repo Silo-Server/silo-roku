@@ -671,10 +671,13 @@ seeks past the room and waits, paused, for the room to reach it:
   paused position, less 100 ms for the resume (`HOLD_PLAY_LEAD_MS`),
   timed on the task like a command. Holds are at most 15 s, since the
   aim is.
-- **Behind anyway.** A landing more than 1 s behind the room teaches the
-  estimate and seeks again, at most 3 seeks a hold; after that, or for a
-  landing within 1 s behind, it plays at once and the rules above take
-  over. A hold seek that never shows a landing within 10 s plays.
+- **Behind anyway.** A landing more than 0.4 s behind the room (the
+  deadband) teaches the estimate and seeks again, at most 3 seeks a hold;
+  after that, or for a landing within 0.4 s behind, it plays at once and
+  the rules above take over. A landing up to 1 s behind would sit inside
+  both the server's band and the corrections' threshold, so nothing would
+  correct it once it played (the Stick stayed 1.0 to 1.5 s behind after
+  one). A hold seek that never shows a landing within 10 s plays.
 - **Ends.** A new room command ends the hold (its play state applies, so
   a play resumes), except a play whose room position is within 1 s of the
   one the hold follows: that is the server's correction for reports sent
