@@ -5,18 +5,20 @@ namespace tests
     ' Watch Party's screens (components/screens/watchParty/) in the test
     ' scene, over a stand-in for the room Task (m.global.roomTask): a plain
     ' node with its output fields, whose command field keeps the last
-    ' command a screen sent.
+    ' command a screen sent, and the app's PartyRelay (m.global.roomRelay),
+    ' to which the spec publishes each output change as AppScene does
+    ' (emit).
     @suite("watch party screens")
     class WatchPartyScreensTests extends rooibos.BaseTestSuite
 
-        ' Each screen lets the relay go as the app releases it, and the next
-        ' test starts with a relay of its own.
+        ' Each screen unsubscribes its feeds as the app releases it, and the
+        ' next test starts with a relay of its own.
         protected override sub afterEach()
             tests.scene.reset()
             for each child in m.top.getChildren(-1, 0)
                 kind = child.subtype()
                 if kind = "WatchPartyScreenProbe" then child.callFunc("onRelease")
-                if kind = "PartyLobbyProbe" then child.callFunc("release")
+                if kind = "PartyLobbyProbe" or kind = "WatchPartyPanelProbe" then child.callFunc("release")
                 if Right(kind, 5) = "Probe" then m.top.removeChild(child)
             end for
             if m.global.hasField("roomTask") then m.global.roomTask = invalid
@@ -34,9 +36,17 @@ namespace tests
             node.setFields({ room: {}, connection: { state: "idle" }, support: { state: "available", missing: [], features: m.features(), checking: false }, sync: {}, suggestions: { items: [], winnerId: "", loading: false }, recent: {}, busy: { kind: "" } })
             node.setFields(fields)
             if not m.global.hasField("roomTask") then m.global.addField("roomTask", "node", false)
+            if not m.global.hasField("roomRelay") then m.global.addField("roomRelay", "node", false)
             m.global.roomTask = node
+            m.global.roomRelay = CreateObject("roSGNode", "PartyRelay")
             return node
         end function
+
+        ' The Task sets an output, and AppScene publishes the change.
+        sub emit(field as String, value as Dynamic)
+            m.global.roomTask.setField(field, value)
+            m.global.roomRelay.callFunc("publish", { field: field, data: value })
+        end sub
 
         function features(fields = {} as Object) as Object
             out = { stagedSelection: true, lobbyReady: true, selectionModeSwitch: true, stopPlayback: true, voteHostOverride: true, picker: false, memberState: false, maxMemberStateIds: 0, sourceFallback: false }
@@ -135,12 +145,50 @@ namespace tests
 
         @it("moves to the lobby once the room has a party")
         sub _()
-            room = m.task()
+            m.task()
             node = m.screen()
-            room.room = m.lobbyRoom()
+            m.emit("room", m.lobbyRoom())
             m.assertNotInvalid(node.callFunc("probeLobby"))
-            room.room = {}
+            m.emit("room", {})
             m.assertInvalid(node.callFunc("probeLobby"), "and back to the page when it goes")
+        end sub
+
+        @it("shows the lobby at once when AppScene opens it in place of the player")
+        sub _()
+            room = m.task({ room: m.lobbyRoom(), connection: { state: "connected" } })
+            node = m.screen({})
+            m.assertNotInvalid(node.callFunc("probeLobby"), "the room went back to the lobby")
+            command = room.command
+            m.assertFalse(util.isObject(command) and util.text(command.kind) = "checkSupport", "no support check in a party")
+        end sub
+
+        @it("hides Rejoin after an ended party, whatever the Task still says")
+        sub _()
+            m.task({ recent: { roomId: "r1", code: "K7PQ2M4X", title: "Heat", replaced: false } })
+            node = m.screen({ message: "watchParty.ended.ended", rejoin: "none" })
+            m.assertEqual(m.keys(node.callFunc("probeControls")), ["start", "startVote", "joinCode"])
+            m.assertEqual(node.callFunc("probeBanner"), i18n.text("watchParty.ended.ended"))
+        end sub
+
+        @it("offers Continue here after a replacement, and focuses it once it shows")
+        sub _()
+            m.task()
+            node = m.screen({ message: "watchParty.ended.replaced", rejoin: "continueHere" })
+            m.assertEqual(m.keys(node.callFunc("probeControls")), ["start", "startVote", "joinCode"], "the Task has not written the recent party yet")
+            m.emit("recent", { roomId: "r1", code: "K7PQ2M4X", title: "Heat", replaced: false })
+            controls = node.callFunc("probeControls")
+            m.assertEqual(controls[2].text, i18n.text("watchParty.rejoin.continueHere"))
+            m.assertTrue(controls[2].highlighted)
+        end sub
+
+        @it("asks AppScene for the player from the page's Return to playback")
+        sub _()
+            m.task({ room: tests.party.makeRoom(), connection: { state: "connected" } })
+            node = m.screen({})
+            lobby = node.callFunc("probeLobby")
+            m.assertEqual(lobby.findNode("primary").text, i18n.text("watchParty.button.returnToPlayback"))
+            lobby.returnToPlayback = true
+            m.assertEqual(m.top.callFunc("sceneLog").watchParty, ["returnToPlayback"])
         end sub
 
         '----------------------------------------------------------------------
@@ -204,7 +252,7 @@ namespace tests
             m.assertEqual(view.title, "Heat")
             m.assertTrue(node.callFunc("probeKey", "play"))
             m.assertEqual(m.global.roomTask.command.kind, "start")
-            m.global.roomTask.connection = { state: "reconnecting" }
+            m.emit("connection", { state: "reconnecting" })
             m.assertFalse(node.callFunc("probeView").primaryEnabled)
             m.assertEqual(node.callFunc("probeView").banner, i18n.text("watchParty.banner.reconnecting"))
         end sub
@@ -241,8 +289,76 @@ namespace tests
         @it("tells its owner when the party goes away")
         sub _()
             node = m.lobby(m.lobbyRoom())
-            m.global.roomTask.room = {}
+            m.emit("room", {})
             m.assertTrue(node.left)
+        end sub
+
+        '----------------------------------------------------------------------
+        @describe("the room panel")
+
+        ' A panel over the player, as AppScene opens it.
+        function panel(room as Object, sync = {} as Object) as Object
+            tests.scene.reset()
+            theme.install()
+            m.task({ room: room, connection: { state: "connected" }, sync: sync })
+            node = CreateObject("roSGNode", "WatchPartyPanelProbe")
+            m.top.appendChild(node)
+            node.setFields({ owner: "screen.1", lowTier: false })
+            node.callFunc("start")
+            return node
+        end function
+
+        function panelLobby(node as Object) as Object
+            return node.findNode("lobbyLayer").getChild(0)
+        end function
+
+        @it("opens the lobby with Return to playback and focus, and returns for Back")
+        sub _()
+            node = m.panel(tests.party.makeRoom())
+            lobby = m.panelLobby(node)
+            m.assertEqual(lobby.mode, "panel")
+            m.assertEqual(lobby.findNode("primary").text, i18n.text("watchParty.button.returnToPlayback"))
+            m.assertTrue(lobby.isInFocusChain(), "the lobby has focus")
+            m.assertTrue(node.callFunc("probeKey", "back"))
+            m.assertEqual(node.dismissed, "returnToPlayback")
+            node.callFunc("release")
+            m.assertEqual(node.findNode("lobbyLayer").getChildCount(), 0, "the lobby goes with it")
+        end sub
+
+        @it("offers a manager Return everyone to lobby once the player is parked at the end")
+        sub _()
+            room = tests.party.makeRoom({ selfRole: "host", selfCanManageRoom: true, selfCanControlTransport: true })
+            node = m.panel(room)
+            lobby = m.panelLobby(node)
+            m.assertEqual(lobby.findNode("primary").text, i18n.text("watchParty.button.returnToPlayback"))
+            m.emit("sync", { atEnd: true })
+            m.assertEqual(lobby.findNode("primary").text, i18n.text("watchParty.button.returnToLobby"))
+        end sub
+
+        @it("dismisses itself when the party goes away")
+        sub _()
+            node = m.panel(tests.party.makeRoom())
+            m.emit("room", {})
+            m.assertEqual(node.dismissed, "left")
+        end sub
+
+        '----------------------------------------------------------------------
+        @describe("the relay")
+
+        @it("hands each change only to feeds that want it, until they unsubscribe")
+        sub _()
+            relay = CreateObject("roSGNode", "PartyRelay")
+            feed = CreateObject("roSGNode", "PartyFeed")
+            feed.fields = { room: true }
+            feed.update = { field: "none", data: invalid }
+            relay.callFunc("subscribe", feed)
+            relay.callFunc("publish", { field: "sync", data: { atEnd: true } })
+            m.assertEqual(feed.update.field, "none", "not a field it wants")
+            relay.callFunc("publish", { field: "room", data: { roomId: "r1" } })
+            m.assertEqual(feed.update, { field: "room", data: { roomId: "r1" } })
+            relay.callFunc("unsubscribe", feed)
+            relay.callFunc("publish", { field: "room", data: {} })
+            m.assertEqual(feed.update.data, { roomId: "r1" })
         end sub
     end class
 end namespace

@@ -1,3 +1,4 @@
+import "pkg:/source/memory/policy.bs"
 import "pkg:/source/nav/phase.bs"
 import "pkg:/source/nav/routes.bs"
 import "pkg:/source/nav/stack.bs"
@@ -8,27 +9,48 @@ import "pkg:/source/watchparty/app.bs"
 ' AppScene as Watch Party's room-session owner (docs/watch-party.md
 ' section 11). It creates the app run's one RoomTask and RoomApiBridge,
 ' publishes the Task as m.global.roomTask for the screens and the player
-' (components/tasks/RoomTask.bs is the field contract), and sets its
-' identity on every session change: a sign-in, a profile or server change,
-' a sign-out, or a phone's borrowed identity (watchparty.app.identity).
-' It forgets a removed server's recent party, opens the room's player
-' when the room plays and closes it when the room stops (section 4.10),
-' shows the Watch Party page with the message when the party ends for
-' this device (section 4.11), and hosts the room panel the player asks
-' for (watchPartyPanel). The rules are watchparty.app's.
+' to send commands to and read (components/tasks/RoomTask.bs is the field
+' contract), and sets its identity on every session change: a sign-in, a
+' profile or server change, a sign-out, or a phone's borrowed identity
+' (watchparty.app.identity). It is the Task's only observer
+' (implementation plan section 4.2): it acts on each output change itself,
+' then publishes it to the app's PartyRelay (m.global.roomRelay), whose
+' feeds the screens, the room panel, and the party player subscribe. It
+' forgets a removed server's recent party, opens the room's player when
+' the room plays and closes it when the room stops (section 4.10), shows
+' the Watch Party page with the message when the party ends for this
+' device (section 4.11), and hosts the room panel the player asks for
+' (watchPartyPanel). The rules are watchparty.app's.
 
 sub watchPartyInit()
     task = CreateObject("roSGNode", "RoomTask")
+    relay = CreateObject("roSGNode", "PartyRelay")
     ' forgetting: request ID to the origin of a server being removed.
-    m.wp = { task: task, ready: false, queued: [], identity: "", forgetting: {}, panel: invalid }
+    m.wp = { task: task, relay: relay, ready: false, queued: [], identity: "", forgetting: {}, panel: invalid }
     m.top.findNode("roomApiBridge").task = task
     task.observeField("ready", "onWatchPartyReady")
-    task.observeField("room", "onWatchPartyRoom")
-    task.observeField("ended", "onWatchPartyEnded")
+    for each field in watchparty.app.outputs()
+        task.observeField(field, "onWatchPartyOutput")
+    end for
     if not m.global.hasField("roomTask") then m.global.addFields({ roomTask: task })
+    if not m.global.hasField("roomRelay") then m.global.addFields({ roomRelay: relay })
     m.watchPartyLayer = m.top.findNode("watchPartyLayer")
     m.top.observeField("watchPartyPanel", "onWatchPartyPanel")
     task.control = "run"
+end sub
+
+' A room Task output changed: AppScene acts on the room and the party's
+' end first, then every subscribed feed hears it, each set's own value
+' (the Task may set the field again before this runs).
+sub onWatchPartyOutput(event as Object)
+    field = event.getField()
+    data = event.getData()
+    if field = "room"
+        watchPartyFollowRoom(data)
+    else if field = "ended"
+        watchPartyEnded(data)
+    end if
+    m.wp.relay.callFunc("publish", { field: field, data: data })
 end sub
 
 ' A command for the Task; ones set before it observes its fields wait.
@@ -84,10 +106,6 @@ end sub
 
 ' ---- The room's player (sections 4.10 and 8)
 
-sub onWatchPartyRoom(event as Object)
-    watchPartyFollowRoom(event.getData())
-end sub
-
 ' Opens, replaces, or closes the party player as the room says
 ' (watchparty.app.roomAction).
 sub watchPartyFollowRoom(room as Dynamic)
@@ -127,6 +145,31 @@ sub watchPartyFollowRoom(room as Dynamic)
     end if
 end sub
 
+' callFunc("watchPartyReturnToPlayback"): "Return to playback" on the
+' Watch Party page, for a member of a playing room whose player is not
+' open (section 4.4). The room's player opens over the page at the room's
+' position (watchparty.app.playerParams: the anchor, then the room's sync
+' command), or, should one lie directly beneath the page, the page goes.
+function watchPartyReturnToPlayback(_args = invalid as Dynamic) as Boolean
+    room = m.wp.task.room
+    entry = watchPartyPlayerEntry()
+    decision = watchparty.app.returnToPlayback(room, entry <> invalid, watchPartyPlayerBelowTop(entry))
+    log.info("watchparty", "[WP] return to playback", { decision: decision })
+    if decision = "open"
+        watchPartyFollowRoom(room)
+    else if decision = "pop"
+        navPop()
+    end if
+    return decision <> "none"
+end function
+
+' Whether entry is the one directly beneath the top of the stack.
+function watchPartyPlayerBelowTop(entry as Dynamic) as Boolean
+    entries = m.navStack.entries
+    count = entries.Count()
+    return entry <> invalid and count >= 2 and entries[count - 2].id = entry.id
+end function
+
 ' The party player's stack entry, or invalid.
 function watchPartyPlayerEntry() as Dynamic
     entries = m.navStack.entries
@@ -151,8 +194,7 @@ end function
 ' The party ended for this device: the panel and the player close, and the
 ' Watch Party page shows the message, in place of the party player or the
 ' page on top, else over whatever shows.
-sub onWatchPartyEnded(event as Object)
-    ended = event.getData()
+sub watchPartyEnded(ended as Dynamic)
     if not util.isObject(ended) then return
     params = watchparty.app.endedParams(ended)
     log.info("watchparty", "[WP] party ended", { reason: util.text(ended.reason), rejoin: params.rejoin })
@@ -182,32 +224,64 @@ end sub
 
 ' ---- The room panel (docs/watch-party.md section 11, Hooks)
 
-' watchPartyPanel { open, reason }: the party player sets open true (reason
-' "back" or "error"); the panel, Back that it leaves unhandled, or AppScene
-' sets it false. The panel component (nav.route.WATCH_PARTY_PANEL_COMPONENT)
-' is created in watchPartyLayer over the player and takes focus; the
-' player takes focus back once it is false.
+' watchPartyPanel { open, reason }: the party player sets open true where
+' its Back ladder would close it (reason "back") and from the error
+' screen's Go Back ("error"). AppScene then creates the panel
+' (nav.route.WATCH_PARTY_PANEL_COMPONENT) in watchPartyLayer over the
+' player, with the player's owner, and starts it, which gives its lobby
+' focus. It is set false when the panel is dismissed (Back, "Return to
+' playback", the party leaving), when Back reaches AppScene with the panel
+' open, and when the player or the party closes; the panel goes, and the
+' player takes focus back (partyPanelClosed).
 sub onWatchPartyPanel(event as Object)
     data = event.getData()
     if util.isObject(data) and util.isTrue(data.open)
-        if m.wp.panel <> invalid then return
-        panel = CreateObject("roSGNode", nav.route.WATCH_PARTY_PANEL_COMPONENT)
-        if panel = invalid
-            log.warn("watchparty", "[WP] this build has no room panel", {})
-            m.top.watchPartyPanel = { open: false, reason: "unavailable" }
-            return
-        end if
-        if panel.hasField("reason") then panel.reason = util.text(data.reason)
-        m.wp.panel = panel
-        m.watchPartyLayer.appendChild(panel)
-        panel.setFocus(true)
+        watchPartyOpenPanel(util.text(data.reason))
         return
     end if
     panel = m.wp.panel
-    if panel = invalid then return
     m.wp.panel = invalid
-    m.watchPartyLayer.removeChild(panel)
+    if panel <> invalid
+        reason = ""
+        if util.isObject(data) then reason = util.text(data.reason)
+        log.info("watchparty", "[WP] room panel closed", { reason: reason })
+        panel.callFunc("release")
+        m.watchPartyLayer.removeChild(panel)
+    end if
+    player = watchPartyPlayerScreen()
+    if player <> invalid then player.callFunc("partyPanelClosed")
 end sub
+
+sub watchPartyOpenPanel(reason as String)
+    if m.wp.panel <> invalid then return
+    player = watchPartyPlayerScreen()
+    panel = invalid
+    if player <> invalid and watchPartyActive() then panel = CreateObject("roSGNode", nav.route.WATCH_PARTY_PANEL_COMPONENT)
+    if panel = invalid
+        log.warn("watchparty", "[WP] no room panel to open", { player: player <> invalid })
+        m.top.watchPartyPanel = { open: false, reason: "unavailable" }
+        return
+    end if
+    log.info("watchparty", "[WP] room panel", { reason: reason })
+    panel.setFields({ owner: player.owner, lowTier: memoryState().tier = memory.tier.LOW })
+    panel.observeField("dismissed", "onWatchPartyPanelDismissed")
+    m.wp.panel = panel
+    m.watchPartyLayer.appendChild(panel)
+    panel.callFunc("start")
+end sub
+
+' The panel's Back, "Return to playback", or the party leaving it.
+sub onWatchPartyPanelDismissed(event as Object)
+    if m.wp.panel = invalid or not event.getRoSGNode().isSameNode(m.wp.panel) then return
+    m.top.watchPartyPanel = { open: false, reason: util.text(event.getData()) }
+end sub
+
+' The party player's screen, or invalid.
+function watchPartyPlayerScreen() as Dynamic
+    entry = watchPartyPlayerEntry()
+    if entry = invalid then return invalid
+    return m.navScreens[entry.id]
+end function
 
 sub watchPartyClosePanel()
     if m.wp.panel <> invalid then m.top.watchPartyPanel = { open: false, reason: "closed" }
