@@ -642,7 +642,7 @@ of settle from the last command or seek. Constants from
 | --- | --- |
 | Playing, drift ≤ 1 s | Nothing (the server's band is 1 s) |
 | Playing, drift > 1 s and ≤ 5 s (2 s for the host executing a command) | Seek in place to room + lead. Lead starts at 0; after each correction seek settles, lead = clamp(lead + residual, 0, 2 s). A residual over 1 s doubles the wait before the next seek, 1 s up to 16 s; a hit resets it to 1 s. Once this plan's landings fall short by more than 1 s: overshoot, then hold (below) |
-| Playing, drift > 5 s, or an in-place seek is a reload on this plan | Budgeted reload aimed ahead (below); on an in-place plan whose landings fall short by more than 1 s, and within 15 s, overshoot, then hold instead |
+| Playing, drift > 5 s, or an in-place seek is a reload on this plan | Budgeted reload aimed ahead (below); on an in-place plan whose landings fall short by more than 1 s, and within 15 s, overshoot, then hold instead; on a copy remux, a held reload aimed ahead of the room (below): a drift over 1 s, which a held reload lands within the deadband, reloads, no faster than the budget |
 | Command while paused or stopped | Seek first only if drift > 5 s, or > 1 s when an in-place seek is possible. Joining a playing room from behind on an in-place plan: overshoot, then hold (below). Otherwise (a copy remux, or a member ahead of the room), seek once more aimed ahead by the first seek's duration if it left more than 0.4 s |
 | Room `seek` command | Exactly to the target, no lead |
 
@@ -736,10 +736,77 @@ seeks past the room and waits, paused, for the room to reach it:
   nothing until it plays on the room position, so it can neither pull
   the room to its frozen frame nor be paused by a mismatch.
 
+**A copy remux's reload, aimed ahead, then held** (owner's decision,
+2026-11-01). On a copy remux every correction is a reload, a
+`seek_reanchor` that rebuilds the stream. With the lead-in reanchor (spec
+section 9.6) the Ultra on production, a 69 Mbps 4K Dolby Vision remux
+served through a proxy whose playlist the server grows slowly, opened
+every reload at the stream's origin, 10.3 to 10.6 s short of its
+`PlayStart`; the seek forward fell 4.4 to 6.9 s short of it, so the member
+stayed 4 to 6 s behind, the server corrected it, and it reloaded again
+every 20 to 30 s, each a visible stop. On the sandbox's small fixtures the
+same lead-in opened at the target. Roku opens a fresh remux playlist at
+its origin or later (the Streaming Stick: up to 8 s past it), never
+before it, so a party's correction reload on a copy remux
+(`watchparty.catchup`'s `remux*`, `watchparty.sync.beginRemuxHold`):
+
+- **Aims ahead.** It asks for its stream at the room's position when the
+  command runs, plus the time a reload takes from its command to showing
+  where it opened (6 s before one is measured: on production about 4.5 s
+  from the content's assignment to its first frame, after the replan and
+  the stop), plus 1.5 s, plus how far below its aim a recent reload
+  opened (the server's origin is the keyframe at or before the position
+  asked for: 0.2 to 1.0 s on production), at most 17 s ahead. The start
+  is the longest of the last 3 reloads' (at most 15 s); an opening past
+  the aim teaches nothing, since Roku does not repeat it reliably. It
+  asks for no lead-in and waits no 1.5 s, and its load plays from
+  wherever Roku opens it: neither the seek to the start nor "reanchoring
+  there" runs on it (`partyOpens` in `playback.session`). Where the aim
+  would reach into the last second of the file, the reload runs as
+  before.
+- **Holds.** The playerCommand is `{reload: true, hold: true, playing:
+  false}`: the player pauses the content it replaces, mutes, and opens the
+  new load paused at its first frame. Only that load's reports count as
+  the landing, never the old content's, whose own failure meanwhile (its
+  segments answered 410 once the replan moved the stream, on production)
+  does not end the hold. It holds paused where it opened, reporting
+  nothing, as an in-place hold does, and the Task plays it as the room
+  reaches it, less 100 ms. The server's corrections of the same timeline
+  during the reload continue the hold, as above. The player gives the new
+  load 25 s to show where it opened, then plays, and so does the Task;
+  the player's 20 s hold limit stands.
+- **Learns.** The Task's first sample of the landing records the reload's
+  time from its command and where it opened less where it aimed, for the
+  next aim.
+- **Behind anyway.** A landing more than 0.4 s behind the room plays at
+  once, since another reload costs a whole start; the budget below paces
+  the next, aimed by the slower start just learned.
+- **Budget.** The reload counts as one of the budget's (below), and its
+  hold's end (its play, the player's own end, or the 25 s limit) starts
+  the back-off to the next. A landing within the deadband lets the drift
+  loop reset the back-off. The member stays on the room after one reload
+  and its hold, about 7 to 9 s of a still frame on production, instead of
+  reloading every 20 to 30 s. The threshold stays the server's 1 s: a
+  held reload lands within the deadband, so it fixes any drift past it.
+- **Logs** (`[WP]`, section 11): `remux reload aim` (room, origin, ahead,
+  expectedStartMs, attempt), the player's `party reload` (aim true),
+  `remux reload opened` (origin, landed, room, ahead, startMs), `remux
+  hold` (holdAt, room, waitMs), the player's `holding` and `hold ended`
+  (reload true), `remux hold plays` (holdAt, room, heldMs), and the
+  fallbacks `remux reload opened behind the room; playing, the next
+  reload waits for the budget`, `remux reload showed no landing;
+  playing`, and `remux hold ended by the player`.
+
+A late joiner on a copy remux and a barrier still seek through the
+lead-in reanchor (sections 7.4 and 7.6), which production opens at the
+origin as well; section 13 keeps them open.
+
 **Reload budget** (`RoomReloadBudget`): one at a time; the next 10 s after
 the last one played, doubling to 60 s; a reload that never lands is stale
 after 30 s; each aims ahead by the previous load's time, at most 10 s;
 landed means within −0.4 to +2 s; drift under 0.4 s resets the back-off.
+A copy remux's held reload aims as above instead, and counts as played
+when its hold ends.
 
 The server re-sends a correction every 10 s or so while a member stays
 over 1 s off; executing one is idempotent.
@@ -751,7 +818,8 @@ attaches; the server's sync command does the rest. On an in-place plan
 that first command overshoots and holds (section 7.5), so the member
 starts playing on the room position instead of a load's or a seek's time
 plus a keyframe gap behind it; on a copy remux it seeks to the room (a `seek_reanchor`, which lands on the
-target) and realigns once. The Roku has no
+target on the sandbox, but at the stream's origin, 10 s short, on
+production's slowly grown 4K remux: section 13) and realigns once. The Roku has no
 background: Home closes the app and the socket with it. Roku's own
 overlays over the player do not pause the room.
 
@@ -869,7 +937,7 @@ reason}`. The room moves every member to a new revision.
 | Entry points | `source/home/shell.bs` and `components/screens/home/shell.bs`; `source/catalog/personal.bs` and `components/screens/detail/DetailPersonal.bs` | The avatar menu's Watch Party row and the detail page's More row (section 4.1) |
 | Picker | `components/screens/watchParty/picker/` | Section 4.8, reusing Home rows, Search, and the episode rail |
 | Art | `scripts/watch-party-art.py` into `images/watchparty/` | The seat shade and rings, the ballot's add card, and the backdrop's gradients |
-| Player | `components/player/PlayerParty.bs`, rules in `source/watchparty/player.bs` and `landing.bs`; the session reducer's party mode in `source/playback/session.bs` | Room start, Back to the panel, status pill, permissions, executing `playerCommand` on the render thread, and a seek's real landing and a barrier's muted roll (section 7.4) |
+| Player | `components/player/PlayerParty.bs`, rules in `source/watchparty/player.bs` and `landing.bs`; the session reducer's party mode in `source/playback/session.bs` | Room start, Back to the panel, status pill, permissions, executing `playerCommand` on the render thread, a seek's real landing and a barrier's muted roll (section 7.4), and a hold, a copy remux's held reload included (section 7.5) |
 | SiloControl in a party | `source/control/policy.bs` (`partyControl`, `partyOffer`), `components/player/PlayerRemote.bs`, `components/AppSceneControl.bs` | Section 9 |
 | Recent party | `source/watchparty/recent.bs` | Section 4.3, in its own 1 KB registry section `silo.party`, which only the room task writes. The session's own section keeps to 15 KB, above its largest record, so the app's five sections fit Roku's 32 KB |
 
@@ -903,7 +971,8 @@ waiting for a clock, the held seek target, permissions), `suggestions`,
 `memberState`, `picker`, `recent`, `busy`, and the one-shot
 `playerCommand` (`{seq, commandId, seek, reload, playing, settle?,
 hold?}`, `settle` only on a barrier's seek: section 7.4; `hold` only on
-an overshoot's seek: section 7.5), `notice`,
+an overshoot's seek or, with `reload`, a copy remux's held reload: section
+7.5), `notice`,
 `result`, and `ended`. Strings are locale keys (`watchParty.*` in
 `locale/en_US/strings.json`), never text, except a server's own error
 message.
@@ -1063,7 +1132,12 @@ The player's part:
 - The player executes `playerCommand` at once, the play state first and
   then the seek, through the session reducer (`seekTo`, or `partyReload`
   for a correction reload: a local reload of the plan where the timeline
-  allows one, else a `seek_reanchor`). The room's play state is the
+  allows one, else a `seek_reanchor`; a held one, `aim`, asks for its
+  position with no lead-in and leaves its load's start unchecked, section
+  7.5). A held reload's settle (`watchparty.landing.begin`'s `reload`)
+  notes positions only once a later load than the session had at the
+  command is on the node and has played, and the old content's error or
+  finished does not end it. The room's play state is the
   reducer's play intent, so the loads it opens follow it. A Video node
   that plays while the room wants it paused (a seek Roku resumed) pauses
   again, except while a barrier's settle plays it muted (section 7.4) or a
@@ -1116,7 +1190,10 @@ The player's part:
   viewer's and applied when the roll ends; the phone's snapshot reports
   the viewer's mute, not the roll's.
 - The diagnostics log's room lines start `[WP]` (the room task's, and
-  the player's commands, transport requests, sessions, and reloads).
+  the player's commands, transport requests, sessions, and reloads). The
+  sync rules write their own as `{kind: "log"}` actions, which the room
+  task logs: a copy remux's held reload's aim, opening, hold, and
+  fallbacks (section 7.5).
 
 ## 12. Testing
 
@@ -1139,7 +1216,12 @@ fixtures for snapshots, commands, and suggestions. Section 7.5's
 overshoot and hold has its own cases in `catchup.spec.bs` (aim, estimate,
 hold decisions), `landing.spec.bs` (pausing on the landing, timeouts),
 `player.spec.bs` (the sample's holding), and `sync.spec.bs` (late join,
-corrections, retries, report silence, and interruptions).
+corrections, retries, report silence, and interruptions); a copy remux's
+held reload in `catchup.spec.bs` (aim, learning, budget), `sync.spec.bs`
+(production's reload loop, the hold, the fallback, corrections meanwhile,
+timeouts), `landing.spec.bs`, `player.spec.bs`,
+`tests/playback/session.spec.bs` (no lead-in, no start check), and
+`tests/player/party.spec.bs` (the old content is not the landing).
 
 ### 12.3 Party matrix
 
@@ -1173,4 +1255,5 @@ OS 16.
 | A member at rest or playing ahead of the room could hold where it is instead of seeking | Not built: it seeks as before | Device runs that show members ahead often |
 | A Roku without `roWebSocket` | No Watch Party | Roku OS 16's release and device list |
 | Children's profiles see suggestions' raw titles and posters, which the server does not filter | Show them, as tvOS does | Server owner's view |
+| The lead-in reanchor (spec section 9.6) opened production's slowly grown 4K remux at the stream's origin, 10.3 to 10.6 s short, and its seek forward fell 4 to 6 s short. A party's correction reload no longer uses it (section 7.5); a late joiner's seek on a copy remux, a barrier there, and every reanchor outside a party still do | Keep the lead-in there until measured: the sandbox's fixtures opened at the target | Device runs on production's remux for a late join, a barrier, and an ordinary seek; whether a held reload suits a barrier, where the room waits at most 10 s |
 | A copy remux of a file with long keyframe gaps converges slowly: FX-021 (10.4 s gaps) took 7 corrections and about 2 minutes to settle, then held a p95 drift of 1.17 s. The 10 s remux lead-in (spec section 5.7) is shorter than the gap | Not changed: its corrections reload as on any copy remux (section 7.5) | Device runs on FX-021 with a change to the lead-in or to how a copy remux corrects |

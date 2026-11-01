@@ -2000,7 +2000,11 @@ Subtitles tab (criterion 4.8).
   These seeks are not the viewer's: playback does not count as seeking
   meanwhile, and a seek the viewer makes replaces them. A complete
   playlist at start, or `#EXT-X-START` that Roku honours, would make this
-  unnecessary: the server's fix.
+  unnecessary: the server's fix. A Watch Party's correction reload on a
+  copy remux asks for no lead-in and checks no start: it aims ahead of the
+  room and holds wherever Roku opens it (watch-party.md section 7.5),
+  since on production the lead-in opened at the stream's origin (section
+  9.6).
 - **Waiting and errors.** The spinner shows while the player buffers, and
   the Reconnecting card while recovery (section 9.6) runs. A failure shows,
   centred, a 40 px warning triangle in `#B00020`, the message in 26 px
@@ -3307,6 +3311,24 @@ reach the server" with Retry, whatever its reconnects are doing then: a try
 waiting, a replan the server has not answered, or a load that is not on the
 `Video` node yet or still buffers (its media restarting the stall timeout).
 An answer or a player callback that comes after it is ignored.
+
+**Open item: the lead-in on a slowly grown remux playlist.** Section
+5.7's lead-in reanchor (ask 10 s before the target, start the load at the
+target, assign the content 1.5 s later) opened at the target on the
+sandbox's small fixtures (W0-2, 14 of 14). On production (Roku Ultra,
+Roku OS 16.0.4, 2026-11-01), a 69 Mbps 4K Dolby Vision copy remux served
+through a proxy origin, with 10 to 22 MB segments that the server adds to
+its `EVENT` playlist slowly, Roku opened every lead-in reanchor at the
+stream's origin, position 0, 10.3 to 10.6 s short of its `PlayStart`: the
+playlist had not grown past the target by Roku's first read, so Roku
+ignored `PlayStart`. The seek forward to the start then landed 4.4 and
+6.9 s in ("the seek to the start did not land"). Once, after a rebuffer,
+the node also jumped back about 9 s by itself. A Watch Party's correction
+reload no longer uses the lead-in (watch-party.md section 7.5). Ordinary
+seeks on a copy remux, a party's late join and barrier, and a resume keep
+it, unchanged, until device runs on that remux show what to do there: a
+longer hold before assignment, a forward seek retried, or the server's
+`#EXT-X-START` or complete playlist.
 
 A media failure that arrives while a replan is in flight waits for that
 replan's answer, which may retire the failed transport. A new plan replaces

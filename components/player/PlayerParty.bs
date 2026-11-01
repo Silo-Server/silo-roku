@@ -212,7 +212,12 @@ sub onPartyCommand(command as Dynamic)
             dispatch({ type: "seekTo", position: stepOf.position, resume: false })
         else if op = "reload"
             m.party.seekAt = now
-            dispatch({ type: "partyReload", position: stepOf.position })
+            ' A held reload (a copy remux's, aimed ahead of the room) asks for
+            ' its stream at the aim, with no lead-in, and holds where Roku
+            ' opens it (section 7.5).
+            hold = util.isTrue(stepOf.hold)
+            if hold then partySettleBegin(stepOf.position, invalid, true, command.seq, true)
+            dispatch({ type: "partyReload", position: stepOf.position, aim: hold })
         end if
     end for
     if util.isNumber(command.seq) then m.party.commandSeq = command.seq
@@ -280,10 +285,15 @@ end sub
 ' shows where it really landed the sample says seeking. A barrier's
 ' (tolerance set) is muted, and plays from a short landing to its target
 ' before it ends. A hold's (section 7.5) is muted, pauses on its landing,
-' and still says seeking until the Task's next command plays it.
-sub partySettleBegin(target as Dynamic, tolerance as Dynamic, hold as Boolean, seq as Dynamic)
-    settle = watchparty.landing.begin(target, m.env.now(), tolerance, hold)
+' and still says seeking until the Task's next command plays it. A
+' reload's hold (reload) measures only the load the reload opens: the
+' load the session has now (fromLoad) and its content's reports are the
+' old position, not the landing (partyReloadOpened).
+sub partySettleBegin(target as Dynamic, tolerance as Dynamic, hold as Boolean, seq as Dynamic, reload = false as Boolean)
+    settle = watchparty.landing.begin(target, m.env.now(), tolerance, hold, reload)
     settle.seq = seq
+    settle.fromLoad = invalid
+    if m.state <> invalid and m.state.plan <> invalid then settle.fromLoad = m.state.plan.load
     m.party.settle = settle
     if not watchparty.landing.mutes(settle) then return
     m.party.restoreMute = m.video.mute
@@ -307,7 +317,7 @@ sub partySettleEnd(report as Boolean, resume as Boolean)
         if not party.wantsPlay and (m.video.state = "playing" or m.video.state = "buffering") then partyPauseNode()
     else if settle.hold
         resume = resume and not (m.closed or m.leaving or m.released)
-        log.info(LOG_TAG, "[WP] hold ended", { target: settle.target, landed: settle.landed, holdAt: settle.holdAt, held: settle.heldAt <> invalid, resume: resume })
+        log.info(LOG_TAG, "[WP] hold ended", { target: settle.target, landed: settle.landed, holdAt: settle.holdAt, held: settle.heldAt <> invalid, resume: resume, reload: settle.reload })
         if resume then partyPlayState(true)
         if settle.holdAt <> invalid then party.afterHold = { at: m.env.now(), from: settle.holdAt, reports: 0 }
     end if
@@ -329,7 +339,7 @@ sub partySettleApply(action as String)
         m.party.holdPaused = true
         if m.video.state = "playing" or m.video.state = "buffering" then partyPauseNode()
         settle = m.party.settle
-        log.info(LOG_TAG, "[WP] holding", { target: settle.target, landed: settle.landed, holdAt: settle.holdAt })
+        log.info(LOG_TAG, "[WP] holding", { target: settle.target, landed: settle.landed, holdAt: settle.holdAt, reload: settle.reload })
         partyReport(true)
     else if action = "stop"
         partySettleEnd(true, true)
@@ -355,7 +365,11 @@ end sub
 sub partySettleTick()
     if m.party = invalid or m.party.settle = invalid then return
     videoState = m.video.state
-    if m.errorVisible or m.leaving or m.closed or videoState = "error" or videoState = "finished" or partyAtEnd()
+    ' The content a held reload replaces may fail or finish meanwhile (prod:
+    ' its remux's segments answered 410 once the replan moved the stream);
+    ' that is not the new load's.
+    replaced = m.party.settle.reload and not partyReloadOpened(m.party.settle)
+    if m.errorVisible or m.leaving or m.closed or (not replaced and (videoState = "error" or videoState = "finished" or partyAtEnd()))
         ' After an error the member wants to play again, as the room does;
         ' at the end it parks.
         partySettleEnd(false, not (videoState = "finished" or partyAtEnd()))
@@ -365,10 +379,22 @@ sub partySettleTick()
 end sub
 
 ' The node has settled from the seek: the session's seek is done and the
-' node plays or is paused again.
+' node plays or is paused again; for a held reload, the load it opened
+' has played.
 function partySettled() as Boolean
     if m.state = invalid or m.state.player.seeking then return false
+    settle = m.party.settle
+    if settle <> invalid and settle.reload and not partyReloadOpened(settle) then return false
     return m.video.state = "playing" or m.video.state = "paused"
+end function
+
+' Whether the load a held reload opened is on the Video node and has
+' played: a later load than the session had when the reload ran.
+function partyReloadOpened(settle as Object) as Boolean
+    if m.state = invalid or m.state.plan = invalid then return false
+    plan = m.state.plan
+    if plan.load = settle.fromLoad or not plan.loadPlayed then return false
+    return m.activePlayed and m.activeLoad <> invalid and m.activeLoad = plan.load
 end function
 
 ' Whether a barrier can roll to its target: the current load plays a plan
