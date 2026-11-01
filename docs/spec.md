@@ -3769,7 +3769,9 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   and when the plan selects a sidecar, which a `SubtitleConfig` naming it
   did not keep Roku off English, the content draws nothing until the check
   (`suppressCaptions`), and subtitles there show from it, on the plan's
-  track. A switch in place writes `Video.subtitleTrack` to the listed name.
+  track. So does content whose plan selects a sidecar on a stream the
+  server kept from a plan with a single rendition, whose `DEFAULT` Roku
+  drew until the check (2026-11-01 regression run). A switch in place writes `Video.subtitleTrack` to the listed name.
   Off stays `suppressCaptions`: every rendition is `AUTOSELECT=YES`, and
   Roku would otherwise show one by the caption language, so a start with
   subtitles Off under caption mode On draws nothing. Content with a
