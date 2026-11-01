@@ -681,7 +681,11 @@ seeks past the room and waits, paused, for the room to reach it:
   a forward landing reported no position for over 1.5 s once played,
   three times of three, and the member fell behind; no other hold did.
 - **Behind anyway.** A landing more than 0.4 s behind the room (the
-  deadband) teaches the estimate and seeks again, at most 3 seeks a hold;
+  deadband) teaches the estimate and seeks again, at most 3 seeks a hold,
+  aimed as above but at least past the last aim by the gap it landed
+  short by: the keyframe it landed on is the last at or before that aim,
+  so the next lies past it (on FX-007 two plain retries landed on the same
+  keyframe, each aim just short of the next);
   after that, or for a landing within 0.4 s behind, it plays at once and
   the rules above take over. A landing up to 1 s behind would sit inside
   both the server's band and the corrections' threshold, so nothing would
