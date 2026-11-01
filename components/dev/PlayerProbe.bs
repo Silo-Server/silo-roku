@@ -1,0 +1,387 @@
+import "pkg:/source/playback/seek.bs"
+
+' Dev builds only: spikes W0-2 and W0-3 (PlayerProbe.xml), driven by ECP:
+'
+'   npm run roku -- input 'playerProbe={"op":"seek","delta":10,"via":"app"}'
+'
+' Ops:
+'   info      the plan's delivery, timeline, and the Video node's state.
+'   seek      one seek to a source position: target (absolute), delta (from
+'             the current position), or frac (of the runtime). via "app"
+'             commits it through the player's session reducer (a local seek
+'             or a seek_reanchor, as a viewer's seek); via "video" sets
+'             Video.seek directly. Logs where playback resumed, how long it
+'             took, and the states between.
+'   series    steps (a list of seek specs) one after another, gapMs apart
+'             once each has resumed, then a summary.
+'   latency   W0-3: PlayerProbeTask sets a field at planned times; the
+'             observer here calls Video.control (action "noop": resume while
+'             playing; "toggle": pause and resume in turn; "seek": seek to the
+'             current position). count, minGapMs, maxGapMs, spinMs.
+'   stop      abandons a series.
+' Every line is printed with a [PROBE] prefix and the wall clock in ms.
+
+const TRIAL_TIMEOUT_MS = 45000
+const SETTLE_MS = 2000
+
+sub init()
+    m.wall = CreateObject("roDateTime")
+    m.timer = m.top.findNode("timer")
+    m.timer.observeField("fire", "onTimer")
+    m.timerFor = ""
+    m.video = invalid
+    m.trial = invalid
+    m.series = invalid
+    m.latency = invalid
+    m.latencyTask = invalid
+    m.lastSeq = -1
+    m.top.observeField("video", "onVideo")
+    m.top.observeField("release", "onRelease")
+    if not m.global.hasField("devPlayerProbe") then m.global.addFields({ devPlayerProbe: {} })
+    m.global.observeField("devPlayerProbe", "onCommand")
+end sub
+
+sub onVideo()
+    video = m.top.video
+    if video = invalid then return
+    m.video = video
+    video.observeField("state", "onState")
+    video.observeField("position", "onPosition")
+end sub
+
+sub onRelease()
+    m.global.unobserveField("devPlayerProbe")
+    if m.video <> invalid
+        m.video.unobserveField("state")
+        m.video.unobserveField("position")
+    end if
+    if m.latencyTask <> invalid then m.latencyTask.control = "stop"
+    m.timer.control = "stop"
+    m.video = invalid
+    m.trial = invalid
+    m.series = invalid
+end sub
+
+' --- Commands --------------------------------------------------------------
+
+sub onCommand()
+    command = m.global.devPlayerProbe
+    if type(command) <> "roAssociativeArray" or command.seq = invalid then return
+    if command.seq <= m.lastSeq then return
+    m.lastSeq = command.seq
+    say("command", command)
+    if m.video = invalid
+        say("no video", {})
+        return
+    end if
+    op = command.op
+    if op = "info"
+        info()
+    else if op = "seek"
+        startTrial(command)
+    else if op = "series"
+        startSeries(command)
+    else if op = "latency"
+        startLatency(command)
+    else if op = "stop"
+        m.series = invalid
+        m.trial = invalid
+        say("stopped", {})
+    else if op = "interval"
+        m.video.notificationInterval = command.seconds
+        say("notificationInterval", { seconds: m.video.notificationInterval })
+    else
+        say("unknown op", { op: op })
+    end if
+end sub
+
+sub info()
+    plan = m.top.planInfo
+    say("info", { plan: plan, state: m.video.state, position: m.video.position, duration: m.video.duration, interval: m.video.notificationInterval })
+end sub
+
+' --- W0-2: seeks -------------------------------------------------------------
+
+sub startTrial(spec as Object)
+    plan = m.top.planInfo
+    if type(plan) <> "roAssociativeArray" or plan.timeline = invalid
+        say("no plan yet", {})
+        return
+    end if
+    timeline = plan.timeline
+    offset = playback.seek.offset(timeline)
+    from = m.video.position + offset
+    target = resolveTarget(spec, from, plan)
+    via = "app"
+    if spec.via = "video" then via = "video"
+    decided = playback.seek.decide(timeline, target)
+    m.trial = { t0: nowMs(), target: target, from: from, via: via, decided: decided.kind, load: plan.load, offset0: offset, sawOther: false, states: [], lastState: "", positions: [], firstPos: invalid, playingAt: invalid, posAtPlaying: invalid, lastPos: invalid, label: spec.label }
+    if via = "video"
+        m.video.seek = playback.seek.playerPosition(timeline, target)
+    else
+        m.top.appSeek = { position: target }
+    end if
+    armTimer(TRIAL_TIMEOUT_MS, "timeout")
+end sub
+
+function resolveTarget(spec as Object, from as Double, plan as Object) as Double
+    runtime = plan.runtime
+    if runtime = invalid then runtime = m.video.duration
+    target = from
+    if spec.target <> invalid
+        target = spec.target
+    else if spec.delta <> invalid
+        target = from + spec.delta
+    else if spec.frac <> invalid and runtime <> invalid
+        target = runtime * spec.frac
+    end if
+    if target < 0 then target = 0
+    if runtime <> invalid and runtime > 60 and target > runtime - 30 then target = runtime - 30
+    return target
+end function
+
+sub onState()
+    trial = m.trial
+    if trial = invalid or m.video = invalid then return
+    state = m.video.state
+    now = nowMs()
+    ' The node repeats "buffering" while it buffers; keep each change once.
+    if state = trial.lastState then return
+    trial.lastState = state
+    trial.states.Push(state + "@" + (now - trial.t0).ToStr())
+    if state = "playing"
+        if trial.sawOther and trial.playingAt = invalid
+            trial.playingAt = now
+            trial.posAtPlaying = m.video.position
+            armTimer(SETTLE_MS, "settle")
+        end if
+    else if state = "error" or state = "finished"
+        finishTrial("ended in " + state)
+    else
+        trial.sawOther = true
+    end if
+end sub
+
+sub onPosition()
+    trial = m.trial
+    if trial = invalid or m.video = invalid then return
+    now = nowMs()
+    if trial.playingAt <> invalid
+        ' The observer can fire several times for one value; keep changes.
+        position = m.video.position
+        if trial.lastPos <> invalid and trial.lastPos.pos = position then return
+        trial.lastPos = { pos: position, at: now }
+        ' The node reports the requested position as it resumes; the first
+        ' different report is where it actually plays from.
+        if trial.firstPos = invalid and position <> trial.posAtPlaying then trial.firstPos = { pos: position, at: now }
+        if trial.positions.Count() < 8 then trial.positions.Push(Str(now - trial.playingAt).Trim() + ":" + Str(round3(position)).Trim())
+    else if not trial.sawOther and now - trial.t0 > 200
+        ' A seek inside the buffer may never leave "playing".
+        plan = m.top.planInfo
+        landed = m.video.position + playback.seek.offset(plan.timeline)
+        if Abs(landed - trial.target) < 5
+            trial.playingAt = now
+            trial.posAtPlaying = m.video.position
+            trial.states.Push("noStateChange@" + (now - trial.t0).ToStr())
+            armTimer(SETTLE_MS, "settle")
+        end if
+    end if
+end sub
+
+sub settle()
+    trial = m.trial
+    if trial = invalid then return
+    plan = m.top.planInfo
+    offset = playback.seek.offset(plan.timeline)
+    result = { label: trial.label, via: trial.via, decided: trial.decided, delivery: plan.delivery, protocol: plan.protocol, from: round3(trial.from), target: round3(trial.target), delta: round3(trial.target - trial.from), resumeMs: trial.playingAt - trial.t0, offset0: trial.offset0, offset1: offset, reloaded: plan.load <> trial.load, states: trial.states, positions: trial.positions }
+    result.landedAtPlaying = round3(trial.posAtPlaying + offset)
+    result.errAtPlaying = round3(trial.posAtPlaying + offset - trial.target)
+    if trial.lastPos <> invalid
+        ' The last position report, run back to the moment playback resumed.
+        estimate = trial.lastPos.pos + offset - (trial.lastPos.at - trial.playingAt) / 1000
+        result.landedEst = round3(estimate)
+        result.err = round3(estimate - trial.target)
+    end if
+    if trial.firstPos <> invalid
+        first = trial.firstPos.pos + offset - (trial.firstPos.at - trial.playingAt) / 1000
+        result.landedFirst = round3(first)
+        result.errFirst = round3(first - trial.target)
+    end if
+    say("seek result", result)
+    m.trial = invalid
+    if m.series <> invalid
+        m.series.results.Push(result)
+        armTimer(m.series.gapMs, "next")
+    end if
+end sub
+
+sub finishTrial(reason as String)
+    trial = m.trial
+    if trial = invalid then return
+    say("seek failed", { reason: reason, label: trial.label, target: trial.target, from: trial.from, states: trial.states })
+    m.trial = invalid
+    if m.series <> invalid
+        m.series.results.Push({ label: trial.label, failed: reason })
+        armTimer(m.series.gapMs, "next")
+    end if
+end sub
+
+sub startSeries(command as Object)
+    gap = command.gapMs
+    if gap = invalid then gap = 4000
+    label = command.label
+    if label = invalid then label = "series"
+    m.series = { steps: command.steps, index: 0, via: command.via, gapMs: gap, label: label, results: [] }
+    nextStep()
+end sub
+
+sub nextStep()
+    series = m.series
+    if series = invalid then return
+    if series.index >= series.steps.Count()
+        summarize(series)
+        m.series = invalid
+        return
+    end if
+    spec = {}
+    spec.Append(series.steps[series.index])
+    if spec.via = invalid then spec.via = series.via
+    spec.label = series.label + "#" + series.index.ToStr()
+    series.index = series.index + 1
+    startTrial(spec)
+end sub
+
+sub summarize(series as Object)
+    errors = []
+    resumes = []
+    failed = 0
+    for each result in series.results
+        if result.failed <> invalid
+            failed = failed + 1
+        else
+            if result.errFirst <> invalid
+                errors.Push(result.errFirst)
+            else if result.err <> invalid
+                errors.Push(result.err)
+            end if
+            resumes.Push(result.resumeMs)
+        end if
+    end for
+    say("series done", { label: series.label, n: series.results.Count(), failed: failed, err: stats(errors), absErr: stats(absolute(errors)), resumeMs: stats(resumes) })
+end sub
+
+' --- W0-3: command latency ---------------------------------------------------
+
+sub startLatency(command as Object)
+    count = command.count
+    if count = invalid then count = 200
+    action = command.action
+    if action = invalid then action = "noop"
+    m.latency = { count: count, action: action, paused: false, total: [], handoff: [], call: [], late: [] }
+    task = CreateObject("roSGNode", "PlayerProbeTask")
+    task.command = command
+    task.observeField("fire", "onFire")
+    m.latencyTask = task
+    say("latency started", { count: count, action: action, state: m.video.state })
+    task.control = "run"
+end sub
+
+sub onFire(event as Object)
+    observed = nowMs()
+    fire = event.getData()
+    latency = m.latency
+    if latency = invalid or m.video = invalid then return
+    if latency.action = "toggle"
+        if latency.paused then m.video.control = "resume" else m.video.control = "pause"
+        latency.paused = not latency.paused
+    else if latency.action = "seek"
+        m.video.seek = m.video.position
+    else
+        m.video.control = "resume"
+    end if
+    done = nowMs()
+    latency.total.Push(observed - fire.planned)
+    latency.handoff.Push(observed - fire.setAt)
+    latency.late.Push(fire.setAt - fire.planned)
+    latency.call.Push(done - observed)
+    if latency.total.Count() >= latency.count
+        say("latency done", { action: latency.action, n: latency.total.Count(), plannedToObserverMs: stats(latency.total), setToObserverMs: stats(latency.handoff), taskLateMs: stats(latency.late), videoCallMs: stats(latency.call), state: m.video.state })
+        printRaw("plannedToObserverMs", latency.total)
+        printRaw("videoCallMs", latency.call)
+        if latency.paused then m.video.control = "resume"
+        m.latency = invalid
+        m.latencyTask = invalid
+    end if
+end sub
+
+sub printRaw(name as String, values as Object)
+    for start = 0 to values.Count() - 1 step 50
+        parts = []
+        last = start + 49
+        if last > values.Count() - 1 then last = values.Count() - 1
+        for i = start to last
+            parts.Push(values[i].ToStr())
+        end for
+        say("raw " + name, { from: start, values: parts.Join(",") })
+    end for
+end sub
+
+' --- Helpers -------------------------------------------------------------------
+
+sub armTimer(ms as Integer, what as String)
+    m.timer.control = "stop"
+    m.timer.duration = ms / 1000
+    m.timerFor = what
+    m.timer.control = "start"
+end sub
+
+sub onTimer()
+    what = m.timerFor
+    m.timerFor = ""
+    if what = "settle"
+        settle()
+    else if what = "timeout"
+        finishTrial("timeout")
+    else if what = "next"
+        nextStep()
+    end if
+end sub
+
+function absolute(values as Object) as Object
+    out = []
+    for each value in values
+        out.Push(Abs(value))
+    end for
+    return out
+end function
+
+function stats(values as Object) as Object
+    sorted = []
+    for each value in values
+        sorted.Push(value)
+    end for
+    sorted.Sort()
+    n = sorted.Count()
+    if n = 0 then return {}
+    sum = 0
+    for each value in sorted
+        sum = sum + value
+    end for
+    return { n: n, min: sorted[0], p50: sorted[Int((n - 1) * 0.5)], p95: sorted[Int((n - 1) * 0.95)], max: sorted[n - 1], mean: round3(sum / n) }
+end function
+
+function round3(value as Dynamic) as Dynamic
+    if value = invalid then return invalid
+    return Int(value * 1000 + 0.5) / 1000
+end function
+
+function nowMs() as Longinteger
+    m.wall.Mark()
+    seconds& = m.wall.AsSeconds()
+    return seconds& * 1000 + m.wall.GetMilliseconds()
+end function
+
+sub say(message as String, fields as Object)
+    ' bs:disable-next-line: LINT3012
+    print "[PROBE] " + nowMs().ToStr() + " " + message + " " + FormatJson(fields)
+end sub
