@@ -1,6 +1,6 @@
 import "pkg:/source/playback/seek.bs"
 
-' Dev builds only: spikes W0-2 and W0-3 (PlayerProbe.xml), driven by ECP:
+' Dev builds only: spikes W0-2 and W0-3 (SpikePlayerProbe.xml), driven by ECP:
 '
 '   npm run roku -- input 'playerProbe={"op":"seek","delta":10,"via":"app"}'
 '
@@ -35,6 +35,7 @@ sub init()
     m.latency = invalid
     m.latencyTask = invalid
     m.lastSeq = -1
+    m.interval = invalid
     m.top.observeField("video", "onVideo")
     m.top.observeField("release", "onRelease")
     if not m.global.hasField("devPlayerProbe") then m.global.addFields({ devPlayerProbe: {} })
@@ -88,6 +89,7 @@ sub onCommand()
         m.trial = invalid
         say("stopped", {})
     else if op = "interval"
+        m.interval = command.seconds
         m.video.notificationInterval = command.seconds
         say("notificationInterval", { seconds: m.video.notificationInterval })
     else
@@ -115,7 +117,10 @@ sub startTrial(spec as Object)
     via = "app"
     if spec.via = "video" then via = "video"
     decided = playback.seek.decide(timeline, target)
-    m.trial = { t0: nowMs(), target: target, from: from, via: via, decided: decided.kind, load: plan.load, offset0: offset, sawOther: false, states: [], lastState: "", positions: [], firstPos: invalid, playingAt: invalid, posAtPlaying: invalid, lastPos: invalid, label: spec.label }
+    ' An app seek that is not local reloads the stream (seek_reanchor): only
+    ' the new stream's playing state counts as the landing.
+    expectReload = via = "app" and decided.kind <> "local"
+    m.trial = { t0: nowMs(), target: target, from: from, via: via, decided: decided.kind, expectReload: expectReload, load: plan.load, offset0: offset, sawOther: false, states: [], lastState: "", positions: [], samples: [], steadyAt: invalid, rebuffers: 0, firstPos: invalid, playingAt: invalid, posAtPlaying: invalid, lastPos: invalid, label: spec.label }
     if via = "video"
         m.video.seek = playback.seek.playerPosition(timeline, target)
     else
@@ -141,6 +146,8 @@ function resolveTarget(spec as Object, from as Double, plan as Object) as Double
 end function
 
 sub onState()
+    ' A new stream (a reload) starts at the node's default interval.
+    if m.video <> invalid and m.interval <> invalid and m.video.notificationInterval <> m.interval then m.video.notificationInterval = m.interval
     trial = m.trial
     if trial = invalid or m.video = invalid then return
     state = m.video.state
@@ -154,11 +161,18 @@ sub onState()
             trial.playingAt = now
             trial.posAtPlaying = m.video.position
             armTimer(SETTLE_MS, "settle")
+        else if trial.playingAt <> invalid
+            ' Playing again after a stall or the player's own seek back: the
+            ' landing is timed from the last entry into playing.
+            trial.steadyAt = now
+            trial.rebuffers = trial.rebuffers + 1
+            armTimer(SETTLE_MS, "settle")
         end if
     else if state = "error" or state = "finished"
         finishTrial("ended in " + state)
     else
         trial.sawOther = true
+        if trial.playingAt <> invalid then armTimer(TRIAL_TIMEOUT_MS, "timeout")
     end if
 end sub
 
@@ -174,8 +188,9 @@ sub onPosition()
         ' The node reports the requested position as it resumes; the first
         ' different report is where it actually plays from.
         if trial.firstPos = invalid and position <> trial.posAtPlaying then trial.firstPos = { pos: position, at: now }
+        trial.samples.Push({ pos: position, at: now })
         if trial.positions.Count() < 8 then trial.positions.Push(Str(now - trial.playingAt).Trim() + ":" + Str(round3(position)).Trim())
-    else if not trial.sawOther and now - trial.t0 > 200
+    else if not trial.sawOther and not trial.expectReload and now - trial.t0 > 200
         ' A seek inside the buffer may never leave "playing".
         plan = m.top.planInfo
         landed = m.video.position + playback.seek.offset(plan.timeline)
@@ -206,6 +221,22 @@ sub settle()
         first = trial.firstPos.pos + offset - (trial.firstPos.at - trial.playingAt) / 1000
         result.landedFirst = round3(first)
         result.errFirst = round3(first - trial.target)
+    end if
+    ' The node echoes the requested position first: the median of the
+    ' reports from 500 ms after resuming, each run back to that moment.
+    steadyAt = trial.playingAt
+    if trial.steadyAt <> invalid then steadyAt = trial.steadyAt
+    result.steadyMs = steadyAt - trial.t0
+    result.rebuffers = trial.rebuffers
+    late = []
+    for each sample in trial.samples
+        if sample.at - steadyAt >= 500 then late.Push(sample.pos + offset - (sample.at - steadyAt) / 1000)
+    end for
+    if late.Count() > 0
+        late.Sort()
+        result.landedMed = round3(late[Int((late.Count() - 1) / 2)])
+        result.errMed = round3(result.landedMed - trial.target)
+        result.lateReports = late.Count()
     end if
     say("seek result", result)
     m.trial = invalid
@@ -254,20 +285,24 @@ end sub
 sub summarize(series as Object)
     errors = []
     resumes = []
+    steadies = []
     failed = 0
     for each result in series.results
         if result.failed <> invalid
             failed = failed + 1
         else
-            if result.errFirst <> invalid
+            if result.errMed <> invalid
+                errors.Push(result.errMed)
+            else if result.errFirst <> invalid
                 errors.Push(result.errFirst)
             else if result.err <> invalid
                 errors.Push(result.err)
             end if
             resumes.Push(result.resumeMs)
+            steadies.Push(result.steadyMs)
         end if
     end for
-    say("series done", { label: series.label, n: series.results.Count(), failed: failed, err: stats(errors), absErr: stats(absolute(errors)), resumeMs: stats(resumes) })
+    say("series done", { label: series.label, n: series.results.Count(), failed: failed, err: stats(errors), absErr: stats(absolute(errors)), resumeMs: stats(resumes), steadyMs: stats(steadies) })
 end sub
 
 ' --- W0-3: command latency ---------------------------------------------------
