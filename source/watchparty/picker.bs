@@ -1,0 +1,194 @@
+import "pkg:/source/catalog/art.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/util/values.bs"
+
+' The party picker (docs/watch-party.md section 4.8), as tvOS's
+' WatchPartyMediaPicker assembles it: its shelves and their requests, what
+' choosing a card opens, and the confirm page's title and facts. Pure;
+' cards are CardContent nodes or AAs with their fields (id, itemType,
+' title, caption, seriesId).
+namespace watchparty.picker
+    const SELECT = "select"
+    const SUGGEST = "suggest"
+    ' Home rows the picker borrows, at most, after leaving out tvOS's.
+    const MAX_HOME_SECTIONS = 4
+    ' Home section types the picker leaves out: personal rows the together
+    ' shelves cover or that would show one member's history, and the
+    ' recently added rows its own shelves replace.
+    const EXCLUDED_HOME_TYPES = "|recently_added|recently_released|new_to_library|continue_watching|next_up|next_in_series|watchlist|favorites|profile_activity_feed|because_you_watched|recommended_for_you|similar_users_liked|taste_match|forgotten_favorites|"
+    const WATCHLIST_LIMIT = 40
+    const RECENT_LIMIT = 24
+
+    ' "Choose a title" or "Suggest a title".
+    function titleKey(purpose as String) as String
+        if purpose = SUGGEST then return "watchParty.picker.suggest"
+        return "watchParty.picker.select"
+    end function
+
+    ' Movies, series, and episodes only.
+    function playable(itemType as Dynamic) as Boolean
+        kind = LCase(util.text(itemType))
+        return kind = "movie" or kind = "series" or kind = "episode"
+    end function
+
+    function homeShown(sectionType as Dynamic) as Boolean
+        kind = LCase(util.text(sectionType))
+        return Instr(1, EXCLUDED_HOME_TYPES, "|" + kind + "|") = 0
+    end function
+
+    ' The shelves in order, empty ones left out: [{ id, titleKey, title,
+    ' cards }], titleKey a locale key or "" when title is the server's.
+    ' input: { continueTogether, watchlist, home: [{ id, title,
+    ' sectionType, cards }], recentMovies, recentSeries }, each a list of
+    ' cards; watchlist is the picker's watchlist_union, or the catalog's
+    ' watchlist without the picker capability. Home rows keep only movies
+    ' and series, as tvOS's do.
+    function shelves(input as Object) as Object
+        out = []
+        addShelf(out, "together", "watchParty.picker.continueTogether", "", playableCards(input.continueTogether, true))
+        addShelf(out, "watchlist", "watchParty.picker.watchlists", "", playableCards(input.watchlist, true))
+        home = 0
+        if type(input.home) = "roArray"
+            for each row in input.home
+                if home < MAX_HOME_SECTIONS and homeShown(row.sectionType)
+                    cards = playableCards(row.cards, false)
+                    if cards.Count() > 0
+                        out.Push({ id: "home." + util.text(row.id), titleKey: "", title: util.text(row.title), cards: cards })
+                        home = home + 1
+                    end if
+                end if
+            end for
+        end if
+        addShelf(out, "recentMovies", "watchParty.picker.recentMovies", "", playableCards(input.recentMovies, true))
+        addShelf(out, "recentSeries", "watchParty.picker.recentSeries", "", playableCards(input.recentSeries, true))
+        return out
+    end function
+
+    sub addShelf(out as Object, id as String, key as String, title as String, cards as Object)
+        if cards.Count() > 0 then out.Push({ id: id, titleKey: key, title: title, cards: cards })
+    end sub
+
+    ' cards that are movies, series, or (when episodes) episodes.
+    function playableCards(cards as Dynamic, episodes as Boolean) as Object
+        out = []
+        if type(cards) <> "roArray" then return out
+        for each card in cards
+            kind = LCase(util.text(card.itemType))
+            if card.id <> "" and (kind = "movie" or kind = "series" or (episodes and kind = "episode")) then out.Push(card)
+        end for
+        return out
+    end function
+
+    ' The group's next episode per series, from the picker output's rows
+    ' (continue_together and watchlist_union): { seriesId: nextUp }.
+    function nextUps(picker as Dynamic) as Object
+        out = {}
+        if not util.isObject(picker) then return out
+        for each list in [picker.continueTogether, picker.watchlistUnion]
+            if type(list) = "roArray"
+                for each row in list
+                    if util.isObject(row.item) and util.isObject(row.nextUp) and util.text(row.nextUp.contentId) <> ""
+                        id = util.text(row.item.content_id)
+                        if id <> "" and not out.DoesExist(id) then out[id] = row.nextUp
+                    end if
+                end for
+            end if
+        end for
+        return out
+    end function
+
+    ' What choosing card opens: { kind: "confirm", contentId } for a movie
+    ' or an episode, and for a series with the group's next episode
+    ' (nextUps) that episode's; { kind: "episodes", seriesId, title } for
+    ' another series; invalid for anything else.
+    function route(card as Dynamic, ups as Object) as Dynamic
+        if card = invalid or util.text(card.id) = "" then return invalid
+        kind = LCase(util.text(card.itemType))
+        if kind = "movie" or kind = "episode" then return { kind: "confirm", contentId: card.id }
+        if kind <> "series" then return invalid
+        nextUp = ups[card.id]
+        if nextUp <> invalid then return { kind: "confirm", contentId: util.text(nextUp.contentId) }
+        title = util.text(card.title)
+        if title = "" then title = util.text(card.caption)
+        return { kind: "episodes", seriesId: card.id, title: title }
+    end function
+
+    ' ---- Requests
+
+    ' The watchlist shelf without the picker capability: GET
+    ' /api/v2/catalog?type=video&limit=40&source=watchlist, as one row.
+    function watchlistRequest(lowTier as Boolean) as Object
+        query = catalog.art.query(lowTier)
+        query.Append({ type: "video", limit: WATCHLIST_LIMIT, source: "watchlist" })
+        return catalog.request.read("/api/v2/catalog", query, { kind: catalog.kind.ROW })
+    end function
+
+    ' A recently added shelf: GET /api/v2/catalog?type={movie|series}
+    ' &limit=24&sort=added_at&order=desc, as one row.
+    function recentRequest(kind as String, lowTier as Boolean) as Object
+        query = catalog.art.query(lowTier)
+        query.Append({ type: kind, limit: RECENT_LIMIT, sort: "added_at", order: "desc" })
+        return catalog.request.read("/api/v2/catalog", query, { kind: catalog.kind.ROW })
+    end function
+
+    ' ---- The confirm page
+
+    ' The confirm page's title, from catalog.detail.fromItem's fields:
+    ' { contentId, contentType ("movie" or "episode"), title, subtitle,
+    ' posterUri, backdropUri, overview, facts, seriesId, seasonNumber,
+    ' episode, spoilerBackdrop, spoilerText, played }. subtitle names an
+    ' episode's series; facts are the subtitle, the year, and the runtime.
+    function choice(detail as Object) as Object
+        episode = detail.itemType = "episode"
+        subtitle = ""
+        if episode then subtitle = util.text(detail.seriesTitle)
+        facts = []
+        if subtitle <> "" then facts.Push(subtitle)
+        if util.isObject(detail.metadata) and type(detail.metadata.items) = "roArray"
+            for each item in detail.metadata.items
+                if item <> "" and facts.Count() < 4 then facts.Push(item)
+            end for
+        end if
+        contentType = "movie"
+        if episode then contentType = "episode"
+        spoilers = detail.spoilers
+        if not util.isObject(spoilers) then spoilers = {}
+        return {
+            contentId: detail.id,
+            contentType: contentType,
+            title: detail.title,
+            subtitle: subtitle,
+            posterUri: util.text(detail.posterUri),
+            backdropUri: util.text(detail.backdropUri),
+            overview: util.text(detail.synopsis),
+            facts: facts,
+            seriesId: util.text(detail.seriesId),
+            seasonNumber: detail.seasonNumber,
+            episode: episode,
+            spoilerBackdrop: util.isTrue(spoilers.spoilerBackdrop),
+            spoilerArt: util.isTrue(spoilers.spoilerArt),
+            spoilerText: util.isTrue(spoilers.spoilerText),
+            played: util.isTrue(detail.played)
+        }
+    end function
+
+    ' The lobby hero's quality chips from catalog.cards.badges: the
+    ' resolution, then "HDR" for any high dynamic range format (section
+    ' 4.4: "4K", "1080p", "720p", "HDR"). Audio names are left out.
+    function qualityChips(badges as Dynamic) as Object
+        out = []
+        if type(badges) <> "roArray" then return out
+        hdr = false
+        for each badge in badges
+            text = util.text(badge)
+            lowered = LCase(text)
+            if lowered = "4k" or lowered = "8k" or (Len(lowered) > 1 and Right(lowered, 1) = "p" and Val(Left(lowered, Len(lowered) - 1)) > 0)
+                if out.Count() = 0 then out.Push(text)
+            else if Instr(1, lowered, "hdr") > 0 or Instr(1, lowered, "dolby vision") > 0 or lowered = "hlg"
+                hdr = true
+            end if
+        end for
+        if hdr then out.Push("HDR")
+        return out
+    end function
+end namespace
