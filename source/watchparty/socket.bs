@@ -19,11 +19,13 @@ import "pkg:/source/util/values.bs"
 '   - Socket IDs are reused, and releasing a socket posts its closed event
 '     onto the shared port. Events after a socket's closed are ignored, by
 '     the handle's own state, and the closed events of sockets this Task
-'     released are consumed by ID (retire, released).
+'     released are consumed by ID (retire, released) for RETIRED_MS.
 '   - After Close() the TCP connection stays open until the object is
 '     released, so a closed socket is released at once. This adapter
-'     assumes Roku posts one closed per socket: on the server's close, or
+'     expects Roku to post one closed per socket: on the server's close, or
 '     on the release of a socket the Task closed (to confirm on the rig).
+'     Should one never come, the owed closed expires, and the session gives
+'     up on a socket that neither opens nor closes in time.
 '   - Automatic pongs work with SetAutoPingReply left at its default.
 '   - A text message over 524,288 bytes closes the socket with 1009
 '     (OVERSIZED_CLOSE); watchparty.session reconnects at once and reads the
@@ -54,6 +56,9 @@ namespace watchparty.socket
     const QUIET_MS = 50000
     ' The close code Roku gives a text message over its 524,288-byte limit.
     const OVERSIZED_CLOSE = 1009
+    ' A released socket's closed event arrives at once; one not seen this
+    ' long after the release is no longer awaited (expire).
+    const RETIRED_MS = 10000
 
     ' Whether this Roku has roWebSocket (Roku OS 16.0 and later). The app
     ' tests the object, never the version (section 3). brighterscript 0.73
@@ -173,26 +178,40 @@ namespace watchparty.socket
     ' ---- Released sockets
 
     ' A socket this Task released: its closed event is still to come, by
-    ' ID. retired is { id: count }.
-    sub retire(retired as Object, id as Integer)
+    ' ID, for RETIRED_MS from now. retired is { id: [releasedAt] }.
+    sub retire(retired as Object, id as Integer, now as Integer)
+        expire(retired, now)
         key = id.ToStr()
-        count = 0
-        if util.isNumber(retired[key]) then count = retired[key]
-        retired[key] = count + 1
+        if type(retired[key]) <> "roArray" then retired[key] = []
+        retired[key].Push(now)
     end sub
 
     ' Whether an event of eventType for socket ID id belongs to a socket
     ' this Task released: its closed is consumed here, so a reused ID's new
     ' socket never reads it as its own.
-    function released(retired as Object, id as Integer, eventType as Integer) as Boolean
+    function released(retired as Object, id as Integer, eventType as Integer, now as Integer) as Boolean
+        expire(retired, now)
         key = id.ToStr()
-        if eventType <> EVENT_CLOSED or not util.isNumber(retired[key]) then return false
-        count = retired[key] - 1
-        if count > 0
-            retired[key] = count
-        else
-            retired.Delete(key)
-        end if
+        if eventType <> EVENT_CLOSED or type(retired[key]) <> "roArray" then return false
+        retired[key].Shift()
+        if retired[key].Count() = 0 then retired.Delete(key)
         return true
     end function
+
+    ' Forgets the closed events still owed after RETIRED_MS: should Roku
+    ' never post one, a new socket that reuses the ID would otherwise lose
+    ' its own closed to it.
+    sub expire(retired as Object, now as Integer)
+        for each key in retired.Keys()
+            kept = []
+            for each at in retired[key]
+                if now - at < RETIRED_MS then kept.Push(at)
+            end for
+            if kept.Count() = 0
+                retired.Delete(key)
+            else
+                retired[key] = kept
+            end if
+        end for
+    end sub
 end namespace
