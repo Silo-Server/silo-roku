@@ -1,9 +1,11 @@
 # Watch Party for Roku
 
-**Status:** Specified, not built. The transport needs spike W0-1 (section 12.1)
-before any other work.
+**Status:** Specified. The room core (section 11: the room task, its
+rules, and the routes) is built and tested headless; the screens, the
+player's part, and AppScene's wiring are not. The transport still needs
+spike W0-1 (section 12.1) on a device.
 
-**Last updated:** 2026-10-31
+**Last updated:** 2026-11-01
 
 **Companion to:** [`spec.md`](spec.md) (product and platform rules). This
 document says how the Roku app takes part in a Silo Watch Party: a room of
@@ -629,19 +631,69 @@ reason}`. The room moves every member to a new revision.
 
 | Part | Where | Owns |
 | --- | --- | --- |
-| Room task | `components/tasks/RoomTask` | The `roWebSocket`, tickets, reconnect, clock, report loop, and command timing. Writes snapshots, commands, and notices to fields |
-| Room logic | `source/watchparty/` | Pure functions: wire parsing, RFC 3339 parsing, clock estimator, snapshot acceptance, command bookkeeping, stall timer, readiness, correction and reload budget, lobby button and hint rules, winner |
-| REST | `source/api/` | The routes in section 5, through the shared client |
-| Room session | `AppScene` | One party per app run, adopted by screens, never owned by them |
+| Room task | `components/tasks/RoomTask` | Runs the room session's decisions: the socket, HTTP through the bridge, the recent party's registry section, logs, and output fields. Its header comment is the field contract |
+| API bridge | `components/tasks/RoomApiBridge` | A render-thread node that sends the task's requests through `api.send` and returns each result envelope to the task, since a task cannot read a `RequestHandle`'s result |
+| Room session | `source/watchparty/session.bs` | Every rule the task runs, as pure functions over one state: support, entering, the connection order and reconnects, pings, frames, endings, host commands, suggestions, picker, Who's Seen It, and the outputs |
+| Room logic | `source/watchparty/` | `time` (RFC 3339 to epoch milliseconds, the anchored clock), `clock` (offset estimator), `wire` (frames, messages, IDs, snapshots, capabilities), `room` (snapshot acceptance, derived facts), `sync` (attach, command timing, readiness, stalls, reports, corrections), `catchup` (seek-only decisions, reload budget), `connection` (reconnect pacing, endings), `lobby` and `votes` (section 4's rules as locale keys), `recent` (section 4.3), `socket` (the `roWebSocket` adapter) |
+| REST | `source/api/watchParty.bs` | The routes in section 5 as requests for the shared client |
+| Room session owner | `AppScene` | One `RoomTask` and one `RoomApiBridge` per app run; sets `identity` on every session change and hands outputs to screens and the player |
 | Watch Party page, lobby, ballot, invite, options | `components/screens/watchParty/` | Section 4 |
 | Picker | `components/screens/watchParty/picker/` | Section 4.8, reusing Home rows, Search, and the episode rail |
-| Player | `components/player/` | Room start, Back to the panel, status pill, permissions, command execution on the render thread |
-| Recent party | `source/storage/registry.bs` | Section 4.3 |
+| Player | `components/player/` | Room start, Back to the panel, status pill, permissions, and executing `playerCommand` on the render thread |
+| Recent party | `source/watchparty/recent.bs` | Section 4.3, in its own 1 KB registry section `silo.party`, which only the room task writes. The session's own section keeps to 15 KB, above its largest record, so the app's five sections fit Roku's 32 KB |
 
 The room task waits on its message port with a timeout to the next due
-event (a command's `execute_at`, a report, a ping), so commands reach the
-render thread on time without a busy loop. The render thread applies a
-command when its field changes; W0-3 measures that hop.
+event (a command's `execute_at`, a report, a ping, a retry; every 250 ms
+while the room plays), so commands reach the render thread on time
+without a busy loop. The task decides every correction from the
+player's samples (`playerSample`); the render thread only executes the
+`playerCommand` it is given, at once, and reports what the player does.
+W0-3 measures that hop.
+
+**Field contract** (in full in `components/tasks/RoomTask.bs`). Inputs:
+`identity` (`{server, account, profile, borrowed}`), `command` (`{kind,
+tag?, ...}`: `checkSupport`, `create`, `join`, `rejoin`, `leave`, `end`,
+`select`, `stage`, `playNow`, `start`, `stop`, `policy`, `mode`,
+`promote`, `suggest`, `vote`, `unvote`, `removeSuggestion`,
+`refreshSuggestions`, `memberState`, `picker`, `lobbyReady`,
+`transportRequest`, `sourceFallback`, `noteTitle`, `forgetRecent`,
+`clearError`), `playerSample` (`{sessionId, revision, position,
+duration, playing, wantsPlay, playable, stalled, seeking, atEnd,
+planInPlace, commandSeq}`), and `session` (`{sessionId, revision}` or
+`{}`). Outputs: `ready`, `room` (the normalized snapshot), `connection`,
+`support`, `sync` (the player's view: attached, catching up, syncing,
+waiting for a clock, the held seek target, permissions), `suggestions`,
+`memberState`, `picker`, `recent`, `busy`, and the one-shot
+`playerCommand` (`{seq, commandId, seek, reload, playing}`), `notice`,
+`result`, and `ended`. Strings are locale keys (`watchParty.*` in
+`locale/en_US/strings.json`), never text, except a server's own error
+message.
+
+**Requests.** Start, selection, and promote carry `once` (source/api/
+request.bs): the account session still refreshes the token on a `401`
+but answers the request with it instead of sending it again, and the
+room session reads the room back after an uncertain answer. Writes whose
+answer carries the room proof or a ticket, and the join, whose body
+carries the code, never pass through a file. The room read is a `GET`,
+whose answer passes through ApiTask's temporary response file like any
+other; it is deleted as soon as it is read.
+
+**Socket assumptions until W0-1.** `source/watchparty/socket.bs` sets the
+subprotocols with `roWebSocket.SetProtocols` (the call Roku's page and
+brs-node 2.6 provide; `PROTOCOLS_AS_HEADER` switches to `AddHeader`),
+turns on `SetAutoPingReply`, verifies `wss://` with the system CA
+bundle, and maps event types 1 (opened), 2 (closed), 3 (error), and 5
+(text). An opened event without a protocol is accepted; one naming
+another protocol ends the attempt.
+
+**Decisions made while building.** A reconnect that gives up (six
+failures and 150 s without a healthy socket) ends the party with the
+"expired" message and keeps Rejoin; section 4.11 has no row for it. A
+late joiner waits paused while its first realigning seek lands, then
+seeks once more aimed ahead by that seek's time when the room moved more
+than 0.4 s, then plays; a seek that never shows as landed is given up
+after 5 s. Playing muted to a guest's short-landed seek target (section
+7.4) waits for W0-2.
 
 ## 12. Testing
 
