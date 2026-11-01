@@ -3464,9 +3464,21 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   chosen before either's plan arrives are both requested.
 - A track or quality change the viewer asked for that the server refuses
   leaves the plan playing as it was, and a notice says so ("Can't switch to
-  that track.", "Can't switch to that quality."). A `track_change` waiting
-  behind a refused one asks for the plan's own member in place of the
-  refused one it took.
+  that track.", "Can't switch to that quality."). A `track_change` the
+  server answers with a terminal whose reason starts with `subtitle_` (a
+  subtitle no route shows) is refused the same way, with "This subtitle
+  can't be shown."; any other terminal ends playback. A `track_change`
+  waiting behind a refused one asks for the plan's own member in place of
+  the refused one it took.
+- A subtitle no route shows is never offered or chosen: an inventory row
+  marked `unplayable`, or, from a server that marks none, an embedded row
+  with no codec and no `url`, `native_selectable`, or `hls_rendition` (a
+  Matroska `S_TEXT/WEBVTT` track FFmpeg does not name), and on Detail a
+  watch projection track that is embedded with no codec. Options and
+  Detail's Subtitles menu leave it out, since neither has a disabled row,
+  and every other track keeps its ordinal; the preferences, a subtitle set
+  aside for captions On, and a pick in Roku's `*` overlay never select it
+  (assumption AG-655).
 - The first release does not claim client-side audio selection within an
   original file; the server may choose a remux that makes selection
   deterministic.
