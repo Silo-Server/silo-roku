@@ -870,7 +870,10 @@ reason}`. The room moves every member to a new revision.
 The room task waits on its message port with a timeout to the next due
 event (a command's `execute_at`, a report, a ping, a retry; every 250 ms
 while the room plays), so commands reach the render thread on time
-without a busy loop. The task decides every correction from the
+without a busy loop. A due command that cannot run yet (held up to 5 s
+behind a seek or load, or waiting for a clock) is checked again at that
+tick, or at the hold's end when sooner; a new `playerSample` wakes the
+task at once. The task decides every correction from the
 player's samples (`playerSample`); the render thread only executes the
 `playerCommand` it is given, at once, and reports what the player does.
 W0-3 measures that hop.
