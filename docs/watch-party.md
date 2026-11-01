@@ -740,7 +740,12 @@ overlays over the player do not pause the room.
 The room's playback uses the normal protocol v3 start
 (`source/playback/capabilities.bs`) with `file_id` = `selected_file_id`,
 `start_position` = the anchor, no resume rewind, `allow_alternate_versions`
-false, mounted paused. `PlaybackStartBody` admits no `library_id`
+false, mounted paused. The room's first pause usually lands while the
+Video node buffers the content; Roku then reports paused, then buffering
+again, and keeps the node paused, so the room's play resumes a node the
+player paused that still says buffering (`watchparty.player.resumesOnPlay`;
+before this every direct start waited for the 20 s no-progress reload).
+`PlaybackStartBody` admits no `library_id`
 (`additionalProperties` false), so `selected_library_id` travels only in
 the player's entry. A plan whose `effective_media_file_id` names another
 file fails with "The Watch Party's selected media version is
