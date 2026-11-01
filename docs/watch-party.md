@@ -1013,7 +1013,9 @@ The player's part:
   reducer's play intent, so the loads it opens follow it. A Video node
   that plays while the room wants it paused (a seek Roku resumed) pauses
   again, except while a barrier's settle plays it muted (section 7.4) or a
-  hold's seek plays it muted to find its landing (section 7.5). A
+  hold's seek plays it muted to find its landing (section 7.5); one whose
+  hold's pause lands after the room's play resumes, since a short hold's
+  play can reach the player before the node reports the pause. A
   seek's sample says seeking until the node shows its real landing
   (`watchparty.landing`); a paused member's seek counts as landed when the
   node reports paused again, or 3 s after it ran. These need the device to
