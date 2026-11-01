@@ -27,8 +27,11 @@ import "pkg:/source/watchparty/wire.bs"
 ' then plays muted from a shorter landing to the target before it reports
 ' the seek landed (watchparty.landing, section 7.4); and hold, true for an
 ' overshoot's seek (section 7.5): the player pauses on its landing and
-' says seeking (and holding) until a later command plays it. Messages for
-' the socket are { kind: "send", text }.
+' says seeking (and holding) until a later command plays it; with reload,
+' a copy remux's reload aimed ahead of the room, which holds where Roku
+' opens it and asks for no lead-in. Messages for the socket are { kind:
+' "send", text }, and lines for the log { kind: "log", level, message,
+' fields }.
 '
 ' ctx, given to each call, is { now, serverNow, room, sample, writable,
 ' snapshotSeq }: the Task's monotonic milliseconds, the server's epoch
@@ -127,6 +130,9 @@ namespace watchparty.sync
         state.overshoot = invalid
         state.shortfalls = []
         state.lastSeek = invalid
+        ' What this title's copy-remux reloads have taken to open, and where
+        ' they opened (watchparty.catchup.remuxModel).
+        state.remux = watchparty.catchup.remuxModel()
         ' Whether the room played by its last command that was not a seek's
         ' barrier (invalid before one): the play state a barrier returns to.
         state.roomPlays = invalid
@@ -362,6 +368,11 @@ namespace watchparty.sync
             atRestBehind = not memberPlaying and ((decision = "seek" and drift > 0) or joining)
             correcting = memberPlaying and (decision = "seek" or decision = "reload")
             if atRestBehind or (correcting and watchparty.catchup.landsShort(state.shortfalls)) then hold = beginHold(state, ctx, ref, command.commandId)
+        else if commandPlays and ref.playing and action <> "seek" and not sample.planInPlace and decision = "reload" and watchparty.catchup.reloadAllowed(state.reloads, now)
+            ' A copy remux's correction: a reload aimed ahead of the room,
+            ' held where Roku opens it (section 7.5).
+            hold = beginRemuxHold(state, ctx, ref, command.commandId)
+            if hold <> invalid then reload = true
         end if
         if hold <> invalid
             seek = hold
@@ -398,6 +409,7 @@ namespace watchparty.sync
         out = [player(state, command.commandId, seek, reload, playing, settle, hold <> invalid)]
         state.executed = { seq: state.seq, sessionId: sample.sessionId }
         if hold <> invalid then state.overshoot.seq = state.seq
+        if hold <> invalid and reload then out.Push(remuxAimLog(state))
         noteExecuted(state, command, ref, now, commandPlays)
         if command.playbackState = "waiting"
             seekTarget = invalid
@@ -475,6 +487,14 @@ namespace watchparty.sync
         end if
         if not watchparty.catchup.reloadAllowed(state.reloads, now) then return []
         state.reloadDeferred = false
+        if not sample.planInPlace
+            aim = beginRemuxHold(state, ctx, ref, appliedId(state))
+            if aim <> invalid
+                action = player(state, state.overshoot.commandId, aim, true, false, invalid, true)
+                state.overshoot.seq = state.seq
+                return [action, remuxAimLog(state)]
+            end if
+        end if
         aimed = watchparty.catchup.reloadBegin(state.reloads, expected, now, sample.duration)
         watchparty.catchup.reloadLoading(state.reloads)
         state.lastBusyAt = now
@@ -531,6 +551,29 @@ namespace watchparty.sync
         return aim
     end function
 
+    ' Starts a copy remux's held reload toward the room of ref: where its
+    ' stream should start (watchparty.catchup.remuxAim), or invalid near the
+    ' end of the file (the caller reloads as before). The reload is a hold
+    ' (reload true) that never seeks again: where Roku opens it is where it
+    ' holds, and the reload budget counts it and paces the next.
+    function beginRemuxHold(state as Object, ctx as Object, ref as Object, commandId as String) as Dynamic
+        room = watchparty.catchup.positionAt(ref, ctx.serverNow)
+        aim = watchparty.catchup.remuxAim(room, state.remux, ctx.sample.duration)
+        if aim = invalid then return invalid
+        watchparty.catchup.reloadHeld(state.reloads, aim, ctx.now)
+        state.overshoot = { seq: invalid, aim: aim, ref: ref, commandId: commandId, startedAt: ctx.now, seeks: 1, dueAt: invalid, resettled: false, reload: true, room: room, opened: false, heldSince: invalid }
+        state.lastBusyAt = ctx.now
+        state.lastLoopSeekAt = ctx.now
+        return aim
+    end function
+
+    ' The [WP] line for a held reload's aim: the room when it was asked,
+    ' where the stream should start, and the start it expects.
+    function remuxAimLog(state as Object) as Object
+        o = state.overshoot
+        return logLine("info", "remux reload aim", { room: roundMs(o.room), origin: roundMs(o.aim), ahead: roundMs(o.aim - o.room), expectedStartMs: Int(watchparty.catchup.remuxExpectedStart(state.remux) * 1000), attempt: state.reloads.attempts })
+    end function
+
     ' The player command for a hold's seek to aim: paused, measured, held.
     function holdSeek(state as Object, aim as Dynamic) as Object
         action = player(state, state.overshoot.commandId, aim, false, false, invalid, true)
@@ -559,17 +602,26 @@ namespace watchparty.sync
         sample = ctx.sample
         now = ctx.now
         o.dueAt = invalid
+        reload = util.isTrue(o.reload)
         ran = sample.commandSeq >= o.seq
         if ran and not util.isTrue(sample.holding) and not sample.seeking
             state.overshoot = invalid
-            return []
+            if not reload then return []
+            watchparty.catchup.reloadAbandon(state.reloads, now)
+            return [logLine("info", "remux hold ended by the player", { position: roundMs(sample.position), heldMs: sinceOr(o.heldSince, now) })]
         end if
         if not ran or not util.isTrue(sample.holding)
-            if now - o.startedAt >= watchparty.catchup.HOLD_LAND_TIMEOUT_MS then return [holdPlay(state)]
-            return []
+            limit = watchparty.catchup.HOLD_LAND_TIMEOUT_MS
+            if reload then limit = watchparty.catchup.REMUX_LAND_TIMEOUT_MS
+            if now - o.startedAt < limit then return []
+            out = []
+            if reload then out.Push(logLine("warn", "remux reload showed no landing; playing", { origin: roundMs(o.aim), ms: now - o.startedAt }))
+            out.Push(holdPlay(state, now))
+            return out
         end if
         if ctx.serverNow = invalid then return []
         room = watchparty.catchup.positionAt(o.ref, ctx.serverNow)
+        if reload then return remuxHoldStep(state, ctx, room)
         if not o.resettled and util.isNumber(sample.landed) and sample.landedSeq = o.seq
             ' Landed on the keyframe after its aim: settle onto it.
             again = watchparty.catchup.forwardResettle(o.aim, sample.landed)
@@ -599,14 +651,50 @@ namespace watchparty.sync
                 return [holdSeek(state, aim)]
             end if
         end if
-        return [holdPlay(state)]
+        return [holdPlay(state, now)]
     end function
 
-    ' The hold is over: play where it is.
-    function holdPlay(state as Object) as Object
-        commandId = state.overshoot.commandId
+    ' A held reload paused where Roku opened it (section 7.5): the first
+    ' sample of its landing teaches the next aim how long the reload took
+    ' and where it opened; then it plays as the room reaches the landing,
+    ' or at once from a landing behind the room, the reload budget pacing
+    ' the next.
+    function remuxHoldStep(state as Object, ctx as Object, room as Dynamic) as Object
+        o = state.overshoot
+        sample = ctx.sample
+        now = ctx.now
+        out = []
+        if not o.opened
+            o.opened = true
+            o.heldSince = now
+            landed = sample.position
+            if util.isNumber(sample.landed) and sample.landedSeq = o.seq then landed = sample.landed
+            startMs = now - o.startedAt
+            watchparty.catchup.noteRemuxOpening(state.remux, startMs, o.aim, landed)
+            out.Push(logLine("info", "remux reload opened", { origin: roundMs(o.aim), landed: roundMs(landed), room: roundMs(room), ahead: roundMs(landed - room), startMs: startMs }))
+        end if
+        verdict = watchparty.catchup.remuxHoldStep(sample.position - room)
+        if verdict.action = "wait"
+            if out.Count() > 0 then out.Push(logLine("info", "remux hold", { holdAt: roundMs(sample.position), room: roundMs(room), waitMs: verdict.inMs }))
+            o.dueAt = now + verdict.inMs
+            return out
+        end if
+        if verdict.fallback
+            out.Push(logLine("warn", "remux reload opened behind the room; playing, the next reload waits for the budget", { holdAt: roundMs(sample.position), room: roundMs(room), behind: roundMs(room - sample.position) }))
+        else
+            out.Push(logLine("info", "remux hold plays", { holdAt: roundMs(sample.position), room: roundMs(room), heldMs: now - o.heldSince }))
+        end if
+        out.Push(holdPlay(state, now))
+        return out
+    end function
+
+    ' The hold is over: play where it is. A held reload's end spaces the
+    ' next reload (watchparty.catchup.reloadAbandon).
+    function holdPlay(state as Object, now as Integer) as Object
+        o = state.overshoot
         state.overshoot = invalid
-        return player(state, commandId, invalid, false, true)
+        if util.isTrue(o.reload) then watchparty.catchup.reloadAbandon(state.reloads, now)
+        return player(state, o.commandId, invalid, false, true)
     end function
 
     ' A correction seek to roomSeconds, aimed ahead by the measured lead. On
@@ -818,6 +906,22 @@ namespace watchparty.sync
 
     function send(text as String) as Object
         return { kind: "send", text: text }
+    end function
+
+    ' A line for the diagnostics log, which the room Task marks [WP].
+    function logLine(level as String, message as String, fields as Object) as Object
+        return { kind: "log", level: level, message: message, fields: fields }
+    end function
+
+    ' Seconds to the millisecond, for the log.
+    function roundMs(seconds as Dynamic) as Dynamic
+        return Int(seconds * 1000 + 0.5) / 1000#
+    end function
+
+    ' Milliseconds since at, or 0 for never.
+    function sinceOr(at as Dynamic, now as Integer) as Integer
+        if at = invalid then return 0
+        return now - at
     end function
 
     ' Milliseconds since at, or a long time for never.

@@ -70,6 +70,28 @@ namespace watchparty.catchup
     ' RESETTLE_PAST_SECONDS past that keyframe (forwardResettle).
     const FORWARD_LANDING_SECONDS = 0.25
     const RESETTLE_PAST_SECONDS = 0.1
+    ' A copy remux's reload, aimed ahead, then held (remux*): Roku opens a
+    ' fresh remux playlist at its origin or later, never before it (prod,
+    ' a 69 Mbps 4K remux: at the origin, 10.3 to 10.6 s short of a lead-in's
+    ' PlayStart; Streaming Stick: up to 8 s past it). So the reload asks for
+    ' its stream at the room plus the time the reload takes to show its
+    ' first frame, with no lead-in, and holds wherever it opens until the
+    ' room reaches it. The start time is learned from the last
+    ' REMUX_START_WINDOW reloads (the longest), REMUX_DEFAULT_START_SECONDS
+    ' before any (prod: about 4.5 s from the content's assignment to its
+    ' first frame, after a 0.3 to 0.5 s replan and a 0.5 s stop), at most
+    ' REMUX_MAX_START_SECONDS; the aim adds REMUX_MARGIN_SECONDS and how far
+    ' below its aim a reload has opened (the server's origin is the
+    ' keyframe at or before the position asked for: 0.2 to 1.0 s on prod),
+    ' at most REMUX_MAX_AHEAD_SECONDS ahead. A landing behind the room costs
+    ' a whole reload more; one ahead, only that much more hold. A reload
+    ' that shows no landing within REMUX_LAND_TIMEOUT_MS plays.
+    const REMUX_START_WINDOW = 3
+    const REMUX_DEFAULT_START_SECONDS = 6
+    const REMUX_MAX_START_SECONDS = 15
+    const REMUX_MARGIN_SECONDS = 1.5
+    const REMUX_MAX_AHEAD_SECONDS = 17
+    const REMUX_LAND_TIMEOUT_MS = 25000
 
     ' ---- The room's position
 
@@ -258,6 +280,81 @@ namespace watchparty.catchup
         return { action: "wait", inMs: untilMs }
     end function
 
+    ' ---- A copy remux's reload, aimed ahead and held (section 7.5)
+
+    ' What a member has learned of its copy remux's reloads: { starts (how
+    ' long each took from its command to its landing, seconds), offsets
+    ' (where each opened less where it aimed, seconds) }, the last
+    ' REMUX_START_WINDOW of each.
+    function remuxModel() as Object
+        return { starts: [], offsets: [] }
+    end function
+
+    ' How long the next reload should take to show where it opened: the
+    ' longest of the recent ones, else REMUX_DEFAULT_START_SECONDS, at most
+    ' REMUX_MAX_START_SECONDS.
+    function remuxExpectedStart(model as Object) as Dynamic
+        out = REMUX_DEFAULT_START_SECONDS
+        if model.starts.Count() > 0
+            out = 0
+            for each seconds in model.starts
+                if seconds > out then out = seconds
+            end for
+        end if
+        if out > REMUX_MAX_START_SECONDS then out = REMUX_MAX_START_SECONDS
+        return out
+    end function
+
+    ' How far ahead of the room a reload aims: the expected start, the
+    ' margin, and the furthest a recent reload opened below its aim (none
+    ' for openings past it, whose distance Roku does not repeat reliably),
+    ' at most REMUX_MAX_AHEAD_SECONDS.
+    function remuxAhead(model as Object) as Dynamic
+        below = 0
+        for each offset in model.offsets
+            if -offset > below then below = -offset
+        end for
+        ahead = remuxExpectedStart(model) + REMUX_MARGIN_SECONDS + below
+        if ahead > REMUX_MAX_AHEAD_SECONDS then ahead = REMUX_MAX_AHEAD_SECONDS
+        return ahead
+    end function
+
+    ' Where a reload for the room at roomSeconds asks its stream to start
+    ' (remuxAhead past it), or invalid when that reaches into the last
+    ' END_MARGIN_SECONDS of a file of durationSeconds (0 for unknown): the
+    ' caller reloads as before.
+    function remuxAim(roomSeconds as Dynamic, model as Object, durationSeconds as Dynamic) as Dynamic
+        aim = roomSeconds + remuxAhead(model)
+        if durationSeconds > 0 and aim > durationSeconds - END_MARGIN_SECONDS then return invalid
+        return aim
+    end function
+
+    ' A reload aimed at aimSeconds showed it opened at landedSeconds startMs
+    ' after its command: the next aim learns both.
+    sub noteRemuxOpening(model as Object, startMs as Integer, aimSeconds as Dynamic, landedSeconds as Dynamic)
+        seconds = startMs / 1000#
+        if seconds < 0 then seconds = 0
+        model.starts.Push(seconds)
+        model.offsets.Push(landedSeconds - aimSeconds)
+        while model.starts.Count() > REMUX_START_WINDOW
+            model.starts.Shift()
+        end while
+        while model.offsets.Count() > REMUX_START_WINDOW
+            model.offsets.Shift()
+        end while
+    end sub
+
+    ' A reload paused where it opened, aheadSeconds past the room
+    ' (negative: behind): { action, inMs }, "wait" inMs before playing or
+    ' "play" now. Never "retry": another reload costs a whole start, so one
+    ' that opened behind plays at once and the reload budget paces the
+    ' next (fallback true then).
+    function remuxHoldStep(aheadSeconds as Dynamic) as Object
+        verdict = holdStep(aheadSeconds, HOLD_TRIES)
+        verdict.fallback = aheadSeconds < -DEADBAND_SECONDS
+        return verdict
+    end function
+
     ' ---- The reload budget (Android RoomReloadBudget)
 
     ' Times are the caller's monotonic milliseconds.
@@ -295,6 +392,18 @@ namespace watchparty.catchup
         budget.nextAllowedAt = now + RELOAD_STALE_MS
         return aim
     end function
+
+    ' Records a copy remux's held reload toward aimSeconds (remuxAim): an
+    ' attempt like reloadBegin's, but never landed by a position (it lands
+    ' where Roku opens it, and its hold decides when it plays); its hold's
+    ' end calls reloadAbandon, which spaces the next.
+    sub reloadHeld(budget as Object, aimSeconds as Dynamic, now as Integer)
+        budget.target = aimSeconds
+        budget.loadStarted = false
+        budget.startedAt = now
+        budget.attempts = budget.attempts + 1
+        budget.nextAllowedAt = now + RELOAD_STALE_MS
+    end sub
 
     ' The reload's own seek was issued.
     sub reloadLoading(budget as Object)

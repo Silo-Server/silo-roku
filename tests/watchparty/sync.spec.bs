@@ -27,6 +27,7 @@ namespace tests
                 sent: [],
                 commands: [],
                 seeks: [],
+                logs: [],
                 seq: 0
             }
             h.sample.Append(sampleFields)
@@ -71,9 +72,29 @@ namespace tests
                         end if
                     end if
                     h.sample.commandSeq = action.command.seq
+                else if action.kind = "log"
+                    h.logs.Push(action)
                 end if
             end for
         end sub
+
+        ' The log lines the rules wrote with message.
+        function logsOf(h as Object, message as String) as Object
+            out = []
+            for each line in h.logs
+                if line.message = message then out.Push(line)
+            end for
+            return out
+        end function
+
+        ' The reloads the player was told to run.
+        function reloads(h as Object) as Object
+            out = []
+            for each command in h.commands
+                if command.reload = true then out.Push(command)
+            end for
+            return out
+        end function
 
         sub advance(h as Object, ms as Integer)
             for i = 1 to ms \ 50
@@ -497,8 +518,10 @@ namespace tests
             h = m.harness({}, { planInPlace: false })
             m.update(h, { position: 97 })
             m.command(h, "drift", "play", 100, "playing")
-            m.assertEqual(h.seeks, [100])
+            m.assertEqual(h.seeks.Count(), 1)
+            m.assertTrue(m.near(h.seeks[0], 107.5, 0.001), "aimed ahead and held (section 7.5): " + FormatJson(h.seeks))
             m.assertTrue(h.commands.Peek().reload)
+            m.assertTrue(h.commands.Peek().hold)
             ' The loop never seeks a copy remux in place.
             m.follow(h, 2.0, 3000)
             m.assertEqual(h.seeks.Count(), 1)
@@ -507,6 +530,8 @@ namespace tests
         @it("paces a member buffering toward play through the reload budget")
         sub _()
             h = m.harness({}, { position: 50, playing: false, stalled: true, planInPlace: false })
+            ' The reload never opens: the member stays where it buffers.
+            h.autoLand = false
             m.command(h, "r1", "play", 100, "playing")
             m.advance(h, 100)
             m.assertEqual(h.seeks.Count(), 1)
@@ -705,14 +730,14 @@ namespace tests
             m.assertTrue(host.commands.Peek().hold, "a host 3 s off would reload")
         end sub
 
-        @it("keeps the old rules for a copy remux and for seeks that land within a second")
+        @it("keeps the keyframe rules off a copy remux, and off seeks that land within a second")
         sub _()
             h = m.harness({}, { planInPlace: false })
             h.sync.shortfalls.Push(3)
             m.update(h, { position: 92 })
             m.command(h, "far", "play", 100, "playing")
             m.assertTrue(h.commands.Peek().reload)
-            m.assertFalse(h.commands.Peek().DoesExist("hold"))
+            m.assertTrue(m.near(h.seeks[0], 107.5, 0.001), "the remux's own aim, not the keyframe overshoot: " + FormatJson(h.seeks))
             near = m.harness()
             near.sync.shortfalls.Push(0.6)
             m.update(near, { position: 98 })
@@ -832,6 +857,171 @@ namespace tests
             m.advance(h, 50)
             due = watchparty.sync.nextWakeMs(h.sync, m.ctx(h))
             m.assertTrue(due < watchparty.sync.TICK_MS and due >= 0, FormatJson(due))
+        end sub
+
+        @describe("a copy remux's reload, aimed ahead and held (section 7.5)")
+
+        ' The player as on prod (a 69 Mbps 4K remux): Roku opens a reload's
+        ' stream at its origin, 0.5 s below the position asked for, startMs
+        ' after the command. A reload with no hold asked 10 s early (the
+        ' lead-in) and its seek forward fell 4.4 s past that origin. Gives
+        ' where the load opened; a held one is paused there.
+        function remuxOpens(h as Object, startMs as Integer) as Dynamic
+            reload = h.commands.Peek()
+            m.update(h, { seeking: true, holding: false, playing: false, wantsPlay: reload.playing = true })
+            m.advance(h, startMs)
+            if reload.hold = true
+                opened = reload.seek - 0.5
+                m.holdAt(h, opened)
+            else
+                opened = reload.seek - 10 + 4.4
+                m.update(h, { seeking: false, playing: true, wantsPlay: true, position: opened })
+            end if
+            return opened
+        end function
+
+        ' The hold's play came: the node plays from where it held.
+        sub holdPlays(h as Object, limitMs as Integer)
+            count = h.commands.Count()
+            while h.commands.Count() = count and h.now < limitMs
+                m.advance(h, 50)
+            end while
+            m.update(h, { seeking: false, holding: false, playing: true, wantsPlay: true })
+        end sub
+
+        @it("puts a copy-remux member Roku reopens at its stream's origin on the room, with no second reload (prod 4K remux)")
+        sub _()
+            h = m.harness({}, { position: 95, planInPlace: false })
+            h.autoLand = false
+            m.command(h, "drift", "play", 100, "playing")
+            m.assertEqual(m.reloads(h).Count(), 1)
+            held = h.commands.Peek().hold = true
+            m.remuxOpens(h, 6000)
+            if held then m.holdPlays(h, 20000)
+            ' The server corrects a member more than 1 s off every 10 s or so.
+            for i = 1 to 4
+                m.advance(h, 10000)
+                m.command(h, "fix-" + i.ToStr(), "play", 100 + h.now / 1000#, "playing")
+            end for
+            m.assertEqual(m.reloads(h).Count(), 1, "it reloaded again: " + FormatJson(h.seeks))
+            drift = 100 + h.now / 1000# - h.sample.position
+            m.assertTrue(Abs(drift) <= watchparty.catchup.DEADBAND_SECONDS, "left " + Str(drift).Trim() + " s off the room")
+        end sub
+
+        @it("asks for the room plus the reload's start, holds silent where it opens, and plays as the room reaches it")
+        sub _()
+            h = m.harness({}, { position: 95, planInPlace: false })
+            h.autoLand = false
+            m.command(h, "drift", "play", 100, "playing")
+            reload = h.commands.Peek()
+            m.assertTrue(reload.reload)
+            m.assertTrue(reload.hold)
+            m.assertFalse(reload.playing, "paused until the room reaches it")
+            m.assertTrue(m.near(reload.seek, 107.5, 0.001), "room + 6 s start (nothing learned) + 1.5 s: " + FormatJson(reload.seek))
+            aim = m.logsOf(h, "remux reload aim")
+            m.assertEqual(aim.Count(), 1)
+            m.assertEqual(aim[0].fields.expectedStartMs, 6000)
+            m.assertTrue(m.near(aim[0].fields.room, 100, 0.001))
+            h.sent.Clear()
+            m.remuxOpens(h, 5000)
+            m.advance(h, 50)
+            opened = m.logsOf(h, "remux reload opened")
+            m.assertEqual(opened.Count(), 1)
+            m.assertTrue(m.near(opened[0].fields.landed, 107, 0.001))
+            m.assertTrue(m.near(opened[0].fields.ahead, 1.95, 0.06), FormatJson(opened[0].fields))
+            m.assertEqual(m.logsOf(h, "remux hold").Count(), 1)
+            m.holdPlays(h, 20000)
+            play = h.commands.Peek()
+            m.assertTrue(play.playing)
+            m.assertEqual(play.seek, invalid)
+            m.assertEqual(play.commandId, "drift")
+            m.assertTrue(m.near(100 + h.now / 1000#, 106.9, 0.06), "plays as the room reaches 107, less the resume")
+            m.assertEqual(h.sent.Count(), 0, "nothing reported while it reloaded and held: " + FormatJson(h.sent))
+            m.assertEqual(m.logsOf(h, "remux hold plays").Count(), 1)
+            m.assertFalse(watchparty.catchup.reloadInFlight(h.sync.reloads), "the hold's end ends the reload")
+            ' What it learned: a 5.05 s start, opened 0.5 s below its aim.
+            m.assertTrue(m.near(watchparty.catchup.remuxAhead(h.sync.remux), 5.05 + 1.5 + 0.5, 0.01), FormatJson(h.sync.remux))
+        end sub
+
+        @it("aims the next reload by the start and opening the last one showed")
+        sub _()
+            h = m.harness({}, { position: 95, planInPlace: false })
+            h.autoLand = false
+            m.command(h, "r1", "play", 100, "playing")
+            m.remuxOpens(h, 8000)
+            m.holdPlays(h, 30000)
+            ' Drifted 3 s behind once more, after the budget's 10 s.
+            m.advance(h, 11000)
+            m.update(h, { position: 100 + h.now / 1000# - 3 })
+            m.command(h, "r2", "play", 100 + h.now / 1000#, "playing")
+            m.assertEqual(m.reloads(h).Count(), 2)
+            room = 100 + h.now / 1000#
+            m.assertTrue(m.near(h.commands.Peek().seek - room, 8.05 + 1.5 + 0.5, 0.06), FormatJson(h.seeks))
+        end sub
+
+        @it("plays a reload that opened behind the room at once, and leaves the next to the reload budget")
+        sub _()
+            h = m.harness({}, { position: 95, planInPlace: false })
+            h.autoLand = false
+            m.command(h, "slow", "play", 100, "playing")
+            ' A 9 s start: it opens at 107, with the room at 109.
+            m.remuxOpens(h, 9000)
+            m.advance(h, 50)
+            play = h.commands.Peek()
+            m.assertTrue(play.playing, "plays at once")
+            m.assertEqual(play.seek, invalid, "never seeks again")
+            m.assertEqual(m.logsOf(h, "remux reload opened behind the room; playing, the next reload waits for the budget").Count(), 1)
+            m.assertInvalid(h.sync.overshoot)
+            m.update(h, { seeking: false, holding: false, playing: true, wantsPlay: true })
+            ' The server's correction a second later waits for the budget, 10 s
+            ' after the hold's end.
+            m.advance(h, 1000)
+            m.command(h, "fix", "play", 100 + h.now / 1000#, "playing")
+            m.assertEqual(m.reloads(h).Count(), 1, "no faster than the budget")
+            m.advance(h, 8500)
+            m.assertEqual(m.reloads(h).Count(), 1)
+            m.advance(h, 1000)
+            m.assertEqual(m.reloads(h).Count(), 2, "the held correction never ran")
+            again = h.commands.Peek()
+            m.assertTrue(again.hold)
+            room = m.logsOf(h, "remux reload aim").Peek().fields.room
+            m.assertTrue(m.near(again.seek - room, 9.05 + 1.5 + 0.5, 0.01), "aimed by the slow start: " + FormatJson(again.seek - room))
+        end sub
+
+        @it("holds on through the server's correction of the same timeline while the reload loads")
+        sub _()
+            h = m.harness({}, { position: 95, planInPlace: false })
+            h.autoLand = false
+            m.command(h, "drift", "play", 100, "playing")
+            m.update(h, { seeking: true, holding: false, playing: false, wantsPlay: false })
+            m.advance(h, 2000)
+            count = h.commands.Count()
+            m.command(h, "fix", "play", 102, "playing")
+            m.advance(h, 4000)
+            m.assertEqual(h.commands.Count(), count, "the correction ended the reload's hold: " + FormatJson(h.commands.Peek()))
+            m.holdAt(h, 107)
+            m.holdPlays(h, 20000)
+            m.assertEqual(h.commands.Peek().commandId, "fix", "reports name the command it followed")
+            m.assertEqual(m.reloads(h).Count(), 1)
+        end sub
+
+        @it("plays a reload that never shows where it opened, and reloads as before near the end of the file")
+        sub _()
+            h = m.harness({}, { position: 95, planInPlace: false })
+            h.autoLand = false
+            m.command(h, "drift", "play", 100, "playing")
+            m.update(h, { seeking: true, holding: false, playing: false, wantsPlay: false })
+            m.advance(h, watchparty.catchup.REMUX_LAND_TIMEOUT_MS - 100)
+            m.assertEqual(h.commands.Count(), 1)
+            m.advance(h, 150)
+            m.assertEqual(h.commands.Count(), 2)
+            m.assertTrue(h.commands.Peek().playing)
+            m.assertEqual(m.logsOf(h, "remux reload showed no landing; playing").Count(), 1)
+            ending = m.harness({}, { position: 95, planInPlace: false, duration: 105 })
+            m.command(ending, "drift", "play", 100, "playing")
+            m.assertTrue(ending.commands.Peek().reload)
+            m.assertFalse(ending.commands.Peek().DoesExist("hold"))
+            m.assertEqual(ending.seeks, [100])
         end sub
 
         @it("re-checks a due command that cannot run yet at the tick, not at once")

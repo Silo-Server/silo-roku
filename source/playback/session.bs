@@ -85,6 +85,10 @@ namespace playback.session
     ' before the target and starts the load at the target (leadIn): Roku
     ' opens a growing remux playlist up to 8 s past its origin and cannot
     ' seek below that for the load's life (W0-2 on the Streaming Stick).
+    ' On a playlist the server grows slowly (prod, a 69 Mbps 4K remux) the
+    ' load opened at the origin instead, 10 s short, and the seek forward
+    ' fell 4 to 6 s short (an open item, docs/spec.md section 9.6). A
+    ' party's held reload asks for no lead-in (onPartyReload).
     const REANCHOR_LEAD_SECONDS = 10
     ' and the player assigns its content this long after the plan's answer,
     ' with the node stopped: Roku starts a remux playlist at most three
@@ -404,27 +408,32 @@ namespace playback.session
         submit(state, request, env, out)
     end sub
 
-    ' {position}: a party's reload at a source position: the room's
+    ' {position, aim}: a party's reload at a source position: the room's
     ' correction reload, or a room seek that moves the member off the end
     ' of the file. A new load of the current plan there where the timeline
     ' allows a local reload, else a seek_reanchor; it opens paused or
     ' playing as the player says (the player's own load commands carry the
-    ' room's play state).
+    ' room's play state). aim: a held reload aimed ahead of the room
+    ' (docs/watch-party.md section 7.5), whose load plays from wherever
+    ' Roku opens it: its seek_reanchor asks for the position itself, with
+    ' no lead-in, and its load's start is not checked (partyOpens).
     sub onPartyReload(state as Object, event as Object, env as Object, out as Object)
         if state.phase <> "active" or not util.isNumber(event.position) then return
         plan = state.plan
         target = playback.seek.clamp(event.position, plan.runtime)
+        aim = util.isTrue(event.aim)
         state.player.ended = false
         playback.seek.cancelSkips(state.skips)
         decision = playback.seek.decide(plan.timeline, target)
-        out.Push({ type: "log", level: "info", message: "[WP] party reload", fields: { position: playback.values.roundMs(target), kind: decision.kind } })
+        out.Push({ type: "log", level: "info", message: "[WP] party reload", fields: { position: playback.values.roundMs(target), kind: decision.kind, aim: aim } })
         if decision.kind = "local"
             state.seekTarget = invalid
             state.player.position = playback.values.toDouble(target)
             reload(state, env, out, decision.position)
+            if aim then plan.partyOpens = plan.load
         else
             state.seekTarget = target
-            submit(state, { rank: RANK_INTENT, op: "seek_reanchor", position: target }, env, out)
+            submit(state, { rank: RANK_INTENT, op: "seek_reanchor", position: target, aim: aim }, env, out)
         end if
     end sub
 
@@ -736,7 +745,8 @@ namespace playback.session
             ' The node plays again after the seek back's rebuffering.
             if plan.seekBack <> invalid and plan.seekBack.buffered then plan.seekBack.resumed = true
             if not plan.loadPlayed
-                if isHls(plan.data) and util.isNumber(plan.loadStart) then plan.startCheck = { at: now }
+                ' A party's held reload plays from wherever Roku opens it.
+                if isHls(plan.data) and util.isNumber(plan.loadStart) and plan.partyOpens <> plan.load then plan.startCheck = { at: now }
             end if
             plan.loadPlayed = true
             plan.loadMedia = true
@@ -1420,8 +1430,9 @@ namespace playback.session
         fields.playback_attempt_id = a.id
         fields.replan_request_id = id
         fields.position_seconds = playback.values.roundMs(position)
-        if op = "seek_reanchor" and isCopyRemux(plan.data)
-            ' The stream starts before the target, and the load at it (leadIn).
+        if op = "seek_reanchor" and isCopyRemux(plan.data) and not util.isTrue(request.aim)
+            ' The stream starts before the target, and the load at it (leadIn);
+            ' a party's held reload asks for its aim itself (onPartyReload).
             request.leadTarget = playback.values.toDouble(position)
             lead = position - REANCHOR_LEAD_SECONDS
             if lead < 0 then lead = 0
@@ -1617,6 +1628,7 @@ namespace playback.session
             playerStart = playback.seek.playerPosition(timeline, request.leadTarget)
             state.plan.loadStart = playback.seek.playerPosition(timeline, request.leadTarget)
         end if
+        if how = "reanchor" and util.isTrue(request.aim) then state.plan.partyOpens = state.plan.load
         state.player.position = playback.seek.sourcePosition(timeline, playerStart)
         state.player.seeking = false
         state.player.state = "loading"
@@ -1791,7 +1803,10 @@ namespace playback.session
             seekBack: invalid,
             ' The plan answers a reanchor asked for REANCHOR_LEAD_SECONDS
             ' before its target, and its load starts at the target (leadIn).
-            leadIn: false
+            leadIn: false,
+            ' The load a party's held reload opened, which plays from wherever
+            ' Roku opens it: its start is not checked (onPartyReload).
+            partyOpens: 0
         }
         playOwnUrl(current)
         if playback.recovery.isProxyStream(plan)
