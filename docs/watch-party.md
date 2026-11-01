@@ -487,8 +487,12 @@ ends the party (section 4.11). Membership flags (`is_ready`,
 ### 6.3 Errors on the socket
 
 `bad_request` before the attach is confirmed goes to the banner; after it,
-to the log only. `internal_error` goes to the banner. A message the client
-does not know is ignored.
+to the log only. The attach is confirmed once a snapshot the socket
+received after its first names the session (section 7.3), not by the held
+snapshot: the server keeps a member's session across sockets, so after a
+reconnect the held snapshot and the new socket's first one both name it
+before the server has answered the new attach. `internal_error` goes to
+the banner. A message the client does not know is ignored.
 
 ### 6.4 Reconnect
 
@@ -537,19 +541,23 @@ never when it arrives. Positions are source positions
 ### 7.3 Reports
 
 - `attach_session` as soon as the playback session is committed, again
-  every 1.5 s until a snapshot names it in `attached_session_id`, and after
-  every reconnect.
+  every 1.5 s until a snapshot sent after it names it in
+  `attached_session_id`, and after every reconnect. Each socket's first
+  snapshot answers nothing: the server sends it before it reads the
+  socket. Until the attach is confirmed, nothing below is sent.
 - `state_report` every 1.5 s with the last executed `command_id`, only when
   the player has a real position: none while stalled, seeking, loading,
   or within 250 ms of a pending command. After a command, reports wait
   until the player shows that command's play state (at least 250 ms, at
   most 3 s).
 - `ready` (and `state_report {is_ready: true, command_id}`) every 500 ms
-  while the room waits on a seek this member must acknowledge, or while
-  this member catches up (`self_ignore_wait`, or its own buffering), and
-  only while the player is playable: never while it seeks, loads, or
-  stalls, which would tell the room it recovered. Never otherwise: a
-  `ready` in a playing room causes another sync seek.
+  while the room waits on a seek this member must acknowledge, until a
+  snapshot after the command shows this member ready (readiness moves no
+  `generation`, so any later snapshot counts), or while this member
+  catches up (`self_ignore_wait`, or its own buffering), and only while
+  the player is playable: never while it seeks, loads, or stalls, which
+  would tell the room it recovered. Never otherwise: a `ready` in a
+  playing room causes another sync seek.
 - `buffering` once per stall, after 2 s without progress while the room
   plays. The 2 s restarts after each seek and command.
 
