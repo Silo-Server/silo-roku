@@ -2364,3 +2364,25 @@ tester's private evidence folder. Assumptions AG-652 to AG-654.
   cosmetic).
 - Roku's "frequent buffering" dialog after a skip ahead on the remux came from
   the lab's network path, not subtitles.
+
+## 2026-11-01 rendition preselect (TCL, OS 15.3.4)
+
+2026-11-01, the TCL 55R625 Roku TV on Roku OS 15.3.4, caption mode On,
+signed in to the shared development server with the every-track renditions
+feature. Two builds of this app: one that named the plan's rendition
+`webvtt/<index>` in the content's `SubtitleConfig` (and a carried sidecar
+by its path), then the shipped one that names `webvtt/1` and preselects no
+sidecar. The console and screenshots stay in the tester's private evidence
+folder. Assumption AG-654.
+
+| Test | Date | Device / OS | Sink | File class | Harness settings | Result | Observed facts |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| P1 Roku's numbering of renditions (AG-654) | 2026-11-01 | 55R625 / 15.3.4 | TV | Bewitched (2005), copy remux and transcode, 32 SRT renditions | Spanish SRT selected (no rendition `DEFAULT`), then Chinese (Simplified), the 4th rendition, selected and the quality changed | PASS | Each listed track's `Description` was its `NAME`. With no rendition `DEFAULT`, Roku's `webvtt/<n>` was the n-th rendition. With Chinese `DEFAULT=YES` on a new transport, Roku named Chinese `webvtt/1`, English `webvtt/2`, English (SDH) `webvtt/3`, Arabic `webvtt/4`, and the 5th onwards by their place. |
+| P2 `webvtt/<index>` preselect | 2026-11-01 | 55R625 / 15.3.4 | TV | as P1 | Chinese selected, Quality to 1080p High | FAIL (build not shipped) | The content named `webvtt/4`; Roku played it, Arabic, from its listing to the settle check, which selected `webvtt/1`. |
+| P3 `webvtt/1` preselect | 2026-11-01 | 55R625 / 15.3.4 | TV | as P1 | Chinese selected, Quality to 1080p High, then 1080p Medium | PASS | Roku played `webvtt/1`, Chinese, at its listing, the first frame and the settle check, with no `subtitleTrack` write; Chinese cues on screen (as boxes: the TV has no CJK font) right after the first frame; no English. Before the playlist loaded, Roku listed the preselected `TrackName` alone (`Language` `eng`, no `Description`). |
+| P4 a sidecar beside the renditions | 2026-11-01 | 55R625 / 15.3.4 | TV | Bewitched with its Spanish SRT; Unthinkable (2020), 720p transcode, French (Canadian) rendition to the external Arabic SRT | the sidecar selected; the first build also named its path in `SubtitleConfig` | PASS with the hold | Roku played `webvtt/1`, English, at its listing and first frame in both builds, while `subtitleTrack` was the sidecar; the hold showed nothing until the settle check selected the sidecar, then its cues (Arabic first seen 8 s after the first frame, between cues before that). No English on screen. |
+
+- Not covered: a reload on a reused transport whose playlist keeps another
+  plan's `DEFAULT` with a rendition selected, where the listing should name
+  the plan's rendition otherwise and hold; the unit tests cover it. The Ultra
+  has not run the preselect.
