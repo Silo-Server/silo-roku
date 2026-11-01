@@ -676,10 +676,15 @@ seeks past the room and waits, paused, for the room to reach it:
   landing within 1 s behind, it plays at once and the rules above take
   over. A hold seek that never shows a landing within 10 s plays.
 - **Ends.** A new room command ends the hold (its play state applies, so
-  a play resumes); so do an error and the end of the file (sound
+  a play resumes), except a play whose room position is within 1 s of the
+  one the hold follows: that is the server's correction for reports sent
+  before the hold, so the hold goes on and plays naming it (on the
+  Streaming Stick such a correction arrived mid-hold, found the member
+  ahead, and undid the hold). An error and the end of the file (sound
   restored; after an error the member wants to play again), the player
   closing (Back's panel does not close it, so the hold goes on beneath
-  the panel), and a deep link or another title, which close the player.
+  the panel), and a deep link or another title (which close the player)
+  end it too.
   If the task never plays it, the player ends the hold itself 20 s after
   it paused, and plays.
 - **Host.** The host holds too. On the v2 room socket the server takes a
