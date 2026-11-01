@@ -26,7 +26,10 @@ sub watchPartyInit()
     task = CreateObject("roSGNode", "RoomTask")
     relay = CreateObject("roSGNode", "PartyRelay")
     ' forgetting: request ID to the origin of a server being removed.
-    m.wp = { task: task, relay: relay, ready: false, queued: [], identity: "", forgetting: {}, panel: invalid }
+    ' seen: the last room output acted on. leaving: the session left a
+    ' party (a deep link, an identity change) and the Task's room has not
+    ' yet said it is out (watchparty.app.stillLeaving).
+    m.wp = { task: task, relay: relay, ready: false, queued: [], identity: "", forgetting: {}, panel: invalid, seen: {}, leaving: false }
     m.top.findNode("roomApiBridge").task = task
     task.observeField("ready", "onWatchPartyReady")
     for each field in watchparty.app.outputs()
@@ -46,6 +49,8 @@ sub onWatchPartyOutput(event as Object)
     field = event.getField()
     data = event.getData()
     if field = "room"
+        m.wp.seen = data
+        m.wp.leaving = watchparty.app.stillLeaving(m.wp.leaving, data)
         watchPartyFollowRoom(data)
     else if field = "ended"
         watchPartyEnded(data)
@@ -79,6 +84,8 @@ sub watchPartySessionChanged()
     if key = m.wp.identity then return
     m.wp.identity = key
     log.info("watchparty", "[WP] identity", { signedIn: identity.account <> "", profile: identity.profile <> "", borrowed: identity.borrowed })
+    ' The Task leaves the party for the new identity (section 4.11).
+    watchPartyBeginLeaving()
     m.wp.task.identity = identity
 end sub
 
@@ -111,8 +118,11 @@ end sub
 sub watchPartyFollowRoom(room as Dynamic)
     entry = watchPartyPlayerEntry()
     player = invalid
-    if entry <> invalid then player = { revision: watchparty.app.partyOf(entry.params).revision }
-    action = watchparty.app.roomAction(room, player)
+    if entry <> invalid
+        party = watchparty.app.partyOf(entry.params)
+        player = { roomId: party.roomId, revision: party.revision }
+    end if
+    action = watchparty.app.roomAction(room, player, m.wp.leaving)
     if action = "none" then return
     log.info("watchparty", "[WP] room player", { action: action })
     top = nav.stack.topEntry(m.navStack)
@@ -132,7 +142,8 @@ sub watchPartyFollowRoom(room as Dynamic)
     params = watchparty.app.playerParams(room)
     watchPartyClosePanel()
     if action = "replace"
-        ' A new selection revision is a new playback session (section 8.2).
+        ' A new selection revision, or another room, is a new playback
+        ' session (section 8.2).
         if top <> invalid and top.id = entry.id then navReplace(nav.route.PLAYER, params)
         return
     end if
@@ -192,23 +203,34 @@ end function
 ' ---- The end of the party (section 4.11)
 
 ' The party ended for this device: the panel and the player close, and the
-' Watch Party page shows the message, in place of the party player or the
-' page on top, else over whatever shows.
+' Watch Party page shows the message (watchparty.app.endedPlacement): in
+' place of the Watch Party page directly beneath a player on top, of a
+' player on top (the party's, or a title played from the lobby, which
+' stops), or of the page on top, else over whatever shows.
 sub watchPartyEnded(ended as Dynamic)
     if not util.isObject(ended) then return
     params = watchparty.app.endedParams(ended)
     log.info("watchparty", "[WP] party ended", { reason: util.text(ended.reason), rejoin: params.rejoin })
     watchPartyClosePanel()
     if m.navShell.phase <> nav.phase.MAIN then return
-    top = nav.stack.topEntry(m.navStack)
-    if top = invalid then return
-    if top.route = nav.route.WATCH_PARTY or (top.route = nav.route.PLAYER and watchparty.app.partyOf(top.params) <> invalid)
+    entries = m.navStack.entries
+    count = entries.Count()
+    top = invalid
+    beneath = invalid
+    if count >= 1 then top = entries[count - 1]
+    if count >= 2 then beneath = entries[count - 2]
+    placement = watchparty.app.endedPlacement(top, beneath)
+    if placement = "pop"
+        ' The page beneath goes too, so two Watch Party pages never stack.
+        navPop()
         navReplace(nav.route.WATCH_PARTY, params)
-        return
+    else if placement = "replace"
+        navReplace(nav.route.WATCH_PARTY, params)
+    else if placement = "push"
+        entry = watchPartyPlayerEntry()
+        if entry <> invalid and m.navScreens[entry.id] <> invalid then m.navScreens[entry.id].callFunc("partyClose")
+        navPush(nav.route.WATCH_PARTY, params)
     end if
-    entry = watchPartyPlayerEntry()
-    if entry <> invalid and m.navScreens[entry.id] <> invalid then m.navScreens[entry.id].callFunc("partyClose")
-    navPush(nav.route.WATCH_PARTY, params)
 end sub
 
 ' ---- Deep links and phones (section 9)
@@ -216,10 +238,18 @@ end sub
 ' A deep link plays at once (criterion 5.2), and the room cannot play
 ' another title for one member: the link leaves the party first.
 sub watchPartyLeaveForLink()
+    watchPartyBeginLeaving()
     if not watchPartyActive() then return
     log.info("watchparty", "[WP] a deep link leaves the party", {})
     watchPartyClosePanel()
     watchPartyCommand({ kind: "leave" })
+end sub
+
+' The session leaves the party it is in, or the one AppScene last saw: the
+' room updates the Task published before the leave open and replace no
+' party player (watchparty.app.roomAction) until its room names none.
+sub watchPartyBeginLeaving()
+    if watchparty.app.inParty(m.wp.task.room) or watchparty.app.inParty(m.wp.seen) then m.wp.leaving = true
 end sub
 
 ' ---- The room panel (docs/watch-party.md section 11, Hooks)

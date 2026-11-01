@@ -373,7 +373,8 @@ keeps the room open for two minutes.
   primary. Back in the panel (with nothing open over its lobby) and
   "Return to playback" close it and give focus back to the player; the
   player takes no focus while it is open. The error screen's Go Back opens
-  the panel too. The panel closes by itself when the party goes (a leave,
+  the panel too. Options and the subtitle search close as the panel
+  opens (voice's stop opens it with them open). The panel closes by itself when the party goes (a leave,
   an end, a replacement) or the room returns to the lobby, and the player
   closes with it.
 - **Status pill** (top right, after 500 ms): "Reconnecting to the party…",
@@ -397,7 +398,9 @@ keeps the room open for two minutes.
   in place of "Return to playback", and a guest's offers neither. The room
   returning to the lobby closes the panel and the player, and the Watch
   Party page's lobby shows: the page beneath the player, else a new one in
-  the player's place. A load that ends early reloads where it stopped.
+  the player's place. A load that ends early reloads where it stopped;
+  loads that keep ending at one position park there after two reloads,
+  and one that opens within 5 s of the end is the end.
 - **Tracks:** audio, subtitles, and quality stay each member's own choice.
 - **Errors:** "The Watch Party's selected media version is unavailable."
   when the plan names another file; source fallback as section 8.3.
@@ -411,8 +414,11 @@ keeps the room open for two minutes.
 | `401`/`403`/`404`/`410` on a read or ticket, or a wrong protocol | "The party connection expired or is no longer available. Join again to continue." | Yes |
 
 The player and panel close, and the Watch Party page shows the message
-(section 10). A sign-out, profile switch, or server switch leaves the
-party silently.
+(section 10). The page takes the place of whatever player is on top,
+the party's or a title the viewer played from the lobby (section 9),
+which stops, so no video plays on beneath it; a Watch Party page just
+beneath that player goes with it, so two never stack. A sign-out,
+profile switch, or server switch leaves the party silently.
 
 ## 5. Server contract
 
@@ -683,7 +689,17 @@ reason}`. The room moves every member to a new revision.
   Roku requires a deep link to play at once (criterion 5.2), and the room
   cannot play another title for one member. tvOS has no equivalent to
   compare.
-- **Profile, server, sign-out.** Each leaves the party first.
+- **A title played in the app.** A title the viewer plays from a detail
+  page, a card, or Shuffle while in a party's lobby keeps the
+  membership, as on tvOS (`AppRouter.presentWatchParty`): the room's
+  player takes its place when the room plays, and the party's end puts
+  the Watch Party page in its place (section 4.11), stopping it. Unlike
+  a deep link, it comes from inside the app, where the room can still
+  claim the screen.
+- **Profile, server, sign-out.** Each leaves the party first. Room
+  updates the task published before a leave (a deep link's or an
+  identity change's) open no party player afterwards: AppScene ignores
+  their opens and replaces until the task's room names no room.
 - **Diagnostics.** The log records room ID, revision, command IDs, drift,
   corrections, and reconnects, never codes, tickets, or proofs (spec
   section 11.1).
@@ -835,8 +851,9 @@ and the player):
   - `{ entry }` from a title's More item (`WatchPartyScreen.xml` lists its
     fields);
   - `{ message, rejoin }` from AppScene when the party ends for this
-    device (section 4.11), in place of the party player or a Watch Party
-    page on top, else over what shows: `message` the `ended` event's
+    device (section 4.11), in place of a player or a Watch Party page on
+    top, and of a Watch Party page directly beneath that player, else
+    over what shows (`watchparty.app.endedPlacement`): `message` the `ended` event's
     locale key, `rejoin` `"none"` (no Rejoin row, whatever `recent` still
     says), `"rejoin"`, or `"continueHere"` (the row reads "Continue
     here"), until the viewer acts (`watchparty.page.recentFor`). Focus
@@ -893,13 +910,19 @@ The player's part:
 - The room player is a `nav.route.PLAYER` entry whose params carry
   `party` (`watchparty.app.playerParams`). AppScene opens it when the
   room plays a file, over whatever shows (replacing a player on top), and
-  replaces it for a new selection revision; the new entry is a new
-  playback session (section 8.2).
+  replaces it for a new selection revision or another room; the new
+  entry is a new playback session (section 8.2). After a leave it opens
+  and replaces nothing until the room output names no room
+  (`watchparty.app.roomAction`'s `leaving`).
 - The session reducer's party mode (`playback.session.create`'s `party`)
   parks the end of the file: the Video node's finished leaves the session
   open, paused at the end, and the player reports `atEnd`. A finished
+  within 5 s of the runtime is the end even for a load that has not
+  played (a reload aimed ahead near the end, clamped to it). A finished
   short of the end reloads where it stopped (tvOS's premature end of
-  file). A room seek on a member at the end is a reload there, since the
+  file), at most twice at one position (within 5 s); the third parks the
+  member there as at the end, until the room's next seek or reload. A
+  room seek on a member at the end is a reload there, since the
   finished content takes no seek; a play without a seek leaves it at the
   end.
 - `planInPlace` is false for a `server_remux_*` delivery and true for
