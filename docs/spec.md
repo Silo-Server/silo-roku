@@ -383,6 +383,7 @@ on 2026-10-25.
 | Card focus | A lift with no ring (D4) over a shadow, black 50% with tvOS's 20 px radius, 10 px lower: posters grow 38 px in height as tvOS's card lift does (1.14 in rows, 1.10 in Browse), landscape cards scale 1.20, detail episode stills 1.08, each side by whole px, every edge of the lifted card on a whole pixel (5.9). The low tier keeps the list's ring without scaling (5.9) |
 | Round button (detail, 76 px) | Rest white 10%, no ring; focused pure white fill with black content, no scale |
 | Pill focus | Pure white fill with black text; the Sort pill and first-run buttons use `#EDEDED`. Scale: Sort 1.04, first-run buttons 1.06, fields 1.04, others none |
+| Scaled text | Roku resamples a scaled Label's glyphs, which blurs Inter's hinted stems, so on the first-run buttons, fields, and server card, the focused profile tile, and the server mark, the art scales but the text is set at the scaled size, rounded down to a whole px (a 29 px label focused at 1.06 is set at 30 px), on whole pixels (`theme.placeUnscaled`). A focused label so grows slightly less than tvOS's, and never outgrows its box |
 
 Type sizes in px (weight), named in `theme.textStyle`:
 
