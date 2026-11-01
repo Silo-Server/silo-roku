@@ -71,10 +71,15 @@ namespace watchparty.player
     ' plan yet, or a start, replan, reanchor, or reload in flight),
     ' playerSeeking (a local seek in flight), seekAgeMs (since the room's
     ' last seek or reload ran), settling (the room's last seek has not shown
-    ' where it really landed, or a barrier's roll runs: watchparty.landing),
-    ' atEnd (parked at the end), planInPlace, commandSeq }. A paused
-    ' member's seek counts as landed SEEK_SETTLE_MS after it ran, should the
-    ' node never report it.
+    ' where it really landed, or a barrier's roll or a hold runs:
+    ' watchparty.landing), holding (a hold is paused on its landing),
+    ' holdAt (where it holds), landed and landedSeq (where the last measured
+    ' seek really landed, and its command's seq), atEnd (parked at the end),
+    ' planInPlace, commandSeq }. A paused member's seek counts as landed
+    ' SEEK_SETTLE_MS after it ran, should the node never report it. A hold
+    ' reports seeking, so the Task sends nothing until it plays, and its
+    ' position is where it holds. landed and landedSeq are left out until a
+    ' seek has landed, so the Task keeps the last.
     function sample(facts as Object) as Object
         videoState = util.text(facts.videoState)
         atEnd = util.isTrue(facts.atEnd)
@@ -84,38 +89,49 @@ namespace watchparty.player
         wantsPlay = util.isTrue(facts.wantsPlay) and not atEnd
         commandSeq = 0
         if util.isNumber(facts.commandSeq) then commandSeq = facts.commandSeq
-        return {
+        holding = util.isTrue(facts.holding)
+        position = numberOr(facts.position, 0)
+        if holding then position = numberOr(facts.holdAt, position)
+        out = {
             sessionId: util.text(facts.sessionId),
             revision: facts.revision,
-            position: numberOr(facts.position, 0),
+            position: position,
             duration: numberOr(facts.duration, 0),
             playing: videoState = "playing" and not seeking and not atEnd,
             wantsPlay: wantsPlay,
             playable: util.isTrue(facts.loadPlayed) and not loading,
             stalled: videoState = "buffering" and wantsPlay,
             seeking: seeking,
+            holding: holding,
             atEnd: atEnd,
             planInPlace: util.isTrue(facts.planInPlace),
             commandSeq: commandSeq
         }
+        if util.isNumber(facts.landed) and util.isNumber(facts.landedSeq)
+            out.landed = facts.landed
+            out.landedSeq = facts.landedSeq
+        end if
+        return out
     end function
 
     ' Whether two samples differ in what the Task decides from: anything but
     ' the position, which the player sends on its own pace.
     function changed(previous as Dynamic, current as Object) as Boolean
         if not util.isObject(previous) then return true
-        for each name in ["sessionId", "revision", "playing", "wantsPlay", "playable", "stalled", "seeking", "atEnd", "planInPlace", "commandSeq"]
+        for each name in ["sessionId", "revision", "playing", "wantsPlay", "playable", "stalled", "seeking", "holding", "atEnd", "planInPlace", "commandSeq", "landedSeq"]
             if FormatJson(previous[name]) <> FormatJson(current[name]) then return true
         end for
         return false
     end function
 
     ' What the render thread does for one playerCommand ({ seq, commandId,
-    ' seek, reload, playing, settle }), in order: [{ op, position, settle }],
-    ' op "seek" (a seek through the session, local or a seek_reanchor),
-    ' "reload" (a new load at position, local or a seek_reanchor), "play",
-    ' or "pause"; settle, on a seek, is the barrier's tolerance, else
-    ' invalid (watchparty.landing.begin). facts:
+    ' seek, reload, playing, settle, hold }), in order: [{ op, position,
+    ' settle, hold }], op "seek" (a seek through the session, local or a
+    ' seek_reanchor), "reload" (a new load at position, local or a
+    ' seek_reanchor), "play", or "pause"; settle, on a seek, is the
+    ' barrier's tolerance, else invalid, and hold, only on a seek and only
+    ' when true, makes it an overshoot's hold (watchparty.landing.begin;
+    ' a reload never holds). facts:
     ' { atEnd }. A member parked at the end takes no seek, so a seek there
     ' reloads; a play without a seek leaves it paused at the end, for the
     ' room's next seek to move it (tvOS). The play state goes first, so a
@@ -137,7 +153,9 @@ namespace watchparty.player
             if util.isTrue(command.reload) or atEnd then op = "reload"
             settle = invalid
             if op = "seek" and util.isNumber(command.settle) then settle = command.settle
-            out.Push({ op: op, position: command.seek, settle: settle })
+            stepOf = { op: op, position: command.seek, settle: settle }
+            if op = "seek" and util.isTrue(command.hold) then stepOf.hold = true
+            out.Push(stepOf)
         end if
         return out
     end function
