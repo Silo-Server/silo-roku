@@ -96,6 +96,10 @@ namespace playback.session
     ' A "finished" this close to the runtime is the content's end, whatever
     ' the player changed just before (stoppedByClient).
     const END_SLACK_SECONDS = 5
+    ' How many times a party's loads that keep ending early at one position
+    ' (within END_SLACK_SECONDS) reload there before the member parks
+    ' (partyFinished).
+    const PARTY_EARLY_END_RELOADS = 2
     const OUTPUT_CHANGE_FEATURE = "output_change_v1"
     ' Requests wait while a start or replan is in flight; a newer one replaces a
     ' queued one of the same or lower rank.
@@ -163,6 +167,9 @@ namespace playback.session
             reachable: true,
             identityChanged: false,
             party: util.isTrue(context.party),
+            ' A party's loads that ended early: { position, count }
+            ' (partyFinished).
+            partyEarlyEnd: invalid,
             loads: loads
         }
     end function
@@ -773,6 +780,15 @@ namespace playback.session
         return state.player.position >= plan.runtime - END_SLACK_SECONDS
     end function
 
+    ' A party's atEnd: a load opened within END_SLACK_SECONDS of the
+    ' runtime, as a reload aimed ahead near the end and clamped to it, is at
+    ' the end even when it finishes before it plays, whose position stays
+    ' where it opened (onPosition).
+    function partyLoadAtEnd(state as Object) as Boolean
+        runtime = state.plan.runtime
+        return util.isNumber(runtime) and state.player.position >= runtime - END_SLACK_SECONDS
+    end function
+
     ' The Video node finished before the content's end, right after the
     ' player changed the content's subtitle, audio, caption drawing, or
     ' caption mode:
@@ -801,11 +817,23 @@ namespace playback.session
     ' connection's, reloads where it stopped, mounted as the player says
     ' (tvOS's premature end of file).
     sub partyFinished(state as Object, env as Object, out as Object)
-        if not atEnd(state)
-            out.Push({ type: "log", level: "warn", message: "[WP] the load ended before the end of the file; reloading where it stopped", fields: { position: playback.values.roundMs(state.player.position) } })
-            onPartyReload(state, { position: state.player.position }, env, out)
-            return
+        position = state.player.position
+        if not partyLoadAtEnd(state)
+            ' Loads that keep ending at one position, as one opened there
+            ' that never plays, park there after PARTY_EARLY_END_RELOADS
+            ' reloads: the room's next seek moves the member on.
+            early = state.partyEarlyEnd
+            if early = invalid or Abs(position - early.position) > END_SLACK_SECONDS then early = { position: position, count: 0 }
+            early.count = early.count + 1
+            state.partyEarlyEnd = early
+            if early.count <= PARTY_EARLY_END_RELOADS
+                out.Push({ type: "log", level: "warn", message: "[WP] the load ended before the end of the file; reloading where it stopped", fields: { position: playback.values.roundMs(position), reloads: early.count } })
+                onPartyReload(state, { position: position }, env, out)
+                return
+            end if
+            out.Push({ type: "log", level: "warn", message: "[WP] the loads keep ending before the end of the file; parked where they stopped", fields: { position: playback.values.roundMs(position) } })
         end if
+        state.partyEarlyEnd = invalid
         state.player.paused = true
         state.player.ended = true
         out.Push({ type: "partyEnded" })
