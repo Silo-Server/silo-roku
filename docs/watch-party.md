@@ -777,13 +777,16 @@ a new socket that reuses the ID never reads it as its own. This assumes
 Roku posts one closed per socket, on the server's close or on the
 release of a socket the task closed; the rig has not confirmed it.
 
-**Liveness.** The server pings every 20 s. A connected socket that has
-shown ping activity (event types 4 or 7) and then none for 50 s
-(`QUIET_MS`) is closed and reconnected. A socket that never shows any is
-never judged by it, so a Roku OS that raises no event for a ping without
-a payload keeps its sockets. On Roku OS 16.0.4 the server's empty pings
-each raise a type 7 event and the automatic pong a type 4 (rig, W0-1 in a
-real room).
+**Liveness.** The server pings every 20 s and answers the client's JSON
+pings (at least every 15 s) with a text pong. A connected socket that has
+shown activity from the server (event types 5, 7, or 8: text, ping, or
+pong) and then none for 50 s (`QUIET_MS`) is closed and reconnected.
+Type 4 (message sent) never counts: it comes for every frame the client
+writes, the automatic pongs included, so it goes on over a path that is
+writable but dead. A socket that never shows any is never judged by it,
+so a Roku OS that raises none of these keeps its sockets. On Roku OS
+16.0.4 the server's empty pings each raise a type 7 event and the
+automatic pong a type 4 (rig, W0-1 in a real room).
 
 **Hooks** (between AppScene, the room Task, the screens, the room panel,
 and the player):
