@@ -612,8 +612,14 @@ server's own, 1 s for a guest and 15 s for the host
 (`watchparty.sync.settleTolerance`). The player mutes, lets the node play
 after Roku's resume while it measures, and then:
 
-- landed within the window (or ahead of the target): pauses there and
-  acknowledges as it is;
+- landed within the window: pauses there and acknowledges as it is;
+- landed further past the target, on a plan that seeks in place, with
+  3 s left: seeks to the target once more, still muted, and goes on from
+  where that lands. On the Ultra a guest a little past the target (a host
+  seek near where everyone is) sometimes landed on the keyframe after it,
+  1.3 to 4.2 s past on FX-007, where the server never accepts its ready
+  and the room waited out its 10 s; from there the same seek lands at or
+  before the target. A second landing past it acknowledges as it is;
 - landed shorter, on a plan that seeks in place, with time left: plays on
   muted to the target, pauses there (0.1 s early, for the pause's own
   delay), then acknowledges;
