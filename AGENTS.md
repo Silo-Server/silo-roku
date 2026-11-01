@@ -17,8 +17,9 @@ wire behavior, platform floor, or certification plan.
 - The first release is sign-in, profiles, browse, search, and playback of
   movies and episodic TV. Section 3 of `docs/spec.md` lists what is deferred;
   do not add deferred features without updating it.
-- Ebooks, offline downloads, server administration, library management, and
-  Watch Together are not part of the first release.
+- Ebooks, offline downloads, server administration, and library management
+  are not part of the first release. Watch Party is in it, on Roku OS 16 or
+  later; `docs/watch-party.md` is its specification.
 - Live TV, OTA/DVB tuners, IPTV, EPG/XMLTV, DVR, `.strm` files, and equivalent
   arbitrary remote-stream shortcuts are permanent Silo non-goals. Do not add
   them here or expose them through a Roku-only path.
