@@ -779,7 +779,9 @@ release of a socket the task closed; the rig has not confirmed it.
 shown ping activity (event types 4 or 7) and then none for 50 s
 (`QUIET_MS`) is closed and reconnected. A socket that never shows any is
 never judged by it, so a Roku OS that raises no event for a ping without
-a payload keeps its sockets (the rig is confirming which it does).
+a payload keeps its sockets. On Roku OS 16.0.4 the server's empty pings
+each raise a type 7 event and the automatic pong a type 4 (rig, W0-1 in a
+real room).
 
 **Hooks** (between AppScene, the room Task, the screens, the room panel,
 and the player):
