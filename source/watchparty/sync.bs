@@ -28,10 +28,13 @@ import "pkg:/source/watchparty/wire.bs"
 ' the seek landed (watchparty.landing, section 7.4). Messages for the
 ' socket are { kind: "send", text }.
 '
-' ctx, given to each call, is { now, serverNow, room, sample, writable }:
-' the Task's monotonic milliseconds, the server's epoch milliseconds (or
-' invalid without a clock), the held snapshot, the last sample (or
-' invalid), and whether the socket is open.
+' ctx, given to each call, is { now, serverNow, room, sample, writable,
+' snapshotSeq }: the Task's monotonic milliseconds, the server's epoch
+' milliseconds (or invalid without a clock), the held snapshot, the last
+' sample (or invalid), whether the socket is open, and how many socket
+' snapshots the session has accepted, each socket's first aside
+' (watchparty.session.acceptRoom): a higher count is a snapshot the server
+' sent after the one before, even at the same generation.
 namespace watchparty.sync
     const REPORT_INTERVAL_MS = 1500
     const READY_RETRY_MS = 500
@@ -90,6 +93,7 @@ namespace watchparty.sync
         state.seen = []
         state.newestIssuedMs = invalid
         state.attachSent = ""
+        state.attachSeq = 0
         state.lastAttachAt = invalid
         state.pending = invalid
         state.applied = invalid
@@ -122,6 +126,7 @@ namespace watchparty.sync
         state.newestIssuedMs = invalid
         state.pending = invalid
         state.attachSent = ""
+        state.attachSeq = 0
         state.lastAttachAt = invalid
         state.readiness = invalid
         state.pendingSeek = invalid
@@ -190,6 +195,7 @@ namespace watchparty.sync
         end if
         if not attached(state, ctx) and (state.attachSent <> sessionId or since(state.lastAttachAt, now) >= ATTACH_RETRY_MS)
             state.attachSent = sessionId
+            state.attachSeq = ctx.snapshotSeq
             state.lastAttachAt = now
             out.Push(send(watchparty.wire.attach(sessionId)))
         end if
@@ -208,7 +214,9 @@ namespace watchparty.sync
         ' Readiness for the waiting command.
         waiting = state.readiness
         if waiting <> invalid
-            if room.playbackState <> "waiting" or (room.generation > waiting.armedGeneration and selfReady)
+            ' Readiness moves no generation: any snapshot after the one the
+            ' command found that shows this member ready confirms it.
+            if room.playbackState <> "waiting" or (ctx.snapshotSeq > waiting.armedSeq and selfReady)
                 state.readiness = invalid
             else if executedLatest and playable and positionOk(waiting, ctx) and since(waiting.lastSentAt, now) >= READY_RETRY_MS
                 waiting.lastSentAt = now
@@ -344,7 +352,7 @@ namespace watchparty.sync
         if command.playbackState = "waiting"
             seekTarget = invalid
             if action = "seek" then seekTarget = target
-            state.readiness = { commandId: command.commandId, seekTarget: seekTarget, armedGeneration: room.generation, lastSentAt: invalid }
+            state.readiness = { commandId: command.commandId, seekTarget: seekTarget, armedSeq: ctx.snapshotSeq, lastSentAt: invalid }
         end if
         return out
     end function
@@ -550,11 +558,13 @@ namespace watchparty.sync
         return util.text(sample.sessionId)
     end function
 
-    ' The server confirmed this socket's attach: a snapshot names the
-    ' session this socket sent.
+    ' The server confirmed this socket's attach: a snapshot it sent after
+    ' the attach names the session. The held snapshot alone does not: the
+    ' server keeps a member's session across sockets, so after a reconnect
+    ' it names the session before the new socket's attach is answered.
     function attached(state as Object, ctx as Object) as Boolean
         sessionId = sessionOf(ctx)
-        return sessionId <> "" and state.attachSent = sessionId and ctx.room.attachedSessionId = sessionId
+        return sessionId <> "" and state.attachSent = sessionId and ctx.room.attachedSessionId = sessionId and ctx.snapshotSeq > state.attachSeq
     end function
 
     ' How short of a barrier's target this member may land and still
