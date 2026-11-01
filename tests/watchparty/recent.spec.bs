@@ -1,0 +1,89 @@
+import "pkg:/source/watchparty/recent.bs"
+import "pkg:/source/storage/registry.bs"
+import "pkg:/source/library/prefs.bs"
+import "pkg:/source/diagnostics/state.bs"
+
+namespace tests
+
+    ' The recent party store, after tvOS's WatchPartyRecentStore cases.
+    @suite("watch party recent party")
+    class WatchPartyRecentTests extends rooibos.BaseTestSuite
+
+        function identity(profile = "p1" as String, server = "https://silo.example" as String, account = "7" as String) as Object
+            return { server: server, account: account, profile: profile }
+        end function
+
+        @describe("registry entries")
+
+        @it("keeps one party per server, account, and profile, and round trips")
+        sub _()
+            entries = []
+            put = watchparty.recent.put(entries, m.identity(), "room-1", "K7PQ2M4X", "Heat", false, 1000)
+            m.assertTrue(put.write)
+            put = watchparty.recent.put(put.entries, m.identity("p2"), "room-2", "Q2W8RT5N", "", false, 1001)
+            put = watchparty.recent.put(put.entries, m.identity(), "room-3", "ZZZZZZZZ", "", false, 1002)
+            m.assertEqual(put.entries.Count(), 2)
+            restored = watchparty.recent.decode(watchparty.recent.encode(put.entries), 1003)
+            m.assertEqual(watchparty.recent.find(restored, m.identity()).roomId, "room-3")
+            m.assertEqual(watchparty.recent.find(restored, m.identity("p2")).code, "Q2W8RT5N")
+            m.assertInvalid(watchparty.recent.find(restored, m.identity("p3")))
+            m.assertInvalid(watchparty.recent.find(restored, m.identity("p1", "https://other.example")))
+        end sub
+
+        @it("writes a changed entry at once and an unchanged one at most hourly")
+        sub _()
+            put = watchparty.recent.put([], m.identity(), "room-1", "K7PQ2M4X", "", false, 1000)
+            m.assertFalse(watchparty.recent.put(put.entries, m.identity(), "room-1", "K7PQ2M4X", "", false, 4599).write)
+            m.assertTrue(watchparty.recent.put(put.entries, m.identity(), "room-1", "K7PQ2M4X", "", false, 4600).write)
+            m.assertTrue(watchparty.recent.put(put.entries, m.identity(), "room-1", "K7PQ2M4X", "Heat", false, 1001).write)
+            m.assertTrue(watchparty.recent.put(put.entries, m.identity(), "room-1", "K7PQ2M4X", "", true, 1001).write)
+        end sub
+
+        @it("expires after a day and drops entries from a clock that went back")
+        sub _()
+            text = watchparty.recent.encode(watchparty.recent.put([], m.identity(), "room-1", "K7PQ2M4X", "", false, 100000).entries)
+            m.assertEqual(watchparty.recent.decode(text, 186399).Count(), 1)
+            m.assertEqual(watchparty.recent.decode(text, 186400).Count(), 0)
+            m.assertEqual(watchparty.recent.decode(text, 99000).Count(), 0)
+            m.assertEqual(watchparty.recent.decode("not json", 1).Count(), 0)
+            m.assertEqual(watchparty.recent.decode("[{""server"":""x""}]", 1).Count(), 0)
+        end sub
+
+        @it("forgets a signed-out account's or a removed server's parties")
+        sub _()
+            entries = watchparty.recent.put([], m.identity(), "room-1", "A", "", false, 1).entries
+            entries = watchparty.recent.put(entries, m.identity("p1", "https://silo.example", "8"), "room-2", "B", "", false, 1).entries
+            entries = watchparty.recent.put(entries, m.identity("p1", "https://other.example"), "room-3", "C", "", false, 1).entries
+            m.assertEqual(watchparty.recent.forget(entries, "https://silo.example", "7").Count(), 2)
+            m.assertEqual(watchparty.recent.forget(entries, "https://silo.example", "").Count(), 1)
+            m.assertEqual(watchparty.recent.remove(entries, m.identity()).Count(), 2)
+        end sub
+
+        @it("never stores more than its budget, dropping the oldest, or a long title")
+        sub _()
+            entries = []
+            long = ""
+            for i = 1 to 20
+                long = long + "abcdefghij"
+            end for
+            for i = 1 to 8
+                entries = watchparty.recent.put(entries, m.identity("profile-" + i.ToStr()), "00000000-0000-4000-8000-00000000000" + (i mod 10).ToStr(), "K7PQ2M4X", "A title", false, i).entries
+            end for
+            text = watchparty.recent.encode(entries)
+            m.assertTrue(Len(text) + Len(watchparty.recent.KEY) <= watchparty.recent.BUDGET_BYTES)
+            restored = watchparty.recent.decode(text, 10)
+            m.assertTrue(restored.Count() >= 1)
+            m.assertEqual(restored[0].profile, "profile-8", "newest kept")
+            m.assertEqual(watchparty.recent.put([], m.identity(), "room-1", "A", long, false, 1).entries[0].title, "")
+        end sub
+
+        @it("fits Roku's 32 KB registry with the app's other sections")
+        sub _()
+            total = storage.BUDGET_BYTES + storage.SERVERS_BUDGET_BYTES + libraryPrefs.BUDGET_BYTES + diag.state.BUDGET_BYTES + watchparty.recent.BUDGET_BYTES
+            m.assertTrue(total <= 32768, "total " + total.ToStr())
+            m.assertTrue(storage.maxBytes() <= storage.BUDGET_BYTES, "maxBytes " + storage.maxBytes().ToStr())
+        end sub
+
+    end class
+
+end namespace
