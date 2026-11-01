@@ -3727,14 +3727,21 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   gets a plan for the same media, which keeps the stream, its URL, and its
   generation (instant-subtitles contract C3; assumption AG-654). Those
   rows are tracks of the content, like an MKV's own, and download nothing.
-  Roku names a stream's WebVTT renditions `webvtt/<n>`; how it numbers
-  several is not yet seen on a device, so the client takes each row's
-  name from Roku's list by `Description` = `NAME` first, then
-  `webvtt/<index>` only when Roku lists that track in the row's language
-  (its primary subtag) and not with a description that names another of
-  the stream's renditions, so that a numbering of Roku's own cannot put
-  another track on the plan's row, and logs `Roku's names for the
-  stream's subtitle renditions` with how each matched. A rendition matched
+  Roku names a stream's WebVTT renditions `webvtt/<n>`, numbering the
+  playlist's `DEFAULT` first and the others after it in playlist order
+  (2026-11-01, the TCL). The client takes each row's name from Roku's
+  list by `Description` = `NAME` first, then `webvtt/<n>` by that
+  numbering, from the rendition the stream marked `DEFAULT` when its
+  content opened (an in-place change keeps it), only when Roku lists that
+  track in the row's language (its primary subtag) and not with a
+  description that names another of the stream's renditions, so that a
+  numbering of Roku's own cannot put another track on the plan's row. A
+  number whose language another rendition shares is ambiguous, as the
+  language does not tell those apart; for the plan's own on content that
+  opened on it, that number is `webvtt/1`, the track it opened on, and the
+  check once the content settles finds it drawn rather than switching
+  away. The client logs `Roku's names for the stream's subtitle
+  renditions` with how each matched. A rendition matched
   neither way has no name: the client writes nothing for it, the check
   once the content settles included, switches to it only by a reload, and
   leaves the plan's own to the playlist's `DEFAULT`; if Roku names the

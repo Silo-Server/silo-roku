@@ -171,10 +171,10 @@ namespace playback.sidecars
     ' The tracks of the content's own stream, which it plays without
     ' carrying them (stream: true): an MKV original's (nativeTracks) and an
     ' HLS stream's subtitle renditions under the names Roku lists in listed
-    ' (renditionTracks).
-    function streamTracks(plan as Object, listed as Dynamic) as Object
+    ' (renditionTracks, defaultId its stream's DEFAULT).
+    function streamTracks(plan as Object, listed as Dynamic, defaultId = invalid as Dynamic) as Object
         out = nativeTracks(plan)
-        out.Append(renditionTracks(plan, listed))
+        out.Append(renditionTracks(plan, listed, defaultId))
         return out
     end function
 
@@ -185,23 +185,40 @@ namespace playback.sidecars
     ' and by how it was matched (renditionName), state "ready", selected
     ' for the plan's own. The server keeps the stream for a track_change
     ' among them or to Off (contract C3), so each is a track the player can
-    ' select on the playing content. None for another stream.
-    function renditionTracks(plan as Object, listed as Dynamic) as Object
+    ' select on the playing content. None for another stream. defaultId is
+    ' the track_id of the rendition the stream marks DEFAULT, "" for none,
+    ' or invalid for plan's own (renditionDefault): Roku's number for each
+    ' rendition (rokuPlace) follows it.
+    function renditionTracks(plan as Object, listed as Dynamic, defaultId = invalid as Dynamic) as Object
         out = []
         subtitle = plan.subtitle
         if not util.isObject(subtitle) or not playback.values.isArray(subtitle.inventory) then return out
         selectedId = ""
         if util.isObject(subtitle.hls_rendition) and clientMode(subtitle) then selectedId = util.text(subtitle.track_id)
+        if not util.isString(defaultId) then defaultId = renditionDefault(plan)
         names = {}
         names.SetModeCaseSensitive()
+        languages = {}
+        defaultIndex = 0
         for each entry in subtitle.inventory
             rendition = renditionRow(plan, entry)
-            if rendition <> invalid then names[util.text(rendition.name)] = true
+            if rendition <> invalid
+                names[util.text(rendition.name)] = true
+                key = playback.tracks.languageKey(entry.language)
+                if key <> ""
+                    count = languages[key]
+                    if count = invalid then count = 0
+                    languages[key] = count + 1
+                end if
+                if defaultId <> "" and entry.track_id = defaultId then defaultIndex = Int(rendition.index)
+            end if
         end for
         for each entry in subtitle.inventory
             rendition = renditionRow(plan, entry)
             if rendition <> invalid
-                found = renditionName(listed, rendition, entry.language, names)
+                count = languages[playback.tracks.languageKey(entry.language)]
+                shared = count <> invalid and count > 1
+                found = renditionName(listed, rendition, entry.language, names, rokuPlace(Int(rendition.index), defaultIndex), shared)
                 language = "und"
                 if playback.values.isText(entry.language) then language = entry.language
                 out.Push({ trackId: entry.track_id, path: found.name, rendition: true, stream: true, state: "ready", selected: entry.track_id = selectedId, language: language, label: util.text(entry.label), index: rendition.index, by: found.by })
@@ -233,26 +250,46 @@ namespace playback.sidecars
         return false
     end function
 
+    ' The track_id of the rendition plan's stream marks DEFAULT=YES when it
+    ' starts, or "": the plan's own, as the server marks it (contract C3).
+    ' A stream kept for an in-place change keeps the DEFAULT it started
+    ' with, so the player keeps this from the plan its content opened with.
+    function renditionDefault(plan as Object) as String
+        subtitle = plan.subtitle
+        if not util.isObject(subtitle) or not util.isObject(subtitle.hls_rendition) then return ""
+        return util.text(subtitle.track_id)
+    end function
+
+    ' Roku's number for the index-th rendition of a stream whose DEFAULT is
+    ' the defaultIndex-th (0 for none): the DEFAULT first, then the others
+    ' in playlist order (2026-11-01 hardware run on the TCL; AG-654).
+    function rokuPlace(index as Integer, defaultIndex as Integer) as Integer
+        if defaultIndex < 1 or index > defaultIndex then return index
+        if index = defaultIndex then return 1
+        return index + 1
+    end function
+
     ' The TrackName Roku lists a subtitle rendition under, as { name, by }:
     ' the one track in listed (Video.availableSubtitleTracks) whose
     ' Description is the rendition's NAME, which the server makes unique in
-    ' its group, by "name"; else "webvtt/<index>", Roku's documented name
-    ' for the stream's index-th WebVTT rendition, by "index", but only when
-    ' Roku lists it with the row's language (its primary subtag,
+    ' its group, by "name"; else "webvtt/<place>", Roku's number for it
+    ' (rokuPlace; its index without one), by "index", but only when Roku
+    ' lists it with the row's language (its primary subtag,
     ' playback.tracks.languageKey), so that a numbering of Roku's own cannot
     ' put another language on the plan's track, and not with a Description
     ' naming another of the stream's renditions (names, every rendition's
-    ' NAME), which makes it that rendition's; else "" by "unlisted",
-    ' before Roku lists the tracks too: a rendition with no name the player
-    ' selects, writes, or switches to, which the stream's DEFAULT shows if
-    ' it is the plan's. A carried sidecar's name (a path, isFile) never
-    ' matches. Earlier runs saw "webvtt/1" for a single rendition, but how
-    ' Roku numbers several is not yet seen on a device, so the player logs
-    ' which way each matched (assumption AG-654).
-    function renditionName(listed as Dynamic, rendition as Object, language as Dynamic, names = {} as Object) as Object
+    ' NAME), which makes it that rendition's; by "ambiguous" instead when
+    ' another rendition shares the row's language (shared), which the
+    ' language then does not tell apart; else "" by "unlisted", before Roku
+    ' lists the tracks too: a rendition with no name the player selects,
+    ' writes, or switches to, which the stream's DEFAULT shows if it is the
+    ' plan's. A carried sidecar's name (a path, isFile) never matches. The
+    ' player logs which way each matched (assumption AG-654).
+    function renditionName(listed as Dynamic, rendition as Object, language as Dynamic, names = {} as Object, place = 0 as Integer, shared = false as Boolean) as Object
         unlisted = { name: "", by: "unlisted" }
         if type(listed) <> "roArray" then return unlisted
-        fallback = RENDITION_PREFIX + Int(rendition.index).ToStr()
+        if place < 1 then place = Int(rendition.index)
+        fallback = RENDITION_PREFIX + place.ToStr()
         rowLanguage = playback.tracks.languageKey(language)
         found = ""
         matches = 0
@@ -270,6 +307,7 @@ namespace playback.sidecars
             end if
         end for
         if matches = 1 then return { name: found, by: "name" }
+        if indexed and shared then return { name: fallback, by: "ambiguous" }
         if indexed then return { name: fallback, by: "index" }
         return unlisted
     end function
