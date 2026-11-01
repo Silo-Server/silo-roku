@@ -23,7 +23,11 @@ import "pkg:/source/util/values.bs"
 ' keeps playing muted to the target and pauses there; then it
 ' acknowledges, well inside the server's 10 s wait (DEADLINE_MS). One the
 ' player cannot roll (a reload plan, the end of the file, too little time
-' left) is acknowledged as it lands.
+' left) is acknowledged as it lands. On the Ultra a guest a little past
+' the target (a host's seek near where everyone is) sometimes landed on
+' the keyframe after it, seconds past, where the server never accepts its
+' ready; such a landing seeks to the target once more, which from there
+' lands at or before it, and rolls as usual.
 '
 ' A hold (section 7.5: overshoot, then hold) is a seek past the room that
 ' the player measures muted like a barrier's, then pauses on its landing
@@ -33,11 +37,13 @@ import "pkg:/source/util/values.bs"
 '
 ' state, from begin: { target, tolerance, barrier, hold, startedAt, phase
 ' ("measuring", "rolling", "holding", "done"), echoes, settledAt, last,
-' lastAt, playingSince, landed, heldAt, holdAt, nudged, rolled }. Each
-' step gives what the player does: "none"; "play" (resume the node if it
-' is paused, still muted); "hold" (pause the node where it landed, holdAt,
-' and report); or "stop" (the settle is over: pause where the room wants
-' the member paused, restore the sound, and report).
+' lastAt, playingSince, landed, heldAt, holdAt, nudged, rolled, reseeked,
+' past (the landing past the target a reseek left) }.
+' Each step gives what the player does: "none"; "play" (resume the node if
+' it is paused, still muted); "seek" (seek to the target again, still
+' muted); "hold" (pause the node where it landed, holdAt, and report); or
+' "stop" (the settle is over: pause where the room wants the member
+' paused, restore the sound, and report).
 namespace watchparty.landing
     ' A report this close to the target is Roku's echo of the request.
     const ECHO_SECONDS = 0.05
@@ -60,6 +66,10 @@ namespace watchparty.landing
     ' A hold the Task never plays ends this long after it paused: past the
     ' longest hold (watchparty.catchup.MAX_OVERSHOOT_SECONDS) and a margin.
     const HOLD_MAX_MS = 20000
+    ' A barrier seeks again from a landing past its target only with this
+    ' long left before DEADLINE_MS: the seek's resume, its landing report,
+    ' and a short roll.
+    const RESEEK_MS = 3000
 
     ' A seek to target that ran at now; tolerance (seconds) for a barrier,
     ' invalid for any other seek; hold for an overshoot's seek.
@@ -67,8 +77,24 @@ namespace watchparty.landing
         barrier = util.isNumber(tolerance)
         if not barrier then tolerance = invalid
         if barrier then hold = false
-        return { target: target, tolerance: tolerance, barrier: barrier, hold: hold, startedAt: now, phase: "measuring", echoes: 0, settledAt: invalid, last: invalid, lastAt: invalid, playingSince: invalid, landed: invalid, heldAt: invalid, holdAt: invalid, nudged: false, rolled: false }
+        return { target: target, tolerance: tolerance, barrier: barrier, hold: hold, startedAt: now, phase: "measuring", echoes: 0, settledAt: invalid, last: invalid, lastAt: invalid, playingSince: invalid, landed: invalid, heldAt: invalid, holdAt: invalid, nudged: false, rolled: false, reseeked: false, past: invalid }
     end function
+
+    ' The player seeks to the target again (the "seek" step) from the
+    ' landing past it: measuring starts over, and the deadline still counts
+    ' from the first seek.
+    sub remeasure(state as Object, past as Dynamic)
+        state.reseeked = true
+        state.past = past
+        state.phase = "measuring"
+        state.echoes = 0
+        state.settledAt = invalid
+        state.last = invalid
+        state.lastAt = invalid
+        state.playingSince = invalid
+        state.landed = invalid
+        state.nudged = false
+    end sub
 
     ' Whether the settle still runs: the sample says seeking until it ends.
     function active(state as Dynamic) as Boolean
@@ -164,7 +190,9 @@ namespace watchparty.landing
     end function
 
     ' The landing is known: a barrier short by more than its tolerance rolls
-    ' to the target when it can in time, else the settle is over.
+    ' to the target when it can in time; one past it by more than that
+    ' landed on the keyframe after the target and seeks to it once more,
+    ' which from there lands at or before it; else the settle is over.
     function land(state as Object, position as Dynamic, now as Integer, canRoll as Boolean) as String
         state.landed = position
         if state.hold
@@ -175,6 +203,10 @@ namespace watchparty.landing
         end if
         if state.barrier and canRoll
             gap = state.target - position
+            if -gap > state.tolerance and not state.reseeked and (now - state.startedAt) + RESEEK_MS <= DEADLINE_MS
+                remeasure(state, position)
+                return "seek"
+            end if
             if gap > state.tolerance and (now - state.startedAt) + gap * 1000 + RESUME_MS <= DEADLINE_MS
                 state.phase = "rolling"
                 state.rolled = true
