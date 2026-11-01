@@ -909,7 +909,12 @@ room session reads the room back after an uncertain answer. The room
 read and the writes whose answer carries the room proof or a ticket, and
 the join, whose body carries the code, are marked `secret` and never pass
 through a file: ApiTask reads a secret `GET`'s answer as a string
-(`AsyncGetToString`) and sends a secret write's body from one.
+(`AsyncGetToString`) and sends a secret write's body from one. Such an
+answer, like any secret answer, meets the 2 MiB budget only once it has
+arrived, before it is parsed: without a file nothing measures it while
+it downloads, and the room read declares no length to judge (the server
+gzips it). The comment at `AsyncGetToString` in `ApiTask.bs` has the
+reasons.
 
 **Socket.** `source/watchparty/socket.bs` follows W0-1 (section 2.1): it
 sets the subprotocols with `SetProtocols` only, leaves
