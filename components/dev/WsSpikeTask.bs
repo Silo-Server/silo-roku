@@ -1,0 +1,326 @@
+' Dev builds only: spike W0-1 (docs/watch-party.md section 12.1). One
+' roWebSocket in a Task, driven by commands from ECP:
+'
+'   npm run roku -- input 'wsSpike={"op":"open","url":"ws://host:port/ws","protocols":"a, b"}'
+'
+' Commands (op): open (url, protocols for SetProtocols, header for an
+' ifHttpAgent AddHeader of Sec-WebSocket-Protocol, headers for SetHeaders,
+' certs to load the common CA bundle, peer false to skip peer verification,
+' autoPing false to turn automatic pong replies off, timeoutMs for a blocking
+' Open), send (text), close (code, reason), ping (text), flood (bytes,
+' intervalMs, count), status, and forget (drop the object without Close).
+' Every step is printed with a [WS-SPIKE] prefix, the wall clock in ms, and
+' the ms since the task started. The spike uses no credentials; tickets in
+' its tests are made up.
+
+sub init()
+    m.top.functionName = "work"
+end sub
+
+sub work()
+    m.port = CreateObject("roMessagePort")
+    m.wall = CreateObject("roDateTime")
+    m.uptime = CreateObject("roTimespan")
+    m.memory = CreateObject("roAppMemoryMonitor")
+    m.ws = invalid
+    m.lastSeq = -1
+    m.flood = invalid
+    m.asked = invalid
+    m.top.observeField("command", m.port)
+    say("task started", { thread: "task" })
+    ' A command set before the observer existed is still in the field.
+    first = m.top.command
+    if type(first) = "roAssociativeArray" and not first.IsEmpty() then handleCommand(first)
+    while true
+        msg = wait(0, m.port)
+        kind = type(msg)
+        if kind = "roSGNodeEvent"
+            handleCommand(msg.getData())
+        else if kind = "roWebSocketEvent"
+            handleEvent(msg)
+        else
+            say("other message", { type: kind })
+        end if
+    end while
+end sub
+
+' --- Commands --------------------------------------------------------------
+
+sub handleCommand(command as Object)
+    if type(command) <> "roAssociativeArray" then return
+    seq = command.seq
+    if seq <> invalid
+        if seq <= m.lastSeq then return
+        m.lastSeq = seq
+    end if
+    op = command.op
+    say("command", command)
+    if op = "open"
+        openSocket(command)
+    else if op = "send"
+        sendText(textOr(command.text, "hello"))
+    else if op = "close"
+        closeSocket(command)
+    else if op = "ping"
+        if requireSocket() then say("SendPing", { result: describeInfo(m.ws.SendPing(textOr(command.text, ""))) })
+    else if op = "flood"
+        startFlood(command)
+    else if op = "busy"
+        busy(command.ms)
+    else if op = "status"
+        status()
+    else if op = "forget"
+        m.ws = invalid
+        say("socket object released without Close", {})
+    else
+        say("unknown op", { op: op })
+    end if
+end sub
+
+sub openSocket(command as Object)
+    ' brighterscript 0.73.7 predates Roku OS 16's roWebSocket.
+    ' bs:disable-next-line: 1129
+    ws = CreateObject("roWebSocket")
+    if ws = invalid
+        say("CreateObject roWebSocket returned invalid", {})
+        return
+    end if
+    m.ws = ws
+    ws.SetMessagePort(m.port)
+    say("created", { socketId: ws.GetSocketId(), autoPing: ws.GetAutoPingReply(), fragment: ws.GetFragmentSize(), sendBuffer: ws.GetMsgSendBufferSize(), recvBuffer: ws.GetMsgRecvBufferSize() })
+    say("SetUrl", { url: command.url, ok: ws.SetUrl(textOr(command.url, "")) })
+    if type(command.protocols) = "roString" or type(command.protocols) = "String"
+        say("SetProtocols", { value: command.protocols, ok: ws.SetProtocols(command.protocols) })
+    end if
+    if type(command.header) = "roString" or type(command.header) = "String"
+        say("AddHeader Sec-WebSocket-Protocol", { value: command.header, ok: ws.AddHeader("Sec-WebSocket-Protocol", command.header) })
+    end if
+    if type(command.headers) = "roAssociativeArray"
+        say("SetHeaders", { value: command.headers, ok: ws.SetHeaders(command.headers) })
+    end if
+    if command.certs = true
+        say("SetCertificatesFile", { ok: ws.SetCertificatesFile("common:/certs/ca-bundle.crt") })
+        ws.InitClientCertificates()
+        say("InitClientCertificates called", {})
+    end if
+    if command.peer = false then say("EnablePeerVerification false", { ok: ws.EnablePeerVerification(false) })
+    if command.recvBuffer <> invalid then probeBufferSetters(ws, command.recvBuffer)
+    if command.autoPing = false
+        ws.SetAutoPingReply(false)
+        say("SetAutoPingReply false", { autoPing: ws.GetAutoPingReply() })
+    end if
+    m.openStart = m.uptime.TotalMilliseconds()
+    timeoutMs = command.timeoutMs
+    if timeoutMs = invalid then timeoutMs = 0
+    ok = ws.Open(timeoutMs)
+    say("Open returned", { timeoutMs: timeoutMs, ok: ok, blockedMs: m.uptime.TotalMilliseconds() - m.openStart })
+    if timeoutMs > 0 then dumpOpenInfo("after blocking Open")
+end sub
+
+' The page lists only getters for the message buffers; try likely setter
+' names, since an unknown member function is a runtime error.
+sub probeBufferSetters(ws as Object, size as Integer)
+    try
+        say("SetMsgRecvBufferSize", { result: describeInfo(ws.SetMsgRecvBufferSize(size)) })
+    catch error
+        say("SetMsgRecvBufferSize failed", { error: error.message })
+    end try
+    try
+        say("SetRecvBufferSize", { result: describeInfo(ws.SetRecvBufferSize(size)) })
+    catch error
+        say("SetRecvBufferSize failed", { error: error.message })
+    end try
+    try
+        say("SetMaxMessageSize", { result: describeInfo(ws.SetMaxMessageSize(size)) })
+    catch error
+        say("SetMaxMessageSize failed", { error: error.message })
+    end try
+    try
+        say("SetRcvBuf", { result: describeInfo(ws.SetRcvBuf(size)) })
+    catch error
+        say("SetRcvBuf failed", { error: error.message })
+    end try
+    say("after setters", { recvBuffer: ws.GetMsgRecvBufferSize(), sendBuffer: ws.GetMsgSendBufferSize() })
+end sub
+
+sub sendText(text as String)
+    if not requireSocket() then return
+    start = m.uptime.TotalMilliseconds()
+    result = m.ws.Send(text)
+    say("Send", { bytes: Len(text), text: Left(text, 80), result: describeInfo(result), blockedMs: m.uptime.TotalMilliseconds() - start, buffered: m.ws.GetBuffered() })
+    ' "size N", "frag N C", and "gfrag N C" ask the server for an N-byte message; time it.
+    words = text.Split(" ")
+    if words.Count() >= 2 and (words[0] = "size" or words[0] = "frag" or words[0] = "gfrag") then m.asked = { size: Val(words[1]), at: start }
+end sub
+
+sub closeSocket(command as Object)
+    if not requireSocket() then return
+    code = command.code
+    if code = invalid then code = 1000
+    start = m.uptime.TotalMilliseconds()
+    m.ws.Close(code, textOr(command.reason, ""))
+    say("Close returned", { code: code, blockedMs: m.uptime.TotalMilliseconds() - start })
+end sub
+
+sub startFlood(command as Object)
+    if not requireSocket() then return
+    bytes = command.bytes
+    if bytes = invalid then bytes = 1024
+    intervalMs = command.intervalMs
+    if intervalMs = invalid then intervalMs = 500
+    count = command.count
+    if count = invalid then count = 120
+    m.flood = { bytes: bytes, count: count, sent: 0, maxBuffered: 0, maxBlockedMs: 0, start: m.uptime.TotalMilliseconds() }
+    m.ws.SetTimer("flood", intervalMs, false)
+    say("flood started", m.flood)
+end sub
+
+sub floodTick()
+    flood = m.flood
+    if flood = invalid or m.ws = invalid then return
+    if flood.sent >= flood.count
+        m.ws.SetTimer("flood", 0, true)
+        flood.durationMs = m.uptime.TotalMilliseconds() - flood.start
+        say("flood done", flood)
+        m.flood = invalid
+        return
+    end if
+    head = "F " + flood.sent.ToStr() + " " + nowMs().ToStr() + " "
+    text = head + string(flood.bytes - Len(head), "x")
+    start = m.uptime.TotalMilliseconds()
+    m.ws.Send(text)
+    blocked = m.uptime.TotalMilliseconds() - start
+    buffered = m.ws.GetBuffered()
+    if buffered > flood.maxBuffered then flood.maxBuffered = buffered
+    if blocked > flood.maxBlockedMs then flood.maxBlockedMs = blocked
+    flood.sent = flood.sent + 1
+    if flood.sent mod 20 = 0 then say("flood progress", { sent: flood.sent, buffered: buffered, blockedMs: blocked })
+end sub
+
+' Keeps the Task out of wait() for ms, to see whether pongs still go out.
+sub busy(ms as Dynamic)
+    if ms = invalid then ms = 25000
+    start = m.uptime.TotalMilliseconds()
+    spins = 0
+    while m.uptime.TotalMilliseconds() - start < ms
+        spins = spins + 1
+    end while
+    say("busy done", { ms: ms, spins: spins })
+end sub
+
+sub status()
+    info = { memory: memoryFacts() }
+    if m.ws <> invalid
+        info.socketId = m.ws.GetSocketId()
+        info.url = m.ws.GetUrl()
+        info.buffered = m.ws.GetBuffered()
+        info.autoPing = m.ws.GetAutoPingReply()
+        info.selected = m.ws.GetSelectedProtocol()
+    end if
+    say("status", info)
+    if m.ws <> invalid then dumpOpenInfo("status")
+end sub
+
+' --- Events ----------------------------------------------------------------
+
+sub handleEvent(event as Object)
+    kind = event.GetType()
+    info = event.GetInfo()
+    current = invalid
+    if m.ws <> invalid then current = m.ws.GetSocketId()
+    if kind = 5
+        received(info.Text, event.GetSocketId())
+        return
+    end if
+    if kind = 9 and info.TimerId = "flood"
+        floodTick()
+        return
+    end if
+    if kind = 4 and m.flood <> invalid then return
+    say("event " + eventName(kind), { type: kind, socketId: event.GetSocketId(), current: current, info: describeInfo(info) })
+    if kind = 1
+        say("opened after", { ms: m.uptime.TotalMilliseconds() - m.openStart })
+        dumpOpenInfo("on Opened")
+    end if
+end sub
+
+sub received(text as Dynamic, socketId as Integer)
+    arrivedAt = m.uptime.TotalMilliseconds()
+    if type(text) <> "roString" and type(text) <> "String"
+        say("text event without Text", { type: type(text) })
+        return
+    end if
+    size = Len(text)
+    facts = { socketId: socketId, chars: size, head: Left(text, 100), tail: Right(text, 40), memory: memoryFacts() }
+    asked = m.asked
+    if asked <> invalid and Left(text, 14) = "{" + Chr(34) + "type" + Chr(34) + ":" + Chr(34) + "blob" + Chr(34)
+        facts.asked = asked.size
+        facts.intact = size = asked.size and Right(text, 2) = Chr(34) + "}"
+        facts.sinceAskMs = arrivedAt - asked.at
+        start = m.uptime.TotalMilliseconds()
+        parsed = ParseJson(text)
+        facts.parseMs = m.uptime.TotalMilliseconds() - start
+        facts.parsed = parsed <> invalid
+        if parsed <> invalid then facts.parsedSize = parsed.size
+        if parsed <> invalid then facts.padIntact = Len(parsed.pad) = parsed.padLen
+        m.asked = invalid
+        facts.memoryAfter = memoryFacts()
+    end if
+    say("text received", facts)
+end sub
+
+sub dumpOpenInfo(where as String)
+    if m.ws = invalid then return
+    say("GetOpenInfo " + where, { openInfo: describeInfo(m.ws.GetOpenInfo()), selected: m.ws.GetSelectedProtocol() })
+end sub
+
+' --- Helpers ---------------------------------------------------------------
+
+function requireSocket() as Boolean
+    if m.ws <> invalid then return true
+    say("no socket; send an open command first", {})
+    return false
+end function
+
+function eventName(kind as Integer) as String
+    names = ["?", "Opened", "Closed", "Error", "MsgSent", "TextReceived", "DataReceived", "PingReceived", "PongReceived", "Timer"]
+    if kind >= 0 and kind < names.Count() then return names[kind]
+    return "unknown"
+end function
+
+' GetInfo values printable as JSON: byte arrays become their length.
+function describeInfo(info as Dynamic) as Dynamic
+    if type(info) <> "roAssociativeArray" then return type(info)
+    out = {}
+    for each key in info
+        value = info[key]
+        if type(value) = "roByteArray"
+            out[key] = "roByteArray(" + value.Count().ToStr() + ")"
+        else
+            out[key] = value
+        end if
+    end for
+    return out
+end function
+
+function memoryFacts() as Object
+    if m.memory = invalid then return { monitor: false }
+    return { availableKb: m.memory.GetChannelAvailableMemory(), percent: m.memory.GetMemoryLimitPercent() }
+end function
+
+function textOr(value as Dynamic, fallback as String) as String
+    if type(value) = "roString" or type(value) = "String" then return value
+    return fallback
+end function
+
+function nowMs() as Longinteger
+    m.wall.Mark()
+    seconds& = m.wall.AsSeconds()
+    return seconds& * 1000 + m.wall.GetMilliseconds()
+end function
+
+sub say(message as String, fields as Object)
+    line = "[WS-SPIKE] " + nowMs().ToStr() + " +" + m.uptime.TotalMilliseconds().ToStr() + " " + message + " " + FormatJson(fields)
+    ' bs:disable-next-line: LINT3012
+    print line
+end sub
