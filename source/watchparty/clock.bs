@@ -1,0 +1,97 @@
+' The room's estimate of server time from ping and pong samples
+' (docs/watch-party.md section 7.1), as Android's RoomClockEstimator and
+' tvOS's WatchPartyClock keep it. Each sample bounds the true offset to
+' within half its round trip, so the offset in use is the fastest recent
+' sample's: queueing only ever lengthens a round trip. Times are epoch
+' milliseconds (watchparty.time): client times from the anchored local
+' clock, server times parsed from the pong.
+'
+' The local clock is monotonic from one anchor, so a Roku wall-clock step
+' cannot move it; a step on the server's side shows as a sample that
+' cannot agree with the best one, which drops the older samples.
+namespace watchparty.clock
+    const MAX_SAMPLES = 8
+    ' A round trip longer than this says nothing useful about the offset.
+    const MAX_RTT_MS = 5000
+    ' Millisecond stamps can make a LAN round trip read slightly negative.
+    const TRUNCATION_MS = 2
+    ' Two offsets further apart than their error bounds plus this mean a
+    ' clock stepped between them.
+    const STEP_MARGIN_MS = 50
+    ' Pings go every WARMUP_INTERVAL_MS until a connection has
+    ' WARMUP_SAMPLES samples (and the estimate holds that many), then
+    ' every PING_INTERVAL_MS.
+    const WARMUP_SAMPLES = 4
+    const WARMUP_INTERVAL_MS = 2000
+    const PING_INTERVAL_MS = 15000
+
+    ' An empty estimate. generation changes whenever the samples are
+    ' dropped, so work scheduled from an older estimate can tell.
+    function create() as Object
+        return { samples: [], generation: 0 }
+    end function
+
+    ' Records one pong: when the ping left (clientSent), the server's
+    ' receive and send stamps, and when the pong arrived (clientReceived).
+    ' Gives whether the sample was usable.
+    function record(estimate as Object, clientSent as Double, serverReceived as Double, serverSent as Double, clientReceived as Double) as Boolean
+        hold = serverSent - serverReceived
+        trip = (clientReceived - clientSent) - hold
+        if hold < 0 or trip < -TRUNCATION_MS or trip > MAX_RTT_MS then return false
+        if trip < 0 then trip = 0
+        sampleOffset = ((serverReceived - clientSent) + (serverSent - clientReceived)) / 2#
+        best = fastest(estimate)
+        if best <> invalid and Abs(sampleOffset - best.offset) * 2 > trip + best.rtt + 2 * STEP_MARGIN_MS
+            ' Both cannot be right: the older samples describe a clock that
+            ' no longer exists. A new generation restarts the warm-up.
+            estimate.samples = []
+            estimate.generation = estimate.generation + 1
+        end if
+        estimate.samples.Push({ offset: sampleOffset, rtt: trip })
+        while estimate.samples.Count() > MAX_SAMPLES
+            estimate.samples.Shift()
+        end while
+        return true
+    end function
+
+    ' Server time minus local time in milliseconds, or invalid before a
+    ' usable sample. Commands wait, paused, until there is one.
+    function offsetMs(estimate as Object) as Dynamic
+        best = fastest(estimate)
+        if best = invalid then return invalid
+        return best.offset
+    end function
+
+    ' The round trip of the sample in use, or invalid.
+    function rttMs(estimate as Object) as Dynamic
+        best = fastest(estimate)
+        if best = invalid then return invalid
+        return best.rtt
+    end function
+
+    ' Server epoch milliseconds at local epoch milliseconds localMs, or
+    ' invalid without an offset.
+    function serverMs(estimate as Object, localMs as Double) as Dynamic
+        best = fastest(estimate)
+        if best = invalid then return invalid
+        return localMs + best.offset
+    end function
+
+    ' The wait before the next ping: fast while the connection has fewer
+    ' than WARMUP_SAMPLES samples, or a step left fewer in the estimate.
+    function pingIntervalMs(estimate as Object, connectionSamples as Integer) as Integer
+        held = estimate.samples.Count()
+        if connectionSamples < held then held = connectionSamples
+        if held < WARMUP_SAMPLES then return WARMUP_INTERVAL_MS
+        return PING_INTERVAL_MS
+    end function
+
+    ' The lowest round trip, the newest of equals.
+    function fastest(estimate as Object) as Dynamic
+        best = invalid
+        for each sample in estimate.samples
+            if best = invalid or sample.rtt <= best.rtt then best = sample
+        end for
+        return best
+    end function
+end namespace

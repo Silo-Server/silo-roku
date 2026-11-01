@@ -67,6 +67,8 @@ SHARDS = [
     ("home", ["home"]),
     # Requests' pure logic and screens (source/requests/, components/screens/requests/).
     ("requests", ["requests"]),
+    # Watch Party's room logic (source/watchparty/) and its room Task.
+    ("watchparty", ["watchparty"]),
 ]
 
 

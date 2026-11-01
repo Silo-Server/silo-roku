@@ -1,0 +1,508 @@
+import "pkg:/source/watchparty/sync.bs"
+
+namespace tests
+
+    ' The sync rules driven like Android's RoomPlaybackBindingTest: a fake
+    ' room and player, time advanced in 50 ms steps, the server clock at
+    ' WALL plus the monotonic time. The fake player lands every seek at
+    ' once and advances at 1x while playing; specs move it otherwise. Cases are the binding's rate-unsupported
+    ' ones (:667-1015) and its report, readiness, and command cases, with
+    ' Roku's "in place" as the plan's property.
+    @suite("watch party sync")
+    class WatchPartySyncTests extends rooibos.BaseTestSuite
+
+        function wall() as Double
+            return 1790000000000#
+        end function
+
+        function harness(roomFields = {} as Object, sampleFields = {} as Object) as Object
+            h = {
+                sync: watchparty.sync.create(),
+                now: 0,
+                clock: true,
+                writable: true,
+                autoLand: true,
+                room: tests.party.makeRoom(roomFields),
+                sample: { sessionId: "ps-1", revision: 3, position: 100, duration: 3000, playing: true, wantsPlay: true, playable: true, stalled: false, seeking: false, atEnd: false, planInPlace: true, commandSeq: 0, receivedAt: 0 },
+                sent: [],
+                commands: [],
+                seeks: []
+            }
+            h.sample.Append(sampleFields)
+            m.collect(h, watchparty.sync.advance(h.sync, m.ctx(h)))
+            h.sent.Clear()
+            return h
+        end function
+
+        function ctx(h as Object) as Object
+            serverNow = invalid
+            if h.clock then serverNow = m.wall() + h.now
+            return { now: h.now, serverNow: serverNow, room: h.room, sample: h.sample, writable: h.writable }
+        end function
+
+        sub collect(h as Object, actions as Object)
+            for each action in actions
+                if action.kind = "send"
+                    message = ParseJson(action.text)
+                    kind = message.type
+                    if kind = "state_report"
+                        kind = "report"
+                        if message.is_ready = true then kind = "report_ready"
+                    end if
+                    message.kind = kind
+                    h.sent.Push(message)
+                else if action.kind = "player"
+                    h.commands.Push(action.command)
+                    if action.command.seek <> invalid
+                        h.seeks.Push(action.command.seek)
+                        if h.autoLand
+                            h.sample.position = action.command.seek
+                            h.sample.receivedAt = h.now
+                        end if
+                    end if
+                    h.sample.commandSeq = action.command.seq
+                end if
+            end for
+        end sub
+
+        sub advance(h as Object, ms as Integer)
+            for i = 1 to ms \ 50
+                h.now = h.now + 50
+                if h.sample.playing and not h.sample.seeking
+                    h.sample.position = h.sample.position + 0.05#
+                    h.sample.receivedAt = h.now
+                end if
+                m.collect(h, watchparty.sync.advance(h.sync, m.ctx(h)))
+            end for
+        end sub
+
+        sub command(h as Object, id as String, action as String, position as Dynamic, state as String, executeInMs = 0 as Integer, fields = {} as Object)
+            cmd = { commandId: id, sessionId: "", selectionRevision: h.room.selectionRevision, action: action, positionSeconds: position, executeAtMs: m.wall() + h.now + executeInMs, issuedAtMs: invalid, playbackState: state }
+            cmd.Append(fields)
+            m.collect(h, watchparty.sync.accept(h.sync, cmd, m.ctx(h)))
+            m.collect(h, watchparty.sync.advance(h.sync, m.ctx(h)))
+        end sub
+
+        sub update(h as Object, fields as Object)
+            h.sample.Append(fields)
+            h.sample.receivedAt = h.now
+        end sub
+
+        ' Keeps the playhead drift seconds behind a room that has played from
+        ' 100 s since time zero, sampling every 50 ms.
+        sub follow(h as Object, drift as Dynamic, forMs as Integer)
+            for i = 1 to forMs \ 50
+                m.update(h, { position: 100 + h.now / 1000# - drift })
+                m.advance(h, 50)
+            end for
+        end sub
+
+        function kinds(h as Object, kind as String) as Object
+            out = []
+            for each message in h.sent
+                if message.kind = kind then out.Push(message)
+            end for
+            return out
+        end function
+
+        function near(a as Dynamic, b as Dynamic, tolerance as Dynamic) as Boolean
+            return Abs(a - b) <= tolerance
+        end function
+
+        @describe("attach and reports")
+
+        @it("attaches at once, resends every 1.5 s, and reports only once a snapshot names the session")
+        sub _()
+            h = m.harness({ attachedSessionId: "" })
+            m.advance(h, 3000)
+            m.assertEqual(m.kinds(h, "attach_session").Count(), 2)
+            m.assertEqual(m.kinds(h, "report").Count(), 0)
+            h.room.attachedSessionId = "ps-1"
+            m.advance(h, 300)
+            reports = m.kinds(h, "report")
+            m.assertEqual(reports.Count(), 1)
+            m.assertTrue(m.near(reports[0].position_seconds, 103.05, 0.01), "the playhead it has now")
+        end sub
+
+        @it("attaches again after the socket closes, even when the snapshot still names the session")
+        sub _()
+            h = m.harness()
+            watchparty.sync.socketClosed(h.sync)
+            m.advance(h, 50)
+            m.assertEqual(m.kinds(h, "attach_session").Count(), 1)
+        end sub
+
+        @it("reports the observed state every 1.5 s")
+        sub _()
+            h = m.harness()
+            ' The harness's first step reported at 0 s.
+            m.advance(h, 1000)
+            m.update(h, { position: 101, wantsPlay: false, playing: false })
+            m.advance(h, 1000)
+            reports = m.kinds(h, "report")
+            m.assertEqual(reports.Count(), 1)
+            m.assertEqual(reports[0].position_seconds, 101)
+            m.assertTrue(reports[0].is_paused)
+            m.advance(h, 1500)
+            m.assertEqual(m.kinds(h, "report").Count(), 2)
+        end sub
+
+        @it("reports nothing while stalled, seeking, or loading")
+        sub _()
+            h = m.harness()
+            for each change in [{ stalled: true }, { stalled: false, seeking: true }, { seeking: false, playable: false }]
+                m.update(h, change)
+                m.advance(h, 1600)
+                m.assertEqual(m.kinds(h, "report").Count(), 0, FormatJson(change))
+                h.sent.Clear()
+            end for
+        end sub
+
+        @describe("commands and readiness")
+
+        @it("applies a waiting seek at its execute time and acknowledges it once landed")
+        sub _()
+            h = m.harness({ playbackState: "waiting" })
+            h.autoLand = false
+            m.command(h, "cmd-1", "seek", 500, "waiting", 400)
+            m.advance(h, 300)
+            m.assertEqual(h.seeks, [])
+            m.advance(h, 200)
+            m.assertEqual(h.seeks, [500])
+            m.assertFalse(h.commands.Peek().playing)
+            ' Still landing: no acknowledgement for the old position.
+            m.update(h, { seeking: true })
+            m.advance(h, 600)
+            m.assertEqual(m.kinds(h, "ready").Count(), 0)
+            m.update(h, { seeking: false, position: 499.6, wantsPlay: false, playing: false })
+            m.advance(h, 300)
+            ready = m.kinds(h, "ready")[0]
+            m.assertEqual(ready.command_id, "cmd-1")
+            m.assertEqual(ready.position_seconds, 499.6)
+            m.assertEqual(m.kinds(h, "report_ready")[0].command_id, "cmd-1")
+        end sub
+
+        @it("retries readiness until a newer snapshot confirms it")
+        sub _()
+            ' The snapshot current when the command arrives still says ready from an earlier cycle.
+            h = m.harness({ playbackState: "waiting", members: [tests.party.makeMember({ isSelf: true, isReady: true })] })
+            m.command(h, "cmd-2", "pause", 100, "waiting")
+            m.update(h, { wantsPlay: false, playing: false })
+            m.advance(h, 1600)
+            m.assertTrue(m.kinds(h, "ready").Count() >= 3)
+            h.room.generation = 11
+            m.advance(h, 300)
+            h.sent.Clear()
+            m.advance(h, 1000)
+            m.assertEqual(m.kinds(h, "ready").Count(), 0)
+        end sub
+
+        @it("acknowledges a waiting seek within five seconds as a guest and fifteen as the host")
+        sub _()
+            h = m.harness({ playbackState: "waiting" }, { playing: false, wantsPlay: false })
+            m.command(h, "cmd-g", "seek", 300, "waiting")
+            m.update(h, { position: 294.9 })
+            m.advance(h, 1000)
+            m.assertEqual(m.kinds(h, "ready").Count(), 0, "a guest 5.1 s off acknowledged")
+            m.update(h, { position: 295.1 })
+            m.advance(h, 600)
+            m.assertEqual(m.kinds(h, "ready")[0].command_id, "cmd-g")
+            h.sent.Clear()
+            m.command(h, "cmd-h", "seek", 400, "waiting")
+            m.update(h, { position: 386 })
+            m.advance(h, 1000)
+            m.assertEqual(m.kinds(h, "ready").Count(), 0)
+            h.room.selfRole = "host"
+            m.advance(h, 300)
+            m.assertEqual(m.kinds(h, "ready")[0].command_id, "cmd-h")
+        end sub
+
+        @it("never executes a superseded delayed command")
+        sub _()
+            h = m.harness()
+            m.command(h, "old", "seek", 50, "playing", 2000)
+            m.advance(h, 100)
+            m.command(h, "new", "seek", 70, "playing", 100)
+            m.advance(h, 3000)
+            m.assertEqual(h.seeks, [70])
+        end sub
+
+        @it("ignores commands for another session or revision, and repeats")
+        sub _()
+            h = m.harness()
+            m.command(h, "c1", "seek", 10, "playing", 0, { sessionId: "someone-else" })
+            m.command(h, "c2", "seek", 20, "playing", 0, { selectionRevision: 2 })
+            m.advance(h, 100)
+            m.assertEqual(h.seeks, [])
+            m.command(h, "c3", "seek", 30, "playing")
+            m.command(h, "c3", "seek", 30, "playing")
+            m.advance(h, 100)
+            m.assertEqual(h.seeks, [30])
+        end sub
+
+        @it("drops a pending command with its socket and runs the replay on the next")
+        sub _()
+            h = m.harness({ playbackState: "waiting" })
+            m.command(h, "replayed", "seek", 250, "waiting", 400)
+            m.advance(h, 100)
+            watchparty.sync.socketClosed(h.sync)
+            m.advance(h, 500)
+            m.assertEqual(h.seeks, [])
+            m.command(h, "replayed", "seek", 250, "waiting")
+            m.advance(h, 100)
+            m.assertEqual(h.seeks, [250])
+            m.update(h, { position: 250, wantsPlay: false, playing: false })
+            m.advance(h, 600)
+            m.assertEqual(m.kinds(h, "ready")[0].command_id, "replayed")
+        end sub
+
+        @it("waits paused for a clock and then projects the late command forward")
+        sub _()
+            h = m.harness()
+            h.clock = false
+            m.command(h, "no-clock", "play", 200, "playing", -60000)
+            m.assertFalse(h.commands.Peek().playing, "waits paused")
+            m.advance(h, 2900)
+            m.assertFalse(watchparty.sync.view(h.sync, m.ctx(h)).waitingForClock)
+            m.advance(h, 1100)
+            m.assertEqual(h.seeks, [])
+            m.assertTrue(watchparty.sync.view(h.sync, m.ctx(h)).waitingForClock)
+            ' The command ran 60 s ago by the server's clock.
+            h.clock = true
+            m.advance(h, 50)
+            m.assertTrue(m.near(h.seeks[0], 264.05, 0.1), FormatJson(h.seeks))
+            m.assertTrue(h.commands.Peek().playing)
+            m.assertFalse(watchparty.sync.view(h.sync, m.ctx(h)).waitingForClock)
+        end sub
+
+        @describe("reports after a command")
+
+        @it("never reports the host's own pause as playing from a stale sample")
+        sub _()
+            h = m.harness({ selfRole: "host", selfCanControlTransport: true })
+            m.command(h, "pause", "pause", 100, "paused")
+            ' The player's sample still says playing.
+            m.advance(h, 2000)
+            for each report in m.kinds(h, "report")
+                m.assertFalse(util.text(report.command_id) = "pause" and not report.is_paused, "named the pause with the old play state")
+            end for
+            m.update(h, { wantsPlay: false, playing: false })
+            m.advance(h, 1600)
+            named = []
+            for each report in m.kinds(h, "report")
+                if util.text(report.command_id) = "pause" then named.Push(report)
+            end for
+            m.assertTrue(named.Count() > 0)
+            for each report in named
+                m.assertTrue(report.is_paused)
+            end for
+        end sub
+
+        @it("reports again without naming a command the player never shows")
+        sub _()
+            h = m.harness()
+            m.command(h, "pause", "pause", 100, "paused")
+            m.advance(h, 4000)
+            reports = m.kinds(h, "report")
+            m.assertTrue(reports.Count() > 0, "reports never resumed")
+            for each report in reports
+                m.assertNotEqual(util.text(report.command_id), "pause")
+            end for
+            ' Once it shows the pause, reports name it.
+            m.update(h, { wantsPlay: false, playing: false })
+            m.advance(h, 1600)
+            last = m.kinds(h, "report").Peek()
+            m.assertEqual(util.text(last.command_id), "pause")
+            m.assertTrue(last.is_paused)
+        end sub
+
+        @describe("corrections without a rate")
+
+        @it("seeks a playing member in place beyond one second, aimed ahead by the measured shortfall")
+        sub _()
+            h = m.harness()
+            m.update(h, { position: 99 })
+            m.command(h, "drift", "play", 100, "playing")
+            m.assertEqual(h.seeks, [], "1 s behind is within the band")
+            m.follow(h, 2.0, 1200)
+            ' The loop's first seek, at about 1 s, aims at the room: 101.
+            m.assertEqual(h.seeks.Count(), 1)
+            m.assertTrue(m.near(h.seeks[0], 101, 0.2), FormatJson(h.seeks))
+            ' It takes 1.25 s to land, so playback resumes 1.25 s behind.
+            m.update(h, { seeking: true })
+            m.advance(h, 1250)
+            m.update(h, { seeking: false })
+            m.follow(h, 1.25, 1650)
+            m.assertEqual(h.seeks.Count(), 1, "the interval did not back off after a miss")
+            ' The next aims ahead by the shortfall it measured.
+            m.follow(h, 1.25, 400)
+            m.assertEqual(h.seeks.Count(), 2)
+            ' At 4.45 s the room is at 104.45; the lead is the 1.25 s shortfall.
+            m.assertTrue(m.near(h.seeks[1], 104.45 + 1.25, 0.15), FormatJson(h.seeks))
+            ' With the same latency it lands on the room and stops.
+            m.update(h, { seeking: true })
+            m.advance(h, 1250)
+            m.update(h, { seeking: false })
+            m.follow(h, 0, 4000)
+            m.assertEqual(h.seeks.Count(), 2)
+        end sub
+
+        @it("turns a command's correction into an in-place seek")
+        sub _()
+            h = m.harness()
+            m.update(h, { position: 98 })
+            m.command(h, "drift", "play", 100, "playing")
+            m.assertEqual(h.seeks, [100])
+            m.assertTrue(h.commands.Peek().playing)
+            m.assertFalse(h.commands.Peek().reload)
+        end sub
+
+        @it("seeks a member stopped ahead of the room back for a pause and a play from rest")
+        sub _()
+            h = m.harness({}, { position: 103, playing: false, wantsPlay: false })
+            m.command(h, "pause", "pause", 100, "paused")
+            m.advance(h, 100)
+            m.assertEqual(h.seeks, [100])
+            m.update(h, { position: 103 })
+            m.command(h, "play", "play", 100, "playing")
+            m.assertEqual(h.seeks.Count(), 2)
+            m.assertTrue(m.near(h.seeks[1], 100, 0.2))
+            ' It lands on the room, so it plays without a second seek.
+            m.update(h, { position: 100 })
+            m.advance(h, 50)
+            m.assertEqual(h.seeks.Count(), 2)
+            m.assertTrue(h.commands.Peek().playing)
+        end sub
+
+        @it("reloads a member a few seconds off when the plan cannot seek in place")
+        sub _()
+            h = m.harness({}, { planInPlace: false })
+            m.update(h, { position: 97 })
+            m.command(h, "drift", "play", 100, "playing")
+            m.assertEqual(h.seeks, [100])
+            m.assertTrue(h.commands.Peek().reload)
+            ' The loop never seeks a copy remux in place.
+            m.follow(h, 2.0, 3000)
+            m.assertEqual(h.seeks.Count(), 1)
+        end sub
+
+        @it("paces a member buffering toward play through the reload budget")
+        sub _()
+            h = m.harness({}, { position: 50, playing: false, stalled: true, planInPlace: false })
+            m.command(h, "r1", "play", 100, "playing")
+            m.advance(h, 100)
+            m.assertEqual(h.seeks.Count(), 1)
+            m.assertTrue(h.commands.Peek().reload)
+            m.command(h, "r2", "play", 110, "playing")
+            m.advance(h, 100)
+            m.assertEqual(h.seeks.Count(), 1, "an unpaced rebuild while buffering toward play")
+            ' The superseded reload's ten-second backoff ends: the held
+            ' correction runs, aimed at where the room is now.
+            m.advance(h, 9000)
+            m.assertEqual(h.seeks.Count(), 1)
+            m.advance(h, 1500)
+            m.assertEqual(h.seeks.Count(), 2, "the held correction never ran")
+            m.assertTrue(h.seeks[1] >= 119, FormatJson(h.seeks))
+        end sub
+
+        @it("realigns a late joiner once more, aimed ahead by its first seek's time")
+        sub _()
+            h = m.harness({}, { position: 0, playing: false, wantsPlay: false })
+            h.sample.commandSeq = -1
+            m.command(h, "sync", "play", 600, "playing")
+            m.assertEqual(h.seeks, [600])
+            first = h.commands.Peek()
+            m.assertFalse(first.playing, "paused until the seek lands")
+            h.sample.commandSeq = 0
+            m.update(h, { seeking: true })
+            m.advance(h, 1500)
+            h.sample.commandSeq = first.seq
+            m.update(h, { seeking: false, position: 600 })
+            m.advance(h, 50)
+            m.assertEqual(h.seeks.Count(), 2)
+            m.assertTrue(m.near(h.seeks[1], 601.55 + 1.55, 0.1), FormatJson(h.seeks))
+            m.assertTrue(h.commands.Peek().playing)
+        end sub
+
+        @describe("stalls and catching up")
+
+        @it("reports one buffering per stall after two seconds, only while the room plays")
+        sub _()
+            h = m.harness()
+            m.update(h, { stalled: true, playing: false })
+            m.advance(h, 1900)
+            m.assertEqual(m.kinds(h, "buffering").Count(), 0)
+            m.advance(h, 200)
+            m.assertEqual(m.kinds(h, "buffering").Count(), 1)
+            m.advance(h, 3000)
+            m.assertEqual(m.kinds(h, "buffering").Count(), 1, "once per stall")
+            m.update(h, { stalled: false, playing: true })
+            m.advance(h, 100)
+            h.room.playbackState = "paused"
+            m.update(h, { stalled: true, playing: false })
+            m.advance(h, 3000)
+            m.assertEqual(m.kinds(h, "buffering").Count(), 1, "a paused room is not told")
+        end sub
+
+        @it("restarts the grace after a seek")
+        sub _()
+            h = m.harness()
+            m.update(h, { stalled: true, playing: false })
+            m.advance(h, 1500)
+            m.update(h, { seeking: true })
+            m.advance(h, 100)
+            m.update(h, { seeking: false })
+            m.advance(h, 1500)
+            m.assertEqual(m.kinds(h, "buffering").Count(), 0)
+            m.advance(h, 600)
+            m.assertEqual(m.kinds(h, "buffering").Count(), 1)
+        end sub
+
+        @it("acknowledges catching up every 500 ms until its entry is ready, and never in a plain playing room")
+        sub _()
+            h = m.harness()
+            m.advance(h, 2000)
+            m.assertEqual(m.kinds(h, "ready").Count(), 0, "a ready in a playing room causes a sync seek")
+            h.room.selfIgnoreWait = true
+            m.advance(h, 1100)
+            m.assertTrue(m.kinds(h, "ready").Count() >= 2)
+            m.assertTrue(watchparty.sync.view(h.sync, m.ctx(h)).catchingUp)
+            h.room.members = [tests.party.makeMember({ isSelf: true, isReady: true })]
+            h.sent.Clear()
+            m.advance(h, 1000)
+            m.assertEqual(m.kinds(h, "ready").Count(), 0)
+        end sub
+
+        @describe("transport requests")
+
+        @it("lets only the host seek and holds the seek target until the room's seek runs")
+        sub _()
+            h = m.harness()
+            m.assertEqual(watchparty.sync.request(h.sync, m.ctx(h), "seek", 600, false).result, "denied")
+            m.assertEqual(watchparty.sync.request(h.sync, m.ctx(h), "pause", invalid, true).result, "denied")
+            h.room.selfRole = "host"
+            h.room.selfCanControlTransport = true
+            out = watchparty.sync.request(h.sync, m.ctx(h), "seek", 600, false)
+            m.assertEqual(out.result, "sent")
+            m.assertEqual(ParseJson(out.actions[0].text), { type: "transport_request", action: "seek", position_seconds: 600, is_paused: false })
+            m.assertEqual(watchparty.sync.view(h.sync, m.ctx(h)).pendingSeek, 600)
+            m.command(h, "s1", "seek", 600.4, "waiting")
+            m.assertInvalid(watchparty.sync.view(h.sync, m.ctx(h)).pendingSeek)
+            out = watchparty.sync.request(h.sync, m.ctx(h), "pause", invalid, true)
+            m.assertTrue(m.near(ParseJson(out.actions[0].text).position_seconds, 600.4, 0.01), "where the room's seek left it")
+            h.writable = false
+            m.assertEqual(watchparty.sync.request(h.sync, m.ctx(h), "play", invalid, false).result, "reconnecting")
+        end sub
+
+        @it("drops a play from the end and a play or pause before the media is playable")
+        sub _()
+            h = m.harness({ selfCanControlTransport: true })
+            m.update(h, { atEnd: true })
+            m.assertEqual(watchparty.sync.request(h.sync, m.ctx(h), "play", invalid, false).result, "ignored")
+            m.update(h, { atEnd: false, playable: false })
+            m.assertEqual(watchparty.sync.request(h.sync, m.ctx(h), "pause", invalid, true).result, "ignored")
+        end sub
+
+    end class
+
+end namespace

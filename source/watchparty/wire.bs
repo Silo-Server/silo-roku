@@ -1,0 +1,414 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/time.bs"
+
+' The room's wire formats (docs/watch-party.md sections 3 and 5): the
+' socket's frames and messages, the HTTP room and suggestion bodies, and
+' the capability documents. Everything the server sends is normalized here
+' into the camelCase shapes the rest of the app reads, with every ID a
+' string: the socket sends user_id, selected_file_id, and
+' selected_library_id as numbers, HTTP as strings
+' (internal/watchtogether/types.go, internal/apiv2/watch_together_*.go).
+'
+' A room (snapshot) is:
+'   roomId, phase ("lobby", "playing", "ended"), playbackState ("idle",
+'   "waiting", "paused", "playing"), selectionMode ("host_pick", "vote"),
+'   selectionRevision, generation (numbers), selectedContentId,
+'   selectedFileId, selectedLibraryId ("" when none), code,
+'   guestControlPolicy ("host_only", "guest_play_pause"), isPaused,
+'   anchorPositionSeconds, anchorUpdatedAtMs (epoch ms or invalid),
+'   memberCount, hostConnected, selfRole ("host", "guest"),
+'   selfCanControlTransport, selfCanManageRoom, selfIgnoreWait,
+'   attachedSessionId, invitePath ("" when none), members: [member]
+' A member is { userId, profileId, displayName, isHost, isSelf, connected,
+' isReady, isBuffering, isSyncing, lobbyReady }; absent flags are false.
+' A command is { commandId, sessionId, selectionRevision, action ("play",
+' "pause", "seek"), positionSeconds, executeAtMs, issuedAtMs (epoch ms or
+' invalid), playbackState }.
+' A suggestion is { id, roomId, suggesterUserId, suggesterProfileId,
+' contentId, contentType, title, subtitle, posterUrl, note, voteCount,
+' votedByMe, createdAtMs }.
+'
+' The room code, ticket, and room proof pass through here; nothing here
+' logs.
+namespace watchparty.wire
+    const PROTOCOL = "silo.room.v2"
+    const TICKET_PREFIX = "silo.ticket."
+    ' The server mints tickets for at most 30 s and closes a socket after at
+    ' most 300 s (internal/apiv2/watch_together_socket.go).
+    const MAX_TICKET_SECONDS = 30
+    const MAX_CONNECTION_SECONDS = 300
+    ' Playback features the room needs, and the optional one (section 3).
+    const FEATURE_COORDINATOR = "watch_party_coordinator_v1"
+    const FEATURE_FIXED_FILE = "fixed_media_file_v1"
+    const FEATURE_SOURCE_FALLBACK = "watch_party_source_fallback_v1"
+    const PHASES = "|lobby|playing|ended|"
+    const PLAYBACK_STATES = "|idle|waiting|paused|playing|"
+    const ACTIONS = "|play|pause|seek|"
+
+    ' ---- Socket frames
+
+    ' One text frame as { type, ... }, or invalid for text that is not JSON
+    ' or a type this client does not know (section 6.3: ignored):
+    '   { type: "snapshot", room }
+    '   { type: "command", command }
+    '   { type: "pong", clientSentAtMs, serverReceivedAtMs, serverSentAtMs }
+    '   { type: "suggestions", items }
+    '   { type: "closed", reason } (room_closed)
+    '   { type: "replaced", reason } (connection_replaced)
+    '   { type: "error", code, message }
+    '   { type: "malformed", frame }: a known type whose body is unusable
+    function parseFrame(text as String) as Dynamic
+        trimmed = text.Trim()
+        if Left(trimmed, 1) <> "{" then return invalid
+        raw = ParseJson(trimmed)
+        if not util.isObject(raw) or not util.isString(raw.type) then return invalid
+        kind = raw.type
+        if kind = "snapshot"
+            room = snapshot(raw.room)
+            if room = invalid then return malformed(kind)
+            return { type: "snapshot", room: room }
+        else if kind = "transport_command"
+            parsed = command(raw.command)
+            if parsed = invalid then return malformed(kind)
+            return { type: "command", command: parsed }
+        else if kind = "pong"
+            sent = watchparty.time.parseMs(raw.client_sent_at)
+            received = watchparty.time.parseMs(raw.server_received_at)
+            replied = watchparty.time.parseMs(raw.server_sent_at)
+            if sent = invalid or received = invalid or replied = invalid then return malformed(kind)
+            return { type: "pong", clientSentAtMs: sent, serverReceivedAtMs: received, serverSentAtMs: replied }
+        else if kind = "suggestions_update"
+            items = suggestions(raw.suggestions)
+            if items = invalid then return malformed(kind)
+            return { type: "suggestions", items: items }
+        else if kind = "room_closed"
+            return { type: "closed", reason: util.text(raw.reason) }
+        else if kind = "connection_replaced"
+            return { type: "replaced", reason: util.text(raw.reason) }
+        else if kind = "error"
+            return { type: "error", code: util.text(raw.code), message: util.text(raw.message) }
+        end if
+        return invalid
+    end function
+
+    function malformed(kind as String) as Object
+        return { type: "malformed", frame: kind }
+    end function
+
+    ' ---- Client messages, as the JSON text sent
+
+    function attach(sessionId as String) as String
+        return FormatJson({ type: "attach_session", session_id: sessionId })
+    end function
+
+    ' A state_report. commandId names the last command this member
+    ' executed ("" for none); isReady makes it a readiness acknowledgement
+    ' of that command while the room waits (section 7.3).
+    function stateReport(sessionId as String, positionSeconds as Dynamic, isPaused as Boolean, commandId as String, isReady as Boolean) as String
+        body = { type: "state_report", session_id: sessionId, position_seconds: finite(positionSeconds), is_paused: isPaused }
+        if commandId <> "" then body.command_id = commandId
+        if isReady then body.is_ready = true
+        return FormatJson(body)
+    end function
+
+    function ready(sessionId as String, commandId as String, positionSeconds as Dynamic, isPaused as Boolean) as String
+        body = { type: "ready", session_id: sessionId, position_seconds: finite(positionSeconds), is_paused: isPaused }
+        if commandId <> "" then body.command_id = commandId
+        return FormatJson(body)
+    end function
+
+    function buffering(sessionId as String, positionSeconds as Dynamic, isPaused as Boolean) as String
+        return FormatJson({ type: "buffering", session_id: sessionId, position_seconds: finite(positionSeconds), is_paused: isPaused })
+    end function
+
+    ' action is "play", "pause", or "seek"; positionSeconds invalid leaves
+    ' it out.
+    function transportRequest(action as String, positionSeconds as Dynamic, isPaused as Boolean) as String
+        body = { type: "transport_request", action: action, is_paused: isPaused }
+        if util.isNumber(positionSeconds) then body.position_seconds = finite(positionSeconds)
+        return FormatJson(body)
+    end function
+
+    function lobbyReady(isReady as Boolean) as String
+        return FormatJson({ type: "lobby_ready", ready: isReady })
+    end function
+
+    function ping(clientSentAtMs as Double) as String
+        return FormatJson({ type: "ping", client_sent_at: watchparty.time.formatMs(clientSentAtMs) })
+    end function
+
+    ' ---- Server shapes
+
+    ' A snapshot from the socket or HTTP, normalized, or invalid when it
+    ' has no room ID or an unknown phase.
+    function snapshot(raw as Dynamic) as Dynamic
+        if not util.isObject(raw) then return invalid
+        roomId = idText(raw.room_id)
+        phase = util.text(raw.phase)
+        if roomId = "" or Instr(1, PHASES, "|" + phase + "|") = 0 or phase = "" then return invalid
+        out = {
+            roomId: roomId,
+            phase: phase,
+            playbackState: util.text(raw.playback_state),
+            selectionMode: util.text(raw.selection_mode),
+            selectionRevision: number(raw.selection_revision, 0),
+            selectedContentId: idText(raw.selected_content_id),
+            selectedFileId: idText(raw.selected_file_id),
+            selectedLibraryId: idText(raw.selected_library_id),
+            code: util.text(raw.code),
+            guestControlPolicy: util.text(raw.guest_control_policy),
+            isPaused: util.isTrue(raw.is_paused),
+            anchorPositionSeconds: number(raw.anchor_position_seconds, 0),
+            anchorUpdatedAtMs: watchparty.time.parseMs(raw.anchor_updated_at),
+            generation: number(raw.generation, 0),
+            memberCount: number(raw.member_count, 0),
+            hostConnected: util.isTrue(raw.host_connected),
+            selfRole: util.text(raw.self_role),
+            selfCanControlTransport: util.isTrue(raw.self_can_control_transport),
+            selfCanManageRoom: util.isTrue(raw.self_can_manage_room),
+            selfIgnoreWait: util.isTrue(raw.self_ignore_wait),
+            attachedSessionId: util.text(raw.attached_session_id),
+            invitePath: util.text(raw.invite_path),
+            members: []
+        }
+        if type(raw.members) = "roArray"
+            for each entry in raw.members
+                if util.isObject(entry) then out.members.Push(member(entry))
+            end for
+        end if
+        return out
+    end function
+
+    function member(raw as Object) as Object
+        return {
+            userId: idText(raw.user_id),
+            profileId: idText(raw.profile_id),
+            displayName: util.text(raw.display_name),
+            isHost: util.isTrue(raw.is_host),
+            isSelf: util.isTrue(raw.is_self),
+            connected: util.isTrue(raw.connected),
+            isReady: util.isTrue(raw.is_ready),
+            isBuffering: util.isTrue(raw.is_buffering),
+            isSyncing: util.isTrue(raw.is_syncing),
+            lobbyReady: util.isTrue(raw.lobby_ready)
+        }
+    end function
+
+    ' A transport command, or invalid when it lacks an ID, has an unknown
+    ' action or state, or a position that is not a finite number of
+    ' seconds from zero. An unparseable execute_at leaves executeAtMs
+    ' invalid: the command runs when it arrives.
+    function command(raw as Dynamic) as Dynamic
+        if not util.isObject(raw) then return invalid
+        commandId = util.text(raw.command_id)
+        action = util.text(raw.action)
+        state = util.text(raw.playback_state)
+        position = raw.position_seconds
+        if commandId = "" or action = "" or Instr(1, ACTIONS, "|" + action + "|") = 0 then return invalid
+        if state = "" or state = "idle" or Instr(1, PLAYBACK_STATES, "|" + state + "|") = 0 then return invalid
+        if not util.isNumber(position) or not isFinite(position) or position < 0 then return invalid
+        return {
+            commandId: commandId,
+            sessionId: util.text(raw.session_id),
+            selectionRevision: number(raw.selection_revision, 0),
+            action: action,
+            positionSeconds: position,
+            executeAtMs: watchparty.time.parseMs(raw.execute_at),
+            issuedAtMs: watchparty.time.parseMs(raw.issued_at),
+            playbackState: state
+        }
+    end function
+
+    ' A suggestion list, or invalid when any row is unusable.
+    function suggestions(list as Dynamic) as Dynamic
+        if type(list) <> "roArray" then return invalid
+        out = []
+        for each raw in list
+            row = suggestion(raw)
+            if row = invalid then return invalid
+            out.Push(row)
+        end for
+        return out
+    end function
+
+    function suggestion(raw as Dynamic) as Dynamic
+        if not util.isObject(raw) then return invalid
+        out = {
+            id: idText(raw.id),
+            roomId: idText(raw.room_id),
+            suggesterUserId: idText(raw.suggester_user_id),
+            suggesterProfileId: idText(raw.suggester_profile_id),
+            contentId: idText(raw.content_id),
+            contentType: util.text(raw.content_type),
+            title: util.text(raw.title),
+            subtitle: util.text(raw.subtitle),
+            posterUrl: util.text(raw.poster_url),
+            note: util.text(raw.note),
+            voteCount: number(raw.vote_count, 0),
+            votedByMe: util.isTrue(raw.voted_by_me),
+            createdAtMs: watchparty.time.parseMs(raw.created_at)
+        }
+        if out.id = "" or out.contentId = "" then return invalid
+        return out
+    end function
+
+    ' A room route's answer, { room, proof }: the snapshot and the renewed
+    ' room proof every snapshot response carries (section 5). Invalid
+    ' without a usable room; proof is "" when absent.
+    function roomResponse(body as Dynamic) as Dynamic
+        if not util.isObject(body) then return invalid
+        room = snapshot(body.room)
+        if room = invalid then return invalid
+        return { room: room, proof: util.text(body.room_access_token) }
+    end function
+
+    ' GET .../suggestions: { items, nextCursor, hasMore }, or invalid.
+    function suggestionsPage(body as Dynamic) as Dynamic
+        if not util.isObject(body) then return invalid
+        items = suggestions(body.items)
+        if items = invalid then return invalid
+        out = { items: items, nextCursor: "", hasMore: false }
+        if util.isObject(body.page)
+            out.hasMore = util.isTrue(body.page.has_more)
+            out.nextCursor = util.text(body.page.next_cursor)
+        end if
+        if out.nextCursor = "" then out.hasMore = false
+        return out
+    end function
+
+    ' POST .../ws-ticket: the ticket, or "" when the answer is outside the
+    ' server's bounds or the ticket could not go in a header unchanged.
+    function ticket(body as Dynamic) as String
+        if not util.isObject(body) then return ""
+        value = util.text(body.ticket)
+        expires = body.expires_in
+        lifetime = body.max_connection_seconds
+        if value = "" or util.text(body.protocol) <> PROTOCOL then return ""
+        if not util.isNumber(expires) or expires < 0 or expires > MAX_TICKET_SECONDS then return ""
+        if not util.isNumber(lifetime) or lifetime < 1 or lifetime > MAX_CONNECTION_SECONDS then return ""
+        for i = 1 to Len(value)
+            c = Asc(Mid(value, i, 1))
+            ' A token: letters, digits, and - . _ ~ only.
+            letterOrDigit = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+            if not letterOrDigit and c <> 45 and c <> 46 and c <> 95 and c <> 126 then return ""
+        end for
+        return value
+    end function
+
+    ' The room socket's URL on the configured origin: ws:// for an http
+    ' server, wss:// for https, the base URL's path kept, no query
+    ' (section 2.2). "" for a base that is not http(s).
+    function socketUrl(baseUrl as String, roomId as String) as String
+        lower = LCase(baseUrl)
+        rest = ""
+        if Left(lower, 8) = "https://"
+            rest = "wss://" + Mid(baseUrl, 9)
+        else if Left(lower, 7) = "http://"
+            rest = "ws://" + Mid(baseUrl, 8)
+        else
+            return ""
+        end if
+        return rest + "/api/v2/watch-together/rooms/" + api.request.escape(roomId) + "/ws"
+    end function
+
+    ' Sec-WebSocket-Protocol's value: exactly these two, in this order.
+    function protocols(ticketValue as String) as String
+        return PROTOCOL + ", " + TICKET_PREFIX + ticketValue
+    end function
+
+    ' ---- Capabilities
+
+    ' Whether this device and session may show Watch Party (section 3):
+    '   { state, missing, features }
+    ' state is "available", "unsupported" (missing names what is absent),
+    ' "notAllowed" (the account or profile may not use rooms, or the session
+    ' is a SiloControl handoff), or "unknown" before both documents arrived.
+    ' input is { webSocket, borrowed, room, playback }: whether
+    ' CreateObject("roWebSocket") gave an object, whether the session is a
+    ' handoff's borrowed identity, and the two capability documents'
+    ' bodies, or invalid while unread. features holds the optional flags:
+    ' stagedSelection, lobbyReady, selectionModeSwitch, stopPlayback,
+    ' voteHostOverride, picker, memberState, maxMemberStateIds, and
+    ' sourceFallback.
+    function evaluate(input as Object) as Object
+        out = { state: "unknown", missing: [], features: features(input.room, input.playback) }
+        if not util.isTrue(input.webSocket)
+            out.state = "unsupported"
+            out.missing.Push("websocket")
+            return out
+        end if
+        if util.isTrue(input.borrowed)
+            out.state = "notAllowed"
+            return out
+        end if
+        room = input.room
+        play = input.playback
+        if not util.isObject(room) or not util.isObject(play) then return out
+        if util.text(room.state) <> "available"
+            out.missing.Push("rooms")
+        else if not util.isTrue(room.allowed)
+            out.state = "notAllowed"
+            return out
+        else
+            if util.text(room.socket_protocol) <> PROTOCOL then out.missing.Push("room_socket")
+            if not util.isTrue(room.connection_replaced) then out.missing.Push("connection_replaced")
+        end if
+        if util.text(play.state) <> "available"
+            out.missing.Push("playback")
+        else if not util.isTrue(play.allowed)
+            out.state = "notAllowed"
+            return out
+        else
+            for each feature in [FEATURE_COORDINATOR, FEATURE_FIXED_FILE]
+                if not util.contains(play.features, feature) then out.missing.Push(feature)
+            end for
+        end if
+        if out.missing.Count() > 0
+            out.state = "unsupported"
+        else
+            out.state = "available"
+        end if
+        return out
+    end function
+
+    function features(room as Dynamic, play as Dynamic) as Object
+        out = { stagedSelection: false, lobbyReady: false, selectionModeSwitch: false, stopPlayback: false, voteHostOverride: false, picker: false, memberState: false, maxMemberStateIds: 0, sourceFallback: false }
+        if util.isObject(room)
+            for each name in [["stagedSelection", "staged_selection"], ["lobbyReady", "lobby_ready"], ["selectionModeSwitch", "selection_mode_switch"], ["stopPlayback", "stop_playback"], ["voteHostOverride", "vote_host_override"], ["picker", "picker"], ["memberState", "member_state"]]
+                out[name[0]] = util.isTrue(room[name[1]])
+            end for
+            if out.memberState and util.isNumber(room.max_member_state_ids) and room.max_member_state_ids > 0 then out.maxMemberStateIds = room.max_member_state_ids
+            if out.maxMemberStateIds = 0 then out.memberState = false
+        end if
+        if util.isObject(play) then out.sourceFallback = util.contains(play.features, FEATURE_SOURCE_FALLBACK)
+        return out
+    end function
+
+    ' ---- Values
+
+    ' An ID as a string: strings as they are, whole numbers in decimal, ""
+    ' for anything else.
+    function idText(value as Dynamic) as String
+        if util.isString(value) then return value
+        t = type(value)
+        if t = "Integer" or t = "roInt" or t = "roInteger" or t = "LongInteger" or t = "roLongInteger" then return value.ToStr()
+        if util.isNumber(value) and isFinite(value) and Abs(value) < 2147483647 and value = Int(value) then return Int(value).ToStr()
+        return ""
+    end function
+
+    function number(value as Dynamic, fallback as Dynamic) as Dynamic
+        if util.isNumber(value) and isFinite(value) then return value
+        return fallback
+    end function
+
+    function isFinite(value as Dynamic) as Boolean
+        ' NaN is unequal to itself; an infinity passes no bound.
+        return value = value and value < 1E30 and value > -1E30
+    end function
+
+    function finite(value as Dynamic) as Dynamic
+        if util.isNumber(value) and isFinite(value) and value >= 0 then return value
+        return 0
+    end function
+end namespace

@@ -1,0 +1,170 @@
+import "pkg:/source/util/values.bs"
+
+' Watch Party's time (docs/watch-party.md section 7.1). The room socket
+' stamps commands and pongs in RFC 3339 with up to nine fractional digits,
+' which roDateTime does not parse, so they are read by hand. Instants are
+' epoch milliseconds in a Double: an Integer holds only 24 days of them.
+'
+' The local clock is a monotonic roTimespan anchored once to roDateTime's
+' wall clock (localClock), so a wall-clock step on the Roku moves no
+' instant this app computes after the anchor.
+namespace watchparty.time
+    const MS_PER_DAY = 86400000
+    const MS_PER_HOUR = 3600000
+    const MS_PER_MINUTE = 60000
+
+    ' Epoch milliseconds of an RFC 3339 instant, or invalid. A fraction
+    ' finer than milliseconds is cut, not rounded, so a stamp never moves
+    ' later. "2026-09-24T18:00:00.240Z" gives 1790272800240.
+    function parseMs(text as Dynamic) as Dynamic
+        if not util.isString(text) then return invalid
+        s = text.Trim()
+        if Len(s) < 20 then return invalid
+        if Mid(s, 5, 1) <> "-" or Mid(s, 8, 1) <> "-" or Mid(s, 14, 1) <> ":" or Mid(s, 17, 1) <> ":" then return invalid
+        separator = UCase(Mid(s, 11, 1))
+        if separator <> "T" and separator <> " " then return invalid
+        year = digitsAt(s, 1, 4)
+        month = digitsAt(s, 6, 2)
+        day = digitsAt(s, 9, 2)
+        hour = digitsAt(s, 12, 2)
+        minute = digitsAt(s, 15, 2)
+        sec = digitsAt(s, 18, 2)
+        if year = invalid or month = invalid or day = invalid or hour = invalid or minute = invalid or sec = invalid then return invalid
+        if month < 1 or month > 12 or day < 1 or day > daysInMonth(year, month) or hour > 23 or minute > 59 or sec > 60 then return invalid
+        at = 20
+        millis = 0
+        if Mid(s, at, 1) = "."
+            at = at + 1
+            count = 0
+            while at <= Len(s) and isDigit(Mid(s, at, 1))
+                if count < 3 then millis = millis * 10 + Asc(Mid(s, at, 1)) - 48
+                count = count + 1
+                at = at + 1
+            end while
+            if count = 0 or count > 9 then return invalid
+            while count < 3
+                millis = millis * 10
+                count = count + 1
+            end while
+        end if
+        zone = UCase(Mid(s, at))
+        shiftMs = 0
+        if zone <> "Z"
+            if Len(zone) <> 6 or Mid(zone, 4, 1) <> ":" then return invalid
+            sign = Left(zone, 1)
+            zoneHours = digitsAt(zone, 2, 2)
+            zoneMinutes = digitsAt(zone, 5, 2)
+            if (sign <> "+" and sign <> "-") or zoneHours = invalid or zoneMinutes = invalid or zoneHours > 23 or zoneMinutes > 59 then return invalid
+            shiftMs = zoneHours * MS_PER_HOUR + zoneMinutes * MS_PER_MINUTE
+            if sign = "+" then shiftMs = -shiftMs
+        end if
+        ' A leap second reads as the next second's start.
+        dayMs = hour * MS_PER_HOUR + minute * MS_PER_MINUTE + sec * 1000 + millis
+        return daysFromCivil(year, month, day) * 1# * MS_PER_DAY + dayMs + shiftMs
+    end function
+
+    ' "2026-09-24T18:00:00.240Z" for epoch milliseconds, always with three
+    ' fractional digits, as client_sent_at.
+    function formatMs(instantMs as Dynamic) as String
+        ' Int gives an Integer, so only the day count and the time of day
+        ' are floored, never the instant itself.
+        days = Int(instantMs / (MS_PER_DAY * 1#))
+        rest = Int(instantMs - days * 1# * MS_PER_DAY)
+        civil = civilFromDays(days)
+        out = pad(civil.year, 4) + "-" + pad(civil.month, 2) + "-" + pad(civil.day, 2)
+        out = out + "T" + pad(rest \ MS_PER_HOUR, 2) + ":" + pad((rest mod MS_PER_HOUR) \ MS_PER_MINUTE, 2) + ":" + pad((rest mod MS_PER_MINUTE) \ 1000, 2)
+        return out + "." + pad(rest mod 1000, 3) + "Z"
+    end function
+
+    ' Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's
+    ' days_from_civil).
+    function daysFromCivil(year as Integer, month as Integer, day as Integer) as Integer
+        y = year
+        if month <= 2 then y = y - 1
+        era = y \ 400
+        if y < 0 and y mod 400 <> 0 then era = era - 1
+        yoe = y - era * 400
+        shifted = month + 9
+        if month > 2 then shifted = month - 3
+        doy = (153 * shifted + 2) \ 5 + day - 1
+        doe = yoe * 365 + yoe \ 4 - yoe \ 100 + doy
+        return era * 146097 + doe - 719468
+    end function
+
+    ' { year, month, day } of days since 1970-01-01 (civil_from_days).
+    function civilFromDays(days as Integer) as Object
+        z = days + 719468
+        era = z \ 146097
+        if z < 0 and z mod 146097 <> 0 then era = era - 1
+        doe = z - era * 146097
+        yoe = (doe - doe \ 1460 + doe \ 36524 - doe \ 146096) \ 365
+        doy = doe - (365 * yoe + yoe \ 4 - yoe \ 100)
+        mp = (5 * doy + 2) \ 153
+        civilDay = doy - (153 * mp + 2) \ 5 + 1
+        civilMonth = mp + 3
+        if mp >= 10 then civilMonth = mp - 9
+        civilYear = yoe + era * 400
+        if civilMonth <= 2 then civilYear = civilYear + 1
+        return { year: civilYear, month: civilMonth, day: civilDay }
+    end function
+
+    function daysInMonth(year as Integer, month as Integer) as Integer
+        if month = 2
+            if (year mod 4 = 0 and year mod 100 <> 0) or year mod 400 = 0 then return 29
+            return 28
+        end if
+        if month = 4 or month = 6 or month = 9 or month = 11 then return 30
+        return 31
+    end function
+
+    ' ---- The local clock
+
+    ' The local clock: span is a roTimespan, wall a roDateTime (or test
+    ' doubles with their TotalMilliseconds, Mark, AsSeconds, and
+    ' GetMilliseconds). Both are marked together once; from then on only
+    ' span advances it.
+    function localClock(span as Object, wall as Object) as Object
+        wall.Mark()
+        span.Mark()
+        return { span: span, anchorMs: wall.AsSeconds() * 1000# + wall.GetMilliseconds() }
+    end function
+
+    ' Milliseconds since the clock was anchored: the scheduling clock. An
+    ' Integer, which wraps after 24 days of one app run.
+    function monotonicMs(clock as Object) as Integer
+        return clock.span.TotalMilliseconds()
+    end function
+
+    ' Epoch milliseconds now, as the anchor plus the monotonic time since.
+    function epochMs(clock as Object) as Double
+        return clock.anchorMs + clock.span.TotalMilliseconds()
+    end function
+
+    ' ---- Helpers
+
+    ' The number of count ASCII digits at position at (1-based), or invalid.
+    function digitsAt(s as String, at as Integer, count as Integer) as Dynamic
+        if at + count - 1 > Len(s) then return invalid
+        value = 0
+        for i = at to at + count - 1
+            c = Mid(s, i, 1)
+            if not isDigit(c) then return invalid
+            value = value * 10 + Asc(c) - 48
+        end for
+        return value
+    end function
+
+    function isDigit(c as String) as Boolean
+        if c = "" then return false
+        code = Asc(c)
+        return code >= 48 and code <= 57
+    end function
+
+    function pad(value as Integer, width as Integer) as String
+        text = value.ToStr()
+        while Len(text) < width
+            text = "0" + text
+        end while
+        return text
+    end function
+end namespace

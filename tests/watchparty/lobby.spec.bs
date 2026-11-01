@@ -1,0 +1,350 @@
+import "pkg:/source/watchparty/lobby.bs"
+import "pkg:/source/watchparty/votes.bs"
+
+namespace tests
+
+    ' The lobby's rules, ported from tvOS's WatchPartyStateTests (vote
+    ' winner, member-state batches, removal, seats, presence, primary
+    ' action, votes) and the hub's hint and button tables.
+    @suite("watch party lobby")
+    class WatchPartyLobbyTests extends rooibos.BaseTestSuite
+
+        function member(name as String, fields = {} as Object) as Object
+            out = tests.party.makeMember({ userId: "1", profileId: LCase(name), displayName: name })
+            out.Append(fields)
+            return out
+        end function
+
+        function lobby(fields = {} as Object) as Object
+            out = tests.party.makeRoom({ phase: "lobby", playbackState: "idle", selectedContentId: "", selectedFileId: "", selectedLibraryId: "" })
+            out.Append(fields)
+            return out
+        end function
+
+        function ctx(fields = {} as Object) as Object
+            features = { stagedSelection: true, lobbyReady: true, selectionModeSwitch: true, stopPlayback: true, voteHostOverride: true, picker: true, memberState: true, maxMemberStateIds: 200, sourceFallback: true }
+            out = { features: features, winner: invalid, suggestionCount: 0, itemTitle: "", selectionUnavailable: false, selectionPending: false, playbackEnded: false, connection: "connected", error: "" }
+            out.Append(fields)
+            return out
+        end function
+
+        @describe("entry points")
+
+        @it("offers Watch Party outside a party or to a host-pick manager, else Suggest to Party")
+        sub _()
+            m.assertEqual(watchparty.lobby.entryTitleKey(invalid), "watchParty.entry.watchParty")
+            m.assertEqual(watchparty.lobby.entryAction(invalid), "create")
+            manager = m.lobby({ selfCanManageRoom: true })
+            m.assertEqual(watchparty.lobby.entryTitleKey(manager), "watchParty.entry.watchParty")
+            m.assertEqual(watchparty.lobby.entryAction(manager), "select")
+            voteManager = m.lobby({ selfCanManageRoom: true, selectionMode: "vote" })
+            m.assertEqual(watchparty.lobby.entryTitleKey(voteManager), "watchParty.entry.suggest")
+            m.assertEqual(watchparty.lobby.entryAction(voteManager), "suggest")
+            guest = m.lobby()
+            m.assertEqual(watchparty.lobby.entryAction(guest), "suggest")
+            m.assertEqual(watchparty.lobby.entryAction(tests.party.makeRoom()), "lobbyOnly", "the Roku explains a suggestion during playback")
+            m.assertEqual(watchparty.lobby.menuTitleKey(guest), "watchParty.menu.return")
+            m.assertEqual(watchparty.lobby.menuTitleKey(invalid), "watchParty.menu.open")
+        end sub
+
+        @describe("votes")
+
+        @it("needs votes for a winner and breaks ties by age, then ID")
+        sub _()
+            m.assertInvalid(watchparty.lobby.winner([tests.party.makeSuggestion("x", 0, 1000#)]))
+            first = tests.party.makeSuggestion("a", 2, 999#)
+            later = tests.party.makeSuggestion("b", 2, 1000#)
+            m.assertEqual(watchparty.lobby.winner([later, first]).id, "a")
+            m.assertEqual(watchparty.lobby.winner([first, tests.party.makeSuggestion("popular", 3, 2000#)]).id, "popular")
+            m.assertEqual(watchparty.lobby.winner([tests.party.makeSuggestion("b", 2, 1000#), tests.party.makeSuggestion("a", 2, 1000#)]).id, "a")
+        end sub
+
+        @it("ranks the socket fixture's suggestions by votes")
+        sub _()
+            items = watchparty.wire.parseFrame(tests.party.text("socket_suggestions_update")).items
+            m.assertEqual(watchparty.lobby.winner(items).title, "Collateral")
+        end sub
+
+        @it("keeps personal votes through a shared broadcast")
+        sub _()
+            list = watchparty.votes.create()
+            m.assertTrue(watchparty.votes.reconcile(list, [tests.party.makeSuggestion("one", 1, 0#, { votedByMe: true })], list.revision))
+            watchparty.votes.receive(list, [tests.party.makeSuggestion("one", 4, 0#), tests.party.makeSuggestion("new", 1, 0#, { votedByMe: true })])
+            m.assertTrue(list.rows[0].votedByMe)
+            m.assertEqual(list.rows[0].voteCount, 4)
+            m.assertFalse(list.rows[1].votedByMe, "a broadcast cannot claim a vote on a new row")
+        end sub
+
+        @it("refuses a read that a broadcast or a mutation overtook")
+        sub _()
+            list = watchparty.votes.create()
+            started = list.revision
+            watchparty.votes.receive(list, [tests.party.makeSuggestion("one", 0, 0#), tests.party.makeSuggestion("new", 0, 0#)])
+            m.assertFalse(watchparty.votes.reconcile(list, [tests.party.makeSuggestion("one", 0, 0#, { votedByMe: true })], started))
+            m.assertEqual(list.rows.Count(), 2)
+            before = list.revision
+            watchparty.votes.invalidate(list)
+            m.assertFalse(watchparty.votes.reconcile(list, [tests.party.makeSuggestion("one", 0, 0#)], before))
+            m.assertTrue(watchparty.votes.reconcile(list, [tests.party.makeSuggestion("one", 0, 0#, { votedByMe: true })], list.revision))
+            m.assertTrue(list.personal["one"])
+        end sub
+
+        @it("dedupes member-state IDs within the advertised and wire limits")
+        sub _()
+            ids = ["", "movie:0", "movie:0"]
+            for i = 1 to 250
+                ids.Push("movie:" + i.ToStr())
+            end for
+            limited = watchparty.lobby.memberStateIds(ids, 500)
+            m.assertEqual(limited.Count(), 200)
+            m.assertEqual(limited[0], "movie:0")
+            m.assertEqual(limited[199], "movie:199")
+            m.assertEqual(watchparty.lobby.memberStateIds(ids, 2), ["movie:0", "movie:1"])
+            m.assertEqual(watchparty.lobby.memberStateIds(ids, 0), [])
+        end sub
+
+        @it("lets the suggester remove by account and profile, and a manager always")
+        sub _()
+            row = tests.party.makeSuggestion("s", 0, 0#, { suggesterUserId: "1", suggesterProfileId: "profile-one" })
+            room = m.lobby({ members: [m.member("Viewer", { isSelf: true, profileId: "profile-one" })] })
+            m.assertTrue(watchparty.lobby.canRemove(row, room))
+            room.members[0].profileId = "another"
+            m.assertFalse(watchparty.lobby.canRemove(row, room))
+            room.members[0].profileId = "profile-one"
+            room.members[0].userId = "2"
+            m.assertFalse(watchparty.lobby.canRemove(row, room))
+            room.selfCanManageRoom = true
+            m.assertTrue(watchparty.lobby.canRemove(row, room))
+            room.roomId = "other-room"
+            m.assertFalse(watchparty.lobby.canRemove(row, room))
+            room.roomId = "room-1"
+            room.phase = "ended"
+            m.assertFalse(watchparty.lobby.canRemove(row, room))
+        end sub
+
+        @it("lets a vote room's manager start only the winner without vote_host_override")
+        sub _()
+            room = m.lobby({ selfCanManageRoom: true, selectionMode: "vote" })
+            leader = tests.party.makeSuggestion("lead", 2, 0#)
+            other = tests.party.makeSuggestion("other", 1, 0#)
+            features = m.ctx().features
+            features.voteHostOverride = false
+            m.assertTrue(watchparty.lobby.canPromote(leader, room, m.ctx({ winner: leader, features: features })))
+            m.assertFalse(watchparty.lobby.canPromote(other, room, m.ctx({ winner: leader, features: features })))
+            m.assertTrue(watchparty.lobby.canPromote(other, room, m.ctx({ winner: leader })))
+            m.assertFalse(watchparty.lobby.canPromote(other, m.lobby({ selectionMode: "vote" }), m.ctx({ winner: leader })), "a guest")
+        end sub
+
+        @describe("seats")
+
+        @it("treats the host as ready and a disconnected member as away")
+        sub _()
+            m.assertEqual(watchparty.lobby.seatState(m.member("Host", { isHost: true }), "lobby"), "ready")
+            m.assertEqual(watchparty.lobby.seatState(m.member("Guest"), "lobby"), "notReady")
+            m.assertEqual(watchparty.lobby.seatState(m.member("Guest", { lobbyReady: true }), "lobby"), "ready")
+            m.assertEqual(watchparty.lobby.seatState(m.member("Guest", { connected: false, lobbyReady: true }), "lobby"), "away")
+            m.assertEqual(watchparty.lobby.seatState(m.member("Guest", { isReady: true }), "playing"), "watching")
+            m.assertEqual(watchparty.lobby.seatState(m.member("Guest", { isReady: true, isBuffering: true }), "playing"), "buffering")
+            m.assertEqual(watchparty.lobby.seatState(m.member("Guest", { isSyncing: true }), "playing"), "syncing")
+            m.assertEqual(watchparty.lobby.seatState(m.member("Guest"), "playing"), "joining")
+        end sub
+
+        @it("orders the host, then this member, then by name")
+        sub _()
+            room = m.lobby({ members: [m.member("zed"), m.member("Me", { isSelf: true }), m.member("amy"), m.member("Host", { isHost: true, connected: false })] })
+            seats = watchparty.lobby.seats(room)
+            names = []
+            for each seat in seats
+                names.Push(seat.member.displayName)
+            end for
+            m.assertEqual(names, ["Host", "Me", "amy", "zed"])
+            m.assertEqual(seats[0].roleKey, "watchParty.seat.host")
+            m.assertEqual(seats[0].stateKey, "watchParty.seat.reconnecting")
+            m.assertEqual(seats[1].roleKey, "watchParty.seat.you")
+            m.assertEqual(seats[1].stateKey, "watchParty.seat.notReady")
+            m.assertEqual(seats[2].initial, "A")
+            m.assertFalse(seats[2].check)
+        end sub
+
+        @it("picks the seat palette as tvOS hashes it, wrapping at 64 bits")
+        sub _()
+            m.assertEqual(watchparty.lobby.paletteIndex("12:p-host"), 5)
+            m.assertEqual(watchparty.lobby.paletteIndex("31:p-guest"), 2)
+            m.assertEqual(watchparty.lobby.paletteIndex("1:p1"), 1)
+            m.assertEqual(watchparty.lobby.paletteIndex("44:p-kid"), 4)
+            ' Past the 64-bit range, positive and negative.
+            m.assertEqual(watchparty.lobby.paletteIndex("7:3f9a1c52-3c4e-4f7b-9a0e-6b2d8c1e7a10"), 1)
+            m.assertEqual(watchparty.lobby.paletteIndex("123456:0b1f9e7d-1111-4111-8111-111111111111"), 0)
+            m.assertEqual(watchparty.lobby.paletteIndex("9:abcdefabcdefabcd"), 4)
+        end sub
+
+        @it("counts only connected members in the summary")
+        sub _()
+            room = m.lobby({ members: [m.member("Host", { isHost: true }), m.member("A", { lobbyReady: true }), m.member("B"), m.member("C", { connected: false, lobbyReady: true })] })
+            m.assertEqual(watchparty.lobby.presence(room), { key: "watchParty.presence.ready", values: { ready: 2, total: 3 } })
+            m.assertEqual(watchparty.lobby.waitingNames(room), ["B"])
+            m.assertEqual(watchparty.lobby.presence(m.lobby({ members: [m.member("Host", { isHost: true })] })).key, "watchParty.presence.onlyYou")
+            m.assertEqual(watchparty.lobby.presence(m.lobby({ members: [] })).key, "watchParty.presence.nobody")
+            playing = tests.party.makeRoom({ members: [m.member("A", { isReady: true }), m.member("B")] })
+            m.assertEqual(watchparty.lobby.presence(playing).values, { watching: 1, total: 2 })
+        end sub
+
+        @it("labels the connection dot")
+        sub _()
+            guest = m.lobby({ hostConnected: false })
+            m.assertEqual(watchparty.lobby.connectionDot(guest, "connected").key, "watchParty.connection.hostAway")
+            m.assertEqual(watchparty.lobby.connectionDot(m.lobby(), "connected").key, "watchParty.connection.open")
+            two = m.lobby({ members: [m.member("A"), m.member("B")] })
+            ' A "count" member hides the AA's Count(), which assertEqual calls.
+            m.assertEqual(watchparty.lobby.connectionDot(two, "connected").values.count, 2)
+            m.assertEqual(watchparty.lobby.connectionDot(two, "reconnecting").key, "watchParty.connection.reconnecting")
+            m.assertEqual(watchparty.lobby.connectionDot(two, "ended").key, "watchParty.connection.disconnected")
+        end sub
+
+        @describe("buttons")
+
+        @it("follows role, mode, and selection")
+        sub _()
+            manager = m.lobby({ selfCanManageRoom: true, selfRole: "host" })
+            m.assertEqual(watchparty.lobby.primary(manager, m.ctx()).action, "chooseTitle")
+            m.assertEqual(watchparty.lobby.primary(manager, m.ctx()).key, "watchParty.button.chooseTitle")
+            manager.selectedContentId = "42"
+            start = watchparty.lobby.primary(manager, m.ctx())
+            m.assertEqual(start.key, "watchParty.button.startForEveryone")
+            m.assertTrue(start.startsOnPlay)
+            m.assertEqual(watchparty.lobby.secondary(manager, m.ctx()).key, "watchParty.button.changeTitle")
+            m.assertFalse(watchparty.lobby.primary(manager, m.ctx({ selectionPending: true })).enabled, "a pick not yet confirmed")
+            m.assertFalse(watchparty.lobby.primary(manager, m.ctx({ connection: "reconnecting" })).enabled)
+            features = m.ctx().features
+            features.stagedSelection = false
+            m.assertEqual(watchparty.lobby.primary(manager, m.ctx({ features: features })).key, "watchParty.button.changeTitle")
+            manager.selectionMode = "vote"
+            m.assertEqual(watchparty.lobby.primary(manager, m.ctx()).key, "watchParty.button.suggestTitle")
+            m.assertInvalid(watchparty.lobby.secondary(manager, m.ctx()))
+            heat = tests.party.makeSuggestion("heat", 1, 0#, { title: "Heat" })
+            winning = watchparty.lobby.primary(manager, m.ctx({ winner: heat }))
+            m.assertEqual(winning.key, "watchParty.button.startWinner")
+            m.assertEqual(winning.values, { title: "Heat" })
+            m.assertEqual(watchparty.lobby.secondary(manager, m.ctx({ winner: heat })).key, "watchParty.button.suggest")
+        end sub
+
+        @it("gives a guest the ready toggle only with lobby_ready")
+        sub _()
+            guest = m.lobby({ members: [m.member("Me", { isSelf: true, lobbyReady: true })] })
+            ready = watchparty.lobby.primary(guest, m.ctx())
+            m.assertEqual(ready.key, "watchParty.button.youreReady")
+            m.assertEqual(ready.undoKey, "watchParty.button.tapToUndo")
+            guest.members[0].lobbyReady = false
+            m.assertEqual(watchparty.lobby.primary(guest, m.ctx()).key, "watchParty.button.imReady")
+            features = m.ctx().features
+            features.lobbyReady = false
+            m.assertEqual(watchparty.lobby.primary(guest, m.ctx({ features: features })).action, "none")
+            m.assertEqual(watchparty.lobby.primary(guest, m.ctx({ selectionUnavailable: true })).action, "none")
+            guest.selectionMode = "vote"
+            m.assertEqual(watchparty.lobby.secondary(guest, m.ctx()).key, "watchParty.button.suggestTitle")
+        end sub
+
+        @it("returns to playback, or to the lobby from a finished player")
+        sub _()
+            host = tests.party.makeRoom({ selfCanManageRoom: true, selfRole: "host" })
+            guest = tests.party.makeRoom()
+            m.assertEqual(watchparty.lobby.primary(host, m.ctx()).action, "returnToPlayback")
+            m.assertEqual(watchparty.lobby.primary(guest, m.ctx()).action, "returnToPlayback")
+            m.assertEqual(watchparty.lobby.primary(guest, m.ctx({ selectionUnavailable: true })).action, "none")
+            m.assertEqual(watchparty.lobby.primary(host, m.ctx({ playbackEnded: true })).action, "returnToLobby")
+            m.assertEqual(watchparty.lobby.primary(host, m.ctx({ playbackEnded: true, selectionUnavailable: true })).action, "returnToLobby")
+            features = m.ctx().features
+            features.stopPlayback = false
+            m.assertEqual(watchparty.lobby.primary(host, m.ctx({ playbackEnded: true, features: features })).action, "none")
+            m.assertEqual(watchparty.lobby.primary(guest, m.ctx({ playbackEnded: true })).action, "none")
+            m.assertEqual(watchparty.lobby.secondary(host, m.ctx()).key, "watchParty.button.chooseSomethingElse")
+            m.assertInvalid(watchparty.lobby.secondary(guest, m.ctx()))
+        end sub
+
+        @describe("hints, hero, and banners")
+
+        @it("hints by mode and readiness")
+        sub _()
+            manager = m.lobby({ selfCanManageRoom: true, selfRole: "host", selectionMode: "vote" })
+            m.assertEqual(watchparty.lobby.hint(manager, m.ctx()).key, "watchParty.hint.suggestToStart")
+            m.assertEqual(watchparty.lobby.hint(manager, m.ctx({ suggestionCount: 2 })).key, "watchParty.hint.noVotes")
+            manager.selectionMode = "host_pick"
+            m.assertInvalid(watchparty.lobby.hint(manager, m.ctx()), "nothing picked yet")
+            manager.selectedContentId = "42"
+            manager.members = [m.member("Host", { isHost: true, isSelf: true }), m.member("Ann"), m.member("Bo"), m.member("Cy", { lobbyReady: true })]
+            m.assertEqual(watchparty.lobby.hint(manager, m.ctx()), { key: "watchParty.hint.notReady.two", values: { first: "Ann", second: "Bo" } })
+            manager.members.Push(m.member("Di"))
+            m.assertEqual(watchparty.lobby.hint(manager, m.ctx()).key, "watchParty.hint.notReady.more")
+            manager.members = [m.member("Host", { isHost: true, isSelf: true }), m.member("Ann", { lobbyReady: true })]
+            m.assertEqual(watchparty.lobby.hint(manager, m.ctx()).key, "watchParty.hint.everyoneReady")
+            manager.members = [m.member("Host", { isHost: true, isSelf: true })]
+            m.assertInvalid(watchparty.lobby.hint(manager, m.ctx()), "alone")
+            guest = m.lobby({ selectionMode: "vote", members: [m.member("Alex", { isHost: true }), m.member("Me", { isSelf: true })] })
+            m.assertEqual(watchparty.lobby.hint(guest, m.ctx()), { key: "watchParty.hint.hostStartsTheWinner", values: { host: "Alex" } })
+            heat = tests.party.makeSuggestion("heat", 1, 0#, { title: "Heat" })
+            m.assertEqual(watchparty.lobby.hint(guest, m.ctx({ winner: heat })).values, { host: "Alex", title: "Heat" })
+            guest.selectionMode = "host_pick"
+            m.assertInvalid(watchparty.lobby.hint(guest, m.ctx()))
+            guest.selectedContentId = "42"
+            m.assertEqual(watchparty.lobby.hint(guest, m.ctx()).key, "watchParty.hint.hostStarts")
+            m.assertInvalid(watchparty.lobby.hint(tests.party.makeRoom(), m.ctx()), "lobby only")
+        end sub
+
+        @it("titles the hero by mode, selection, and role")
+        sub _()
+            guest = m.lobby({ members: [m.member("Alex", { isHost: true }), m.member("Me", { isSelf: true })] })
+            open = watchparty.lobby.hero(guest, m.ctx())
+            m.assertEqual(open.eyebrowKey, "watchParty.hero.open")
+            m.assertEqual(open.titleKey, "watchParty.hero.waiting")
+            m.assertEqual(open.titleValues, { host: "Alex" })
+            guest.selectedContentId = "42"
+            m.assertEqual(watchparty.lobby.hero(guest, m.ctx()).titleKey, "watchParty.hero.loading")
+            m.assertEqual(watchparty.lobby.hero(guest, m.ctx({ selectionUnavailable: true })).titleKey, "watchParty.hero.hidden")
+            item = watchparty.lobby.hero(guest, m.ctx({ itemTitle: "Heat" }))
+            m.assertEqual(item.kind, "item")
+            m.assertEqual(item.title, "Heat")
+            m.assertEqual(item.eyebrowKey, "watchParty.hero.upNext")
+            m.assertEqual(item.captionKey, "watchParty.hero.hostChose")
+            vote = watchparty.lobby.hero(m.lobby({ selectionMode: "vote", selfCanManageRoom: true }), m.ctx({ suggestionCount: 1 }))
+            m.assertEqual(vote.eyebrowKey, "watchParty.hero.voting.one")
+            m.assertEqual(vote.captionKey, "watchParty.hero.voteCaption.manager")
+            playing = watchparty.lobby.hero(tests.party.makeRoom({ selfRole: "host" }), m.ctx({ itemTitle: "Heat" }))
+            m.assertEqual(playing.eyebrowKey, "watchParty.hero.nowWatching")
+            m.assertEqual(playing.captionKey, "watchParty.hero.youChose")
+        end sub
+
+        @it("shows the first banner that applies")
+        sub _()
+            guest = m.lobby({ hostConnected: false, members: [m.member("Alex", { isHost: true, connected: false })] })
+            m.assertEqual(watchparty.lobby.banner(guest, m.ctx({ error: "Boom" })).text, "Boom")
+            m.assertEqual(watchparty.lobby.banner(guest, m.ctx({ selectionUnavailable: true })).key, "watchParty.banner.unavailable.guest")
+            m.assertEqual(watchparty.lobby.banner(guest, m.ctx()), { key: "watchParty.banner.hostAway", values: { host: "Alex" }, text: "", tone: "warning" })
+            m.assertEqual(watchparty.lobby.banner(m.lobby(), m.ctx({ connection: "reconnecting" })).key, "watchParty.banner.reconnecting")
+            m.assertInvalid(watchparty.lobby.banner(m.lobby(), m.ctx()))
+        end sub
+
+        @it("labels Rejoin and the page's banner")
+        sub _()
+            m.assertEqual(watchparty.lobby.rejoin({ title: "Heat", replaced: false }), { key: "watchParty.rejoin.title", values: { title: "Heat" }, captionKey: "" })
+            m.assertEqual(watchparty.lobby.rejoin({ title: "" }).key, "watchParty.rejoin.recent")
+            m.assertEqual(watchparty.lobby.rejoin({ title: "Heat", replaced: true }).captionKey, "watchParty.rejoin.takeOver")
+            m.assertEqual(watchparty.lobby.pageBanner("checking", "").key, "watchParty.page.checking")
+            m.assertEqual(watchparty.lobby.pageBanner("notAllowed", "").key, "watchParty.page.unavailable")
+            m.assertEqual(watchparty.lobby.pageBanner("available", "Oops").text, "Oops")
+            m.assertInvalid(watchparty.lobby.pageBanner("available", ""))
+            m.assertTrue(watchparty.lobby.showsCheckAgain("unsupported"))
+            m.assertFalse(watchparty.lobby.showsCheckAgain("available"))
+        end sub
+
+        @it("words Who's Seen It")
+        sub _()
+            m.assertEqual(watchparty.lobby.whoSeen("in_progress", true), { key: "watchParty.whoSeen.inProgress", watchlist: true })
+            m.assertEqual(watchparty.lobby.whoSeen("unseen", false).key, "watchParty.whoSeen.notWatched")
+            m.assertEqual(watchparty.lobby.whoSeen(invalid, false).key, "watchParty.whoSeen.noHistory")
+            m.assertEqual(watchparty.lobby.votesKey(1), "watchParty.ballot.votes.one")
+            m.assertEqual(watchparty.lobby.votesKey(3), "watchParty.ballot.votes.other")
+        end sub
+
+    end class
+
+end namespace
