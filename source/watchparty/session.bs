@@ -33,6 +33,14 @@ import "pkg:/source/watchparty/wire.bs"
 ' the room's own code in its snapshot and recent entry, which the screens
 ' show.
 namespace watchparty.session
+    ' Roku closes a socket with this code for a text message over its
+    ' 524,288-byte limit (W0-1), which a suggestions_update near the
+    ' 200-suggestion cap can be.
+    const OVERSIZED_CLOSE = 1009
+    ' Such a close reconnects at once at most this many times in
+    ' OVERSIZED_WINDOW_MS; more follow the ordinary back-off.
+    const OVERSIZED_LIMIT = 3
+    const OVERSIZED_WINDOW_MS = 60000
     ' A suggestions_update is followed by a read this much later, so a burst
     ' of frames costs one read (tvOS).
     const SUGGESTION_READ_DELAY_MS = 200
@@ -215,9 +223,10 @@ namespace watchparty.session
         kind = event.kind
         if kind = "open"
             protocol = util.text(event.protocol)
-            ' The server answers with silo.room.v2; any other answer ends
-            ' the attempt (section 2.2). "" is a platform that does not say.
-            if protocol <> "" and protocol <> watchparty.wire.PROTOCOL
+            ' The server answers with silo.room.v2; any other answer, or
+            ' none, ends the attempt (section 2.2; W0-1: roWebSocket's
+            ' GetSelectedProtocol() names it once the socket opens).
+            if protocol <> watchparty.wire.PROTOCOL
                 trace(out, "warn", "room socket chose another protocol", { roomId: party.roomId })
                 endParty(s, "expired", out)
                 return finish(s, out, env)
@@ -238,7 +247,13 @@ namespace watchparty.session
             frame(s, watchparty.wire.parseFrame(util.text(event.text)), out, env)
         else if kind = "close" or kind = "error"
             ' An error is often followed by a close: the socket ends once.
-            if party.conn.step = "socket" or party.conn.step = "open" then socketEnded(s, out, env)
+            if party.conn.step = "socket" or party.conn.step = "open"
+                if kind = "close" and util.isNumber(event.code) and event.code = OVERSIZED_CLOSE and oversizedAgain(party, env.now)
+                    oversized(s, out, env)
+                else
+                    socketEnded(s, out, env)
+                end if
+            end if
         end if
         return finish(s, out, env)
     end function
@@ -414,7 +429,7 @@ namespace watchparty.session
             roomId: body.room.roomId,
             proof: body.proof,
             held: watchparty.room.holder(),
-            conn: { state: "connecting", step: "idle", epoch: 0, attempt: 0, openedAt: invalid, retryAt: invalid, writable: false, policy: watchparty.connection.create(env.now) },
+            conn: { state: "connecting", step: "idle", epoch: 0, attempt: 0, openedAt: invalid, retryAt: invalid, writable: false, oversized: [], policy: watchparty.connection.create(env.now) },
             clock: watchparty.clock.create(),
             connectionSamples: 0,
             lastPingAt: invalid,
@@ -504,6 +519,35 @@ namespace watchparty.session
         watchparty.sync.socketClosed(party.sync)
         party.reads.running = false
         retry(s, openedAt, out, env)
+    end sub
+
+    ' Whether a 1009 close may reconnect at once: fewer than
+    ' OVERSIZED_LIMIT of them in the last OVERSIZED_WINDOW_MS. Counts it.
+    function oversizedAgain(party as Object, now as Integer) as Boolean
+        kept = []
+        for each at in party.conn.oversized
+            if now - at < OVERSIZED_WINDOW_MS then kept.Push(at)
+        end for
+        party.conn.oversized = kept
+        if kept.Count() >= OVERSIZED_LIMIT then return false
+        kept.Push(now)
+        return true
+    end function
+
+    ' The socket closed on a message too large for roWebSocket (owner's
+    ' decision, W0-1): the client reconnects at once, with no back-off and
+    ' no "Reconnecting", and reads the suggestions over HTTP, since the
+    ' message it lost was most likely their broadcast.
+    sub oversized(s as Object, out as Object, env as Object)
+        party = s.party
+        trace(out, "warn", "room socket closed on a message over the client's limit; reconnecting at once", { roomId: party.roomId, code: OVERSIZED_CLOSE })
+        party.conn.writable = false
+        party.conn.openedAt = invalid
+        party.conn.step = "idle"
+        watchparty.sync.socketClosed(party.sync)
+        party.reads.running = false
+        scheduleSuggestions(party, env.now, 0)
+        connect(s, out)
     end sub
 
     sub retry(s as Object, openedAt as Dynamic, out as Object, env as Object)
@@ -1170,6 +1214,7 @@ namespace watchparty.session
         if party <> invalid
             view = watchparty.sync.view(party.sync, syncContext(s, env))
             view.selectionPending = party.selectionPending
+            view.atEnd = party.sample <> invalid and party.sample.atEnd
             view.title = party.title
             changed(s, merged, "sync", view)
         else

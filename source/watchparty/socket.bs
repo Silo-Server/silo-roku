@@ -1,31 +1,55 @@
 import "pkg:/source/util/values.bs"
 
 ' The room socket over Roku OS 16's roWebSocket (docs/watch-party.md
-' section 2), kept thin so spike W0-1's findings change only this file.
+' section 2), kept thin so the hardware's findings change only this file.
 ' The room Task alone uses it; nothing here logs a ticket or a frame.
 '
-' What this assumes until W0-1 confirms it on a Roku Ultra (the names are
-' those of Roku's roWebSocket page as brs-node 2.6 implements it):
+' What spike W0-1 found on a Roku Ultra 4850X, Roku OS 16.0.4 (section
+' 2.1):
 '   - SetProtocols("silo.room.v2, silo.ticket.<t>") sends
-'     Sec-WebSocket-Protocol exactly so, and the opened event's Protocol
-'     (or GetSelectedProtocol) is the server's answer. PROTOCOLS_AS_HEADER
-'     sends the same value with ifHttpAgent's AddHeader instead.
-'   - SetAutoPingReply(true) answers the server's ping frames with pongs,
-'     which the server requires every 30 s (section 2.2).
-'   - wss:// verifies the server against the system CA bundle, as
-'     roUrlTransfer does.
-'   - Events are roWebSocketEvent with GetType() 1 opened, 2 closed,
-'     3 error, 5 text received; GetInfo() carries Protocol, Code, Reason,
-'     and Text.
+'     Sec-WebSocket-Protocol exactly so. An AddHeader of the same header
+'     never reaches the server, so there is no header path.
+'   - Open(0) opens asynchronously and always returns false: the socket is
+'     open only once event type 1 (opened) arrives, and only when
+'     GetSelectedProtocol() is then silo.room.v2.
+'   - Events: 1 opened { Protocol, TargetIPAddr, EffectiveUrl }, 2 closed
+'     { Code, Reason, Error, ErrorMsg }, 3 error, 4 message sent (also for
+'     the automatic pongs), 5 text, 7 ping received (when the ping carries
+'     a payload), 8 pong received, 9 timer.
+'   - Socket IDs are reused, and releasing a socket posts its closed event
+'     onto the shared port. Events after a socket's closed are ignored, by
+'     the handle's own state, and the closed events of sockets this Task
+'     released are consumed by ID (retire, released).
+'   - After Close() the TCP connection stays open until the object is
+'     released, so a closed socket is released at once. This adapter
+'     assumes Roku posts one closed per socket: on the server's close, or
+'     on the release of a socket the Task closed (to confirm on the rig).
+'   - Automatic pongs work with SetAutoPingReply left at its default.
+'   - A text message over 524,288 bytes closes the socket with 1009
+'     (OVERSIZED_CLOSE); watchparty.session reconnects at once and reads the
+'     suggestions over HTTP.
+'
+' Liveness. The server pings every 20 s. A socket that has shown ping
+' activity (LIVENESS_EVENTS) and then shows none for QUIET_MS is dead: the
+' Task closes it, and the session reconnects. A socket that never shows
+' any is never judged by it, so a Roku OS that reports no such events
+' keeps its sockets (the rig is confirming whether a ping without a
+' payload raises one).
 namespace watchparty.socket
     const CA_BUNDLE = "common:/certs/ca-bundle.crt"
-    ' Whether the subprotocol goes as a header rather than through
-    ' SetProtocols; W0-1 decides.
-    const PROTOCOLS_AS_HEADER = false
     const EVENT_OPENED = 1
     const EVENT_CLOSED = 2
     const EVENT_ERROR = 3
+    const EVENT_SENT = 4
     const EVENT_TEXT = 5
+    const EVENT_PING = 7
+    ' The event types that count as ping activity.
+    const LIVENESS_EVENTS = "|4|7|"
+    ' A connected socket silent this long after ping activity is dead: two
+    ' of the server's 20 s pings and a margin.
+    const QUIET_MS = 50000
+    ' The close code Roku gives a text message over its 524,288-byte limit.
+    const OVERSIZED_CLOSE = 1009
 
     ' Whether this Roku has roWebSocket (Roku OS 16.0 and later). The app
     ' tests the object, never the version (section 3). brighterscript 0.73
@@ -35,42 +59,59 @@ namespace watchparty.socket
         return type(CreateObject("roWebSocket")) = "roWebSocket"
     end function
 
-    ' Opens url with the room's subprotocols, its events going to port.
-    ' Gives { ws, epoch, id }, or invalid when the object or the open
-    ' failed; epoch marks the events (watchparty.session.onSocket).
-    function open(url as String, protocols as String, port as Object, epoch as Integer) as Dynamic
+    ' Opens url with the room's subprotocols, its events going to port, at
+    ' now (the Task's monotonic milliseconds). Gives the handle { ws, epoch,
+    ' id, closed, live }, or invalid when the object could not be set up;
+    ' epoch marks the events (watchparty.session.onSocket). The open itself
+    ' answers later, as an opened or closed event.
+    function open(url as String, protocols as String, port as Object, epoch as Integer, now as Integer) as Dynamic
         ' bs:disable-next-line: 1129
         ws = CreateObject("roWebSocket")
         if type(ws) <> "roWebSocket" then return invalid
         ws.SetMessagePort(port)
-        if LCase(Left(url, 6)) = "wss://" then ws.SetCertificatesFile(CA_BUNDLE)
-        if PROTOCOLS_AS_HEADER
-            ws.AddHeader("Sec-WebSocket-Protocol", protocols)
-        else
-            ws.SetProtocols(protocols)
+        if LCase(Left(url, 6)) = "wss://"
+            ws.SetCertificatesFile(CA_BUNDLE)
+            ws.InitClientCertificates()
         end if
-        ws.SetAutoPingReply(true)
+        ws.SetProtocols(protocols)
         if not ws.SetUrl(url) then return invalid
-        if not ws.Open() then return invalid
-        return { ws: ws, epoch: epoch, id: ws.GetSocketId() }
+        ' Asynchronous: returns false and answers with an event.
+        ws.Open(0)
+        return { ws: ws, epoch: epoch, id: ws.GetSocketId(), closed: false, live: liveness(now) }
     end function
 
     ' Sends one text frame. Gives whether the socket took it.
     function send(handle as Object, text as String) as Boolean
+        if handle.closed then return false
         return handle.ws.Send(text) <> invalid
     end function
 
+    ' Closes the socket. The caller releases the handle right after, which
+    ' ends the TCP connection and posts one more closed event (retire).
     sub close(handle as Object)
-        handle.ws.Close(1000, "")
+        if not handle.closed then handle.ws.Close(1000, "")
+        handle.closed = true
     end sub
 
     ' A port message as the session's socket event, or invalid when it is
-    ' another socket's or an event the session does not use.
-    function event(handle as Dynamic, msg as Dynamic) as Dynamic
-        if handle = invalid or type(msg) <> "roWebSocketEvent" or msg.GetSocketId() <> handle.id then return invalid
-        info = msg.GetInfo()
-        mapped = mapEvent(msg.GetType(), info, handle.epoch)
-        if mapped <> invalid and mapped.kind = "open" and mapped.protocol = "" then mapped.protocol = util.text(handle.ws.GetSelectedProtocol())
+    ' another socket's, comes after this socket's closed, or is an event
+    ' the session does not use. now is the Task's monotonic milliseconds,
+    ' for liveness. A closed event marks the handle closed; the Task then
+    ' releases it.
+    function event(handle as Dynamic, msg as Dynamic, now as Integer) as Dynamic
+        if handle = invalid or handle.closed or type(msg) <> "roWebSocketEvent" or msg.GetSocketId() <> handle.id then return invalid
+        eventType = msg.GetType()
+        noteActivity(handle.live, eventType, now)
+        mapped = mapEvent(eventType, msg.GetInfo(), handle.epoch)
+        if mapped = invalid then return invalid
+        if mapped.kind = "open"
+            ' The server's answer, which must be silo.room.v2 (section 2.2).
+            selected = util.text(handle.ws.GetSelectedProtocol())
+            if selected <> "" then mapped.protocol = selected
+            handle.live.openedAt = now
+        else if mapped.kind = "close"
+            handle.closed = true
+        end if
         return mapped
     end function
 
@@ -96,5 +137,59 @@ namespace watchparty.socket
             return invalid
         end if
         return out
+    end function
+
+    ' ---- Liveness
+
+    ' A socket's liveness at now: { openedAt (once open), armed (ping
+    ' activity seen), lastAt (the latest) }.
+    function liveness(now as Integer) as Object
+        return { openedAt: invalid, armed: false, lastAt: now }
+    end function
+
+    sub noteActivity(live as Object, eventType as Integer, now as Integer)
+        if Instr(1, LIVENESS_EVENTS, "|" + eventType.ToStr() + "|") = 0 then return
+        live.armed = true
+        live.lastAt = now
+    end sub
+
+    ' Whether an open socket that has shown ping activity has gone quiet.
+    function isQuiet(live as Object, now as Integer) as Boolean
+        return live.openedAt <> invalid and live.armed and now - live.lastAt >= QUIET_MS
+    end function
+
+    ' Milliseconds until the socket would count as quiet, or invalid while
+    ' it is not judged.
+    function quietInMs(live as Object, now as Integer) as Dynamic
+        if live.openedAt = invalid or not live.armed then return invalid
+        due = live.lastAt + QUIET_MS - now
+        if due < 0 then return 0
+        return due
+    end function
+
+    ' ---- Released sockets
+
+    ' A socket this Task released: its closed event is still to come, by
+    ' ID. retired is { id: count }.
+    sub retire(retired as Object, id as Integer)
+        key = id.ToStr()
+        count = 0
+        if util.isNumber(retired[key]) then count = retired[key]
+        retired[key] = count + 1
+    end sub
+
+    ' Whether an event of eventType for socket ID id belongs to a socket
+    ' this Task released: its closed is consumed here, so a reused ID's new
+    ' socket never reads it as its own.
+    function released(retired as Object, id as Integer, eventType as Integer) as Boolean
+        key = id.ToStr()
+        if eventType <> EVENT_CLOSED or not util.isNumber(retired[key]) then return false
+        count = retired[key] - 1
+        if count > 0
+            retired[key] = count
+        else
+            retired.Delete(key)
+        end if
+        return true
     end function
 end namespace
