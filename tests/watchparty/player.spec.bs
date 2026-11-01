@@ -1,0 +1,190 @@
+import "pkg:/source/watchparty/player.bs"
+
+namespace tests
+
+    ' The player's part in a party (source/watchparty/player.bs): what it
+    ' reports, how it runs the room's commands, and what the viewer's presses
+    ' become.
+    @suite("watch party player")
+    class WatchPartyPlayerTests extends rooibos.BaseTestSuite
+
+        ' The player's facts for watchparty.player.sample: a committed
+        ' session playing an original, fields overriding.
+        function facts(fields = {} as Object) as Object
+            out = { sessionId: "ps-1", revision: 3, position: 120.5, duration: 7200, videoState: "playing", wantsPlay: true, loadPlayed: true, loading: false, playerSeeking: false, seekAgeMs: invalid, atEnd: false, planInPlace: true, commandSeq: 4 }
+            out.Append(fields)
+            return out
+        end function
+
+        @describe("plans")
+
+        @it("counts originals and transcodes as in place, and a server remux as a reload")
+        sub _()
+            m.assertTrue(watchparty.player.planInPlace({ delivery: "original_http" }))
+            m.assertTrue(watchparty.player.planInPlace({ delivery: "server_transcode_hls" }))
+            m.assertFalse(watchparty.player.planInPlace({ delivery: "server_remux_hls" }))
+            m.assertFalse(watchparty.player.planInPlace({ delivery: "server_remux_progressive" }))
+            m.assertTrue(watchparty.player.planInPlace({}))
+            m.assertTrue(watchparty.player.planInPlace(invalid))
+        end sub
+
+        @it("refuses a plan of another file than the room's")
+        sub _()
+            m.assertTrue(watchparty.player.versionRefused({ effective_media_file_id: "43" }, "42"))
+            m.assertFalse(watchparty.player.versionRefused({ effective_media_file_id: "42" }, "42"))
+            m.assertFalse(watchparty.player.versionRefused({}, "42"))
+            m.assertFalse(watchparty.player.versionRefused(invalid, "42"))
+        end sub
+
+        @it("maps the start refusals the room's source fallback answers")
+        sub _()
+            for each reason in ["no_alternate_version", "hdr_transcode_unsupported", "subtitle_conversion_unsupported", "transcoding_disabled"]
+                m.assertEqual(watchparty.player.fallbackReason(reason), reason)
+            end for
+            m.assertEqual(watchparty.player.fallbackReason("not_found"), "")
+            m.assertEqual(watchparty.player.fallbackReason(""), "")
+            m.assertEqual(watchparty.player.fallbackReason(invalid), "")
+        end sub
+
+        @it("reads a start's refusal from its terminal, else ApiTask's reason")
+        sub _()
+            m.assertEqual(watchparty.player.refusalReason({ kind: "ok", decision: { outcome: "terminal", terminal: { reason: "no_alternate_version" } } }), "no_alternate_version")
+            m.assertEqual(watchparty.player.refusalReason({ kind: "refused", reason: "playback_unavailable" }), "playback_unavailable")
+            m.assertEqual(watchparty.player.refusalReason(invalid), "")
+        end sub
+
+        @describe("samples")
+
+        @it("reports a playing member's position and the room's play state")
+        sub _()
+            sample = watchparty.player.sample(m.facts())
+            m.assertEqual(sample, { sessionId: "ps-1", revision: 3, position: 120.5, duration: 7200, playing: true, wantsPlay: true, playable: true, stalled: false, seeking: false, atEnd: false, planInPlace: true, commandSeq: 4 })
+        end sub
+
+        @it("counts a load in flight as seeking and not playable")
+        sub _()
+            sample = watchparty.player.sample(m.facts({ loading: true }))
+            m.assertTrue(sample.seeking)
+            m.assertFalse(sample.playable)
+            m.assertFalse(sample.playing)
+        end sub
+
+        @it("counts buffering as a stall only while the room wants it playing")
+        sub _()
+            m.assertTrue(watchparty.player.sample(m.facts({ videoState: "buffering" })).stalled)
+            m.assertFalse(watchparty.player.sample(m.facts({ videoState: "buffering", wantsPlay: false })).stalled)
+        end sub
+
+        @it("parks a member at the end paused and still playable")
+        sub _()
+            sample = watchparty.player.sample(m.facts({ videoState: "finished", atEnd: true }))
+            m.assertTrue(sample.atEnd)
+            m.assertFalse(sample.wantsPlay)
+            m.assertFalse(sample.playing)
+            m.assertTrue(sample.playable)
+        end sub
+
+        @it("gives a paused member's seek up as landed after its settle time")
+        sub _()
+            m.assertTrue(watchparty.player.sample(m.facts({ videoState: "paused", wantsPlay: false, playerSeeking: true, seekAgeMs: 2999 })).seeking)
+            m.assertFalse(watchparty.player.sample(m.facts({ videoState: "paused", wantsPlay: false, playerSeeking: true, seekAgeMs: 3000 })).seeking)
+            m.assertTrue(watchparty.player.sample(m.facts({ videoState: "buffering", playerSeeking: true, seekAgeMs: 9000 })).seeking)
+        end sub
+
+        @it("sends at once only what the Task decides from")
+        sub _()
+            before = watchparty.player.sample(m.facts())
+            m.assertTrue(watchparty.player.changed(invalid, before))
+            m.assertFalse(watchparty.player.changed(before, watchparty.player.sample(m.facts({ position: 121 }))))
+            m.assertTrue(watchparty.player.changed(before, watchparty.player.sample(m.facts({ commandSeq: 5 }))))
+            m.assertTrue(watchparty.player.changed(before, watchparty.player.sample(m.facts({ videoState: "buffering" }))))
+            m.assertTrue(watchparty.player.changed(before, watchparty.player.sample(m.facts({ sessionId: "ps-2" }))))
+        end sub
+
+        @describe("commands")
+
+        @it("plays before it seeks, so the load the seek opens follows the room")
+        sub _()
+            m.assertEqual(watchparty.player.steps({ seq: 1, seek: 30, reload: false, playing: true }, { atEnd: false }), [{ op: "play", position: invalid }, { op: "seek", position: 30 }])
+            m.assertEqual(watchparty.player.steps({ seq: 1, seek: 30, reload: false, playing: false }, { atEnd: false }), [{ op: "pause", position: invalid }, { op: "seek", position: 30 }])
+        end sub
+
+        @it("reloads for a correction reload, and keeps the play state when the command leaves it")
+        sub _()
+            m.assertEqual(watchparty.player.steps({ seq: 1, seek: 40, reload: true, playing: invalid }, { atEnd: false }), [{ op: "reload", position: 40 }])
+            m.assertEqual(watchparty.player.steps({ seq: 1, seek: invalid, reload: false, playing: true }, { atEnd: false }), [{ op: "play", position: invalid }])
+        end sub
+
+        @it("moves a member off the end only with a seek, as a reload")
+        sub _()
+            m.assertEqual(watchparty.player.steps({ seq: 1, seek: invalid, reload: false, playing: true }, { atEnd: true }), [])
+            m.assertEqual(watchparty.player.steps({ seq: 1, seek: 10, reload: false, playing: true }, { atEnd: true }), [{ op: "play", position: invalid }, { op: "reload", position: 10 }])
+        end sub
+
+        @it("does nothing for no command")
+        sub _()
+            m.assertEqual(watchparty.player.steps(invalid, { atEnd: false }), [])
+        end sub
+
+        @describe("presses")
+
+        @it("lets a guest of a play-and-pause room play and pause, not seek")
+        sub _()
+            sync = { canPlayPause: true, canSeek: false }
+            m.assertEqual(watchparty.player.transport("pause", sync), { send: true, noticeKey: "" })
+            m.assertEqual(watchparty.player.transport("seek", sync), { send: false, noticeKey: "watchParty.player.hostOnlySeek" })
+        end sub
+
+        @it("tells a guest of a host-only room who may play or pause")
+        sub _()
+            m.assertEqual(watchparty.player.transport("play", { canPlayPause: false, canSeek: false }), { send: false, noticeKey: "watchParty.player.hostOnlyPlayPause" })
+        end sub
+
+        @it("lets the host do both, and sends nothing outside a party")
+        sub _()
+            host = { canPlayPause: true, canSeek: true }
+            m.assertTrue(watchparty.player.transport("seek", host).send)
+            m.assertTrue(watchparty.player.transport("play", host).send)
+            m.assertFalse(watchparty.player.transport("play", {}).send)
+            m.assertEqual(watchparty.player.transport("play", {}).noticeKey, "")
+        end sub
+
+        @it("toggles against the room's play state")
+        sub _()
+            m.assertEqual(watchparty.player.toggleAction(true), "pause")
+            m.assertEqual(watchparty.player.toggleAction(false), "play")
+        end sub
+
+        @describe("status pill")
+
+        @it("shows after 500 ms, Reconnecting first")
+        sub _()
+            state = watchparty.player.pillState()
+            input = { connection: "reconnecting", waitingForClock: true, syncing: true }
+            m.assertEqual(watchparty.player.pill(state, input, 1000), "")
+            m.assertEqual(watchparty.player.pillDueMs(state, 1000), 500)
+            m.assertEqual(watchparty.player.pill(state, input, 1499), "")
+            m.assertEqual(watchparty.player.pill(state, input, 1500), "watchParty.player.reconnecting")
+        end sub
+
+        @it("says waiting for timing, then syncing, and restarts its delay when the state changes")
+        sub _()
+            state = watchparty.player.pillState()
+            m.assertEqual(watchparty.player.pill(state, { connection: "connected", waitingForClock: true, syncing: false }, 0), "")
+            m.assertEqual(watchparty.player.pill(state, { connection: "connected", waitingForClock: true, syncing: false }, 600), "watchParty.player.waitingForClock")
+            m.assertEqual(watchparty.player.pill(state, { connection: "connected", waitingForClock: false, syncing: true }, 700), "")
+            m.assertEqual(watchparty.player.pill(state, { connection: "connected", waitingForClock: false, syncing: true }, 1200), "watchParty.player.syncing")
+        end sub
+
+        @it("hides a state shorter than its delay")
+        sub _()
+            state = watchparty.player.pillState()
+            m.assertEqual(watchparty.player.pill(state, { connection: "connected", syncing: true }, 0), "")
+            m.assertEqual(watchparty.player.pill(state, { connection: "connected", syncing: false }, 300), "")
+            m.assertEqual(watchparty.player.pill(state, { connection: "connected", syncing: false }, 900), "")
+            m.assertInvalid(watchparty.player.pillDueMs(state, 900))
+        end sub
+
+    end class
+
+end namespace
