@@ -1,11 +1,24 @@
 # Watch Party for Roku
 
-**Status:** Specified. The room core (section 11: the room task, its
-rules, and the routes), AppScene's wiring, the player's part, and the
-screens (section 4: the page, lobby, ballot, invitation, options, picker,
-the room panel, and the entry points) are built and tested headless.
-Spike W0-1 (section 12.1) ran on the Roku Ultra and settled the transport
-(section 2.1); nothing else has run on a device yet.
+**Status:** Built. The room core (section 11: the room task, its rules,
+and the routes), AppScene's wiring, the player's part, and the screens
+(section 4: the page, lobby, ballot, invitation, options, picker, the
+room panel, and the entry points) are tested headless (section 12.2) and
+on a Roku Ultra 4850X and a Streaming Stick 3840R (Roku OS 16.0.4),
+against a sandbox server with a web client as the other member. Spikes
+W0-1, W0-2, and W0-4 ran (section 12.1; W0-4's peak on the Stick was
+98 MB, about 34% of the app's limit). Every guest and host flow passed
+on both devices: joining by code, starts on direct, copy-remux, and
+transcode plans, pause, resume, and seek barriers, refusals, the room
+panel, a late join and Continue here on a long-GOP direct file, socket
+rotations and a 10 s outage, the invitation, options, vote rooms, the
+picker, and End. Not run on a device: a late join into a copy-remux or
+transcode plan; a Roku holding (section 7.5) as the host; a copy-remux
+seek with the Roku as the host; scanning the invitation's QR code with a
+phone (it was decoded from a screenshot); parking at the end of the
+file as a guest; and the host's "Return everyone to lobby" at the end
+of the file, never shown because the server returned the room to the
+lobby within 2 s of the end. Section 13 lists what is open.
 
 **Last updated:** 2026-11-01
 
@@ -1139,3 +1152,4 @@ OS 16.
 | A member at rest or playing ahead of the room could hold where it is instead of seeking | Not built: it seeks as before | Device runs that show members ahead often |
 | A Roku without `roWebSocket` | No Watch Party | Roku OS 16's release and device list |
 | Children's profiles see suggestions' raw titles and posters, which the server does not filter | Show them, as tvOS does | Server owner's view |
+| A copy remux of a file with long keyframe gaps converges slowly: FX-021 (10.4 s gaps) took 7 corrections and about 2 minutes to settle, then held a p95 drift of 1.17 s. The 10 s remux lead-in (spec section 5.7) is shorter than the gap | Not changed: its corrections reload as on any copy remux (section 7.5) | Device runs on FX-021 with a change to the lead-in or to how a copy remux corrects |
