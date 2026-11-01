@@ -505,6 +505,8 @@ the banner. A message the client does not know is ignored.
   wrong protocol, or `connection_replaced` stop reconnecting
   (section 4.11). A `401` first refreshes the access token through the
   single-flight coordinator (spec section 6.4), once.
+- A socket whose open has not answered, opened or closed, within 15 s
+  is closed and counts as one that failed.
 - A pending command is dropped when its socket closes. After a reconnect
   the client attaches again; the server answers with a sync command.
 
@@ -781,9 +783,13 @@ another, ends the attempt. Each socket's handle keeps its own state:
 events after its closed are ignored, and the room task releases a socket
 as soon as it closes. A socket the task closed itself still owes the
 closed event its release posts, which the task consumes by socket ID, so
-a new socket that reuses the ID never reads it as its own. This assumes
-Roku posts one closed per socket, on the server's close or on the
-release of a socket the task closed; the rig has not confirmed it.
+a new socket that reuses the ID never reads it as its own. This expects
+Roku to post one closed per socket, on the server's close or on the
+release of a socket the task closed; the rig has not confirmed it. An
+owed closed not seen within 10 s of the release is no longer awaited, and
+a socket that neither opens nor closes within 15 s of its open counts as
+closed (section 6.4), so a closed Roku never posts, or one consumed for
+the wrong socket, cannot leave the party stuck.
 
 **Liveness.** The server pings every 20 s and answers the client's JSON
 pings (at least every 15 s) with a text pong. A connected socket that has

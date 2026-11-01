@@ -41,6 +41,10 @@ namespace watchparty.session
     ' OVERSIZED_WINDOW_MS; more follow the ordinary back-off.
     const OVERSIZED_LIMIT = 3
     const OVERSIZED_WINDOW_MS = 60000
+    ' A socket that neither opens nor closes this long after it was asked
+    ' to open counts as closed: a handshake that never answers, or a closed
+    ' event Roku never posted.
+    const OPEN_TIMEOUT_MS = 15000
     ' A suggestions_update is followed by a read this much later, so a burst
     ' of frames costs one read (tvOS).
     const SUGGESTION_READ_DELAY_MS = 200
@@ -222,6 +226,9 @@ namespace watchparty.session
         if party = invalid or event.epoch <> party.conn.epoch then return out
         kind = event.kind
         if kind = "open"
+            ' Only the socket being opened opens; one given up on stays shut.
+            if party.conn.step <> "socket" then return finish(s, out, env)
+            party.conn.openDueAt = invalid
             protocol = util.text(event.protocol)
             ' The server answers with silo.room.v2; any other answer, or
             ' none, ends the attempt (section 2.2; W0-1: roWebSocket's
@@ -268,6 +275,11 @@ namespace watchparty.session
                 party.conn.retryAt = invalid
                 connect(s, out)
             end if
+            if party.conn.step = "socket" and party.conn.openDueAt <> invalid and env.now >= party.conn.openDueAt
+                trace(out, "warn", "room socket never answered its open; reconnecting", { roomId: party.roomId, epoch: party.conn.epoch })
+                out.Push({ kind: "close" })
+                socketEnded(s, out, env)
+            end if
             pingIfDue(s, out, env)
             if party.reads.dueAt <> invalid and env.now >= party.reads.dueAt and not party.reads.running then startSuggestionsRead(s, out)
             runSync(s, out, env)
@@ -281,6 +293,7 @@ namespace watchparty.session
         if party = invalid then return invalid
         wake = invalid
         if party.conn.retryAt <> invalid then wake = earliest(wake, party.conn.retryAt - env.now)
+        if party.conn.step = "socket" and party.conn.openDueAt <> invalid then wake = earliest(wake, party.conn.openDueAt - env.now)
         if party.reads.dueAt <> invalid and not party.reads.running then wake = earliest(wake, party.reads.dueAt - env.now)
         if party.conn.writable
             interval = watchparty.clock.pingIntervalMs(party.clock, party.connectionSamples)
@@ -431,7 +444,7 @@ namespace watchparty.session
             proof: body.proof,
             held: watchparty.room.holder(),
             snapshotSeq: 0,
-            conn: { state: "connecting", step: "idle", epoch: 0, attempt: 0, openedAt: invalid, retryAt: invalid, writable: false, greeted: false, oversized: [], policy: watchparty.connection.create(env.now) },
+            conn: { state: "connecting", step: "idle", epoch: 0, attempt: 0, openedAt: invalid, retryAt: invalid, writable: false, greeted: false, openDueAt: invalid, oversized: [], policy: watchparty.connection.create(env.now) },
             clock: watchparty.clock.create(),
             connectionSamples: 0,
             lastPingAt: invalid,
@@ -494,6 +507,7 @@ namespace watchparty.session
         end if
         conn.step = "socket"
         conn.epoch = conn.epoch + 1
+        conn.openDueAt = env.now + OPEN_TIMEOUT_MS
         out.Push({ kind: "open", epoch: conn.epoch, url: url, protocols: watchparty.wire.protocols(value) })
     end sub
 
@@ -517,6 +531,7 @@ namespace watchparty.session
         openedAt = conn.openedAt
         conn.writable = false
         conn.openedAt = invalid
+        conn.openDueAt = invalid
         conn.step = "idle"
         watchparty.sync.socketClosed(party.sync)
         party.reads.running = false
@@ -545,6 +560,7 @@ namespace watchparty.session
         trace(out, "warn", "room socket closed on a message over the client's limit; reconnecting at once", { roomId: party.roomId, code: OVERSIZED_CLOSE })
         party.conn.writable = false
         party.conn.openedAt = invalid
+        party.conn.openDueAt = invalid
         party.conn.step = "idle"
         watchparty.sync.socketClosed(party.sync)
         party.reads.running = false
