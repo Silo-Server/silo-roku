@@ -674,6 +674,12 @@ seeks past the room and waits, paused, for the room to reach it:
   paused position, less 100 ms for the resume (`HOLD_PLAY_LEAD_MS`),
   timed on the task like a command. Holds are at most 15 s, since the
   aim is.
+- **Past the aim.** A seek that lands more than 0.25 s past its aim
+  landed on the keyframe after it (on the Streaming Stick, FX-007 now
+  and then): the hold seeks once more, to 0.1 s past that keyframe, so
+  the node lands on it the usual way, and holds there. A node paused on
+  a forward landing reported no position for over 1.5 s once played,
+  three times of three, and the member fell behind; no other hold did.
 - **Behind anyway.** A landing more than 0.4 s behind the room (the
   deadband) teaches the estimate and seeks again, at most 3 seeks a hold;
   after that, or for a landing within 0.4 s behind, it plays at once and
