@@ -644,9 +644,12 @@ server corrected it every 10 s (bug 5 of the Streaming Stick's
 end-to-end run). A Roku member cannot play faster to close that, so it
 seeks past the room and waits, paused, for the room to reach it:
 
-- **When.** A member at rest joining a playing room from behind
-  (Continue here, a rejoin) on an in-place
-  plan; and any correction on an in-place plan once the plan's recent
+- **When.** On an in-place plan: a member at rest behind a playing
+  room; a member joining one (Continue here, a rejoin), whose first
+  command finds it at rest no more than 1 s ahead, even when it seems on
+  the room, since its load's own start lands on a keyframe short of the
+  anchor it asked for (the Stick played 1.5 to 5 s behind before its
+  first correction); and any correction on an in-place plan once the plan's recent
   landings fall short by more than 1 s (`PAUSED_SEEK_SECONDS`, the drift
   at which an in-place seek starts), including a correction that would
   otherwise be a reload, since a reload of an in-place plan lands on the
@@ -710,11 +713,10 @@ over 1 s off; executing one is idempotent.
 ### 7.6 Late join and background
 
 A member joining a playing room loads paused at the snapshot's anchor and
-attaches; the server's sync command does the rest. That command finds
-the member at rest behind a playing room: on an in-place plan it
-overshoots and holds (section 7.5), so it starts playing on the room
-position instead of a seek's time plus a keyframe gap behind it; on a
-copy remux it seeks to the room (a `seek_reanchor`, which lands on the
+attaches; the server's sync command does the rest. On an in-place plan
+that first command overshoots and holds (section 7.5), so the member
+starts playing on the room position instead of a load's or a seek's time
+plus a keyframe gap behind it; on a copy remux it seeks to the room (a `seek_reanchor`, which lands on the
 target) and realigns once. The Roku has no
 background: Home closes the app and the socket with it. Roku's own
 overlays over the player do not pause the room.
