@@ -1,5 +1,6 @@
 import "pkg:/components/screens/watchParty/room.bs"
 import "pkg:/source/playback/skipIntro.bs"
+import "pkg:/source/watchparty/landing.bs"
 import "pkg:/source/watchparty/player.bs"
 
 ' The player in a Watch Party (docs/watch-party.md sections 4.10, 7, and
@@ -59,7 +60,12 @@ sub partyBegin(party as Object)
         pill: watchparty.player.pillState(),
         panelOpen: false,
         closing: false,
-        refusedStart: false
+        refusedStart: false,
+        ' The room's last seek until the Video node shows where it landed,
+        ' and a barrier's roll to its target (watchparty.landing), with the
+        ' viewer's own mute to restore after a barrier's.
+        settle: invalid,
+        restoreMute: false
     }
     if task <> invalid
         partyObserve("onPartyFeed", ["playerCommand", "sync", "connection", "notice"])
@@ -74,6 +80,7 @@ sub partyRelease()
     party = m.party
     if party = invalid then return
     m.partyTimer.control = "stop"
+    partySettleEnd(false)
     partyUnobserve()
     ' The session closed with the player (section 7.3).
     if party.task <> invalid and party.sessionSent <> "" then party.task.session = {}
@@ -177,12 +184,15 @@ sub onPartyCommand(command as Dynamic)
     if m.party = invalid or m.closed or m.leaving then return
     if not util.isObject(command) then return
     now = m.env.now()
+    ' A new command ends the last seek's settle, and its muted roll.
+    partySettleEnd(false)
     for each stepOf in watchparty.player.steps(command, { atEnd: partyAtEnd() })
         op = stepOf.op
         if op = "play" or op = "pause"
             partyPlayState(op = "play")
         else if op = "seek"
             m.party.seekAt = now
+            partySettleBegin(stepOf.position, stepOf.settle)
             dispatch({ type: "seekTo", position: stepOf.position, resume: false })
         else if op = "reload"
             m.party.seekAt = now
@@ -190,7 +200,7 @@ sub onPartyCommand(command as Dynamic)
         end if
     end for
     if util.isNumber(command.seq) then m.party.commandSeq = command.seq
-    log.info(LOG_TAG, "[WP] executed", { commandId: util.text(command.commandId), seq: command.seq, seek: command.seek, reload: util.isTrue(command.reload), playing: command.playing })
+    log.info(LOG_TAG, "[WP] executed", { commandId: util.text(command.commandId), seq: command.seq, seek: command.seek, reload: util.isTrue(command.reload), playing: command.playing, settle: command.settle })
     partyReport(true)
 end sub
 
@@ -212,15 +222,108 @@ sub partyPlayState(playing as Boolean)
 end sub
 
 ' The Video node played while the room wants this member paused (a seek
-' Roku resumed, or content that opened playing): it pauses again.
+' Roku resumed, or content that opened playing): it pauses again, unless a
+' barrier's settle plays it muted to measure or roll (it pauses as the
+' settle ends).
 sub partyHoldPause(videoState as String)
     if m.party = invalid or m.party.wantsPlay or videoState <> "playing" then return
+    if watchparty.landing.holdsNode(m.party.settle) then return
     m.video.control = "pause"
 end sub
+
+' ---- A seek's landing (sections 7.4 and 7.5, watchparty.landing)
+
+' A seek the room's command runs: until the Video node shows where it
+' really landed the sample says seeking. A barrier's (tolerance set) is
+' muted, and plays from a short landing to its target before it ends.
+sub partySettleBegin(target as Dynamic, tolerance as Dynamic)
+    settle = watchparty.landing.begin(target, m.env.now(), tolerance)
+    m.party.settle = settle
+    if not settle.barrier then return
+    m.party.restoreMute = m.video.mute
+    m.video.mute = true
+end sub
+
+' The settle is over or given up (a new command, an error, the end, the
+' player going): a barrier's member pauses if the room wants it paused and
+' its sound comes back, and with report the Task hears where it is at
+' once.
+sub partySettleEnd(report as Boolean)
+    party = m.party
+    if party = invalid or party.settle = invalid then return
+    settle = party.settle
+    party.settle = invalid
+    if settle.barrier
+        m.video.mute = party.restoreMute
+        log.info(LOG_TAG, "[WP] barrier settled", { target: settle.target, landed: settle.landed, rolled: settle.rolled, complete: settle.phase = "done" })
+        if not party.wantsPlay and (m.video.state = "playing" or m.video.state = "buffering") then m.video.control = "pause"
+    end if
+    if report then partyReport(true)
+end sub
+
+' What watchparty.landing decided.
+sub partySettleApply(action as String)
+    if action = "play"
+        if m.video.state = "paused" then m.video.control = "resume"
+    else if action = "stop"
+        partySettleEnd(true)
+    end if
+end sub
+
+' A Video position report (Player.bs's onVideoPosition), once the node has
+' settled from the seek.
+sub partySettlePosition()
+    if m.party = invalid or not watchparty.landing.active(m.party.settle) or not partySettled() then return
+    partySettleApply(watchparty.landing.note(m.party.settle, m.state.player.position, m.env.now(), partyCanRoll()))
+end sub
+
+' The party timer's check (every 250 ms): timeouts, the roll's stop
+' between reports, and a failure or the end, which give the settle up.
+sub partySettleTick()
+    if m.party = invalid or m.party.settle = invalid then return
+    videoState = m.video.state
+    if m.errorVisible or m.leaving or m.closed or videoState = "error" or videoState = "finished" or partyAtEnd()
+        partySettleEnd(false)
+        return
+    end if
+    partySettleApply(watchparty.landing.tick(m.party.settle, m.env.now(), partySettled(), videoState = "playing", partyCanRoll()))
+end sub
+
+' The node has settled from the seek: the session's seek is done and the
+' node plays or is paused again.
+function partySettled() as Boolean
+    if m.state = invalid or m.state.player.seeking then return false
+    return m.video.state = "playing" or m.video.state = "paused"
+end function
+
+' Whether a barrier can roll to its target: the current load plays a plan
+' that seeks in place (not a copy remux's seek_reanchor), short of the end.
+function partyCanRoll() as Boolean
+    state = m.state
+    if state = invalid or state.plan = invalid or m.errorVisible or util.isTrue(state.player.ended) then return false
+    item = m.current
+    if item = invalid or m.activeLoad = invalid or m.activeLoad <> item.load then return false
+    return watchparty.player.planInPlace(state.plan.data)
+end function
+
+' A phone's mute during a barrier's roll is the viewer's, restored after
+' it; gives whether the roll took it.
+function partyHoldsMute(muted as Boolean) as Boolean
+    if m.party = invalid or not watchparty.landing.holdsNode(m.party.settle) then return false
+    m.party.restoreMute = muted
+    return true
+end function
+
+' Whether the viewer has the sound off, whatever a roll does meanwhile.
+function partyViewerMuted() as Boolean
+    if m.party <> invalid and watchparty.landing.holdsNode(m.party.settle) then return m.party.restoreMute
+    return m.video.mute
+end function
 
 ' The end of the file (playback.session's partyEnded): the member stays
 ' there paused with its session open, and the room decides what follows.
 sub partyEnded()
+    partySettleEnd(false)
     log.info(LOG_TAG, "[WP] parked at the end of the file", {})
     m.party.wantsPlay = false
     partyReport(true)
@@ -260,7 +363,7 @@ end sub
 ' node.
 function partyFacts(now as Integer) as Object
     party = m.party
-    facts = { sessionId: "", revision: party.revision, position: 0, duration: 0, videoState: m.video.state, wantsPlay: party.wantsPlay, loadPlayed: false, loading: true, playerSeeking: false, seekAgeMs: invalid, atEnd: false, planInPlace: true, commandSeq: party.commandSeq }
+    facts = { sessionId: "", revision: party.revision, position: 0, duration: 0, videoState: m.video.state, wantsPlay: party.wantsPlay, loadPlayed: false, loading: true, playerSeeking: false, seekAgeMs: invalid, settling: watchparty.landing.active(party.settle), atEnd: false, planInPlace: true, commandSeq: party.commandSeq }
     if party.seekAt <> invalid then facts.seekAgeMs = now - party.seekAt
     state = m.state
     if state = invalid or m.errorVisible then return facts
@@ -310,6 +413,7 @@ end sub
 
 sub onPartyTimer()
     if m.party = invalid or m.closed then return
+    partySettleTick()
     refreshChrome()
 end sub
 

@@ -19,9 +19,14 @@ import "pkg:/source/watchparty/wire.bs"
 ' (components/tasks/RoomTask.bs lists their meaning; receivedAt is the
 ' Task's monotonic time when the sample arrived). Each decision for the
 ' player is { kind: "player", command: { seq, commandId, seek, reload,
-' playing } }: seek a source position or invalid, reload true for a
-' budgeted correction, playing the play state to leave it in, or invalid
-' to leave it. Messages for the socket are { kind: "send", text }.
+' playing, settle } }: seek a source position or invalid, reload true for
+' a budgeted correction, playing the play state to leave it in, or invalid
+' to leave it, and settle, for a room seek that sets the room waiting (a
+' barrier), how short of the target the member may land and still
+' acknowledge where it is (settleTolerance), else invalid: the player
+' then plays muted from a shorter landing to the target before it reports
+' the seek landed (watchparty.landing, section 7.4). Messages for the
+' socket are { kind: "send", text }.
 '
 ' ctx, given to each call, is { now, serverNow, room, sample, writable }:
 ' the Task's monotonic milliseconds, the server's epoch milliseconds (or
@@ -53,6 +58,10 @@ namespace watchparty.sync
     ' decide.
     const GUEST_SEEK_TOLERANCE_SECONDS = 5
     const HOST_SEEK_TOLERANCE_SECONDS = 15
+    ' The server's window for a guest's acknowledgement of a room seek
+    ' (section 7.4). A guest whose seek lands shorter rolls to the target
+    ' first (settleTolerance).
+    const GUEST_ROOM_SEEK_WINDOW_SECONDS = 1
     ' This member's seek request holds the scrubber until the room's seek to
     ' it runs, at most PENDING_SEEK_TIMEOUT_MS; a room seek within
     ' PENDING_SEEK_MATCH_SECONDS answers it.
@@ -320,7 +329,9 @@ namespace watchparty.sync
         else if memberPlaying and Abs(drift) <= watchparty.catchup.DEADBAND_SECONDS
             watchparty.catchup.reloadSettle(state.reloads)
         end if
-        out = [player(state, command.commandId, seek, reload, playing)]
+        settle = invalid
+        if action = "seek" and command.playbackState = "waiting" and seek <> invalid then settle = settleTolerance(room)
+        out = [player(state, command.commandId, seek, reload, playing, settle)]
         state.applied = command
         state.appliedAt = now
         state.lastBusyAt = now
@@ -544,6 +555,15 @@ namespace watchparty.sync
         return sessionId <> "" and state.attachSent = sessionId and ctx.room.attachedSessionId = sessionId
     end function
 
+    ' How short of a barrier's target this member may land and still
+    ' acknowledge where it is: the server's own window for the role, 1 s
+    ' for a guest and 15 s for the host (section 7.4). A landing shorter
+    ' than that plays muted to the target first (watchparty.landing).
+    function settleTolerance(room as Dynamic) as Integer
+        if watchparty.room.isHost(room) then return HOST_SEEK_TOLERANCE_SECONDS
+        return GUEST_ROOM_SEEK_WINDOW_SECONDS
+    end function
+
     ' The waiting seek's target, if any, is close enough to acknowledge.
     function positionOk(waiting as Object, ctx as Object) as Boolean
         if waiting.seekTarget = invalid or ctx.sample.atEnd then return true
@@ -571,9 +591,11 @@ namespace watchparty.sync
         return state.applied.commandId
     end function
 
-    function player(state as Object, commandId as String, seek as Dynamic, reload as Boolean, playing as Dynamic) as Object
+    function player(state as Object, commandId as String, seek as Dynamic, reload as Boolean, playing as Dynamic, settle = invalid as Dynamic) as Object
         state.seq = state.seq + 1
-        return { kind: "player", command: { seq: state.seq, commandId: commandId, seek: seek, reload: reload, playing: playing } }
+        command = { seq: state.seq, commandId: commandId, seek: seek, reload: reload, playing: playing }
+        if settle <> invalid then command.settle = settle
+        return { kind: "player", command: command }
     end function
 
     function send(text as String) as Object
