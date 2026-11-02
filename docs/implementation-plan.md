@@ -348,6 +348,10 @@ functions, and set nodes.
   a fixed box. Artwork URLs are signed and expire (default 4 h): responses older
   than the signature window are re-fetched, and a Poster that reports
   `loadStatus="failed"` triggers one refresh. Artwork never carries credentials.
+  A server that stores its own artwork sends root-relative paths, which resolve
+  against the origin the request went to (`catalog.art.uri`); an image store's
+  absolute URLs are used as they are. Watch Party suggestions send the server's form back
+  (`catalog.art.serverPath`), as the other apps do.
 - **Hero:** the backdrop decodes at its displayed rectangle: 1229×756 on FHD and
   819×504 on HD and on the low tier (a spec section 5.9 deviation for low-tier
   sharpness). The cross-fade starts only after the incoming Poster reports
