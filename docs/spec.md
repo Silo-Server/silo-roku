@@ -148,7 +148,8 @@ Browse:
 Requests, shown only when the server offers them to the profile
 (`GET /api/v2/requests/status`):
 
-- the Requests tab: the account's requests and the server's Discover rows,
+- the Requests page, in the avatar menu: the account's requests and the
+  server's Discover rows,
   in the admin's order, with See all and the studio, network, and genre
   rows;
 - a title's request page: Request, Cancel Request, Notify Me, and the
@@ -418,15 +419,15 @@ their existing HD/FHD assets.
   and no background band. Left to right:
   - the Silo wordmark, 96 px wide;
   - then, centred on the screen, a 58 px Search circle, then Home, Movies,
-    Series, For You, Calendar, and Requests, 8 px apart;
+    Series, For You, and Calendar, 8 px apart;
   - the 58 px profile avatar, at the right inset.
 
   The avatar, here and in its menu's header, is drawn as on the profile
   picker (section 5.4). A library tab appears only when the profile can see a
-  library of that type; For You and Calendar always appear, as on tvOS,
-  whose default menu ends with them (`TVPrimaryMenuProjection`). Requests
-  trails them while the server offers Requests to the profile (section
-  5.11). Opening any of them from the bar starts in its content. The bar appears on root pages only: Search is a pushed
+  library of that type; For You and Calendar always appear. The bar is fixed
+  and matches tvOS and Android TV, which also show Music and Audiobooks
+  tabs that Roku defers. Requests is in the avatar menu (section 5.11).
+  Opening any of them from the bar starts in its content. The bar appears on root pages only: Search is a pushed
   page without it (D3), and detail pages have none.
 - **Tabs** are capsules 56 px tall with 29 px side padding and 26 px labels:
   - focused: a pure white fill with black text;
@@ -445,7 +446,8 @@ their existing HD/FHD assets.
   - Panel: 460 px wide, top at 132, right edge at the right inset, padding 14.
   - Header: a 44 px avatar; the profile's name in 24 px SemiBold; the
     server's display name in uppercase, 14 px, letter-spaced, at 38%.
-  - Rows: Switch Profile, Watchlist, Favorites, History, and Watch Party
+  - Rows: Switch Profile, Watchlist, Favorites, History, Requests (while
+    the server offers Requests, section 5.11), and Watch Party
     ("Return to Watch Party" in a party, while the server offers one:
     [`watch-party.md`](watch-party.md) section 4.1); then Settings;
     then Switch Server and Sign Out. They are 54 px tall (22 px SemiBold,
@@ -2418,14 +2420,15 @@ and `request-discover-rows.md`). The pure decisions are
   Requests shows only when `requests_enabled` is true, `allowed` is true,
   and `state` is `available`; a missing `allowed` or `state` reads as off.
   A failed read keeps what was known. Notify Me needs `follow_supported`
-  too. When an answer turns Requests off, the bar drops the tab and a
-  Requests page under it goes to Home; a request page whose action the
+  too. When an answer turns Requests off, the avatar menu drops its row and
+  the Requests page closes the next time it shows; a request page whose action the
   server refuses with `capability_*` or `permission_denied` reads the
   status again and goes to Home if it is now off. Child profiles and
   quotas are the server's: a profile it does not allow gets `allowed`
   false, and a title over its rating ceiling is left out of every list.
-- **The Requests tab** (`RequestsScreen`, `nav.route.REQUESTS`), last of the
-  tabs, is a stack root drawn as For You is (section 5.10): the hero shows
+- **The Requests page** (`RequestsScreen`, `nav.route.REQUESTS`), pushed
+  from the avatar menu, is drawn as For You is (section 5.10) without the
+  top bar, as tvOS pushes `TVRequestsPage`: the hero shows
   the focused card (its title, year and media type, TMDB rating or when it
   was requested, synopsis, and backdrop, with the request's status as the
   hero's badge), over these rows:
@@ -2474,7 +2477,7 @@ and `request-discover-rows.md`). The pure decisions are
   `next_page` when it moves on and stays within `total_pages` (at most
   500), else the next page, reading past a page its filters emptied (three
   in a row at most); My Requests pages by cursor, 40 at a time, newest
-  first. OK on a card opens it as on the Requests tab.
+  first. OK on a card opens it as on the Requests page.
 - **Request page** (`RequestDetailScreen`, `nav.route.REQUEST_DETAIL`),
   read from `GET /api/v2/requests/detail/{movie|series}/{tmdb_id}`: the
   library detail page's hero (section 5.6) with the title, the content
