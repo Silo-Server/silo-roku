@@ -2845,39 +2845,40 @@ sort and filters are keyed by a digest that cannot be re-keyed, so a
 migrated account keeps the keys it had (no account part); an account
 added later keys them with its ID, and its sign-out deletes them.
 
-**Picker.** "Who's watching?" shows every saved server's tiles, each a
-(server, account, profile). One server looks as before; several show one
-section per server, headed by the server's mark and name, the active
-server first, then by last use; Up and Down move between sections. Tiles
-render from each account's last profile list, so the picker opens offline,
-and the lists are read again behind it (other accounts' only on servers
-whose origin answers `system/info` in this run). Where two tiles from
-different accounts on one server look alike (the same name, or both
-`default`), each adds the account's username. An account that needs to
-sign in again shows "Sign in again" on its tiles; choosing one opens
-sign-in with its username filled in, and Back from that sign-in returns to
-the picker. A server with no account shows a Sign in tile. Choosing another
-account's tile makes that account active, on its server, and opens the
-profile (asking for its PIN as before). Add, at the end of the active
-server's section, offers Add a profile (when the household has a primary
-profile, as before), Sign in to {server}, and Add a server. After a
-sign-in, an account with one profile and no PIN opens; otherwise the
-picker returns focused on the new account's first tile. Profile Selection
-applies to tiles: Automatic restores the last tile, and a single tile
-without a PIN never shows the picker.
+**Picker and Change Account.** "Who's watching?" shows the open
+account's profiles, as before, from the account's last profile list when
+the server cannot be reached. Change Account, in the picker's footer (in
+Change server's place) and in the avatar menu (in Switch Server's), shows
+a rail of the saved servers, each with its mark (its branding's
+`mark_url`, else the Silo project icon) and name, the active server first,
+then by last use, with Add server under them; beside it, the selected
+server's accounts, each with its profile count, the open one badged
+Current and one that needs to sign in again badged "Sign in again", then
+Add an account on that server. Left and Right move between the rail and the
+accounts; an arrow shows when either has more rows to scroll. OK on an
+account makes it active, on its server, and shows its picker; on one that
+needs to sign in again, sign-in with its username filled in, where Back
+returns to Change Account. With no account open (after a sign-out or an
+expiry) while another has a session, Change Account is the root screen
+instead of the picker. Add, after the profiles, opens a sheet of three
+choices: Add a profile (when the household has a primary profile, as
+before), Add an account (Change Account, on the active server's Add an
+account), and Add a server. After a sign-in, an account with one profile
+and no PIN opens; otherwise its picker shows. Profile Selection applies as
+before: Automatic restores the last account and profile, and a single
+profile without a PIN never shows the picker.
 
-**Signing out.** The avatar menu has no Switch Server (Switch Profile's
-picker covers every server). Its header adds the username after the server
-while the active server has more than one saved account. Sign Out asks
-"Sign out of {account} on {server}?" and signs out of the active account
-only: its session ends on the server (best effort), and its tokens, profile
-list, PIN proofs, Browse sort and filters, and recent Watch Party go. The
-server stays saved; with another account's session to go to, the picker
-shows (the server's tiles become a Sign in tile when it has no account
-left), otherwise sign-in. Sign Out & Remove Server is offered while the
-server has no other account. A refused refresh is not a sign-out: the
-account stays, and with another session to go to the picker shows its tiles
-with "Sign in again".
+**Signing out.** The avatar menu's Switch Server is now Change Account. Its
+header adds the username after the server while the active server has more
+than one saved account. Sign Out asks "Sign out of {account} on {server}?"
+and signs out of the active account only: its session ends on the server
+(best effort), and its tokens, profile list, PIN proofs, Browse sort and
+filters, and recent Watch Party go. The server stays saved; with another
+account's session to go to, Change Account shows (with a Sign in row for
+the server when it has no account left), otherwise sign-in. Sign Out &
+Remove Server is offered while the server has no other account. A refused
+refresh is not a sign-out: the account stays, and with another session to
+go to Change Account shows it with "Sign in again".
 
 **Settings › Accounts** replaces the Server category: for each server, its
 accounts with their profile counts (OK signs out, or offers Sign In Again
@@ -2885,14 +2886,19 @@ for an account that needs it), Add an account on {server}, Rename Server
 (the viewer's label, which wins over the server's own name), and Remove
 Server, which signs out of every account on it; then Add a server.
 
-Roku-specific deviations from that design: there are no downloads and no
-push notifications on Roku, so nothing about them applies; the section's
-"logo" is the server's mark (its initial), as Roku has no branding image;
-Add sits at the end of the active server's row for room on a 1080p screen;
-signing in as a different account on an expired tile keeps the expired
-account saved rather than replacing it (no downloads to lose); a migrated
-account's Browse entries are not deleted at its sign-out and age out of
-Browse's budget instead.
+Roku-specific deviations from that design: by the project owner's
+decision of 2026-11-02, the picker shows one account at a time with a
+Change Account screen (servers on a rail, each server's accounts beside
+it), rather than the design's single picker merging every account's
+tiles, and Add an account reaches every saved server, not only the active
+one; a server without a mark of its own shows the Silo project icon where
+the design shows its initial; the Android and Apple apps follow the
+design. There are no
+downloads and no push notifications on Roku, so nothing about them
+applies. Signing in as a different account on an expired one keeps the
+expired account saved rather than replacing it (no downloads to lose). A
+migrated account's Browse entries are not deleted at its sign-out and age
+out of Browse's budget instead.
 
 ## 8. Catalog and browse behavior
 

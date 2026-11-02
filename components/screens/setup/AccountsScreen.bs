@@ -1,0 +1,367 @@
+import "pkg:/components/screens/firstRun.bs"
+import "pkg:/components/theme/browse.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/onboarding/accounts.bs"
+import "pkg:/source/onboarding/profiles.bs"
+
+' The rail: rows 520 wide and 88 tall, 8 apart, a 56 px mark 16 px in and
+' the name 18 px after it; Add server 16 px under the window's last row. The
+' accounts 40 px to its right: cards 760 wide and 128 tall (ServerCard),
+' 16 apart. Each shows VISIBLE_* rows at once and scrolls; an arrow 12 px
+' under it says when more are above or below.
+const RAIL_WIDTH = 520
+const RAIL_ROW = 88
+const RAIL_GAP = 8
+const RAIL_MARK = 56
+const RAIL_INSET = 16
+const RAIL_TEXT_GAP = 18
+const ADD_SERVER_GAP = 16
+const ADD_PLUS = 28
+const VISIBLE_SERVERS = 5
+const PANE_GAP = 40
+const CARD_WIDTH = 760
+const CARD_HEIGHT = 128
+const CARD_GAP = 16
+const VISIBLE_ACCOUNTS = 4
+const HINT_GAP = 12
+' The rail's height (its window and Add server) and the accounts' (their
+' window of cards).
+const RAIL_HEIGHT = 560
+const PANE_HEIGHT = 560
+
+sub init()
+    m.layout = m.top.findNode("layout")
+    m.layout.headline = i18n.text("accounts.headline")
+    m.layout.body = i18n.text("accounts.body")
+    m.form = m.top.findNode("form")
+    m.railLayer = m.top.findNode("rail")
+    m.paneLayer = m.top.findNode("pane")
+    m.paneLayer.translation = [RAIL_WIDTH + PANE_GAP, 0]
+    m.railHint = styleFormLabel(m.top.findNode("railHint"), theme.textStyle.SETTINGS_BODY, theme.color.TEXT_TERTIARY)
+    m.paneHint = styleFormLabel(m.top.findNode("paneHint"), theme.textStyle.SETTINGS_BODY, theme.color.TEXT_TERTIARY)
+    m.errorLabel = styleFormLabel(m.top.findNode("error"), theme.textStyle.FIELD_ERROR, theme.color.ERROR)
+    m.errorLabel.width = RAIL_WIDTH + PANE_GAP + CARD_WIDTH
+    ' onboarding.accounts.servers, and the rail's rows: one per server,
+    ' then Add server.
+    m.servers = []
+    m.railRows = []
+    ' The shown server's cards: its accounts, then Add an account.
+    m.cards = []
+    m.shown = 0
+    ' "rail" or "pane", the row focused in each, and each window's first row.
+    m.zone = "pane"
+    m.railAt = 0
+    m.paneAt = 0
+    m.railFirst = 0
+    m.paneFirst = 0
+    m.errorText = ""
+    m.request = invalid
+    ' Each server's mark image by origin, "" for none (askMark).
+    m.marks = {}
+end sub
+
+sub onShow(event as Object)
+    if event.first then start()
+    m.layout.callFunc("showMesh", true)
+    m.top.prompting = true
+    focusScreen()
+    paint()
+    if event.first then sayFocus()
+end sub
+
+sub onHide()
+    if m.request <> invalid then dropRequest()
+    m.top.prompting = false
+    m.layout.callFunc("showMesh", false)
+end sub
+
+sub onRelease()
+    m.top.prompting = false
+end sub
+
+' The servers, the active one shown, focus on its open account; from the
+' picker's Add an account (params.add), on that server's Add an account.
+sub start()
+    m.servers = onboarding.accounts.servers(api.session.current())
+    params = m.top.entry.params
+    addFor = ""
+    if util.isObject(params) then addFor = util.text(params.add)
+    m.railAt = 0
+    for i = 0 to m.servers.Count() - 1
+        if addFor <> "" and m.servers[i].origin = addFor then m.railAt = i
+    end for
+    buildRail()
+    arrangeColumn(m.layout, invalid, 0, m.form, FORM_GAP, RAIL_HEIGHT + HINT_GAP + labelHeight(m.railHint))
+    showAccounts(m.railAt)
+    m.zone = "pane"
+    m.paneAt = currentCard()
+    if addFor <> "" then m.paneAt = m.cards.Count() - 1
+    if m.servers.Count() = 0
+        m.zone = "rail"
+        m.railAt = m.railRows.Count() - 1
+    end if
+end sub
+
+sub buildRail()
+    m.railLayer.removeChildrenIndex(m.railLayer.getChildCount(), 0)
+    m.railRows = []
+    for each server in m.servers
+        m.railRows.Push(railRow(server.name, server.origin, false))
+        askMark(server.origin)
+    end for
+    m.railRows.Push(railRow(i18n.text("accounts.addServer"), "", true))
+end sub
+
+function railRow(name as String, origin as String, isAdd as Boolean) as Object
+    group = m.railLayer.createChild("Group")
+    fill = group.createChild("Poster")
+    fill.setFields({ uri: theme.browseArt.ROW_FILL, width: RAIL_WIDTH, height: RAIL_ROW, visible: false })
+    mark = invalid
+    plus = invalid
+    if isAdd
+        plus = group.createChild("Poster")
+        plus.setFields({ uri: theme.firstRunArt.ADD_PLUS, width: ADD_PLUS, height: ADD_PLUS, translation: [RAIL_INSET + (RAIL_MARK - ADD_PLUS) \ 2, (RAIL_ROW - ADD_PLUS) \ 2] })
+    else
+        mark = group.createChild("ServerMark")
+        mark.setFields({ size: RAIL_MARK, name: name, brandMark: true, uri: util.text(m.marks[origin]), translation: [RAIL_INSET, (RAIL_ROW - RAIL_MARK) \ 2] })
+    end if
+    textX = RAIL_INSET + RAIL_MARK + RAIL_TEXT_GAP
+    label = group.createChild("Label")
+    label.setFields({ font: theme.font(theme.textStyle.SETTINGS_CATEGORY), text: name, width: RAIL_WIDTH - textX - RAIL_INSET, height: RAIL_ROW, vertAlign: "center", translation: [textX, 0] })
+    return { group: group, fill: fill, mark: mark, plus: plus, label: label, origin: origin, isAdd: isAdd }
+end function
+
+' The cards for server index: its accounts, then Add an account on it.
+sub showAccounts(index as Integer)
+    m.paneLayer.removeChildrenIndex(m.paneLayer.getChildCount(), 0)
+    m.cards = []
+    m.paneFirst = 0
+    if index < 0 or index >= m.servers.Count() then return
+    m.shown = index
+    server = m.servers[index]
+    for each account in server.accounts
+        card = m.paneLayer.createChild("ServerCard")
+        name = account.username
+        if name = "" then name = i18n.text("settings.accounts.account")
+        badge = ""
+        key = onboarding.accounts.badge(account)
+        if key <> "" then badge = i18n.text(key)
+        card.setFields({ width: CARD_WIDTH, name: name, address: profileCount(account), badge: badge, warning: account.needsSignIn })
+        card.audioText = i18n.text("accounts.rowAudioBadge", { account: name, server: server.name, badge: badge })
+        m.cards.Push({ node: card, kind: "account", account: account, origin: server.origin })
+    end for
+    card = m.paneLayer.createChild("ServerCard")
+    card.setFields({ width: CARD_WIDTH, name: i18n.text("accounts.addAccount"), address: i18n.text("accounts.addAccountOn", { server: server.name }), markName: "+" })
+    card.audioText = i18n.text("settings.accounts.addAccount", { server: server.name })
+    m.cards.Push({ node: card, kind: "add", account: invalid, origin: server.origin })
+end sub
+
+' "3 profiles", "1 profile", or "" before any were listed.
+function profileCount(account as Object) as String
+    if account.profiles = 0 then return ""
+    if account.profiles = 1 then return i18n.text("settings.accounts.oneProfile")
+    return i18n.text("settings.accounts.profiles", { count: account.profiles.ToStr() })
+end function
+
+' The open account's card on the shown server, else the first.
+function currentCard() as Integer
+    for i = 0 to m.cards.Count() - 1
+        if m.cards[i].kind = "account" and m.cards[i].account.current then return i
+    end for
+    return 0
+end function
+
+' Places the rows in their windows and draws focus and selection: the
+' focused row fills #EDEDED, the shown server keeps a dim fill.
+sub paint()
+    servers = m.servers.Count()
+    focusedServer = m.railAt
+    if focusedServer >= servers then focusedServer = m.shown
+    m.railFirst = onboarding.accounts.windowStart(m.railFirst, focusedServer, servers, VISIBLE_SERVERS)
+    for i = 0 to m.railRows.Count() - 1
+        row = m.railRows[i]
+        if row.isAdd
+            shown = servers
+            if shown > VISIBLE_SERVERS then shown = VISIBLE_SERVERS
+            row.group.translation = [0, shown * (RAIL_ROW + RAIL_GAP) - RAIL_GAP + ADD_SERVER_GAP]
+            row.group.visible = true
+        else
+            row.group.translation = [0, (i - m.railFirst) * (RAIL_ROW + RAIL_GAP)]
+            row.group.visible = i >= m.railFirst and i < m.railFirst + VISIBLE_SERVERS
+        end if
+        focused = m.zone = "rail" and i = m.railAt
+        row.fill.visible = focused or (not row.isAdd and i = m.shown)
+        row.fill.blendColor = theme.color.CHROME_SELECTED_FILL
+        row.label.color = theme.color.TEXT
+        if row.plus <> invalid then row.plus.blendColor = theme.color.TEXT
+        if focused
+            row.fill.blendColor = theme.color.FOCUS
+            row.label.color = theme.color.ON_FOCUS
+            if row.plus <> invalid then row.plus.blendColor = theme.color.ON_FOCUS
+        end if
+    end for
+    m.railHint.text = hint(m.railFirst, VISIBLE_SERVERS, servers)
+    m.railHint.translation = [0, RAIL_HEIGHT + HINT_GAP]
+    count = m.cards.Count()
+    m.paneFirst = onboarding.accounts.windowStart(m.paneFirst, m.paneAt, count, VISIBLE_ACCOUNTS)
+    for i = 0 to count - 1
+        node = m.cards[i].node
+        node.translation = [0, (i - m.paneFirst) * (CARD_HEIGHT + CARD_GAP)]
+        node.visible = i >= m.paneFirst and i < m.paneFirst + VISIBLE_ACCOUNTS
+        node.highlighted = m.zone = "pane" and i = m.paneAt
+    end for
+    m.paneHint.text = hint(m.paneFirst, VISIBLE_ACCOUNTS, count)
+    m.paneHint.translation = [RAIL_WIDTH + PANE_GAP, PANE_HEIGHT + HINT_GAP]
+    m.errorLabel.text = m.errorText
+    m.errorLabel.visible = m.errorText <> ""
+    m.errorLabel.translation = [0, RAIL_HEIGHT + HINT_GAP + labelHeight(m.railHint) + HINT_GAP]
+end sub
+
+' "↓" while rows wait below the window, "↑" above it, "↕" both, else "".
+function hint(first as Integer, visible as Integer, count as Integer) as String
+    below = first + visible < count
+    above = first > 0
+    if above and below then return "↕"
+    if below then return "↓"
+    if above then return "↑"
+    return ""
+end function
+
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press then return false
+    if m.request <> invalid
+        if key = "back" then dropRequest()
+        return true
+    end if
+    if key = "up" or key = "down"
+        moveFocus(key)
+        return true
+    end if
+    if key = "right" and m.zone = "rail" and m.railAt < m.servers.Count()
+        enterPane()
+        return true
+    end if
+    ' Left, and Back on the root screen, go from the accounts to the rail.
+    if (key = "left" or (key = "back" and not firstRunIsPushed())) and m.zone = "pane" and m.servers.Count() > 0
+        m.zone = "rail"
+        m.railAt = m.shown
+        paint()
+        sayFocus()
+        return true
+    end if
+    if key = "OK"
+        activate()
+        return true
+    end if
+    return key = "left" or key = "right"
+end function
+
+' Up and Down within the rail, which shows the server focused, or within
+' its accounts.
+sub moveFocus(key as String)
+    delta = 1
+    if key = "up" then delta = -1
+    if m.zone = "rail"
+        target = m.railAt + delta
+        if target < 0 or target >= m.railRows.Count() then return
+        m.railAt = target
+        if m.railAt < m.servers.Count() then showAccounts(m.railAt)
+    else
+        target = m.paneAt + delta
+        if target < 0 or target >= m.cards.Count() then return
+        m.paneAt = target
+    end if
+    paint()
+    sayFocus()
+end sub
+
+sub enterPane()
+    m.zone = "pane"
+    m.paneAt = currentCard()
+    paint()
+    sayFocus()
+end sub
+
+sub sayFocus()
+    if m.zone = "rail"
+        if m.railAt < m.railRows.Count() then speak(m.railRows[m.railAt].label.text)
+    else if m.paneAt < m.cards.Count()
+        speak(m.cards[m.paneAt].node.audioText)
+    end if
+end sub
+
+' The rail: a server goes to its accounts, Add server to server entry. The
+' accounts: the open one goes back to its picker; another opens its own (or
+' asks to sign in again); Add an account signs in on that server. A change
+' of account starts the app over (nav.phase).
+sub activate()
+    if m.zone = "rail"
+        if m.railAt >= m.servers.Count()
+            nav.push(nav.route.SETUP, { pushed: true })
+        else
+            enterPane()
+        end if
+        return
+    end if
+    if m.paneAt >= m.cards.Count() then return
+    card = m.cards[m.paneAt]
+    if card.kind = "add"
+        addAccount(card.origin)
+        return
+    end if
+    account = card.account
+    if account.current and not account.needsSignIn
+        if firstRunIsPushed() then nav.pop()
+        return
+    end if
+    m.errorText = ""
+    send("onChanged")
+    api.session.useAccount(account.accountId, "", m.request, true)
+end sub
+
+' Signing in on the active server while an account is open pushes sign-in
+' over this screen, so that account stays open and Back comes back here;
+' anywhere else the server becomes active with no account.
+sub addAccount(origin as String)
+    session = api.session.current()
+    if session <> invalid and session.status = "signed_in" and origin = session.origin
+        nav.push(nav.route.SIGN_IN, { pushed: true })
+        return
+    end if
+    m.errorText = ""
+    send("onChanged")
+    api.session.signInOn(origin, m.request)
+end sub
+
+sub onChanged(event as Object)
+    result = takeResult(event)
+    if result = invalid or result.ok then return
+    m.errorText = i18n.text("accounts.error.change")
+    paint()
+    speak(m.errorText, false)
+end sub
+
+' A server's public branding, once per screen: its mark_url shows on its
+' rail row (onboarding.profiles.avatarUri resolves it, and leaves out SVG).
+sub askMark(origin as String)
+    if m.marks.DoesExist(origin) then return
+    m.marks[origin] = ""
+    request = catalog.request.branding()
+    request.url = origin + "/api/v2/theme/branding"
+    handle = api.newHandle(m.top.owner)
+    handle.addFields({ origin: origin })
+    handle.observeField("status", "onBranding")
+    api.send(request, handle)
+end sub
+
+sub onBranding(event as Object)
+    handle = event.getRoSGNode()
+    result = api.resultOf(handle)
+    if not result.ok or not util.isObject(result.body) then return
+    uri = onboarding.profiles.avatarUri(util.text(result.body.markUrl), handle.origin)
+    m.marks[handle.origin] = uri
+    for each row in m.railRows
+        if row.mark <> invalid and row.origin = handle.origin then row.mark.uri = uri
+    end for
+end sub

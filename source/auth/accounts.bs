@@ -15,26 +15,20 @@ import "pkg:/source/util/values.bs"
 ' its localAccountId; the server's user ID only finds a saved account again
 ' when the same person signs in (installAccount). Only the active account's
 ' credentials go with screens' requests; a packed account's go only with
-' the requests built here for its sign-out or its profile list
-' (refreshAccount), to an origin system/info confirmed in this run.
+' its sign-out, to an origin system/info confirmed in this run.
 '
 ' Session operations:
-'   { session: "useAccount", accountId, profileId }  makes a saved account
-'       active, on its server, remembering profileId as its profile, so the
-'       picker opens it (or asks to sign in again); answers { changed }
+'   { session: "useAccount", accountId, profileId, choose }  makes a saved
+'       account active, on its server, remembering profileId as its
+'       profile, so the picker opens it (or asks to sign in again); choose
+'       has the picker wait for the viewer; answers { changed }
 '   { session: "signInOn", origin }  makes origin, a saved server, active
 '       with no account, and asks for a sign-in there (signInAsked)
 '   { session: "cancelSignIn" }  back from a sign-in another account's
-'       session could take the place of: the picker shows again
-'   { session: "refreshAccount", accountId }  lists a saved account's
-'       profiles again for the picker; answers { profiles, signedIn }
+'       session could take the place of: Change Account shows
 '   { session: "renameServer", origin, label }  the viewer's name for a
 '       saved server, "" for its own
 namespace api.auth.coordinator
-    ' The kinds of the requests built for a packed account.
-    const ACCOUNT_ORIGIN = "accountOrigin"
-    const ACCOUNT_REFRESH = "accountRefresh"
-    const ACCOUNT_PROFILES = "accountProfiles"
     const ME_PATH = "/api/v2/account/me"
 
     ' Whether a saved account other than the active one has a session.
@@ -155,7 +149,7 @@ namespace api.auth.coordinator
 
     ' A refused refresh ended the active account's session: with another
     ' account's session to go to, the account steps aside, keeping its
-    ' tiles with "Sign in again", and the picker shows; alone, it stays, and
+    ' row in Change Account with "Sign in again"; alone, it stays, and
     ' sign-in asks for it as before.
     sub expireActive(state as Object, now as Integer)
         if hasOtherSessions(state) then park(state, storage.activeAccount(state.saved, now))
@@ -176,6 +170,8 @@ namespace api.auth.coordinator
         profileId = util.text(input.profileId)
         if profileId <> "" then state.saved.profileId = profileId
         state.signInAsked = false
+        ' Change Account: the picker waits for the viewer.
+        if util.isTrue(input.choose) then state.launchAsks = true
         ' Every Time forgets the account's PIN proofs, as a change of server
         ' did: its PIN-locked profiles ask again.
         if state.saved.launchBehavior = onboarding.launch.EVERY_TIME then state.saved.profileTokens = []
@@ -250,75 +246,6 @@ namespace api.auth.coordinator
         return { kind: "forgetAccount", scope: scope }
     end function
 
-    ' ---- Listing a packed account's profiles
-
-    function refreshAccount(state as Object, input as Object, now as Integer) as Object
-        index = accountIndex(state, util.text(input.accountId))
-        if index < 0 then return [reply(api.response.failure(input, "invalid_request"))]
-        account = state.saved.accounts[index]
-        caller = { requestId: util.text(input.requestId), owner: util.text(input.owner) }
-        if account.accessToken = "" then return [reply(succeeded(caller, { profiles: account.profiles, signedIn: false }))]
-        if state.verified[account.origin] <> true
-            request = build(state, { owner: caller.owner }, { method: "GET", url: account.origin + api.auth.server.INFO_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: ACCOUNT_ORIGIN, origin: account.origin, accountId: account.id, caller: caller })
-            return [submit(request)]
-        end if
-        return continueAccount(state, account, caller, now, false)
-    end function
-
-    ' The packed account's next step: a refresh when its token has expired,
-    ' else its profile list.
-    function continueAccount(state as Object, account as Object, caller as Object, now as Integer, afterRefresh as Boolean) as Object
-        if not afterRefresh and account.refreshToken <> "" and account.expiresAt > 0 and now >= account.expiresAt - EXPIRY_MARGIN_SECONDS
-            request = build(state, { owner: caller.owner }, { method: "POST", url: account.origin + REFRESH_PATH, body: { refresh_token: account.refreshToken }, timeoutMs: REFRESH_TIMEOUT_MS }, { kind: ACCOUNT_REFRESH, origin: account.origin, accountId: account.id, refreshToken: account.refreshToken, caller: caller })
-            return [submit(request)]
-        end if
-        request = build(state, { owner: caller.owner }, { method: "GET", url: account.origin + api.auth.profiles.LIST_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: ACCOUNT_PROFILES, origin: account.origin, accountId: account.id, accessToken: account.accessToken, refreshed: afterRefresh, caller: caller })
-        return [submit(request)]
-    end function
-
-    ' A request built for a packed account ended.
-    function accountSettled(state as Object, op as Object, result as Object, now as Integer) as Object
-        index = accountIndex(state, op.accountId)
-        if index < 0 then return [reply(api.response.failure(op.caller, "identity_changed"))]
-        account = state.saved.accounts[index]
-        if op.kind = ACCOUNT_ORIGIN
-            check = api.auth.server.checkInfo(result, op.origin, state.allowUnconfirmedOrigin)
-            if not check.ok then return [reply(api.response.failure(op.caller, check.error))]
-            state.verified[op.origin] = true
-            return continueAccount(state, account, op.caller, now, false)
-        end if
-        if op.kind = ACCOUNT_REFRESH
-            ' Tokens rotated by a later sign-in or refresh are not replaced.
-            if account.refreshToken <> op.refreshToken then return [reply(succeeded(op.caller, { profiles: account.profiles, signedIn: account.accessToken <> "" }))]
-            tokens = parseTokens(result)
-            if tokens <> invalid
-                setAccountTokens(account, tokens, now)
-                decisions = [persist()]
-                decisions.Append(continueAccount(state, account, op.caller, now, true))
-                return decisions
-            end if
-            if result.ok <> true and result.status <> 0 and api.auth.problems.action(result.error.problemType, result.status, "refresh") = api.auth.problems.SIGN_OUT
-                ' Expired, not signed out: the account and its tiles stay.
-                clearAccountSession(account)
-                return [persist(), publish(), reply(succeeded(op.caller, { profiles: account.profiles, signedIn: false }))]
-            end if
-            return [reply(withoutBody(result))]
-        end if
-        if result.status = 401 and not util.isTrue(op.refreshed) and account.refreshToken <> ""
-            account.expiresAt = 1
-            return continueAccount(state, account, op.caller, now, false)
-        end if
-        if not result.ok then return [reply(withoutBody(result))]
-        list = api.auth.profiles.list(result.body)
-        decisions = []
-        if FormatJson(storage.encodeProfiles(list)) <> FormatJson(storage.encodeProfiles(account.profiles))
-            account.profiles = list
-            decisions = [persist(), publish()]
-        end if
-        decisions.Push(reply(succeeded(op.caller, { profiles: list, signedIn: true })))
-        return decisions
-    end function
-
     ' A TokenPair's tokens and times on account, a packed one or state.saved
     ' (setTokens): the proactive refresh comes PROACTIVE_SECONDS before
     ' expiry, or halfway for a short lifetime.
@@ -330,14 +257,6 @@ namespace api.auth.coordinator
         if early < lifetime \ 2 then early = lifetime \ 2
         account.expiresAt = now + lifetime
         account.refreshAt = now + early
-    end sub
-
-    sub clearAccountSession(account as Object)
-        account.accessToken = ""
-        account.refreshToken = ""
-        account.expiresAt = 0
-        account.refreshAt = 0
-        account.profileTokens = []
     end sub
 
     ' What the active account's own answers say about it: GET

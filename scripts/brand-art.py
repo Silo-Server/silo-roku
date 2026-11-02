@@ -13,6 +13,9 @@ silo-branding repository's SVG masters.
   brand/wordmark.png       the wordmark for dark fields at 150x78, the size the
                            first-run screens draw it (the top bar draws it
                            smaller)
+  brand/server_mark.png    the project icon (the mark on its rounded deep blue
+                           tile) at 160x160: a server's mark where its
+                           branding gives none, drawn at 80 px or smaller
 
 The poster and splashes are opaque RGB, as Roku requires. The artwork is used
 as supplied (the brand rules forbid recolouring or redrawing it), so the
@@ -51,6 +54,7 @@ ART = [
     ("splash_sd.png", 720, 480, "black", 0.22),
 ]
 WORDMARK_SIZE = (150, 78)
+SERVER_MARK_SIZE = 160
 
 
 def compose(width, height, background, fraction, wordmark):
@@ -83,8 +87,10 @@ def main():
     if len(sys.argv) != 2:
         sys.exit("usage: brand-art.py /path/to/silo-branding")
     wordmark = pathlib.Path(sys.argv[1]).resolve() / "logo/svg/silo-wordmark-white.svg"
-    if not wordmark.is_file():
-        sys.exit(f"missing {wordmark}")
+    icon = pathlib.Path(sys.argv[1]).resolve() / "logo/svg/silo-project-icon.svg"
+    for master in [wordmark, icon]:
+        if not master.is_file():
+            sys.exit(f"missing {master}")
     with tempfile.TemporaryDirectory() as scratch:
         scratch = pathlib.Path(scratch)
         # librsvg loads an <image> only from the referencing file's directory.
@@ -102,6 +108,10 @@ def main():
             str(wordmark), "-o", str(rendered))
         run("magick", str(rendered), "-background", "none", "-gravity", "center",
             "-extent", f"{width}x{height}", "-strip", "PNG32:" + str(IMAGES / "brand/wordmark.png"))
+        rendered = scratch / "server_mark.png"
+        size = str(SERVER_MARK_SIZE)
+        run("rsvg-convert", "-w", size, "-h", size, str(icon), "-o", str(rendered))
+        run("magick", str(rendered), "-strip", "PNG32:" + str(IMAGES / "brand/server_mark.png"))
 
 
 if __name__ == "__main__":
