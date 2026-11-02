@@ -159,8 +159,9 @@ Requests, shown only when the server offers them to the profile
 
 Personal lists:
 
-- Watchlist, Favorites, and History pages, opened from the avatar menu;
-  Watchlist and Favorites show only when the server offers them
+- Watchlist and Favorites pages, opened from the For You menu, and the
+  History page, opened from the avatar menu; Watchlist and Favorites show
+  only when the server offers them
   (`GET /api/v2/capabilities/personal-lists`);
 - the detail page's Watchlist button and More menu: add to or remove from
   the Watchlist and Favorites, and mark a movie, a series, the season shown,
@@ -446,19 +447,13 @@ their existing HD/FHD assets.
   - Panel: 460 px wide, top at 132, right edge at the right inset, padding 14.
   - Header: a 44 px avatar; the profile's name in 24 px SemiBold; the
     server's display name in uppercase, 14 px, letter-spaced, at 38%.
-  - Rows: Switch Profile, Watchlist, Favorites, History, Requests (while
-    the server offers Requests, section 5.11), and Watch Party
-    ("Return to Watch Party" in a party, while the server offers one:
-    [`watch-party.md`](watch-party.md) section 4.1); then Settings;
-    then Switch Server and Sign Out. They are 54 px tall (22 px SemiBold,
+  - Rows: Switch Profile, History, Requests (while the server offers
+    Requests, section 5.11), and Watch Party ("Return to Watch Party" in a
+    party, while the server offers one: [`watch-party.md`](watch-party.md)
+    section 4.1); then Settings, Switch Server, and Sign Out. Watchlist and
+    Favorites are in the For You menu only. They are 54 px tall (22 px SemiBold,
     16 px inset), 10 px apart. A focused row gets a white fill with radius
     14; resting labels are at 86%, and Sign Out is red at 90%.
-  - Watchlist and Favorites show only when
-    `GET /api/v2/capabilities/personal-lists` answers `state` `available`
-    and `allowed` true for the profile. Each page with the bar reads it as
-    it starts; a failed read or an older server without the document leaves
-    them out. A menu open before the read lands is built again when it
-    does, keeping its highlighted row. History always shows.
   - A divider separates groups only.
   - Sign Out asks for confirmation (Cancel / Sign Out / Sign Out & Remove
     Server).
@@ -467,10 +462,13 @@ their existing HD/FHD assets.
   headed "FOR YOU" in the library list's header style, then
   Recommendations, Watchlist, and Favorites as the avatar menu's rows, each after a
   26 px glyph (bookmark, heart, sparkles) in a 30 px column, 14 px before
-  its label. Watchlist and Favorites show only when the avatar menu lists
-  them. Entering it highlights its first row; Up past the first row closes
+  its label. Watchlist and Favorites show only when
+  `GET /api/v2/capabilities/personal-lists` answers `state` `available`
+  and `allowed` true for the profile. Each page with the bar reads it as
+  it starts; a failed read or an older server without the document leaves
+  them out. Entering it highlights its first row; Up past the first row closes
   it onto the tab, and Down past the last closes it into the content.
-  Watchlist and Favorites open their pages, as from the avatar menu;
+  Watchlist and Favorites open their pages;
   Recommendations opens the For You page, or on that page enters its
   content.
 - **Library list** (Movies or Series).
