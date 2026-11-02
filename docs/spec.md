@@ -148,7 +148,8 @@ Browse:
 Requests, shown only when the server offers them to the profile
 (`GET /api/v2/requests/status`):
 
-- the Requests tab: the account's requests and the server's Discover rows,
+- the Requests page, in the avatar menu: the account's requests and the
+  server's Discover rows,
   in the admin's order, with See all and the studio, network, and genre
   rows;
 - a title's request page: Request, Cancel Request, Notify Me, and the
@@ -158,8 +159,9 @@ Requests, shown only when the server offers them to the profile
 
 Personal lists:
 
-- Watchlist, Favorites, and History pages, opened from the avatar menu;
-  Watchlist and Favorites show only when the server offers them
+- Watchlist and Favorites pages, opened from the For You menu, and the
+  History page, opened from the avatar menu; Watchlist and Favorites show
+  only when the server offers them
   (`GET /api/v2/capabilities/personal-lists`);
 - the detail page's Watchlist button and More menu: add to or remove from
   the Watchlist and Favorites, and mark a movie, a series, the season shown,
@@ -383,7 +385,7 @@ on 2026-10-25.
 | Landscape card | 360×200 px, for Continue Watching, in-progress, and "next" rows only (5.5) |
 | Card gap / row spacing | 40 px / 10 px between rows (each strip has 14 px padding above and below) |
 | Card corner radius | 12 px (detail episode stills 18) |
-| Card focus | A lift with no ring (D4) over a shadow, black 50% with tvOS's 20 px radius, 10 px lower: posters grow 38 px in height as tvOS's card lift does (1.14 in rows, 1.10 in Browse), landscape cards scale 1.20, detail episode stills 1.08, each side by whole px, every edge of the lifted card on a whole pixel (5.9). The low tier keeps the list's ring without scaling (5.9) |
+| Card focus | tvOS's outlined lift (silo-apple #973, `TVCardOutlineButtonStyle`): posters, landscape cards, episode stills, and cast portraits scale 1.05, each side by whole px, every edge of the lifted card on a whole pixel (5.9), over a shadow, black 50% with tvOS's 20 px radius, 10 px lower, with a 4 px white outline at 70% inside the card's edge (3 px in HD) that scales with it. Trailers & More cards outline without lifting. The low tier keeps the list's ring without scaling (5.9) |
 | Round button (detail, 76 px) | Rest white 10%, no ring; focused pure white fill with black content, no scale |
 | Pill focus | Pure white fill with black text; the Sort pill and first-run buttons use `#EDEDED`. Scale: Sort 1.04, first-run buttons 1.06, fields 1.04, others none |
 | Scaled text | Roku resamples a scaled Label's glyphs, which blurs Inter's hinted stems, so on the first-run buttons, fields, and server card, the focused profile tile, and the server mark, the art scales but the text is set at the scaled size, rounded down to a whole px (a 29 px label focused at 1.06 is set at 30 px), on whole pixels (`theme.placeUnscaled`). A focused label so grows slightly less than tvOS's, and never outgrows its box |
@@ -418,15 +420,15 @@ their existing HD/FHD assets.
   and no background band. Left to right:
   - the Silo wordmark, 96 px wide;
   - then, centred on the screen, a 58 px Search circle, then Home, Movies,
-    Series, For You, Calendar, and Requests, 8 px apart;
+    Series, For You, and Calendar, 8 px apart;
   - the 58 px profile avatar, at the right inset.
 
   The avatar, here and in its menu's header, is drawn as on the profile
   picker (section 5.4). A library tab appears only when the profile can see a
-  library of that type; For You and Calendar always appear, as on tvOS,
-  whose default menu ends with them (`TVPrimaryMenuProjection`). Requests
-  trails them while the server offers Requests to the profile (section
-  5.11). Opening any of them from the bar starts in its content. The bar appears on root pages only: Search is a pushed
+  library of that type; For You and Calendar always appear. The bar is fixed
+  and matches tvOS and Android TV, which also show Music and Audiobooks
+  tabs that Roku defers. Requests is in the avatar menu (section 5.11).
+  Opening any of them from the bar starts in its content. The bar appears on root pages only: Search is a pushed
   page without it (D3), and detail pages have none.
 - **Tabs** are capsules 56 px tall with 29 px side padding and 26 px labels:
   - focused: a pure white fill with black text;
@@ -445,18 +447,13 @@ their existing HD/FHD assets.
   - Panel: 460 px wide, top at 132, right edge at the right inset, padding 14.
   - Header: a 44 px avatar; the profile's name in 24 px SemiBold; the
     server's display name in uppercase, 14 px, letter-spaced, at 38%.
-  - Rows: Switch Profile, Watchlist, Favorites, History, and Watch Party
-    ("Return to Watch Party" in a party, while the server offers one:
-    [`watch-party.md`](watch-party.md) section 4.1); then Settings;
-    then Switch Server and Sign Out. They are 54 px tall (22 px SemiBold,
+  - Rows: Switch Profile, History, Requests (while the server offers
+    Requests, section 5.11), and Watch Party ("Return to Watch Party" in a
+    party, while the server offers one: [`watch-party.md`](watch-party.md)
+    section 4.1); then Settings, Switch Server, and Sign Out. Watchlist and
+    Favorites are in the For You menu only. They are 54 px tall (22 px SemiBold,
     16 px inset), 10 px apart. A focused row gets a white fill with radius
     14; resting labels are at 86%, and Sign Out is red at 90%.
-  - Watchlist and Favorites show only when
-    `GET /api/v2/capabilities/personal-lists` answers `state` `available`
-    and `allowed` true for the profile. Each page with the bar reads it as
-    it starts; a failed read or an older server without the document leaves
-    them out. A menu open before the read lands is built again when it
-    does, keeping its highlighted row. History always shows.
   - A divider separates groups only.
   - Sign Out asks for confirmation (Cancel / Sign Out / Sign Out & Remove
     Server).
@@ -465,10 +462,13 @@ their existing HD/FHD assets.
   headed "FOR YOU" in the library list's header style, then
   Recommendations, Watchlist, and Favorites as the avatar menu's rows, each after a
   26 px glyph (bookmark, heart, sparkles) in a 30 px column, 14 px before
-  its label. Watchlist and Favorites show only when the avatar menu lists
-  them. Entering it highlights its first row; Up past the first row closes
+  its label. Watchlist and Favorites show only when
+  `GET /api/v2/capabilities/personal-lists` answers `state` `available`
+  and `allowed` true for the profile. Each page with the bar reads it as
+  it starts; a failed read or an older server without the document leaves
+  them out. Entering it highlights its first row; Up past the first row closes
   it onto the tab, and Down past the last closes it into the content.
-  Watchlist and Favorites open their pages, as from the avatar menu;
+  Watchlist and Favorites open their pages;
   Recommendations opens the For You page, or on that page enters its
   content.
 - **Library list** (Movies or Series).
@@ -824,12 +824,15 @@ their existing HD/FHD assets.
     and any "next" section; every other row shows posters, including rows of
     episodes (section 5.9).
   - Captions sit 22 px under posters and 14 px under landscape cards. The
-    title is 24 px Medium at 45%, white SemiBold when focused. A second line,
+    title is 24 px Medium at 45%, white when focused. A second line,
     4 px below it, shows the year for movies and series, or "S01E02 · Pilot"
     beneath an episode's series name. Metadata is 20 px Regular at 32%, white
-    at 92% and Medium when focused. Both lines stay single-line and truncate
-    at the tail; they drop together clear of focused artwork. Rows and grids
-    reserve space for both lines and the focus drop. The low tier keeps both
+    at 92% when focused. Focus changes only the colour, so a truncated title
+    does not reflow (tvOS's `tvCardTitleFocus`). Both lines stay single-line
+    and truncate at the tail; where the lifted card reaches past the caption's
+    gap less 8 px they drop together by the difference (2 px under Browse's
+    posters, none under a row's). Rows and grids reserve space for both lines
+    and the focus drop. The low tier keeps both
     lines without scaling or dropping them.
     Focus does not change caption width, horizontal position, or font size.
     The vertical drop is 5 px under row posters and 13 px under landscape
@@ -1340,9 +1343,12 @@ their existing HD/FHD assets.
     until the last one is fully visible.
   - Played episodes are dimmed by black 35% and carry a 40 px check disc. A
     5 px progress bar shows the resume point.
-  - Captions, 18 px below: "S01E02 · Title" in 20 px SemiBold at 92% (100%
-    when focused or current), over "Feb 18, 2026 · 52m" in 17 px Medium at
-    60%.
+  - Captions, 18 px below: "S01E02 · Title" in 20 px SemiBold at 45%, over
+    "Feb 18, 2026 · 52m" in 17 px Medium at 32%, white and white 92% when
+    focused or current, as other card captions; they do not drop.
+  - The current episode, the one Play acts on, keeps the focus outline and
+    bright caption without the lift while focus is elsewhere, such as on Play
+    after opening an episode from Continue Watching (tvOS's `isCurrent`).
   - A focused episode updates the hero's metadata line (series rating · air
     date · runtime · ratings · Season N · Episode M) and synopsis. The air
     date and runtime come from its card at once; its ratings follow when
@@ -1360,17 +1366,18 @@ their existing HD/FHD assets.
     preserves server order and displays up to 24 people with 200 px
     portraits, names, and characters. Missing portraits use initials;
     entries without a person ID remain readable but cannot open a person.
-    Focus follows Home's card treatment: a centred 38 px lift with a round
-    shadow and highlighted captions, without an outline. The low tier uses
-    an outline without lifting. Names wrap to at most two lines, with the
+    Focus follows Home's card treatment: a centred 1.05 lift with a round
+    shadow, a 4 px white outline at 70% inside the circle, and highlighted
+    captions. The low tier uses the outline without lifting. Names wrap to at most two lines, with the
     character 6 px below; both captions stay clear of the lifted portrait.
     All supporting rails use floating focus: cards remain stationary until
     selection crosses the visible edge. Selection and viewport position
     survive Back and screen reconstruction. Poster cards use Home's
-    ringless lift and shadow, or an outline without lift on the low tier.
+    outlined lift and shadow, or the list's ring without lift on the low
+    tier.
   - Recommendations preserve server order, show up to 12 movie/series
     poster cards, and open the existing detail route. Their two-line captions
-    are centred 16 px under each poster, dropping 11 px with the Home-style
+    are centred 16 px under each poster, staying put under the Home-style
     focus lift. Their request starts
     900 ms after primary detail loading; placeholders are not focusable,
     and empty or failed responses remove the whole section. Up and Down
@@ -1393,8 +1400,8 @@ their existing HD/FHD assets.
     "Behind the Scenes"; "Extra" for a kind the client does not know), and
     5 px under it its runtime ("2:31", "1:02:03"; 17 px Medium at
     `#EDEDED` 60%).
-  - Focus draws a 3 px white ring at 90% inside the card's edge (2 px in
-    HD) and brightens the title to full `#EDEDED`, with Home's shadow; the
+  - Focus draws Home's 4 px white outline at 70% inside the card's edge (3 px
+    in HD) and brightens the title to full `#EDEDED`, with Home's shadow; the
     card does not lift and the caption does not drop, as both tvOS detail
     pages pass `TVTrailersRail` `focusScale: 1.0`. The same on every tier.
     Floating focus and the selection kept across Back and rebuilding, as
@@ -2196,9 +2203,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Letter-spaced small text (badge chips, uppercase headers) | Spacing approximated with hair spaces (`theme.tracked`) | Roku `Label` has no letter-spacing field |
 | System fonts cover every script | Titles in scripts outside Latin, Greek, Cyrillic, and Vietnamese (for example CJK and Arabic) render as boxes | Neither the packaged Inter subset nor Roku's system font covers them, and a CJK font does not fit the 4 MB package |
 | Panels, buttons, cards, and the hero's title cast soft shadows, and a focused card's caption glows; focused controls change over 120 ms or more | Cards use a shadow 9-patch (5.2) and lift with the list's own focus animation; panels open with tvOS's 0.12 s fade; panels, buttons, and the title have no shadow, captions no glow; detail action circles animate width and label reveal on the normal tier (5.6), while the low tier snaps | Roku has no blur, and animations cost frames on 512 MB devices |
-| Focused cards lift on every device | On the low tier, cards do not scale and the list draws a 9-patch ring | Plan section 4.6: frame rate on 512 MB and non-OpenGL devices |
-| Cast and recommendation cards use an outline and a smaller scale than Home | Detail supporting rails use Home's ringless lift and caption highlighting; cast retains round portraits and a round shadow. Low-tier cards keep an outline without lifting | Consistent focus treatment across Roku's Home and detail rails |
-| A focused card scales by one factor (a poster 1.14) about its centre | Each side grows by whole px, so the two axes differ slightly: a row's poster lifts to 202×302, Browse's to 286×428, Search's to 266×398, a landscape card to 432×240, a detail episode still to 388×216. The card scales about its top-left corner and moves back by that lift (a landscape card 36 and 20 px), so its left and top edges are whole px exactly | At a fractional edge Roku drew the art a pixel past the 9-patch frame that rounds the corners, a white line down a lifted card's right edge (hardware run 26). Scaled about its centre, a float's 1.2 put the first Continue Watching card's left edge at x 43.99998, and Roku drew its progress bar, a Rectangle, from x 43, a tick left of the frame's corner (runs 26 and 27) |
+| Focused cards lift on every device, with a white outline at 70% | On the low tier, cards do not scale and the list draws its 9-patch ring (`#EDEDED`, opaque) in place of the outline | Plan section 4.6: frame rate on 512 MB and non-OpenGL devices |
+| A focused card scales by one factor (1.05) about its centre | Each side grows by whole px, so the two axes differ slightly: a row's poster lifts to 184×278, Browse's to 274×410, Search's to 252×378, a landscape card or detail episode still to 378×210. The card and its outline scale about its top-left corner and move back by that lift (a landscape card 9 and 5 px), so their left and top edges are whole px exactly | At a fractional edge Roku drew the art a pixel past the 9-patch frame that rounds the corners, a white line down a lifted card's right edge (hardware run 26). Scaled about its centre, a float's 1.2 put the first Continue Watching card's left edge at x 43.99998, and Roku drew its progress bar, a Rectangle, from x 43, a tick left of the frame's corner (runs 26 and 27) |
 | The detail Subtitles menu leads with the profile's subtitle language; the player's list with the watch projection's effective subtitle language | Both lead with the projection's `effective_subtitle_language`, so the detail menu and Options' Subtitles list the same tracks in the same order and words. Each lists its own source, as on tvOS: the detail menu the version's tracks, Options the plan's inventory, so a sidecar only the plan names shows only in Options | The two lists disagreed on hardware run 27: Options listed the server's order and hid titles the detail menu showed. A detail pick is an ordinal into the projection's list, so the detail menu cannot offer a track the projection does not name |
 | A subtitle's title shows unless it is a release name, a format, a flag, or its language | A title that is a subtitle file's name ("Heat (1995).en.srt") is dropped too, on the detail menu and in Options | The server gives an untitled sidecar its file's name as its title and its inventory label (hardware run 6) |
 | Avatar menu rows, and the detail page's More menu rows, have an icon before the label | Labels without icons; More's rows keep the Versions menu's empty check column | No icon art ships for the menus; More reuses the Versions menu (section 5.6) |
@@ -2412,14 +2418,15 @@ and `request-discover-rows.md`). The pure decisions are
   Requests shows only when `requests_enabled` is true, `allowed` is true,
   and `state` is `available`; a missing `allowed` or `state` reads as off.
   A failed read keeps what was known. Notify Me needs `follow_supported`
-  too. When an answer turns Requests off, the bar drops the tab and a
-  Requests page under it goes to Home; a request page whose action the
+  too. When an answer turns Requests off, the avatar menu drops its row and
+  the Requests page closes the next time it shows; a request page whose action the
   server refuses with `capability_*` or `permission_denied` reads the
   status again and goes to Home if it is now off. Child profiles and
   quotas are the server's: a profile it does not allow gets `allowed`
   false, and a title over its rating ceiling is left out of every list.
-- **The Requests tab** (`RequestsScreen`, `nav.route.REQUESTS`), last of the
-  tabs, is a stack root drawn as For You is (section 5.10): the hero shows
+- **The Requests page** (`RequestsScreen`, `nav.route.REQUESTS`), pushed
+  from the avatar menu, is drawn as For You is (section 5.10) without the
+  top bar, as tvOS pushes `TVRequestsPage`: the hero shows
   the focused card (its title, year and media type, TMDB rating or when it
   was requested, synopsis, and backdrop, with the request's status as the
   hero's badge), over these rows:
@@ -2468,7 +2475,7 @@ and `request-discover-rows.md`). The pure decisions are
   `next_page` when it moves on and stays within `total_pages` (at most
   500), else the next page, reading past a page its filters emptied (three
   in a row at most); My Requests pages by cursor, 40 at a time, newest
-  first. OK on a card opens it as on the Requests tab.
+  first. OK on a card opens it as on the Requests page.
 - **Request page** (`RequestDetailScreen`, `nav.route.REQUEST_DETAIL`),
   read from `GET /api/v2/requests/detail/{movie|series}/{tmdb_id}`: the
   library detail page's hero (section 5.6) with the title, the content
