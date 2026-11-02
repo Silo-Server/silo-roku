@@ -1,34 +1,20 @@
 import "pkg:/source/api/request.bs"
 import "pkg:/source/util/values.bs"
 
-' The app's registry section (plan section 4.3, spec sections 7.2 to 7.4).
-' Main() reads one snapshot before the scene starts and hands it to ApiTask,
-' which is the only writer afterwards. A record is:
+' The app's registry sections (plan section 4.3, spec sections 7.2 to 7.4).
+' Main() reads one snapshot before the scene starts (migrating an older
+' layout first, source/storage/migration.bs) and hands it to ApiTask, which
+' is the only writer afterwards. A record is:
 '   version        the layout it was read from (VERSION, or newer)
-'   origin         the configured server base URL, or ""
+'   origin         the active server's base URL, or ""
 '   deviceId       the installation ID sent as X-Silo-Device-Id; "" until
 '                  ApiTask generates it, once
-'   accountId      the signed-in account, kept when a session expires so the
-'                  same account resumes its remembered profile
-'   accessToken, refreshToken   both "" when signed out
-'   expiresAt      when the access token expires, in wall-clock seconds
-'   refreshAt      when ApiTask refreshes it ahead of expiry, likewise
-'   profileId      the last profile the viewer chose on this device, or ""
-'   profileTokens  [{ id, token }], oldest first: X-Profile-Token values the
-'                  current login session verified
 '   pairingKey     the SiloControl receiver's pairing key as 32 hex digits,
 '                  or "" while Require Pairing is off (docs/silocontrol.md
 '                  section 9.4); kept across sign-outs
-'   serverName     the configured server's name (theme/branding's
-'                  server_name), or "" until it is known
-'   servers        the other saved servers, most recently used first, each
-'                  { origin, name, accountId, profileId, accessToken,
-'                  refreshToken, expiresAt, refreshAt, profileTokens, usedAt }
-'                  with its session kept as the configured server's is;
-'                  usedAt is when it stopped being the configured server, in
-'                  wall-clock seconds. They live in their own section
-'                  (SERVERS_SECTION), so the configured server's never shrinks
-'                  for them
+'   serverName     the active server's name (theme/branding's server_name),
+'                  or "" until it is known; serverLabel the name the viewer
+'                  gave it in Settings › Accounts, or ""
 '   launchBehavior  Profile Selection (onboarding.launch), or "" until the
 '                  session settles it; this device's, whatever the server,
 '                  and kept across sign-outs
@@ -36,31 +22,64 @@ import "pkg:/source/util/values.bs"
 '                  this device opens automatically
 '   usedAt         when Silo was last in use here with a profile open, in
 '                  wall-clock seconds, or 0
-' Each value is stored as a string under its KEYS name. A value over its byte
-' bound is not stored, which keeps the section under BUDGET_BYTES.
+' The active account, unpacked (accountId "" for none):
+'   accountId      its localAccountId, a UUID made on this device, which
+'                  every local key uses and which never changes
+'   serverUserId   the server's user ID, for finding a saved account again
+'                  at sign-in; "" until known
+'   username       the account's username, "" until known
+'   accessToken, refreshToken   both "" when it needs to sign in again
+'   expiresAt      when the access token expires, in wall-clock seconds
+'   refreshAt      when ApiTask refreshes it ahead of expiry, likewise
+'   profileId      the last profile the viewer chose in it on this device
+'   profileTokens  [{ id, token }], oldest first: X-Profile-Token values the
+'                  current login session verified
+'   profiles       the account's profiles as last listed, for the picker:
+'                  [{ id, name, hasPin, isChild, avatarUrl }]
+'   addedAt        when it was saved here, in wall-clock seconds
+'   legacyKeys     its local data kept the keys it had before accounts
+'                  (an account made by the migration), which have no
+'                  account part (libraryPrefs.key)
+'   servers        the other saved servers, most recently used first, each
+'                  { origin, name, label, usedAt }
+'   accounts       the other saved accounts, most recently used first, each
+'                  { id, origin, serverUserId, username, accessToken,
+'                  refreshToken, expiresAt, refreshAt, profileId,
+'                  profileTokens, profiles, addedAt, usedAt, legacyKeys }
+' The device's values live in SECTION_NAME, each as a string under its KEYS
+' name; servers and accounts in ACCOUNTS_SECTION: the servers as one JSON
+' list under SERVERS_KEY, the active server first, and each account as JSON
+' under ACCOUNT_PREFIX + its ID. A value over its byte bound is not stored.
 namespace storage
     const SECTION_NAME = "silo"
-    ' The other saved servers, as one JSON list under SERVERS_KEY, kept to
-    ' SERVERS_BUDGET_BYTES: past it, the oldest servers' sessions go first
-    ' (they stay saved, signed out), then the oldest servers. With
-    ' BUDGET_BYTES, Browse's section (libraryPrefs.BUDGET_BYTES), and the
+    const ACCOUNTS_SECTION = "silo.accounts"
+    const SERVERS_KEY = "servers"
+    const ACCOUNT_PREFIX = "a."
+    ' ACCOUNTS_SECTION's managed keys: every key in it (write).
+    const ALL_KEYS = "*"
+    ' Past ACCOUNTS_BUDGET_BYTES the least recently used accounts lose their
+    ' profile lists, then their sessions (they stay saved, needing to sign in
+    ' again), then go. With BUDGET_BYTES, Browse's section
+    ' (libraryPrefs.BUDGET_BYTES), Watch Party's (watchparty.recent), and the
     ' diagnostics section (diag.state.BUDGET_BYTES) it keeps to Roku's 32 KB.
-    const SERVERS_SECTION = "silo.servers"
-    const SERVERS_KEY = "list"
-    const SERVERS_KEYS = "list"
-    const SERVERS_BUDGET_BYTES = 8192
-    ' Saved servers besides the configured one.
+    const ACCOUNTS_BUDGET_BYTES = 21504
+    ' Saved servers besides the active one, and saved accounts in all.
     const MAX_SAVED_SERVERS = 7
+    const MAX_ACCOUNTS = 12
     const MAX_NAME_BYTES = 128
+    ' The profiles kept for an account's tiles, and their values' bounds; an
+    ' avatar URL over its bound is not kept (the tile shows the initial).
+    const MAX_PROFILES = 12
+    const MAX_AVATAR_BYTES = 512
     ' Layout version. Later layouts add keys and never change what an existing
     ' key means, so a newer section's known keys still read. A change that
-    ' cannot keep to that bumps VERSION and teaches decode() the older layout,
-    ' so an app update never signs the viewer out (spec section 7.2).
-    const VERSION = 1
-    ' Roku gives an app 32 KB of registry; the section keeps to 15 KB of it,
-    ' above maxBytes() (about 13.7 KB), leaving 1 KB for Watch Party's recent
-    ' party (watchparty.recent.BUDGET_BYTES).
-    const BUDGET_BYTES = 15360
+    ' cannot keep to that bumps VERSION and teaches the migration the older
+    ' layout, so an app update never signs the viewer out (spec section 7.2).
+    ' Layout 1 kept one account per server (source/storage/migration.bs).
+    const VERSION = 2
+    ' The device's section is small now that sessions live in
+    ' ACCOUNTS_SECTION; it keeps to this, above maxBytes().
+    const BUDGET_BYTES = 2048
     const MAX_PROFILE_TOKENS = 6
     ' Byte bounds per stored value. Token bounds follow the contract's 4096-byte
     ' refresh_token limit; profile tokens are short opaque strings.
@@ -75,21 +94,58 @@ namespace storage
     ' to MAX_RETRY_MS while writes keep failing (save).
     const RETRY_MS = 1000
     const MAX_RETRY_MS = 60000
-    ' Every key this module writes; write() never touches others, such as keys
-    ' a newer layout added.
-    const KEYS = "schema|origin|device|account|access_token|refresh_token|expires_at|refresh_at|profile|profile_tokens|pairing_key|server_name|launch_behavior|launch_offer|used_at"
+    ' Every key this module writes in SECTION_NAME; write() never touches
+    ' others, such as keys a newer layout added.
+    const KEYS = "schema|origin|device|active|pairing_key|launch_behavior|launch_offer|used_at"
     const MAX_BEHAVIOR_BYTES = 32
 
     ' The record of a fresh install.
     function empty() as Object
-        return { version: VERSION, origin: "", deviceId: "", accountId: "", accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileId: "", profileTokens: [], pairingKey: "", serverName: "", servers: [], launchBehavior: "", launchOffer: false, usedAt: 0 }
+        record = { version: VERSION, origin: "", deviceId: "", pairingKey: "", serverName: "", serverLabel: "", servers: [], accounts: [], launchBehavior: "", launchOffer: false, usedAt: 0 }
+        unpack(record, invalid)
+        return record
     end function
 
-    ' Reads the sections and decodes them (Main, before the scene starts).
-    function load(section as Object, serversSection = invalid as Dynamic) as Object
-        serversRaw = {}
-        if serversSection <> invalid then serversRaw = read(serversSection)
-        return decode(read(section), serversRaw)
+    ' An account with nothing but its ID and server.
+    function newAccount(id as String, origin as String, now = 0 as Integer) as Object
+        return { id: id, origin: origin, serverUserId: "", username: "", accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileId: "", profileTokens: [], profiles: [], addedAt: now, usedAt: now, legacyKeys: false }
+    end function
+
+    ' A new localAccountId.
+    function newAccountId() as String
+        return LCase(CreateObject("roDeviceInfo").GetRandomUUID())
+    end function
+
+    ' The record's active account, packed as accounts' entries are, or
+    ' invalid for none. usedAt is now.
+    function activeAccount(record as Object, now = 0 as Integer) as Dynamic
+        if record.accountId = "" then return invalid
+        tokens = []
+        tokens.Append(record.profileTokens)
+        return { id: record.accountId, origin: record.origin, serverUserId: record.serverUserId, username: record.username, accessToken: record.accessToken, refreshToken: record.refreshToken, expiresAt: record.expiresAt, refreshAt: record.refreshAt, profileId: record.profileId, profileTokens: tokens, profiles: record.profiles, addedAt: record.addedAt, usedAt: now, legacyKeys: record.legacyKeys }
+    end function
+
+    ' Makes account (packed) the record's active one; invalid clears it.
+    sub unpack(record as Object, account as Dynamic)
+        if account = invalid then account = newAccount("", "")
+        record.accountId = account.id
+        record.serverUserId = account.serverUserId
+        record.username = account.username
+        record.accessToken = account.accessToken
+        record.refreshToken = account.refreshToken
+        record.expiresAt = account.expiresAt
+        record.refreshAt = account.refreshAt
+        record.profileId = account.profileId
+        record.profileTokens = account.profileTokens
+        record.profiles = account.profiles
+        record.addedAt = account.addedAt
+        record.legacyKeys = account.legacyKeys
+    end sub
+
+    ' Reads the sections and decodes them (Main, before the scene starts,
+    ' after the migration).
+    function load(section as Object, accountsSection as Object) as Object
+        return decode(read(section), read(accountsSection))
     end function
 
     ' The section's values by key.
@@ -101,11 +157,11 @@ namespace storage
         return raw
     end function
 
-    ' The record a raw section holds. A newer section keeps its version, and
+    ' The record raw sections hold. A newer section keeps its version, and
     ' its known keys read as they do at VERSION. Values that do not validate
-    ' are dropped one by one; tokens survive only as a pair, with their server.
-    ' serversRaw is the saved servers' section.
-    function decode(raw as Object, serversRaw = {} as Object) as Object
+    ' are dropped one by one; tokens survive only as a pair, with their
+    ' account. accountsRaw is ACCOUNTS_SECTION's.
+    function decode(raw as Object, accountsRaw = {} as Object) as Object
         record = empty()
         record.version = versionOf(raw)
         if record.version < VERSION then record.version = VERSION
@@ -117,27 +173,37 @@ namespace storage
         record.launchBehavior = boundedText(raw.launch_behavior, MAX_BEHAVIOR_BYTES)
         record.launchOffer = raw.launch_offer = "1"
         record.usedAt = seconds(raw.used_at)
-        record.accountId = boundedText(raw.account, MAX_ID_BYTES)
-        record.profileId = boundedText(raw.profile, MAX_ID_BYTES)
-        record.servers = decodeServers(serversRaw[SERVERS_KEY], record.origin)
-        if record.origin = ""
-            record.accountId = ""
-            record.profileId = ""
-            return record
-        end if
-        record.serverName = boundedText(raw.server_name, MAX_NAME_BYTES)
-        access = boundedText(raw.access_token, MAX_TOKEN_BYTES)
-        refresh = boundedText(raw.refresh_token, MAX_TOKEN_BYTES)
-        if access = "" or refresh = "" then return record
-        record.accessToken = access
-        record.refreshToken = refresh
-        record.expiresAt = seconds(raw.expires_at)
-        record.refreshAt = seconds(raw.refresh_at)
-        record.profileTokens = decodeProfileTokens(raw.profile_tokens)
+        servers = decodeServers(accountsRaw[SERVERS_KEY])
+        accounts = decodeAccounts(accountsRaw, servers)
+        ' The active server's entry, if it has one, names it.
+        for i = 0 to servers.Count() - 1
+            if servers[i].origin = record.origin
+                record.serverName = servers[i].name
+                record.serverLabel = servers[i].label
+                servers.Delete(i)
+                exit for
+            end if
+        end for
+        while servers.Count() > MAX_SAVED_SERVERS
+            servers.Pop()
+        end while
+        record.servers = servers
+        active = ""
+        if record.origin <> "" then active = boundedText(raw.active, MAX_ID_BYTES)
+        others = []
+        for each account in accounts
+            if active <> "" and account.id = active and account.origin = record.origin
+                unpack(record, account)
+            else
+                others.Push(account)
+            end if
+        end for
+        record.accounts = others
         return record
     end function
 
-    ' The raw section for a record: strings by key, empty values left out.
+    ' SECTION_NAME's raw values for a record: strings by key, empty values
+    ' left out.
     function encode(record as Object) as Object
         layout = VERSION
         if util.isNumber(record.version) and record.version > VERSION then layout = record.version
@@ -148,31 +214,96 @@ namespace storage
         put(raw, "launch_behavior", record.launchBehavior, MAX_BEHAVIOR_BYTES)
         if util.isTrue(record.launchOffer) then raw.launch_offer = "1"
         if util.isNumber(record.usedAt) and record.usedAt > 0 then raw.used_at = record.usedAt.ToStr()
-        put(raw, "account", record.accountId, MAX_ID_BYTES)
-        put(raw, "profile", record.profileId, MAX_ID_BYTES)
-        put(raw, "server_name", record.serverName, MAX_NAME_BYTES)
-        put(raw, "access_token", record.accessToken, MAX_TOKEN_BYTES)
-        put(raw, "refresh_token", record.refreshToken, MAX_TOKEN_BYTES)
-        if not raw.DoesExist("access_token") or not raw.DoesExist("refresh_token")
-            raw.Delete("access_token")
-            raw.Delete("refresh_token")
-            return raw
-        end if
-        if util.isNumber(record.expiresAt) and record.expiresAt > 0 then raw.expires_at = record.expiresAt.ToStr()
-        if util.isNumber(record.refreshAt) and record.refreshAt > 0 then raw.refresh_at = record.refreshAt.ToStr()
-        tokens = encodeProfileTokens(record.profileTokens)
-        if tokens <> "" then raw.profile_tokens = tokens
+        if util.isString(record.origin) and record.origin <> "" then put(raw, "active", record.accountId, MAX_ID_BYTES)
         return raw
+    end function
+
+    ' ACCOUNTS_SECTION's raw values for a record, within
+    ' ACCOUNTS_BUDGET_BYTES: the servers' list, the active server first, and
+    ' each account's entry, the active one included. now stamps the active
+    ' account's use.
+    function encodeAccounts(record as Object, now = 0 as Integer) as Object
+        servers = []
+        if util.isString(record.origin) and record.origin <> "" then servers.Push({ origin: record.origin, name: record.serverName, label: record.serverLabel, usedAt: now })
+        if type(record.servers) = "roArray" then servers.Append(record.servers)
+        list = []
+        seen = {}
+        for each server in servers
+            entry = serverEntry(server)
+            if entry <> invalid and not seen.DoesExist(entry.origin) and list.Count() <= MAX_SAVED_SERVERS
+                seen[entry.origin] = true
+                list.Push(entry)
+            end if
+        end for
+        ' Most recently used first: the active account, then the others in
+        ' their order; an account whose server is not saved is not kept.
+        accounts = []
+        active = invalid
+        if util.isString(record.accountId) then active = activeAccount(record, now)
+        if active <> invalid then accounts.Push(active)
+        if type(record.accounts) = "roArray" then accounts.Append(record.accounts)
+        entries = []
+        ids = {}
+        for each account in accounts
+            entry = accountEntry(account)
+            if entry <> invalid and seen.DoesExist(entry.server) and not ids.DoesExist(account.id) and entries.Count() < MAX_ACCOUNTS
+                ids[account.id] = true
+                entries.Push({ key: ACCOUNT_PREFIX + account.id, entry: entry })
+            end if
+        end for
+        while true
+            raw = {}
+            if list.Count() > 0 then raw[SERVERS_KEY] = FormatJson(list)
+            for each item in entries
+                raw[item.key] = FormatJson(item.entry)
+            end for
+            if bytes(raw) <= ACCOUNTS_BUDGET_BYTES or not shed(entries) then return raw
+        end while
+        return {}
+    end function
+
+    ' Makes room in the least recently used entry that has something to
+    ' give, the active account's last: its profile list, then its session,
+    ' then the entry. Gives whether anything went.
+    function shed(entries as Object) as Boolean
+        for i = entries.Count() - 1 to 0 step -1
+            if entries[i].entry.DoesExist("profiles")
+                entries[i].entry.Delete("profiles")
+                return true
+            end if
+        end for
+        for i = entries.Count() - 1 to 1 step -1
+            if entries[i].entry.DoesExist("access_token")
+                signOutEntry(entries[i].entry)
+                return true
+            end if
+        end for
+        if entries.Count() < 2 then return false
+        entries.Pop()
+        return true
     end function
 
     ' Writes the raw section's changed keys, deletes the managed keys it lacks,
     ' and flushes. Gives whether every write, delete, and the flush succeeded;
     ' after a failure the section may hold part of raw, and the next write
     ' compares again, so it retries just the keys that still differ.
-    ' managed lists the keys it manages, "|"-separated (KEYS, or SERVERS_KEYS).
+    ' managed lists the keys it manages, "|"-separated (KEYS), or ALL_KEYS
+    ' for every key in the section (ACCOUNTS_SECTION).
     function write(section as Object, raw as Object, managed = KEYS as String) as Boolean
         ok = true
-        for each key in managed.Split("|")
+        names = []
+        if managed = ALL_KEYS
+            ' GetKeyList gives an roList, which Append does not take.
+            for each key in section.GetKeyList()
+                names.Push(key)
+            end for
+            for each key in raw
+                if not section.Exists(key) then names.Push(key)
+            end for
+        else
+            names = managed.Split("|")
+        end if
+        for each key in names
             if raw.DoesExist(key)
                 if not section.Exists(key) or section.Read(key) <> raw[key]
                     if not section.Write(key, raw[key]) then ok = false
@@ -240,9 +371,10 @@ namespace storage
         return total
     end function
 
-    ' The most the section can hold: every managed key with a value at its bound.
+    ' The most SECTION_NAME can hold: every managed key with a value at its
+    ' bound.
     function maxBytes() as Integer
-        values = { schema: MAX_SECONDS_BYTES, origin: MAX_ORIGIN_BYTES, device: MAX_ID_BYTES, account: MAX_ID_BYTES, profile: MAX_ID_BYTES, access_token: MAX_TOKEN_BYTES, refresh_token: MAX_TOKEN_BYTES, expires_at: MAX_SECONDS_BYTES, refresh_at: MAX_SECONDS_BYTES, profile_tokens: MAX_PROFILE_TOKENS_BYTES, pairing_key: PAIRING_KEY_BYTES, server_name: MAX_NAME_BYTES, launch_behavior: MAX_BEHAVIOR_BYTES, launch_offer: 1, used_at: MAX_SECONDS_BYTES }
+        values = { schema: MAX_SECONDS_BYTES, origin: MAX_ORIGIN_BYTES, device: MAX_ID_BYTES, active: MAX_ID_BYTES, pairing_key: PAIRING_KEY_BYTES, launch_behavior: MAX_BEHAVIOR_BYTES, launch_offer: 1, used_at: MAX_SECONDS_BYTES }
         total = 0
         for each key in KEYS.Split("|")
             total = total + Len(key) + values[key]
@@ -251,7 +383,7 @@ namespace storage
     end function
 
     ' X-Silo-Device-Id (spec section 7.4): letters, digits, ".", "_", ":", and
-    ' "-", at most 128 characters.
+    ' "-", at most 128 characters. Account IDs follow the same rule.
     function isDeviceId(value as Dynamic) as Boolean
         if not util.isString(value) or value = "" or Len(value) > MAX_ID_BYTES then return false
         for i = 1 to Len(value)
@@ -280,46 +412,17 @@ namespace storage
         return value.ToInt()
     end function
 
-    ' The saved servers' section for a record's servers: their JSON under
-    ' SERVERS_KEY within SERVERS_BUDGET_BYTES, or nothing for none. Past the
-    ' budget the oldest server still signed in loses its session, then,
-    ' once none is, the oldest server goes.
-    function encodeServers(list as Dynamic) as Object
-        kept = []
-        if type(list) = "roArray"
-            for each entry in list
-                server = serverEntry(entry)
-                if server <> invalid and kept.Count() < MAX_SAVED_SERVERS then kept.Push(server)
-            end for
-        end if
-        while kept.Count() > 0
-            text = FormatJson(kept)
-            if byteLength(SERVERS_KEY) + byteLength(text) <= SERVERS_BUDGET_BYTES then return { list: text }
-            dropped = false
-            for i = kept.Count() - 1 to 0 step -1
-                if kept[i].DoesExist("access_token")
-                    signOutEntry(kept[i])
-                    dropped = true
-                    exit for
-                end if
-            end for
-            if not dropped then kept.Pop()
-        end while
-        return {}
-    end function
-
-    ' The saved servers a section's list holds, most recently used first:
-    ' each origin once, never current's, at most MAX_SAVED_SERVERS.
-    function decodeServers(text as Dynamic, current as String) as Object
+    ' The saved servers a list's JSON holds, most recently used first, each
+    ' origin once.
+    function decodeServers(text as Dynamic) as Object
         out = []
         if not util.isString(text) or Left(text, 1) <> "[" then return out
         list = ParseJson(text)
         if type(list) <> "roArray" then return out
         seen = {}
-        if current <> "" then seen[current] = true
         for each entry in list
             server = decodeServer(entry)
-            if server <> invalid and not seen.DoesExist(server.origin) and out.Count() < MAX_SAVED_SERVERS
+            if server <> invalid and not seen.DoesExist(server.origin) and out.Count() <= MAX_SAVED_SERVERS
                 seen[server.origin] = true
                 out.Push(server)
             end if
@@ -331,49 +434,131 @@ namespace storage
         if not util.isObject(entry) then return invalid
         origin = api.request.baseUrl(entry.origin)
         if origin = invalid or origin <> entry.origin or not fits(origin, MAX_ORIGIN_BYTES) then return invalid
-        server = { origin: origin, name: boundedText(entry.name, MAX_NAME_BYTES), accountId: boundedText(entry.account, MAX_ID_BYTES), profileId: boundedText(entry.profile, MAX_ID_BYTES), accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileTokens: [], usedAt: seconds(entry.used_at) }
-        access = boundedText(entry.access_token, MAX_TOKEN_BYTES)
-        refresh = boundedText(entry.refresh_token, MAX_TOKEN_BYTES)
-        if access = "" or refresh = "" then return server
-        server.accessToken = access
-        server.refreshToken = refresh
-        server.expiresAt = seconds(entry.expires_at)
-        server.refreshAt = seconds(entry.refresh_at)
-        server.profileTokens = decodeProfileTokens(entry.profile_tokens)
-        return server
+        return { origin: origin, name: boundedText(entry.name, MAX_NAME_BYTES), label: boundedText(entry.label, MAX_NAME_BYTES), usedAt: seconds(entry.used_at) }
     end function
 
-    ' A saved server as stored: strings by key, empty values left out, or
-    ' invalid for one without a valid origin.
+    ' A saved server as stored, or invalid for one without a valid origin.
     function serverEntry(server as Dynamic) as Dynamic
         if not util.isObject(server) then return invalid
         origin = api.request.baseUrl(server.origin)
         if origin = invalid or origin <> server.origin or not fits(origin, MAX_ORIGIN_BYTES) then return invalid
         out = { origin: origin }
         put(out, "name", server.name, MAX_NAME_BYTES)
-        put(out, "account", server.accountId, MAX_ID_BYTES)
-        put(out, "profile", server.profileId, MAX_ID_BYTES)
+        put(out, "label", server.label, MAX_NAME_BYTES)
         if util.isNumber(server.usedAt) and server.usedAt > 0 then out.used_at = server.usedAt.ToStr()
-        put(out, "access_token", server.accessToken, MAX_TOKEN_BYTES)
-        put(out, "refresh_token", server.refreshToken, MAX_TOKEN_BYTES)
+        return out
+    end function
+
+    ' The accounts ACCOUNTS_SECTION holds whose server is saved, most
+    ' recently used first.
+    function decodeAccounts(accountsRaw as Object, servers as Object) as Object
+        saved = {}
+        for each server in servers
+            saved[server.origin] = true
+        end for
+        out = []
+        for each key in accountsRaw
+            if Left(key, Len(ACCOUNT_PREFIX)) = ACCOUNT_PREFIX
+                account = decodeAccount(Mid(key, Len(ACCOUNT_PREFIX) + 1), accountsRaw[key])
+                if account <> invalid and saved.DoesExist(account.origin) then out.Push(account)
+            end if
+        end for
+        out.SortBy("usedAt", "r")
+        while out.Count() > MAX_ACCOUNTS
+            out.Pop()
+        end while
+        return out
+    end function
+
+    function decodeAccount(id as String, text as Dynamic) as Dynamic
+        if not isDeviceId(id) or not util.isString(text) or Left(text, 1) <> "{" then return invalid
+        entry = ParseJson(text)
+        if not util.isObject(entry) then return invalid
+        origin = api.request.baseUrl(entry.server)
+        if origin = invalid or origin <> entry.server then return invalid
+        account = newAccount(id, origin, seconds(entry.added_at))
+        account.usedAt = seconds(entry.used_at)
+        account.serverUserId = boundedText(entry.user, MAX_ID_BYTES)
+        account.username = boundedText(entry.username, MAX_NAME_BYTES)
+        account.profileId = boundedText(entry.profile, MAX_ID_BYTES)
+        account.legacyKeys = entry.legacy = "1"
+        account.profiles = decodeProfiles(entry.profiles)
+        access = boundedText(entry.access_token, MAX_TOKEN_BYTES)
+        refresh = boundedText(entry.refresh_token, MAX_TOKEN_BYTES)
+        if access = "" or refresh = "" then return account
+        account.accessToken = access
+        account.refreshToken = refresh
+        account.expiresAt = seconds(entry.expires_at)
+        account.refreshAt = seconds(entry.refresh_at)
+        account.profileTokens = decodeProfileTokens(entry.profile_tokens)
+        return account
+    end function
+
+    ' An account as stored: strings by key, empty values left out, or
+    ' invalid for one without an ID or a valid server.
+    function accountEntry(account as Dynamic) as Dynamic
+        if not util.isObject(account) or not isDeviceId(account.id) then return invalid
+        origin = api.request.baseUrl(account.origin)
+        if origin = invalid or origin <> account.origin or not fits(origin, MAX_ORIGIN_BYTES) then return invalid
+        out = { server: origin }
+        put(out, "user", account.serverUserId, MAX_ID_BYTES)
+        put(out, "username", account.username, MAX_NAME_BYTES)
+        put(out, "profile", account.profileId, MAX_ID_BYTES)
+        if util.isNumber(account.addedAt) and account.addedAt > 0 then out.added_at = account.addedAt.ToStr()
+        if util.isNumber(account.usedAt) and account.usedAt > 0 then out.used_at = account.usedAt.ToStr()
+        if util.isTrue(account.legacyKeys) then out.legacy = "1"
+        profiles = encodeProfiles(account.profiles)
+        if profiles.Count() > 0 then out.profiles = profiles
+        put(out, "access_token", account.accessToken, MAX_TOKEN_BYTES)
+        put(out, "refresh_token", account.refreshToken, MAX_TOKEN_BYTES)
         if not out.DoesExist("access_token") or not out.DoesExist("refresh_token")
             signOutEntry(out)
             return out
         end if
-        if util.isNumber(server.expiresAt) and server.expiresAt > 0 then out.expires_at = server.expiresAt.ToStr()
-        if util.isNumber(server.refreshAt) and server.refreshAt > 0 then out.refresh_at = server.refreshAt.ToStr()
-        tokens = encodeProfileTokens(server.profileTokens)
+        if util.isNumber(account.expiresAt) and account.expiresAt > 0 then out.expires_at = account.expiresAt.ToStr()
+        if util.isNumber(account.refreshAt) and account.refreshAt > 0 then out.refresh_at = account.refreshAt.ToStr()
+        tokens = encodeProfileTokens(account.profileTokens)
         if tokens <> "" then out.profile_tokens = tokens
         return out
     end function
 
-    ' A stored saved server without its session; its account and profile
-    ' stay, so signing in to it again reopens that profile.
+    ' A stored account without its session; its username, profile, and
+    ' profile list stay, so its tiles show "Sign in again".
     sub signOutEntry(entry as Object)
         for each key in ["access_token", "refresh_token", "expires_at", "refresh_at", "profile_tokens"]
             entry.Delete(key)
         end for
     end sub
+
+    ' The profiles a stored list holds, in its order.
+    function decodeProfiles(list as Dynamic) as Object
+        out = []
+        if type(list) <> "roArray" then return out
+        for each entry in list
+            if util.isObject(entry)
+                id = boundedText(entry.id, MAX_ID_BYTES)
+                if id <> "" and out.Count() < MAX_PROFILES then out.Push({ id: id, name: boundedText(entry.name, MAX_NAME_BYTES), hasPin: entry.pin = true, isChild: entry.child = true, avatarUrl: boundedText(entry.avatar, MAX_AVATAR_BYTES) })
+            end if
+        end for
+        return out
+    end function
+
+    ' A profile list (api.auth.profiles.list's items) as stored.
+    function encodeProfiles(list as Dynamic) as Object
+        out = []
+        if type(list) <> "roArray" then return out
+        for each profile in list
+            if util.isObject(profile) and boundedText(profile.id, MAX_ID_BYTES) <> "" and out.Count() < MAX_PROFILES
+                entry = { id: profile.id }
+                put(entry, "name", profile.name, MAX_NAME_BYTES)
+                put(entry, "avatar", profile.avatarUrl, MAX_AVATAR_BYTES)
+                if util.isTrue(profile.hasPin) then entry.pin = true
+                if util.isTrue(profile.isChild) then entry.child = true
+                out.Push(entry)
+            end if
+        end for
+        return out
+    end function
 
     function decodeProfileTokens(text as Dynamic) as Object
         out = []

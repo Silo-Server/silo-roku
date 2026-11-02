@@ -1,0 +1,178 @@
+import "pkg:/source/api/session.bs"
+import "pkg:/source/home/shell.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/onboarding/address.bs"
+import "pkg:/source/util/i18n.bs"
+
+' Settings › Accounts (docs/spec.md section 7.5), the rail's "server"
+' category: for each saved server, the active one first, its accounts with
+' how many profiles each has, Add an account on it, Rename Server, and
+' Remove Server, which signs out of every account on it; then Add a
+' server. OK on an account asks to sign out of it, or to sign in again when
+' it needs to. Part of SettingsScreen, which calls accountsRows from
+' showCategory and accountsActivate from activate.
+
+' Builds the category's rows into group: m.accountRows says what each is,
+' { kind, origin, accountId, name, signedIn }, kind "account", "addAccount",
+' "rename", "remove", or "addServer".
+sub accountsRows(group as Object)
+    m.accountRows = []
+    session = api.session.current()
+    if session = invalid or type(session.servers) <> "roArray" then return
+    accounts = []
+    if type(session.accounts) = "roArray" then accounts = session.accounts
+    for each server in session.servers
+        origin = util.text(server.origin)
+        name = util.text(server.name).Trim()
+        if name = "" then name = onboarding.address.hostOf(origin)
+        heading = "server|" + origin
+        for each account in accounts
+            if util.text(account.origin) = origin
+                row = accountsRow(group, heading, name, i18n.text("settings.accounts.account"), true)
+                if util.text(account.username) <> "" then row.title.text = account.username
+                row.value.text = accountValue(account)
+                m.accountRows.Push({ kind: "account", origin: origin, accountId: util.text(account.id), name: name, username: util.text(account.username), signedIn: util.isTrue(account.signedIn), current: util.isTrue(account.current) })
+            end if
+        end for
+        accountsRow(group, heading, name, i18n.text("settings.accounts.addAccount", { server: name }), true)
+        m.accountRows.Push({ kind: "addAccount", origin: origin, accountId: "", name: name })
+        row = accountsRow(group, heading, name, i18n.text("settings.accounts.rename"), true)
+        row.value.text = onboarding.address.hostOf(origin)
+        m.accountRows.Push({ kind: "rename", origin: origin, accountId: "", name: name, label: util.text(server.label) })
+        accountsRow(group, heading, name, i18n.text("settings.accounts.remove"), false)
+        m.accountRows.Push({ kind: "remove", origin: origin, accountId: "", name: name })
+    end for
+    accountsRow(group, "addServer", "", i18n.text("settings.accounts.addServer"), true)
+    m.accountRows.Push({ kind: "addServer", origin: "", accountId: "", name: "" })
+end sub
+
+function accountsRow(group as Object, section as String, name as String, title as String, hasChevron as Boolean) as Object
+    row = makeRow(group, "accounts." + m.rows.Count().ToStr(), hasChevron)
+    row.title.text = title
+    row.section.text = UCase(name)
+    m.rows.Push(row)
+    m.rowSections.Push(section)
+    return row
+end function
+
+' "3 profiles", "1 profile", or "Sign in again".
+function accountValue(account as Object) as String
+    if not util.isTrue(account.signedIn) then return i18n.text("profiles.signInAgain")
+    count = 0
+    if type(account.profiles) = "roArray" then count = account.profiles.Count()
+    if count = 0 then return ""
+    if count = 1 then return i18n.text("settings.accounts.oneProfile")
+    return i18n.text("settings.accounts.profiles", { count: count.ToStr() })
+end function
+
+' OK on the focused row; true when focus moved to a dialog or another
+' screen.
+function accountsActivate() as Boolean
+    if m.at < 0 or m.at >= m.accountRows.Count() then return false
+    row = m.accountRows[m.at]
+    session = api.session.current()
+    if row.kind = "addServer"
+        nav.push(nav.route.SETUP, { pushed: true })
+        return true
+    end if
+    if row.kind = "addAccount"
+        if session <> invalid and session.status = "signed_in" and row.origin = session.origin
+            ' The account open now stays saved; Back comes back here.
+            nav.push(nav.route.SIGN_IN, { pushed: true })
+        else
+            accountsSend("signInOn", row)
+        end if
+        return true
+    end if
+    if row.kind = "rename"
+        m.accountsRow = row
+        if m.keyboard = invalid
+            m.keyboard = m.top.createChild("KeyboardPanel")
+            m.keyboard.observeField("closed", "onRenameClosed")
+        end if
+        m.keyboard.callFunc("open", { title: i18n.text("settings.accounts.renameTitle", { server: row.name }), text: row.name, hint: "", secure: false, revealable: false, domain: "alphanumeric", maxLength: 64 })
+        return true
+    end if
+    m.accountsRow = row
+    m.dialog = m.top.createChild("SignOutDialog")
+    if row.kind = "remove"
+        m.dialog.copy = { title: i18n.text("settings.accounts.removeTitle", { server: row.name }), message: i18n.text("settings.accounts.removeMessage", { server: row.name }), confirm: i18n.text("settings.accounts.removeConfirm"), cancel: i18n.text("shell.signOut.cancel"), destructive: true }
+    else if row.signedIn
+        title = i18n.text("shell.signOut.title")
+        if row.username <> "" then title = i18n.text("shell.signOut.titleNamed", { account: row.username, server: row.name })
+        m.dialog.copy = { title: title, message: i18n.text("shell.signOut.messageAccount"), confirm: i18n.text("shell.signOut.confirm"), cancel: i18n.text("shell.signOut.cancel"), destructive: true }
+    else
+        ' Expired: signing in again is offered first; signing out stays
+        ' a choice, never the default.
+        m.dialog.copy = { title: i18n.text("settings.accounts.expiredTitle", { account: accountName(row), server: row.name }), message: i18n.text("settings.accounts.expiredMessage"), confirm: i18n.text("settings.accounts.signInAgain"), remove: i18n.text("shell.signOut.confirm"), cancel: i18n.text("shell.signOut.cancel"), destructive: false }
+    end if
+    m.dialog.observeField("choice", "onAccountsChoice")
+    m.dialog.setFocus(true)
+    return true
+end function
+
+function accountName(row as Object) as String
+    if row.username <> "" then return row.username
+    return i18n.text("settings.accounts.account")
+end function
+
+sub onAccountsChoice()
+    choice = m.dialog.choice
+    row = m.accountsRow
+    closeDialog()
+    if row = invalid or choice = "cancel" then return
+    if row.kind = "remove"
+        if choice = "confirm" then accountsSend("forgetServer", row)
+    else if row.signedIn
+        if choice = "confirm" then accountsSend("signOut", row)
+    else if choice = "confirm"
+        ' The account becomes active, and sign-in asks for it.
+        accountsSend("useAccount", row)
+    else if choice = "remove"
+        accountsSend("signOut", row)
+    end if
+end sub
+
+sub onRenameClosed()
+    label = m.keyboard.callFunc("takeText").Trim()
+    focusScreen()
+    row = m.accountsRow
+    if row = invalid or label = row.name then return
+    accountsSend("renameServer", row, label)
+end sub
+
+' One account or server change; the rows are built again from the session
+' it publishes. Signing out of the active account, or a change of account or
+' server, starts the app over (nav.phase), which releases this screen.
+sub accountsSend(op as String, row as Object, label = "" as String)
+    handle = api.newHandle(m.top.owner)
+    handle.observeField("status", "onAccountsChanged")
+    if op = "signInOn"
+        api.session.signInOn(row.origin, handle)
+    else if op = "forgetServer"
+        api.session.forgetServer(row.origin, handle)
+    else if op = "signOut"
+        api.session.signOut(handle, row.accountId)
+    else if op = "useAccount"
+        api.session.useAccount(row.accountId, "", handle)
+    else if op = "renameServer"
+        api.session.renameServer(row.origin, label, handle)
+    end if
+end sub
+
+sub onAccountsChanged(event as Object)
+    if m.released then return
+    result = api.resultOf(event.getRoSGNode())
+    if not result.ok
+        notice("settings.saveFailed", true)
+        return
+    end if
+    if m.category <> "server" then return
+    at = m.at
+    showCategory()
+    m.at = at
+    clampFocus()
+    paint()
+    describeFocus()
+end sub

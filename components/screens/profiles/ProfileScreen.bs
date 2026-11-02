@@ -9,12 +9,27 @@ import "pkg:/source/onboarding/profiles.bs"
 ' the avatars 84 px under that.
 const ACCOUNT_GAP = 14
 const GRID_GAP = 84
-' At most this many rows show; more scroll.
+' At most this many rows of a grid show; more scroll.
 const VISIBLE_ROWS = 2
 ' Change server and Sign out, compact buttons 20 px apart, pinned EDGE px
 ' above the bottom; the heading and grid are centred between EDGE and them.
 const FOOTER_GAP = 20
 const EDGE = 60
+' Several servers (docs/spec.md section 7.5): the sections start
+' SECTIONS_TOP_GAP under the title at SECTIONS_LEFT, SECTION_GAP apart, each
+' headed by the server's 44 px mark and, MARK_GAP after it, its name, the
+' avatars HEADER_GAP under the header, clipped to the room between the
+' title and the buttons, where sections that do not fit scroll.
+const SECTIONS_LEFT = 120
+const SECTIONS_TOP_GAP = 36
+const SECTION_GAP = 24
+const MARK_SIZE = 44
+const MARK_GAP = 16
+const HEADER_GAP = 8
+' A tile with the account's username under its name is this much taller.
+const DETAIL_HEIGHT = 34
+' The clip keeps this much room above a section for its focused tiles' ring.
+const RING_ROOM = 24
 
 sub init()
     m.mesh = m.top.findNode("mesh")
@@ -30,10 +45,7 @@ sub init()
     m.accountHeight = Int(m.subtitle.boundingRect().height)
     m.subtitle.text = ""
     m.accountText = ""
-    m.grid = m.top.findNode("grid")
-    m.grid.itemSize = [onboarding.profiles.COLUMN, onboarding.profiles.TILE_HEIGHT]
-    m.grid.itemSpacing = [0, onboarding.profiles.ROW_PITCH - onboarding.profiles.TILE_HEIGHT]
-    m.grid.observeField("itemSelected", "onProfileSelected")
+    m.sectionLayer = m.top.findNode("sections")
     m.status = m.top.findNode("status")
     m.status.observeField("activated", "onRetry")
     m.buttonRow = m.top.findNode("buttons")
@@ -43,18 +55,33 @@ sub init()
     m.spinner = m.top.findNode("spinner")
     m.textures = nav.textures.create()
     nav.textures.addPoster(m.textures, m.mesh)
-    nav.textures.addList(m.textures, m.grid)
+    ' The active account's profiles as just listed, or invalid before (or
+    ' when the list could not load: its saved one stands in).
+    m.live = invalid
+    ' The active account's profiles, listed or saved.
     m.profiles = []
+    ' onboarding.profiles.sections, and the ones built: each { origin,
+    ' name, tiles, group, grid, rows }; m.at is the one with focus.
+    m.sectionList = []
+    m.sections = []
+    m.at = 0
+    ' Profiles a saved account listed since the screen opened, by account
+    ' ID (refreshOthers), and the requests asking.
+    m.listed = {}
+    m.refreshes = {}
+    m.stale = false
     ' "loading", "opening", "picking", or "error".
     m.state = "loading"
     m.errorKey = ""
     m.request = invalid
     m.dialog = invalid
+    m.dialogKind = ""
+    m.addChoices = []
     m.choosing = false
     ' The focus key a rebuilt picker returns to (Screen.xml onShow).
     m.restore = invalid
-    ' Add profile shows (the household has a primary profile), and the add
-    ' flow (PIN, New Profile) was opened from it.
+    ' Add profile is offered (the household has a primary profile), and the
+    ' add flow (PIN, New Profile) was opened from it.
     m.canAdd = false
     m.adding = false
     m.reload = invalid
@@ -77,6 +104,8 @@ sub onShow(event as Object)
         else
             loadProfiles()
         end if
+    else if m.stale and m.state = "picking"
+        rebuild(event.restore)
     else if nav.textures.restore(m.textures)
         restoreTile(event.restore)
     end if
@@ -105,16 +134,16 @@ sub onRelease()
     closeDialog()
 end sub
 
-' The viewer's way back from PIN, or the first focus: the grid when it
-' shows, Try again on an error, otherwise the buttons.
+' The viewer's way back from PIN, or the first focus: the grid with focus
+' when tiles show, Try again on an error, otherwise the buttons.
 sub focusPicker()
     ' Covered (the Companion screen's "You're all set" over a picker whose
     ' list is still on its way): the screen on top keeps focus, and onShow
     ' takes it back.
     if not m.top.visible then return
-    if m.state = "picking" and m.profiles.Count() > 0
+    if m.state = "picking" and m.sections.Count() > 0
         highlightAt(invalid)
-        m.grid.setFocus(true)
+        m.sections[m.at].grid.setFocus(true)
     else if m.state = "error" and m.status.action <> ""
         highlightAt(invalid)
         m.status.setFocus(true)
@@ -126,13 +155,22 @@ sub focusPicker()
     end if
 end sub
 
+' The active account's profiles are listed first, so a profile it no longer
+' has never reopens; with no account active, the picker shows what is
+' saved.
 sub loadProfiles()
     m.state = "loading"
     m.errorKey = ""
     m.top.prompting = false
-    send("onProfiles")
-    api.session.profiles(m.request)
+    session = api.session.current()
+    if session <> invalid and session.status = "signed_in"
+        send("onProfiles")
+        api.session.profiles(m.request)
+        refresh()
+        return
+    end if
     refresh()
+    decide()
 end sub
 
 sub onRetry()
@@ -143,16 +181,39 @@ end sub
 sub onProfiles(event as Object)
     result = takeResult(event)
     if result = invalid then return
-    if not result.ok
-        showError(onboarding.profiles.loadErrorKey(result))
-        return
+    if result.ok
+        m.live = api.auth.profiles.list(result.body)
+        if m.live.Count() = 0 and onboarding.profiles.tileCount(onboarding.profiles.sections(api.session.current(), m.live)) <= 1
+            showError("profiles.empty")
+            return
+        end if
+    else
+        ' Offline, the saved lists stand in, when there are any (spec: the
+        ' picker opens from them).
+        m.live = invalid
+        if not hasSavedProfiles()
+            showError(onboarding.profiles.loadErrorKey(result))
+            return
+        end if
     end if
-    m.profiles = api.auth.profiles.list(result.body)
-    if m.profiles.Count() = 0
-        showError("profiles.empty")
-        return
-    end if
+    decide()
+end sub
+
+function hasSavedProfiles() as Boolean
     session = api.session.current()
+    if session = invalid or type(session.accounts) <> "roArray" then return false
+    for each account in session.accounts
+        if type(account.profiles) = "roArray" and account.profiles.Count() > 0 then return true
+    end for
+    return false
+end function
+
+' Opens the remembered or only profile, as Profile Selection says, or shows
+' the picker.
+sub decide()
+    session = api.session.current()
+    m.sectionList = sectionsNow(session)
+    m.profiles = activeProfiles(session)
     rememberedId = ""
     if session <> invalid then rememberedId = session.rememberedProfileId
     ' The open profile whose token the server refused reopens, which asks for
@@ -162,8 +223,9 @@ sub onProfiles(event as Object)
     m.choosing = util.isObject(params) and util.isTrue(params.choose)
     launch = invalid
     if session <> invalid then launch = session.launch
+    signedIn = session <> invalid and session.status = "signed_in"
     ' A picker rebuilt under memory pressure (PIN cancelled) is still choosing.
-    choice = onboarding.profiles.onLoad(m.profiles, rememberedId, m.choosing or m.restore <> invalid, launch)
+    choice = onboarding.profiles.onTiles(m.profiles, rememberedId, m.choosing or m.restore <> invalid or not signedIn, launch, onboarding.profiles.tileCount(m.sectionList))
     if choice.action = onboarding.profiles.OPEN
         openProfile(choice.profile, true)
         return
@@ -172,75 +234,176 @@ sub onProfiles(event as Object)
     if m.restore <> invalid
         restoreTile(m.restore)
     else
-        m.grid.jumpToItem = onboarding.profiles.focusIndex(m.profiles, rememberedId)
+        focusOn(initialKey(session, rememberedId))
     end if
     m.restore = invalid
+    refreshOthers()
+end sub
+
+' Focus starts on the profile last opened in the active account (tvOS),
+' or, right after a sign-in, on the new account's first tile.
+function initialKey(session as Dynamic, rememberedId as String) as String
+    if session = invalid then return ""
+    accountId = util.text(session.accountId)
+    if rememberedId <> "" and not (util.isObject(session.launch) and util.isTrue(session.launch.afterSignIn)) then return accountId + "|" + rememberedId
+    for each section in m.sectionList
+        for each tile in section.tiles
+            if tile.accountId = accountId and accountId <> "" then return tile.key
+        end for
+    end for
+    return ""
+end function
+
+' The sections for the session, with the profiles saved accounts listed
+' since the screen opened in place of the ones the session saved.
+function sectionsNow(session as Dynamic) as Object
+    if session = invalid then return []
+    if m.listed.Count() > 0 and type(session.accounts) = "roArray"
+        accounts = []
+        for each account in session.accounts
+            copy = {}
+            copy.Append(account)
+            if m.listed.DoesExist(util.text(account.id)) then copy.profiles = m.listed[account.id]
+            accounts.Push(copy)
+        end for
+        view = {}
+        view.Append(session)
+        view.accounts = accounts
+        session = view
+    end if
+    return onboarding.profiles.sections(session, m.live)
+end function
+
+' The active account's profiles: as listed, else as saved.
+function activeProfiles(session as Dynamic) as Object
+    if m.live <> invalid then return m.live
+    if session = invalid or type(session.accounts) <> "roArray" then return []
+    for each account in session.accounts
+        if util.isTrue(account.current) and type(account.profiles) = "roArray" then return account.profiles
+    end for
+    return []
+end function
+
+' Lists every other signed-in account's profiles again, behind the picker.
+sub refreshOthers()
+    session = api.session.current()
+    if session = invalid or type(session.accounts) <> "roArray" then return
+    for each account in session.accounts
+        id = util.text(account.id)
+        if not util.isTrue(account.current) and util.isTrue(account.signedIn) and not m.refreshes.DoesExist(id)
+            handle = api.newHandle(m.top.owner)
+            handle.addFields({ accountId: id })
+            handle.observeField("status", "onAccountListed")
+            m.refreshes[id] = handle
+            api.session.refreshAccount(id, handle)
+        end if
+    end for
+end sub
+
+' A saved account's profiles came back: its tiles show them, keeping focus.
+' One that needs to sign in again now shows that.
+sub onAccountListed(event as Object)
+    handle = event.getRoSGNode()
+    result = api.resultOf(handle)
+    if not result.ok or not util.isObject(result.body) then return
+    id = handle.accountId
+    before = FormatJson(m.sectionList)
+    if type(result.body.profiles) = "roArray" then m.listed[id] = result.body.profiles
+    if m.state <> "picking" then return
+    after = sectionsNow(api.session.current())
+    if FormatJson(after) = before then return
+    if not m.top.visible
+        m.stale = true
+        return
+    end if
+    rebuild(focusKey())
+end sub
+
+' Builds the sections again from the session, focus on key.
+sub rebuild(key as Dynamic)
+    m.stale = false
+    m.sectionList = sectionsNow(api.session.current())
+    m.sections = []
+    showPicker()
+    if key <> invalid then restoreTile(key)
 end sub
 
 ' The focused tile, kept when PIN covers the picker (spec section 5.3).
 function focusKey() as Dynamic
-    return keyAt(m.grid.itemFocused)
+    if m.state <> "picking" or m.sections.Count() = 0 then return invalid
+    section = m.sections[m.at]
+    index = section.grid.itemFocused
+    keys = tileKeys(section)
+    if index < 0 or index >= keys.Count() then return invalid
+    return nav.focus.newKey(section.key, keys[index], m.at, index)
 end function
 
-' The focus key of the tile at index: a profile's ID, or
-' onboarding.profiles.ADD_TILE for Add profile, so a picker rebuilt under
-' memory pressure returns to it after the add flow.
-function keyAt(index as Integer) as Dynamic
-    ids = tileIds()
-    if m.state <> "picking" or index < 0 or index >= ids.Count() then return invalid
-    return nav.focus.newKey("profiles", ids[index], 0, index)
-end function
-
-' The grid's tiles' keys in order: the profiles' IDs, then Add profile's.
-function tileIds() as Object
-    ids = []
-    for each profile in m.profiles
-        ids.Push(profile.id)
+' A section's tiles' keys in order, Add's last where it has it.
+function tileKeys(section as Object) as Object
+    keys = []
+    for each tile in section.tiles
+        keys.Push(tile.key)
     end for
-    if m.canAdd then ids.Push(onboarding.profiles.ADD_TILE)
-    return ids
+    if section.add then keys.Push(onboarding.profiles.ADD_TILE)
+    return keys
 end function
 
-' Focus on the tile key names, or on the same position when that profile has
+' Focus on the tile key names, or on the same position when that tile has
 ' gone.
 sub restoreTile(key as Dynamic)
-    m.grid.jumpToItem = restoreIndex(key)
+    if m.sections.Count() = 0 then return
+    rows = []
+    for each section in m.sections
+        rows.Push(nav.focus.newRow(section.key, tileKeys(section), true))
+    end for
+    spot = nav.focus.target(key, { rows: rows, complete: true }, true)
+    row = spot.row
+    if row < 0 or row >= m.sections.Count() then row = 0
+    item = spot.item
+    if item < 0 then item = 0
+    focusSection(row, item)
 end sub
 
-function restoreIndex(key as Dynamic) as Integer
-    spot = nav.focus.target(key, { rows: [nav.focus.newRow("profiles", tileIds(), true)], complete: true }, true)
-    return spot.item
-end function
-
-' Builds the grid, once, and shows it with Change server and Sign out.
-sub showPicker()
-    if m.grid.content = invalid
-        root = CreateObject("roSGNode", "ContentNode")
-        base = sessionOrigin()
-        for each profile in m.profiles
-            item = root.createChild("ProfileContent")
-            item.title = profile.name
-            item.initials = onboarding.profiles.initials(profile.name)
-            item.tint = onboarding.profiles.tintIndex(profile.id)
-            item.avatarUri = onboarding.profiles.avatarUri(profile.avatarUrl, base)
-            item.hasPin = profile.hasPin
-            item.isChild = profile.isChild
-            item.description = profileDescription(profile)
+' Focus on the tile whose key is key, else the first.
+sub focusOn(key as String)
+    for i = 0 to m.sections.Count() - 1
+        keys = tileKeys(m.sections[i])
+        for j = 0 to keys.Count() - 1
+            if keys[j] = key
+                focusSection(i, j)
+                return
+            end if
         end for
+    end for
+    focusSection(0, 0)
+end sub
+
+sub focusSection(index as Integer, item as Integer)
+    if index < 0 or index >= m.sections.Count() then return
+    m.at = index
+    grid = m.sections[index].grid
+    count = grid.content.getChildCount()
+    if item >= count then item = count - 1
+    if item < 0 then item = 0
+    grid.jumpToItem = item
+    placeSections()
+    if m.top.visible and m.state = "picking" and m.controlAt = invalid then grid.setFocus(true)
+end sub
+
+' Builds the sections, once per list, and shows them with Change server and
+' Sign out. One server is today's grid; several are one section each, the
+' active server's first. Add ends the first, the active server's, as its
+' choices are about it (openAddChoice).
+sub showPicker()
+    if m.sections.Count() = 0
+        m.sectionLayer.removeChildrenIndex(m.sectionLayer.getChildCount(), 0)
+        m.textures.lists = []
         m.canAdd = onboarding.profiles.householdPrimary(m.profiles) <> invalid
-        if m.canAdd
-            item = root.createChild("ProfileContent")
-            item.isAdd = true
-            item.title = i18n.text("profiles.add")
-            item.description = item.title
-        end if
-        grid = onboarding.profiles.gridLayout(root.getChildCount())
-        m.grid.numColumns = grid.columns
-        rows = grid.rows
-        if rows > VISIBLE_ROWS then rows = VISIBLE_ROWS
-        m.grid.numRows = rows
-        m.grid.content = root
-        m.grid.translation = [grid.x, 0]
+        multi = m.sectionList.Count() > 1
+        for i = 0 to m.sectionList.Count() - 1
+            source = m.sectionList[i]
+            m.sections.Push(buildSection(source.origin, source.name, source.tiles, multi, i = 0))
+        end for
         loadAccount()
     end if
     m.state = "picking"
@@ -249,17 +412,105 @@ sub showPicker()
     focusPicker()
 end sub
 
+function buildSection(key as String, name as String, tiles as Object, header as Boolean, add as Boolean) as Object
+    group = m.sectionLayer.createChild("Group")
+    section = { key: key, name: name, tiles: tiles, add: add, group: group, mark: invalid, label: invalid, headerHeight: 0 }
+    if header
+        section.mark = group.createChild("ServerMark")
+        section.mark.setFields({ size: MARK_SIZE, name: name })
+        section.label = group.createChild("Label")
+        section.label.setFields({ font: theme.font(theme.textStyle.SERVER_NAME), color: theme.color.TEXT, text: name, height: MARK_SIZE, vertAlign: "center", translation: [MARK_SIZE + MARK_GAP, 0] })
+        section.headerHeight = MARK_SIZE + HEADER_GAP
+    end if
+    root = CreateObject("roSGNode", "ContentNode")
+    tall = false
+    for each tile in tiles
+        item = root.createChild("ProfileContent")
+        fillTile(item, tile)
+        if tile.detail <> "" then tall = true
+    end for
+    if add
+        item = root.createChild("ProfileContent")
+        item.isAdd = true
+        item.title = i18n.text("profiles.add")
+        item.description = item.title
+    end if
+    grid = group.createChild("MarkupGrid")
+    grid.setFields({ itemComponentName: "ProfileTile", drawFocusFeedback: false, vertFocusAnimationStyle: "floatingFocus" })
+    height = onboarding.profiles.TILE_HEIGHT
+    if tall then height = height + DETAIL_HEIGHT
+    grid.itemSize = [onboarding.profiles.COLUMN, height]
+    grid.itemSpacing = [0, onboarding.profiles.ROW_PITCH - onboarding.profiles.TILE_HEIGHT]
+    layout = onboarding.profiles.gridLayout(root.getChildCount())
+    grid.numColumns = layout.columns
+    rows = layout.rows
+    if rows > VISIBLE_ROWS then rows = VISIBLE_ROWS
+    grid.numRows = rows
+    grid.content = root
+    grid.observeField("itemSelected", "onTileSelected")
+    nav.textures.addList(m.textures, grid)
+    section.grid = grid
+    section.rows = rows
+    section.x = layout.x
+    section.rowPitch = onboarding.profiles.ROW_PITCH
+    if tall then section.rowPitch = section.rowPitch + DETAIL_HEIGHT
+    section.extra = height - onboarding.profiles.TILE_HEIGHT
+    return section
+end function
+
+sub fillTile(item as Object, tile as Object)
+    item.detail = tile.detail
+    item.needsSignIn = tile.needsSignIn
+    if tile.kind = onboarding.profiles.SERVER_TILE
+        item.isAdd = true
+        item.title = i18n.text("profiles.signInTile")
+        item.description = i18n.text("profiles.signInTileAudio", { server: serverNameOf(tile.origin) })
+        return
+    end if
+    if tile.kind = onboarding.profiles.ACCOUNT_TILE
+        name = tile.username
+        if name = "" then name = serverNameOf(tile.origin)
+        item.title = name
+        item.initials = onboarding.profiles.initials(name)
+        item.tint = onboarding.profiles.tintIndex(tile.accountId)
+        item.description = tileDescription(name, tile, false, false)
+        return
+    end if
+    profile = tile.profile
+    item.title = profile.name
+    item.initials = onboarding.profiles.initials(profile.name)
+    item.tint = onboarding.profiles.tintIndex(profile.id)
+    item.avatarUri = onboarding.profiles.avatarUri(profile.avatarUrl, tile.origin)
+    item.hasPin = profile.hasPin
+    item.isChild = profile.isChild
+    item.description = tileDescription(profile.name, tile, profile.hasPin, profile.isChild)
+end sub
+
 ' What the audio guide says for a tile, as the Android TV app describes it:
-' the name, then "PIN protected" and "Kids profile" where they apply.
-function profileDescription(profile as Object) as String
-    parts = [profile.name]
-    if profile.hasPin then parts.Push(i18n.text("profiles.pinProtected"))
-    if profile.isChild then parts.Push(i18n.text("profiles.kidsProfile"))
+' the name, the username where it shows, then "PIN protected", "Kids
+' profile", and "Sign in again" where they apply.
+function tileDescription(name as String, tile as Object, hasPin as Boolean, isChild as Boolean) as String
+    parts = [name]
+    if tile.detail <> "" then parts.Push(tile.detail)
+    if hasPin then parts.Push(i18n.text("profiles.pinProtected"))
+    if isChild then parts.Push(i18n.text("profiles.kidsProfile"))
+    if tile.needsSignIn then parts.Push(i18n.text("profiles.signInAgain"))
+    if m.sectionList.Count() > 1 then parts.Push(serverNameOf(tile.origin))
     return parts.Join(", ")
 end function
 
-' "Signed in as" with the account's username, when the server says it.
+function serverNameOf(origin as String) as String
+    for each section in m.sectionList
+        if section.origin = origin then return section.name
+    end for
+    return onboarding.address.hostOf(origin)
+end function
+
+' "Signed in as" with the account's username, when the server says it;
+' with one server shown.
 sub loadAccount()
+    session = api.session.current()
+    if session = invalid or session.status <> "signed_in" then return
     m.accountRequest = api.newHandle(m.top.owner)
     m.accountRequest.observeField("status", "onAccount")
     api.session.validate(m.accountRequest)
@@ -287,45 +538,82 @@ sub showError(key as String)
     focusPicker()
 end sub
 
-' Lays the screen out for its state: the heading and grid, or the error,
-' centred above the buttons pinned to the bottom.
+' Lays the screen out for its state: the heading and sections, or the
+' error, centred above the buttons pinned to the bottom. Sign out shows
+' while an account is active.
 sub refresh()
     picking = m.state = "picking"
     failed = m.state = "error"
     footerTop = 1080 - EDGE - m.footerHeight
-    m.grid.visible = picking
+    m.sectionLayer.visible = picking
     m.headline.visible = picking
-    m.subtitle.visible = picking
+    m.subtitle.visible = picking and m.sections.Count() = 1
     m.status.visible = failed
     if failed
         action = ""
         if m.errorKey <> "profiles.error.passwordChange" then action = i18n.text("common.tryAgain")
         m.status.setFields({ message: i18n.text(m.errorKey), action: action, centre: [960, (EDGE + footerTop) \ 2] })
     end if
+    session = api.session.current()
+    buttons = [m.changeServer]
+    m.signOut.visible = session <> invalid and util.text(session.accountId) <> ""
+    if m.signOut.visible then buttons.Push(m.signOut)
     m.buttonRow.visible = picking or failed
-    width = placeInRow([m.changeServer, m.signOut], FOOTER_GAP)
+    width = placeInRow(buttons, FOOTER_GAP)
     m.buttonRow.translation = [(1920 - width) \ 2, footerTop]
-    if picking then placeHeading(footerTop)
+    if picking then placeSections()
     rowsNow = []
-    if m.buttonRow.visible then rowsNow.Push([m.changeServer, m.signOut])
+    if m.buttonRow.visible then rowsNow.Push(buttons)
     setControlRows(rowsNow, false)
     spin(m.spinner, m.state = "loading" or m.state = "opening", [960, 540])
 end sub
 
-' The title, the account line, and the grid, centred between EDGE and the
-' buttons. The grid's height runs from its avatars' tops to a focused
-' name's foot.
-sub placeHeading(footerTop as Integer)
-    rows = m.grid.numRows
-    gridHeight = rows * onboarding.profiles.ROW_HEIGHT + (rows - 1) * (onboarding.profiles.ROW_PITCH - onboarding.profiles.ROW_HEIGHT) + onboarding.profiles.NAME_FOCUS_DROP
+' One section: the title, the account line, and the grid, centred between
+' EDGE and the buttons, the grid's height running from its avatars' tops to
+' a focused name's foot. Several: the title, then each section under the
+' one before, moved up as far as the focused one needs to show whole.
+sub placeSections()
+    if m.sections.Count() = 0 then return
+    footerTop = 1080 - EDGE - m.footerHeight
     headlineHeight = Int(m.headline.boundingRect().height)
-    total = headlineHeight + ACCOUNT_GAP + m.accountHeight + GRID_GAP + gridHeight
-    top = EDGE + (footerTop - EDGE - total) \ 2
-    if top < EDGE then top = EDGE
-    m.headline.translation = [0, top]
-    m.subtitle.translation = [0, top + headlineHeight + ACCOUNT_GAP]
-    avatarTop = top + headlineHeight + ACCOUNT_GAP + m.accountHeight + GRID_GAP
-    m.grid.translation = [m.grid.translation[0], avatarTop - onboarding.profiles.AVATAR_TOP]
+    if m.sections.Count() = 1
+        section = m.sections[0]
+        rows = section.rows
+        gridHeight = rows * (onboarding.profiles.ROW_HEIGHT + section.extra) + (rows - 1) * (section.rowPitch - onboarding.profiles.ROW_HEIGHT - section.extra) + onboarding.profiles.NAME_FOCUS_DROP
+        total = headlineHeight + ACCOUNT_GAP + m.accountHeight + GRID_GAP + gridHeight
+        top = EDGE + (footerTop - EDGE - total) \ 2
+        if top < EDGE then top = EDGE
+        m.headline.translation = [0, top]
+        m.subtitle.translation = [0, top + headlineHeight + ACCOUNT_GAP]
+        avatarTop = top + headlineHeight + ACCOUNT_GAP + m.accountHeight + GRID_GAP
+        m.sectionLayer.translation = [0, 0]
+        ' Nothing scrolls, so nothing is clipped.
+        m.sectionLayer.clippingRect = [0, 0, 1920, 1080]
+        section.group.translation = [0, 0]
+        section.grid.translation = [section.x, avatarTop - onboarding.profiles.AVATAR_TOP]
+        return
+    end if
+    m.headline.translation = [0, EDGE]
+    windowTop = EDGE + headlineHeight + SECTIONS_TOP_GAP
+    windowBottom = footerTop - FOOTER_GAP
+    y = 0
+    tops = []
+    heights = []
+    for each section in m.sections
+        height = section.headerHeight + section.rows * section.rowPitch - (section.rowPitch - onboarding.profiles.ROW_HEIGHT - section.extra) + onboarding.profiles.NAME_FOCUS_DROP + onboarding.profiles.AVATAR_TOP
+        tops.Push(y)
+        heights.Push(height)
+        section.group.translation = [SECTIONS_LEFT, y]
+        section.grid.translation = [- (onboarding.profiles.COLUMN - 240) \ 2 - 12, section.headerHeight]
+        y = y + height + SECTION_GAP
+    end for
+    room = windowBottom - windowTop
+    offset = 0
+    focusBottom = tops[m.at] + heights[m.at]
+    if focusBottom > room then offset = focusBottom - room
+    if tops[m.at] < offset then offset = tops[m.at]
+    m.sectionLayer.translation = [0, windowTop - offset]
+    m.sectionLayer.clippingRect = [0, offset - RING_ROOM, 1920, room + RING_ROOM]
 end sub
 
 ' Add profile (tvOS, Android TV): creating a profile takes the household's
@@ -379,21 +667,60 @@ sub onReloaded(event as Object)
     list = api.auth.profiles.list(result.body)
     added = onboarding.profiles.addedProfile(list, m.profiles)
     if added = invalid then return
+    m.live = list
     m.profiles = list
-    m.grid.content = invalid
-    showPicker()
-    m.grid.jumpToItem = onboarding.profiles.focusIndex(m.profiles, added.id)
+    session = api.session.current()
+    rebuild(invalid)
+    focusOn(util.text(session.accountId) + "|" + added.id)
 end sub
 
-sub onProfileSelected()
+sub onTileSelected(event as Object)
     if m.request <> invalid then return
-    if m.grid.itemSelected >= m.profiles.Count()
-        startAdd()
+    grid = event.getRoSGNode()
+    for i = 0 to m.sections.Count() - 1
+        if m.sections[i].grid.isSameNode(grid)
+            m.at = i
+            chooseTile(m.sections[i], grid.itemSelected)
+            return
+        end if
+    end for
+end sub
+
+' A tile in the active account opens its profile; one in another account
+' or on another server makes that account active, which opens it (or asks
+' to sign in again); a server's Sign in tile asks for a sign-in there.
+sub chooseTile(section as Object, index as Integer)
+    if index >= section.tiles.Count()
+        if section.add then openAddChoice()
         return
     end if
+    tile = section.tiles[index]
+    session = api.session.current()
+    if tile.kind = onboarding.profiles.SERVER_TILE
+        send("onSwitched")
+        api.session.signInOn(tile.origin, m.request)
+        return
+    end if
+    if session = invalid or tile.accountId <> util.text(session.accountId) or tile.needsSignIn
+        profileId = ""
+        if tile.profile <> invalid then profileId = tile.profile.id
+        send("onSwitched")
+        api.session.useAccount(tile.accountId, profileId, m.request)
+        return
+    end if
+    if tile.profile = invalid then return
     ' A new choice clears the last one's error.
     showAccountLine(m.accountText, theme.color.MARQUEE_SECONDARY)
-    openProfile(m.profiles[m.grid.itemSelected], false)
+    openProfile(tile.profile, false)
+end sub
+
+' Another account or server: the app starts over for it, so only a failure
+' is left to show.
+sub onSwitched(event as Object)
+    result = takeResult(event)
+    if result = invalid or result.ok then return
+    showAccountLine(i18n.text("profiles.error.select"), theme.color.ERROR)
+    speak(m.subtitle.text)
 end sub
 
 ' Chooses the profile. The session answers pin_required when its PIN must
@@ -428,7 +755,9 @@ sub onOpened(event as Object)
     if m.openedAutomatically
         ' The remembered profile could not open: let the viewer choose.
         showPicker()
-        m.grid.jumpToItem = onboarding.profiles.focusIndex(m.profiles, m.opening.id)
+        session = api.session.current()
+        focusOn(util.text(session.accountId) + "|" + m.opening.id)
+        refreshOthers()
         return
     end if
     ' In the account line's place until the next choice.
@@ -440,7 +769,9 @@ function onKeyEvent(key as String, press as Boolean) as Boolean
     if not press then return false
     if m.request <> invalid then return key <> "back"
     if m.controlAt = invalid
-        ' The grid or Try again left a key unhandled.
+        ' A grid or Try again left a key unhandled: Up and Down move between
+        ' the sections, then to the buttons.
+        if m.state = "picking" and (key = "up" or key = "down") and moveSection(key) then return true
         if key = "down" and m.buttonRow.visible
             focusScreen()
             highlightAt({ row: 0, col: 0 })
@@ -463,29 +794,124 @@ function onKeyEvent(key as String, press as Boolean) as Boolean
     return true
 end function
 
-' "Sign out?" (spec section 5.4), as tvOS asks before signing out.
-sub confirmSignOut()
+' Up or Down past a grid's edge goes to the section above or below, in the
+' same column where it can.
+function moveSection(key as String) as Boolean
+    target = m.at + 1
+    if key = "up" then target = m.at - 1
+    if target < 0 or target >= m.sections.Count() then return false
+    grid = m.sections[m.at].grid
+    column = 0
+    if grid.numColumns > 0 then column = grid.itemFocused mod grid.numColumns
+    nextGrid = m.sections[target].grid
+    count = nextGrid.content.getChildCount()
+    item = column
+    if key = "up"
+        lastRow = (count - 1) \ nextGrid.numColumns
+        item = lastRow * nextGrid.numColumns + column
+    end if
+    if item >= count then item = count - 1
+    focusSection(target, item)
+    return true
+end function
+
+' Add: another profile in this account (when the household has a primary
+' profile), another account on this server, or another server.
+sub openAddChoice()
+    session = api.session.current()
+    server = serverNameOf(sessionOrigin())
+    m.addChoices = []
+    labels = []
+    if m.canAdd and session <> invalid and session.status = "signed_in"
+        m.addChoices.Push("profile")
+        labels.Push(i18n.text("profiles.addChoice.profile"))
+    end if
+    m.addChoices.Push("account")
+    labels.Push(i18n.text("profiles.addChoice.account", { server: server }))
+    m.addChoices.Push("server")
+    labels.Push(i18n.text("profiles.addChoice.server"))
+    labels.Push(i18n.text("common.cancel"))
     dialog = CreateObject("roSGNode", "StandardMessageDialog")
-    dialog.title = i18n.text("profiles.signOut.title")
-    dialog.message = [i18n.text("profiles.signOut.body")]
-    dialog.buttons = [i18n.text("profiles.signOut.confirm"), i18n.text("profiles.signOut.remove"), i18n.text("common.cancel")]
-    dialog.observeField("buttonSelected", "onSignOutAnswered")
-    dialog.observeField("wasClosed", "onSignOutAnswered")
+    dialog.title = i18n.text("profiles.addChoice.title")
+    dialog.message = [i18n.text("profiles.addChoice.body")]
+    dialog.buttons = labels
+    showDialog(dialog, "add")
+end sub
+
+sub onAddAnswered(chosen as Integer)
+    if chosen < 0 or chosen >= m.addChoices.Count() then return
+    choice = m.addChoices[chosen]
+    if choice = "profile"
+        startAdd()
+    else if choice = "account"
+        session = api.session.current()
+        if session <> invalid and session.status = "signed_in"
+            ' The account open now stays saved; Back comes back here.
+            nav.push(nav.route.SIGN_IN, { pushed: true })
+        else
+            send("onSwitched")
+            api.session.signInOn(sessionOrigin(), m.request)
+        end if
+    else if choice = "server"
+        nav.push(nav.route.SETUP, { pushed: true })
+    end if
+end sub
+
+' "Sign out of {account} on {server}?" (spec section 5.4), as tvOS asks
+' before signing out. Removing the server too is offered while it has no
+' other account.
+sub confirmSignOut()
+    session = api.session.current()
+    if session = invalid then return
+    server = serverNameOf(sessionOrigin())
+    account = util.text(session.username)
+    title = i18n.text("profiles.signOut.title")
+    if account <> "" then title = i18n.text("profiles.signOut.titleNamed", { account: account, server: server })
+    buttons = [i18n.text("profiles.signOut.confirm")]
+    if accountsOnServer(session) <= 1 then buttons.Push(i18n.text("profiles.signOut.remove"))
+    buttons.Push(i18n.text("common.cancel"))
+    dialog = CreateObject("roSGNode", "StandardMessageDialog")
+    dialog.title = title
+    dialog.message = [i18n.text("profiles.signOut.bodyAccount")]
+    dialog.buttons = buttons
+    m.signOutButtons = buttons.Count()
+    showDialog(dialog, "signOut")
+end sub
+
+' How many accounts are saved on the active server.
+function accountsOnServer(session as Object) as Integer
+    if type(session.servers) <> "roArray" then return 0
+    for each server in session.servers
+        if util.isTrue(server.current) and util.isNumber(server.accounts) then return server.accounts
+    end for
+    return 0
+end function
+
+sub showDialog(dialog as Object, kind as String)
+    dialog.observeField("buttonSelected", "onDialogAnswered")
+    dialog.observeField("wasClosed", "onDialogAnswered")
     m.dialog = dialog
+    m.dialogKind = kind
     m.top.getScene().dialog = dialog
 end sub
 
-sub onSignOutAnswered()
+sub onDialogAnswered()
     if m.dialog = invalid then return
     chosen = -1
     if m.dialog.wasClosed <> true then chosen = m.dialog.buttonSelected
+    kind = m.dialogKind
     closeDialog()
+    if kind = "add"
+        focusPicker()
+        onAddAnswered(chosen)
+        return
+    end if
     focusScreen()
     if chosen = 0
         ' Ends the session here at once, then tells the server; AppScene
-        ' starts over at sign-in.
+        ' shows the picker for the other accounts, or sign-in.
         api.session.signOut(api.newHandle(m.top.owner))
-    else if chosen = 1
+    else if chosen = 1 and m.signOutButtons = 3
         ' Also forgets the server: the next saved server takes its place,
         ' else AppScene starts over at server setup.
         api.session.forgetCurrentServer(api.newHandle(m.top.owner))
@@ -498,4 +924,5 @@ sub closeDialog()
     m.dialog.unobserveField("wasClosed")
     m.dialog.close = true
     m.dialog = invalid
+    m.dialogKind = ""
 end sub

@@ -1,6 +1,7 @@
 import "pkg:/components/theme/tokens.bs"
 import "pkg:/source/api/request.bs"
 import "pkg:/source/auth/profiles.bs"
+import "pkg:/source/onboarding/address.bs"
 import "pkg:/source/util/values.bs"
 
 ' The profile picker (spec sections 5.4 and 7.3). Pure; messages are locale
@@ -24,8 +25,18 @@ namespace onboarding.profiles
     const ROW_PITCH = 342
     ' One row's height from the avatar's top to its name's foot at rest.
     const ROW_HEIGHT = 282
-    ' Add profile's item in the picker's focus keys; profile IDs are never it.
+    ' Add's item in the picker's focus keys; profile IDs are never it.
     const ADD_TILE = "+add"
+    ' A server's Sign in tile's focus key starts with this, then its origin.
+    const SIGN_IN_TILE = "+signin|"
+    ' The tile kinds (sections).
+    const PROFILE_TILE = "profile"
+    ' An account whose profiles were never listed here (it came over from
+    ' before accounts): one tile, which opens the account.
+    const ACCOUNT_TILE = "account"
+    const SERVER_TILE = "signIn"
+    ' The profile ID older accounts all have.
+    const DEFAULT_PROFILE = "default"
 
     ' Whether a profile opens without the picker, as { action, profile }:
     ' OPEN for the profile last chosen on this device (an ordinary launch
@@ -48,6 +59,98 @@ namespace onboarding.profiles
         single = list.Count() = 1 and not list[0].hasPin
         if single and (not asks or util.isTrue(launch.afterSignIn)) then return { action: OPEN, profile: list[0] }
         return { action: PICK, profile: invalid }
+    end function
+
+    ' Whether the picker opens a profile without showing, as onLoad, for
+    ' the merged picker: tiles counts every tile but Add (sections). A
+    ' single tile without a PIN never shows the picker (it is list's only
+    ' profile, on the active account); right after a sign-in, an account
+    ' with one profile and no PIN opens it.
+    function onTiles(list as Object, rememberedId as String, choosing as Boolean, launch as Dynamic, tiles as Integer) as Object
+        choice = onLoad(list, rememberedId, choosing, launch)
+        if choice.action = OPEN or choosing then return choice
+        single = list.Count() = 1 and not list[0].hasPin
+        if single and tiles = 1 then return { action: OPEN, profile: list[0] }
+        if tiles > 1 and single and not (util.isObject(launch) and util.isTrue(launch.afterSignIn)) then return { action: PICK, profile: invalid }
+        return choice
+    end function
+
+    ' The merged picker's sections for a session (api.auth.coordinator.view):
+    ' one per saved server, the active one first, then by last use, each
+    ' { origin, name, tiles }. active is the active account's profiles as
+    ' just listed, which stand in for its cached ones, or invalid. A tile is
+    ' { kind, key, accountId, origin, username, profile, current,
+    ' needsSignIn, detail }: kind PROFILE_TILE for a profile, ACCOUNT_TILE
+    ' for an account with no profiles listed yet, SERVER_TILE for a server
+    ' with no account (Sign in). detail is the account's username where two
+    ' tiles from different accounts on one server would look alike: the
+    ' same name, or both the default profile.
+    function sections(session as Dynamic, active = invalid as Dynamic) as Object
+        out = []
+        if not util.isObject(session) or type(session.servers) <> "roArray" then return out
+        accounts = []
+        if type(session.accounts) = "roArray" then accounts = session.accounts
+        for each server in session.servers
+            origin = util.text(server.origin)
+            name = util.text(server.name).Trim()
+            if name = "" then name = onboarding.address.hostOf(origin)
+            tiles = []
+            for each account in accounts
+                if util.text(account.origin) = origin then tiles.Append(accountTiles(account, origin, active))
+            end for
+            if tiles.Count() = 0 then tiles.Push({ kind: SERVER_TILE, key: SIGN_IN_TILE + origin, accountId: "", origin: origin, username: "", profile: invalid, current: false, needsSignIn: false, detail: "" })
+            disambiguate(tiles)
+            out.Push({ origin: origin, name: name, tiles: tiles })
+        end for
+        return out
+    end function
+
+    function accountTiles(account as Object, origin as String, active as Dynamic) as Object
+        current = util.isTrue(account.current)
+        profiles = account.profiles
+        if current and type(active) = "roArray" then profiles = active
+        if type(profiles) <> "roArray" then profiles = []
+        out = []
+        base = { accountId: util.text(account.id), origin: origin, username: util.text(account.username), current: current, needsSignIn: not util.isTrue(account.signedIn), detail: "" }
+        for each profile in profiles
+            tile = { kind: PROFILE_TILE, key: base.accountId + "|" + util.text(profile.id), profile: profile }
+            tile.Append(base)
+            out.Push(tile)
+        end for
+        if out.Count() = 0
+            tile = { kind: ACCOUNT_TILE, key: base.accountId + "|", profile: invalid }
+            tile.Append(base)
+            out.Push(tile)
+        end if
+        return out
+    end function
+
+    ' Adds the username to tiles from different accounts that look alike.
+    sub disambiguate(tiles as Object)
+        for i = 0 to tiles.Count() - 1
+            for j = i + 1 to tiles.Count() - 1
+                if tiles[i].accountId <> tiles[j].accountId and lookAlike(tiles[i], tiles[j])
+                    tiles[i].detail = tiles[i].username
+                    tiles[j].detail = tiles[j].username
+                end if
+            end for
+        end for
+    end sub
+
+    function lookAlike(a as Object, b as Object) as Boolean
+        if a.kind = SERVER_TILE or b.kind = SERVER_TILE then return false
+        if a.profile = invalid or b.profile = invalid then return a.profile = invalid and b.profile = invalid
+        if a.profile.id = DEFAULT_PROFILE and b.profile.id = DEFAULT_PROFILE then return true
+        return LCase(util.text(a.profile.name).Trim()) = LCase(util.text(b.profile.name).Trim())
+    end function
+
+    ' How many tiles sections hold.
+    function tileCount(list as Object) as Integer
+        count = 0
+        for each section in list
+            count = count + section.tiles.Count()
+        end for
+        return count
     end function
 
     ' The picker grid for count profiles: up to AVATARS_PER_ROW columns,

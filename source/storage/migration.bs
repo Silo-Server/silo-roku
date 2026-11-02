@@ -1,0 +1,187 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/storage/registry.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' The one-time move to accounts (registry layout 2), run by Main before the
+' scene starts and before ApiTask, the registry's writer, exists. It needs no
+' network. Layout 1 kept one session per server: the configured server's in
+' SECTION_NAME (account, access_token, refresh_token, expires_at,
+' refresh_at, profile, profile_tokens, server_name) and the other servers'
+' as one JSON list under "list" in LEGACY_SERVERS_SECTION. Each server with
+' a saved account becomes one account with a new localAccountId, keeping its
+' tokens, the server's user ID, its remembered profile and PIN proofs, and
+' its local data (legacyKeys; the recent Watch Party is moved to the new
+' ID). The layout-1 slots are deleted only once the new ones read back;
+' until then the next launch migrates again. Nothing outside this file reads
+' them.
+namespace storage.migration
+    const LEGACY_SERVERS_SECTION = "silo.servers"
+    const LEGACY_SERVERS_KEY = "list"
+    const LEGACY_KEYS = "account|access_token|refresh_token|expires_at|refresh_at|profile|profile_tokens|server_name"
+    ' Watch Party's recent party (watchparty.recent.SECTION and KEY).
+    const PARTY_SECTION = "silo.party"
+    const PARTY_KEY = "recent"
+
+    ' Migrates the sections when they hold layout 1, or finishes a migration
+    ' whose clean-up failed. Gives the record to start from.
+    function migrate(section as Object, accountsSection as Object) as Object
+        raw = storage.read(section)
+        oldServers = CreateObject("roRegistrySection", LEGACY_SERVERS_SECTION)
+        if storage.versionOf(raw) >= 2
+            clean(section, oldServers)
+            return storage.load(section, accountsSection)
+        end if
+        moved = fromLegacy(raw, storage.read(oldServers), storage.newAccountId)
+        record = moved.record
+        device = storage.encode(record)
+        ' The schema goes last, so a migration that stops part way is
+        ' migrated again.
+        device.Delete("schema")
+        accounts = storage.encodeAccounts(record, record.usedAt)
+        written = storage.write(section, device, "origin|device|active|pairing_key|launch_behavior|launch_offer|used_at")
+        written = storage.write(accountsSection, accounts, storage.ALL_KEYS) and written
+        readBack = storage.decode(storage.read(section), storage.read(accountsSection))
+        if not written or not sameAccounts(record, readBack)
+            log.warn("storage", "account migration did not read back; layout 1 kept", { accounts: moved.ids.Count() })
+            return record
+        end if
+        layout = storage.VERSION
+        section.Write("schema", layout.ToStr())
+        section.Flush()
+        clean(section, oldServers)
+        moveRecentParty(moved.ids)
+        log.info("storage", "migrated to accounts", { accounts: moved.ids.Count() })
+        return readBack
+    end function
+
+    ' Deletes the layout-1 slots, if any are left.
+    sub clean(section as Object, oldServers as Object)
+        changed = false
+        for each key in LEGACY_KEYS.Split("|")
+            if section.Exists(key)
+                section.Delete(key)
+                changed = true
+            end if
+        end for
+        if changed then section.Flush()
+        if oldServers.Exists(LEGACY_SERVERS_KEY)
+            oldServers.Delete(LEGACY_SERVERS_KEY)
+            oldServers.Flush()
+        end if
+    end sub
+
+    ' The layout-2 record for layout-1 raw sections, as { record, ids }: ids
+    ' maps each new localAccountId to { server, user }, the server and the
+    ' server's user ID it came from. newId makes a localAccountId.
+    function fromLegacy(raw as Object, serversRaw as Object, newId as Function) as Object
+        record = storage.empty()
+        ids = {}
+        origin = api.request.baseUrl(raw.origin)
+        if origin <> invalid and origin = raw.origin and storage.fits(origin, storage.MAX_ORIGIN_BYTES) then record.origin = origin
+        if storage.isDeviceId(raw.device) then record.deviceId = raw.device
+        if storage.isPairingKey(raw.pairing_key) then record.pairingKey = raw.pairing_key
+        record.launchBehavior = storage.boundedText(raw.launch_behavior, storage.MAX_BEHAVIOR_BYTES)
+        record.launchOffer = raw.launch_offer = "1"
+        record.usedAt = storage.seconds(raw.used_at)
+        if record.origin <> ""
+            record.serverName = storage.boundedText(raw.server_name, storage.MAX_NAME_BYTES)
+            account = legacyAccount(raw, record.origin, newId, record.usedAt)
+            if account <> invalid
+                storage.unpack(record, account)
+                ids[account.id] = { server: record.origin, user: account.serverUserId }
+            end if
+        end if
+        seen = {}
+        seen[record.origin] = true
+        for each entry in legacyServers(serversRaw[LEGACY_SERVERS_KEY])
+            origin = api.request.baseUrl(entry.origin)
+            if origin <> invalid and origin = entry.origin and not seen.DoesExist(origin) and record.servers.Count() < storage.MAX_SAVED_SERVERS
+                seen[origin] = true
+                usedAt = storage.seconds(entry.used_at)
+                record.servers.Push({ origin: origin, name: storage.boundedText(entry.name, storage.MAX_NAME_BYTES), label: "", usedAt: usedAt })
+                account = legacyAccount(entry, origin, newId, usedAt)
+                if account <> invalid
+                    record.accounts.Push(account)
+                    ids[account.id] = { server: origin, user: account.serverUserId }
+                end if
+            end if
+        end for
+        return { record: record, ids: ids }
+    end function
+
+    ' The account a layout-1 server kept, or invalid for a server that kept
+    ' none: its tokens when it had both, the server's user ID, the
+    ' remembered profile, and its PIN proofs.
+    function legacyAccount(raw as Object, origin as String, newId as Function, usedAt as Integer) as Dynamic
+        serverUserId = storage.boundedText(raw.account, storage.MAX_ID_BYTES)
+        access = storage.boundedText(raw.access_token, storage.MAX_TOKEN_BYTES)
+        refresh = storage.boundedText(raw.refresh_token, storage.MAX_TOKEN_BYTES)
+        hasSession = access <> "" and refresh <> ""
+        if serverUserId = "" and not hasSession then return invalid
+        account = storage.newAccount(newId(), origin, usedAt)
+        account.serverUserId = serverUserId
+        account.profileId = storage.boundedText(raw.profile, storage.MAX_ID_BYTES)
+        account.legacyKeys = true
+        if not hasSession then return account
+        account.accessToken = access
+        account.refreshToken = refresh
+        account.expiresAt = storage.seconds(raw.expires_at)
+        account.refreshAt = storage.seconds(raw.refresh_at)
+        account.profileTokens = storage.decodeProfileTokens(raw.profile_tokens)
+        return account
+    end function
+
+    function legacyServers(text as Dynamic) as Object
+        out = []
+        if not util.isString(text) or Left(text, 1) <> "[" then return out
+        list = ParseJson(text)
+        if type(list) <> "roArray" then return out
+        for each entry in list
+            if util.isObject(entry) and util.isString(entry.origin) then out.Push(entry)
+        end for
+        return out
+    end function
+
+    ' Whether written holds every account of record with the same session.
+    function sameAccounts(record as Object, written as Object) as Boolean
+        if written.origin <> record.origin or written.accountId <> record.accountId or written.accessToken <> record.accessToken or written.refreshToken <> record.refreshToken then return false
+        if written.accounts.Count() <> record.accounts.Count() then return false
+        found = {}
+        for each account in written.accounts
+            found[account.id] = account
+        end for
+        for each account in record.accounts
+            other = found[account.id]
+            if other = invalid or other.accessToken <> account.accessToken or other.refreshToken <> account.refreshToken or other.origin <> account.origin then return false
+        end for
+        return true
+    end function
+
+    ' The recent Watch Party, keyed by the server's user ID in layout 1,
+    ' moves to the localAccountId that took that account over.
+    sub moveRecentParty(ids as Object)
+        party = CreateObject("roRegistrySection", PARTY_SECTION)
+        if not party.Exists(PARTY_KEY) then return
+        list = ParseJson(party.Read(PARTY_KEY))
+        if type(list) <> "roArray" then return
+        kept = []
+        for each entry in list
+            if util.isObject(entry)
+                for each id in ids
+                    if util.text(entry.server) = ids[id].server and util.text(entry.account) = ids[id].user and ids[id].user <> ""
+                        entry.account = id
+                        kept.Push(entry)
+                        exit for
+                    end if
+                end for
+            end if
+        end for
+        if kept.Count() = 0
+            party.Delete(PARTY_KEY)
+        else
+            party.Write(PARTY_KEY, FormatJson(kept))
+        end if
+        party.Flush()
+    end sub
+end namespace

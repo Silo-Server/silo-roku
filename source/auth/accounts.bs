@@ -1,0 +1,404 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/api/response.bs"
+import "pkg:/source/auth/problems.bs"
+import "pkg:/source/auth/profiles.bs"
+import "pkg:/source/auth/server.bs"
+import "pkg:/source/onboarding/launch.bs"
+import "pkg:/source/storage/registry.bs"
+import "pkg:/source/util/values.bs"
+
+' Several accounts per server in the account session (docs/spec.md section
+' 7.5). Part of api.auth.coordinator, whose decisions it returns. One
+' account is active, unpacked into state.saved as the configured server's
+' session was; every other is packed in state.saved.accounts with its
+' session, so switching to it needs no new sign-in. An account is keyed by
+' its localAccountId; the server's user ID only finds a saved account again
+' when the same person signs in (installAccount). Only the active account's
+' credentials go with screens' requests; a packed account's go only with
+' the requests built here for its sign-out or its profile list
+' (refreshAccount), to an origin system/info confirmed in this run.
+'
+' Session operations:
+'   { session: "useAccount", accountId, profileId }  makes a saved account
+'       active, on its server, remembering profileId as its profile, so the
+'       picker opens it (or asks to sign in again); answers { changed }
+'   { session: "signInOn", origin }  makes origin, a saved server, active
+'       with no account, and asks for a sign-in there (signInAsked)
+'   { session: "cancelSignIn" }  back from a sign-in another account's
+'       session could take the place of: the picker shows again
+'   { session: "refreshAccount", accountId }  lists a saved account's
+'       profiles again for the picker; answers { profiles, signedIn }
+'   { session: "renameServer", origin, label }  the viewer's name for a
+'       saved server, "" for its own
+namespace api.auth.coordinator
+    ' The kinds of the requests built for a packed account.
+    const ACCOUNT_ORIGIN = "accountOrigin"
+    const ACCOUNT_REFRESH = "accountRefresh"
+    const ACCOUNT_PROFILES = "accountProfiles"
+    const ME_PATH = "/api/v2/account/me"
+
+    ' Whether a saved account other than the active one has a session.
+    function hasOtherSessions(state as Object) as Boolean
+        for each account in state.saved.accounts
+            if account.accessToken <> "" then return true
+        end for
+        return false
+    end function
+
+    function accountIndex(state as Object, id as String) as Integer
+        accounts = state.saved.accounts
+        for i = 0 to accounts.Count() - 1
+            if accounts[i].id = id then return i
+        end for
+        return -1
+    end function
+
+    ' The most recently used saved account on origin, or invalid.
+    function latestAccount(state as Object, origin as String) as Dynamic
+        for each account in state.saved.accounts
+            if account.origin = origin then return account
+        end for
+        return invalid
+    end function
+
+    ' Ends the session as endSession does for reason, keeping the active
+    ' account, if any, packed first in the saved accounts with what is left
+    ' of its session. Gives endSession's decisions.
+    function deactivate(state as Object, reason as String, now as Integer) as Object
+        packed = storage.activeAccount(state.saved, now)
+        decisions = endSession(state, "")
+        park(state, packed)
+        state.reason = reason
+        return decisions
+    end function
+
+    ' Puts packed, the active account as it was, first among the saved
+    ' accounts, and leaves no account active.
+    sub park(state as Object, packed as Dynamic)
+        if packed <> invalid then state.saved.accounts.Unshift(packed)
+        storage.unpack(state.saved, invalid)
+    end sub
+
+    ' Makes the saved account id active; gives whether it was saved.
+    function activate(state as Object, id as String) as Boolean
+        index = accountIndex(state, id)
+        if index < 0 then return false
+        account = state.saved.accounts[index]
+        state.saved.accounts.Delete(index)
+        storage.unpack(state.saved, account)
+        return true
+    end function
+
+    ' Makes origin the active server, the one it replaces first among the
+    ' saved servers. Its origin is checked before the first credential goes
+    ' there. The caller has deactivated the account.
+    sub moveToServer(state as Object, origin as String, now as Integer)
+        saved = state.saved
+        if origin = saved.origin then return
+        kept = []
+        if saved.origin <> "" then kept.Push({ origin: saved.origin, name: saved.serverName, label: saved.serverLabel, usedAt: now })
+        saved.serverName = ""
+        saved.serverLabel = ""
+        for each server in saved.servers
+            if server.origin = origin
+                saved.serverName = server.name
+                saved.serverLabel = server.label
+            else if kept.Count() < storage.MAX_SAVED_SERVERS
+                kept.Push(server)
+            end if
+        end for
+        saved.servers = kept
+        saved.origin = origin
+        state.originCheck = originState("unverified", "", origin)
+    end sub
+
+    ' A sign-in on the active server, with a password, a code, or a phone:
+    ' the saved account the server's user is, active or not, takes the new
+    ' tokens, so signing in again never adds a duplicate; otherwise a new
+    ' account is saved, and the one that was active stays saved with its
+    ' session. A saved session the new tokens replace ends on the server.
+    ' Gives the decisions that end the session before.
+    function installAccount(state as Object, user as Object, tokens as Object, now as Integer) as Object
+        saved = state.saved
+        userId = util.text(user.id)
+        ' The session the new tokens replace, which then ends on the server.
+        replaced = invalid
+        if saved.accountId <> "" and saved.serverUserId = userId
+            ' The same account: it keeps its remembered profile.
+            replaced = storage.activeAccount(saved, now)
+            decisions = endSession(state, "")
+        else
+            decisions = deactivate(state, "", now)
+            match = invalid
+            for each account in saved.accounts
+                if account.origin = saved.origin and account.serverUserId = userId
+                    match = account
+                    exit for
+                end if
+            end for
+            if match <> invalid
+                replaced = match
+                activate(state, match.id)
+            else
+                storage.unpack(saved, storage.newAccount(storage.newAccountId(), saved.origin, now))
+                saved.serverUserId = userId
+            end if
+        end if
+        if nonEmpty(user.username) then saved.username = user.username
+        setTokens(state, tokens, now)
+        state.signInAsked = false
+        state.reason = ""
+        signedIn(state)
+        if replaced <> invalid and replaced.accessToken <> "" and replaced.accessToken <> saved.accessToken then decisions.Append(endRemoteSession(state, replaced, now))
+        return decisions
+    end function
+
+    ' A refused refresh ended the active account's session: with another
+    ' account's session to go to, the account steps aside, keeping its
+    ' tiles with "Sign in again", and the picker shows; alone, it stays, and
+    ' sign-in asks for it as before.
+    sub expireActive(state as Object, now as Integer)
+        if hasOtherSessions(state) then park(state, storage.activeAccount(state.saved, now))
+    end sub
+
+    function useAccount(state as Object, input as Object, now as Integer) as Object
+        id = util.text(input.accountId)
+        if id <> "" and id = state.saved.accountId then return [reply(succeeded(input, { changed: false }))]
+        index = accountIndex(state, id)
+        if index < 0 then return [reply(api.response.failure(input, "invalid_request"))]
+        origin = state.saved.accounts[index].origin
+        changed = origin <> state.saved.origin
+        ' A withdrawal goes after a change of server cancels every request.
+        withdraw = endSignInAttempts(state)
+        decisions = deactivate(state, "", now)
+        if changed then moveToServer(state, origin, now)
+        activate(state, id)
+        profileId = util.text(input.profileId)
+        if profileId <> "" then state.saved.profileId = profileId
+        state.signInAsked = false
+        ' Every Time forgets the account's PIN proofs, as a change of server
+        ' did: its PIN-locked profiles ask again.
+        if state.saved.launchBehavior = onboarding.launch.EVERY_TIME then state.saved.profileTokens = []
+        if changed then decisions.Append(serverChanged(state, origin))
+        decisions.Append([persist(), publish(), reply(succeeded(input, { changed: true }))])
+        decisions.Append(withdraw)
+        return decisions
+    end function
+
+    function signInOn(state as Object, input as Object, now as Integer) as Object
+        origin = util.text(input.origin)
+        if origin = "" or (origin <> state.saved.origin and savedIndex(state, origin) < 0) then return [reply(api.response.failure(input, "invalid_request"))]
+        changed = origin <> state.saved.origin
+        withdraw = endSignInAttempts(state)
+        decisions = deactivate(state, "", now)
+        if changed then moveToServer(state, origin, now)
+        state.signInAsked = true
+        if changed then decisions.Append(serverChanged(state, origin))
+        decisions.Append([persist(), publish(), reply(succeeded(input, { changed: changed }))])
+        decisions.Append(withdraw)
+        return decisions
+    end function
+
+    function cancelSignIn(state as Object, input as Object, now as Integer) as Object
+        if state.saved.accessToken <> "" or not hasOtherSessions(state) then return [reply(succeeded(input, { changed: false }))]
+        decisions = deactivate(state, "", now)
+        state.signInAsked = false
+        decisions.Append([persist(), publish(), reply(succeeded(input, { changed: true }))])
+        return decisions
+    end function
+
+    ' After moveToServer: credentialed requests stop waiting on the old
+    ' origin's check, and every request but playback jobs is cancelled.
+    function serverChanged(state as Object, origin as String) as Object
+        decisions = setOriginHold(state, false)
+        decisions.Push({ kind: "server", origin: origin })
+        return decisions
+    end function
+
+    function renameServer(state as Object, input as Object) as Object
+        origin = util.text(input.origin)
+        label = util.text(input.label).Trim()
+        if origin = "" or not storage.fits(label, storage.MAX_NAME_BYTES) then return [reply(api.response.failure(input, "invalid_request"))]
+        if origin = state.saved.origin
+            state.saved.serverLabel = label
+        else
+            index = savedIndex(state, origin)
+            if index < 0 then return [reply(api.response.failure(input, "invalid_request"))]
+            state.saved.servers[index].label = label
+        end if
+        return [persist(), publish(), reply(succeeded(input, { label: label }))]
+    end function
+
+    ' Signs out of a saved account that is not the active one: it goes from
+    ' this device, with its local data, and its session ends on its server
+    ' when this run confirmed that origin.
+    function signOutSaved(state as Object, input as Object, id as String, now as Integer) as Object
+        index = accountIndex(state, id)
+        if index < 0 then return [reply(api.response.failure(input, "invalid_request"))]
+        removed = state.saved.accounts[index]
+        state.saved.accounts.Delete(index)
+        decisions = [forgetAccount(removed), persist(), publish(), reply(succeeded(input, {}))]
+        decisions.Append(endRemoteSession(state, removed, now))
+        return decisions
+    end function
+
+    ' ApiTask deletes a removed account's local data (Browse's sort and
+    ' filters, libraryPrefs.forget).
+    function forgetAccount(account as Object) as Object
+        scope = ""
+        if not util.isTrue(account.legacyKeys) then scope = account.id
+        return { kind: "forgetAccount", scope: scope }
+    end function
+
+    ' ---- Listing a packed account's profiles
+
+    function refreshAccount(state as Object, input as Object, now as Integer) as Object
+        index = accountIndex(state, util.text(input.accountId))
+        if index < 0 then return [reply(api.response.failure(input, "invalid_request"))]
+        account = state.saved.accounts[index]
+        caller = { requestId: util.text(input.requestId), owner: util.text(input.owner) }
+        if account.accessToken = "" then return [reply(succeeded(caller, { profiles: account.profiles, signedIn: false }))]
+        if state.verified[account.origin] <> true
+            request = build(state, { owner: caller.owner }, { method: "GET", url: account.origin + api.auth.server.INFO_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: ACCOUNT_ORIGIN, origin: account.origin, accountId: account.id, caller: caller })
+            return [submit(request)]
+        end if
+        return continueAccount(state, account, caller, now, false)
+    end function
+
+    ' The packed account's next step: a refresh when its token has expired,
+    ' else its profile list.
+    function continueAccount(state as Object, account as Object, caller as Object, now as Integer, afterRefresh as Boolean) as Object
+        if not afterRefresh and account.refreshToken <> "" and account.expiresAt > 0 and now >= account.expiresAt - EXPIRY_MARGIN_SECONDS
+            request = build(state, { owner: caller.owner }, { method: "POST", url: account.origin + REFRESH_PATH, body: { refresh_token: account.refreshToken }, timeoutMs: REFRESH_TIMEOUT_MS }, { kind: ACCOUNT_REFRESH, origin: account.origin, accountId: account.id, refreshToken: account.refreshToken, caller: caller })
+            return [submit(request)]
+        end if
+        request = build(state, { owner: caller.owner }, { method: "GET", url: account.origin + api.auth.profiles.LIST_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: ACCOUNT_PROFILES, origin: account.origin, accountId: account.id, accessToken: account.accessToken, refreshed: afterRefresh, caller: caller })
+        return [submit(request)]
+    end function
+
+    ' A request built for a packed account ended.
+    function accountSettled(state as Object, op as Object, result as Object, now as Integer) as Object
+        index = accountIndex(state, op.accountId)
+        if index < 0 then return [reply(api.response.failure(op.caller, "identity_changed"))]
+        account = state.saved.accounts[index]
+        if op.kind = ACCOUNT_ORIGIN
+            check = api.auth.server.checkInfo(result, op.origin, state.allowUnconfirmedOrigin)
+            if not check.ok then return [reply(api.response.failure(op.caller, check.error))]
+            state.verified[op.origin] = true
+            return continueAccount(state, account, op.caller, now, false)
+        end if
+        if op.kind = ACCOUNT_REFRESH
+            ' Tokens rotated by a later sign-in or refresh are not replaced.
+            if account.refreshToken <> op.refreshToken then return [reply(succeeded(op.caller, { profiles: account.profiles, signedIn: account.accessToken <> "" }))]
+            tokens = parseTokens(result)
+            if tokens <> invalid
+                setAccountTokens(account, tokens, now)
+                decisions = [persist()]
+                decisions.Append(continueAccount(state, account, op.caller, now, true))
+                return decisions
+            end if
+            if result.ok <> true and result.status <> 0 and api.auth.problems.action(result.error.problemType, result.status, "refresh") = api.auth.problems.SIGN_OUT
+                ' Expired, not signed out: the account and its tiles stay.
+                clearAccountSession(account)
+                return [persist(), publish(), reply(succeeded(op.caller, { profiles: account.profiles, signedIn: false }))]
+            end if
+            return [reply(withoutBody(result))]
+        end if
+        if result.status = 401 and not util.isTrue(op.refreshed) and account.refreshToken <> ""
+            account.expiresAt = 1
+            return continueAccount(state, account, op.caller, now, false)
+        end if
+        if not result.ok then return [reply(withoutBody(result))]
+        list = api.auth.profiles.list(result.body)
+        decisions = []
+        if FormatJson(storage.encodeProfiles(list)) <> FormatJson(storage.encodeProfiles(account.profiles))
+            account.profiles = list
+            decisions = [persist(), publish()]
+        end if
+        decisions.Push(reply(succeeded(op.caller, { profiles: list, signedIn: true })))
+        return decisions
+    end function
+
+    ' A TokenPair's tokens and times on account, a packed one or state.saved
+    ' (setTokens): the proactive refresh comes PROACTIVE_SECONDS before
+    ' expiry, or halfway for a short lifetime.
+    sub setAccountTokens(account as Object, tokens as Object, now as Integer)
+        account.accessToken = tokens.accessToken
+        account.refreshToken = tokens.refreshToken
+        lifetime = tokens.expiresIn
+        early = lifetime - PROACTIVE_SECONDS
+        if early < lifetime \ 2 then early = lifetime \ 2
+        account.expiresAt = now + lifetime
+        account.refreshAt = now + early
+    end sub
+
+    sub clearAccountSession(account as Object)
+        account.accessToken = ""
+        account.refreshToken = ""
+        account.expiresAt = 0
+        account.refreshAt = 0
+        account.profileTokens = []
+    end sub
+
+    ' What the active account's own answers say about it: GET
+    ' /api/v2/profiles is its profile list for the picker, and GET
+    ' /api/v2/account/me its username and the server's user ID. Only an
+    ' answer to the tokens now in use counts.
+    function noteAccount(state as Object, request as Object, result as Object) as Object
+        if result.ok <> true or request.auth <> "account" or state.saved.accountId = "" then return []
+        if not util.isNumber(request.authGeneration) or request.authGeneration <> state.generation then return []
+        if util.text(request.method) <> "" and UCase(util.text(request.method)) <> "GET" then return []
+        path = util.text(request.path)
+        saved = state.saved
+        if path = api.auth.profiles.LIST_PATH
+            list = api.auth.profiles.list(result.body)
+            if FormatJson(storage.encodeProfiles(list)) = FormatJson(storage.encodeProfiles(saved.profiles)) then return []
+            saved.profiles = list
+            return [persist(), publish()]
+        end if
+        if path <> ME_PATH or not util.isObject(result.body) then return []
+        changed = false
+        username = util.text(result.body.username)
+        if username <> "" and storage.fits(username, storage.MAX_NAME_BYTES) and username <> saved.username
+            saved.username = username
+            changed = true
+        end if
+        userId = util.text(result.body.id)
+        if saved.serverUserId = "" and userId <> "" and storage.fits(userId, storage.MAX_ID_BYTES)
+            saved.serverUserId = userId
+            changed = true
+        end if
+        if not changed then return []
+        return [persist(), publish()]
+    end function
+
+    ' ---- What screens may know
+
+    ' Every saved account, the active one first, then the most recently
+    ' used: { id, origin, username, current, signedIn, profiles }.
+    function accountsView(state as Object) as Object
+        out = []
+        saved = state.saved
+        if saved.accountId <> "" then out.Push(accountView(storage.activeAccount(saved), true))
+        for each account in saved.accounts
+            out.Push(accountView(account, false))
+        end for
+        return out
+    end function
+
+    function accountView(account as Object, current as Boolean) as Object
+        profiles = []
+        for each profile in account.profiles
+            profiles.Push(profileView(profile))
+        end for
+        return { id: account.id, origin: account.origin, username: account.username, current: current, signedIn: account.accessToken <> "", profiles: profiles }
+    end function
+
+    ' The key part of the active account's local data (libraryPrefs.key):
+    ' its ID, or "" for an account that kept the keys it had before
+    ' accounts.
+    function accountScope(state as Object) as String
+        if state.saved.legacyKeys then return ""
+        return state.saved.accountId
+    end function
+end namespace
