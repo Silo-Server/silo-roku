@@ -155,12 +155,14 @@ namespace api.auth.coordinator
     end function
 
     ' The decisions to carry out once, at launch, before the first publish:
+    ' the saved servers left without an account go (dropEmptyServers),
     ' Profile Selection's starting choice on a device with none, whether this
     ' launch asks who's watching (onboarding.launch.asksAtLaunch), and the
     ' check of a stored server's origin. now is wall-clock seconds.
     function start(state as Object, now = 0 as Integer) as Object
         decisions = []
         saved = state.saved
+        if dropEmptyServers(state) then decisions.Push(persist())
         if not onboarding.launch.isBehavior(saved.launchBehavior)
             remembered = saved.profileId <> ""
             for each account in saved.accounts
@@ -169,7 +171,7 @@ namespace api.auth.coordinator
             first = onboarding.launch.settle(remembered)
             saved.launchBehavior = first.behavior
             saved.launchOffer = first.offer
-            decisions.Push(persist())
+            if decisions.Count() = 0 then decisions.Push(persist())
         end if
         if saved.accessToken <> "" and onboarding.launch.asksAtLaunch(saved.launchBehavior, saved.usedAt, now)
             if askWhoIsWatching(state) and decisions.Count() = 0 then decisions.Push(persist())
@@ -492,14 +494,16 @@ namespace api.auth.coordinator
 
     ' Signs out of the active account: it goes from this device at once,
     ' with its local data, whatever the server says, and its server stays
-    ' saved. Then the server is asked to end its session: with the access
-    ' token, or, when that has expired, after a refresh with the captured
-    ' refresh token, whose tokens are dropped. accountId names a saved
-    ' account instead (signOutSaved).
+    ' saved while another account is on it; the server's last account takes
+    ' the server with it (removeServer). Then the server is asked to end its
+    ' session: with the access token, or, when that has expired, after a
+    ' refresh with the captured refresh token, whose tokens are dropped.
+    ' accountId names a saved account instead (signOutSaved).
     function signOut(state as Object, input as Object, now as Integer) as Object
         id = util.text(input.accountId)
         if id <> "" and id <> state.saved.accountId then return signOutSaved(state, input, id, now)
         origin = state.saved.origin
+        if state.saved.accountId <> "" and accountsOn(state, origin) = 1 then return removeServer(state, input, origin, now, false)
         access = state.saved.accessToken
         refresh = state.saved.refreshToken
         isExpired = expired(state, now)
@@ -708,14 +712,22 @@ namespace api.auth.coordinator
     end function
 
     ' Removes a saved server from this device, signing out of every account
-    ' on it, with their local data. Removing the active server makes the
-    ' most recently used saved server active, with its most recently used
-    ' account, or none (status no_server). Each removed session is ended on
-    ' its server when this run confirmed that origin (leaving), and
-    ' otherwise only forgotten here.
+    ' on it, with their local data (removeServer).
     function forgetServer(state as Object, input as Object, now as Integer) as Object
         origin = util.text(input.origin)
         if origin = "" or (origin <> state.saved.origin and savedIndex(state, origin) < 0) then return [reply(api.response.failure(input, "invalid_request"))]
+        return removeServer(state, input, origin, now, true)
+    end function
+
+    ' Removes the server origin, signing out of every account on it, with
+    ' their local data. Removing the active server makes the most recently
+    ' used saved server active, or none (status no_server); openNext opens
+    ' its most recently used account (Remove Server), and otherwise none is
+    ' open, so Change Account or sign-in shows (a sign-out). Each removed
+    ' session is ended on its server when this run confirmed that origin
+    ' (leaving), and otherwise only forgotten here. Answers { origin }, the
+    ' active server's afterwards.
+    function removeServer(state as Object, input as Object, origin as String, now as Integer, openNext as Boolean) as Object
         removed = []
         kept = []
         for each account in state.saved.accounts
@@ -731,7 +743,7 @@ namespace api.auth.coordinator
             active = storage.activeAccount(state.saved, now)
             if active <> invalid then removed.Unshift(active)
             withdraw = endSignInAttempts(state)
-            decisions = endSession(state, "signed_out")
+            ended = endSession(state, "signed_out")
             storage.unpack(state.saved, invalid)
             state.signInAsked = false
             nextServer = invalid
@@ -746,16 +758,18 @@ namespace api.auth.coordinator
                 state.saved.serverName = nextServer.name
                 state.saved.serverLabel = nextServer.label
                 account = latestAccount(state, nextOrigin)
-                if account <> invalid
+                if openNext and account <> invalid
                     activate(state, account.id)
                     ' The server it falls back to follows the launch rule too.
                     if state.saved.launchBehavior = onboarding.launch.EVERY_TIME then askWhoIsWatching(state)
                 end if
             end if
             state.originCheck = originState("unverified", "", nextOrigin)
-            decisions.Append(setOriginHold(state, false))
-            ' The sign-outs go after the change cancels every request.
+            decisions = setOriginHold(state, false)
+            ' The sign-outs, a phone's borrowed one among them, go after the
+            ' change cancels every request.
             decisions.Append([{ kind: "server", origin: nextOrigin }, persist(), publish(), reply(succeeded(input, { origin: nextOrigin }))])
+            decisions.Append(ended)
             decisions.Append(withdraw)
         else
             state.saved.servers.Delete(savedIndex(state, origin))

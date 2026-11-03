@@ -24,8 +24,9 @@ import "pkg:/source/util/values.bs"
 '       has the picker wait for the viewer; answers { changed }
 '   { session: "signInOn", origin }  makes origin, a saved server, active
 '       with no account, and asks for a sign-in there (signInAsked)
-'   { session: "cancelSignIn" }  back from a sign-in another account's
-'       session could take the place of: Change Account shows
+'   { session: "cancelSignIn" }  back from a sign-in: a server with no
+'       account yet goes; otherwise Change Account shows while another
+'       account has a session
 '   { session: "renameServer", origin, label }  the viewer's name for a
 '       saved server, "" for its own
 namespace api.auth.coordinator
@@ -37,6 +38,33 @@ namespace api.auth.coordinator
             if account.accessToken <> "" then return true
         end for
         return false
+    end function
+
+    ' How many accounts, open or saved, are on origin.
+    function accountsOn(state as Object, origin as String) as Integer
+        count = 0
+        if state.saved.accountId <> "" and state.saved.origin = origin then count = 1
+        for each account in state.saved.accounts
+            if account.origin = origin then count = count + 1
+        end for
+        return count
+    end function
+
+    ' At launch, a saved server with no account goes: a saved server never
+    ' stays without one (docs/spec.md section 7.5), and one signed out of
+    ' before accounts was kept. The active server stays, as the one being
+    ' signed in to, and none goes when an account entry could not be read
+    ' (storage.decode's unreadAccounts). Gives whether any went.
+    function dropEmptyServers(state as Object) as Boolean
+        saved = state.saved
+        if util.isTrue(saved.unreadAccounts) then return false
+        kept = []
+        for each server in saved.servers
+            if accountsOn(state, server.origin) > 0 then kept.Push(server)
+        end for
+        if kept.Count() = saved.servers.Count() then return false
+        saved.servers = kept
+        return true
     end function
 
     function accountIndex(state as Object, id as String) as Integer
@@ -197,8 +225,14 @@ namespace api.auth.coordinator
         return decisions
     end function
 
+    ' Back from a sign-in: on a server with no account yet, the server goes
+    ' (removeServer); otherwise, while another account has a session, the
+    ' account steps aside and Change Account shows.
     function cancelSignIn(state as Object, input as Object, now as Integer) as Object
-        if state.saved.accessToken <> "" or not hasOtherSessions(state) then return [reply(succeeded(input, { changed: false }))]
+        if state.saved.accessToken <> "" then return [reply(succeeded(input, { changed: false }))]
+        origin = state.saved.origin
+        if origin <> "" and accountsOn(state, origin) = 0 then return removeServer(state, input, origin, now, false)
+        if not hasOtherSessions(state) then return [reply(succeeded(input, { changed: false }))]
         decisions = deactivate(state, "", now)
         state.signInAsked = false
         decisions.Append([persist(), publish(), reply(succeeded(input, { changed: true }))])
@@ -229,11 +263,13 @@ namespace api.auth.coordinator
 
     ' Signs out of a saved account that is not the active one: it goes from
     ' this device, with its local data, and its session ends on its server
-    ' when this run confirmed that origin.
+    ' when this run confirmed that origin. Its server's last account takes
+    ' the server with it (removeServer).
     function signOutSaved(state as Object, input as Object, id as String, now as Integer) as Object
         index = accountIndex(state, id)
         if index < 0 then return [reply(api.response.failure(input, "invalid_request"))]
         removed = state.saved.accounts[index]
+        if accountsOn(state, removed.origin) = 1 then return removeServer(state, input, removed.origin, now, false)
         state.saved.accounts.Delete(index)
         decisions = [forgetAccount(removed), persist(), publish(), reply(succeeded(input, {}))]
         decisions.Append(endRemoteSession(state, removed, now))

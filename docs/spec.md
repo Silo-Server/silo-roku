@@ -455,8 +455,8 @@ their existing HD/FHD assets.
     16 px inset), 10 px apart. A focused row gets a white fill with radius
     14; resting labels are at 86%, and Sign Out is red at 90%.
   - A divider separates groups only.
-  - Sign Out asks for confirmation (Cancel / Sign Out / Sign Out & Remove
-    Server).
+  - Sign Out asks for confirmation (Cancel / Sign Out), saying the server
+    is removed too when it has no other account (section 7.5).
 - **For You menu** (tvOS's `TVForYouDropdown`). The avatar menu's panel,
   460 px wide at y 132, centred under the tab within the side insets,
   headed "FOR YOU" in the library list's header style, then
@@ -649,8 +649,8 @@ their existing HD/FHD assets.
     (a white capsule with black text, top right).
   - Change server and Sign out, compact buttons 20 px apart, are pinned 60 px
     above the bottom edge, centred. The heading and grid are centred in the
-    space above them. Sign out asks for confirmation (Sign out / Sign Out & Remove
-    Server / Cancel).
+    space above them. Sign out asks for confirmation (Cancel / Sign out),
+    as the avatar menu's does.
   - A list that fails to load shows the error as section 5.8 does, with Try
     again.
   - Focus starts on the profile last opened on this device, else the first.
@@ -2873,12 +2873,18 @@ header adds the username after the server while the active server has more
 than one saved account. Sign Out asks "Sign out of {account} on {server}?"
 and signs out of the active account only: its session ends on the server
 (best effort), and its tokens, profile list, PIN proofs, Browse sort and
-filters, and recent Watch Party go. The server stays saved; with another
-account's session to go to, Change Account shows (with a Sign in row for
-the server when it has no account left), otherwise sign-in. Sign Out &
-Remove Server is offered while the server has no other account. A refused
-refresh is not a sign-out: the account stays, and with another session to
-go to Change Account shows it with "Sign in again".
+filters, and recent Watch Party go. A saved server never stays without an
+account (owner decision, 2026-11-03): signing out of a server's last
+account removes the server too, and the confirmation adds "{server} will
+be removed from this Roku."; there is no separate Sign Out & Remove Server.
+Then, with another account's session to go to, Change Account shows,
+otherwise sign-in (on the most recently used saved server when the server
+went), or server setup when no server is left. At launch, saved servers
+with no account go (servers kept after a sign-out before accounts), except
+the active one, and none when an account entry cannot be read. Back from
+signing in to a server with no account yet removes it. A refused refresh
+is not a sign-out: the account stays, its server with it, and with another
+session to go to Change Account shows it with "Sign in again".
 
 **Settings › Accounts** replaces the Server category: for each server, its
 accounts with their profile counts (OK signs out, or offers Sign In Again

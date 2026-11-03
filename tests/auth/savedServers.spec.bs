@@ -68,7 +68,9 @@ namespace tests
         sub _()
             record = tests.sessions.signedIn()
             for i = 1 to storage.MAX_SAVED_SERVERS
-                record.servers.Push({ origin: "https://s" + i.ToStr() + ".example", name: "", label: "", usedAt: tests.sessions.NOW - i })
+                origin = "https://s" + i.ToStr() + ".example"
+                record.servers.Push({ origin: origin, name: "", label: "", usedAt: tests.sessions.NOW - i })
+                record.accounts.Push(storage.newAccount("s" + i.ToStr(), origin, tests.sessions.NOW - i))
             end for
             loop = tests.sessions.create(record)
             tests.sessions.send(loop, { requestId: "s1", session: "server", address: "https://new.example" })
@@ -200,6 +202,88 @@ namespace tests
             view = api.auth.coordinator.view(loop.session)
             m.assertEqual([loop.delivered.i2.body.changed, view.signInAsked], [true, false])
             m.assertTrue(nav.phase.choosesAccount(view))
+        end sub
+
+        @describe("no saved server without an account")
+
+        @it("removes the server with its last account's sign-out, and shows Change Account for another server's session")
+        sub _()
+            loop = m.onOther()
+            m.signIn(loop, "2", "sam")
+            tests.sessions.send(loop, { requestId: "o1", session: "signOut" })
+            m.assertTrue(loop.delivered.o1.ok)
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.origin, view.accountId, view.reason], ["signed_out", "https://silo.example", "", "signed_out"])
+            m.assertEqual(view.servers.Count(), 1, "other.example went with sam")
+            m.assertTrue(nav.phase.choosesAccount(view), "Change Account shows for the account on Home")
+            logout = tests.sessions.runningId(loop, api.auth.coordinator.LOGOUT_PATH)
+            m.assertNotInvalid(logout)
+            m.assertEqual([loop.running[logout].url, loop.running[logout].headers.Authorization], ["https://other.example/api/v2/auth/logout", "Bearer acc2"])
+        end sub
+
+        @it("removes a saved server with its last account's sign-out from Settings")
+        sub _()
+            loop = m.onOther()
+            m.signIn(loop, "2", "sam")
+            tests.sessions.send(loop, { requestId: "o1", session: "signOut", accountId: "1" })
+            m.assertTrue(loop.delivered.o1.ok)
+            record = api.auth.coordinator.record(loop.session)
+            m.assertEqual([record.origin, record.accessToken, record.servers.Count(), record.accounts.Count()], ["https://other.example", "acc2", 0, 0])
+        end sub
+
+        @it("goes to server setup when the last server's last account signs out")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "o1", session: "signOut" })
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.origin, view.servers], ["no_server", "", []])
+            m.assertNotInvalid(tests.sessions.runningId(loop, api.auth.coordinator.LOGOUT_PATH))
+        end sub
+
+        @it("keeps a server whose account needs to sign in again")
+        sub _()
+            record = tests.sessions.signedIn()
+            m.addServer(record, "https://lake.example", false)
+            loop = tests.sessions.create(record)
+            m.assertEqual(api.auth.coordinator.record(loop.session).servers.Count(), 1)
+        end sub
+
+        @it("removes a server with no account when its sign-in is backed out of")
+        sub _()
+            loop = m.onOther()
+            tests.sessions.send(loop, { requestId: "c1", session: "cancelSignIn" })
+            m.assertEqual(loop.delivered.c1.body, { origin: "https://silo.example" })
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.origin, view.accountId, view.servers.Count()], ["https://silo.example", "", 1])
+            m.assertTrue(nav.phase.choosesAccount(view))
+
+            ' The only server: server setup shows.
+            loop = tests.sessions.create(tests.sessions.signedOut())
+            tests.sessions.send(loop, { requestId: "c2", session: "cancelSignIn" })
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "no_server")
+        end sub
+
+        @it("drops saved servers with no account at launch, but not the one being signed in to")
+        sub _()
+            record = tests.sessions.signedOut()
+            m.addServer(record, "https://kept.example", true)
+            record.servers.Push({ origin: "https://empty.example", name: "", label: "", usedAt: 1 })
+            loop = tests.sessions.create(record)
+            saved = api.auth.coordinator.record(loop.session)
+            m.assertEqual([saved.origin, saved.servers.Count(), saved.servers[0].origin], ["https://silo.example", 1, "https://kept.example"])
+            m.assertEqual(loop.persisted.Peek().servers.Count(), 1, "stored without it")
+        end sub
+
+        @it("drops no server at launch when an account entry cannot be read")
+        sub _()
+            record = tests.sessions.signedIn()
+            record.servers.Push({ origin: "https://empty.example", name: "", label: "", usedAt: 1 })
+            accounts = storage.encodeAccounts(record, tests.sessions.NOW)
+            accounts[storage.ACCOUNT_PREFIX + "broken"] = "{not json"
+            decoded = storage.decode(storage.encode(record), accounts)
+            m.assertTrue(decoded.unreadAccounts)
+            loop = tests.sessions.create(decoded)
+            m.assertEqual(api.auth.coordinator.record(loop.session).servers.Count(), 1)
         end sub
 
         @describe("naming")
@@ -398,6 +482,18 @@ namespace tests
             id = "l" + userId + loop.events.Count().ToStr()
             tests.sessions.send(loop, { requestId: id, session: "signIn", username: username, password: "pw" })
             tests.sessions.respond(loop, id, 200, { access_token: "acc2", refresh_token: "ref2", expires_in: 3600, user: { id: userId, username: username, role: "user" } })
+        end sub
+
+        ' Saves origin with an account on it, signed in when signedIn is true.
+        sub addServer(record as Object, origin as String, signedIn as Boolean)
+            record.servers.Push({ origin: origin, name: "", label: "", usedAt: 1 })
+            account = storage.newAccount("k" + record.accounts.Count().ToStr(), origin, 1)
+            if signedIn
+                account.accessToken = "acck"
+                account.refreshToken = "refk"
+                account.expiresAt = tests.sessions.NOW + 3600
+            end if
+            record.accounts.Push(account)
         end sub
 
         ' The account on https://silo.example, saved with a session.
