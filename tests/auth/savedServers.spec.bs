@@ -1,31 +1,33 @@
 namespace tests
 
-    ' Saved servers (source/auth/coordinator.bs): a server change keeps the
-    ' server it leaves with its session, switching back restores it, and a
-    ' saved server can be named and removed.
-    @suite("saved servers")
+    ' Saved servers and accounts (source/auth/coordinator.bs,
+    ' source/auth/accounts.bs): a server change keeps the server it leaves
+    ' and its account with its session, switching back restores them, a
+    ' server may keep several accounts, and servers can be named and removed.
+    @suite("saved servers and accounts")
     class SavedServersTests extends rooibos.BaseTestSuite
 
-        @describe("switching")
+        @describe("switching servers")
 
-        @it("keeps the server it leaves, with its session, and lists it after the current one")
+        @it("keeps the server it leaves, and its account with its session")
         sub _()
             loop = m.onOther()
             saved = loop.persisted.Peek()
             m.assertEqual([saved.origin, saved.accessToken, saved.accountId], ["https://other.example", "", ""])
             m.assertEqual(saved.servers.Count(), 1)
-            home = saved.servers[0]
-            m.assertEqual([home.origin, home.name, home.accountId, home.profileId, home.accessToken, home.refreshToken, home.usedAt], ["https://silo.example", "Home", "1", "p-owner", "acc", "ref", tests.sessions.NOW])
+            m.assertEqual([saved.servers[0].origin, saved.servers[0].name, saved.servers[0].usedAt], ["https://silo.example", "Home", tests.sessions.NOW])
+            m.assertEqual(saved.accounts.Count(), 1)
+            home = saved.accounts[0]
+            m.assertEqual([home.id, home.origin, home.serverUserId, home.profileId, home.accessToken, home.refreshToken], ["1", "https://silo.example", "1", "p-owner", "acc", "ref"])
             m.assertEqual(home.profileTokens, [{ id: "p-owner", token: "pvt_fixture" }])
             view = api.auth.coordinator.view(loop.session)
-            m.assertEqual(view.servers, [{ origin: "https://other.example", name: "", current: true, signedIn: false }, { origin: "https://silo.example", name: "Home", current: false, signedIn: true }])
-            ' The registry holds both sections.
-            stored = storage.decodeServers(loop.serversRegistry.data[storage.SERVERS_KEY], "https://other.example")
-            m.assertEqual(stored.Count(), 1)
-            m.assertEqual(stored[0].accessToken, "acc")
+            m.assertEqual(view.servers, [{ origin: "https://other.example", name: "", brand: "", label: "", current: true, signedIn: false, accounts: 0 }, { origin: "https://silo.example", name: "Home", brand: "Home", label: "", current: false, signedIn: true, accounts: 1 }])
+            ' The registry keeps the account under its own key.
+            stored = loop.accountsRegistry.data[storage.ACCOUNT_PREFIX + "1"]
+            m.assertTrue(Instr(1, stored, "acc") > 0)
         end sub
 
-        @it("switches back to a saved server with the session it kept, after checking its origin")
+        @it("switches back to a saved server with the account it kept, after checking its origin")
         sub _()
             loop = m.onOther()
             tests.sessions.send(loop, { requestId: "s2", session: "server", address: "https://silo.example" })
@@ -36,9 +38,7 @@ namespace tests
             record = api.auth.coordinator.record(loop.session)
             m.assertEqual([record.accessToken, record.refreshToken, record.profileTokens.Count()], ["acc", "ref", 1])
             m.assertEqual(tests.sessions.count(loop, "start /api/v2/auth/login"), 0)
-            ' The server just left is saved in its place.
-            m.assertEqual(record.servers.Count(), 1)
-            m.assertEqual([record.servers[0].origin, record.servers[0].accessToken], ["https://other.example", ""])
+            m.assertEqual([record.servers.Count(), record.servers[0].origin, record.accounts.Count()], [1, "https://other.example", 0])
 
             ' Its requests carry its own tokens at once.
             tests.sessions.send(loop, { requestId: "r1", path: "/api/v2/profiles", auth: "account" })
@@ -46,7 +46,14 @@ namespace tests
             m.assertEqual(loop.running.r1.url, "https://silo.example/api/v2/profiles")
         end sub
 
-        @it("keeps the session of a server that could not be reached")
+        @it("asks for a sign-in on a server it changes to that has no account")
+        sub _()
+            loop = m.onOther()
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.accountId, view.signInAsked], ["signed_out", "", true])
+        end sub
+
+        @it("keeps the account of a server that could not be reached")
         sub _()
             loop = m.onOther()
             tests.sessions.send(loop, { requestId: "s2", session: "server", address: "https://silo.example" })
@@ -54,14 +61,14 @@ namespace tests
             m.assertEqual(loop.delivered.s2.error.kind, "unreachable")
             record = api.auth.coordinator.record(loop.session)
             m.assertEqual(record.origin, "https://other.example")
-            m.assertEqual(record.servers[0].accessToken, "acc")
+            m.assertEqual(record.accounts[0].accessToken, "acc")
         end sub
 
         @it("keeps at most MAX_SAVED_SERVERS besides the current one, dropping the least recently used")
         sub _()
             record = tests.sessions.signedIn()
             for i = 1 to storage.MAX_SAVED_SERVERS
-                record.servers.Push({ origin: "https://s" + i.ToStr() + ".example", name: "", accountId: "", profileId: "", accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileTokens: [], usedAt: tests.sessions.NOW - i })
+                record.servers.Push({ origin: "https://s" + i.ToStr() + ".example", name: "", label: "", usedAt: tests.sessions.NOW - i })
             end for
             loop = tests.sessions.create(record)
             tests.sessions.send(loop, { requestId: "s1", session: "server", address: "https://new.example" })
@@ -72,17 +79,113 @@ namespace tests
             m.assertEqual(servers.Peek().origin, "https://s" + (storage.MAX_SAVED_SERVERS - 1).ToStr() + ".example")
         end sub
 
-        @it("keeps the remembered profile when a phone signs this Roku in to a saved server")
+        @it("keeps the account and remembered profile when a phone signs this Roku in to a saved server as the same user")
         sub _()
             loop = m.onOther()
             session = loop.session
-            decisions = api.auth.coordinator.companionSignedIn(session, { requestId: "c1" }, { origin: "https://silo.example", check: { ok: true, error: invalid, warning: invalid } }, { accessToken: "acc9", refreshToken: "ref9", expiresIn: 3600 }, "1", { status: "approved" }, 200, tests.sessions.NOW)
+            decisions = api.auth.coordinator.companionSignedIn(session, { requestId: "c1" }, { origin: "https://silo.example", check: { ok: true, error: invalid, warning: invalid } }, { accessToken: "acc9", refreshToken: "ref9", expiresIn: 3600 }, { id: "1", username: "alex" }, { status: "approved" }, 200, tests.sessions.NOW)
             tests.sessions.apply(loop, decisions)
             record = api.auth.coordinator.record(session)
-            m.assertEqual([record.origin, record.accessToken, record.profileId, record.serverName], ["https://silo.example", "acc9", "p-owner", "Home"])
+            m.assertEqual([record.origin, record.accountId, record.accessToken, record.profileId, record.serverName, record.username], ["https://silo.example", "1", "acc9", "p-owner", "Home", "alex"])
             ' Profile tokens belong to the login session that verified them.
             m.assertEqual(record.profileTokens, [])
             m.assertEqual(record.servers[0].origin, "https://other.example")
+        end sub
+
+        @describe("several accounts on a server")
+
+        @it("adds an account on the current server, keeping the open one saved with its session")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            m.signIn(loop, "2", "sam")
+            record = api.auth.coordinator.record(loop.session)
+            m.assertNotEqual(record.accountId, "1")
+            m.assertEqual([record.serverUserId, record.username, record.accessToken], ["2", "sam", "acc2"])
+            m.assertEqual(record.accounts.Count(), 1)
+            m.assertEqual([record.accounts[0].id, record.accounts[0].accessToken], ["1", "acc"])
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.servers[0].accounts, view.accounts.Count(), view.accounts[0].current, view.accounts[1].id], [2, 2, true, "1"])
+        end sub
+
+        @it("refreshes a saved account signed in again instead of adding another, and ends the session it replaces")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            m.signIn(loop, "2", "sam")
+            sam = api.auth.coordinator.record(loop.session).accountId
+            m.signIn(loop, "1", "alex")
+            record = api.auth.coordinator.record(loop.session)
+            m.assertEqual([record.accountId, record.accessToken, record.accounts.Count(), record.accounts[0].id], ["1", "acc2", 1, sam])
+            logout = tests.sessions.runningId(loop, api.auth.coordinator.LOGOUT_PATH)
+            m.assertNotInvalid(logout)
+            m.assertEqual(loop.running[logout].headers.Authorization, "Bearer acc")
+        end sub
+
+        @it("makes a saved account active on its server, with its session")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            m.signIn(loop, "2", "sam")
+            tests.sessions.send(loop, { requestId: "u1", session: "useAccount", accountId: "1", profileId: "p-1", choose: true })
+            m.assertEqual(loop.delivered.u1.body, { changed: true })
+            record = api.auth.coordinator.record(loop.session)
+            m.assertEqual([record.accountId, record.accessToken, record.profileId], ["1", "acc", "p-1"])
+            view = api.auth.coordinator.view(loop.session)
+            m.assertTrue(view.launch.asks, "Change Account has the picker wait for the viewer")
+            tests.sessions.send(loop, { requestId: "u2", session: "useAccount", accountId: "gone" })
+            m.assertEqual(loop.delivered.u2.error.kind, "invalid_request")
+        end sub
+
+        @it("signs out of the open account only, keeping its server and the other account")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            m.signIn(loop, "2", "sam")
+            tests.sessions.send(loop, { requestId: "o1", session: "signOut" })
+            record = api.auth.coordinator.record(loop.session)
+            m.assertEqual([record.origin, record.accountId, record.accessToken, record.accounts.Count(), record.accounts[0].id], ["https://silo.example", "", "", 1, "1"])
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.reason, view.signInAsked], ["signed_out", "signed_out", false])
+            m.assertTrue(nav.phase.choosesAccount(view), "Change Account shows for the account left")
+        end sub
+
+        @it("signs out of a saved account without touching the open one")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            m.signIn(loop, "2", "sam")
+            open = api.auth.coordinator.record(loop.session).accountId
+            tests.sessions.send(loop, { requestId: "o1", session: "signOut", accountId: "1" })
+            m.assertTrue(loop.delivered.o1.ok)
+            record = api.auth.coordinator.record(loop.session)
+            m.assertEqual([record.accountId, record.accessToken, record.accounts.Count()], [open, "acc2", 0])
+            logout = tests.sessions.runningId(loop, api.auth.coordinator.LOGOUT_PATH)
+            m.assertNotInvalid(logout)
+            m.assertEqual(loop.running[logout].headers.Authorization, "Bearer acc")
+        end sub
+
+        @it("steps an expired account aside while another has a session, and keeps it alone")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            m.signIn(loop, "2", "sam")
+            api.auth.coordinator.endSession(loop.session, "expired")
+            api.auth.coordinator.expireActive(loop.session, tests.sessions.NOW)
+            record = api.auth.coordinator.record(loop.session)
+            m.assertEqual([record.accountId, record.accounts.Count(), record.accounts[0].serverUserId, record.accounts[0].accessToken], ["", 2, "2", ""])
+
+            alone = tests.sessions.create(tests.sessions.signedIn())
+            api.auth.coordinator.endSession(alone.session, "expired")
+            api.auth.coordinator.expireActive(alone.session, tests.sessions.NOW)
+            m.assertEqual(api.auth.coordinator.record(alone.session).accountId, "1")
+        end sub
+
+        @it("asks for a sign-in on a saved server, and goes back to Change Account")
+        sub _()
+            loop = m.onOther()
+            tests.sessions.send(loop, { requestId: "i1", session: "signInOn", origin: "https://silo.example" })
+            m.assertEqual(loop.delivered.i1.body, { changed: true })
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.origin, view.accountId, view.signInAsked], ["https://silo.example", "", true])
+            tests.sessions.send(loop, { requestId: "i2", session: "cancelSignIn" })
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([loop.delivered.i2.body.changed, view.signInAsked], [true, false])
+            m.assertTrue(nav.phase.choosesAccount(view))
         end sub
 
         @describe("naming")
@@ -100,14 +203,23 @@ namespace tests
             m.assertEqual([saved.serverName, saved.servers[0].name], ["Cabin", "Home Media"])
         end sub
 
+        @it("keeps the viewer's name for a server over its own")
+        sub _()
+            loop = m.onOther()
+            tests.sessions.send(loop, { requestId: "l1", session: "renameServer", origin: "https://silo.example", label: " Lake " })
+            m.assertEqual(loop.delivered.l1.body, { label: "Lake" })
+            m.assertEqual(api.auth.coordinator.view(loop.session).servers[1].name, "Lake")
+            m.assertEqual(api.auth.coordinator.view(loop.session).servers[1].brand, "Home")
+        end sub
+
         @describe("removing")
 
-        @it("removes a saved server and ends its session on a server this run confirmed")
+        @it("removes a saved server and ends its accounts' sessions on a server this run confirmed")
         sub _()
             loop = m.onOther()
             tests.sessions.send(loop, { requestId: "f1", session: "forgetServer", origin: "https://silo.example" })
             m.assertEqual(loop.delivered.f1.body, { origin: "https://other.example" })
-            m.assertEqual(loop.persisted.Peek().servers, [])
+            m.assertEqual([loop.persisted.Peek().servers, loop.persisted.Peek().accounts], [[], []])
             m.assertEqual(api.auth.coordinator.view(loop.session).servers.Count(), 1)
             logout = tests.sessions.runningId(loop, api.auth.coordinator.LOGOUT_PATH)
             m.assertNotInvalid(logout)
@@ -119,11 +231,12 @@ namespace tests
         sub _()
             record = tests.sessions.signedOut()
             record.origin = "https://other.example"
-            record.servers = [m.savedHome()]
+            record.servers = [{ origin: "https://silo.example", name: "Home", label: "", usedAt: tests.sessions.NOW - 60 }]
+            record.accounts = [m.savedHome()]
             loop = tests.sessions.create(record)
             tests.sessions.send(loop, { requestId: "f1", session: "forgetServer", origin: "https://silo.example" })
             m.assertTrue(loop.delivered.f1.ok)
-            m.assertEqual(loop.persisted.Peek().servers, [])
+            m.assertEqual([loop.persisted.Peek().servers, loop.persisted.Peek().accounts], [[], []])
             m.assertTrue(loop.running.IsEmpty(), "nothing goes to an unconfirmed origin")
         end sub
 
@@ -136,7 +249,7 @@ namespace tests
             m.assertEqual(loop.delivered.f1.body, { origin: "https://other.example" })
             view = api.auth.coordinator.view(loop.session)
             m.assertEqual([view.status, view.origin, view.reason], ["signed_out", "https://other.example", "signed_out"])
-            m.assertEqual(view.servers, [{ origin: "https://other.example", name: "", current: true, signedIn: false }])
+            m.assertEqual(view.servers.Count(), 1)
             ' The sign-out goes to the removed server after the change, with its token.
             logout = tests.sessions.runningId(loop, api.auth.coordinator.LOGOUT_PATH)
             m.assertNotInvalid(logout)
@@ -172,67 +285,83 @@ namespace tests
 
         @describe("storage")
 
-        @it("keeps saved servers and their sessions across a relaunch")
+        @it("keeps saved servers and accounts with their sessions across a relaunch")
         sub _()
             record = tests.sessions.signedIn()
             record.serverName = "Cabin"
+            record.servers = [{ origin: "https://home.example", name: "Home", label: "Lake", usedAt: 9 }, { origin: "http://nas.local:8096", name: "", label: "", usedAt: 5 }]
             home = m.savedHome()
+            home.id = "h1"
             home.origin = "https://home.example"
-            record.servers = [home, { origin: "http://nas.local:8096", name: "", accountId: "4", profileId: "", accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileTokens: [], usedAt: 5 }]
-            raw = storage.encode(record)
-            m.assertEqual(raw.server_name, "Cabin")
-            m.assertEqual(storage.decode(raw, storage.encodeServers(record.servers)), record)
+            nas = storage.newAccount("4", "http://nas.local:8096", 5)
+            nas.serverUserId = "u4"
+            record.accounts = [home, nas]
+            accountsRaw = storage.encodeAccounts(record, tests.sessions.NOW)
+            decoded = storage.decode(storage.encode(record), accountsRaw)
+            m.assertEqual([decoded.accountId, decoded.accessToken, decoded.serverName], ["1", "acc", "Cabin"])
+            m.assertEqual(decoded.servers, record.servers)
+            m.assertEqual([decoded.accounts.Count(), decoded.accounts[0].id, decoded.accounts[0].accessToken, decoded.accounts[1].id, decoded.accounts[1].serverUserId], [2, "h1", "acc", "4", "u4"])
         end sub
 
-        @it("drops a saved server that repeats another or the current one, or has no valid origin")
+        @it("drops a saved server that repeats another, or has no valid origin, and an account whose server is not saved")
         sub _()
-            text = FormatJson([{ origin: "https://silo.example" }, { origin: "https://a.example" }, { origin: "https://a.example", name: "again" }, { origin: "ftp://b.example" }, { origin: "https://c.example/" }, "x"])
-            servers = storage.decodeServers(text, "https://silo.example")
+            text = FormatJson([{ origin: "https://a.example" }, { origin: "https://a.example", name: "again" }, { origin: "ftp://b.example" }, { origin: "https://c.example/" }, "x"])
+            servers = storage.decodeServers(text)
             m.assertEqual(servers.Count(), 1)
             m.assertEqual([servers[0].origin, servers[0].name], ["https://a.example", ""])
-            m.assertEqual(storage.decodeServers("{", ""), [])
+            m.assertEqual(storage.decodeServers("{"), [])
+            accounts = storage.decodeAccounts({ "a.k": FormatJson({ server: "https://a.example" }), "a.lost": FormatJson({ server: "https://gone.example" }), "a.bad id": FormatJson({ server: "https://a.example" }) }, servers)
+            m.assertEqual(accounts.Count(), 1)
+            m.assertEqual(accounts[0].id, "k")
         end sub
 
-        @it("keeps saved sessions only as a pair")
+        @it("keeps an account's session only as a pair")
         sub _()
             home = m.savedHome()
             home.refreshToken = ""
-            server = storage.decodeServers(storage.encodeServers([home]).list, "")[0]
-            m.assertEqual([server.accessToken, server.refreshToken, server.profileTokens, server.accountId], ["", "", [], "1"])
+            account = storage.decodeAccount(home.id, FormatJson(storage.accountEntry(home)))
+            m.assertEqual([account.accessToken, account.refreshToken, account.profileTokens, account.serverUserId, account.profileId], ["", "", [], "1", "p-owner"])
         end sub
 
-        @it("keeps the section within its budget, signing out the oldest servers first")
+        @it("keeps the section within its budget: profile lists go first, then the oldest sessions, then the oldest accounts")
         sub _()
-            servers = []
+            record = tests.sessions.signedIn()
             for i = 1 to storage.MAX_SAVED_SERVERS
-                server = m.savedHome()
-                server.origin = "https://s" + i.ToStr() + ".example"
-                server.accessToken = string(1500, "a")
-                server.refreshToken = string(1500, "r")
-                servers.Push(server)
+                record.servers.Push({ origin: "https://s" + i.ToStr() + ".example", name: "", label: "", usedAt: tests.sessions.NOW - i })
+                account = m.savedHome()
+                account.id = "k" + i.ToStr()
+                account.usedAt = tests.sessions.NOW - 60 - i
+                account.origin = "https://s" + i.ToStr() + ".example"
+                account.accessToken = string(1500, "a")
+                account.refreshToken = string(1500, "r")
+                account.profiles = [{ id: "p", name: string(100, "n"), hasPin: false, isChild: false, avatarUrl: "https://a.example/" + string(400, "x") }]
+                record.accounts.Push(account)
             end for
-            raw = storage.encodeServers(servers)
-            m.assertTrue(storage.bytes(raw) <= storage.SERVERS_BUDGET_BYTES, "bytes " + storage.bytes(raw).ToStr())
-            kept = storage.decodeServers(raw.list, "")
-            m.assertEqual(kept.Count(), storage.MAX_SAVED_SERVERS, "every server stays saved")
-            m.assertEqual(kept[0].accessToken, servers[0].accessToken, "the most recent keeps its session")
-            m.assertEqual(kept.Peek().accessToken, "", "the oldest is signed out")
-            m.assertEqual(kept.Peek().accountId, "1")
+            raw = storage.encodeAccounts(record, tests.sessions.NOW)
+            m.assertTrue(storage.bytes(raw) <= storage.ACCOUNTS_BUDGET_BYTES, "bytes " + storage.bytes(raw).ToStr())
+            decoded = storage.decode(storage.encode(record), raw)
+            m.assertEqual(decoded.servers.Count(), storage.MAX_SAVED_SERVERS, "every server stays saved")
+            m.assertEqual(decoded.accountId, "1", "the active account stays")
+            m.assertEqual(decoded.accounts[0].accessToken, record.accounts[0].accessToken, "the most recent keeps its session")
+            m.assertEqual(decoded.accounts.Peek().accessToken, "", "the oldest is signed out")
+            m.assertEqual(decoded.accounts.Peek().profiles, [], "the oldest lost its profile list first")
 
-            ' Past the budget even signed out, the oldest servers go.
-            for i = 0 to servers.Count() - 1
-                servers[i].origin = "https://" + string(1000, "h") + i.ToStr() + ".example"
-                servers[i].name = string(storage.MAX_NAME_BYTES, "n")
+            ' Past the budget even signed out, the oldest accounts go.
+            for each account in record.accounts
+                account.username = string(storage.MAX_NAME_BYTES, "u")
+                account.serverUserId = string(storage.MAX_ID_BYTES, "i")
             end for
-            raw = storage.encodeServers(servers)
-            m.assertTrue(storage.bytes(raw) <= storage.SERVERS_BUDGET_BYTES)
-            m.assertTrue(storage.decodeServers(raw.list, "").Count() < storage.MAX_SAVED_SERVERS)
-            m.assertEqual(storage.encodeServers([]), {})
+            for each server in record.servers
+                server.name = string(storage.MAX_NAME_BYTES, "n")
+                server.label = string(storage.MAX_NAME_BYTES, "l")
+            end for
+            raw = storage.encodeAccounts(record, tests.sessions.NOW)
+            m.assertTrue(storage.bytes(raw) <= storage.ACCOUNTS_BUDGET_BYTES)
         end sub
 
         @it("keeps every section within Roku's 32 KB")
         sub _()
-            m.assertTrue(storage.BUDGET_BYTES + storage.SERVERS_BUDGET_BYTES + libraryPrefs.BUDGET_BYTES <= 32768)
+            m.assertTrue(storage.BUDGET_BYTES + storage.ACCOUNTS_BUDGET_BYTES + libraryPrefs.BUDGET_BYTES + diag.state.BUDGET_BYTES + watchparty.recent.BUDGET_BYTES <= 32768)
             m.assertTrue(storage.maxBytes() <= storage.BUDGET_BYTES, "maxBytes " + storage.maxBytes().ToStr())
         end sub
 
@@ -249,9 +378,25 @@ namespace tests
             return loop
         end function
 
-        ' https://silo.example saved with a session.
+        ' A password sign-in on the current server as the server's user
+        ' userId, which answers tokens "acc2" / "ref2".
+        sub signIn(loop as Object, userId as String, username as String)
+            id = "l" + userId + loop.events.Count().ToStr()
+            tests.sessions.send(loop, { requestId: id, session: "signIn", username: username, password: "pw" })
+            tests.sessions.respond(loop, id, 200, { access_token: "acc2", refresh_token: "ref2", expires_in: 3600, user: { id: userId, username: username, role: "user" } })
+        end sub
+
+        ' The account on https://silo.example, saved with a session.
         function savedHome() as Object
-            return { origin: "https://silo.example", name: "Home", accountId: "1", profileId: "p-owner", accessToken: "acc", refreshToken: "ref", expiresAt: tests.sessions.NOW + 3600, refreshAt: tests.sessions.NOW + 1800, profileTokens: [{ id: "p-owner", token: "pvt_fixture" }], usedAt: tests.sessions.NOW - 60 }
+            account = storage.newAccount("1", "https://silo.example", tests.sessions.NOW - 60)
+            account.serverUserId = "1"
+            account.profileId = "p-owner"
+            account.accessToken = "acc"
+            account.refreshToken = "ref"
+            account.expiresAt = tests.sessions.NOW + 3600
+            account.refreshAt = tests.sessions.NOW + 1800
+            account.profileTokens = [{ id: "p-owner", token: "pvt_fixture" }]
+            return account
         end function
 
     end class
