@@ -450,7 +450,7 @@ their existing HD/FHD assets.
   - Rows: Switch Profile, History, Requests (while the server offers
     Requests, section 5.11), and Watch Party ("Return to Watch Party" in a
     party, while the server offers one: [`watch-party.md`](watch-party.md)
-    section 4.1); then Settings, Switch Server, and Sign Out. Watchlist and
+    section 4.1); then Settings, Change Account (section 7.5), and Sign Out. Watchlist and
     Favorites are in the For You menu only. They are 54 px tall (22 px SemiBold,
     16 px inset), 10 px apart. A focused row gets a white fill with radius
     14; resting labels are at 86%, and Sign Out is red at 90%.
@@ -570,8 +570,9 @@ their existing HD/FHD assets.
   HTTP. Before using plain HTTP, the client asks "Connect without
   encryption?". The address keyboard keeps its `https://`, `http://`, and
   `.com` chips (5.9).
-- **Saved servers.** Change server (sign-in, the picker, the message
-  screens, Settings, and the avatar menu's Switch Server) opens this list
+- **Saved servers.** Change server (sign-in and the message screens; the
+  picker, Settings, and the avatar menu reach servers through Change
+  Account, section 7.5) opens this list
   when another server is saved, and server setup ("Set up with your phone")
   otherwise. Message
   screen layout with no card: "Choose a server", "Switch to a saved server,
