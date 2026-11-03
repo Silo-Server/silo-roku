@@ -662,9 +662,9 @@ their existing HD/FHD assets.
     takes the profiles' ring, scale, and name. It opens the primary
     profile's PIN when it has one, then New Profile; back on the picker, the
     list is read again and a new profile joins it with focus.
-  - An account with a single profile and no PIN skips the picker, except
-    when Profile Selection asks at launch; right after a sign-in it skips
-    it then too, as tvOS does.
+  - An account with a single profile and no PIN skips the picker, whatever
+    Profile Selection says, unless the viewer chose Switch Profile (section
+    7.5).
 - **Profile at launch.** Whether a launch reopens the profile last chosen on
   this device or asks "Who's watching?" follows Profile Selection (Settings
   > General, section 5.8.1), as tvOS's `ProfileLaunchPreferences` and
