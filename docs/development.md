@@ -209,10 +209,12 @@ package after `genkey`. Signing replaces the device's dev app.
 `v<major>.<minor>` (or `v<major>.<minor>.<anything>`) that matches the manifest
 makes the release package and a draft GitHub Release with the `.pkg`
 attached. Both run the pull request checks first and carry the Package run
-number as `build_version`. The sign job runs on a self-hosted runner labelled
-`roku-signer` that reaches a Roku in Developer Mode, in the `roku-signing`
-environment, which holds the variables `ROKU_HOST` and `ROKU_DEV_ID` and the
-secrets `ROKU_PASSWORD` (the device's installer password),
+number plus 6 as `build_version`; the offset keeps builds above the six
+packaged before the repository moved from `silo-roku-archive`. The sign job
+runs on a self-hosted runner labelled `roku-signer` that reaches a Roku in
+Developer Mode, in the `roku-signing` environment, which holds the secrets
+`ROKU_HOST` and `ROKU_DEV_ID` (secrets rather than variables, so the public
+Actions log masks them), `ROKU_PASSWORD` (the device's installer password),
 `ROKU_SIGN_PASSWORD`, and `ROKU_SIGN_KEY_BASE64` (a key package, base64; sign a
 minimal app for it, since secrets are limited to 48 KB). On a macOS runner
 installed as a service, keep the runner's `.path` to system directories

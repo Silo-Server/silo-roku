@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Set build_version in the packaged manifest to the CI run number, leaving the
-# committed manifest alone. bsc deletes its staging directory after zipping, so
-# this rewrites the manifest entry inside the zip. Without GITHUB_RUN_NUMBER
-# (local builds) the package keeps the committed value.
+# Set build_version in the packaged manifest to the CI run number plus
+# BUILD_VERSION_OFFSET (default 0), leaving the committed manifest alone. bsc
+# deletes its staging directory after zipping, so this rewrites the manifest
+# entry inside the zip. Without GITHUB_RUN_NUMBER (local builds) the package
+# keeps the committed value.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 zip=${1:-out/silo-roku.zip}
@@ -13,6 +14,9 @@ if [ -z "$run" ]; then
     exit 0
 fi
 case $run in *[!0-9]*) echo "GITHUB_RUN_NUMBER is not a number: $run" >&2; exit 1 ;; esac
+offset=${BUILD_VERSION_OFFSET:-0}
+case $offset in *[!0-9]*) echo "BUILD_VERSION_OFFSET is not a number: $offset" >&2; exit 1 ;; esac
+build=$((run + offset))
 [ -f "$zip" ] || { echo "missing $zip; run npm run build" >&2; exit 1; }
 zip_path=$(cd "$(dirname "$zip")" && pwd)/$(basename "$zip")
 
@@ -20,7 +24,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 unzip -q "$zip" manifest -d "$tmp"
 grep -q '^build_version=' "$tmp/manifest" || { echo "$zip manifest has no build_version" >&2; exit 1; }
-sed "s/^build_version=.*/build_version=$run/" "$tmp/manifest" > "$tmp/manifest.new"
+sed "s/^build_version=.*/build_version=$build/" "$tmp/manifest" > "$tmp/manifest.new"
 mv "$tmp/manifest.new" "$tmp/manifest"
 (cd "$tmp" && zip -q -X "$zip_path" manifest)
-echo "stamped build_version=$run into $zip"
+echo "stamped build_version=$build into $zip"
