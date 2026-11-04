@@ -3,8 +3,8 @@ import "pkg:/source/nav/player.bs"
 import "pkg:/source/api/scheduler.bs"
 
 ' Optional lower-page content never blocks the hero, playback, or selectors:
-' Cast & Crew, Trailers & More, and recommendations, and the page's theme
-' music (components/audio/ThemeMusic).
+' Cast & Crew, Trailers & More, a movie's box set, and recommendations, and
+' the page's theme music (components/audio/ThemeMusic).
 sub initSupporting()
     m.castRail = m.top.findNode("cast")
     m.castRail.heading = i18n.text("detail.cast")
@@ -15,6 +15,18 @@ sub initSupporting()
     m.extrasRail.heading = i18n.text("detail.trailers")
     m.extrasRail.observeField("chosen", "onExtraChosen")
     m.extrasContent = invalid
+    ' A movie's box set (catalog.boxSets), as tvOS's TVBoxSetRow: the read's
+    ' answer, the row's cards, the card focus returns to (its ID, from a
+    ' rebuilt page's focus key), and whether the page asked the server if
+    ' it has box sets.
+    m.boxSetRail = m.top.findNode("boxSet")
+    m.boxSetRail.observeField("chosen", "onBoxSetChosen")
+    m.boxSet = invalid
+    m.boxSetContent = invalid
+    m.boxSetFocus = ""
+    m.boxSetAsked = false
+    ' The server has box sets: the row is read again as the page refreshes.
+    m.boxSetsOffered = false
     m.similarRail = m.top.findNode("similar")
     m.similarRail.observeField("chosen", "onSimilarChosen")
     m.supportingTimer = m.top.findNode("supportingTimer")
@@ -26,6 +38,7 @@ end sub
 sub startSupporting(extras = invalid as Dynamic)
     m.castRail.lowTier = m.lowTier
     m.extrasRail.lowTier = m.lowTier
+    m.boxSetRail.lowTier = m.lowTier
     m.similarRail.lowTier = m.lowTier
     m.castRail.people = { items: m.detail.cast }
     m.castRail.visible = m.detail.cast.Count() > 0
@@ -52,6 +65,7 @@ sub loadSimilar()
     request = catalog.request.similar(m.detail.id)
     request.lane = api.scheduler.LANE_PREFETCH
     send(request, { kind: "similar", id: m.detail.id })
+    loadBoxSetRow()
 end sub
 
 function hasExtras() as Boolean
@@ -63,7 +77,15 @@ function hasSimilar() as Boolean
 end function
 
 sub onSupportingAnswer(entry as Object, result as Object, content as Dynamic)
-    if entry.kind = "similar"
+    if entry.kind = "boxSetCapability"
+        if m.detail = invalid or entry.id <> m.detail.id then return
+        offered = result.ok and util.isObject(result.body) and util.isTrue(result.body.boxSets)
+        boxSetsRemember(offered)
+        m.boxSetsOffered = offered
+        if offered then readBoxSetRow()
+    else if entry.kind = "boxSet"
+        onBoxSetRow(entry, result)
+    else if entry.kind = "similar"
         if m.detail = invalid or entry.id <> m.detail.id then return
         m.similarContent = invalid
         if result.ok then m.similarContent = content
@@ -106,6 +128,145 @@ sub onExtraChosen()
     pushPlayer({ intent: nav.player.intent(card.id, nav.player.START_OVER) })
 end sub
 
+' --- A movie's box set ----------------------------------------------------------
+
+' Reads the movie's box set for its row, with the recommendations, and
+' again whenever the page is shown again or the movie's watched state
+' changes (refreshBoxSetRow), so the row's watched marks follow the player
+' and Mark as Watched. Only a movie, and only once the server says it has
+' box sets: the search capability's box_sets, which a page asks for once
+' while no page this session has had a yes (boxSetsKnown).
+sub loadBoxSetRow()
+    if m.detail = invalid or m.series or m.released then return
+    if boxSetsKnown() then m.boxSetsOffered = true
+    if m.boxSetsOffered
+        readBoxSetRow()
+    else if not m.boxSetAsked
+        m.boxSetAsked = true
+        request = catalog.request.searchCapabilities()
+        request.lane = api.scheduler.LANE_PREFETCH
+        send(request, { kind: "boxSetCapability", id: m.detail.id })
+    end if
+end sub
+
+' The page refreshes: the row is read again once the page knows the server
+' has box sets.
+sub refreshBoxSetRow()
+    if m.boxSetsOffered then loadBoxSetRow()
+end sub
+
+' The read, in place of one still out.
+sub readBoxSetRow()
+    cancelKind("boxSet")
+    request = catalog.request.itemBoxSet(m.detail.id, m.libraryId)
+    request.lane = api.scheduler.LANE_PREFETCH
+    send(request, { kind: "boxSet", id: m.detail.id })
+end sub
+
+' A failed read keeps the row as it is; the server answering that the
+' movie is in no box set the viewer sees, or 404, removes it.
+sub onBoxSetRow(entry as Object, result as Object)
+    if m.detail = invalid or entry.id <> m.detail.id then return
+    if result.ok
+        body = result.body
+        if util.isObject(body) and util.isTrue(body.found)
+            showBoxSetRow(body)
+        else
+            hideBoxSetRow()
+        end if
+    else if result.status = 404
+        hideBoxSetRow()
+    else
+        return
+    end if
+    layout()
+    if not m.top.visible then return
+    if m.wantedZone = ZONE_BOX_SET and hasBoxSetRow()
+        focusRestored()
+    else if m.zone = ZONE_BOX_SET and not hasBoxSetRow()
+        focusZone(ZONE_BOX_SET)
+    else
+        scrollFor(m.zone)
+    end if
+end sub
+
+' The row's cards: the films that fit (catalog.boxSets.rowWindow), the movie
+' on screen marked THIS FILM and without a card menu, then Explore all.
+' Focus stays on the card it was on, else lands on this film.
+sub showBoxSetRow(body as Object)
+    items = body.items
+    current = -1
+    for i = 0 to items.Count() - 1
+        if util.text(items[i].id) = m.detail.id then current = i
+    end for
+    shown = catalog.boxSets.rowWindow(items.Count(), current, m.boxSetRail.callFunc("posterSlots", m.lowTier), true)
+    focused = m.boxSetFocus
+    if focused = "" then focused = boxSetRowKey()
+    content = CreateObject("roSGNode", "RowContent")
+    content.setFields({ shape: catalog.shape.POSTER, lowTier: m.lowTier, captionStyle: "grid" })
+    index = -1
+    for i = shown.first to shown.first + shown.size - 1
+        fields = items[i]
+        card = content.createChild("CardContent")
+        card.setFields(fields)
+        if i = current
+            card.setFields({ flags: [i18n.text("boxSets.thisFilm")], hasUserState: false, audioGuideText: i18n.text("boxSets.thisFilmAudio", { title: util.text(fields.title) }) })
+            if focused = "" then index = content.getChildCount() - 1
+        end if
+        if focused <> "" and card.id = focused then index = content.getChildCount() - 1
+    end for
+    words = catalog.cards.words(m.copy)
+    more = content.createChild("CardContent")
+    more.setFields(catalog.cards.moreCard(words.exploreAll, body.boxSet.title, catalog.shape.POSTER, words))
+    if focused = catalog.cards.MORE_ID then index = content.getChildCount() - 1
+    if index < 0 then index = 0
+    m.boxSetFocus = ""
+    m.boxSet = body.boxSet
+    m.boxSetContent = content
+    m.boxSetRail.heading = body.boxSet.title
+    m.boxSetRail.firstVisible = 0
+    m.boxSetRail.index = index
+    m.boxSetRail.content = content
+    m.boxSetRail.visible = true
+end sub
+
+sub hideBoxSetRow()
+    m.boxSet = invalid
+    m.boxSetContent = invalid
+    m.boxSetRail.content = invalid
+    m.boxSetRail.visible = false
+end sub
+
+function hasBoxSetRow() as Boolean
+    return m.boxSetContent <> invalid and m.boxSetRail.visible
+end function
+
+' The ID of the row's card focus is on, for the page's focus key; "" with
+' no row.
+function boxSetRowKey() as String
+    if not hasBoxSetRow() then return ""
+    card = m.boxSetContent.getChild(m.boxSetRail.index)
+    if card = invalid then return ""
+    return card.id
+end function
+
+' Explore all opens the box set's page; another film its own page in the
+' box set's library; this film nothing.
+sub onBoxSetChosen()
+    if not hasBoxSetRow() then return
+    card = m.boxSetContent.getChild(m.boxSetRail.chosen)
+    if card = invalid then return
+    if card.itemType = catalog.cards.MORE
+        pushBoxSet(catalog.boxSets.summaryParams(m.boxSet))
+        return
+    end if
+    if card.id = "" or card.id = m.detail.id then return
+    params = catalog.detail.routeParams(card)
+    params.libraryId = m.boxSet.libraryId
+    if m.dev <> invalid then params.dev = m.dev
+    pushSupportingDetail(params)
+end sub
+
 sub onSimilarChosen()
     if hasSimilar() then openSupportingTitle(m.similarContent.getChild(m.similarRail.chosen))
 end sub
@@ -127,12 +288,14 @@ sub hideSupporting()
     m.supportingTimer.control = "stop"
     m.castRail.callFunc("detach")
     m.extrasRail.callFunc("detach")
+    m.boxSetRail.callFunc("detach")
     m.similarRail.callFunc("detach")
 end sub
 
 sub attachSupporting()
     m.castRail.callFunc("attach")
     m.extrasRail.callFunc("attach")
+    m.boxSetRail.callFunc("attach")
     m.similarRail.callFunc("attach")
     if m.detail <> invalid and not m.similarRequested then m.supportingTimer.control = "start"
 end sub
@@ -143,6 +306,10 @@ end sub
 
 sub pushPerson(params as Object)
     nav.push(nav.route.PERSON, params)
+end sub
+
+sub pushBoxSet(params as Object)
+    nav.push(nav.route.BOX_SET, params)
 end sub
 
 sub pushPlayer(params as Object)

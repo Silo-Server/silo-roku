@@ -1,7 +1,9 @@
+import "pkg:/components/views/boxSets.bs"
 import "pkg:/components/views/cardMenu.bs"
 import "pkg:/components/theme/browse.bs"
 import "pkg:/components/theme/helpers.bs"
 import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/boxSets.bs"
 import "pkg:/source/catalog/grid.bs"
 import "pkg:/source/catalog/requests.bs"
 import "pkg:/source/memory/policy.bs"
@@ -29,6 +31,9 @@ const COLUMN_X = 760
 const FILTER_HEIGHT = 60
 ' The count's 22 px line.
 const COUNT_HEIGHT = 27
+' The Box Sets heading, and its gap to the row, as a Home row's title.
+const BOX_SET_HEADING_HEIGHT = 44
+const BOX_SET_HEADING_GAP = 34
 
 sub init()
     m.top.findNode("background").color = theme.color.BACKGROUND
@@ -61,6 +66,19 @@ sub init()
     m.grid.observeField("total", "showState")
     m.grid.observeField("selectedItem", "onSelected")
     m.gridList = m.grid.findNode("grid")
+    ' Box sets matching the query, a row above the titles (catalog.boxSets).
+    m.boxSetHeading = m.top.findNode("boxSetHeading")
+    m.boxSetHeading.setFields({ font: theme.font(theme.textStyle.SECTION_HEADER), color: theme.color.TEXT, height: BOX_SET_HEADING_HEIGHT, vertAlign: "center", text: i18n.text("boxSets.searchHeading") })
+    m.boxSetGrid = m.top.findNode("boxSets")
+    m.boxSetGrid.columns = theme.browse.GRID_SEARCH_COLUMNS
+    m.boxSetGrid.cardSize = [theme.browse.GRID_SEARCH_CARD_WIDTH, theme.browse.GRID_SEARCH_CARD_HEIGHT]
+    m.boxSetGrid.observeField("selectedItem", "onSelected")
+    m.boxSetList = m.boxSetGrid.findNode("grid")
+    ' The box sets shown, the read for them, and whether the server has
+    ' them (the capability's boxSets).
+    m.boxSetCount = 0
+    m.boxSetHandle = invalid
+    m.boxSetsOffered = false
     m.status = m.top.findNode("status")
     m.status.observeField("activated", "onRetry")
     m.spinner = m.top.findNode("spinner")
@@ -68,6 +86,7 @@ sub init()
     m.debounce.observeField("fire", "onDebounce")
     m.textures = nav.textures.create()
     nav.textures.addView(m.textures, m.grid)
+    nav.textures.addView(m.textures, m.boxSetGrid)
     m.clock = CreateObject("roTimespan")
     m.query = search.create()
     m.zone = search.zone.KEYBOARD
@@ -143,6 +162,7 @@ sub start()
     memoryState = platform.current().memory
     m.lowTier = memoryState.tier = memory.tier.LOW
     m.grid.owner = m.top.owner
+    m.boxSetGrid.owner = m.top.owner
     m.grid.pages = memoryState.gridPages
     platform.subscribe(m.top.owner, [platform.topic.MEMORY_LEVEL], "onMemoryLevel")
     m.capabilities = api.newHandle(m.top.owner)
@@ -189,6 +209,8 @@ sub onCapabilities()
     result = api.resultOf(m.capabilities)
     body = result.body
     videoWithEpisodes = result.ok and util.isObject(body) and util.isTrue(body.available) and util.isTrue(body.videoWithEpisodes)
+    m.boxSetsOffered = result.ok and util.isObject(body) and util.isTrue(body.boxSets)
+    boxSetsRemember(m.boxSetsOffered)
     apply(search.capabilities(m.query, videoWithEpisodes))
 end sub
 
@@ -207,6 +229,7 @@ sub apply(decision as Object)
             request = catalog.request.search(decision.q, decision.scope, decision.videoWithEpisodes, "", catalog.grid.PAGE_SIZE, m.lowTier)
         end if
         m.grid.callFunc("load", { request: request, lowTier: m.lowTier })
+        searchBoxSets(decision)
         if m.restoreGrid <> invalid
             m.grid.callFunc("restoreFocus", m.restoreGrid)
             m.restoreGrid = invalid
@@ -214,20 +237,75 @@ sub apply(decision as Object)
     else if action = search.step.CLEAR
         m.debounce.control = "stop"
         m.grid.callFunc("clear")
+        clearBoxSets()
     end if
     m.filter.selected = m.query.scope
     arrange()
     showState()
 end sub
 
-' The results column: the filter once a query exists, the count, and the
-' grid, with the empty and error states centred in the space below.
+' Looks for box sets matching a query that runs, when it should
+' (search.wantsBoxSets), in place of the last query's.
+sub searchBoxSets(decision as Object)
+    clearBoxSets()
+    if not search.wantsBoxSets(decision, m.boxSetsOffered) then return
+    m.boxSetHandle = api.newHandle(m.top.owner)
+    m.boxSetHandle.observeField("status", "onBoxSets")
+    api.send(catalog.request.searchBoxSets(decision.q, catalog.boxSets.SEARCH_LIMIT), m.boxSetHandle)
+end sub
+
+' Drops the box sets shown and cancels their read.
+sub clearBoxSets()
+    if m.boxSetHandle <> invalid then api.cancel(m.boxSetHandle)
+    m.boxSetHandle = invalid
+    if m.boxSetCount > 0 then m.boxSetGrid.callFunc("clear")
+    m.boxSetCount = 0
+end sub
+
+' The box sets arrived: they lead the results. A failed read shows none
+' rather than failing the titles beside it, as on tvOS.
+sub onBoxSets(event as Object)
+    handle = event.getRoSGNode()
+    if m.boxSetHandle = invalid or not m.boxSetHandle.isSameNode(handle) then return
+    m.boxSetHandle = invalid
+    result = api.resultOf(handle)
+    items = []
+    if result <> invalid and util.isTrue(result.ok) and util.isObject(result.body) and type(result.body.items) = "roArray" then items = result.body.items
+    showBoxSets(items)
+end sub
+
+' items: catalog.boxSets.card fields, for the row above the titles.
+sub showBoxSets(items as Object)
+    m.boxSetCount = items.Count()
+    if m.boxSetCount > 0 then m.boxSetGrid.callFunc("load", { items: items, lowTier: m.lowTier })
+    arrange()
+    showState()
+    ' Focus waiting on titles that found nothing moves to the box sets.
+    if m.zone = search.zone.RESULTS and zoneTarget(search.zone.RESULTS) = invalid then focusZone(search.zone.RESULTS)
+end sub
+
+function hasBoxSets() as Boolean
+    return m.boxSetCount > 0 and m.query.text <> ""
+end function
+
+' The results column: the filter once a query exists, the box sets it
+' found unless focus is in the titles, the count, and the grid, with the
+' empty and error states centred in the space below.
 sub arrange()
     y = TOP
     m.filter.visible = m.query.text <> ""
     if m.filter.visible
         m.filter.translation = [COLUMN_X, y]
         y = y + FILTER_HEIGHT + GAP
+    end if
+    boxSetsShown = hasBoxSets() and m.zone <> search.zone.RESULTS
+    m.boxSetHeading.visible = boxSetsShown
+    m.boxSetGrid.visible = boxSetsShown
+    if boxSetsShown
+        m.boxSetHeading.translation = [COLUMN_X, y]
+        y = y + BOX_SET_HEADING_HEIGHT + BOX_SET_HEADING_GAP
+        m.boxSetGrid.translation = [COLUMN_X, y]
+        y = y + theme.browse.GRID_SEARCH_CARD_HEIGHT + theme.browse.captionSpace("grid", "poster") + GAP
     end if
     m.count.translation = [COLUMN_X, y]
     y = y + COUNT_HEIGHT + GAP
@@ -258,6 +336,8 @@ sub showState()
     if not hasQuery
         message = i18n.text("search.initial")
         detail = i18n.text("search.initialBody")
+    else if gridState = "empty" and hasBoxSets()
+        ' The box sets are the results.
     else if gridState = "empty"
         message = i18n.text("search.empty")
         detail = i18n.text("search.emptyBody")
@@ -281,13 +361,17 @@ sub onGridState()
     if m.zone = search.zone.RESULTS then focusZone(search.zone.RESULTS)
     gridState = m.grid.state
     spoken = m.count.text
-    if gridState = "empty" or gridState = "error" then spoken = m.status.message + ". " + m.status.detail
+    if (gridState = "empty" and not hasBoxSets()) or gridState = "error" then spoken = m.status.message + ". " + m.status.detail
     if gridState <> "loading" and spoken <> "" then say(spoken)
 end sub
 
-sub onSelected()
-    card = m.grid.selectedItem
+sub onSelected(event as Object)
+    card = event.getData()
     if card = invalid then return
+    if catalog.boxSets.isCard(card)
+        nav.push(nav.route.BOX_SET, catalog.boxSets.routeParams(card))
+        return
+    end if
     ' A title to request opens its request page (requestsUi.destination).
     target = requestsUi.destination(card, m.lowTier)
     if target <> invalid
@@ -300,11 +384,18 @@ end sub
 ' Moves focus to a zone (search.zone).
 sub focusZone(zone as String)
     target = zoneTarget(zone)
+    ' Titles that found nothing leave the box sets as the results.
+    if target = invalid and zone = search.zone.RESULTS and hasBoxSets()
+        zone = search.zone.BOX_SETS
+        target = zoneTarget(zone)
+    end if
     if target = invalid
         zone = search.zone.KEYBOARD
         target = m.keyboard
     end if
     m.zone = zone
+    ' The box sets show unless focus is in the titles.
+    arrange()
     focusNode(target)
 end sub
 
@@ -316,6 +407,10 @@ function zoneTarget(zone as String) as Dynamic
     if zone = search.zone.KEYBOARD then return m.keyboard
     if m.query.text = "" then return invalid
     if zone = search.zone.FILTER then return m.filter
+    if zone = search.zone.BOX_SETS
+        if hasBoxSets() then return m.boxSetList
+        return invalid
+    end if
     gridState = m.grid.state
     if gridState = "ready" or gridState = "loading" or m.query.held then return m.gridList
     if gridState = "error" then return m.status
@@ -345,7 +440,7 @@ function onKeyEvent(key as String, press as Boolean) as Boolean
         focusZone(search.zone.KEYBOARD)
         return true
     end if
-    target = search.move(m.zone, key)
+    target = search.move(m.zone, key, hasBoxSets())
     if target = "" then return false
     if m.zone = search.zone.KEYBOARD
         ' Play runs the query at once, as Android TV's Search key does.

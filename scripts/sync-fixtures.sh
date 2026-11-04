@@ -17,7 +17,7 @@
 # The commit defaults to the pin below; fetch it in the checkout first.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-pinned=f133b241f3526604aedb0791b39e65dac6edc18a
+pinned=e3af98b06af2ee0ced92da518bf372f4b9fd5df6
 server=${1:?usage: scripts/sync-fixtures.sh <silo-server checkout> [commit]}
 commit=${2:-$pinned}
 
@@ -76,6 +76,8 @@ CATALOG = {
     "unfollowRequestMedia",
     # On-view description translation (source/catalog/translation.bs).
     "getMetadataAICapability", "translateCatalogItemDescription",
+    # Movie box sets: search, the box set page, and a movie page's row (source/catalog/boxSets.bs).
+    "searchCatalogBoxSets", "getCatalogBoxSet", "getCatalogItemBoxSet",
 }
 # The connection state, its learned-limit reset, and the speed test
 # (source/playback/connection.bs, components/AppSceneConnection.bs).

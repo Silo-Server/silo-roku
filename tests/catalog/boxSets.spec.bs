@@ -1,0 +1,141 @@
+namespace tests
+
+    ' Movie box sets (source/catalog/boxSets.bs): the server's three reads as
+    ' the map step reduces them, a box set card, the page's facts and Play,
+    ' and which films a movie page's row shows.
+    @suite("catalog box sets")
+    class CatalogBoxSetsTests extends rooibos.BaseTestSuite
+
+        function strings() as Object
+            return i18n.load("en_US")
+        end function
+
+        function mapped(kind as String, body as Dynamic, origin = "" as String) as Object
+            request = { requestId: "r1", map: { kind: kind, origin: origin } }
+            return catalog.map.apply(request, tests.catalogData.ok(body), tests.catalogData.words())
+        end function
+
+        ' A CatalogBoxSet as the server sends it.
+        function boxSetBody(extra = invalid as Dynamic) as Object
+            out = { id: "1241", library_id: "12", title: "Harry Potter Box Set", overview: "  Eight films.  ", poster_url: "https://img.example/hp.jpg", backdrop_url: "/api/v2/images/hp-backdrop", movie_count: 8, played_count: 0, first_year: 2001, last_year: 2011 }
+            if extra <> invalid then out.Append(extra)
+            return out
+        end function
+
+        function summary(extra = invalid as Dynamic) as Object
+            return catalog.boxSets.summary(m.boxSetBody(extra), { origin: "https://silo.example" })
+        end function
+
+        @describe("the map step")
+
+        @it("lists searched box sets as cards in the server's order, leaving out one without an ID or library")
+        sub _()
+            body = { items: [m.boxSetBody(), { id: "", library_id: "12", title: "No ID" }, m.boxSetBody({ id: "10", library_id: "", title: "No library" }), m.boxSetBody({ id: "9485", title: "The Fast and the Furious Box Set", played_count: 3, movie_count: 10 })] }
+            result = m.mapped(catalog.kind.BOX_SETS, body, "https://silo.example")
+            m.assertTrue(result.ok)
+            items = result.body.items
+            m.assertEqual(items.Count(), 2)
+            m.assertEqual(items[0].id, "box_set:1241")
+            m.assertEqual(items[0].itemType, catalog.boxSets.ITEM_TYPE)
+            m.assertEqual([items[0].boxSetId, items[0].libraryId], ["1241", "12"])
+            m.assertEqual(items[0].artUri, "https://img.example/hp.jpg")
+            m.assertEqual(items[0].backdropUri, "https://silo.example/api/v2/images/hp-backdrop", "root-relative artwork resolves against the origin")
+            m.assertEqual(items[0].flags, ["BOX SET"])
+            m.assertEqual(items[0].timeTag, "8 films")
+            m.assertEqual(items[0].captionDetail, "2001 – 2011")
+            m.assertEqual(items[0].synopsis, "Eight films.")
+            m.assertEqual(items[0].audioGuideText, "Harry Potter Box Set, box set of 8 films")
+            m.assertEqual(items[1].captionDetail, "3 / 10 watched", "once started the card counts what is watched")
+            m.assertFalse(m.mapped(catalog.kind.BOX_SETS, { items: invalid }).ok, "a list without items is malformed")
+        end sub
+
+        @it("reads a box set with its movies in release order as poster cards")
+        sub _()
+            body = m.boxSetBody({ played_count: 1, items: [tests.catalogData.item(1, { user_state: { played: true } }), { title: "no ID" }, tests.catalogData.item(2)] })
+            result = m.mapped(catalog.kind.BOX_SET, body)
+            m.assertTrue(result.ok)
+            m.assertEqual(result.body.boxSet.id, "1241")
+            m.assertEqual(result.body.boxSet.playedCount, 1)
+            m.assertEqual(result.body.items.Count(), 2)
+            m.assertEqual(result.body.items[0].id, "movie:m1")
+            m.assertTrue(result.body.items[0].played)
+            m.assertEqual(result.body.items[1].shape, catalog.shape.POSTER)
+            m.assertFalse(m.mapped(catalog.kind.BOX_SET, { id: "1241", library_id: "12" }).ok, "a box set without items is malformed")
+        end sub
+
+        @it("reads a movie's box set, or none when box_set is absent")
+        sub _()
+            found = m.mapped(catalog.kind.ITEM_BOX_SET, { box_set: m.boxSetBody({ items: tests.catalogData.items(3) }) })
+            m.assertTrue(found.body.found)
+            m.assertEqual(found.body.items.Count(), 3)
+            m.assertEqual(found.body.boxSet.title, "Harry Potter Box Set")
+            m.assertEqual(m.mapped(catalog.kind.ITEM_BOX_SET, {}).body, { found: false })
+            m.assertFalse(m.mapped(catalog.kind.ITEM_BOX_SET, { box_set: "x" }).ok)
+        end sub
+
+        @describe("the page")
+
+        @it("states the film count, the years, and how many are watched, as tvOS's factTokens")
+        sub _()
+            copy = m.strings()
+            m.assertEqual(catalog.boxSets.facts(m.summary(), copy), ["8 films", "2001 – 2011"])
+            m.assertEqual(catalog.boxSets.facts(m.summary({ played_count: 5 }), copy), ["8 films", "2001 – 2011", "5 of 8 watched"])
+            m.assertEqual(catalog.boxSets.facts(m.summary({ movie_count: 1, first_year: 1999, last_year: 1999 }), copy), ["1 film", "1999"])
+            m.assertEqual(catalog.boxSets.facts(m.summary({ first_year: invalid, last_year: invalid }), copy), ["8 films"])
+            line = catalog.boxSets.heroLine(m.summary(), copy)
+            m.assertEqual(line.rating, "BOX SET")
+            m.assertEqual(line.items, ["8 films", "2001 – 2011"])
+        end sub
+
+        @it("plays the first film not yet played, or the first once all are, and says Continue once started")
+        sub _()
+            copy = m.strings()
+            m.assertEqual(catalog.boxSets.nextIndex([]), -1)
+            m.assertEqual(catalog.boxSets.nextIndex([{ played: true }, { played: false }, { played: false }]), 1)
+            m.assertEqual(catalog.boxSets.nextIndex([{ played: true }, { played: true }]), 0)
+            m.assertEqual(catalog.boxSets.playLabel(m.summary(), "Philosopher's Stone", copy), "Play Philosopher's Stone")
+            m.assertEqual(catalog.boxSets.playLabel(m.summary({ played_count: 2 }), "Prisoner of Azkaban", copy), "Continue · Prisoner of Azkaban")
+            m.assertEqual(catalog.boxSets.playLabel(m.summary({ played_count: 8 }), "Philosopher's Stone", copy), "Play Philosopher's Stone", "all watched starts over")
+        end sub
+
+        @it("opens a box set card's page with its ID, library, and what the hero shows first")
+        sub _()
+            card = catalog.boxSets.card(m.summary(), m.strings())
+            m.assertTrue(catalog.boxSets.isCard(card))
+            m.assertFalse(catalog.boxSets.isCard({ itemType: "movie" }))
+            params = catalog.boxSets.routeParams(card)
+            m.assertEqual([params.boxSetId, params.libraryId], ["1241", "12"])
+            m.assertEqual(params.seed.title, "Harry Potter Box Set")
+            m.assertEqual(params.seed.synopsis, "Eight films.")
+            m.assertEqual(catalog.boxSets.summaryParams(m.summary()).boxSetId, "1241")
+        end sub
+
+        @describe("a movie page's row (tvOS's BoxSetRowWindow)")
+
+        @it("starts at the first film, keeping a slot for Explore all")
+        sub _()
+            m.assertEqual(catalog.boxSets.rowWindow(8, 0, 6, true), { first: 0, size: 5 })
+            m.assertEqual(catalog.boxSets.rowWindow(8, 4, 6, true), { first: 0, size: 5 }, "the film on screen already shows")
+            m.assertEqual(catalog.boxSets.rowWindow(3, 2, 6, true), { first: 0, size: 3 })
+            m.assertEqual(catalog.boxSets.rowWindow(3, -1, 6, true), { first: 0, size: 3 })
+        end sub
+
+        @it("slides so a film past the slots follows the one before it, ending at the last film")
+        sub _()
+            m.assertEqual(catalog.boxSets.rowWindow(8, 5, 6, true), { first: 3, size: 5 })
+            m.assertEqual(catalog.boxSets.rowWindow(8, 7, 6, true), { first: 3, size: 5 })
+            m.assertEqual(catalog.boxSets.rowWindow(10, 6, 7, true), { first: 4, size: 6 })
+            m.assertEqual(catalog.boxSets.rowWindow(4, 3, 2, true), { first: 3, size: 1 }, "one film slot has no room for the film before")
+        end sub
+
+        @describe("search")
+
+        @it("looks for box sets in All and Movies only")
+        sub _()
+            m.assertTrue(catalog.boxSets.searches(catalog.searchScope.ALL))
+            m.assertTrue(catalog.boxSets.searches(catalog.searchScope.MOVIES))
+            m.assertFalse(catalog.boxSets.searches(catalog.searchScope.SERIES))
+            m.assertFalse(catalog.boxSets.searches(search.REQUESTS_SCOPE))
+        end sub
+    end class
+end namespace

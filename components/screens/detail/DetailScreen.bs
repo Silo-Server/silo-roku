@@ -1,12 +1,14 @@
 import "pkg:/components/theme/browse.bs"
 import "pkg:/components/theme/detail.bs"
 import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/views/boxSets.bs"
 import "pkg:/components/views/cardMenu.bs"
 import "pkg:/components/views/pending.bs"
 import "pkg:/components/views/spoilers.bs"
 import "pkg:/components/views/themeMusic.bs"
 import "pkg:/source/api/client.bs"
 import "pkg:/source/catalog/actions.bs"
+import "pkg:/source/catalog/boxSets.bs"
 import "pkg:/source/catalog/detail.bs"
 import "pkg:/source/catalog/palette.bs"
 import "pkg:/source/catalog/requests.bs"
@@ -22,7 +24,8 @@ import "pkg:/source/util/values.bs"
 ' Versions, Audio Tracks, and Subtitles menus and readout, the player
 ' handoff, and the refresh after playback in DetailPlayback.bs; Watchlist,
 ' Favorites, and Mark as Watched in DetailPersonal.bs; Cast & Crew,
-' Trailers & More, recommendations, and theme music in DetailSupporting.bs.
+' Trailers & More, a movie's box set, recommendations, and theme music in
+' DetailSupporting.bs.
 ' Every request goes through components/views/pending.bs under the screen's
 ' owner; an answer for a season or item no longer shown is dropped.
 
@@ -33,6 +36,7 @@ const ZONE_EPISODES = "episodes"
 const ZONE_DETAILS = "details"
 const ZONE_CAST = "cast"
 const ZONE_EXTRAS = "extras"
+const ZONE_BOX_SET = "boxSet"
 const ZONE_SIMILAR = "similar"
 
 sub init()
@@ -141,6 +145,9 @@ sub onShow(event as Object)
         showArt()
         attachRail()
         attachSupporting()
+        ' Back from the player, a film of its box set, or the box set's page:
+        ' the row's watched marks may have changed.
+        refreshBoxSetRow()
         syncPersonalLists()
         if event.refresh then returnFromPlayer(event.played)
         translationChanged()
@@ -181,7 +188,7 @@ end sub
 ' Where focus was, the season and episode shown, and what the player was
 ' given, so a page rebuilt from its entry opens the same way.
 function focusKey() as Dynamic
-    key = { cast: m.castRail.index, castFirst: m.castRail.firstVisible, extras: m.extrasRail.index, extrasFirst: m.extrasRail.firstVisible, similar: m.similarRail.index, similarFirst: m.similarRail.firstVisible, zone: m.zone, button: m.actions.focusedKey, season: -1, episode: "", played: "" }
+    key = { cast: m.castRail.index, castFirst: m.castRail.firstVisible, extras: m.extrasRail.index, extrasFirst: m.extrasRail.firstVisible, boxSet: boxSetRowKey(), similar: m.similarRail.index, similarFirst: m.similarRail.firstVisible, zone: m.zone, button: m.actions.focusedKey, season: -1, episode: "", played: "" }
     if m.seasonIndex >= 0 and m.seasonIndex < m.seasonNodes.Count() then key.season = m.seasonNodes[m.seasonIndex].seasonNumber
     if m.target <> invalid and m.target.episode then key.episode = m.target.contentId
     if m.playing <> invalid then key.played = m.playing.contentId
@@ -245,6 +252,7 @@ sub start(restore as Dynamic, refresh as Boolean, played as Dynamic)
         if util.isNumber(restore.castFirst) then m.castRail.firstVisible = restore.castFirst
         if util.isNumber(restore.extras) then m.extrasRail.index = restore.extras
         if util.isNumber(restore.extrasFirst) then m.extrasRail.firstVisible = restore.extrasFirst
+        if util.isString(restore.boxSet) then m.boxSetFocus = restore.boxSet
         if util.isNumber(restore.similar) then m.similarRail.index = restore.similar
         if util.isNumber(restore.similarFirst) then m.similarRail.firstVisible = restore.similarFirst
     end if
@@ -374,7 +382,7 @@ end sub
 sub onAnswer(entry as Object, result as Object, content as Dynamic)
     if entry.kind = "item"
         onItem(result, content)
-    else if entry.kind = "similar"
+    else if entry.kind = "similar" or entry.kind = "boxSet" or entry.kind = "boxSetCapability"
         onSupportingAnswer(entry, result, content)
     else if entry.kind = "seasons"
         onSeasons(result, content)
@@ -528,6 +536,10 @@ sub layout()
         m.extrasRail.translation = [0, top]
         top = top + m.extrasRail.height + theme.detail.SECTION_GAP
     end if
+    if m.boxSetRail.visible
+        m.boxSetRail.translation = [0, top]
+        top = top + m.boxSetRail.height + theme.detail.SECTION_GAP
+    end if
     if m.similarRail.visible
         m.similarRail.translation = [0, top]
         top = top + m.similarRail.height + theme.detail.SECTION_GAP
@@ -548,6 +560,7 @@ function zones() as Object
     supportingReady = not m.series or not m.seasonsLoading
     if supportingReady and m.castRail.visible then out.Push(ZONE_CAST)
     if supportingReady and hasExtras() then out.Push(ZONE_EXTRAS)
+    if supportingReady and hasBoxSetRow() then out.Push(ZONE_BOX_SET)
     if supportingReady and hasSimilar() then out.Push(ZONE_SIMILAR)
     if m.details.visible and supportingReady then out.Push(ZONE_DETAILS)
     return out
@@ -555,7 +568,7 @@ end function
 
 ' Focuses zone, or the nearest zone below it, else above, when it is empty.
 sub focusZone(zone as String)
-    order = [ZONE_ACTIONS, ZONE_SEASONS, ZONE_EPISODES, ZONE_CAST, ZONE_EXTRAS, ZONE_SIMILAR, ZONE_DETAILS]
+    order = [ZONE_ACTIONS, ZONE_SEASONS, ZONE_EPISODES, ZONE_CAST, ZONE_EXTRAS, ZONE_BOX_SET, ZONE_SIMILAR, ZONE_DETAILS]
     available = zones()
     ' A hidden page (the player above it) only remembers the zone.
     if available.Count() = 0 or not m.top.visible
@@ -584,6 +597,8 @@ sub focusZone(zone as String)
         m.castRail.setFocus(true)
     else if chosen = ZONE_EXTRAS
         m.extrasRail.setFocus(true)
+    else if chosen = ZONE_BOX_SET
+        m.boxSetRail.setFocus(true)
     else if chosen = ZONE_SIMILAR
         m.similarRail.setFocus(true)
     else
@@ -611,6 +626,8 @@ sub scrollFor(zone as String)
         offset = m.castRail.translation[1] - 180
     else if zone = ZONE_EXTRAS
         offset = m.extrasRail.translation[1] - 180
+    else if zone = ZONE_BOX_SET
+        offset = m.boxSetRail.translation[1] - 180
     else if zone = ZONE_SIMILAR
         offset = m.similarRail.translation[1] - 180
     else if zone = ZONE_DETAILS
@@ -658,8 +675,14 @@ end sub
 
 function onKeyEvent(key as String, press as Boolean) as Boolean
     if not press or m.status.visible or cardMenuShown() then return false
-    ' Options on a More Like This card opens its menu (components/views/cardMenu.bs).
+    ' Options on a More Like This card, or a box set film other than this
+    ' one, opens its menu (components/views/cardMenu.bs).
     if key = "options"
+        if m.zone = ZONE_BOX_SET and hasBoxSetRow()
+            card = m.boxSetContent.getChild(m.boxSetRail.index)
+            if card = invalid or card.itemType = catalog.cards.MORE or card.id = m.detail.id then return false
+            return cardMenuOpen(card, { sectionType: "", home: false }, m.boxSetRail)
+        end if
         if m.zone <> ZONE_SIMILAR or not hasSimilar() then return false
         return cardMenuOpen(m.similarContent.getChild(m.similarRail.index), { sectionType: "", home: false }, m.similarRail)
     end if

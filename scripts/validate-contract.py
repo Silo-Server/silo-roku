@@ -34,23 +34,13 @@ SCHEMAS = json.loads((FIXTURES / "openapi" / "playback-v3.json").read_text())["c
 # Members newer than the pinned schema, which the client sends only when the
 # server advertises the feature that honors them (assumption AG-171):
 # dv8_base_layer_compatibility_ids under dv8_base_layer_compatibility_ids_v1,
-# from silo-server roku/dv8-bl-compat-ids (2110cf8ac, not on main yet); and a
-# native_embedded entry's limitations under native_embedded_limitations_v1,
-# from the instant-subtitles contract (C2, 2026-10-29; the server change is
-# not on main yet, assumption AG-652), written here from the contract until
-# scripts/sync-fixtures.sh can bring the server's schema in. Drop an entry
-# once the sync brings the member in.
+# from silo-server roku/dv8-bl-compat-ids (2110cf8ac, not on main yet),
+# written here until scripts/sync-fixtures.sh can bring the server's schema
+# in. Drop an entry once the sync brings the member in (a native_embedded
+# entry's limitations came in with the fixtures from e3af98b06).
 PROPOSED = {
     "DeliveryCapabilityV3": {
         "dv8_base_layer_compatibility_ids": {"type": "array", "maxItems": 16, "items": {"type": "integer", "minimum": 0, "maximum": 15}},
-    },
-    "NativeEmbeddedSubtitleCapabilityV3": {
-        "limitations": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
-    },
-    # A response member (contract C3, assumption AG-654): the plan's own
-    # rendition's index, which proposed_problems checks.
-    "HLSSubtitleRenditionV3": {
-        "index": {"type": "integer", "minimum": 1},
     },
 }
 for _schema, _members in PROPOSED.items():
@@ -59,20 +49,13 @@ for _schema, _members in PROPOSED.items():
             sys.exit(f"validate-contract: the pinned schema now has {_schema}.{_name}; drop it from PROPOSED")
         SCHEMAS[_schema]["properties"][_name] = _member
 # Response schemas the client reads that the pinned server does not publish
-# yet, from the instant-subtitles contract C3 as silo-server
-# feat-subtitle-renditions-all defines them in contracts/api/v2/openapi.json
-# (not on main yet; assumption AG-654): an inventory row's hls_rendition
-# (and, in PROPOSED, subtitle.hls_rendition's index). They are added whole
-# and checked against the plans in tests/fixtures/proposed/
+# yet, added whole and checked against the plans in tests/fixtures/proposed/
 # (proposed_problems), which the client's tests play.
 # scripts/sync-fixtures.sh vendors them once the pinned server has them (its
-# RESPONSE_ROOTS); drop an entry then.
-PROPOSED_RESPONSE = {
-    "SubtitleInventoryHLSRenditionV3": {
-        "additionalProperties": False, "type": "object", "required": ["group_id", "name", "index"],
-        "properties": {"group_id": {"type": "string"}, "name": {"type": "string"}, "index": {"type": "integer", "minimum": 1}},
-    },
-}
+# RESPONSE_ROOTS); drop an entry then. Empty since e3af98b06 published the
+# instant-subtitles contract's (C3, assumption AG-654): an inventory row's
+# hls_rendition and subtitle.hls_rendition's index.
+PROPOSED_RESPONSE = {}
 for _schema, _definition in PROPOSED_RESPONSE.items():
     if _schema in SCHEMAS:
         sys.exit(f"validate-contract: the pinned schema now has {_schema}; drop it from PROPOSED_RESPONSE")

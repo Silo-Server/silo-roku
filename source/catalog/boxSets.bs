@@ -1,0 +1,238 @@
+import "pkg:/source/catalog/art.bs"
+import "pkg:/source/catalog/cards.bs"
+import "pkg:/source/catalog/detail.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Movie box sets (spec section 5.6, docs/catalog-api.md "Movie box sets"):
+' the movies TMDB lists in one collection that the viewer can see in one
+' library. Search lists matching box sets ahead of its titles, a box set
+' opens its own page, and a movie's page shows its box set as a row. The
+' server advertises them with the search capability's box_sets; library
+' grids never group movies into box sets. Pure: ApiTask's map step
+' (source/catalog/map.bs) reduces the answers with these, and the screens
+' read the results.
+'
+' A box set as the screens read it (summary):
+'
+'     { id, libraryId, title, overview, posterUri, backdropUri, tint,
+'       tintHash, movieCount, playedCount, firstYear, lastYear }
+'
+' firstYear and lastYear are 0 when unknown.
+namespace catalog.boxSets
+    ' A box set card's itemType, and the start of its ID (content IDs never
+    ' take this form), as tvOS's BrowseItem(boxSet:) lifts one into a card.
+    const ITEM_TYPE = "box_set"
+    const ID_PREFIX = "box_set:"
+    ' Box sets Search asks for: one row of the search grid's four columns
+    ' (theme.browse.GRID_SEARCH_COLUMNS). tvOS asks for five in six.
+    const SEARCH_LIMIT = 4
+
+    ' summary from a CatalogBoxSet, or invalid without an ID or library.
+    function summary(body as Dynamic, copy as Object) as Dynamic
+        if not util.isObject(body) then return invalid
+        id = util.text(body.id)
+        libraryId = util.text(body.library_id)
+        if id = "" or libraryId = "" then return invalid
+        return {
+            id: id,
+            libraryId: libraryId,
+            title: util.text(body.title),
+            overview: util.text(body.overview).Trim(),
+            posterUri: catalog.cards.artwork(body.poster_url, copy),
+            backdropUri: catalog.cards.artwork(body.backdrop_url, copy),
+            tint: catalog.art.washColor(body.backdrop_thumbhash),
+            tintHash: util.text(body.backdrop_thumbhash),
+            movieCount: whole(body.movie_count),
+            playedCount: whole(body.played_count),
+            firstYear: whole(body.first_year),
+            lastYear: whole(body.last_year)
+        }
+    end function
+
+    ' searchCatalogBoxSets: { items: [card fields] } in the server's order,
+    ' best match first, for a BrowseGrid's local items (CardContent fields).
+    ' strings is the locale table (i18n.load). An entry without an ID is
+    ' left out.
+    function list(body as Object, copy as Object, strings as Object) as Dynamic
+        if type(body.items) <> "roArray" then return invalid
+        out = []
+        for each entry in body.items
+            boxSet = summary(entry, copy)
+            if boxSet <> invalid then out.Push(card(boxSet, strings))
+        end for
+        return { items: out }
+    end function
+
+    ' getCatalogBoxSet: { boxSet: summary, items: [card fields] }, the movies
+    ' in collection (release) order as poster cards. invalid when the body
+    ' is not a box set.
+    function detail(body as Object, copy as Object) as Dynamic
+        boxSet = summary(body, copy)
+        if boxSet = invalid or type(body.items) <> "roArray" then return invalid
+        items = []
+        for each item in body.items
+            fields = catalog.cards.fromItem(item, catalog.shape.POSTER, copy)
+            if fields <> invalid then items.Push(fields)
+        end for
+        return { boxSet: boxSet, items: items }
+    end function
+
+    ' getCatalogItemBoxSet: detail's answer with found true, or { found:
+    ' false } when the movie is in no box set the viewer sees (box_set
+    ' absent). invalid for a box_set that is not one.
+    function ofItem(body as Object, copy as Object) as Dynamic
+        if body.box_set = invalid then return { found: false }
+        if not util.isObject(body.box_set) then return invalid
+        out = detail(body.box_set, copy)
+        if out <> invalid then out.found = true
+        return out
+    end function
+
+    ' A box set as a search card: its poster with BOX SET at the top left
+    ' and the film count at the bottom right (tvOS's BoxSetCardBadges), the
+    ' title over the card caption (cardCaption). It carries the box set's
+    ' ID and library, which its page needs.
+    function card(boxSet as Object, strings as Object) as Object
+        films = filmCount(boxSet.movieCount, strings)
+        spoken = i18n.format(i18n.lookup(strings, "boxSets.audio"), { title: boxSet.title, films: films })
+        return {
+            id: ID_PREFIX + boxSet.id,
+            itemType: ITEM_TYPE,
+            shape: catalog.shape.POSTER,
+            title: boxSet.title,
+            caption: boxSet.title,
+            captionDetail: cardCaption(boxSet, strings),
+            heroTitle: boxSet.title,
+            artUri: boxSet.posterUri,
+            backdropUri: boxSet.backdropUri,
+            tint: boxSet.tint,
+            tintHash: boxSet.tintHash,
+            synopsis: boxSet.overview,
+            flags: [i18n.lookup(strings, "boxSets.label")],
+            timeTag: films,
+            boxSetId: boxSet.id,
+            libraryId: boxSet.libraryId,
+            audioGuideText: spoken
+        }
+    end function
+
+    ' Whether a card (CardContent or its fields) is a box set's.
+    function isCard(fields as Dynamic) as Boolean
+        return fields <> invalid and util.text(fields.itemType) = ITEM_TYPE and util.text(fields.boxSetId) <> ""
+    end function
+
+    ' The nav.route.BOX_SET params for a box set card, seeded with what the
+    ' card shows so the page paints its hero before its read answers.
+    function routeParams(fields as Object) as Object
+        return { boxSetId: util.text(fields.boxSetId), libraryId: util.text(fields.libraryId), seed: { title: util.text(fields.title), backdropUri: util.text(fields.backdropUri), tint: util.text(fields.tint), synopsis: util.text(fields.synopsis) } }
+    end function
+
+    ' The same params for a box set summary (a movie page's Explore all).
+    function summaryParams(boxSet as Object) as Object
+        return { boxSetId: boxSet.id, libraryId: boxSet.libraryId, seed: { title: boxSet.title, backdropUri: boxSet.backdropUri, tint: boxSet.tint, synopsis: boxSet.overview } }
+    end function
+
+    ' "1 film" or "8 films".
+    function filmCount(count as Integer, strings as Object) as String
+        key = "boxSets.filmOther"
+        if count = 1 then key = "boxSets.filmOne"
+        return i18n.format(i18n.lookup(strings, key), { count: count })
+    end function
+
+    ' "2001 – 2011", one year when the box set spans one, or "".
+    function years(boxSet as Object) as String
+        first = boxSet.firstYear
+        last = boxSet.lastYear
+        if first > 0 and last > 0 and first <> last then return first.ToStr() + " – " + last.ToStr()
+        if first > 0 then return first.ToStr()
+        if last > 0 then return last.ToStr()
+        return ""
+    end function
+
+    ' A card's second line, as tvOS's cardCaption: "5 / 8 watched" once a
+    ' film is played, else the years, else the film count.
+    function cardCaption(boxSet as Object, strings as Object) as String
+        if boxSet.playedCount > 0 then return i18n.format(i18n.lookup(strings, "boxSets.watchedCard"), { played: boxSet.playedCount, count: boxSet.movieCount })
+        span = years(boxSet)
+        if span <> "" then return span
+        return filmCount(boxSet.movieCount, strings)
+    end function
+
+    ' The page hero's facts, as tvOS's factTokens: the film count, the
+    ' years, and "5 of 8 watched" once a film is played.
+    function facts(boxSet as Object, strings as Object) as Object
+        out = [filmCount(boxSet.movieCount, strings)]
+        span = years(boxSet)
+        if span <> "" then out.Push(span)
+        if boxSet.playedCount > 0 then out.Push(i18n.format(i18n.lookup(strings, "boxSets.watchedFact"), { played: boxSet.playedCount, count: boxSet.movieCount }))
+        return out
+    end function
+
+    ' The hero's metadata line (catalog.detail.line): BOX SET in the rating
+    ' chip, then the facts.
+    function heroLine(boxSet as Object, strings as Object) as Object
+        return catalog.detail.line(i18n.lookup(strings, "boxSets.label"), facts(boxSet, strings), "")
+    end function
+
+    ' The index of the movie Play starts: the first in collection order the
+    ' profile has not played, or the first once all are; -1 without movies.
+    function nextIndex(items as Object) as Integer
+        if items.Count() = 0 then return -1
+        for i = 0 to items.Count() - 1
+            if not util.isTrue(items[i].played) then return i
+        end for
+        return 0
+    end function
+
+    ' Some, but not all, of the films are played: Play reads Continue.
+    function started(boxSet as Object) as Boolean
+        return boxSet.playedCount > 0 and boxSet.playedCount < boxSet.movieCount
+    end function
+
+    ' The Play pill's label: "Play <title>", or "Continue · <title>" once
+    ' started, as the phone and web apps name the film (tvOS puts the title
+    ' under the verb, which Roku's pill cannot).
+    function playLabel(boxSet as Object, movieTitle as String, strings as Object) as String
+        key = "boxSets.play"
+        if started(boxSet) then key = "boxSets.continue"
+        return i18n.format(i18n.lookup(strings, key), { title: movieTitle })
+    end function
+
+    ' Which films a movie page's box set row shows (tvOS's BoxSetRowWindow):
+    ' the row does not scroll, and holds slots cards, the last of them an
+    ' Explore all card when exploreAll. It starts at the first film; when
+    ' the film on screen (current, its index or -1) would not fit, it slides
+    ' so that film follows the one before it, ending at the last film.
+    ' { first, size }, the films' range.
+    function rowWindow(total as Integer, current as Integer, slots as Integer, exploreAll as Boolean) as Object
+        filmSlots = slots
+        if exploreAll then filmSlots = slots - 1
+        if filmSlots < 0 then filmSlots = 0
+        first = 0
+        if current >= filmSlots and filmSlots > 0
+            ' With a single slot there is no room for the film before.
+            before = 0
+            if filmSlots > 1 then before = 1
+            first = current - before
+            if first > total - filmSlots then first = total - filmSlots
+            if first < 0 then first = 0
+        end if
+        size = total - first
+        if size > filmSlots then size = filmSlots
+        if size < 0 then size = 0
+        return { first: first, size: size }
+    end function
+
+    ' Box sets are movies: All and Movies look for them, Series and
+    ' Requests do not (tvOS's searchesBoxSets).
+    function searches(scope as String) as Boolean
+        return scope = catalog.searchScope.ALL or scope = catalog.searchScope.MOVIES
+    end function
+
+    function whole(value as Dynamic) as Integer
+        if util.isNumber(value) and value > 0 then return Int(value)
+        return 0
+    end function
+end namespace

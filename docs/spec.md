@@ -119,6 +119,11 @@ Browse:
   grid with sort, filters, and an alphabet rail, and read-only Collections
   pages;
 - search across movies, series, and episodes;
+- movie box sets, where the server has them (`box_sets` on
+  `GET /api/v2/catalog/search/capabilities`): matching box sets ahead of
+  Search's titles, a box set's page with its films in release order and
+  Play for the next one, and a box set row on a movie's page (section 5.6;
+  added at the owner's request on 2026-11-04, after tvOS and Android TV);
 - movie detail, and series detail with season and episode lists, cast, and
   recommendations;
 - a person page from the detail page's cast: biography and the person's
@@ -912,6 +917,12 @@ their existing HD/FHD assets.
   - Focus: entering Browse focuses Sort. Down from any pill goes to the
     first poster, Up to the tab; Left and Right move along Sort, Filter,
     and Shuffle, and Right from the last goes to the alphabet rail.
+  - Down from a poster with none straight below it, the row below being
+    the grid's short last row, goes to that row's last poster, as tvOS's
+    focus engine and Android TV's grids do. Every poster grid follows
+    this (Browse, Search, collections, row pages, person pages, the
+    personal lists, the party picker, and box set pages), and so does the
+    profile picker before Down reaches its buttons.
   - Sort pill: "Sort · Title A–Z", 24 px Medium, padding 22. At rest, a white
     7% fill and a 9% border. Focused, an `#EDEDED` fill with black text,
     scaled 1.04.
@@ -1102,6 +1113,46 @@ their existing HD/FHD assets.
   - Captions use Browse's two-line treatment: title and year, or series
     name and "S01E02 · Pilot" for episodes. Both lines truncate at the tail.
   - An episode result opens its series' page with that episode selected.
+  - Box sets (tvOS's `SearchView.boxSetSection`). When the search
+    capability says `box_sets`, All and Movies (never Series or Request)
+    also send `GET /api/v2/catalog/box-sets?q=&limit=4` with each query,
+    cancelled by the next. Matches lead the results: 48 px under the
+    filter, "Box Sets" in the section header style, 34 px down one row of
+    the grid's 240×360 posters, then 48 px to the count and the titles. A
+    box set card shows the collection's poster with BOX SET at its top left
+    and the film count ("8 films") at its bottom right, in the calendar
+    card's pills, and under it the title and "5 / 8 watched" once a film is
+    played, else the years ("2001 – 2011"), else the film count. A failed
+    read shows no box sets. With box sets and no titles, the box sets are
+    the results and "No results" does not show.
+  - Right from the keyboard and Down from the filter reach the box sets
+    first; Down from them enters the titles, and while focus is in the
+    titles the box sets make way, so the count and grid sit where they do
+    without them; Up from the grid's first row brings them back. OK on a
+    box set opens its page; a box set card has no card menu (5.9).
+- **Box set page** (tvOS's `BoxSetDetailView`), pushed from a Search box
+  set card or a movie page's Explore all.
+  - `GET /api/v2/catalog/box-sets/{id}?library_id=` with Home's artwork
+    widths: the movies TMDB lists in one collection that the viewer can see
+    in that library, in release order. The card's title, backdrop, and
+    overview paint the hero until it answers.
+  - The detail hero, without a logo: the box set's title, then BOX SET in
+    the rating chip followed by the film count, the years, and "5 of 8
+    watched" once one is played, then the overview. One Play pill: "Play
+    <film>", or "Continue · <film>" once some but not all are watched, for
+    the first film the profile has not played (the first once all are),
+    which starts where its watch state says.
+  - 690 px down, "Movies" and the films in Browse's grid of six 260×390
+    posters across. Focus opens on Play; Down enters the grid and the page
+    moves up so the grid sits at Browse's y 332; Up from its first row
+    returns. OK on a film opens its page in the box set's library;
+    Options opens its card menu.
+  - The page reads the box set again whenever it shows again (back from a
+    film or the player), keeping it on a failed read; a 404 (box sets
+    turned off for the library, or too few of its films visible) replaces
+    it with "This box set isn't available" / "Box sets may be turned off
+    for this library, or too few of its movies are here." and Back. A
+    first read that fails offers Retry.
 - **Detail hero.**
   - Frame: 690 px tall, 100 px side inset, text starting 116 px from the top
     in a 1080 px column. The backdrop, its fades, and its wash are the Home
@@ -1362,8 +1413,8 @@ their existing HD/FHD assets.
     existing apps do.
 - **Cast and recommendations.**
   - After the hero on movies, or the episode rail on series, show Cast &
-    Crew, then Trailers & More, then Related Movies or Recommended Series,
-    then Details. Cast
+    Crew, then Trailers & More, then a movie's box set, then Related Movies
+    or Recommended Series, then Details. Cast
     preserves server order and displays up to 24 people with 200 px
     portraits, names, and characters. Missing portraits use initials;
     entries without a person ID remain readable but cannot open a person.
@@ -1385,6 +1436,24 @@ their existing HD/FHD assets.
     move between available sections; late responses do not take focus.
   - OK on a cast card with a person ID opens the person's page; Back from
     it returns to that card.
+- **Box set row** (tvOS's `TVBoxSetRow`), on a movie's page only.
+  - With the recommendations' read, the page asks
+    `GET /api/v2/catalog/search/capabilities` whether the server has box
+    sets, unless a page this session already heard yes from it (only a yes
+    is kept); then `GET /api/v2/catalog/items/{id}/box-set`, with the
+    page's `library_id` when it has one. No `box_set`, or a 404, shows no
+    row. The row reads again when the page shows again and after Mark as
+    Watched; a failed reread keeps it.
+  - The box set's title as the heading, then as many of its films in
+    release order as fit across without scrolling, six posters (seven on
+    the low tier) less one for the Explore all card Home rows end with,
+    which opens the box set's page. The row starts at the first film; when
+    the movie on screen would not fit, it slides so that film follows the
+    one before it, ending at the last film. The movie on screen carries a
+    THIS FILM pill and no card menu, and Down into the row lands on it; OK
+    on it does nothing. Another film opens its page in the box set's
+    library; Options opens its card menu. Back to the page returns focus to
+    the card it left, Explore all included.
 - **Trailers & More** (tvOS's `TVTrailersRail`).
   - The item's local extras (`extras` on `GET /api/v2/catalog/items/{id}`:
     trailers, teasers, featurettes, behind the scenes, and the rest) in
@@ -2319,9 +2388,13 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Watchlist and Favorites are root pages under the top bar, which stays with the avatar; History is a pushed page | All three are pushed pages without the bar; Back returns to the page below with focus on the avatar | One page type for the three lists; the bar's selected tab has no state for a page that belongs to no tab |
 | Watchlist and Favorites read the whole list (up to 100 pages of 200) into an 8-column grid of 176 px posters; History reads `GET /api/v2/catalog?source=history` 60 at a time | Each list reads its own endpoint (`/api/v2/watchlist`, `/api/v2/favorites`, `/api/v2/history`) 40 at a time into Browse's six-column grid of 260×390 posters, holding at most the memory policy's pages | One bounded grid (`catalog.grid`) and its memory budget for every paged list (plan section 4.8); the contract's own list endpoints |
 | Watchlist's empty state says "Tap the bookmark icon on any item to add it here", Favorites' "Tap the heart icon on any item to add it here" | "Add titles from a detail page and they will appear here." and "Add favorites from a detail page and they will appear here." (the iOS words), with a Back button | A remote has no tap, and a page without the bar needs a way out from its empty state |
-| A card's context menu (press and hold) offers Play or Resume on Continue Watching, Mark as Watched, Favorites, and Watchlist, and on Home Remove from Continue Watching or Next Up; a Watchlist or Favorites page drops a card whose flag turns off. History offers no removal | Options (*) on a focused card opens the same menu, in the same order, on Home, the library tabs, Browse, collections, Search, person pages, More Like This, and the Watchlist, Favorites, and History pages (`source/catalog/cardMenu.bs`); Favorites and Watchlist show only when the server offers the lists. History adds Remove from History (`POST /api/v2/history/remove`, the card's item, which for a series covers its episodes). A change shows on the card at once and goes back with the notice if refused; Home and Recommended read their rows again after one. A card read before another page's change takes the change when its menu opens | Roku has no press and hold: a list consumes OK on press. `*` is Roku's options key. Development builds keep `*` on Home's bar for the diagnostic screen |
+| A card's context menu (press and hold) offers Play or Resume on Continue Watching, Mark as Watched, Favorites, and Watchlist, and on Home Remove from Continue Watching or Next Up; a Watchlist or Favorites page drops a card whose flag turns off. History offers no removal | Options (*) on a focused card opens the same menu, in the same order, on Home, the library tabs, Browse, collections, Search, person pages, More Like This, box set pages and rows, and the Watchlist, Favorites, and History pages (`source/catalog/cardMenu.bs`); Favorites and Watchlist show only when the server offers the lists. History adds Remove from History (`POST /api/v2/history/remove`, the card's item, which for a series covers its episodes). A change shows on the card at once and goes back with the notice if refused; Home and Recommended read their rows again after one. A card read before another page's change takes the change when its menu opens | Roku has no press and hold: a list consumes OK on press. `*` is Roku's options key. Development builds keep `*` on Home's bar for the diagnostic screen |
 | An episode card's context menu marks that episode watched or unwatched | More on a series page has Mark Episode Watched or Unwatched for the episode Play plays (the active one) | Roku's episode rail has no context menu; the action row already names that episode |
 | More also offers Find Trailers, Show Series Info, and Watch Party where they apply | Shuffle, Favorites, the watched rows, Translate Description while the page offers it (section 5.6), and Watch Party where it applies ([`watch-party.md`](watch-party.md) section 4.1) | Scope (sections 3.3 and 3.4); Find Trailers (`POST /api/v2/catalog/items/{id}/trailers/refresh`, offered by `GET /api/v2/capabilities/trailers`) fetches remote videos, which Roku leaves out (next row) |
+| A box set card draws two sleeves peeking above its poster and a watched-progress bar along its foot | The poster with the BOX SET and film count pills, and "5 / 8 watched" in its caption | Roku cards draw no art outside their frame, and poster cards have no progress bar (5.5); the caption carries the count |
+| Search asks for five box sets and lays them out in the six-column grid above the titles, which scroll with them | Four, one row of the search grid's four columns; the row makes way while focus is in the titles | Search's results column holds two poster rows (section 5.6); scrolling the column would put a partial row under the filter |
+| The box set page's Play shows the verb with the film's title beneath it | "Play <film>" or "Continue · <film>" on one line, as the phone and web apps word it | The action row's pill holds one label (section 5.6) |
+| The movie on screen in a box set row is outlined and labelled THIS FILM | A THIS FILM pill at the poster's top left, the calendar card's pill | Roku cards draw only the focus outline; the pill reuses the card's badge |
 | Trailers & More also lists the item's remote trailers and clips (`videos`, YouTube only), captioned "YouTube" with YouTube's still, which open in the YouTube app; tvOS drops them when the app is not installed | Only the local extras, which play in Silo's player | Certification criterion 5.3 forbids opening another app, and the server gives a remote video only as its site and key (`ItemVideoInfo`), with no stream it hosts or relays (silo-server `3e2d306b2`; assumption AG-361) |
 | A theme fades in to 35% of the volume over 300 ms and fades out as it stops | It plays at the TV's volume and starts and stops at once | Roku's `Audio` node has no volume or gain field, only `mute` (AG-363) |
 | A theme pauses while the app is in the background and resumes on return | Pressing Home closes the app, and the theme with it | Roku keeps no app running in the background without Instant Resume, which this client does not use |
@@ -2940,6 +3013,10 @@ The first release consumes:
   when `GET /api/v2/catalog/search/capabilities` advertises it, and `video`
   otherwise;
 - `GET /api/v2/catalog/items/{id}` for detail;
+- `GET /api/v2/catalog/box-sets?q=`, `GET /api/v2/catalog/box-sets/{id}?library_id=`,
+  and `GET /api/v2/catalog/items/{id}/box-set` for movie box sets in
+  Search, the box set page, and a movie page's row, when the search
+  capability advertises `box_sets` (section 5.6);
 - `GET /api/v2/recommendations/similar/{item_id}?limit=12` for detail
   recommendations;
 - `GET /api/v2/catalog/people/{id}` for the person page's header;

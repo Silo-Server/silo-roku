@@ -1,0 +1,369 @@
+import "pkg:/components/theme/browse.bs"
+import "pkg:/components/theme/detail.bs"
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/views/cardMenu.bs"
+import "pkg:/components/views/pending.bs"
+import "pkg:/source/api/client.bs"
+import "pkg:/source/catalog/actions.bs"
+import "pkg:/source/catalog/boxSets.bs"
+import "pkg:/source/catalog/detail.bs"
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/memory/policy.bs"
+import "pkg:/source/nav/client.bs"
+import "pkg:/source/nav/player.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/nav/textures.bs"
+import "pkg:/source/platform/client.bs"
+import "pkg:/source/platform/topics.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Focus zones, top to bottom: the Play pill, then the films.
+const ZONE_ACTIONS = "actions"
+const ZONE_GRID = "grid"
+' The Movies heading, a detail section's, and its gap to the grid.
+const HEADING_HEIGHT = 44
+const HEADING_GAP = 34
+
+sub init()
+    i18n.install()
+    m.copy = m.global.strings
+    m.top.findNode("background").color = theme.color.BACKGROUND
+    m.page = m.top.findNode("page")
+    m.hero = m.top.findNode("hero")
+    m.hero.observeField("actionsTop", "placeActions")
+    m.actions = m.top.findNode("actions")
+    m.actions.observeField("activated", "onAction")
+    m.heading = m.top.findNode("heading")
+    m.heading.setFields({ text: i18n.text("boxSets.movies"), font: theme.font(theme.textStyle.SECTION_HEADER), color: theme.color.TEXT, height: HEADING_HEIGHT, vertAlign: "center" })
+    m.gridTop = theme.detail.HERO_HEIGHT + HEADING_HEIGHT + HEADING_GAP
+    m.heading.translation = [theme.size.DETAIL_SIDE_INSET, theme.detail.HERO_HEIGHT]
+    m.grid = m.top.findNode("grid")
+    m.grid.translation = [theme.size.DETAIL_SIDE_INSET, m.gridTop]
+    m.grid.observeField("selectedItem", "onSelected")
+    m.menuLayer = m.top.findNode("menuLayer")
+    cardMenuInit()
+    m.status = m.top.findNode("status")
+    m.status.observeField("activated", "onStatusAction")
+    m.spinner = m.top.findNode("spinner")
+    m.spinner.centre = [960, 820]
+    m.scroll = m.top.findNode("scroll")
+    m.scroll.duration = theme.detail.MOVIE_SCROLL_SECONDS
+    m.scrollTo = m.top.findNode("scrollTo")
+    m.textures = nav.textures.create()
+    nav.textures.addPoster(m.textures, m.hero.findNode("backdrop"))
+    nav.textures.addView(m.textures, m.grid)
+    m.pending = []
+    m.params = {}
+    ' The box set (catalog.boxSets.summary) and its films' card fields, once
+    ' read.
+    m.boxSet = invalid
+    m.items = []
+    ' The hero's backdrop, which a hidden page keeps off its Poster.
+    m.backdropUri = ""
+    m.zone = ZONE_ACTIONS
+    m.wantedZone = ""
+    m.restoreGrid = invalid
+    m.lowTier = false
+    m.statusRetries = false
+end sub
+
+' --- Screen hooks -----------------------------------------------------------
+
+sub onShow(event as Object)
+    if event.first
+        params = m.top.entry.params
+        if util.isObject(params) then m.params = params
+        state = platform.current().memory
+        m.lowTier = state.tier = memory.tier.LOW
+        m.hero.lowTier = m.lowTier
+        m.actions.lowTier = m.lowTier
+        m.grid.owner = m.top.owner
+        m.grid.pages = state.gridPages
+        platform.subscribe(m.top.owner, [platform.topic.MEMORY_LEVEL], "onMemoryLevel")
+        restore = event.restore
+        if util.isObject(restore)
+            if util.text(restore.zone) = ZONE_GRID then m.wantedZone = ZONE_GRID
+            m.restoreGrid = restore.grid
+        end if
+        showSeed(params)
+        loadBoxSet()
+    else
+        nav.textures.restore(m.textures)
+        showArt()
+        m.actions.active = true
+        ' Back from a film or the player: watched counts and the next film
+        ' may have changed.
+        if util.isObject(event.restore) then m.restoreGrid = event.restore.grid
+        loadBoxSet()
+    end if
+    focusZone(m.zone)
+end sub
+
+sub onHide()
+    m.scroll.control = "stop"
+    m.actions.active = false
+    nav.textures.hide(m.textures)
+end sub
+
+sub onPressure(_level as String)
+    nav.textures.detach(m.textures)
+end sub
+
+sub onRelease()
+    m.actions.active = false
+    cancelPending()
+end sub
+
+function focusKey() as Dynamic
+    return { zone: m.zone, grid: m.grid.callFunc("focusKey") }
+end function
+
+function onMemoryLevel(event as Object) as Boolean
+    m.grid.pages = event.gridPages
+    return true
+end function
+
+function backContext() as Object
+    return { overlay: cardMenuShown(), zone: nav.zone.NONE }
+end function
+
+function onBack(action as String) as Boolean
+    if action = nav.action.CLOSE_OVERLAY then cardMenuClose()
+    return true
+end function
+
+' Changes from a film's card menu show on the card itself.
+sub cardMenuApplied(_card as Object, _value as Integer)
+end sub
+
+' --- Loading ----------------------------------------------------------------
+
+' Paints the card's seed, if the route has one, or the hero's quiet bars.
+sub showSeed(params as Object)
+    seed = params.seed
+    if not util.isObject(seed)
+        m.hero.placeholders = true
+        return
+    end if
+    m.hero.content = { title: util.text(seed.title), metadata: catalog.detail.line(i18n.text("boxSets.label"), [], ""), synopsis: util.text(seed.synopsis) }
+    m.hero.tint = util.text(seed.tint)
+    m.backdropUri = util.text(seed.backdropUri)
+    showArt()
+end sub
+
+sub loadBoxSet()
+    id = util.text(m.params.boxSetId)
+    libraryId = util.text(m.params.libraryId)
+    if id = "" or libraryId = ""
+        showError("boxSets.unavailable", "boxSets.unavailableBody", false)
+        return
+    end if
+    cancelPending()
+    if m.boxSet = invalid then m.spinner.running = true
+    request = catalog.request.boxSet(id, libraryId, m.lowTier)
+    request.lane = "interactive"
+    sendPending(request, { kind: "boxSet" })
+end sub
+
+sub onResult(event as Object)
+    handle = event.getRoSGNode()
+    entry = takePending(handle)
+    if entry = invalid then return
+    result = api.resultOf(handle)
+    if result <> invalid then onBoxSet(result)
+end sub
+
+' A reread over a shown box set keeps it when the read fails, unless the
+' server answers 404 (tvOS's BoxSetDetailViewModel.load).
+sub onBoxSet(result as Object)
+    m.spinner.running = false
+    if result.ok <> true or not util.isObject(result.body)
+        if result.status = 404 or result.status = 403 or result.status = 410
+            showError("boxSets.unavailable", "boxSets.unavailableBody", false)
+        else if m.boxSet = invalid
+            showError("boxSets.error", "", true)
+        end if
+        return
+    end if
+    m.boxSet = result.body.boxSet
+    m.items = result.body.items
+    present()
+end sub
+
+sub present()
+    m.status.visible = false
+    m.page.visible = true
+    boxSet = m.boxSet
+    m.hero.setFields({ placeholders: false, tint: boxSet.tint, content: { title: boxSet.title, metadata: catalog.boxSets.heroLine(boxSet, m.copy), synopsis: boxSet.overview } })
+    m.backdropUri = boxSet.backdropUri
+    showArt()
+    buttons = []
+    nextAt = catalog.boxSets.nextIndex(m.items)
+    if nextAt >= 0
+        label = catalog.boxSets.playLabel(boxSet, util.text(m.items[nextAt].title), m.copy)
+        buttons.Push({ key: catalog.action.PLAY, label: label, enabled: true })
+    end if
+    m.actions.buttons = { items: buttons, primaryWidth: theme.detail.PLAY_WIDTH }
+    ' The grid starts over with the films; focus stays on the film it was on.
+    restore = m.restoreGrid
+    if restore = invalid and m.zone = ZONE_GRID then restore = m.grid.callFunc("focusKey")
+    m.restoreGrid = invalid
+    m.grid.callFunc("load", { items: m.items, lowTier: m.lowTier })
+    if restore <> invalid then m.grid.callFunc("restoreFocus", restore)
+    m.top.ready = true
+    if not m.top.visible then return
+    zone = m.zone
+    if m.wantedZone <> "" and zoneTarget(m.wantedZone) <> invalid
+        zone = m.wantedZone
+        m.wantedZone = ""
+    end if
+    focusZone(zone)
+end sub
+
+' The backdrop goes on the hero only while the page shows: a hidden page's
+' Posters belong to nav.textures, whose restore puts back what hide took.
+sub showArt()
+    if not m.top.visible then return
+    if m.hero.backdropUri <> m.backdropUri then m.hero.backdropUri = m.backdropUri
+end sub
+
+sub showError(key as String, detailKey as String, retry as Boolean)
+    m.spinner.running = false
+    m.page.visible = false
+    m.boxSet = invalid
+    m.items = []
+    m.status.message = i18n.text(key)
+    m.status.detail = ""
+    if detailKey <> "" then m.status.detail = i18n.text(detailKey)
+    m.statusRetries = retry
+    if retry
+        m.status.kind = "error"
+        m.status.action = i18n.text("states.retry")
+    else
+        m.status.kind = "empty"
+        m.status.action = i18n.text("common.back")
+    end if
+    m.status.visible = true
+    m.top.ready = true
+    if m.top.visible
+        m.status.setFocus(true)
+        m.status.callFunc("announce")
+    end if
+end sub
+
+sub onStatusAction()
+    if m.statusRetries
+        m.status.visible = false
+        m.page.visible = true
+        loadBoxSet()
+    else
+        nav.pop()
+    end if
+end sub
+
+' --- Layout and focus -------------------------------------------------------
+
+sub placeActions()
+    m.actions.translation = [theme.size.DETAIL_SIDE_INSET, m.hero.actionsTop]
+end sub
+
+' The node a zone focuses, or invalid when it has nothing to focus.
+function zoneTarget(zone as String) as Dynamic
+    if m.status.visible then return m.status
+    if zone = ZONE_ACTIONS
+        buttons = m.actions.buttons
+        if util.isObject(buttons) and type(buttons.items) = "roArray" and buttons.items.Count() > 0 then return m.actions
+        return invalid
+    end if
+    if zone = ZONE_GRID and m.items.Count() > 0 then return m.grid
+    return invalid
+end function
+
+' Focuses zone, else the other one, else the screen itself; the page moves
+' so the grid sits where Browse's does while it has focus.
+sub focusZone(zone as String)
+    if not m.top.visible then return
+    target = zoneTarget(zone)
+    if target = invalid
+        other = ZONE_GRID
+        if zone = ZONE_GRID then other = ZONE_ACTIONS
+        if zoneTarget(other) <> invalid
+            zone = other
+            target = zoneTarget(zone)
+        end if
+    end if
+    m.zone = zone
+    if target = invalid
+        focusScreen()
+    else if not target.isInFocusChain()
+        target.setFocus(true)
+    end if
+    scrollFor(zone)
+end sub
+
+sub scrollFor(zone as String)
+    target = [0, 0]
+    if zone = ZONE_GRID then target = [0, theme.browse.GRID_TOP - m.gridTop]
+    current = m.page.translation
+    if current[1] = target[1] then return
+    m.scroll.control = "stop"
+    if m.lowTier
+        m.page.translation = target
+        return
+    end if
+    m.scrollTo.keyValue = [current, target]
+    m.scroll.control = "start"
+end sub
+
+' --- Actions ----------------------------------------------------------------
+
+sub onAction()
+    if m.actions.activated = catalog.action.PLAY then play()
+end sub
+
+' Plays the first film the profile has not played, from where its watch
+' state says (nav.player.RESUME): an unfinished film resumes.
+sub play()
+    nextAt = catalog.boxSets.nextIndex(m.items)
+    if nextAt < 0 then return
+    id = util.text(m.items[nextAt].id)
+    if id = "" then return
+    pushRoute(nav.route.PLAYER, { intent: nav.player.intent(id, nav.player.RESUME) })
+end sub
+
+' A film opens its page in the box set's library.
+sub onSelected(event as Object)
+    card = event.getData()
+    if card = invalid or card.id = "" or m.boxSet = invalid then return
+    params = catalog.detail.routeParams(card)
+    params.libraryId = m.boxSet.libraryId
+    pushRoute(nav.route.DETAIL, params)
+end sub
+
+sub pushRoute(route as String, params as Object)
+    nav.push(route, params)
+end sub
+
+' Down from Play enters the films and Up from their first row returns;
+' Play on the remote plays the next film; Options on a film opens its menu.
+function onKeyEvent(key as String, press as Boolean) as Boolean
+    if not press or cardMenuShown() or m.status.visible then return false
+    if key = "options"
+        if m.zone <> ZONE_GRID or not m.grid.isInFocusChain() then return false
+        return cardMenuOpen(m.grid.callFunc("focusedCard"), { sectionType: "", home: false }, m.grid)
+    end if
+    if key = "down" and m.zone = ZONE_ACTIONS and zoneTarget(ZONE_GRID) <> invalid
+        focusZone(ZONE_GRID)
+        return true
+    end if
+    if key = "up" and m.zone = ZONE_GRID and zoneTarget(ZONE_ACTIONS) <> invalid
+        focusZone(ZONE_ACTIONS)
+        return true
+    end if
+    if key = "play" and m.zone = ZONE_ACTIONS
+        play()
+        return true
+    end if
+    return false
+end function
