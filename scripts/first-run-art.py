@@ -18,6 +18,11 @@
                           and the mask that rounds an avatar image
   avatar_shade.png        light top left and shade bottom right over the disc,
                           with a 2 px white 14% outline, as the apps draw it
+  avatar_disc_64.png, avatar_shade_64.png
+                          the same at 64 px, for the avatars drawn under 100 px
+                          (the top bar's, the avatar menu's, Settings'): Roku
+                          scales without mipmaps, so 220 px art drawn at 58
+                          px has jagged edges
   avatar_ring.png         the focused avatar's 6 px ring, its outer edge
                           12 px outside a 220 px avatar (244 px), as tvOS
                           draws it
@@ -125,6 +130,7 @@ INK = (0xED, 0xED, 0xED)
 STRETCH = 2
 
 AVATAR = 220
+SMALL_AVATAR = 64
 AVATAR_RING_GAP = 6
 AVATAR_RING_WIDTH = 6
 LOCK_BADGE = 60
@@ -234,22 +240,23 @@ def rgba(alpha, color):
     return [[tuple(round(c) for c in color) + (round(255 * a),) for a in line] for line in alpha]
 
 
-def avatar_shade():
+def avatar_shade(size=AVATAR):
     """The apps' radial gradient over a tint disc, as a white or black overlay.
 
     The apps blend from the tint lightened 35% towards white at (0.3, 0.25)
     of the disc, through the tint at half the 0.8-wide radius, to the tint
     darkened 45% towards black. Over a disc of the tint, white at 35% x (1 - 2t)
     and then black at 45% x (2t - 1) give exactly those colours. The outline
-    is laid over that.
+    is laid over that, 2 px at 220 px and proportionally thinner when smaller,
+    so every size looks as the 220 px art scaled down.
     """
-    cover = disc_alpha(AVATAR, AVATAR / 2)
-    outline = disc_alpha(AVATAR, AVATAR / 2, ring=2)
+    cover = disc_alpha(size, size / 2)
+    outline = disc_alpha(size, size / 2, ring=2 * size / AVATAR)
     rows = []
-    for py in range(AVATAR):
+    for py in range(size):
         row = []
-        for px in range(AVATAR):
-            t = clamp(math.hypot(px + 0.5 - AVATAR * 0.3, py + 0.5 - AVATAR * 0.25) / (AVATAR * 0.8))
+        for px in range(size):
+            t = clamp(math.hypot(px + 0.5 - size * 0.3, py + 0.5 - size * 0.25) / (size * 0.8))
             color, alpha = (WHITE, 0.35 * (1 - 2 * t)) if t < 0.5 else (BLACK, 0.45 * (2 * t - 1))
             edge = 0.14 * outline[py][px]
             # The outline over the shade, both in straight alpha.
@@ -874,6 +881,8 @@ def images():
     yield from rounded_nine_patches("rounded_40", 40, hd(40), with_ring=False)
     yield "avatar_disc.png", rgba(disc_alpha(AVATAR, AVATAR / 2), WHITE)
     yield "avatar_shade.png", avatar_shade()
+    yield f"avatar_disc_{SMALL_AVATAR}.png", rgba(disc_alpha(SMALL_AVATAR, SMALL_AVATAR / 2), WHITE)
+    yield f"avatar_shade_{SMALL_AVATAR}.png", avatar_shade(SMALL_AVATAR)
     yield "avatar_ring.png", avatar_ring()
     yield "lock_badge.png", lock_badge()
     yield "pin_dot.png", rgba(disc_alpha(PIN_DOT, PIN_DOT / 2), WHITE)

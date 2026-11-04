@@ -79,8 +79,9 @@ tvOS's shared art (spec section 5, silo-apple b90a86ea; AG-222):
   check_disc.png             the watched mark: a logical 40 px #EDEDED disc
                              with a black check, rasterized at 2x
   cast_shadow.png            circular portrait shadow using the card shadow blur
-  circle_ring_3.png          the focused top bar avatar's ring: 3 px inside a 58 px
-                             circle, white
+  avatar_ring_60.png         the focused top bar avatar's ring: 3 px inside a 60 px
+                             circle, white, centred in 64 px so no edge of the
+                             circle meets the image's edge
   cast_ring.png              a focused cast portrait's outline: 4 px inside a
                              200 px circle, white, at 70% opacity
   rounded_{14,12}_{fhd,hd}.9.png
@@ -122,10 +123,9 @@ PLACEHOLDER = (88, 132)  # stretched over any card
 PLACEHOLDER_BASE = (0x16, 0x17, 0x1C)
 # Android TV's DefaultArtwork: colour, alpha, and centre as a fraction of the size.
 GLOWS = (((0x00, 0x34, 0xFB), 0.176, (0.0, 0.0)), ((0xFD, 0x74, 0x03), 0.144, (1.0, 1.0)), ((0xF5, 0x0B, 0x4F), 0.112, (0.7, 0.3)))
-CIRCLE = 58  # top bar search and avatar circles, FHD px
 GLYPH = 28  # magnifier, FHD px: SF Symbols' magnifyingglass at 27 pt semibold
 GLYPH_SCALE = 2  # intrinsic pixels per logical FHD pixel; glyphs only
-AVATAR_RING = 3  # the focused avatar's ring, inside the circle
+AVATAR_RING = (60, 3, 2)  # the focused avatar's ring: circle, width inside it, transparent margin
 OUTLINE = 4  # a focused card's outline (tvOS's TVCardOutline.lineWidth), inside the card
 CAST = 200  # a cast portrait, FHD px
 WHITE = (0xFF, 0xFF, 0xFF)
@@ -240,12 +240,13 @@ def placeholder(width, height):
     return rows
 
 
-def circle_ring(size, width):
-    def covered(x, y, size):
-        r = size / 2
-        d = ((x - r) ** 2 + (y - r) ** 2) ** 0.5
+def circle_ring(size, width, margin=0):
+    """A ring width px inside a size px circle, centred in an image margin px larger on each side."""
+    def covered(x, y, side):
+        c, r = side / 2, size / 2
+        d = ((x - c) ** 2 + (y - c) ** 2) ** 0.5
         return r - width <= d <= r
-    return [[WHITE + (a,) for a in line] for line in coverage(size, covered)]
+    return [[WHITE + (a,) for a in line] for line in coverage(size + 2 * margin, covered)]
 
 
 def magnifier(size):
@@ -512,7 +513,7 @@ def images():
         yield f"progress_{radius}_{height}.9.png", progress_track(radius, height)
     yield "check_disc.png", check_disc(CHECK_DISC)
     yield "explore_all.png", explore_all(*EXPLORE)
-    yield "circle_ring_3.png", circle_ring(CIRCLE, AVATAR_RING)
+    yield f"avatar_ring_{AVATAR_RING[0]}.png", circle_ring(*AVATAR_RING)
     yield "cast_ring.png", circle_ring(CAST, OUTLINE)
     yield "cast_shadow.png", cast_shadow()
     for res, scale in (("fhd", lambda px: px), ("hd", hd)):
