@@ -971,7 +971,7 @@ only from Settings or the prompt after a crash.
 | `brighterscript-formatter` | 1.8.4 | Format check |
 | `rooibos-roku` | 5.17.0 | Unit tests |
 | `brs-node`, `brs-scenegraph` | 2.6.1, 0.6.1, Node 22 | Headless runner (not release evidence) |
-| `sca-cmd` | 14.16.0, sha256-pinned | Static Analysis |
+| `sca-cmd` | 15.0.3, sha256-pinned | Static Analysis |
 | `roku-test-automation` | 2.2.x | On-device journeys from Milestone 2 |
 | Roku Resource Monitor, Perfetto, port 8080/ECP queries | — | Memory, texture, rendezvous, frame-rate, latency |
 
@@ -983,8 +983,9 @@ stdout contains `[Rooibos Result]: PASS` (`brs-cli` exits 0 even when tests fail
 with a 5-minute timeout and JUnit output; `scripts/hygiene.sh`, case-insensitive
 greps on built output (no `/api/v1`, `InitClientCertificates`,
 `observeFieldScoped(`, `observeFieldScopedEx` with a string argument, or bare
-`print`; required manifest keys). Packaging stamps `build_version` from the CI run
-number; the version-increase check runs only on release tags.
+`print`; required manifest keys). Release packages carry the version and build number from the release tag
+(`docs/releasing.md`); other CI packages stamp `build_version` from the run
+number.
 
 **`sca-cmd` supply:** the pinned zip comes from a mirror the maintainers choose
 before M0-3 merges (it is Apache-2.0), cached in CI. On a cache miss with a changed

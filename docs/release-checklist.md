@@ -99,7 +99,7 @@ Source for every row: Roku certification criteria,
 | 5.1 | Deep linking for all media types | `contentId` and `mediaType` at launch and through `roInput` (`source/deeplink/`); movie, episode, series, season play, a season like its series; invalid or inaccessible links fall back to Home (spec 10.1) | Runs 4–5 ECP matrix PASS (Roku TV), signed in and signed out | Partial (Deep Linking Tester not run, section 4) |
 | 5.2 | Direct to Play | The link plays directly, resuming without a prompt, using the profile rule in spec 10.1 | Runs 4–5 | Partial: Roku's Direct to Play page ties it to a Roku Search catalog ([Direct to Play](https://developer.roku.com/dev/docs/direct-to-play)), which Silo has no global form of (Q5) |
 | 5.3 | No deep links into other apps | None | Code | Met |
-| 6.1 | Non-zero version, increased for every submitted build | Manifest version 0.1; CI stamps `build_version` from the run number (`scripts/stamp-build-version.sh`); a version-increase check is planned for release tags (plan 8) | — | Partial |
+| 6.1 | Non-zero version, increased for every submitted build | Release packages carry the version and the repository's build counter, which never resets: 1.0.0 build 12 is `1.0.12` (`scripts/release-version.py`, [`releasing.md`](releasing.md)); a hotfix goes to the public app only | Release workflow tests (`npm run check:release-version`) | Met (no package uploaded yet) |
 | 6.2 | Kids and family rules | Not listed as made for kids | — | N/A |
 | 6.3 | No pornographic content in public apps; anything shown outside the app suitable for all ages | The app shows each household's own library; store art and descriptions will be generic | — | Open: Roku answer (Q3) |
 | 6.4 | Splash in FHD and HD; artwork identifies the app, uses broadcast-safe colours, and is not transparent | `splash_screen_fhd` 1920×1080, `_hd` 1280×720, `_sd` 720×480, the official wordmark opaque on `#161616` (`scripts/brand-art.py`) | Not yet seen on hardware | Open (hardware check) |
@@ -117,7 +117,7 @@ Source: [Static Analysis](https://developer.roku.com/dev/docs/static-analysis-to
 and the [`sca-cmd` changelog](https://devtools.web.roku.com/static-channel-analysis/CHANGELOG.md).
 Errors block publishing; warnings do not, today.
 
-- [x] Local `sca-cmd` 14.16.0 in CI, sha256-pinned (`scripts/sca.sh`,
+- [x] Local `sca-cmd` 15.0.3 in CI, sha256-pinned (`scripts/sca.sh`,
   assumption AG-7); CI fails on errors and on Monitoring warnings. The weekly
   job flags a new upstream build (`.github/workflows/sca-weekly.yml`).
 - [ ] Dashboard Static Analysis on a signed package. Never run: there is no
@@ -294,9 +294,9 @@ beta environment "for internal testing only".
   forced sign-in for every viewer (criterion 4.1).
 - [ ] Release build from a clean checkout: `npm ci`, `npm run ci` green,
   `build_version` stamped, debug and test components excluded
-  (`scripts/hygiene.sh`), then packaged and signed with the key. The Package
-  workflow (`.github/workflows/package.yml`) does this for beta and release
-  packages; see "Signed packages" in `docs/development.md`.
+  (`scripts/hygiene.sh`), then packaged and signed with the key. The Release
+  workflow (`.github/workflows/release.yml`) does this for beta and store
+  packages; see [`releasing.md`](releasing.md).
 - [ ] Uploaded to a beta app; dashboard Static Analysis run and its
   authentication findings triaged (section 3).
 - [ ] Install-over-existing-data rehearsal: a newer package signed with the

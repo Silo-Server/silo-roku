@@ -15,9 +15,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# The jar's Implementation-Version; Roku's changelog dates it 2026-10-13.
-SCA_CMD_VERSION=14.16.0
-SCA_CMD_SHA256=272ef9847bf69daacac64094596f2ede7a9c1a8e9d7418c73c18ab148b772f31
+# The jar's Implementation-Version; Roku's changelog dates it 2026-10-26.
+SCA_CMD_VERSION=15.0.3
+SCA_CMD_SHA256=c88c544f967be5055e762ec9267175a34efc17fc6f9f065bd015c4cd45aa67e6
 url=${SCA_CMD_URL:-https://devtools.web.roku.com/static-channel-analysis/sca-cmd.zip}
 changelog=https://devtools.web.roku.com/static-channel-analysis/CHANGELOG.md
 

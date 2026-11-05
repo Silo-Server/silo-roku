@@ -1,0 +1,280 @@
+name: Release
+
+# Makes a tester build, numbered as silo-apple and silo-android number theirs:
+# tags the commit vX.Y.Z-beta.B, builds and signs a beta and a release package
+# of it, and publishes a GitHub prerelease with notes on what changed since the
+# last build. Upload the beta package to the beta app in the Roku Developer
+# Dashboard; promote.yml later turns the same build into a store release
+# without rebuilding. See docs/releasing.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'build = another build of the unreleased version. minor or patch = start the next version once the current one is promoted.'
+        required: true
+        type: choice
+        default: build
+        options:
+          - build
+          - minor
+          - patch
+      version:
+        description: 'Optional: use this version (for example 1.2.0) instead of bump.'
+        required: false
+        type: string
+
+# One release at a time: each run takes the next build number.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Choose version and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the tag; list draft releases
+      actions: read # check CI on the commit
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build: ${{ steps.version.outputs.build }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Releases are made from main."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # all tags
+          persist-credentials: false
+
+      - name: Require CI to have passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          conclusion="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow ci.yml \
+            --commit "${GITHUB_SHA}" --event push --limit 1 --json conclusion --jq '.[0].conclusion // ""')"
+          if [[ "${conclusion}" != "success" ]]; then
+            echo "::error::CI has not passed on ${GITHUB_SHA::9} (${conclusion:-still running or missing}). Release once it is green."
+            exit 1
+          fi
+
+      # A promoted version waiting for Roku's review (a draft vX.Y.Z release)
+      # counts as released. Listing drafts needs contents: write.
+      - name: Choose version and build
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.bump }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          draft_tags="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '.[] | select(.draft) | .tag_name')"
+          drafts=()
+          for draft in ${draft_tags}; do
+            drafts+=(--draft "${draft}")
+          done
+          python3 -I scripts/release-version.py next --bump "${BUMP}" --version "${VERSION}" "${drafts[@]}" |
+            tee -a "${GITHUB_OUTPUT}"
+
+      # A tag without a release comes from a run that failed before publishing.
+      # Starting this build's notes there would leave out changes no tester got.
+      - name: Require the previous build to have shipped
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous_tag }}
+        run: |
+          if [[ -n "${PREVIOUS_TAG}" ]] && ! gh release view "${PREVIOUS_TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null; then
+            echo "::error::${PREVIOUS_TAG} has no release, so its run failed. Re-run that run's failed jobs, or delete the tag if its package never reached the Roku Developer Dashboard."
+            exit 1
+          fi
+
+      # Tagging last in this job reserves the build number once everything
+      # above succeeded. A later failure keeps the tag: re-run the run's failed
+      # jobs (see docs/releasing.md).
+      - name: Tag the commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${GITHUB_SHA}" --silent
+
+  build:
+    name: Build the packages
+    needs: prepare
+    runs-on: [self-hosted, Linux, X64, silo-roku]
+    timeout-minutes: 15
+    env:
+      SILO_VERSION: ${{ needs.prepare.outputs.version }}
+      SILO_BUILD: ${{ needs.prepare.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm run build:beta
+
+      # Both packages carry the same version and build; only the beta build
+      # constant (X-Silo-Client-Channel: beta) tells them apart.
+      - name: Stamp the version
+        run: |
+          scripts/stamp-build-version.sh out/silo-roku.zip
+          scripts/stamp-build-version.sh out/silo-roku-beta.zip
+
+      - name: Check the packages
+        run: |
+          for zip in out/silo-roku.zip out/silo-roku-beta.zip; do
+            scripts/check-size.sh "$zip"
+            scripts/hygiene.sh "$zip"
+          done
+
+      - name: Read the pinned sca-cmd hash
+        id: sca-pin
+        run: echo "sha256=$(scripts/sca.sh --print-pin)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ format('{0}/sca-cmd', runner.tool_cache) }}
+          key: sca-cmd-${{ steps.sca-pin.outputs.sha256 }}
+
+      # The store package as Roku's Static Analysis will see it, stamped.
+      - run: scripts/sca.sh out/silo-roku.zip
+        env:
+          SCA_CMD_CACHE_DIR: ${{ format('{0}/sca-cmd', runner.tool_cache) }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zips
+          path: |
+            out/silo-roku.zip
+            out/silo-roku-beta.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    name: Sign on the Roku
+    needs: [prepare, build]
+    runs-on: [self-hosted, roku-signer]
+    environment: roku-signing
+    timeout-minutes: 20
+    # One device signs, and a run rekeys it and replaces its dev app.
+    concurrency:
+      group: roku-signer
+      cancel-in-progress: false
+    env:
+      NAME: silo-roku-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: zips
+          path: ${{ runner.temp }}/zips
+
+      - name: Sign both packages
+        env:
+          ROKU_HOST: ${{ secrets.ROKU_HOST }}
+          ROKU_DEV_ID: ${{ secrets.ROKU_DEV_ID }}
+          ROKU_PASSWORD: ${{ secrets.ROKU_PASSWORD }}
+          ROKU_SIGN_PASSWORD: ${{ secrets.ROKU_SIGN_PASSWORD }}
+          ROKU_SIGN_KEY_BASE64: ${{ secrets.ROKU_SIGN_KEY_BASE64 }}
+        run: |
+          umask 077
+          export ROKU_SIGN_KEY="$RUNNER_TEMP/sign-key.pkg"
+          trap 'rm -f "$ROKU_SIGN_KEY"' EXIT
+          printf %s "$ROKU_SIGN_KEY_BASE64" | base64 --decode > "$ROKU_SIGN_KEY"
+          scripts/package.sh "$RUNNER_TEMP/zips/silo-roku-beta.zip" "out/$NAME-beta.pkg"
+          scripts/package.sh "$RUNNER_TEMP/zips/silo-roku.zip" "out/$NAME.pkg"
+
+      # Packages stay off the public prerelease: they go to the Roku Developer
+      # Dashboard by hand, and promote.yml attaches the store one to the draft
+      # release. 90 days is the longest GitHub keeps an artifact here.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.NAME }}-beta
+          path: out/${{ env.NAME }}-beta.pkg
+          if-no-files-found: error
+          retention-days: 90
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.NAME }}
+          path: out/${{ env.NAME }}.pkg
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Remove the packages from the runner
+        if: ${{ always() }}
+        run: rm -rf out "$RUNNER_TEMP/zips"
+
+  publish:
+    name: Publish the GitHub prerelease
+    needs: [prepare, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      BUILD: ${{ needs.prepare.outputs.build }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Publish the prerelease
+        run: |
+          if gh release view "${TAG}" > /dev/null 2>&1; then
+            echo "${TAG} is already published."
+            exit 0
+          fi
+          gh api "repos/${GH_REPO}/releases/generate-notes" \
+            -f tag_name="${TAG}" ${PREVIOUS_TAG:+-f previous_tag_name="${PREVIOUS_TAG}"} --jq .body > generated.md
+          {
+            echo "Tester build ${VERSION} (${BUILD}) for the Roku beta app."
+            echo
+            cat generated.md
+          } > notes.md
+          # A prerelease never becomes Latest, so releases/latest keeps pointing
+          # at the store release.
+          gh release create "${TAG}" --verify-tag --prerelease \
+            --title "Silo Roku ${VERSION} (${BUILD})" --notes-file notes.md
+          {
+            echo "### Upload to the Roku beta app"
+            echo
+            echo "Download the \`silo-roku-${VERSION}-${BUILD}-beta\` artifact from this run and upload its .pkg to the beta app in the Roku Developer Dashboard."
+            echo
+            echo "Release notes (1,500 characters at most):"
+            echo
+            python3 -I scripts/release-version.py store-notes 1500 < generated.md | sed 's/^/    /'
+          } >> "${GITHUB_STEP_SUMMARY}"

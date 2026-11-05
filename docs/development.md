@@ -178,7 +178,8 @@ device), `check:header-probe` (the header probe's unit tests), and the tests.
 Static Analysis needs Java 21, unzip, and Python 3; it downloads `sca-cmd` once
 into `~/.cache/silo-roku/sca-cmd` (override with `SCA_CMD_CACHE_DIR`) and runs
 it only when its sha256 matches the pin in `scripts/sca.sh`. CI packages carry
-the run number as `build_version`; local builds keep the manifest's value.
+the run number as `build_version`, and release packages their version and build
+([`releasing.md`](releasing.md)); local builds keep the manifest's value.
 
 Sideloading replaces the single developer app slot on the device. The script
 checks the installer status, verifies the expected title and version in ECP,
@@ -207,17 +208,13 @@ sideload settings, and uses the same `ROKU_DEPLOY_VIA` relay. Without
 `ROKU_SIGN_KEY` the device's current key signs, which makes the first key
 package after `genkey`. Signing replaces the device's dev app.
 
-`.github/workflows/package.yml` builds signed packages. Running it by hand
-(Actions, Package, Run workflow) makes a beta package; pushing a tag
-`v<major>.<minor>` (or `v<major>.<minor>.<anything>`) that matches the manifest
-makes the release package and a draft GitHub Release with the `.pkg`
-attached. Both run the pull request checks first and carry the Package run
-number plus 6 as `build_version`; the offset keeps builds above the six
-packaged before the repository moved from `silo-roku-archive`. The sign job
-runs on a self-hosted runner labelled `roku-signer` that reaches a Roku in
-Developer Mode, in the `roku-signing` environment, which holds the secrets
-`ROKU_HOST` and `ROKU_DEV_ID` (secrets rather than variables, so the public
-Actions log masks them), `ROKU_PASSWORD` (the device's installer password),
+The Release workflow (`.github/workflows/release.yml`) builds and signs the
+beta and store packages of a tester build; [`releasing.md`](releasing.md)
+covers versions, tags, and promotion. The sign job runs on a self-hosted
+runner labelled `roku-signer` that reaches a Roku in Developer Mode, in the
+`roku-signing` environment, which holds the secrets `ROKU_HOST` and
+`ROKU_DEV_ID` (secrets rather than variables, so the public Actions log masks
+them), `ROKU_PASSWORD` (the device's installer password),
 `ROKU_SIGN_PASSWORD`, and `ROKU_SIGN_KEY_BASE64` (a key package, base64; sign a
 minimal app for it, since secrets are limited to 48 KB). On a macOS runner
 installed as a service, keep the runner's `.path` to system directories
@@ -225,9 +222,10 @@ installed as a service, keep the runner's `.path` to system directories
 paths on external volumes: a background service that touches an external
 volume waits forever on a privacy prompt, and macOS denies local network
 access to non-system binaries such as Python, which is why the scripts reach
-the device with `curl`. Roku has no upload
-API: download the `.pkg` from the run or the release and upload it to the beta
-or public app in the Roku Developer Dashboard.
+the device with `curl`. `config.sh` writes both files from the current shell,
+so check them again after registering the runner. Roku has no upload
+API: [`releasing.md`](releasing.md) says which package goes to which app in the
+Roku Developer Dashboard.
 
 ## Remote control
 
