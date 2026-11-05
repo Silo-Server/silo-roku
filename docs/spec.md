@@ -867,7 +867,10 @@ their existing HD/FHD assets.
     its editor. The shell reads it again each time a page with the top bar
     starts, and a profile without an answer yet shows no badges. A failed
     read keeps what applies; a 404 (a server without the endpoint) falls
-    back to the server's default, or to the built-in document.
+    back to the server's default, or to the built-in document. The uploaded
+    images a document draws download through `ApiTask` before it applies,
+    each once a session, so no card is drawn without them; one that fails
+    leaves its badge as it draws without the image.
   - Card overlays draw without costing frames. `OverlayArtTask` draws each
     card's badges once per distinct look, size, and data. A card that
     rounds its corners with the 9-patch frame (no `Effect`, a 1080p UI)
