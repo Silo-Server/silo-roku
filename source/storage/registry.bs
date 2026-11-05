@@ -72,7 +72,8 @@ namespace storage
     ' The bytes budgeted for each account a companion session signs in
     ' (sessionSignIns): its entry with both tokens and a few PIN proofs,
     ' without its profile list, which goes first. A Silo sign-in stores
-    ' about 1 KB.
+    ' about 1 KB; a session's sign-in past what the budget keeps is refused
+    ' when it is pushed (roomForSignIn).
     const SIGN_IN_BYTES = 2560
     const MAX_NAME_BYTES = 128
     ' The profiles kept for an account's tiles, and their values' bounds; an
@@ -246,34 +247,8 @@ namespace storage
     ' each account's entry, the active one included. now stamps the active
     ' account's use.
     function encodeAccounts(record as Object, now = 0 as Integer) as Object
-        servers = []
-        if util.isString(record.origin) and record.origin <> "" then servers.Push({ origin: record.origin, name: record.serverName, label: record.serverLabel, usedAt: now })
-        if type(record.servers) = "roArray" then servers.Append(record.servers)
-        list = []
-        seen = {}
-        for each server in servers
-            entry = serverEntry(server)
-            if entry <> invalid and not seen.DoesExist(entry.origin) and list.Count() <= MAX_SAVED_SERVERS
-                seen[entry.origin] = true
-                list.Push(entry)
-            end if
-        end for
-        ' Most recently used first: the active account, then the others in
-        ' their order; an account whose server is not saved is not kept.
-        accounts = []
-        active = invalid
-        if util.isString(record.accountId) then active = activeAccount(record, now)
-        if active <> invalid then accounts.Push(active)
-        if type(record.accounts) = "roArray" then accounts.Append(record.accounts)
-        entries = []
-        ids = {}
-        for each account in accounts
-            entry = accountEntry(account)
-            if entry <> invalid and seen.DoesExist(entry.server) and not ids.DoesExist(account.id) and entries.Count() < MAX_ACCOUNTS
-                ids[account.id] = true
-                entries.Push({ key: ACCOUNT_PREFIX + account.id, entry: entry })
-            end if
-        end for
+        list = serverList(record, now)
+        entries = accountEntries(savedAccounts(record, now), list)
         while true
             raw = {}
             if list.Count() > 0 then raw[SERVERS_KEY] = FormatJson(list)
@@ -289,6 +264,112 @@ namespace storage
             end if
         end while
         return {}
+    end function
+
+    ' The servers' list as stored: the active server first, then the others
+    ' in their order, each once.
+    function serverList(record as Object, now = 0 as Integer) as Object
+        servers = []
+        if util.isString(record.origin) and record.origin <> "" then servers.Push({ origin: record.origin, name: record.serverName, label: record.serverLabel, usedAt: now })
+        if type(record.servers) = "roArray" then servers.Append(record.servers)
+        list = []
+        seen = {}
+        for each server in servers
+            entry = serverEntry(server)
+            if entry <> invalid and not seen.DoesExist(entry.origin) and list.Count() <= MAX_SAVED_SERVERS
+                seen[entry.origin] = true
+                list.Push(entry)
+            end if
+        end for
+        return list
+    end function
+
+    ' Every saved account, most recently used first: the active one, then
+    ' the others in their order.
+    function savedAccounts(record as Object, now = 0 as Integer) as Object
+        accounts = []
+        active = invalid
+        if util.isString(record.accountId) then active = activeAccount(record, now)
+        if active <> invalid then accounts.Push(active)
+        if type(record.accounts) = "roArray" then accounts.Append(record.accounts)
+        return accounts
+    end function
+
+    ' The entries ACCOUNTS_SECTION keeps for accounts, in their order: each
+    ' account once, on a server list holds, at most MAX_ACCOUNTS.
+    function accountEntries(accounts as Object, list as Object) as Object
+        seen = {}
+        for each server in list
+            seen[server.origin] = true
+        end for
+        entries = []
+        ids = {}
+        for each account in accounts
+            entry = accountEntry(account)
+            if entry <> invalid and seen.DoesExist(entry.server) and not ids.DoesExist(account.id) and entries.Count() < MAX_ACCOUNTS
+                ids[account.id] = true
+                entries.Push({ id: account.id, key: ACCOUNT_PREFIX + account.id, entry: entry })
+            end if
+        end for
+        return entries
+    end function
+
+    ' Whether the next account a companion session signs in, on origin,
+    ' can be saved without the budget taking the session of an account
+    ' the session signed in before (ids, by ID; docs/companion-pairing.md
+    ' section 4). The accounts are as stored now; the next one is taken at
+    ' the most an entry can hold, on its server, newly saved under the
+    ' longest name and label, as the active account and server.
+    function roomForSignIn(record as Object, ids as Object, origin as String, now = 0 as Integer) as Boolean
+        if ids.Count() = 0 then return true
+        incoming = newAccount(string(MAX_ID_BYTES, "i"), origin, now)
+        incoming.serverUserId = string(MAX_ID_BYTES, "u")
+        incoming.username = string(MAX_NAME_BYTES, "n")
+        incoming.profileId = string(MAX_ID_BYTES, "p")
+        incoming.accessToken = string(MAX_TOKEN_BYTES, "a")
+        incoming.refreshToken = string(MAX_TOKEN_BYTES, "r")
+        incoming.expiresAt = now
+        incoming.refreshAt = now
+        list = []
+        server = serverEntry({ origin: origin, name: string(MAX_NAME_BYTES, "n"), label: string(MAX_NAME_BYTES, "l"), usedAt: now })
+        if server <> invalid then list.Push(server)
+        for each entry in serverList(record, now)
+            if entry.origin <> origin and list.Count() <= MAX_SAVED_SERVERS then list.Push(entry)
+        end for
+        accounts = [incoming]
+        accounts.Append(savedAccounts(record, now))
+        return keepsSessions(list, accounts, ids)
+    end function
+
+    ' Whether encodeAccounts, given list and accounts, keeps the session of
+    ' every account whose ID ids holds. shed takes every profile list, then
+    ' the sessions of the entries after the last of those, before it takes
+    ' any of theirs; so they keep theirs when that leaves enough room. One
+    ' that list or MAX_ACCOUNTS leaves out keeps nothing.
+    function keepsSessions(list as Object, accounts as Object, ids as Object) as Boolean
+        wanted = 0
+        for each account in accounts
+            if util.isObject(account) and util.isString(account.id) and ids.DoesExist(account.id) then wanted = wanted + 1
+        end for
+        entries = accountEntries(accounts, list)
+        last = 0
+        for i = 0 to entries.Count() - 1
+            if ids.DoesExist(entries[i].id)
+                last = i
+                wanted = wanted - 1
+            end if
+        end for
+        if wanted > 0 then return false
+        raw = {}
+        if list.Count() > 0 then raw[SERVERS_KEY] = FormatJson(list)
+        for i = 0 to entries.Count() - 1
+            entry = {}
+            entry.Append(entries[i].entry)
+            entry.Delete("profiles")
+            if i > last then signOutEntry(entry)
+            raw[entries[i].key] = FormatJson(entry)
+        end for
+        return bytes(raw) <= ACCOUNTS_BUDGET_BYTES
     end function
 
     ' Makes room in the least recently used entry that has something to

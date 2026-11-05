@@ -525,6 +525,51 @@ namespace tests
             end for
         end sub
 
+        ' Silo's tokens are a few hundred bytes, but the registry keeps
+        ' tokens up to MAX_TOKEN_BYTES: a session of large ones is refused
+        ' its next push (roomForSignIn) before one could cost an earlier
+        ' sign-in its session.
+        @it("refuses a sign-in that could cost one the session signed in its session")
+        sub _()
+            for each size in [300, 1500, 3000, storage.MAX_TOKEN_BYTES]
+                record = tests.sessions.signedIn()
+                record.accounts = []
+                record.servers = []
+                ' Accounts and servers saved before the session.
+                for i = 1 to 6
+                    older = m.savedHome()
+                    older.id = "older-" + i.ToStr()
+                    older.origin = "https://before-" + i.ToStr() + ".example.org"
+                    older.username = string(storage.MAX_NAME_BYTES, "o")
+                    older.usedAt = tests.sessions.NOW - 600 - i
+                    older.accessToken = string(storage.MAX_TOKEN_BYTES, "o")
+                    older.refreshToken = string(storage.MAX_TOKEN_BYTES, "p")
+                    record.accounts.Push(older)
+                    record.servers.Push({ origin: older.origin, name: string(storage.MAX_NAME_BYTES, "n"), label: "", usedAt: older.usedAt })
+                end for
+                ids = {}
+                count = 0
+                while count < storage.sessionSignIns() and storage.roomForSignIn(record, ids, m.sessionOrigin(count + 1), tests.sessions.NOW)
+                    count = count + 1
+                    m.saveSignIn(record, m.sessionAccount(count, size), tests.sessions.NOW)
+                    ids[record.accountId] = true
+                    m.assertTrue(m.keptSessions(record, ids), "size " + size.ToStr() + ", sign-in " + count.ToStr())
+                end while
+                if size < 1500
+                    m.assertEqual(count, storage.sessionSignIns(), "Silo-sized sign-ins reach lim")
+                else
+                    m.assertTrue(count < storage.sessionSignIns(), "size " + size.ToStr())
+                end if
+                if size = storage.MAX_TOKEN_BYTES
+                    ' The refused sign-in, saved anyway, would have cost an
+                    ' earlier one its session.
+                    m.saveSignIn(record, m.sessionAccount(count + 1, size), tests.sessions.NOW)
+                    ids[record.accountId] = true
+                    m.assertFalse(m.keptSessions(record, ids))
+                end if
+            end for
+        end sub
+
         @it("keeps every section within Roku's 32 KB")
         sub _()
             m.assertTrue(storage.BUDGET_BYTES + storage.ACCOUNTS_BUDGET_BYTES + libraryPrefs.BUDGET_BYTES + diag.state.BUDGET_BYTES + watchparty.recent.BUDGET_BYTES <= 32768)
@@ -565,6 +610,56 @@ namespace tests
         end sub
 
         ' The account on https://silo.example, saved with a session.
+        function sessionOrigin(i as Integer) as String
+            return "https://session-" + i.ToStr() + ".example.org"
+        end function
+
+        ' The session's sign-in i with tokens of size bytes, on its own
+        ' server, with a profile list and the longest username.
+        function sessionAccount(i as Integer, size as Integer) as Object
+            account = storage.newAccount("session-" + i.ToStr(), m.sessionOrigin(i), tests.sessions.NOW)
+            account.serverUserId = "user-" + i.ToStr()
+            account.username = string(storage.MAX_NAME_BYTES, "u")
+            account.accessToken = string(size, "a")
+            account.refreshToken = string(size, "r")
+            account.expiresAt = tests.sessions.NOW + 3600
+            account.refreshAt = tests.sessions.NOW + 1800
+            account.profiles = [{ id: "p", name: string(100, "n"), hasPin: false, isChild: false, avatarUrl: "https://a.example/" + string(400, "x") }]
+            return account
+        end function
+
+        ' Saves account as a phone's sign-in does: the active account and
+        ' server, the ones before it first among the saved.
+        sub saveSignIn(record as Object, account as Object, now as Integer)
+            if record.origin <> account.origin
+                kept = [{ origin: record.origin, name: record.serverName, label: record.serverLabel, usedAt: now }]
+                for each server in record.servers
+                    if server.origin <> account.origin and kept.Count() < storage.MAX_SAVED_SERVERS then kept.Push(server)
+                end for
+                record.servers = kept
+                record.origin = account.origin
+                record.serverName = string(storage.MAX_NAME_BYTES, "n")
+            end if
+            record.accounts.Unshift(storage.activeAccount(record, now))
+            storage.unpack(record, account)
+        end sub
+
+        ' Whether the record as stored keeps the session of every account ids
+        ' holds.
+        function keptSessions(record as Object, ids as Object) as Boolean
+            decoded = storage.decode(storage.encode(record), storage.encodeAccounts(record, tests.sessions.NOW))
+            accounts = [storage.activeAccount(decoded)]
+            accounts.Append(decoded.accounts)
+            for each id in ids
+                kept = false
+                for each account in accounts
+                    if account <> invalid and account.id = id and account.accessToken <> "" then kept = true
+                end for
+                if not kept then return false
+            end for
+            return true
+        end function
+
         function savedHome() as Object
             account = storage.newAccount("1", "https://silo.example", tests.sessions.NOW - 60)
             account.serverUserId = "1"

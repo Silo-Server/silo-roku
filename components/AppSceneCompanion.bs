@@ -24,7 +24,8 @@ import "pkg:/source/util/values.bs"
 '
 ' On the server screen a phone's session signs in as many accounts as it
 ' pushes, on any servers, each kept as its own account (TXT acct), up to
-' storage.sessionSignIns (lim); a push past that, or any after the sign-in
+' storage.sessionSignIns (lim); a push past that, one the registry could
+' not keep beside them (storage.roomForSignIn), or any after the sign-in
 ' screen's one, gets limit_reached. Every device login a session starts
 ' carries one binding (source/auth/binding.bs). When the session ends with
 ' one account signed in, its picker shows; with several, the first one to
@@ -45,7 +46,7 @@ const COMPANION_COMPLETE_SECONDS = 2
 const COMPANION_CODE_WAIT_SECONDS = 15
 
 sub companionInit()
-    m.companion = { task: invalid, taskReady: false, queued: [], retiring: [], mode: "", serverIdentity: "", identityOrigin: "", identityHandle: invalid, sid: "", phone: "", consented: false, push: invalid, stage: "idle", alternate: invalid, probing: [], userCode: "", matchCode: "", screenCode: invalid, failure: "", help: "", handle: invalid, requestOpen: false, clock: CreateObject("roTimespan"), deadline: 0, interval: 5, signedIn: false, finishing: false, signedInAs: "", pairing: "", signIns: [], accountsFor: "", accountsHandle: invalid }
+    m.companion = { task: invalid, taskReady: false, queued: [], retiring: [], mode: "", serverIdentity: "", identityOrigin: "", identityHandle: invalid, sid: "", phone: "", consented: false, push: invalid, stage: "idle", alternate: invalid, probing: [], userCode: "", matchCode: "", screenCode: invalid, failure: "", help: "", handle: invalid, requestOpen: false, clock: CreateObject("roTimespan"), deadline: 0, interval: 5, signedIn: false, finishing: false, signedInAs: "", lastSignIn: invalid, pairing: "", signIns: [], accountsFor: "", accountsHandle: invalid }
     m.companionPollTimer = m.top.findNode("companionPollTimer")
     m.companionIdleTimer = m.top.findNode("companionIdleTimer")
     m.companionFinishTimer = m.top.findNode("companionFinishTimer")
@@ -184,6 +185,7 @@ sub companionStop(reason as String)
     m.companion.stage = "idle"
     m.companion.signedIn = false
     m.companion.finishing = false
+    m.companion.lastSignIn = invalid
     m.companion.pairing = ""
     m.companion.signIns = []
     companionDropAccounts()
@@ -494,6 +496,8 @@ sub onCompanionServer(event as Object)
     kind = companionErrorKind(result)
     if kind = "unreachable"
         companionProbeAlternates()
+    else if kind = "limit_reached"
+        companionRefuseMore()
     else if kind = "identity_mismatch"
         companionFail("identity_mismatch")
     else if kind = "server_update_required" or kind = "origin_unconfirmed"
@@ -529,6 +533,10 @@ end sub
 sub onCompanionProbed(event as Object)
     result = companionTake(event)
     if result = invalid then return
+    if companionErrorKind(result) = "limit_reached"
+        companionRefuseMore()
+        return
+    end if
     endpoint = m.companion.probing.Shift()
     if result.ok = true
         m.companion.alternate = endpoint
@@ -538,6 +546,24 @@ sub onCompanionProbed(event as Object)
         return
     end if
     companionProbeNext()
+end sub
+
+' The registry could not keep another sign-in without one this session
+' signed in losing its session (section 4, storage.roomForSignIn): as for
+' a push past lim, the phone hears limit_reached, and the session waits
+' again for its next push or its done, showing the last sign-in.
+sub companionRefuseMore()
+    if not m.companion.finishing
+        companionFail("limit_reached")
+        return
+    end if
+    companionSend(silocontrol.pairing.serverResult(m.companion.push.url, "limit_reached"))
+    log.info("companion", "push refused", { code: "limit_reached" })
+    m.companion.push = m.companion.lastSignIn.push
+    m.companion.signedInAs = m.companion.lastSignIn.username
+    m.companion.stage = "signedIn"
+    companionShowScreen()
+    companionRestartTimer(m.companionFinishTimer, COMPANION_FINISH_SECONDS)
 end sub
 
 ' Step 3: the device login at the confirmed address.
@@ -643,6 +669,7 @@ end sub
 sub companionSignedIn(accountId as String, username as String)
     if m.companion.stage = "signedIn" then return
     m.companion.signedInAs = username
+    m.companion.lastSignIn = { push: m.companion.push, username: username }
     m.companion.signedIn = true
     m.companion.finishing = true
     m.companion.stage = "signedIn"
@@ -661,12 +688,13 @@ sub companionSignedIn(accountId as String, username as String)
 end sub
 
 ' The phone is done, or it did not push again in time: "You're all set"
-' (tvOS's completed state). An attempt after the last sign-in that is
-' still in flight is withdrawn. A second call, as the phone leaves,
-' changes nothing.
+' (tvOS's completed state), naming the server of the last sign-in. An
+' attempt after it that is still in flight is withdrawn. A second call, as
+' the phone leaves, changes nothing.
 sub companionFinish()
     if not m.companion.finishing or m.companion.stage = "completed" then return
     companionAbandon()
+    m.companion.push = m.companion.lastSignIn.push
     m.companion.stage = "completed"
     companionShowScreen()
     companionRestartTimer(m.companionFinishTimer, COMPANION_COMPLETE_SECONDS)

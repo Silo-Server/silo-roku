@@ -76,10 +76,10 @@ It advertises through the app's own mDNS responder (as SiloControl does,
     (`storage.sessionSignIns`). Each sign-in becomes the most recently used
     account on the most recently used server, so it survives the registry
     budget (spec section 7.5) while the session's sign-ins fit 12 accounts,
-    their servers fit 8, and each entry fits 2.5 KB, against about 1 KB for
-    a Silo sign-in. An entry past that could cost an earlier sign-in of the
-    session its session (it stays saved, needing to sign in again); nothing
-    checks for that at run time.
+    their servers fit 8, and their entries fit the budget. A Silo sign-in
+    stores about 1 KB, so 8 fit; tokens the registry keeps can be up to
+    4 KB each, so a session of large sign-ins can be refused sooner
+    (section 4).
 - The listener takes the first free port of 52827–52836, else any port.
 - Leaving the screen stops the receiver and sends goodbye records, so phones
   withdraw the offer.
@@ -113,7 +113,10 @@ objects with `type` and `v: 1`:
   that signs in is the poll's.
 - On the server screen a session takes a push after each sign-in, on any
   server and as often as the phone sends one, up to `lim` sign-ins; the
-  next gets `serverResult failed limit_reached` and changes nothing. Each
+  next gets `serverResult failed limit_reached` and changes nothing. So
+  does a push before that when the registry could not keep one more
+  sign-in, taken at the most an entry holds, without an account the
+  session signed in losing its session (`storage.roomForSignIn`). Each
   sign-in makes its server the current one and its account the open one;
   the servers and accounts it leaves stay saved with their sessions
   ([`spec.md`](spec.md) section 7.5). Signing in again as an account

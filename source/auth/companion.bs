@@ -19,7 +19,10 @@ import "pkg:/source/util/values.bs"
 '       serverIdentity }. The origin is then confirmed for this attempt, and
 '       nothing is stored. pairing names the phone's session: the first
 '       check of a new one makes its binding secret (api.auth.binding),
-'       which every later attempt in it uses.
+'       which every later attempt in it uses. Answers the error
+'       limit_reached, checking nothing, when the registry could not save
+'       another account without one this session signed in losing its
+'       session (storage.roomForSignIn).
 '   { session: "companionStart", deviceName }  starts a device login at the
 '       confirmed origin, with the session's binding when that server takes
 '       it; answers { userCode, matchCode, interval, expiresIn }
@@ -45,12 +48,14 @@ namespace api.auth.coordinator
     ' The poll's refusal of a wrong or missing binding_secret.
     const BINDING_MISMATCH = "device_binding_mismatch"
 
-    function companionServer(state as Object, input as Object) as Object
+    function companionServer(state as Object, input as Object, now as Integer) as Object
         address = api.auth.server.normalize(input.address, true)
         if address.error <> invalid then return [reply(api.response.failure(input, address.error))]
+        companionPairing(state, util.text(input.pairing))
+        ' The registry could not keep another sign-in with the session's.
+        if not storage.roomForSignIn(state.saved, state.companionPairing.signIns, address.url, now) then return [reply(api.response.failure(input, "limit_reached"))]
         state.companion = invalid
         state.companionAttempt += 1
-        companionPairing(state, util.text(input.pairing))
         request = build(state, { owner: util.text(input.owner) }, { method: "GET", url: address.url + api.auth.server.INFO_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "companionInfo", origin: address.url, attempt: state.companionAttempt, input: input })
         return [submit(request)]
     end function
@@ -91,10 +96,11 @@ namespace api.auth.coordinator
         return [reply(succeeded(input, { origin: op.origin, serverIdentity: op.serverIdentity }, 200))]
     end function
 
-    ' The phone's session pairing: a new one gets a new binding secret.
+    ' The phone's session pairing: a new one gets a new binding secret, and
+    ' keeps the IDs of the accounts it signs in (signIns).
     sub companionPairing(state as Object, sessionId as String)
         if state.companionPairing <> invalid and state.companionPairing.id = sessionId then return
-        state.companionPairing = { id: sessionId, binding: api.auth.binding.forSecret(api.auth.binding.newSecret(util.text(state.saved.deviceId))) }
+        state.companionPairing = { id: sessionId, binding: api.auth.binding.forSecret(api.auth.binding.newSecret(util.text(state.saved.deviceId))), signIns: {} }
     end sub
 
     function companionStart(state as Object, input as Object) as Object
@@ -185,7 +191,9 @@ namespace api.auth.coordinator
             decisions.Append(withdraw)
         end if
         decisions.Append(installAccount(state, user, tokens, now))
-        ' The render thread keeps the session's sign-ins (AppSceneCompanion).
+        ' The render thread keeps the session's sign-ins (AppSceneCompanion),
+        ' and the pairing the accounts whose sessions the registry keeps.
+        if state.companionPairing <> invalid then state.companionPairing.signIns[state.saved.accountId] = true
         answer.accountId = state.saved.accountId
         answer.username = state.saved.username
         answer.origin = companion.origin
