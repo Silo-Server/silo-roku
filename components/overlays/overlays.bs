@@ -1,0 +1,903 @@
+import "pkg:/source/catalog/overlayData.bs"
+import "pkg:/source/playback/tracks.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Card overlays: the badges painted on a card's artwork (4K, Dolby Vision, a
+' rating), as silo-server's docs/architecture/card-overlays.md specifies them
+' and the web client draws them (web/src/lib/overlays and
+' web/src/components/overlays at silo-server ae3bac00c9). The profile's
+' ui.card_overlays document, or the server's default, picks the badges, their
+' places, and a look; the web client is its only editor, so Roku only reads
+' it. Pure: the card (components/views/CardOverlays.bs) measures and draws.
+'
+' Lengths are the web's, in px at the 185 px reference poster width; a poster
+' scales them by its width over REFERENCE_WIDTH, as every client does, and a
+' wide card (landscape, episode) draws them at 1.
+namespace catalog.overlays
+    const REFERENCE_WIDTH = 185
+    const EDGE_INSET = 8
+    const EDGE_GAP = 8
+    ' A corner draws at most this many badges and a rail one more; the rest
+    ' are dropped rather than overlapping.
+    const MAX_CORNER = 3
+    const MAX_RAIL = 4
+    ' An uploaded image that replaces a whole badge is this many times the
+    ' height of the text badge it stands for.
+    const VALUE_IMAGE_SCALE = 1.6
+    const ATTENTION_ACCENT = "#f59e0b"
+    const DOCUMENT_KEY = "ui.card_overlays"
+    const ENABLED_KEY = "ui.card_overlays_enabled"
+    const IMAGE_PATH = "/api/v2/overlay-images/"
+    ' Positions, in the order the card lays them out.
+    const TOP_LEFT = "top-left"
+    const BOTTOM_LEFT = "bottom-left"
+    const BOTTOM_RIGHT = "bottom-right"
+    const LEFT_EDGE = "left-edge"
+    const RIGHT_EDGE = "right-edge"
+    ' Settings revision 25's presets, style, rails, and images; and the
+    ' smallest and largest style size.
+    const SIZE_MIN = 0.75
+    const SIZE_MAX = 2
+
+    ' --- The registry ---------------------------------------------------
+
+    ' Every badge, in the web registry's order, which is the default render
+    ' order within a position: { id, position, enabled, icon, iconCapable,
+    ' accent, sourceMark }. icon is the static icon ("" for none or a
+    ' value's own, iconFor); accent the default accent ("" for none);
+    ' sourceMark a rating's source ("" for none). Built once per thread.
+    function registry() as Object
+        if m.catalogOverlayRegistry <> invalid then return m.catalogOverlayRegistry
+        defs = []
+        ' tech
+        defs.Push(entryOf("resolution", TOP_LEFT, true, "monitor", true))
+        defs.Push(entryOf("hdr", TOP_LEFT, true, "", true))
+        defs.Push(entryOf("resolution_hdr", TOP_LEFT, false, "", true))
+        defs.Push(entryOf("resolution_hdr_audio", TOP_LEFT, false, "", true))
+        defs.Push(entryOf("audio", TOP_LEFT, true, "", true))
+        defs.Push(entryOf("audio_channels", TOP_LEFT, false, "volume", true))
+        defs.Push(entryOf("video_codec", TOP_LEFT, false, "film", true))
+        defs.Push(entryOf("container", BOTTOM_LEFT, false, "", false))
+        defs.Push(entryOf("aspect_ratio", BOTTOM_RIGHT, false, "layout", true))
+        defs.Push(entryOf("release_type", BOTTOM_LEFT, true, "", false))
+        defs.Push(entryOf("edition", BOTTOM_LEFT, false, "", false))
+        defs.Push(entryOf("multi_audio", BOTTOM_RIGHT, false, "languages", true))
+        defs.Push(entryOf("multi_sub", BOTTOM_RIGHT, false, "subtitles", true))
+        ' ratings
+        defs.Push(rating("rating_imdb", "#f5c518", "IMDb"))
+        defs.Push(rating("rating_tmdb", "#01b4e4", "TMDB"))
+        defs.Push(rating("rating_rt", "#fa320a", "RT"))
+        defs.Push(rating("rating_rt_audience", "#fa6400", "RT Audience"))
+        defs.Push(entryOf("content_rating", BOTTOM_RIGHT, false, "shield", true))
+        defs.Push(entryOf("advisory_age", BOTTOM_RIGHT, false, "users", true))
+        ' metadata
+        defs.Push(entryOf("year", BOTTOM_LEFT, false, "", false))
+        defs.Push(entryOf("runtime", BOTTOM_LEFT, false, "clock", true))
+        defs.Push(entryOf("original_language", BOTTOM_LEFT, false, "globe", true))
+        defs.Push(entryOf("studio", BOTTOM_RIGHT, false, "building", true))
+        defs.Push(entryOf("network", BOTTOM_RIGHT, false, "tv", true))
+        ' ribbons
+        defs.Push(entryOf("show_status", RIGHT_EDGE, false, "tv", true))
+        defs.Push(entryOf("request_status", TOP_LEFT, true, "", true))
+        m.catalogOverlayRegistry = defs
+        return defs
+    end function
+
+    function entryOf(id as String, position as String, enabled as Boolean, icon as String, iconCapable as Boolean) as Object
+        return { id: id, position: position, enabled: enabled, icon: icon, iconCapable: iconCapable, accent: "", sourceMark: "" }
+    end function
+
+    function rating(id as String, accent as String, mark as String) as Object
+        out = entryOf(id, LEFT_EDGE, false, "", false)
+        out.accent = accent
+        out.sourceMark = mark
+        return out
+    end function
+
+    function isPosition(value as Dynamic) as Boolean
+        return util.contains([TOP_LEFT, BOTTOM_LEFT, BOTTOM_RIGHT, LEFT_EDGE, RIGHT_EDGE], value)
+    end function
+
+    function isKnownId(value as Dynamic) as Boolean
+        if not util.isString(value) then return false
+        for each entry in registry()
+            if entry.id = value then return true
+        end for
+        return false
+    end function
+
+    ' --- What a badge shows ---------------------------------------------
+
+    ' The locale strings the labels use, from an i18n strings table, which
+    ' also holds the language names (language.<code>).
+    function words(strings as Object) as Object
+        out = { strings: strings }
+        for each key in ["multiAudio", "subtitles", "runtimeHoursMinutes", "runtimeMinutes", "returning", "ended", "cancelled", "upcoming"]
+            out[key] = i18n.lookup(strings, "overlays." + key)
+        end for
+        return out
+    end function
+
+    ' The badge's label for data, or "" when the card has no value for it.
+    function label(id as String, data as Object, copy as Object) as String
+        if id = "resolution" then return prettyResolution(data.resolution)
+        if id = "resolution_hdr"
+            resolution = prettyResolution(data.resolution)
+            if resolution = "" then return ""
+            return joined([resolution, compactHdr(data.hdr)])
+        end if
+        if id = "resolution_hdr_audio" then return joined([prettyResolution(data.resolution), compactHdr(data.hdr), util.text(data.audio)])
+        if id = "multi_audio"
+            if util.isTrue(data.multi_audio) then return copy.multiAudio
+            return ""
+        end if
+        if id = "multi_sub"
+            if util.isTrue(data.multi_sub) then return copy.subtitles
+            return ""
+        end if
+        if id = "rating_imdb" then return ratingLabel("IMDb", outOfTen(data.rating_imdb))
+        if id = "rating_tmdb" then return ratingLabel("TMDB", outOfTen(data.rating_tmdb))
+        if id = "rating_rt" then return ratingLabel("RT", percent(data.rating_rt_critic))
+        if id = "rating_rt_audience" then return ratingLabel("RT Audience", percent(data.rating_rt_audience))
+        if id = "advisory_age"
+            if util.isNumber(data.advisory_age) and data.advisory_age > 0 then return Int(data.advisory_age).ToStr() + "+"
+            return ""
+        end if
+        if id = "year"
+            if util.isNumber(data.year) and data.year > 0 then return Int(data.year).ToStr()
+            return ""
+        end if
+        if id = "runtime" then return runtimeText(data.runtime, copy)
+        if id = "original_language" then return languageText(data.original_language, copy)
+        if id = "show_status" then return showStatusText(data.show_status, copy)
+        if id = "request_status" then return util.text(data.request_status)
+        return util.text(data[id])
+    end function
+
+    ' The score a rating badge shows without its mark ("7.8", "93%"), or ""
+    ' for a badge that is not a rating or a card without the score.
+    function score(id as String, data as Object) as String
+        if id = "rating_imdb" then return outOfTen(data.rating_imdb)
+        if id = "rating_tmdb" then return outOfTen(data.rating_tmdb)
+        if id = "rating_rt" then return percent(data.rating_rt_critic)
+        if id = "rating_rt_audience" then return percent(data.rating_rt_audience)
+        return ""
+    end function
+
+    ' The key a valueImages entry matches: the value as the API sends it
+    ' (the contract's value keys), or "" for a badge that takes none.
+    function valueKey(id as String, data as Object) as String
+        if id = "resolution_hdr"
+            if util.text(data.resolution) = "" then return ""
+            return joined([util.text(data.resolution), util.text(data.hdr)])
+        end if
+        if id = "resolution_hdr_audio" then return joined([util.text(data.resolution), util.text(data.hdr), util.text(data.audio)])
+        if id = "show_status" then return showStatusKey(data.show_status)
+        if util.contains(["resolution", "hdr", "audio", "audio_channels", "video_codec", "container", "aspect_ratio", "release_type", "edition", "content_rating", "original_language", "studio", "network"], id) then return util.text(data[id])
+        return ""
+    end function
+
+    ' The icon a badge draws for data (its value's own, else its static
+    ' one), "" for none. hdr10, hdr, atmos, and av1 are wordmarks: their
+    ' text is the mark (WORDMARKS).
+    function iconFor(entry as Object, data as Object) as String
+        id = entry.id
+        if id = "hdr"
+            hdr = util.text(data.hdr)
+            if Instr(1, hdr, "DV") > 0 then return "dolby-vision"
+            if hdr = "HDR10" then return "hdr10"
+            if hdr = "HDR" then return "hdr"
+            return ""
+        end if
+        if id = "resolution_hdr" or id = "resolution_hdr_audio"
+            if Instr(1, util.text(data.hdr), "DV") > 0 then return "dolby-vision"
+            return ""
+        end if
+        if id = "audio"
+            audio = util.text(data.audio)
+            if audio = "" then return ""
+            if LCase(audio) = "atmos" then return "atmos"
+            return "volume"
+        end if
+        if id = "video_codec"
+            codec = util.text(data.video_codec)
+            if codec = "" then return ""
+            if codec = "AV1" then return "av1"
+            return "film"
+        end if
+        if id = "request_status" then return util.text(data.request_status_icon)
+        return entry.icon
+    end function
+
+    ' A wordmark icon's text: the badge draws it as bold text, and leaves
+    ' out a label that says the same thing ("HDR10 HDR10").
+    function wordmark(icon as String) as String
+        if icon = "hdr" then return "HDR"
+        if icon = "hdr10" then return "HDR10"
+        if icon = "atmos" then return "ATMOS"
+        if icon = "av1" then return "AV1"
+        return ""
+    end function
+
+    ' "4K" and "8K" for UHD, "1080p" for a line count, else the value in
+    ' capitals (the web's prettyResolution).
+    function prettyResolution(value as Dynamic) as String
+        text = util.text(value).Trim()
+        lowered = LCase(text)
+        if lowered = "" then return ""
+        if lowered = "2160p" or lowered = "4k" or lowered = "uhd" then return "4K"
+        if lowered = "4320p" or lowered = "8k" then return "8K"
+        if Len(lowered) > 1 and Right(lowered, 1) = "p" and isDigits(Left(lowered, Len(lowered) - 1)) then return lowered
+        return UCase(util.text(value))
+    end function
+
+    function isDigits(text as String) as Boolean
+        if text = "" then return false
+        for i = 1 to Len(text)
+            c = Mid(text, i, 1)
+            if c < "0" or c > "9" then return false
+        end for
+        return true
+    end function
+
+    ' The dynamic range in a combined badge: any Dolby Vision is "DV",
+    ' HDR10+ keeps its name, and anything else is "HDR".
+    function compactHdr(value as Dynamic) as String
+        hdr = util.text(value)
+        if hdr = "" then return ""
+        if Instr(1, hdr, "DV") > 0 then return "DV"
+        if Instr(1, hdr, "HDR10+") > 0 then return "HDR10+"
+        return "HDR"
+    end function
+
+    function ratingLabel(mark as String, value as String) as String
+        if value = "" then return ""
+        return mark + " " + value
+    end function
+
+    ' A score out of 10 to one decimal ("7.8"), "" for none.
+    function outOfTen(value as Dynamic) as String
+        if not util.isNumber(value) then return ""
+        tenths = Int(value * 10 + 0.5)
+        sign = ""
+        if tenths < 0
+            sign = "-"
+            tenths = -tenths
+        end if
+        return sign + (tenths \ 10).ToStr() + "." + (tenths mod 10).ToStr()
+    end function
+
+    ' A score out of 100 as a percentage ("93%"), "" for none.
+    function percent(value as Dynamic) as String
+        if not util.isNumber(value) then return ""
+        return Int(value + 0.5).ToStr() + "%"
+    end function
+
+    ' "2h 43m", "43m", or "" for none (the web's formatRuntime).
+    function runtimeText(minutes as Dynamic, copy as Object) as String
+        if not util.isNumber(minutes) or minutes <= 0 then return ""
+        whole = Int(minutes)
+        hours = whole \ 60
+        rest = whole mod 60
+        if hours > 0 then return i18n.format(copy.runtimeHoursMinutes, { hours: hours, minutes: rest })
+        return i18n.format(copy.runtimeMinutes, { minutes: rest })
+    end function
+
+    ' The language's name ("English"), the code in capitals when the table
+    ' has none, or "" for none.
+    function languageText(value as Dynamic, copy as Object) as String
+        key = playback.tracks.languageKey(value)
+        if key = "" then return ""
+        strings = copy.strings
+        if util.isObject(strings) and util.isString(strings["language." + key]) then return strings["language." + key]
+        return UCase(util.text(value).Trim())
+    end function
+
+    ' The normalized status the contract's value keys use: Returning,
+    ' Ended, Cancelled, or Upcoming, else the value as sent, "" for none.
+    function showStatusKey(value as Dynamic) as String
+        status = util.text(value)
+        lowered = LCase(status)
+        if lowered = "" then return ""
+        if util.contains(["returning", "returning series", "continuing", "in_production", "in production"], lowered) then return "Returning"
+        if lowered = "ended" then return "Ended"
+        if lowered = "cancelled" or lowered = "canceled" then return "Cancelled"
+        if lowered = "upcoming" or lowered = "planned" then return "Upcoming"
+        return status
+    end function
+
+    function showStatusText(value as Dynamic, copy as Object) as String
+        status = showStatusKey(value)
+        if status = "Returning" then return copy.returning
+        if status = "Ended" then return copy.ended
+        if status = "Cancelled" then return copy.cancelled
+        if status = "Upcoming" then return copy.upcoming
+        return status
+    end function
+
+    function joined(parts as Object) as String
+        out = ""
+        for each part in parts
+            if part <> ""
+                if out <> "" then out = out + " "
+                out = out + part
+            end if
+        end for
+        return out
+    end function
+
+    ' --- The document ---------------------------------------------------
+
+    ' The built-in document: the classic look and each badge's defaults.
+    function defaults() as Object
+        return { preset: "classic", style: invalid, order: [], items: items(invalid) }
+    end function
+
+    ' A complete document from the stored value (an object, the JSON text
+    ' the server's default comes as, or invalid), as the web's
+    ' parseOverlayPrefs reads it: a v1 document (badges by id) migrates, an
+    ' unknown preset is classic, a stored top-right badge moves to the
+    ' right-edge rail, and an invalid field is dropped rather than failing
+    ' the document. { preset, style (parseStyle, or invalid), order (ids),
+    ' items: { <id>: { enabled, position, accent ("" for the badge's own),
+    ' showIcon (invalid to follow the preset), image ("" for none),
+    ' valueImages ({ <key>: ref }, or invalid) } } }.
+    function parse(raw as Dynamic) as Object
+        parsed = raw
+        if util.isString(raw)
+            if raw = "" then return defaults()
+            parsed = ParseJson(raw)
+        end if
+        if not util.isObject(parsed) then return defaults()
+        v2 = (util.isNumber(parsed.version) and parsed.version = 2) or (util.isString(parsed.preset) and util.isObject(parsed.items))
+        if not v2 then return { preset: "classic", style: invalid, order: [], items: items(parsed) }
+        preset = "classic"
+        if util.contains(presetIds(), parsed.preset) then preset = parsed.preset
+        order = []
+        if type(parsed.order) = "roArray"
+            for each id in parsed.order
+                if isKnownId(id) and not util.contains(order, id) then order.Push(id)
+            end for
+        end if
+        source = invalid
+        if util.isObject(parsed.items) then source = parsed.items
+        return { preset: preset, style: parseStyle(parsed.style), order: order, items: items(source) }
+    end function
+
+    function presetIds() as Object
+        return ["minimal", "classic", "vibrant", "pill", "square", "plate", "band"]
+    end function
+
+    function items(source as Dynamic) as Object
+        out = {}
+        for each entry in registry()
+            base = { enabled: entry.enabled, position: entry.position, accent: "", showIcon: invalid, image: "", valueImages: invalid }
+            patch = invalid
+            if util.isObject(source) then patch = source[entry.id]
+            if util.isObject(patch)
+                if util.isBoolean(patch.enabled) then base.enabled = patch.enabled
+                position = patch.position
+                if util.isString(position) and position = "top-right" then position = RIGHT_EDGE
+                if isPosition(position) then base.position = position
+                if isHex(patch.accentColor, 6) then base.accent = patch.accentColor
+                if util.isBoolean(patch.showIcon) then base.showIcon = patch.showIcon
+                if isImageRef(patch.image) then base.image = patch.image
+                base.valueImages = parseValueImages(patch.valueImages)
+            end if
+            out[entry.id] = base
+        end for
+        return out
+    end function
+
+    function parseValueImages(value as Dynamic) as Dynamic
+        if not util.isObject(value) then return invalid
+        out = {}
+        out.SetModeCaseSensitive()
+        count = 0
+        for each key in value
+            if count >= 32 then exit for
+            if Len(key) > 0 and Len(key) <= 64 and isImageRef(value[key])
+                out[key] = value[key]
+                count = count + 1
+            end if
+        end for
+        if count = 0 then return invalid
+        return out
+    end function
+
+    ' The style overrides the contract accepts, each invalid field dropped;
+    ' invalid for none.
+    function parseStyle(value as Dynamic) as Dynamic
+        if not util.isObject(value) then return invalid
+        style = {}
+        if util.isNumber(value.size) and value.size >= SIZE_MIN and value.size <= SIZE_MAX then style.size = value.size
+        if util.contains(["pill", "rounded", "square"], value.shape) then style.shape = value.shape
+        if isHex(value.background, 8) then style.background = value.background
+        if isHex(value.textColor, 6) then style.textColor = value.textColor
+        if isHex(value.borderColor, 8) then style.borderColor = value.borderColor
+        if util.isNumber(value.borderWidth) and value.borderWidth = Int(value.borderWidth) and value.borderWidth >= 0 and value.borderWidth <= 3 then style.borderWidth = Int(value.borderWidth)
+        if util.contains(["regular", "semibold", "extrabold"], value.fontWeight) then style.fontWeight = value.fontWeight
+        if util.isBoolean(value.uppercase) then style.uppercase = value.uppercase
+        if util.isBoolean(value.shadow) then style.shadow = value.shadow
+        if style.Count() = 0 then return invalid
+        return style
+    end function
+
+    ' "#" and digits hex digits.
+    function isHex(value as Dynamic, digits as Integer) as Boolean
+        if not util.isString(value) or Len(value) <> digits + 1 or Left(value, 1) <> "#" then return false
+        for i = 2 to Len(value)
+            if Instr(1, "0123456789abcdefABCDEF", Mid(value, i, 1)) = 0 then return false
+        end for
+        return true
+    end function
+
+    ' An uploaded image's reference: 64 lowercase hex digits and ".webp".
+    function isImageRef(value as Dynamic) as Boolean
+        if not util.isString(value) or Len(value) <> 69 or Right(value, 5) <> ".webp" then return false
+        for i = 1 to 64
+            if Instr(1, "0123456789abcdef", Mid(value, i, 1)) = 0 then return false
+        end for
+        return true
+    end function
+
+    ' The document without image references the server no longer lists
+    ' (listed: { <ref>: { width, height } }), so a deleted image costs no
+    ' request per card.
+    function withoutUnlisted(prefs as Object, listed as Object) as Object
+        for each id in prefs.items
+            item = prefs.items[id]
+            if item.image <> "" and not listed.DoesExist(item.image) then item.image = ""
+            if item.valueImages <> invalid
+                kept = {}
+                kept.SetModeCaseSensitive()
+                for each key in item.valueImages
+                    if listed.DoesExist(item.valueImages[key]) then kept[key] = item.valueImages[key]
+                end for
+                item.valueImages = invalid
+                if kept.Count() > 0 then item.valueImages = kept
+            end if
+        end for
+        return prefs
+    end function
+
+    ' The enabled badges at a position, combined badges hiding the badges
+    ' they already show, in the document's order and then the registry's.
+    function placed(prefs as Object, position as String) as Object
+        hidden = {}
+        if isOn(prefs, "resolution_hdr_audio")
+            for each id in ["resolution", "hdr", "audio", "resolution_hdr"]
+                hidden[id] = true
+            end for
+        end if
+        if isOn(prefs, "resolution_hdr")
+            hidden.resolution = true
+            hidden.hdr = true
+        end if
+        out = []
+        for each entry in registry()
+            item = prefs.items[entry.id]
+            if item <> invalid and item.enabled and item.position = position and not hidden.DoesExist(entry.id) then out.Push(entry)
+        end for
+        if prefs.order.Count() = 0 then return out
+        ranked = []
+        for each entry in out
+            rank = 999
+            for i = 0 to prefs.order.Count() - 1
+                if prefs.order[i] = entry.id
+                    rank = i
+                    exit for
+                end if
+            end for
+            ' Equal ranks keep the registry's order: SortBy is not stable.
+            ranked.Push({ key: rank * 1000 + ranked.Count(), entry: entry })
+        end for
+        ranked.SortBy("key")
+        sorted = []
+        for each wrapper in ranked
+            sorted.Push(wrapper.entry)
+        end for
+        return sorted
+    end function
+
+    function isOn(prefs as Object, id as String) as Boolean
+        item = prefs.items[id]
+        return item <> invalid and item.enabled
+    end function
+
+    ' --- Resolving a card's badges --------------------------------------
+
+    ' A badge for data under the document and look, or invalid when the card
+    ' has no value for it: { id, label, accent ("" for none), icon ("" for
+    ' none), mark (a wordmark's text, "" for none), text (what the label
+    ' shows: "" when the wordmark says it), image and valueImage (refs, ""
+    ' for none), valueKey, sourceMark, score }. text and the rest are
+    ' finished for the look by finish.
+    function badge(entry as Object, data as Object, look as Object, config as Dynamic, copy as Object) as Dynamic
+        text = label(entry.id, data, copy)
+        if text = "" then return invalid
+        icon = iconFor(entry, data)
+        showIcon = look.preferIcon
+        if config <> invalid and util.isBoolean(config.showIcon) then showIcon = config.showIcon
+        if not (entry.iconCapable and icon <> "" and showIcon) then icon = ""
+        accent = entry.accent
+        if entry.id = "request_status" and util.isTrue(data.request_status_attention) then accent = ATTENTION_ACCENT
+        image = ""
+        valueImage = ""
+        key = valueKey(entry.id, data)
+        if config <> invalid
+            if config.accent <> "" then accent = config.accent
+            image = config.image
+            if key <> "" and config.valueImages <> invalid and config.valueImages.DoesExist(key) then valueImage = config.valueImages[key]
+        end if
+        points = score(entry.id, data)
+        mark = ""
+        if entry.sourceMark <> "" and points <> "" then mark = entry.sourceMark
+        out = { id: entry.id, label: text, accent: accent, icon: icon, image: image, valueImage: valueImage, valueKey: key, sourceMark: mark, score: points }
+        return finish(out, look)
+    end function
+
+    ' What a badge draws without (image false) or with its uploaded icon
+    ' image: chip (a rating's source mark on an accent chip, the plate
+    ' look's), text (the label, or only the score beside an image that
+    ' stands for the source or a chip, or "" when a wordmark says it),
+    ' scoreOnly (a bare score never truncates), and markText (the
+    ' wordmark drawn in the icon's place).
+    function finish(out as Object, look as Object, image = false as Boolean) as Object
+        out.chip = ""
+        if not image and look.sourceChips and out.sourceMark <> "" then out.chip = out.sourceMark
+        out.scoreOnly = (image or out.chip <> "") and out.score <> ""
+        out.markText = ""
+        if not image then out.markText = wordmark(out.icon)
+        if out.scoreOnly
+            out.text = out.score
+        else if out.markText <> "" and LCase(out.markText) = LCase(out.label.Trim())
+            out.text = ""
+        else
+            out.text = out.label
+        end if
+        if look.uppercase
+            out.text = UCase(out.text)
+            out.chip = UCase(out.chip)
+        end if
+        return out
+    end function
+
+    ' The card's badges at each position, capped: { topLeft, bottomLeft,
+    ' bottomRight, leftEdge, rightEdge }, each a list of badges.
+    function resolve(prefs as Object, data as Object, look as Object, copy as Object) as Object
+        out = {}
+        for each pair in [["topLeft", TOP_LEFT, MAX_CORNER], ["bottomLeft", BOTTOM_LEFT, MAX_CORNER], ["bottomRight", BOTTOM_RIGHT, MAX_CORNER], ["leftEdge", LEFT_EDGE, MAX_RAIL], ["rightEdge", RIGHT_EDGE, MAX_RAIL]]
+            list = []
+            for each entry in placed(prefs, pair[1])
+                if list.Count() >= pair[2] then exit for
+                resolved = badge(entry, data, look, prefs.items[entry.id], copy)
+                if resolved <> invalid then list.Push(resolved)
+            end for
+            out[pair[0]] = list
+        end for
+        return out
+    end function
+
+    ' The two bottom corners as rows from the top, each { left, right }
+    ' (invalid where a corner has fewer badges), so the shorter corner lines
+    ' up with the bottom and each badge shares its width only with the badge
+    ' beside it.
+    function bottomRows(left as Object, right as Object) as Object
+        levels = left.Count()
+        if right.Count() > levels then levels = right.Count()
+        rows = []
+        for level = 0 to levels - 1
+            rows.Push({ left: at(left, level - levels + left.Count()), right: at(right, level - levels + right.Count()) })
+        end for
+        return rows
+    end function
+
+    function at(list as Object, index as Integer) as Dynamic
+        if index < 0 or index >= list.Count() then return invalid
+        return list[index]
+    end function
+
+    ' How many of a band's marks (widths in px, in order) fit whole in
+    ' width with gap between them and a divider (dividerWidth) before each
+    ' after the first: at least one, which may then truncate.
+    function bandFit(widths as Object, width as Float, gap as Float, dividerWidth as Float) as Integer
+        if widths.Count() = 0 then return 0
+        used = widths[0]
+        count = 1
+        for i = 1 to widths.Count() - 1
+            used = used + 2 * gap + dividerWidth + widths[i]
+            ' Half a pixel absorbs rounding, as the web's measure does.
+            if used > width + 0.5 then exit for
+            count = count + 1
+        end for
+        return count
+    end function
+
+    ' --- Looks ----------------------------------------------------------
+
+    ' A preset's look (presets.ts) with the style's overrides (style.ts):
+    ' { id, band (the edge-band layout), sourceChips, weight (400 to 800),
+    ' uppercase, fontSize, padX, padY, radius (px, or -1 for a capsule),
+    ' borderWidth, accentLeft (the square look's accent stripe, px),
+    ' textShadow ({ x, y, blur, color } or invalid), boxShadow (likewise),
+    ' iconSize, iconGap, preferIcon, stackGap, strategy (how the accent
+    ' paints: "bg", "border", or "text"), and the style's colours (fill,
+    ' textColor, borderColor: "" for the preset's own) }, at the reference
+    ' width.
+    function lookOf(preset as String, style as Dynamic) as Object
+        out = presetLook(preset)
+        out.fill = ""
+        out.textColor = ""
+        out.borderColor = ""
+        out.solid = ""
+        out.styled = false
+        if not util.isObject(style) then return out
+        scale = 1.0
+        if util.isNumber(style.size) then scale = style.size
+        for each key in ["fontSize", "padX", "padY", "iconSize", "iconGap", "stackGap"]
+            out[key] = out[key] * scale
+        end for
+        weight = util.text(style.fontWeight)
+        if weight = "regular" then out.weight = 400
+        if weight = "semibold" then out.weight = 600
+        if weight = "extrabold" then out.weight = 800
+        if util.isBoolean(style.uppercase) then out.uppercase = style.uppercase
+        shape = util.text(style.shape)
+        if shape = "pill" then out.radius = -1
+        if shape = "rounded" then out.radius = 6
+        if shape = "square" then out.radius = 2
+        if util.isNumber(style.borderWidth) then out.borderWidth = style.borderWidth
+        if util.isBoolean(style.shadow)
+            if not style.shadow then out.boxShadow = invalid
+            if style.shadow and out.boxShadow = invalid then out.boxShadow = { x: 0, y: 2, blur: 6, color: "#00000059" }
+        end if
+        background = util.text(style.background)
+        alpha = 0.0
+        if background <> "" then alpha = parseColor(background).a
+        borderWidth = 0
+        if util.isNumber(style.borderWidth) then borderWidth = style.borderWidth
+        ' A framed badge gets padding; bare text would run to the frame.
+        if alpha > 0 or borderWidth > 0
+            if out.padX < out.fontSize * 0.6 then out.padX = out.fontSize * 0.6
+            if out.padY < out.fontSize * 0.2 then out.padY = out.fontSize * 0.2
+        end if
+        ' From half opacity the fill, not the artwork, is behind the text.
+        if alpha >= 0.5
+            out.solid = background
+            out.textShadow = invalid
+        end if
+        out.fill = background
+        out.textColor = util.text(style.textColor)
+        out.borderColor = util.text(style.borderColor)
+        out.styled = background <> "" or out.textColor <> "" or out.borderColor <> "" or util.isNumber(style.borderWidth)
+        return out
+    end function
+
+    function presetLook(preset as String) as Object
+        shadow = { x: 0, y: 1, blur: 2, color: "#000000D9" }
+        if preset = "minimal" then return preLook(preset, 600, 9, 4, 0, 8, 0, 10, 4, false, 2, "text", shadow, invalid)
+        if preset = "vibrant" then return preLook(preset, 700, 10, 8, 2, 10, 0, 12, 4, true, 4, "bg", invalid, { x: 0, y: 1, blur: 2, color: "#00000040" })
+        if preset = "pill" then return preLook(preset, 600, 10, 10, 4, -1, 1, 12, 4, true, 4, "bg", invalid, invalid)
+        if preset = "square"
+            out = preLook(preset, 700, 9, 6, 2, 8, 0, 10, 4, false, 2, "border", invalid, invalid)
+            out.accentLeft = 2
+            return out
+        end if
+        if preset = "plate"
+            out = preLook(preset, 800, 12, 7, 4, 6, 1, 13, 5, true, 4, "border", invalid, { x: 0, y: 2, blur: 6, color: "#00000059" })
+            out.sourceChips = true
+            return out
+        end if
+        if preset = "band"
+            out = preLook(preset, 800, 12.5, 0, 1, 0, 0, 13, 3, false, 7, "text", { x: 0, y: 1, blur: 3, color: "#000000BF" }, invalid)
+            out.band = true
+            return out
+        end if
+        return preLook("classic", 600, 10, 8, 2, -1, 1, 11, 4, false, 4, "bg", invalid, invalid)
+    end function
+
+    function preLook(id as String, weight as Integer, fontSize as Float, padX as Float, padY as Float, radius as Float, borderWidth as Float, iconSize as Float, iconGap as Float, preferIcon as Boolean, stackGap as Float, strategy as String, textShadow as Dynamic, boxShadow as Dynamic) as Object
+        return { id: id, band: false, sourceChips: false, weight: weight, uppercase: true, fontSize: fontSize, padX: padX, padY: padY, radius: radius, borderWidth: borderWidth, accentLeft: 0, textShadow: textShadow, boxShadow: boxShadow, iconSize: iconSize, iconGap: iconGap, preferIcon: preferIcon, stackGap: stackGap, strategy: strategy }
+    end function
+
+    ' Whether a look's rail badges sit flush against the card's edge as tabs:
+    ' a filled look's do; bare text (minimal, band) keeps the corner inset.
+    function flushRails(look as Object) as Boolean
+        return not look.band and look.id <> "minimal"
+    end function
+
+    ' A badge's colours under look for its accent ("" for none), as
+    ' "#RRGGBBAA" or "" for none: { fill, text, border, accentLeft }. The
+    ' preset's badgeStyle, then the style's colours over it.
+    function paint(look as Object, accent as String) as Object
+        id = look.id
+        hasAccent = accent <> ""
+        out = { fill: "", text: "#FFFFFFFF", border: "", accentLeft: "" }
+        if id = "minimal" or id = "band"
+            out.text = "#FFFFFFD9"
+            if id = "band" then out.text = "#FFFFFFFF"
+            if hasAccent then out.text = opaque(accent)
+        else if id = "classic"
+            out.fill = "#00000099"
+            if hasAccent then out.fill = mix(accent, 0.28, "#00000099")
+            out.border = "#FFFFFF26"
+        else if id = "vibrant"
+            out.fill = "#DCDCDCF2"
+            out.text = "#000000FF"
+            if hasAccent
+                out.fill = opaque(accent)
+                out.text = "#FFFFFFFF"
+            end if
+        else if id = "pill"
+            out.fill = "#14141EB3"
+            if hasAccent then out.fill = mix(accent, 0.20, "#14141EB3")
+            out.border = "#FFFFFF26"
+        else if id = "square"
+            out.fill = "#000000CC"
+            if hasAccent
+                out.text = opaque(accent)
+                out.accentLeft = opaque(accent)
+            end if
+        else if id = "plate"
+            out.fill = "#000000B8"
+            out.border = "#FFFFFF1A"
+            if hasAccent then out.border = mix(accent, 0.45, "#00000000")
+        end if
+        if not look.styled then return out
+        strategy = look.strategy
+        accentText = hasAccent and strategy = "text" and (look.solid = "" or contrast(accent, look.solid) >= 3)
+        accentFill = hasAccent and (strategy = "bg" or (strategy = "text" and not accentText))
+        if look.fill <> ""
+            out.fill = look.fill
+            if accentFill then out.fill = mix(accent, 0.30, look.fill)
+        end if
+        text = look.textColor
+        if text = "" and look.solid <> "" then text = readableOn(look.solid)
+        if text <> "" and not accentText then out.text = opaque(text)
+        if look.borderColor <> "" and not (hasAccent and strategy = "border") then out.border = look.borderColor
+        ' A border the preset does not colour takes the text's colour, as
+        ' CSS's currentColor does.
+        if look.borderWidth > 0 and out.border = "" then out.border = out.text
+        return out
+    end function
+
+    ' --- Colours --------------------------------------------------------
+
+    ' "#RRGGBB" or "#RRGGBBAA" as { r, g, b, a }, channels 0 to 1.
+    function parseColor(hex as String) as Object
+        out = { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
+        if Len(hex) < 7 then return out
+        out.r = Val(Mid(hex, 2, 2), 16) / 255
+        out.g = Val(Mid(hex, 4, 2), 16) / 255
+        out.b = Val(Mid(hex, 6, 2), 16) / 255
+        if Len(hex) >= 9 then out.a = Val(Mid(hex, 8, 2), 16) / 255
+        return out
+    end function
+
+    function hexOf(color as Object) as String
+        out = "#"
+        for each channel in [color.r, color.g, color.b, color.a]
+            value = Int(channel * 255 + 0.5)
+            if value < 0 then value = 0
+            if value > 255 then value = 255
+            out = out + Right("0" + StrI(value, 16), 2)
+        end for
+        return UCase(out)
+    end function
+
+    function opaque(hex as String) as String
+        return UCase(Left(hex, 7)) + "FF"
+    end function
+
+    ' CSS's color-mix(in srgb, a share, b): premultiplied interpolation.
+    function mix(a as String, share as Float, b as String) as String
+        x = parseColor(a)
+        y = parseColor(b)
+        alpha = x.a * share + y.a * (1 - share)
+        if alpha <= 0 then return "#00000000"
+        out = { a: alpha }
+        for each key in ["r", "g", "b"]
+            out[key] = (x[key] * x.a * share + y[key] * y.a * (1 - share)) / alpha
+        end for
+        return hexOf(out)
+    end function
+
+    function luminance(hex as String) as Float
+        color = parseColor(hex)
+        total = 0.0
+        weights = { r: 0.2126, g: 0.7152, b: 0.0722 }
+        for each key in ["r", "g", "b"]
+            channel = color[key]
+            if channel <= 0.03928
+                channel = channel / 12.92
+            else
+                channel = ((channel + 0.055) / 1.055) ^ 2.4
+            end if
+            total = total + weights[key] * channel
+        end for
+        return total
+    end function
+
+    ' The WCAG contrast ratio of two colours, ignoring alpha.
+    function contrast(a as String, b as String) as Float
+        x = luminance(a)
+        y = luminance(b)
+        if x < y
+            swap = x
+            x = y
+            y = swap
+        end if
+        return (x + 0.05) / (y + 0.05)
+    end function
+
+    ' Black or white, whichever reads better on a colour.
+    function readableOn(hex as String) as String
+        if luminance(hex) > 0.4 then return "#000000"
+        return "#FFFFFF"
+    end function
+
+    ' "#RRGGBBAA" as a Roku colour "0xRRGGBBAA".
+    function rokuColor(hex as String) as String
+        if Len(hex) = 7 then return "0x" + UCase(Mid(hex, 2)) + "FF"
+        return "0x" + UCase(Mid(hex, 2))
+    end function
+
+    ' --- Reading the document -------------------------------------------
+
+    function configRequest() as Object
+        return { path: "/api/v2/settings/overlay-config", auth: "profile", jsonText: ["defaults"] }
+    end function
+
+    function valuesRequest() as Object
+        return { path: "/api/v2/settings/values/effective", query: { keys: [DOCUMENT_KEY, ENABLED_KEY] }, auth: "profile", jsonText: ["value"] }
+    end function
+
+    ' The profile's stored values from an EffectiveSettingCollection: {
+    ' document (invalid unless the profile chose one), enabled (invalid
+    ' unless the profile chose) }. A value counts as the profile's only when
+    ' its source says so; the server's default comes from the overlay
+    ' config.
+    function profileValues(body as Dynamic) as Object
+        out = { document: invalid, enabled: invalid }
+        if not util.isObject(body) then return out
+        list = body.items
+        if type(list) <> "roArray" then return out
+        for each item in list
+            if util.isObject(item) and util.isString(item.key)
+                own = not util.isString(item.source) or item.source = "profile"
+                if item.key = DOCUMENT_KEY and own and item.value <> invalid then out.document = item.value
+                if item.key = ENABLED_KEY and own and util.isBoolean(item.value) then out.enabled = item.value
+            end if
+        end for
+        return out
+    end function
+
+    ' What cards draw from the profile's values (profileValues, or invalid
+    ' before or without them) and the overlay config (invalid before or
+    ' without it): { enabled, prefs, images ({ <ref>: { width, height } }) }.
+    ' The profile's choice wins, then the server's default; without either
+    ' badges are on in the classic look.
+    function settle(values as Dynamic, config as Dynamic) as Object
+        images = {}
+        enabled = true
+        defaultDocument = invalid
+        if util.isObject(config)
+            if util.isBoolean(config.enabled) then enabled = config.enabled
+            defaultDocument = config.defaults
+            if type(config.images) = "roArray"
+                for each image in config.images
+                    if util.isObject(image) and isImageRef(image.ref) then images[image.ref] = { width: image.width, height: image.height }
+                end for
+            end if
+        end if
+        document = defaultDocument
+        if util.isObject(values)
+            if util.isBoolean(values.enabled) then enabled = values.enabled
+            if values.document <> invalid then document = values.document
+        end if
+        return { enabled: enabled, prefs: withoutUnlisted(parse(document), images), images: images }
+    end function
+
+end namespace

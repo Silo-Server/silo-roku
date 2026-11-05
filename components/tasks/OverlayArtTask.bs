@@ -1,0 +1,169 @@
+import "pkg:/components/overlays/overlayDraw.bs"
+import "pkg:/source/util/values.bs"
+
+sub init()
+    m.top.functionName = "serve"
+end sub
+
+' How long after the viewer last moved focus the Task waits to draw: an
+' image's encoding stalls the frames drawn meanwhile (55R625 and Ultra 4850X
+' measurements in docs/spec.md section 5.9).
+const QUIET_MS = 1500
+
+' Draws each requested key once: the cards on screen first, then the cards
+' views asked for ahead (prefetch), and none while the viewer moves focus.
+' Requests that arrive meanwhile are taken between images. A request made for
+' a document other than the one that applies when its turn comes is dropped;
+' the card asks again under the new key.
+sub serve()
+    port = CreateObject("roMessagePort")
+    m.top.observeField("request", port)
+    files = CreateObject("roFileSystem")
+    for each name in files.GetDirectoryListing("tmp:/")
+        if Left(name, 8) = "overlay-" then files.Delete("tmp:/" + name)
+    end for
+    m.queues = { now: [], ahead: [] }
+    m.asked = {}
+    ' The cards waiting for each key, told when it is drawn.
+    m.waiting = {}
+    m.state = invalid
+    m.clock = CreateObject("roTimespan")
+    m.lastActivity = -QUIET_MS
+    m.seenActivity = m.top.activity
+    ' Requests set before the Task observed the field were lost but the
+    ' last: the views showing cards have them ask again.
+    takeRequest(m.top.request)
+    announce()
+    done = {}
+    while true
+        idle = m.queues.now.Count() = 0 and m.queues.ahead.Count() = 0
+        quietFor = sinceActivity()
+        if idle
+            if done.Count() > 0
+                publish(done)
+                done = {}
+            end if
+            take(wait(0, port))
+        else if quietFor < QUIET_MS
+            if done.Count() > 0
+                publish(done)
+                done = {}
+            end if
+            ' Focus moves are read, not sent: look again every 100 ms.
+            take(wait(100, port))
+        else
+            request = m.queues.now.Shift()
+            if request = invalid then request = m.queues.ahead.Shift()
+            answer(request, done)
+            ' Cards look for their images after every few, and when the
+            ' queues empty, rather than after each: one rendezvous with the
+            ' render thread per batch.
+            if done.Count() >= 6
+                publish(done)
+                done = {}
+            end if
+        end if
+        message = port.GetMessage()
+        while message <> invalid
+            take(message)
+            message = port.GetMessage()
+        end while
+    end while
+end sub
+
+' How long since the viewer last moved focus, in ms.
+function sinceActivity() as Integer
+    seen = m.top.activity
+    if seen <> m.seenActivity
+        m.seenActivity = seen
+        m.lastActivity = m.clock.TotalMilliseconds()
+    end if
+    return m.clock.TotalMilliseconds() - m.lastActivity
+end function
+
+sub take(message as Dynamic)
+    if type(message) = "roSGNodeEvent" then takeRequest(message.getData())
+end sub
+
+sub takeRequest(request as Dynamic)
+    if not util.isObject(request) or not util.isString(request.key) or request.key = "" then return
+    if request.card <> invalid
+        ' Published before this request was read: the card may have looked
+        ' first.
+        if m.asked[request.key] = "done"
+            request.card.overlayRefresh = true
+            return
+        end if
+        if not m.waiting.DoesExist(request.key) then m.waiting[request.key] = []
+        m.waiting[request.key].Push(request.card)
+        request.Delete("card")
+    end if
+    if m.asked.DoesExist(request.key)
+        ' A card on screen now wants what was asked for ahead: it goes first.
+        if not util.isTrue(request.prefetch) and m.asked[request.key] = "ahead"
+            m.asked[request.key] = "now"
+            m.queues.now.Push(request)
+        end if
+        return
+    end if
+    if util.isTrue(request.prefetch)
+        m.asked[request.key] = "ahead"
+        m.queues.ahead.Push(request)
+    else
+        m.asked[request.key] = "now"
+        m.queues.now.Push(request)
+    end if
+end sub
+
+' Draws request's image into done under its key, unless it is drawn already
+' or its document no longer applies.
+sub answer(request as Object, done as Object)
+    if m.asked[request.key] = "done" then return
+    state = invalid
+    if request.prefsKey <> "none"
+        state = currentState(request.prefsKey)
+        if state = invalid
+            ' Its cards ask again under the document that applies now.
+            m.asked.Delete(request.key)
+            tell(request.key)
+            return
+        end if
+    end if
+    m.asked[request.key] = "done"
+    done[request.key] = catalog.overlayDraw.draw(request, state, catalog.overlayDraw.words())
+end sub
+
+' Adds done's keys as fields and tells the cards waiting for them
+' (components/views/cardOverlays.bs).
+sub publish(done as Object)
+    m.top.addFields(done)
+    for each key in done
+        tell(key)
+    end for
+end sub
+
+sub tell(key as String)
+    if not m.waiting.DoesExist(key) then return
+    for each card in m.waiting[key]
+        card.overlayRefresh = true
+    end for
+    m.waiting.Delete(key)
+end sub
+
+' Tells the views showing cards that the Task listens now: requests made
+' before were lost, and their cards ask again (overlayKeys.bs).
+sub announce()
+    if not m.global.hasField("overlayArtRevision") then m.global.addFields({ overlayArtRevision: 0 })
+    m.global.overlayArtRevision = m.global.overlayArtRevision + 1
+end sub
+
+' The overlays that apply when they are prefsKey's, read from m.global once
+' per document; invalid when another document applies now.
+function currentState(prefsKey as String) as Dynamic
+    if m.state <> invalid and m.state.prefsKey = prefsKey then return m.state
+    if not m.global.hasField("cardOverlays") then return invalid
+    state = m.global.cardOverlays
+    if not util.isObject(state) or util.text(state.prefsKey) <> prefsKey then return invalid
+    m.state = state
+    return state
+end function

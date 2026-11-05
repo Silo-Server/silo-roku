@@ -1,0 +1,114 @@
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/views/overlayState.bs"
+import "pkg:/source/catalog/cards.bs"
+import "pkg:/source/util/values.bs"
+
+' Card overlay images by key (render thread): what a card of a shape and size
+' asks OverlayArtTask to draw for an item, for the card itself
+' (components/views/cardOverlays.bs) and for the views that ask ahead for the
+' cards they will show (overlayPrefetch), so scrolling finds them drawn.
+
+' The key of item's overlay image on a card of shape, width x height, "" for
+' nothing to draw: the document's key ("none" without badges), the card's
+' size and shape, whether it lifts its bottom row over a progress bar, its
+' data's key, and the episodes left.
+function overlayKeyFor(item as Object, shape as String, width as Integer, height as Integer, framed as Boolean) as String
+    if item.itemType = catalog.cards.MORE or item.id = "" then return ""
+    poster = shape = catalog.shape.POSTER
+    if not poster and shape <> catalog.shape.LANDSCAPE and shape <> catalog.shape.EPISODE then return ""
+    count = 0
+    if poster and not item.played then count = item.remaining
+    prefsKey = "none"
+    if item.overlayKey <> ""
+        state = overlayState()
+        if state <> invalid and state.prefsKey <> "" then prefsKey = state.prefsKey
+    end if
+    if prefsKey = "none" and count <= 0 then return ""
+    dataKey = ""
+    if prefsKey <> "none" then dataKey = item.overlayKey
+    flags = Left(shape, 1)
+    if not poster and item.progress >= 0 then flags = flags + "p"
+    if framed then flags = flags + "f"
+    return "ov" + prefsKey + "_" + width.ToStr() + "x" + height.ToStr() + flags + "_" + dataKey + "_" + count.ToStr()
+end function
+
+' What OverlayArtTask needs to draw key; prefetch for a card not on screen
+' yet, which waits behind those that are.
+function overlayRequestFor(item as Object, key as String, shape as String, width as Integer, height as Integer, framed as Boolean, prefetch = false as Boolean) as Object
+    checkInset = theme.browse.CHECK_INSET
+    if shape = catalog.shape.LANDSCAPE then checkInset = theme.browse.LANDSCAPE_CHECK_INSET
+    radius = theme.size.CARD_RADIUS
+    if shape = catalog.shape.EPISODE then radius = theme.size.STILL_RADIUS
+    count = 0
+    if shape = catalog.shape.POSTER and not item.played then count = item.remaining
+    prefsKey = Mid(key, 3, Instr(1, key, "_") - 3)
+    return { key: key, prefsKey: prefsKey, data: item.overlayData, w: width, h: height, shape: shape, progress: shape <> catalog.shape.POSTER and item.progress >= 0, remaining: count, radius: radius, check: { size: theme.size.CHECK_DISC, inset: checkInset }, frame: framed, frameColor: "#" + Mid(theme.color.BACKGROUND, 3), prefetch: prefetch }
+end function
+
+' The app's OverlayArtTask, started by the first view that needs it.
+function overlayArtNode() as Object
+    if not m.global.hasField("overlayArt")
+        task = CreateObject("roSGNode", "OverlayArtTask")
+        task.control = "run"
+        m.global.addFields({ overlayArt: task })
+    end if
+    return m.global.overlayArt
+end function
+
+' Asks ahead for the images of content's cards (CardContent children) on
+' cards of shape, width x height, that are not drawn yet.
+sub overlayPrefetch(content as Dynamic, shape as String, width as Integer, height as Integer, framed as Boolean)
+    if content = invalid or width <= 0 or height <= 0 then return
+    art = invalid
+    for each item in content.getChildren(-1, 0)
+        if item.hasField("overlayKey")
+            key = overlayKeyFor(item, shape, width, height, framed)
+            if key <> ""
+                if art = invalid then art = overlayArtNode()
+                if not art.hasField(key) then art.request = overlayRequestFor(item, key, shape, width, height, framed, true)
+            end if
+        end if
+    end for
+end sub
+
+'' Whether cards with lowTier show their overlays in their frame: where the
+' frame rounds their corners (no ambient wash, theme.ambientWash) on a
+' 1080p UI, since a 9-patch's corners stay at device pixels on a 720p one.
+function overlayFramed(lowTier as Boolean) as Boolean
+    if theme.ambientWash(lowTier) then return false
+    if m.ovFullHd = invalid then m.ovFullHd = CreateObject("roDeviceInfo").GetUIResolution().name = "FHD"
+    return m.ovFullHd
+end function
+
+' Calls callback when cards' overlays should draw again: a new document
+' (m.global.cardOverlaysRevision), or OverlayArtTask started listening
+' (overlayArtRevision), when requests made before then are lost. Only
+' long-lived views observe these, as for spoilers: an observer on m.global
+' keeps its component alive (AG-323). A card waiting for an image is told
+' by the Task itself (cardOverlays.bs).
+sub overlayHostObserve(prefsCallback as String, artCallback as String)
+    overlayObserve(prefsCallback)
+    if not m.global.hasField("overlayArtRevision") then m.global.addFields({ overlayArtRevision: 0 })
+    m.global.observeField("overlayArtRevision", artCallback)
+end sub
+
+' Draws again the cards of content (CardContent children, or rows of them)
+' that carry overlays, as spoilerRefresh does.
+sub overlayRefresh(content as Dynamic)
+    if content = invalid then return
+    for each child in content.getChildren(-1, 0)
+        if child.hasField("overlayRevision")
+            if child.overlayKey <> "" or child.remaining > 0 then child.overlayRevision = child.overlayRevision + 1
+        else
+            overlayRefresh(child)
+        end if
+    end for
+end sub
+
+' Tells OverlayArtTask the viewer is moving focus, so it waits to draw: an
+' image's encoding stalls the frames drawn meanwhile.
+sub overlayActivity()
+    if not m.global.hasField("overlayArt") then return
+    art = m.global.overlayArt
+    art.activity = art.activity + 1
+end sub

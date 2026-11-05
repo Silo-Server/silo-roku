@@ -865,7 +865,26 @@ their existing HD/FHD assets.
     over a progress bar. The top row stops short of the watched check's
     corner. Roku reads the document and never writes it; the web client is
     its editor. The shell reads it again each time a page with the top bar
-    starts, and a profile without an answer yet shows no badges.
+    starts, and a profile without an answer yet shows no badges. A failed
+    read keeps what applies; a 404 (a server without the endpoint) falls
+    back to the server's default, or to the built-in document.
+  - Card overlays draw without costing frames. `OverlayArtTask` draws each
+    card's badges once per distinct look, size, and data. A card that
+    rounds its corners with the 9-patch frame (no `Effect`, a 1080p UI)
+    shows them in that frame: a 9-patch of its top and bottom bands, the
+    badges and corners, around clear rows that stretch down the middle,
+    so overlays add no node and no texture beyond the frame's. Elsewhere,
+    and for badges that reach the card's middle (the edge rails), a card
+    shows its top half's and bottom half's badges as up to two Posters.
+    Rows ask for their cards' images as their content arrives, and the
+    Task draws only while focus has rested 1.5 s, since encoding an image
+    stalls the frames drawn meanwhile. A card whose image is not drawn yet,
+    such as one in a row loaded as focus reaches it, shows its badges once
+    focus rests. Measured against the release before card overlays,
+    scrolling a Home row and moving between rows keep their frame rates on
+    the Ultra 4850X (Roku OS 16.0.4, `Effect`, Posters) and the 55R625
+    (15.3.4, frame) within each device's run-to-run spread; a 720p UI, which
+    uses the Posters, was not measured.
   - A started, unfinished series or season poster (`user_state.watched_count`
     above 0 and `unplayed_count` above 0) shows the episodes left in the
     check's place: the number in Inter Bold 20 on a black 65% disc of the
@@ -2308,8 +2327,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The hero's meta line shows the IMDb or TMDB mark before the score | The source's name as text ("IMDb 8.3") | No logo art ships for rating sources |
 | Runtimes read "45m" and "1h 0m" | "45 min" and "1h", as Android TV writes them | The `catalog.` runtime strings serve Home, detail, and Up Next alike; a copy change of its own moves them |
 | Card overlay text in the 800 weight (plate, band, `extrabold`, the HDR10 and ATMOS wordmarks) | Inter Bold (700) | Bold is the heaviest packaged weight |
-| Card overlay badges letter-space their text, and the minimal and band looks blur a text shadow, as vibrant and plate blur a drop shadow | No letter-spacing; a text shadow is one copy of the text offset 1 px at 60% of the shadow's opacity, and a drop shadow the badge's shape in the shadow's colour, offset and spread by a quarter of the blur, at 60% | Roku `Label` has no tracking, and SceneGraph has no blur |
-| A badge's corner radius scales freely with the card and the look's size | The radius rounds down to a packaged 9-patch's (1 to 16 px, then even to 32 px), and a border to a whole 1 to 4 px | Roku draws a 9-patch's corners at device pixels whatever the node's scale, so each radius needs its own texture (`scripts/badge-art.py`) |
+| Card overlay badges letter-space their text, and the minimal and band looks blur a text shadow, as vibrant and plate blur a drop shadow | No letter-spacing; a text shadow is one copy of the text offset 1 px at 60% of the shadow's opacity, and a drop shadow the badge's shape in the shadow's colour in rings widening a pixel each across half the blur | `roBitmap` draws text whole (characters drawn one by one land unevenly) and has no blur |
+| Card overlay badges show as soon as a card does | A card shows its badges once its image is drawn: at once for cards its row or grid asked for ahead, and after focus rests 1.5 s for a row loaded as focus reaches it | The images are drawn off the render thread, and encoding one stalls the frames drawn meanwhile (above) |
 | The watch-status corner is a 22 px emerald check on posters only, scaled with the card, and the episodes left on a 22 px disc | Roku keeps tvOS's 40 px check disc on every card shape, and draws the episodes left at its size | The check disc follows tvOS (section 5.5); the episodes left take its place |
 | The request-status badge and its download bar mark watchlist titles outside the library | Not drawn | Roku lists no watchlist titles outside the library, so no card has the badge's data |
 | Card overlay settings (badges on or off, presets, positions, colours, images) | Not offered; Roku draws what the web client saved | The web client is the only editor the contract names; tvOS reads the setting only too |

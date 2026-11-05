@@ -1,36 +1,19 @@
 #!/usr/bin/env python3
-"""Write the card overlay badges' art into images/badges/ (components/views/
-CardOverlays.bs; silo-server docs/architecture/card-overlays.md).
+"""Write the card overlay badges' glyphs into images/badges/ (source/catalog/
+overlayDraw.bs; silo-server docs/architecture/card-overlays.md).
 
-  fill_{round,left,right}_{R}_{fhd,hd}.9.png
-                     a badge's fill: a white rounded square of radius R as a
-                     9-patch, for each R in RADII (FHD px; HD radii are 2/3 of
-                     it, at least 1). Roku draws a 9-patch's corners at the
-                     device's pixels whatever the node's scale, so each radius
-                     a badge can take has its own texture, and the card picks
-                     the largest that fits. left and right are the edge
-                     rails' tabs: square on the side flush with the card's
-                     edge (left: the left side)
-  ring_{round,left,right}_{R}_{T}_{fhd,hd}.9.png
-                     a badge's border at radius R with a T px stroke, for T
-                     in STROKES (HD 2/3 of it, at least 1), its corner patch
-                     at least the stroke wide. A tab's ring leaves the flush
-                     side open
-  scrim_top.png, scrim_bottom.png
-                     the edge band's scrim, white for blendColor: 85% at the
-                     card's edge, 60% at 55% of the way in, clear at the end
   <glyph>.png        the badges' 24-unit glyphs at 2 px per unit (48 px),
-                     2-unit round-capped strokes, white for blendColor:
+                     2-unit round-capped strokes, white for a tint:
                      monitor, volume, film, layout, languages, subtitles,
                      shield, users, clock, globe, building, tv; and
                      dolby_vision, a ring with the right half of its middle
                      filled, as the web's inline mark draws it
 
-Shapes are plain geometry, not brand assets or a copied icon set. The 9-patch
-border follows scripts/ui-art.py: top and left marks stretch the middle 2 px,
-right and bottom mark the whole image as content. Edges are antialiased by
-supersampling. Uses only the standard library, so the pixels are the same on
-every machine. Run from anywhere: python3 scripts/badge-art.py
+OverlayArtTask scales each into a card's overlay image; fills, borders, and
+scrims it draws itself. Shapes are plain geometry, not brand
+assets or a copied icon set. Edges are antialiased by supersampling. Uses
+only the standard library, so the pixels are the same on every machine. Run
+from anywhere: python3 scripts/badge-art.py
 """
 import math
 import pathlib
@@ -38,18 +21,10 @@ import struct
 import zlib
 
 WHITE = (0xFF, 0xFF, 0xFF)
-STRETCH = 2
-RADII = tuple(range(1, 17)) + tuple(range(18, 33, 2))  # FHD px
-STROKES = (1, 2, 3, 4)  # FHD px
-SCRIM = 64  # px tall
 GLYPH_UNITS = 24
 GLYPH_SCALE = 2
 STROKE = 2.0  # glyph units
 SAMPLES = 8
-
-
-def hd(fhd_px):
-    return max(1, round(fhd_px * 2 / 3))
 
 
 def coverage(width, height, covered, scale=1):
@@ -76,64 +51,6 @@ def box_distance(x, y, left, top, right, bottom, radii):
     qx = abs(x - cx) - ((right - left) / 2 - radius)
     qy = abs(y - cy) - ((bottom - top) / 2 - radius)
     return math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - radius
-
-
-def corner_radii(shape, radius):
-    if shape == "left":
-        return (0, radius, radius, 0)
-    if shape == "right":
-        return (radius, 0, 0, radius)
-    return (radius, radius, radius, radius)
-
-
-def fill(shape, radius):
-    size = 2 * radius + STRETCH
-    radii = corner_radii(shape, radius)
-    return coverage(size, size, lambda x, y: box_distance(x, y, 0, 0, size, size, radii) <= 0)
-
-
-def ring(shape, radius, stroke):
-    """The border of fill(shape, radius), stroke px wide; a tab's flush side
-    has none, so its inner edge runs past that side. The corners that do not
-    stretch are at least the stroke wide, or a stroke wider than the radius
-    would stretch over the whole badge."""
-    size = 2 * max(radius, stroke) + STRETCH
-    radii = corner_radii(shape, radius)
-    inner = tuple(max(r - stroke, 0) for r in radii)
-    left = -stroke if shape == "left" else stroke
-    right = size + stroke if shape == "right" else size - stroke
-
-    def covered(x, y):
-        if box_distance(x, y, 0, 0, size, size, radii) > 0:
-            return False
-        return box_distance(x, y, left, stroke, right, size - stroke, inner) > 0
-    return coverage(size, size, covered)
-
-
-def scrim(top):
-    """A column from 85% at the edge to 60% at 55% to clear."""
-    rows = []
-    for y in range(SCRIM):
-        t = (y + 0.5) / SCRIM
-        alpha = 0.85 + (0.6 - 0.85) * t / 0.55 if t <= 0.55 else 0.6 * (1 - (t - 0.55) / 0.45)
-        rows.append([WHITE + (round(255 * alpha),)] * 2)
-    return rows if top else rows[::-1]
-
-
-def nine_patch(alpha):
-    return nine_patch_rgba([[WHITE + (a,) for a in line] for line in alpha])
-
-
-def nine_patch_rgba(pixels):
-    height, width = len(pixels), len(pixels[0])
-    clear, mark = (0, 0, 0, 0), (0, 0, 0, 255)
-    first_x = (width - STRETCH) // 2 + 1
-    first_y = (height - STRETCH) // 2 + 1
-    rows = [[mark if first_x <= x < first_x + STRETCH else clear for x in range(width + 2)]]
-    for y, line in enumerate(pixels, start=1):
-        rows.append([mark if first_y <= y < first_y + STRETCH else clear] + list(line) + [mark])
-    rows.append([clear] + [mark] * width + [clear])
-    return rows
 
 
 # --- Glyphs, in 24 units ------------------------------------------------
@@ -244,14 +161,6 @@ def png(rows):
 
 
 def images():
-    for res, scale in (("fhd", lambda px: px), ("hd", hd)):
-        for radius in RADII:
-            for shape in ("round", "left", "right"):
-                yield f"fill_{shape}_{radius}_{res}.9.png", nine_patch(fill(shape, scale(radius)))
-                for stroke in STROKES:
-                    yield f"ring_{shape}_{radius}_{stroke}_{res}.9.png", nine_patch(ring(shape, scale(radius), scale(stroke)))
-    yield "scrim_top.png", scrim(True)
-    yield "scrim_bottom.png", scrim(False)
     for name, parts in GLYPHS.items():
         yield f"{name}.png", glyph(parts)
     yield "dolby_vision.png", dolby_vision()

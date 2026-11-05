@@ -1,0 +1,933 @@
+import "pkg:/components/overlays/overlays.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' Drawing a card's overlays into one image (OverlayArtTask; Task thread only:
+' it fetches uploaded images with roUrlTransfer). A card shows its badges, a
+' band's scrims, and its episodes-left disc as one Poster of this image, so a
+' card adds one node whatever it draws (plan section 4.6): Labels, 9-patches,
+' and glyph Posters per badge cost the 55R625 a third of its scrolling frame
+' rate. The layout and looks are catalog.overlays' (the web's CardOverlays);
+' this file measures text with the packaged Inter, draws anti-aliased rounded
+' fills and borders from end caps drawn pixel by pixel once, scales glyphs
+' and uploaded images to their size, and writes only the boxes it drew in.
+namespace catalog.overlayDraw
+    const DIR = "tmp:/overlay-"
+    const ELLIPSIS = "…"
+
+    ' Draws spec ({ key, data, w, h, shape, progress, remaining, radius,
+    ' check: { size, inset }, frame, frameColor }) under state (m.global.cardOverlays: prefs,
+    ' images, origin; invalid for the disc alone) and gives
+    ' "x,y,w,h,uri;x,y,w,h,uri": the box drawn in the card and the image of
+    ' its top half's overlays and of its bottom half's ("" for a half with
+    ' none), or "" for nothing. Two images, not one: a card's top and bottom
+    ' badges in one image make a texture the height of the card, mostly
+    ' clear, that costs the 55R625 frames to draw on every card. Halves
+    ' drawn alike share one file: encoding one costs tens of milliseconds
+    ' whatever its size.
+    function draw(spec as Object, state as Dynamic, copy as Object) as String
+        width = Int(spec.w)
+        height = Int(spec.h)
+        if width <= 0 or height <= 0 then return ""
+        bmp = CreateObject("roBitmap", { width: width, height: height, AlphaEnable: true })
+        if bmp = invalid then return ""
+        bmp.Clear(0)
+        c = { bmp: bmp, width: width, height: height, radius: spec.radius, groups: [newGroup(width, height), newGroup(width, height)] }
+        if util.isObject(state) and util.isObject(state.prefs) and util.isObject(spec.data) and spec.data.Count() > 0
+            c.origin = util.text(state.origin)
+            c.images = state.images
+            drawBadges(c, spec, state.prefs, copy)
+        end if
+        if spec.remaining > 0 then countDisc(c, spec)
+        if util.isTrue(spec.frame)
+            framed = frame(c, spec)
+            if framed <> "" then return framed
+        end if
+        bmp.Finish()
+        top = encode(c, c.groups[0], spec, "t")
+        bottom = encode(c, c.groups[1], spec, "b")
+        if top = "" and bottom = "" then return ""
+        return top + ";" + bottom
+    end function
+
+    ' The card's frame with its overlays, "F,uri", or "" when they do not fit
+    ' one: a 9-patch of the card's top band and bottom band, holding the
+    ' badges and the frame's corners in the page colour, around two clear
+    ' rows that stretch down the card's middle. A card that rounds its
+    ' corners with this frame (no Effect) shows its overlays in it, so they
+    ' cost no node and no texture beyond the frame's: overlay Posters cost
+    ' the 55R625 frames (docs/spec.md section 5.5). Badges that reach the
+    ' middle (the edge rails) do not fit.
+    function frame(c as Object, spec as Object) as String
+        radius = Int(spec.radius + 0.999)
+        top = radius
+        if c.groups[0].maxY > c.groups[0].minY and c.groups[0].maxY > top then top = c.groups[0].maxY
+        bottom = c.height - radius
+        if c.groups[1].maxY > c.groups[1].minY and c.groups[1].minY < bottom then bottom = c.groups[1].minY
+        if top + (c.height - bottom) > c.height * 0.6 then return ""
+        cornerMask(c, spec.radius, spec.frameColor)
+        c.bmp.Finish()
+        bands = c.height - bottom
+        if m.overlayFiles = invalid then m.overlayFiles = {}
+        ops = []
+        ops.Append(c.groups[0].ops)
+        ops.Append(c.groups[1].ops)
+        ops.Push("frame" + c.width.ToStr() + "x" + c.height.ToStr() + "," + top.ToStr() + "," + bands.ToStr() + "," + spec.radius.ToStr() + "," + spec.frameColor)
+        signature = catalog.overlays.hashOf(ops.Join("|"))
+        if m.overlayFiles.DoesExist(signature) then return m.overlayFiles[signature]
+        ' The 9-patch: a 1 px border marking the middle 2 columns and the 2
+        ' clear rows to stretch, and all of the image as content.
+        width = c.width + 2
+        height = top + 2 + bands + 2
+        out = CreateObject("roBitmap", { width: width, height: height, AlphaEnable: false })
+        out.Clear(0)
+        topBand = CreateObject("roRegion", c.bmp, 0, 0, c.width, top)
+        bottomBand = CreateObject("roRegion", c.bmp, 0, bottom, c.width, bands)
+        out.DrawObject(1, 1, topBand)
+        out.DrawObject(1, 1 + top + 2, bottomBand)
+        mark = &h000000FF
+        out.DrawRect(1 + Int(c.width / 2) - 1, 0, 2, 1, mark)
+        out.DrawRect(0, 1 + top, 1, 2, mark)
+        out.DrawRect(width - 1, 1, 1, height - 2, mark)
+        out.DrawRect(1, height - 1, width - 2, 1, mark)
+        out.Finish()
+        png = out.GetPng(0, 0, width, height)
+        path = DIR + spec.key + ".9.png"
+        if png = invalid or not png.WriteFile(path) then return ""
+        placed = "F," + path
+        m.overlayFiles[signature] = placed
+        return placed
+    end function
+
+    ' The frame's corners over the card: outside a radius in color, as the
+    ' packaged card frame paints them (scripts/ui-art.py card_frame).
+    sub cornerMask(c as Object, radius as Float, color as String)
+        tint = colorOf(color)
+        size = Int(radius + 0.999)
+        mask = cornerOf(radius, size, tint)
+        c.bmp.DrawObject(0, 0, mask.tl)
+        c.bmp.DrawObject(c.width - size, 0, mask.tr)
+        c.bmp.DrawObject(0, c.height - size, mask.bl)
+        c.bmp.DrawObject(c.width - size, c.height - size, mask.br)
+    end sub
+
+    ' The four corners outside radius, size px square, in tint, cached.
+    function cornerOf(radius as Float, size as Integer, tint as Object) as Object
+        if m.overlayCorners = invalid then m.overlayCorners = {}
+        key = radius.ToStr() + "|" + packed(tint).ToStr()
+        found = m.overlayCorners[key]
+        if found <> invalid then return found
+        found = {}
+        for each corner in ["tl", "tr", "bl", "br"]
+            bmp = CreateObject("roBitmap", { width: size, height: size, AlphaEnable: false })
+            bmp.Clear(0)
+            for j = 0 to size - 1
+                for i = 0 to size - 1
+                    ' The pixel's distance from the corner's circle centre.
+                    dx = radius - (i + 0.5)
+                    dy = radius - (j + 0.5)
+                    if corner = "tr" or corner = "br" then dx = (i + 0.5) - (size - radius)
+                    if corner = "bl" or corner = "br" then dy = (j + 0.5) - (size - radius)
+                    outside = 0.0
+                    if dx > 0 and dy > 0 then outside = clamp(Sqr(dx * dx + dy * dy) - radius + 0.5)
+                    if outside > 0 then bmp.DrawRect(i, j, 1, 1, packed(scaled(tint, outside)))
+                end for
+            end for
+            bmp.Finish()
+            found[corner] = bmp
+        end for
+        m.overlayCorners[key] = found
+        return found
+    end function
+
+    ' The box and ops (what was drawn where) of one half of a card's image.
+    function newGroup(width as Integer, height as Integer) as Object
+        return { minX: width, minY: height, maxX: 0, maxY: 0, ops: [] }
+    end function
+
+    ' The half's image, "x,y,w,h,uri", written once per distinct look.
+    function encode(c as Object, group as Object, spec as Object, suffix as String) as String
+        if group.maxX <= group.minX or group.maxY <= group.minY then return ""
+        w = group.maxX - group.minX
+        h = group.maxY - group.minY
+        if m.overlayFiles = invalid then m.overlayFiles = {}
+        group.ops.Push("box" + group.minX.ToStr() + "," + group.minY.ToStr() + "," + w.ToStr() + "," + h.ToStr() + "," + spec.radius.ToStr())
+        signature = catalog.overlays.hashOf(group.ops.Join("|"))
+        if m.overlayFiles.DoesExist(signature) then return m.overlayFiles[signature]
+        ' A bitmap of just the box: a Poster does not show GetPng's output for
+        ' part of a bitmap (55R625, Roku OS 15.3.4), though roBitmap reads it.
+        out = CreateObject("roBitmap", { width: w, height: h, AlphaEnable: false })
+        out.Clear(0)
+        out.DrawObject(-group.minX, -group.minY, c.bmp)
+        out.Finish()
+        png = out.GetPng(0, 0, w, h)
+        path = DIR + spec.key + "-" + suffix + ".png"
+        if png = invalid or not png.WriteFile(path) then return ""
+        placed = group.minX.ToStr() + "," + group.minY.ToStr() + "," + w.ToStr() + "," + h.ToStr() + "," + path
+        m.overlayFiles[signature] = placed
+        return placed
+    end function
+
+    ' Records what was drawn at y, h tall, in the half it sits in, for the
+    ' half's signature.
+    sub note(c as Object, op as String, y as Integer, h as Integer)
+        group = groupAt(c, y, h)
+        group.ops.Push(op)
+    end sub
+
+    function groupAt(c as Object, y as Integer, h as Integer) as Object
+        if y + h / 2 < c.height / 2 then return c.groups[0]
+        return c.groups[1]
+    end function
+
+    ' --- Layout (the web's CardOverlays) --------------------------------
+
+    sub drawBadges(c as Object, spec as Object, prefs as Object, copy as Object)
+        look = catalog.overlays.lookOf(prefs.preset, prefs.style)
+        resolved = catalog.overlays.resolve(prefs, spec.data, look, copy)
+        wide = spec.shape <> "poster"
+        k = 1.0
+        if not wide then k = c.width / catalog.overlays.REFERENCE_WIDTH
+        c.look = look
+        c.k = k
+        c.inset = catalog.overlays.EDGE_INSET * k
+        ' The top row stops short of the watch-status corner (the check disc).
+        reserve = spec.check.inset + spec.check.size + catalog.overlays.EDGE_GAP * k
+        progress = wide and util.isTrue(spec.progress)
+        if look.band
+            bandTop(c, resolved.topLeft, c.width - reserve)
+            bottom = []
+            bottom.Append(resolved.bottomLeft)
+            bottom.Append(resolved.bottomRight)
+            bandBottom(c, bottom, progress)
+        else
+            stackTop(c, resolved.topLeft, c.width - reserve - c.inset)
+            bottomRows(c, resolved.bottomLeft, resolved.bottomRight, progress)
+        end if
+        railInset = c.inset
+        if catalog.overlays.flushRails(look) then railInset = 0
+        drawRail(c, resolved.leftEdge, railInset, "left")
+        drawRail(c, resolved.rightEdge, railInset, "right")
+    end sub
+
+    sub stackTop(c as Object, list as Object, maxWidth as Float)
+        y = c.inset
+        for each badge in list
+            plan = measure(c, badge, maxWidth, "")
+            paintBadge(c, plan, c.inset, y)
+            y = y + plan.h + c.look.stackGap * c.k
+        end for
+    end sub
+
+    sub drawRail(c as Object, list as Object, inset as Float, side as String)
+        if list.Count() = 0 then return
+        flush = ""
+        if inset = 0 then flush = side
+        gap = c.look.stackGap * c.k
+        plans = []
+        total = 0.0
+        for each badge in list
+            plan = measure(c, badge, c.width * 0.6, flush)
+            plans.Push(plan)
+            total = total + plan.h
+        end for
+        total = total + gap * (plans.Count() - 1)
+        y = (c.height - total) / 2
+        for each plan in plans
+            x = inset
+            if side = "right" then x = c.width - inset - plan.w
+            paintBadge(c, plan, x, y)
+            y = y + plan.h + gap
+        end for
+    end sub
+
+    ' The bottom corners a row per level from the bottom up; a pair too wide
+    ' to share its row wraps, the right badge onto a line under the left.
+    sub bottomRows(c as Object, left as Object, right as Object, progress as Boolean)
+        rows = catalog.overlays.bottomRows(left, right)
+        gap = c.look.stackGap * c.k
+        edgeGap = catalog.overlays.EDGE_GAP * c.k
+        available = c.width - 2 * c.inset
+        bottom = c.height - c.inset
+        if progress then bottom = bottom - c.inset
+        for i = rows.Count() - 1 to 0 step -1
+            row = rows[i]
+            l = invalid
+            r = invalid
+            if row.left <> invalid then l = measure(c, row.left, available, "")
+            if row.right <> invalid then r = measure(c, row.right, available, "")
+            if l <> invalid and r <> invalid and l.w + edgeGap + r.w > available
+                paintBadge(c, r, c.width - c.inset - r.w, bottom - r.h)
+                bottom = bottom - r.h - gap
+                paintBadge(c, l, c.inset, bottom - l.h)
+                bottom = bottom - l.h - gap
+            else
+                lineHeight = 0.0
+                if l <> invalid
+                    paintBadge(c, l, c.inset, bottom - l.h)
+                    lineHeight = l.h
+                end if
+                if r <> invalid
+                    paintBadge(c, r, c.width - c.inset - r.w, bottom - r.h)
+                    if r.h > lineHeight then lineHeight = r.h
+                end if
+                bottom = bottom - lineHeight - gap
+            end if
+        end for
+    end sub
+
+    sub bandTop(c as Object, list as Object, right as Float)
+        if list.Count() = 0 then return
+        marks = bandMarks(c, list, right - c.inset)
+        drawScrim(c, 0, Int(c.inset * 4 + marks.h + 0.5), true)
+        placeMarks(c, marks, c.inset, c.inset)
+    end sub
+
+    sub bandBottom(c as Object, list as Object, progress as Boolean)
+        if list.Count() = 0 then return
+        marks = bandMarks(c, list, c.width - 2 * c.inset)
+        below = c.inset
+        if progress then below = 2 * c.inset
+        strip = Int(c.inset * 3 + marks.h + below + 0.5)
+        drawScrim(c, c.height - strip, strip, false)
+        placeMarks(c, marks, (c.width - marks.w) / 2, c.height - below - marks.h)
+    end sub
+
+    ' The marks that fit whole in available, with a divider before each after
+    ' the first; only a first mark too wide on its own truncates.
+    function bandMarks(c as Object, list as Object, available as Float) as Object
+        gap = c.look.stackGap * c.k
+        plans = []
+        widths = []
+        for each badge in list
+            plan = measure(c, badge, 100000, "")
+            plans.Push(plan)
+            widths.Push(plan.w)
+        end for
+        count = catalog.overlays.bandFit(widths, available, gap, 1)
+        if count = 1 and plans[0].w > available then plans[0] = measure(c, list[0], available, "")
+        kept = []
+        total = 0.0
+        tallest = 0.0
+        for i = 0 to count - 1
+            kept.Push(plans[i])
+            total = total + plans[i].w
+            if i > 0 then total = total + 2 * gap + 1
+            if plans[i].h > tallest then tallest = plans[i].h
+        end for
+        return { plans: kept, w: total, h: tallest, gap: gap }
+    end function
+
+    sub placeMarks(c as Object, marks as Object, x as Float, y as Float)
+        dividerHeight = c.look.fontSize * c.k * 0.9
+        for i = 0 to marks.plans.Count() - 1
+            plan = marks.plans[i]
+            if i > 0
+                x = x + marks.gap
+                note(c, "divider" + whole(x).ToStr() + "," + whole(y).ToStr() + "," + whole(dividerHeight).ToStr(), whole(y), whole(marks.h))
+                fillRect(c, whole(x), whole(y + (marks.h - dividerHeight) / 2), 1, whole(dividerHeight), rgba(255, 255, 255, 0.4))
+                x = x + 1 + marks.gap
+            end if
+            paintBadge(c, plan, x, y + (marks.h - plan.h) / 2)
+            x = x + plan.w
+        end for
+    end sub
+
+    ' A band's scrim from y, height rows: black 85% at the card's edge, 60%
+    ' at 55% of the way in, clear at the end, inside the card's rounded
+    ' corners.
+    sub drawScrim(c as Object, y0 as Integer, rows as Integer, top as Boolean)
+        note(c, "scrim" + y0.ToStr() + "," + rows.ToStr() + "," + top.ToStr() + "," + c.width.ToStr(), y0, rows)
+        for j = 0 to rows - 1
+            t = (j + 0.5) / rows
+            if not top then t = 1 - t
+            if t <= 0.55
+                alpha = 0.85 + (0.6 - 0.85) * t / 0.55
+            else
+                alpha = 0.6 * (1 - (t - 0.55) / 0.45)
+            end if
+            y = y0 + j
+            cardRow(c, y, alpha)
+        end for
+    end sub
+
+    ' A row of black at alpha across the card, its ends anti-aliased to the
+    ' card's corners.
+    sub cardRow(c as Object, y as Integer, alpha as Float)
+        r = c.radius
+        yc = y + 0.5
+        dy = 0.0
+        if yc < r then dy = r - yc
+        if yc > c.height - r then dy = yc - (c.height - r)
+        if dy <= 0
+            fillRect(c, 0, y, c.width, 1, rgba(0, 0, 0, alpha))
+            return
+        end if
+        zone = Int(r) + 1
+        for x = 0 to zone - 1
+            d = Sqr((r - (x + 0.5)) ^ 2 + dy * dy)
+            amount = clamp(r - d + 0.5)
+            if (x + 0.5) >= r then amount = clamp(r - dy + 0.5)
+            if amount > 0
+                fillRect(c, x, y, 1, 1, rgba(0, 0, 0, alpha * amount))
+                fillRect(c, c.width - 1 - x, y, 1, 1, rgba(0, 0, 0, alpha * amount))
+            end if
+        end for
+        middle = clamp(r - dy + 0.5)
+        if middle > 0 then fillRect(c, zone, y, c.width - 2 * zone, 1, rgba(0, 0, 0, alpha * middle))
+    end sub
+
+    ' --- A badge ---------------------------------------------------------
+
+    ' What badge draws at most maxWidth wide: its size w x h and its parts.
+    ' rail is "left" or "right" for a flush flush with that edge, else "".
+    function measure(c as Object, badge as Object, maxWidth as Float, rail as String) as Object
+        look = c.look
+        k = c.k
+        ' An uploaded image for the badge's value replaces the whole badge.
+        if badge.valueImage <> ""
+            image = uploaded(c, badge.valueImage)
+            if image <> invalid
+                h = (look.fontSize + 2 * look.padY) * catalog.overlays.VALUE_IMAGE_SCALE * k
+                w = h * image.GetWidth() / image.GetHeight()
+                if w > maxWidth then w = maxWidth
+                return { kind: "value", image: image, w: whole(w), h: whole(h) }
+            end if
+        end if
+        iconImage = invalid
+        if badge.image <> "" then iconImage = uploaded(c, badge.image)
+        catalog.overlays.finish(badge, look, iconImage <> invalid)
+        colors = catalog.overlays.paint(look, badge.accent)
+        fontSize = textSize(look.fontSize * k)
+        plan = { kind: "badge", badge: badge, colors: colors, rail: rail, font: fontOf(look.weight, fontSize), fontSize: fontSize }
+        border = 0.0
+        if colors.border <> "" and catalog.overlays.parseColor(colors.border).a > 0 then border = look.borderWidth * k
+        iconSize = look.iconSize * k
+        ' The lead: an uploaded icon image, a source chip, a wordmark, or a
+        ' glyph.
+        lead = { kind: "", w: 0.0, h: 0.0 }
+        if iconImage <> invalid
+            lead = { kind: "image", image: iconImage, h: whole(iconSize), w: whole(iconSize * iconImage.GetWidth() / iconImage.GetHeight()) }
+            if lead.w > maxWidth then lead.w = whole(maxWidth)
+        else if badge.chip <> ""
+            chipColor = badge.accent
+            if chipColor = "" then chipColor = "#FFFFFF"
+            lead = { kind: "chip", text: badge.chip, color: catalog.overlays.opaque(chipColor), textColor: catalog.overlays.readableOn(chipColor) }
+            lead.w = textWidth(plan.font, badge.chip) + 0.7 * fontSize
+            lead.h = fontSize * 1.3
+        else if badge.markText <> ""
+            units = 10
+            if badge.icon = "atmos" then units = 9
+            markFont = fontOf(800, textSize(iconSize * units / 12))
+            lead = { kind: "mark", text: badge.markText, font: markFont, w: textWidth(markFont, badge.markText), h: iconSize }
+        else if badge.icon <> ""
+            lead = { kind: "glyph", icon: badge.icon, w: whole(iconSize), h: whole(iconSize) }
+        end if
+        text = badge.text
+        width = 0.0
+        if text <> "" then width = textWidth(plan.font, text)
+        contentHeight = fontSize
+        if lead.h > contentHeight then contentHeight = lead.h
+        gap = 0.0
+        if lead.w > 0 and width > 0 then gap = look.iconGap * k
+        left = border
+        right = border
+        if rail = "left" then left = 0
+        if rail = "right" then right = 0
+        if look.accentLeft > 0 and colors.accentLeft <> "" and rail <> "left" then left = look.accentLeft * k
+        padX = look.padX * k
+        padY = look.padY * k
+        w = left + padX + lead.w + gap + width + padX + right
+        ' A bare score never truncates; any other label does, with an
+        ' ellipsis.
+        if w > maxWidth and width > 0 and not badge.scoreOnly
+            text = fit(plan.font, text, width - (w - maxWidth))
+            width = 0
+            if text <> "" then width = textWidth(plan.font, text)
+            w = maxWidth
+        end if
+        plan.append({ lead: lead, text: text, textWidth: width, gap: gap, border: border, left: left, padX: padX, padY: padY, contentHeight: contentHeight, w: w, h: border + padY + contentHeight + padY + border })
+        return plan
+    end function
+
+    ' Draws plan at x, y from a sprite of it, drawn once per look, text, and
+    ' size: most cards share their badges ("4K", "BLURAY"), so a card's image
+    ' is mostly copies of sprites.
+    sub paintBadge(c as Object, plan as Object, x as Float, y as Float)
+        lead = plan.lead
+        if lead = invalid then lead = {}
+        key = FormatJson({ kind: plan.kind, w: whole(plan.w), h: whole(plan.h), rail: plan.rail, text: plan.text, font: plan.fontSize, border: plan.border, left: plan.left, padX: plan.padX, padY: plan.padY, content: plan.contentHeight, gap: plan.gap, lead: [lead.kind, lead.text, lead.icon, lead.w, lead.h, lead.color], colors: plan.colors, look: [c.look.id, c.look.weight, c.look.radius, c.look.accentLeft, c.look.boxShadow, c.look.textShadow, c.k], images: [plan.badge.image, plan.badge.valueImage] })
+        margin = whole(8 * c.k) + 2
+        sprite = spriteOf(c, key, plan.w, plan.h, margin, plan)
+        x0 = whole(x)
+        y0 = whole(y)
+        if sprite.maxX <= sprite.minX then return
+        ' The half the badge's pixels go to (touch) records it too.
+        note(c, key + "@" + x0.ToStr() + "," + y0.ToStr(), y0 - margin + sprite.minY, sprite.maxY - sprite.minY)
+        ' Copied onto the card's clear canvas (see paintBadgeAt), only the
+        ' box the sprite drew in; blended over the band's scrim or with a
+        ' drop shadow, which is dark.
+        if c.look.band or c.look.boxShadow <> invalid
+            c.bmp.DrawObject(x0 - margin, y0 - margin, sprite.bmp)
+        else
+            region = CreateObject("roRegion", sprite.bmp, sprite.minX, sprite.minY, sprite.maxX - sprite.minX, sprite.maxY - sprite.minY)
+            c.bmp.SetAlphaEnable(false)
+            c.bmp.DrawObject(x0 - margin + sprite.minX, y0 - margin + sprite.minY, region)
+            c.bmp.SetAlphaEnable(true)
+        end if
+        touch(c, x0 - margin + sprite.minX, y0 - margin + sprite.minY, sprite.maxX - sprite.minX, sprite.maxY - sprite.minY)
+    end sub
+
+    ' The sprite for key: plan (or the episodes-left disc, for a plan of {
+    ' discLabel }) drawn at margin in a bitmap margin px larger on every side,
+    ' with the box it drew in, cached for the Task's life.
+    function spriteOf(c as Object, key as String, w as Float, h as Float, margin as Integer, plan as Object) as Object
+        if m.overlaySprites = invalid then m.overlaySprites = {}
+        found = m.overlaySprites[key]
+        if found <> invalid then return found
+        width = whole(w) + 2 * margin
+        height = whole(h) + 2 * margin
+        bmp = CreateObject("roBitmap", { width: width, height: height, AlphaEnable: true })
+        bmp.Clear(0)
+        sc = { bmp: bmp, width: width, height: height, minX: width, minY: height, maxX: 0, maxY: 0, radius: 0, look: c.look, k: c.k, images: c.images, origin: c.origin }
+        if plan.DoesExist("discLabel")
+            discAt(sc, margin, margin, whole(w), whole(h), plan.discLabel)
+        else
+            paintBadgeAt(sc, plan, margin, margin)
+        end if
+        bmp.Finish()
+        found = { bmp: bmp, minX: sc.minX, minY: sc.minY, maxX: sc.maxX, maxY: sc.maxY }
+        m.overlaySprites[key] = found
+        return found
+    end function
+
+    sub paintBadgeAt(c as Object, plan as Object, x as Float, y as Float)
+        x0 = whole(x)
+        y0 = whole(y)
+        w = whole(plan.w)
+        h = whole(plan.h)
+        if plan.kind = "value"
+            c.bmp.SetAlphaEnable(false)
+            drawImage(c, plan.image, x0, y0, w, h, rgba(255, 255, 255, 1))
+            c.bmp.SetAlphaEnable(true)
+            return
+        end if
+        look = c.look
+        colors = plan.colors
+        radius = look.radius * c.k
+        if look.radius < 0 or radius > h / 2 then radius = h / 2
+        if radius > w / 2 then radius = w / 2
+        radii = [radius, radius, radius, radius]
+        if plan.rail = "left" then radii = [0, radius, radius, 0]
+        if plan.rail = "right" then radii = [radius, 0, 0, radius]
+        hasFill = colors.fill <> "" and catalog.overlays.parseColor(colors.fill).a > 0
+        shadow = look.boxShadow
+        ' roBitmap's blending multiplies a colour by its alpha over a clear
+        ' pixel and never divides it back, so what lands on clear canvas is
+        ' copied, not blended: the fill (unless a shadow is under it), and
+        ' the border when there is no fill.
+        shadowed = shadow <> invalid and hasFill
+        if shadowed then boxShadow(c, x0, y0, w, h, radii, shadow)
+        if hasFill
+            c.bmp.SetAlphaEnable(shadowed)
+            drawShape(c, x0, y0, w, h, radii, colorOf(colors.fill), 0, plan.rail)
+            c.bmp.SetAlphaEnable(true)
+        end if
+        if plan.border > 0
+            c.bmp.SetAlphaEnable(hasFill)
+            drawShape(c, x0, y0, w, h, radii, colorOf(colors.border), plan.border, plan.rail)
+            c.bmp.SetAlphaEnable(true)
+        end if
+        if colors.accentLeft <> "" and look.accentLeft > 0 and plan.rail <> "left"
+            inset = whole(radius * 0.3)
+            fillRect(c, x0, y0 + inset, whole(plan.left), h - 2 * inset, colorOf(colors.accentLeft))
+        end if
+        cx = x0 + plan.left + plan.padX
+        cy = y0 + plan.border + plan.padY
+        lead = plan.lead
+        ly = cy + (plan.contentHeight - lead.h) / 2
+        if lead.kind = "image"
+            drawImage(c, lead.image, whole(cx), whole(ly), lead.w, lead.h, rgba(255, 255, 255, 1))
+        else if lead.kind = "glyph"
+            drawImage(c, glyphOf(lead.icon), whole(cx), whole(ly), lead.w, lead.h, colorOf(colors.text))
+        else if lead.kind = "chip"
+            chipHeight = whole(lead.h)
+            chipRadius = plan.fontSize * 0.2
+            drawShape(c, whole(cx), whole(ly), whole(lead.w), chipHeight, [chipRadius, chipRadius, chipRadius, chipRadius], colorOf(lead.color), 0, "")
+            drawText(c, lead.text, cx + 0.35 * plan.fontSize, ly + (lead.h - plan.fontSize) / 2, plan.fontSize, plan.font, colorOf(lead.textColor))
+        else if lead.kind = "mark"
+            drawText(c, lead.text, cx, ly, lead.h, lead.font, colorOf(colors.text))
+        end if
+        if plan.text <> ""
+            tx = cx + lead.w + plan.gap
+            textShadow = look.textShadow
+            if textShadow <> invalid
+                offset = textShadow.y * c.k
+                if offset < 1 then offset = 1
+                shadowColor = colorOf(textShadow.color)
+                shadowColor.a = shadowColor.a * 0.6
+                drawText(c, plan.text, tx + textShadow.x * c.k, cy + offset, plan.contentHeight, plan.font, shadowColor)
+            end if
+            drawText(c, plan.text, tx, cy, plan.contentHeight, plan.font, colorOf(colors.text))
+        end if
+    end sub
+
+    ' A soft drop shadow: the badge's shape in the shadow's colour, offset,
+    ' in rings that widen by a pixel each across the blur, so the layers
+    ' build to the shadow's opacity inside and fade out at its edge.
+    sub boxShadow(c as Object, x as Integer, y as Integer, w as Integer, h as Integer, radii as Object, shadow as Object)
+        tint = colorOf(shadow.color)
+        steps = whole(shadow.blur * c.k / 2)
+        if steps < 1 then steps = 1
+        layer = { r: tint.r, g: tint.g, b: tint.b, a: tint.a / (steps + 1) }
+        sx = whole(shadow.x * c.k)
+        sy = whole(shadow.y * c.k)
+        for i = steps to 0 step -1
+            grown = [radii[0] + i, radii[1] + i, radii[2] + i, radii[3] + i]
+            drawShape(c, x + sx - i, y + sy - i, w + 2 * i, h + 2 * i, grown, layer, 0, "")
+        end for
+    end sub
+
+    ' --- The watch-status corner ----------------------------------------
+
+    ' The episodes left on a dark disc the check's size, in its place
+    ' (the web's CardWatchStatus): black 65% with a 1 px white 20% ring and
+    ' the number in Bold at half the disc, widening for more digits.
+    sub countDisc(c as Object, spec as Object)
+        size = spec.check.size
+        label = spec.remaining.ToStr()
+        numberFont = fontOf(700, Int(size / 2))
+        width = textWidth(numberFont, label) + 0.8 * size / 2
+        if width < size then width = size
+        w = whole(width)
+        sprite = spriteOf(c, "disc|" + label + "|" + size.ToStr(), w, size, 0, { discLabel: label })
+        x = c.width - spec.check.inset - w
+        y = spec.check.inset
+        note(c, "disc" + label + "@" + x.ToStr() + "," + y.ToStr(), y, size)
+        ' Copied onto clear canvas, blended over the band's top scrim.
+        c.bmp.SetAlphaEnable(c.look <> invalid and c.look.band)
+        c.bmp.DrawObject(x, y, sprite.bmp)
+        c.bmp.SetAlphaEnable(true)
+        touch(c, x, y, w, size)
+    end sub
+
+    ' The disc w x size at x, y: black 65% with a 1 px white 20% ring and
+    ' label in Bold at half its height.
+    sub discAt(c as Object, x as Integer, y as Integer, w as Integer, size as Integer, label as String)
+        numberFont = fontOf(700, Int(size / 2))
+        radii = [size / 2, size / 2, size / 2, size / 2]
+        c.bmp.SetAlphaEnable(false)
+        drawShape(c, x, y, w, size, radii, rgba(0, 0, 0, 0.65), 0, "")
+        c.bmp.SetAlphaEnable(true)
+        drawShape(c, x, y, w, size, radii, rgba(255, 255, 255, 0.2), 1, "")
+        drawText(c, label, x + (w - textWidth(numberFont, label)) / 2, y + (size - Int(size / 2)) / 2, Int(size / 2), numberFont, rgba(255, 255, 255, 1))
+    end sub
+
+    ' --- Primitives ------------------------------------------------------
+
+    ' A rounded rectangle at x, y, w x h with corner radii [top left, top
+    ' right, bottom right, bottom left] (each side's two the same: a tab
+    ' squares one side), filled (stroke 0) or as a border stroke px wide; a
+    ' tab's border (rail "left" or "right") is open on that side. Each end
+    ' is a cap bitmap drawn pixel by pixel once per radius, height, stroke,
+    ' and colour (capOf); the middle is rectangles.
+    sub drawShape(c as Object, x as Integer, y as Integer, w as Integer, h as Integer, radii as Object, tint as Object, stroke as Float, rail as String)
+        if w <= 0 or h <= 0 then return
+        leftRadius = radii[0]
+        rightRadius = radii[1]
+        if leftRadius > w / 2 then leftRadius = w / 2
+        if rightRadius > w / 2 then rightRadius = w / 2
+        left = capWidth(leftRadius, stroke, rail = "left")
+        right = capWidth(rightRadius, stroke, rail = "right")
+        if left + right > w
+            left = Int(w / 2)
+            right = w - left
+        end if
+        if left > 0 then capDraw(c, capOf(leftRadius, h, stroke, tint, "left", rail = "left", left), x, y)
+        if right > 0 then capDraw(c, capOf(rightRadius, h, stroke, tint, "right", rail = "right", right), x + w - right, y)
+        middle = w - left - right
+        if middle <= 0 then return
+        if stroke = 0
+            fillRect(c, x + left, y, middle, h, tint)
+            return
+        end if
+        ' A border's middle: its top and bottom strokes, a fractional stroke's
+        ' last row at its share.
+        rows = Int(stroke)
+        part = stroke - rows
+        if rows > 0
+            fillRect(c, x + left, y, middle, rows, tint)
+            fillRect(c, x + left, y + h - rows, middle, rows, tint)
+        end if
+        if part > 0
+            fillRect(c, x + left, y + rows, middle, 1, scaled(tint, part))
+            fillRect(c, x + left, y + h - rows - 1, middle, 1, scaled(tint, part))
+        end if
+    end sub
+
+    ' The width of a shape's end: its radius, at least the stroke of a
+    ' border, 0 for a square side with no border there.
+    function capWidth(radius as Float, stroke as Float, open as Boolean) as Integer
+        width = Int(radius + 0.999)
+        if stroke > 0 and not open and Int(stroke + 0.999) > width then width = Int(stroke + 0.999)
+        return width
+    end function
+
+    sub capDraw(c as Object, cap as Object, x as Integer, y as Integer)
+        c.bmp.DrawObject(x, y, cap)
+        touch(c, x, y, cap.GetWidth(), cap.GetHeight())
+    end sub
+
+    ' One end of a shape, width x h: its corners' coverage of radius and, for
+    ' a border, the stroke down that side (none when open), cached.
+    function capOf(radius as Float, h as Integer, stroke as Float, tint as Object, side as String, open as Boolean, width as Integer) as Object
+        if m.overlayCaps = invalid then m.overlayCaps = {}
+        key = side + "|" + radius.ToStr() + "|" + h.ToStr() + "|" + stroke.ToStr() + "|" + open.ToStr() + "|" + width.ToStr() + "|" + packed(tint).ToStr()
+        found = m.overlayCaps[key]
+        if found <> invalid then return found
+        ' Each pixel is set once, copied: a blend would darken the colour.
+        bmp = CreateObject("roBitmap", { width: width, height: h, AlphaEnable: false })
+        bmp.Clear(0)
+        cap = { bmp: bmp, width: width, height: h, minX: width, minY: h, maxX: 0, maxY: 0 }
+        ' The cap is the shape's end in a box twice its width: a shape that
+        ' long has this end and the mirror of it.
+        span = 2 * width
+        radii = [radius, radius, radius, radius]
+        flush = ""
+        if open then flush = side
+        for j = 0 to h - 1
+            for i = 0 to width - 1
+                px = i + 0.5
+                if side = "right" then px = width + i + 0.5
+                plot(cap, i, j, cover(px, j + 0.5, span, h, radii, stroke, flush), tint)
+            end for
+        end for
+        bmp.Finish()
+        m.overlayCaps[key] = bmp
+        return bmp
+    end function
+
+    ' How much of the pixel centred at px, py (in the shape's box) the shape
+    ' covers, 0 to 1.
+    function cover(px as Float, py as Float, w as Integer, h as Integer, radii as Object, stroke as Float, rail as String) as Float
+        outer = clamp(0.5 - distance(px, py, 0, 0, w, h, radii))
+        if stroke = 0 or outer = 0 then return outer
+        left = stroke
+        right = w - stroke
+        if rail = "left" then left = -stroke
+        if rail = "right" then right = w + stroke
+        inner = [radii[0] - stroke, radii[1] - stroke, radii[2] - stroke, radii[3] - stroke]
+        for i = 0 to 3
+            if inner[i] < 0 then inner[i] = 0
+        end for
+        return clamp(outer - clamp(0.5 - distance(px, py, left, stroke, right, h - stroke, inner)))
+    end function
+
+    ' The signed distance from px, py to the rectangle left, top, right,
+    ' bottom with corner radii, negative inside.
+    function distance(px as Float, py as Float, left as Float, top as Float, right as Float, bottom as Float, radii as Object) as Float
+        cx = (left + right) / 2
+        cy = (top + bottom) / 2
+        if px < cx
+            r = radii[3]
+            if py < cy then r = radii[0]
+        else
+            r = radii[2]
+            if py < cy then r = radii[1]
+        end if
+        qx = Abs(px - cx) - ((right - left) / 2 - r)
+        qy = Abs(py - cy) - ((bottom - top) / 2 - r)
+        mx = qx
+        if mx < 0 then mx = 0
+        my = qy
+        if my < 0 then my = 0
+        inside = qx
+        if qy > inside then inside = qy
+        if inside > 0 then inside = 0
+        return Sqr(mx * mx + my * my) + inside - r
+    end function
+
+    sub plot(c as Object, x as Integer, y as Integer, amount as Float, tint as Object)
+        if amount <= 0 then return
+        fillRect(c, x, y, 1, 1, scaled(tint, amount))
+    end sub
+
+    sub fillRect(c as Object, x as Integer, y as Integer, w as Integer, h as Integer, tint as Object)
+        if w <= 0 or h <= 0 or tint.a <= 0 then return
+        if x < 0
+            w = w + x
+            x = 0
+        end if
+        if y < 0
+            h = h + y
+            y = 0
+        end if
+        if x + w > c.width then w = c.width - x
+        if y + h > c.height then h = c.height - y
+        if w <= 0 or h <= 0 then return
+        c.bmp.DrawRect(x, y, w, h, packed(tint))
+        touch(c, x, y, w, h)
+    end sub
+
+    ' Text at x, y in a line height px tall (CSS's leading-none: the font's
+    ' ascent and descent centred on it).
+    sub drawText(c as Object, value as String, x as Float, y as Float, height as Float, face as Object, tint as Object)
+        ascent = face.GetAscent()
+        descent = face.GetDescent()
+        top = whole(y + (height - ascent - descent) / 2)
+        c.bmp.DrawText(value, whole(x), top, packed(tint), face)
+        touch(c, whole(x), top, whole(textWidth(face, value)) + 1, ascent + descent)
+    end sub
+
+    ' An image scaled to w x h; tint multiplies its colour. Scaled straight
+    ' from the source: a bitmap that received a scaled draw draws nothing
+    ' over a translucent fill (Ultra 4850X, Roku OS 16.0.4), so it is not
+    ' halved first.
+    sub drawImage(c as Object, source as Object, x as Integer, y as Integer, w as Integer, h as Integer, tint as Object)
+        if source = invalid or w <= 0 or h <= 0 then return
+        c.bmp.DrawScaledObject(x, y, w / source.GetWidth(), h / source.GetHeight(), source, packed(tint))
+        touch(c, x, y, w, h)
+    end sub
+
+    sub touch(c as Object, x as Integer, y as Integer, w as Integer, h as Integer)
+        ' A card's image keeps a box per half; a sprite's or cap's bitmap one.
+        area = c
+        if c.groups <> invalid then area = groupAt(c, y, h)
+        if x < area.minX then area.minX = x
+        if y < area.minY then area.minY = y
+        if x + w > area.maxX then area.maxX = x + w
+        if y + h > area.maxY then area.maxY = y + h
+        if area.minX < 0 then area.minX = 0
+        if area.minY < 0 then area.minY = 0
+        if area.maxX > c.width then area.maxX = c.width
+        if area.maxY > c.height then area.maxY = c.height
+    end sub
+
+    ' --- Text ------------------------------------------------------------
+
+    ' The packaged Inter at weight (400 to 800; 800 draws in Bold, the
+    ' heaviest packaged) and size px, registered once per thread.
+    function fontOf(weight as Integer, size as Integer) as Object
+        if m.overlayFonts = invalid
+            registry = CreateObject("roFontRegistry")
+            for each name in ["Regular", "Medium", "SemiBold", "Bold"]
+                registry.Register("pkg:/fonts/Inter-" + name + ".ttf")
+            end for
+            m.overlayFontRegistry = registry
+            m.overlayFonts = {}
+        end if
+        family = "Inter"
+        bold = false
+        if weight >= 500 then family = "Inter Medium"
+        if weight >= 600 then family = "Inter SemiBold"
+        if weight >= 700
+            family = "Inter"
+            bold = true
+        end if
+        key = family + bold.ToStr() + size.ToStr()
+        found = m.overlayFonts[key]
+        if found <> invalid then return found
+        found = m.overlayFontRegistry.GetFont(family, size, bold, false)
+        m.overlayFonts[key] = found
+        return found
+    end function
+
+    function textWidth(face as Object, value as String) as Float
+        if value = "" then return 0
+        return face.GetOneLineWidth(value, 100000)
+    end function
+
+    ' value cut to fit width with an ellipsis, "" when not even that fits.
+    function fit(face as Object, value as String, width as Float) as String
+        if textWidth(face, value) <= width then return value
+        for count = Len(value) - 1 to 1 step -1
+            cut = Left(value, count).Trim() + ELLIPSIS
+            if textWidth(face, cut) <= width then return cut
+        end for
+        return ""
+    end function
+
+    ' A text size in whole px, at least 6.
+    function textSize(value as Float) as Integer
+        size = Int(value + 0.5)
+        if size < 6 then size = 6
+        return size
+    end function
+
+    ' --- Images ----------------------------------------------------------
+
+    ' A badge glyph (images/badges/<icon>.png, 48 px white), loaded once.
+    function glyphOf(icon as String) as Dynamic
+        if m.overlayGlyphs = invalid then m.overlayGlyphs = {}
+        name = icon.Replace("-", "_")
+        found = m.overlayGlyphs[name]
+        if found = invalid
+            found = CreateObject("roBitmap", "pkg:/images/badges/" + name + ".png")
+            m.overlayGlyphs[name] = found
+        end if
+        return found
+    end function
+
+    ' An administrator's uploaded image, fetched once from the configured
+    ' server (the endpoint is public and takes no credentials), or invalid
+    ' when it does not load: the badge then draws what it would without it.
+    function uploaded(c as Object, ref as String) as Dynamic
+        if m.overlayImages = invalid then m.overlayImages = {}
+        if m.overlayImages.DoesExist(ref)
+            found = m.overlayImages[ref]
+            if type(found) = "roBitmap" then return found
+            return invalid
+        end if
+        m.overlayImages[ref] = false
+        if not util.isObject(c.images) or not c.images.DoesExist(ref) or c.origin = "" then return invalid
+        path = DIR + "image-" + ref
+        transfer = CreateObject("roUrlTransfer")
+        transfer.SetUrl(c.origin + catalog.overlays.IMAGE_PATH + ref)
+        transfer.SetCertificatesFile("common:/certs/ca-bundle.crt")
+        if transfer.GetToFile(path) <> 200 then return invalid
+        bitmap = CreateObject("roBitmap", path)
+        if bitmap = invalid or bitmap.GetWidth() <= 0 or bitmap.GetHeight() <= 0 then return invalid
+        m.overlayImages[ref] = bitmap
+        return bitmap
+    end function
+
+    ' --- Colours ---------------------------------------------------------
+
+    function colorOf(hex as String) as Object
+        parsed = catalog.overlays.parseColor(hex)
+        return { r: Int(parsed.r * 255 + 0.5), g: Int(parsed.g * 255 + 0.5), b: Int(parsed.b * 255 + 0.5), a: parsed.a }
+    end function
+
+    function rgba(r as Integer, g as Integer, b as Integer, a as Float) as Object
+        return { r: r, g: g, b: b, a: a }
+    end function
+
+    function scaled(tint as Object, amount as Float) as Object
+        return { r: tint.r, g: tint.g, b: tint.b, a: tint.a * amount }
+    end function
+
+    ' A colour as roBitmap's &hRRGGBBAA integer.
+    function packed(tint as Object) as Integer
+        alpha = Int(tint.a * 255 + 0.5)
+        if alpha > 255 then alpha = 255
+        if alpha < 0 then alpha = 0
+        return (tint.r << 24) or (tint.g << 16) or (tint.b << 8) or alpha
+    end function
+
+    function clamp(value as Float) as Float
+        if value < 0 then return 0
+        if value > 1 then return 1
+        return value
+    end function
+
+    function whole(value as Float) as Integer
+        return Int(value + 0.5)
+    end function
+
+    ' The locale words the labels use (catalog.overlays.words), with the
+    ' device locale's strings.
+    function words() as Object
+        if m.overlayWords = invalid then m.overlayWords = catalog.overlays.words(i18n.load(CreateObject("roDeviceInfo").GetCurrentLocale()))
+        return m.overlayWords
+    end function
+end namespace
