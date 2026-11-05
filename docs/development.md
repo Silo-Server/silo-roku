@@ -96,6 +96,10 @@ it owns, so parallel work merges cleanly. Shell and Home use `home.`,
 `upNext.`, and `skipIntro.`; first run and profiles `firstRun.`, `setup.`,
 `signIn.`, `update.`, `passwordOff.`, `profiles.`, `pin.`, and `states.`. The shared
 `common.` and `language.` keys change in a change of their own.
+`scripts/badge-art.py` regenerates `images/badges/`: the card overlay
+badges' fills and borders as a 9-patch for each corner radius and stroke
+(Roku draws 9-patch corners at device pixels, so a scaled Poster cannot change
+its radius), the edge band's scrims, and the badge glyphs.
 `scripts/watch-party-art.py` regenerates `images/watchparty/` (the
 seats' shade and rings, the ballot's add card, and the lobby backdrop's
 gradients) with the first-run script's shape and PNG helpers.

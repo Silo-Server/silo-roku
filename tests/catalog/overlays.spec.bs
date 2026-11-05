@@ -1,0 +1,361 @@
+namespace tests
+
+    @suite("card overlays")
+    class CatalogOverlaysTests extends rooibos.BaseTestSuite
+
+        function copy() as Object
+            return catalog.overlays.words(i18n.load("en_US"))
+        end function
+
+        function movie(extra = invalid as Dynamic) as Object
+            out = { resolution: "2160p", hdr: "DV HDR10", audio: "Atmos", release_type: "REMUX", rating_imdb: 7.84, year: 2021 }
+            if extra <> invalid then out.Append(extra)
+            return out
+        end function
+
+        function prefs(items as Object, extra = invalid as Dynamic) as Object
+            doc = { version: 2, preset: "classic", order: [], items: items }
+            if extra <> invalid then doc.Append(extra)
+            return catalog.overlays.parse(doc)
+        end function
+
+        function ids(list as Object) as Object
+            out = []
+            for each entry in list
+                out.Push(entry.id)
+            end for
+            return out
+        end function
+
+        @describe("the document (the web's parseOverlayPrefs)")
+
+        @it("gives the built-in document for nothing, bad JSON, or a non-object")
+        sub _()
+            for each raw in [invalid, "", "{not json", "[1]", 3]
+                doc = catalog.overlays.parse(raw)
+                m.assertEqual(doc.preset, "classic")
+                m.assertTrue(doc.items.resolution.enabled)
+                m.assertEqual(doc.items.resolution.position, "top-left")
+                m.assertFalse(doc.items.year.enabled)
+                m.assertEqual(doc.items.rating_imdb.position, "left-edge")
+                m.assertEqual(doc.items.show_status.position, "right-edge")
+            end for
+        end sub
+
+        @it("reads the server default's JSON text")
+        sub _()
+            doc = catalog.overlays.parse(FormatJson({ version: 2, preset: "band", order: [], items: { year: { enabled: true, position: "bottom-right" } } }))
+            m.assertEqual(doc.preset, "band")
+            m.assertTrue(doc.items.year.enabled)
+            m.assertEqual(doc.items.year.position, "bottom-right")
+        end sub
+
+        @it("migrates a v1 document of badges by id")
+        sub _()
+            doc = catalog.overlays.parse({ year: { enabled: true, position: "bottom-left" }, resolution: { enabled: false, position: "top-left" } })
+            m.assertEqual(doc.preset, "classic")
+            m.assertTrue(doc.items.year.enabled)
+            m.assertFalse(doc.items.resolution.enabled)
+        end sub
+
+        @it("moves a stored top-right badge to the right-edge rail and keeps a bad position's default")
+        sub _()
+            doc = m.prefs({ rating_imdb: { enabled: true, position: "top-right" }, year: { enabled: true, position: "middle" } })
+            m.assertEqual(doc.items.rating_imdb.position, "right-edge")
+            m.assertEqual(doc.items.year.position, "bottom-left")
+        end sub
+
+        @it("makes an unknown preset classic and drops unknown ids from the order")
+        sub _()
+            doc = catalog.overlays.parse({ version: 2, preset: "neon", order: ["year", "nope", "year", "hdr"], items: {} })
+            m.assertEqual(doc.preset, "classic")
+            m.assertEqual(doc.order, ["year", "hdr"])
+        end sub
+
+        @it("keeps an item's accent, icon choice, and image references only when valid")
+        sub _()
+            ref = string(64, "a") + ".webp"
+            doc = m.prefs({ audio: { enabled: true, position: "top-left", accentColor: "#10b981", showIcon: false, image: ref, valueImages: { "Atmos": ref, "TrueHD": "x.png" } }, hdr: { enabled: true, position: "top-left", accentColor: "red", image: "nope" } })
+            m.assertEqual(doc.items.audio.accent, "#10b981")
+            m.assertFalse(doc.items.audio.showIcon)
+            m.assertEqual(doc.items.audio.image, ref)
+            m.assertEqual(doc.items.audio.valueImages.Count(), 1)
+            m.assertEqual(doc.items.audio.valueImages["Atmos"], ref)
+            m.assertEqual(doc.items.hdr.accent, "")
+            m.assertInvalid(doc.items.hdr.showIcon)
+            m.assertEqual(doc.items.hdr.image, "")
+        end sub
+
+        @it("keeps each valid style field and drops the rest")
+        sub _()
+            style = catalog.overlays.parseStyle({ size: 1.5, shape: "blob", background: "#112233CC", textColor: "#ffffff80", borderWidth: 2.5, fontWeight: "extrabold", uppercase: false, shadow: true })
+            m.assertEqual(style.size, 1.5)
+            m.assertFalse(style.DoesExist("shape"))
+            m.assertEqual(style.background, "#112233CC")
+            m.assertFalse(style.DoesExist("textColor"))
+            m.assertFalse(style.DoesExist("borderWidth"))
+            m.assertEqual(style.fontWeight, "extrabold")
+            m.assertFalse(style.uppercase)
+            m.assertTrue(style.shadow)
+            m.assertInvalid(catalog.overlays.parseStyle({ size: 3 }))
+        end sub
+
+        @describe("which badges show where")
+
+        @it("hides the badges a combined badge already shows")
+        sub _()
+            doc = m.prefs({ resolution_hdr: { enabled: true, position: "top-left" } })
+            m.assertEqual(m.ids(catalog.overlays.placed(doc, "top-left")), ["resolution_hdr", "audio", "request_status"])
+            doc = m.prefs({ resolution_hdr: { enabled: true, position: "top-left" }, resolution_hdr_audio: { enabled: true, position: "top-left" } })
+            m.assertEqual(m.ids(catalog.overlays.placed(doc, "top-left")), ["resolution_hdr_audio", "request_status"])
+        end sub
+
+        @it("orders a position by the document's order, then the registry's")
+        sub _()
+            doc = m.prefs({ hdr: { enabled: true, position: "top-left" } }, { order: ["audio", "resolution"] })
+            m.assertEqual(m.ids(catalog.overlays.placed(doc, "top-left")), ["audio", "resolution", "hdr", "request_status"])
+        end sub
+
+        @it("caps a corner at three badges and a rail at four, dropping those without a value")
+        sub _()
+            items = {}
+            for each id in ["resolution", "hdr", "audio", "video_codec", "container"]
+                items[id] = { enabled: true, position: "top-left" }
+            end for
+            for each id in ["rating_imdb", "rating_tmdb", "rating_rt", "rating_rt_audience", "year"]
+                items[id] = { enabled: true, position: "left-edge" }
+            end for
+            look = catalog.overlays.lookOf("classic", invalid)
+            data = m.movie({ video_codec: "H.265", container: "MKV", rating_tmdb: 7, rating_rt_critic: 91, rating_rt_audience: 88 })
+            out = catalog.overlays.resolve(m.prefs(items), data, look, m.copy())
+            m.assertEqual(m.ids(out.topLeft), ["resolution", "hdr", "audio"])
+            m.assertEqual(m.ids(out.leftEdge), ["rating_imdb", "rating_tmdb", "rating_rt", "rating_rt_audience"])
+            out = catalog.overlays.resolve(m.prefs(items), { year: 2020, rating_tmdb: 6.5 }, look, m.copy())
+            m.assertEqual(m.ids(out.topLeft), [])
+            m.assertEqual(m.ids(out.leftEdge), ["rating_tmdb", "year"])
+        end sub
+
+        @describe("labels, keys, and icons (the web registry)")
+
+        @it("names resolutions and dynamic range as the web does")
+        sub _()
+            m.assertEqual(catalog.overlays.prettyResolution("2160p"), "4K")
+            m.assertEqual(catalog.overlays.prettyResolution("4320p"), "8K")
+            m.assertEqual(catalog.overlays.prettyResolution("1080p"), "1080p")
+            m.assertEqual(catalog.overlays.prettyResolution("sd"), "SD")
+            m.assertEqual(catalog.overlays.compactHdr("DV HDR10+"), "DV")
+            m.assertEqual(catalog.overlays.compactHdr("HDR10+"), "HDR10+")
+            m.assertEqual(catalog.overlays.compactHdr("HLG"), "HDR")
+            copy = m.copy()
+            m.assertEqual(catalog.overlays.label("resolution_hdr", m.movie(), copy), "4K DV")
+            m.assertEqual(catalog.overlays.label("resolution_hdr", { hdr: "HDR10" }, copy), "")
+            m.assertEqual(catalog.overlays.label("resolution_hdr_audio", { hdr: "HDR10", audio: "TrueHD" }, copy), "HDR TrueHD")
+            m.assertEqual(catalog.overlays.valueKey("resolution_hdr", m.movie()), "2160p DV HDR10")
+            m.assertEqual(catalog.overlays.valueKey("resolution_hdr_audio", m.movie()), "2160p DV HDR10 Atmos")
+            m.assertEqual(catalog.overlays.valueKey("resolution_hdr", { resolution: "1080p" }), "1080p")
+        end sub
+
+        @it("labels ratings with their source, and the rest of the registry")
+        sub _()
+            copy = m.copy()
+            m.assertEqual(catalog.overlays.label("rating_imdb", m.movie(), copy), "IMDb 7.8")
+            m.assertEqual(catalog.overlays.label("rating_tmdb", { rating_tmdb: 6 }, copy), "TMDB 6.0")
+            m.assertEqual(catalog.overlays.label("rating_rt", { rating_rt_critic: 92.6 }, copy), "RT 93%")
+            m.assertEqual(catalog.overlays.label("rating_rt_audience", { rating_rt_audience: 80 }, copy), "RT Audience 80%")
+            m.assertEqual(catalog.overlays.label("advisory_age", { advisory_age: 13 }, copy), "13+")
+            m.assertEqual(catalog.overlays.label("runtime", { runtime: 163 }, copy), "2h 43m")
+            m.assertEqual(catalog.overlays.label("runtime", { runtime: 45 }, copy), "45m")
+            m.assertEqual(catalog.overlays.label("multi_sub", { multi_sub: true }, copy), "CC")
+            m.assertEqual(catalog.overlays.label("multi_audio", { multi_audio: true }, copy), "Multi-Audio")
+            m.assertEqual(catalog.overlays.label("original_language", { original_language: "fr" }, copy), "French")
+            m.assertEqual(catalog.overlays.label("show_status", { show_status: "Returning Series" }, copy), "Returning")
+            m.assertEqual(catalog.overlays.valueKey("show_status", { show_status: "canceled" }), "Cancelled")
+            m.assertEqual(catalog.overlays.valueKey("rating_imdb", m.movie()), "")
+        end sub
+
+        @it("picks value icons and leaves out a label its wordmark says")
+        sub _()
+            look = catalog.overlays.lookOf("vibrant", invalid)
+            doc = m.prefs({})
+            copy = m.copy()
+            entries = {}
+            for each entry in catalog.overlays.registry()
+                entries[entry.id] = entry
+            end for
+            hdr = catalog.overlays.badge(entries.hdr, { hdr: "HDR10" }, look, doc.items.hdr, copy)
+            m.assertEqual(hdr.icon, "hdr10")
+            m.assertEqual(hdr.markText, "HDR10")
+            m.assertEqual(hdr.text, "")
+            dv = catalog.overlays.badge(entries.hdr, { hdr: "DV HDR10" }, look, doc.items.hdr, copy)
+            m.assertEqual(dv.icon, "dolby-vision")
+            m.assertEqual(dv.text, "DV HDR10")
+            audio = catalog.overlays.badge(entries.audio, { audio: "Atmos" }, look, doc.items.audio, copy)
+            m.assertEqual(audio.icon, "atmos")
+            m.assertEqual(audio.text, "")
+            ' Classic does not prefer icons; a badge's showIcon does.
+            classic = catalog.overlays.lookOf("classic", invalid)
+            m.assertEqual(catalog.overlays.badge(entries.resolution, m.movie(), classic, doc.items.resolution, copy).icon, "")
+            shown = m.prefs({ resolution: { enabled: true, position: "top-left", showIcon: true } })
+            m.assertEqual(catalog.overlays.badge(entries.resolution, m.movie(), classic, shown.items.resolution, copy).icon, "monitor")
+        end sub
+
+        @it("draws a plate rating as a source chip and a score, and uppercases text")
+        sub _()
+            look = catalog.overlays.lookOf("plate", invalid)
+            entry = catalog.overlays.registry()[13]
+            m.assertEqual(entry.id, "rating_imdb")
+            badge = catalog.overlays.badge(entry, m.movie(), look, invalid, m.copy())
+            m.assertEqual(badge.chip, "IMDB")
+            m.assertEqual(badge.text, "7.8")
+            m.assertTrue(badge.scoreOnly)
+            m.assertEqual(badge.accent, "#f5c518")
+            classic = catalog.overlays.badge(entry, m.movie(), catalog.overlays.lookOf("classic", invalid), invalid, m.copy())
+            m.assertEqual(classic.chip, "")
+            m.assertEqual(classic.text, "IMDB 7.8")
+        end sub
+
+        @it("matches a value image by the API's value, and an image beside a rating shows only the score")
+        sub _()
+            ref = string(64, "b") + ".webp"
+            doc = m.prefs({ resolution: { enabled: true, position: "top-left", valueImages: { "2160p": ref } }, rating_imdb: { enabled: true, position: "left-edge", image: ref } })
+            look = catalog.overlays.lookOf("classic", invalid)
+            out = catalog.overlays.resolve(doc, m.movie(), look, m.copy())
+            m.assertEqual(out.topLeft[0].valueImage, ref)
+            rating = catalog.overlays.finish(out.leftEdge[0], look, true)
+            m.assertEqual(rating.text, "7.8")
+        end sub
+
+        @describe("looks and colours (presets.ts, style.ts)")
+
+        @it("scales a look by the style's size and frames bare text with padding")
+        sub _()
+            look = catalog.overlays.lookOf("minimal", { size: 2, background: "#000000FF" })
+            m.assertEqual(look.fontSize, 18.0)
+            m.assertEqual(look.padX, 18 * 0.6)
+            m.assertEqual(look.padY, 18 * 0.2)
+            m.assertInvalid(look.textShadow)
+            colors = catalog.overlays.paint(look, "")
+            m.assertEqual(colors.fill, "#000000FF")
+            m.assertEqual(colors.text, "#FFFFFFFF")
+            m.assertEqual(catalog.overlays.lookOf("classic", { shape: "rounded" }).radius, 6)
+            m.assertEqual(catalog.overlays.lookOf("pill", { shadow: true }).boxShadow.blur, 6)
+            m.assertInvalid(catalog.overlays.lookOf("plate", { shadow: false }).boxShadow)
+        end sub
+
+        @it("paints each preset's accent where the preset puts it")
+        sub _()
+            classic = catalog.overlays.paint(catalog.overlays.lookOf("classic", invalid), "#f5c518")
+            m.assertEqual(classic.fill, catalog.overlays.mix("#f5c518", 0.28, "#00000099"))
+            m.assertEqual(classic.border, "#FFFFFF26")
+            vibrant = catalog.overlays.paint(catalog.overlays.lookOf("vibrant", invalid), "")
+            m.assertEqual(vibrant.fill, "#DCDCDCF2")
+            m.assertEqual(vibrant.text, "#000000FF")
+            square = catalog.overlays.paint(catalog.overlays.lookOf("square", invalid), "#3b82f6")
+            m.assertEqual(square.text, "#3B82F6FF")
+            m.assertEqual(square.accentLeft, "#3B82F6FF")
+            plate = catalog.overlays.paint(catalog.overlays.lookOf("plate", invalid), "#f5c518")
+            m.assertEqual(plate.border, "#F5C51873")
+        end sub
+
+        @it("mixes colours as CSS color-mix does, with premultiplied alpha")
+        sub _()
+            m.assertEqual(catalog.overlays.mix("#ffffff", 0.5, "#00000000"), "#FFFFFF80")
+            m.assertEqual(catalog.overlays.mix("#ff0000", 0.5, "#0000ffff"), "#800080FF")
+        end sub
+
+        @it("writes an accent as text only where it reads on a solid fill")
+        sub _()
+            look = catalog.overlays.lookOf("band", { background: "#FFFFFFFF" })
+            colors = catalog.overlays.paint(look, "#ffff00")
+            ' Yellow on white is below 3:1, so it tints the fill instead.
+            m.assertEqual(colors.text, "#000000FF")
+            m.assertEqual(colors.fill, catalog.overlays.mix("#ffff00", 0.30, "#FFFFFFFF"))
+            colors = catalog.overlays.paint(look, "#1d4ed8")
+            m.assertEqual(colors.text, "#1D4ED8FF")
+            m.assertEqual(catalog.overlays.readableOn("#f5c518"), "#000000")
+            m.assertEqual(catalog.overlays.readableOn("#01b4e4"), "#FFFFFF")
+            m.assertEqual(catalog.overlays.readableOn("#fa320a"), "#FFFFFF")
+        end sub
+
+        @describe("what applies (useOverlayPrefs)")
+
+        @it("prefers the profile's own document and switch over the server's")
+        sub _()
+            config = { enabled: true, defaults: FormatJson({ version: 2, preset: "pill", order: [], items: {} }), images: [] }
+            settled = catalog.overlays.settle(invalid, config)
+            m.assertTrue(settled.enabled)
+            m.assertEqual(settled.prefs.preset, "pill")
+            values = catalog.overlays.profileValues({ items: [{ key: "ui.card_overlays", value: { version: 2, preset: "square", order: [], items: {} }, source: "profile" }, { key: "ui.card_overlays_enabled", value: false, source: "profile" }] })
+            settled = catalog.overlays.settle(values, config)
+            m.assertFalse(settled.enabled)
+            m.assertEqual(settled.prefs.preset, "square")
+        end sub
+
+        @it("leaves the server's default to a contract default and turns badges on without config")
+        sub _()
+            values = catalog.overlays.profileValues({ items: [{ key: "ui.card_overlays", value: invalid, source: "default" }, { key: "ui.card_overlays_enabled", value: true, source: "default" }] })
+            m.assertInvalid(values.document)
+            m.assertInvalid(values.enabled)
+            settled = catalog.overlays.settle(values, { enabled: false, images: [] })
+            m.assertFalse(settled.enabled)
+            settled = catalog.overlays.settle(invalid, invalid)
+            m.assertTrue(settled.enabled)
+            m.assertEqual(settled.prefs.preset, "classic")
+        end sub
+
+        @it("drops image references the server no longer lists")
+        sub _()
+            kept = string(64, "c") + ".webp"
+            gone = string(64, "d") + ".webp"
+            values = { document: { version: 2, preset: "classic", order: [], items: { audio: { enabled: true, position: "top-left", image: gone, valueImages: { "Atmos": kept, "DTS": gone } } } }, enabled: invalid }
+            settled = catalog.overlays.settle(values, { enabled: true, images: [{ ref: kept, name: "Atmos", url: "/x", width: 300, height: 120 }] })
+            m.assertEqual(settled.prefs.items.audio.image, "")
+            m.assertEqual(settled.prefs.items.audio.valueImages.Count(), 1)
+            m.assertEqual(settled.images[kept].width, 300)
+        end sub
+
+        @describe("cards")
+
+        @it("keeps only the fields the badges read")
+        sub _()
+            data = catalog.overlays.dataOf({ overlay_summary: { resolution: "1080p", hdr: "", multi_sub: true, multi_audio: false }, rating_imdb: 8, studios: ["", " A24 "], networks: [], year: 2020, title: "Ignored" })
+            m.assertEqual(data, { resolution: "1080p", multi_sub: true, rating_imdb: 8, studio: "A24", year: 2020 })
+            m.assertEqual(catalog.overlays.dataOf(invalid), {})
+        end sub
+
+        @it("counts the episodes left only on a started, unfinished series")
+        sub _()
+            m.assertEqual(catalog.overlays.remaining({ watched_count: 3, unplayed_count: 7 }), 7)
+            m.assertEqual(catalog.overlays.remaining({ watched_count: 0, unplayed_count: 7 }), 0)
+            m.assertEqual(catalog.overlays.remaining({ watched_count: 3, unplayed_count: 7, played: true }), 0)
+            m.assertEqual(catalog.overlays.remaining(invalid), 0)
+        end sub
+
+        @it("carries the badge fields on a catalog card")
+        sub _()
+            card = catalog.cards.fromItem({ content_id: "series:1", type: "series", title: "Show", overlay_summary: { resolution: "2160p" }, user_state: { watched_count: 2, unplayed_count: 5 } }, catalog.shape.POSTER, tests.catalogData.words())
+            m.assertEqual(card.overlayData.resolution, "2160p")
+            m.assertEqual(card.remaining, 5)
+        end sub
+
+        @describe("layout")
+
+        @it("lines the shorter bottom corner up with the bottom")
+        sub _()
+            rows = catalog.overlays.bottomRows([{ id: "a" }, { id: "b" }], [{ id: "c" }])
+            m.assertEqual(rows.Count(), 2)
+            m.assertEqual(rows[0].left.id, "a")
+            m.assertInvalid(rows[0].right)
+            m.assertEqual(rows[1].left.id, "b")
+            m.assertEqual(rows[1].right.id, "c")
+        end sub
+
+        @it("fits a band's marks whole, keeping at least the first")
+        sub _()
+            m.assertEqual(catalog.overlays.bandFit([40, 30, 30], 100, 7, 1), 2)
+            m.assertEqual(catalog.overlays.bandFit([40, 30, 30], 200, 7, 1), 3)
+            m.assertEqual(catalog.overlays.bandFit([300, 30], 100, 7, 1), 1)
+            m.assertEqual(catalog.overlays.bandFit([], 100, 7, 1), 0)
+        end sub
+    end class
+end namespace

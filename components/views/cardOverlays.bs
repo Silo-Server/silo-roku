@@ -1,0 +1,681 @@
+import "pkg:/components/theme/helpers.bs"
+import "pkg:/components/views/overlayState.bs"
+import "pkg:/source/catalog/cards.bs"
+import "pkg:/source/catalog/overlays.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/values.bs"
+
+' CatalogCard's badges (catalog.overlays; silo-server's card-overlays.md, the
+' web's CardOverlays.tsx): a poster's, landscape card's, or episode still's
+' badges in a layer over its art and progress bar, under the frame that
+' rounds its corners and under the watched mark, so a band's scrim follows the
+' card's corners and the top-right corner stays the watch status's. A poster
+' scales the web's lengths by its width over the 185 px reference; a wide
+' card draws them at 1 and lifts its bottom row clear of a progress bar. The
+' layer and each badge's nodes are made when a card first needs them and
+' hidden on a card that does not, so a library without badges costs nothing.
+' Card-relative pixels are the web's; Roku-specific: the 800 weight draws in
+' Bold (700), the heaviest packaged; letter-spacing is not drawn (Label has no
+' tracking); a drop or text shadow is an offset copy of the badge's shape or
+' text, as Roku has no blur; and radii round to the packaged 9-patches'
+' (docs/spec.md section 5.9).
+
+sub overlayInit()
+    ' { layer, badges (a pool of badge nodes), dividers, scrimTop,
+    ' scrimBottom }, made when first needed.
+    m.ov = invalid
+    ' Uploaded images that did not load on this card: the badge falls back.
+    m.ovFailed = {}
+    ' The remaining-episodes disc in the status corner { group, fill, ring,
+    ' label }, made when first needed.
+    m.ovCount = invalid
+    m.ovLook = invalid
+    m.ovLookRevision = -1
+    m.ovWords = invalid
+    overlayObserve("onOverlayRevision")
+end sub
+
+sub onOverlayRevision()
+    item = m.top.itemContent
+    if item <> invalid and m.cardSize[0] > 0 then overlayShow(item)
+end sub
+
+' Whether the card's shape carries badges.
+function overlayShape() as Boolean
+    return m.shape = catalog.shape.POSTER or m.shape = catalog.shape.LANDSCAPE or m.shape = catalog.shape.EPISODE
+end function
+
+' Draws item's badges under the overlays that apply, or hides them.
+sub overlayShow(item as Object)
+    overlayCount(item)
+    state = overlayState()
+    data = item.overlayData
+    if state = invalid or not util.isObject(data) or data.Count() = 0 or not overlayShape() or item.itemType = catalog.cards.MORE
+        overlayHide()
+        return
+    end if
+    revision = overlayRevision()
+    if m.ovLookRevision <> revision
+        m.ovLookRevision = revision
+        m.ovLook = catalog.overlays.lookOf(state.prefs.preset, state.prefs.style)
+    end if
+    look = m.ovLook
+    resolved = catalog.overlays.resolve(state.prefs, data, look, overlayWords())
+    total = 0
+    for each key in resolved
+        total = total + resolved[key].Count()
+    end for
+    if total = 0
+        overlayHide()
+        return
+    end if
+    wide = m.shape <> catalog.shape.POSTER
+    k = 1.0
+    if not wide then k = m.cardSize[0] / catalog.overlays.REFERENCE_WIDTH
+    width = m.cardSize[0]
+    height = m.cardSize[1]
+    inset = catalog.overlays.EDGE_INSET * k
+    ' The top row stops short of the watch-status corner (Roku's check disc).
+    checkInset = theme.browse.CHECK_INSET
+    if m.shape = catalog.shape.LANDSCAPE then checkInset = theme.browse.LANDSCAPE_CHECK_INSET
+    reserve = checkInset + theme.size.CHECK_DISC + catalog.overlays.EDGE_GAP * k
+    progress = wide and item.progress >= 0
+    ctx = { k: k, look: look, origin: state.origin, images: state.images, width: width, height: height, inset: inset, used: 0, dividers: 0 }
+    overlayLayer()
+    if look.band
+        overlayBandTop(ctx, resolved.topLeft, width - reserve)
+        bottom = []
+        bottom.Append(resolved.bottomLeft)
+        bottom.Append(resolved.bottomRight)
+        overlayBandBottom(ctx, bottom, progress)
+    else
+        overlayHideScrims()
+        overlayStackTop(ctx, resolved.topLeft, width - reserve - inset)
+        overlayBottomRows(ctx, resolved.bottomLeft, resolved.bottomRight, progress)
+    end if
+    railInset = inset
+    if catalog.overlays.flushRails(look) then railInset = 0
+    overlayRail(ctx, resolved.leftEdge, railInset, "left")
+    overlayRail(ctx, resolved.rightEdge, railInset, "right")
+    for i = ctx.used to m.ov.badges.Count() - 1
+        m.ov.badges[i].group.visible = false
+    end for
+    for i = ctx.dividers to m.ov.dividers.Count() - 1
+        m.ov.dividers[i].visible = false
+    end for
+    m.ov.layer.visible = true
+end sub
+
+sub overlayHide()
+    if m.ov <> invalid then m.ov.layer.visible = false
+end sub
+
+sub overlayHideScrims()
+    if m.ov.scrimTop <> invalid then m.ov.scrimTop.visible = false
+    if m.ov.scrimBottom <> invalid then m.ov.scrimBottom.visible = false
+end sub
+
+' The layer, under the frame (and so under the check disc and pills made
+' after it).
+sub overlayLayer()
+    if m.ov <> invalid then return
+    layer = CreateObject("roSGNode", "Group")
+    layer.id = "overlays"
+    index = 0
+    for each child in m.card.getChildren(-1, 0)
+        if child.isSameNode(m.frame) then exit for
+        index = index + 1
+    end for
+    m.card.insertChild(layer, index)
+    m.ov = { layer: layer, badges: [], dividers: [], scrimTop: invalid, scrimBottom: invalid }
+end sub
+
+' The locale words the labels use, built once for the app.
+function overlayWords() as Object
+    if m.ovWords <> invalid then return m.ovWords
+    if not m.global.hasField("overlayWords")
+        i18n.install()
+        strings = m.global.strings
+        copy = catalog.overlays.words(strings)
+        names = {}
+        for each key in strings
+            if Left(key, 9) = "language." then names[key] = strings[key]
+        end for
+        copy.strings = names
+        m.global.addFields({ overlayWords: copy })
+    end if
+    m.ovWords = m.global.overlayWords
+    return m.ovWords
+end function
+
+' --- Placing badges -----------------------------------------------------
+
+' The top-left corner's badges stacked down from the inset, each at most
+' maxWidth wide.
+sub overlayStackTop(ctx as Object, badges as Object, maxWidth as Float)
+    y = ctx.inset
+    for each badge in badges
+        node = overlayBadgeNode(ctx)
+        size = overlayDraw(node, badge, ctx, maxWidth, "")
+        node.group.translation = [overlayWhole(ctx.inset), overlayWhole(y)]
+        y = y + size[1] + ctx.look.stackGap * ctx.k
+    end for
+end sub
+
+' A rail's badges stacked about the card's middle, against its edge as tabs
+' (inset 0) or at the corner inset, at most 60% of the card wide.
+sub overlayRail(ctx as Object, badges as Object, inset as Float, side as String)
+    if badges.Count() = 0 then return
+    rail = ""
+    if inset = 0 then rail = side
+    gap = ctx.look.stackGap * ctx.k
+    placed = []
+    total = 0.0
+    for each badge in badges
+        node = overlayBadgeNode(ctx)
+        size = overlayDraw(node, badge, ctx, ctx.width * 0.6, rail)
+        placed.Push({ node: node, size: size })
+        total = total + size[1]
+    end for
+    total = total + gap * (placed.Count() - 1)
+    y = (ctx.height - total) / 2
+    for each entry in placed
+        x = inset
+        if side = "right" then x = ctx.width - inset - entry.size[0]
+        entry.node.group.translation = [overlayWhole(x), overlayWhole(y)]
+        y = y + entry.size[1] + gap
+    end for
+end sub
+
+' The bottom corners, a row per level from the bottom up: a pair too wide to
+' share the row wraps, the right badge onto a line of its own under the left.
+sub overlayBottomRows(ctx as Object, left as Object, right as Object, progress as Boolean)
+    rows = catalog.overlays.bottomRows(left, right)
+    if rows.Count() = 0 then return
+    gap = ctx.look.stackGap * ctx.k
+    edgeGap = catalog.overlays.EDGE_GAP * ctx.k
+    available = ctx.width - 2 * ctx.inset
+    bottom = ctx.height - ctx.inset
+    if progress then bottom = bottom - ctx.inset
+    for i = rows.Count() - 1 to 0 step -1
+        row = rows[i]
+        leftNode = invalid
+        rightNode = invalid
+        leftSize = [0, 0]
+        rightSize = [0, 0]
+        if row.left <> invalid
+            leftNode = overlayBadgeNode(ctx)
+            leftSize = overlayDraw(leftNode, row.left, ctx, available, "")
+        end if
+        if row.right <> invalid
+            rightNode = overlayBadgeNode(ctx)
+            rightSize = overlayDraw(rightNode, row.right, ctx, available, "")
+        end if
+        wraps = leftNode <> invalid and rightNode <> invalid and leftSize[0] + edgeGap + rightSize[0] > available
+        if wraps
+            rightNode.group.translation = [overlayWhole(ctx.width - ctx.inset - rightSize[0]), overlayWhole(bottom - rightSize[1])]
+            bottom = bottom - rightSize[1] - gap
+            leftNode.group.translation = [overlayWhole(ctx.inset), overlayWhole(bottom - leftSize[1])]
+            bottom = bottom - leftSize[1] - gap
+        else
+            lineHeight = leftSize[1]
+            if rightSize[1] > lineHeight then lineHeight = rightSize[1]
+            if leftNode <> invalid then leftNode.group.translation = [overlayWhole(ctx.inset), overlayWhole(bottom - leftSize[1])]
+            if rightNode <> invalid then rightNode.group.translation = [overlayWhole(ctx.width - ctx.inset - rightSize[0]), overlayWhole(bottom - rightSize[1])]
+            bottom = bottom - lineHeight - gap
+        end if
+    end for
+end sub
+
+' The band's top strip: the top-left badges as marks over a scrim, from the
+' inset to the watch-status corner.
+sub overlayBandTop(ctx as Object, badges as Object, right as Float)
+    if badges.Count() = 0
+        if m.ov.scrimTop <> invalid then m.ov.scrimTop.visible = false
+        return
+    end if
+    marks = overlayBandMarks(ctx, badges, right - ctx.inset)
+    if m.ov.scrimTop = invalid then m.ov.scrimTop = overlayScrim("pkg:/images/badges/scrim_top.png")
+    m.ov.scrimTop.setFields({ visible: true, translation: [0, 0], width: ctx.width, height: overlayWhole(ctx.inset * 4 + marks.height) })
+    overlayPlaceMarks(ctx, marks, ctx.inset, ctx.inset)
+end sub
+
+' The band's bottom strip: both bottom corners' badges, left first, centred
+' over a scrim; it rises clear of a progress bar.
+sub overlayBandBottom(ctx as Object, badges as Object, progress as Boolean)
+    if badges.Count() = 0
+        if m.ov.scrimBottom <> invalid then m.ov.scrimBottom.visible = false
+        return
+    end if
+    marks = overlayBandMarks(ctx, badges, ctx.width - 2 * ctx.inset)
+    below = ctx.inset
+    if progress then below = 2 * ctx.inset
+    strip = ctx.inset * 3 + marks.height + below
+    if m.ov.scrimBottom = invalid then m.ov.scrimBottom = overlayScrim("pkg:/images/badges/scrim_bottom.png")
+    m.ov.scrimBottom.setFields({ visible: true, translation: [0, overlayWhole(ctx.height - strip)], width: ctx.width, height: overlayWhole(strip) })
+    overlayPlaceMarks(ctx, marks, (ctx.width - marks.width) / 2, ctx.height - below - marks.height)
+end sub
+
+' The marks that fit whole in available, in order, with a divider before
+' each after the first: { items: [{ node, size }], width, height }. Only a
+' first mark too wide on its own truncates.
+function overlayBandMarks(ctx as Object, badges as Object, available as Float) as Object
+    gap = ctx.look.stackGap * ctx.k
+    drawn = []
+    widths = []
+    for each badge in badges
+        node = overlayBadgeNode(ctx)
+        size = overlayDraw(node, badge, ctx, 100000, "")
+        drawn.Push({ node: node, size: size })
+        widths.Push(size[0])
+    end for
+    count = catalog.overlays.bandFit(widths, available, gap, 1)
+    for i = count to drawn.Count() - 1
+        drawn[i].node.group.visible = false
+    end for
+    items = []
+    total = 0.0
+    tallest = 0.0
+    for i = 0 to count - 1
+        entry = drawn[i]
+        if count = 1 and entry.size[0] > available then entry.size = overlayDraw(entry.node, badges[0], ctx, available, "")
+        items.Push(entry)
+        total = total + entry.size[0]
+        if i > 0 then total = total + 2 * gap + 1
+        if entry.size[1] > tallest then tallest = entry.size[1]
+    end for
+    return { items: items, width: total, height: tallest, gap: gap }
+end function
+
+sub overlayPlaceMarks(ctx as Object, marks as Object, x as Float, y as Float)
+    fontSize = ctx.look.fontSize * ctx.k
+    for i = 0 to marks.items.Count() - 1
+        entry = marks.items[i]
+        if i > 0
+            x = x + marks.gap
+            divider = overlayDivider(ctx)
+            dividerHeight = fontSize * 0.9
+            divider.setFields({ translation: [overlayWhole(x), overlayWhole(y + (marks.height - dividerHeight) / 2)], height: overlayWhole(dividerHeight) })
+            x = x + 1 + marks.gap
+        end if
+        entry.node.group.translation = [overlayWhole(x), overlayWhole(y + (marks.height - entry.size[1]) / 2)]
+        x = x + entry.size[0]
+    end for
+end sub
+
+function overlayScrim(uri as String) as Object
+    scrim = CreateObject("roSGNode", "Poster")
+    scrim.loadDisplayMode = "scaleToFill"
+    scrim.blendColor = "0x000000FF"
+    ' Over the ambient wash the frame is hidden, so the scrim rounds its own
+    ' corners with the card's Effect (its uri follows).
+    if m.rounded
+        effect = theme.roundedEffect([radiusOf(m.shape)])
+        if theme.attachEffect(scrim, effect) then m.effects.Push(effect)
+    end if
+    m.ov.layer.insertChild(scrim, 0)
+    scrim.uri = uri
+    return scrim
+end function
+
+function overlayDivider(ctx as Object) as Object
+    if ctx.dividers >= m.ov.dividers.Count()
+        divider = m.ov.layer.createChild("Rectangle")
+        divider.setFields({ width: 1, color: "0xFFFFFF66" })
+        m.ov.dividers.Push(divider)
+    end if
+    divider = m.ov.dividers[ctx.dividers]
+    ctx.dividers = ctx.dividers + 1
+    divider.visible = true
+    return divider
+end function
+
+' --- Drawing a badge ----------------------------------------------------
+
+' The next unused badge node, made when the pool runs out: { group, and the
+' parts made when first needed }.
+function overlayBadgeNode(ctx as Object) as Object
+    if ctx.used >= m.ov.badges.Count()
+        group = m.ov.layer.createChild("Group")
+        group.id = "badge"
+        node = { group: group }
+        for each name in overlayPartNames().Split("|")
+            node[name] = invalid
+        end for
+        m.ov.badges.Push(node)
+    end if
+    node = m.ov.badges[ctx.used]
+    ctx.used = ctx.used + 1
+    node.group.visible = true
+    return node
+end function
+
+' Lays badge out in node at its top-left corner, at most maxWidth wide, and
+' gives its [width, height]. rail is "left" or "right" for a tab flush with
+' that edge, else "".
+function overlayDraw(node as Object, badge as Object, ctx as Object, maxWidth as Float, rail as String) as Object
+    look = ctx.look
+    k = ctx.k
+    overlayHideParts(node)
+    ' An uploaded image for the badge's value replaces the whole badge.
+    if badge.valueImage <> "" and not m.ovFailed.DoesExist(badge.valueImage)
+        imageHeight = (look.fontSize + 2 * look.padY) * catalog.overlays.VALUE_IMAGE_SCALE * k
+        size = overlayImage(node, badge.valueImage, ctx, imageHeight, maxWidth)
+        node.image.translation = [0, 0]
+        return size
+    end if
+    withImage = badge.image <> "" and not m.ovFailed.DoesExist(badge.image)
+    catalog.overlays.finish(badge, look, withImage)
+    colors = catalog.overlays.paint(look, badge.accent)
+    fontSize = overlayPx(look.fontSize * k)
+    font = overlayFont(look.weight, fontSize)
+    iconSize = look.iconSize * k
+    iconGap = look.iconGap * k
+    padX = look.padX * k
+    padY = look.padY * k
+    border = 0.0
+    if colors.border <> "" and catalog.overlays.parseColor(colors.border).a > 0 then border = look.borderWidth * k
+    ' The lead: an uploaded icon image, a source chip, a glyph, or a wordmark.
+    lead = [0.0, 0.0]
+    leadNodes = []
+    if withImage
+        lead = overlayImage(node, badge.image, ctx, iconSize, maxWidth)
+        leadNodes = [node.image]
+    else if badge.chip <> ""
+        lead = overlayChip(node, badge, font, fontSize)
+        leadNodes = [node.chipFill, node.chipText]
+    else if badge.markText <> ""
+        lead = overlayMark(node, badge.markText, badge.icon, iconSize, colors.text)
+        leadNodes = [node.mark]
+    else if badge.icon <> ""
+        lead = overlayIcon(node, badge.icon, iconSize, colors.text)
+        leadNodes = [node.icon]
+    end if
+    textWidth = 0.0
+    if badge.text <> ""
+        overlayText(node, badge.text, font, colors.text)
+        textWidth = node.text.boundingRect().width
+    end if
+    contentHeight = fontSize
+    if lead[1] > contentHeight then contentHeight = lead[1]
+    gap = 0.0
+    if lead[0] > 0 and textWidth > 0 then gap = iconGap
+    left = border
+    right = border
+    if rail = "left" then left = 0
+    if rail = "right" then right = 0
+    if look.accentLeft > 0 and colors.accentLeft <> "" and rail <> "left" then left = look.accentLeft * k
+    width = left + padX + lead[0] + gap + textWidth + padX + right
+    height = border + padY + contentHeight + padY + border
+    ' A bare score never truncates; any other label does.
+    if width > maxWidth and textWidth > 0 and not badge.scoreOnly
+        textWidth = textWidth - (width - maxWidth)
+        if textWidth < 0 then textWidth = 0
+        width = maxWidth
+    end if
+    x = left + padX
+    y = border + padY
+    for each part in leadNodes
+        part.translation = [overlayWhole(x), overlayWhole(y + (contentHeight - lead[1]) / 2)]
+    end for
+    if textWidth > 0
+        x = x + lead[0] + gap
+        node.text.setFields({ translation: [overlayWhole(x), overlayWhole(y)], width: textWidth, height: contentHeight })
+        if look.textShadow <> invalid then overlayTextShadow(node, look.textShadow, k)
+    else if node.text <> invalid
+        node.text.visible = false
+    end if
+    overlayFrame(node, ctx, colors, width, height, border, rail, left)
+    return [width, height]
+end function
+
+sub overlayHideParts(node as Object)
+    for each name in overlayPartNames().Split("|")
+        if node[name] <> invalid then node[name].visible = false
+    end for
+end sub
+
+' A badge's parts from the back, each made when first needed.
+function overlayPartNames() as String
+    return "shadow|fill|ring|stripe|chipFill|chipText|icon|mark|image|textShadow|text"
+end function
+
+' The badge's part name, made when first needed in its place among the
+' parts already made (overlayPartNames), so a reused badge keeps its order.
+function overlayPart(node as Object, name as String, kind as String) as Object
+    if node[name] <> invalid then return node[name]
+    index = 0
+    for each other in overlayPartNames().Split("|")
+        if other = name then exit for
+        if node[other] <> invalid then index = index + 1
+    end for
+    child = CreateObject("roSGNode", kind)
+    if kind = "Label" then child.setFields({ wrap: false, numLines: 1, vertAlign: "center" })
+    node.group.insertChild(child, index)
+    node[name] = child
+    return child
+end function
+
+' The fill, border, accent stripe, and drop shadow behind a badge of width x
+' height.
+sub overlayFrame(node as Object, ctx as Object, colors as Object, width as Float, height as Float, border as Float, rail as String, stripe as Float)
+    look = ctx.look
+    k = ctx.k
+    shape = "round"
+    if rail <> "" then shape = rail
+    radius = look.radius * k
+    if look.radius < 0 or radius > height / 2 then radius = height / 2
+    if radius > width / 2 then radius = width / 2
+    textureRadius = overlayRadius(radius)
+    fill = colors.fill
+    if fill <> "" and catalog.overlays.parseColor(fill).a > 0
+        overlayPart(node, "fill", "Poster")
+        overlayPatch(node.fill, overlayFillUri(shape, textureRadius), fill, 0, 0, width, height)
+    end if
+    if border > 0
+        overlayPart(node, "ring", "Poster")
+        overlayPatch(node.ring, overlayRingUri(shape, textureRadius, border), colors.border, 0, 0, width, height)
+    end if
+    if stripe > 0 and colors.accentLeft <> "" and rail <> "left"
+        overlayPart(node, "stripe", "Rectangle")
+        inset = textureRadius * 0.3
+        node.stripe.setFields({ visible: true, translation: [0, overlayWhole(inset)], width: stripe, height: height - 2 * inset, color: catalog.overlays.rokuColor(colors.accentLeft) })
+    end if
+    ' Roku has no blur: the drop shadow is the fill's shape in the shadow's
+    ' colour, offset, spread by a quarter of the blur, at 60% of its opacity.
+    shadow = look.boxShadow
+    if shadow <> invalid and fill <> ""
+        spread = shadow.blur * k / 4
+        overlayPart(node, "shadow", "Poster")
+        overlayPatch(node.shadow, overlayFillUri(shape, overlayRadius(radius + spread)), shadow.color, shadow.x * k - spread, shadow.y * k - spread, width + 2 * spread, height + 2 * spread)
+        node.shadow.opacity = node.shadow.opacity * 0.6
+    end if
+end sub
+
+' A 9-patch Poster at x, y covering width x height in color.
+sub overlayPatch(poster as Object, uri as String, color as String, x as Float, y as Float, width as Float, height as Float)
+    poster.setFields(overlayTint(color, "blendColor", { visible: true, uri: uri, width: width, height: height, translation: [x, y] }))
+end sub
+
+' fields with a "#RRGGBBAA" colour as an opaque colour in field (a Poster's
+' blendColor, a Label's color) and its alpha as opacity, times share.
+function overlayTint(color as String, field as String, fields as Object, share = 1.0 as Float) as Object
+    fields[field] = Left(catalog.overlays.rokuColor(color), 8) + "FF"
+    fields.opacity = catalog.overlays.parseColor(color).a * share
+    return fields
+end function
+
+' The largest radius with art (scripts/badge-art.py RADII: 1 to 16, then
+' even to 32) at most radius, at least 1: Roku draws a 9-patch's corners
+' at the device's pixels, so each radius has its own texture.
+function overlayRadius(radius as Float) as Integer
+    whole = Int(radius)
+    if whole < 1 then return 1
+    if whole > 32 then return 32
+    if whole > 16 and whole mod 2 = 1 then whole = whole - 1
+    return whole
+end function
+
+function overlayFillUri(shape as String, radius as Integer) as String
+    return "pkg:/images/badges/fill_" + shape + "_" + radius.ToStr() + "_$$RES$$.9.png"
+end function
+
+' A border of width px, as the nearest stroke with art (1 to 4 px).
+function overlayRingUri(shape as String, radius as Integer, width as Float) as String
+    stroke = Int(width + 0.5)
+    if stroke < 1 then stroke = 1
+    if stroke > 4 then stroke = 4
+    return "pkg:/images/badges/ring_" + shape + "_" + radius.ToStr() + "_" + stroke.ToStr() + "_$$RES$$.9.png"
+end function
+
+sub overlayText(node as Object, text as String, font as Object, color as String)
+    overlayPart(node, "text", "Label")
+    node.text.setFields(overlayTint(color, "color", { visible: true, text: text, font: font, width: 0 }))
+end sub
+
+' One offset copy of the text in the shadow's colour, under it: Roku has no
+' blur, so the copy is softened to 60% of the shadow's opacity.
+sub overlayTextShadow(node as Object, shadow as Object, k as Float)
+    overlayPart(node, "textShadow", "Label")
+    offset = shadow.y * k
+    if offset < 1 then offset = 1
+    t = node.text
+    node.textShadow.setFields(overlayTint(shadow.color, "color", { visible: true, text: t.text, font: t.font, width: t.width, height: t.height, translation: [t.translation[0] + shadow.x * k, t.translation[1] + offset] }, 0.6))
+end sub
+
+' A glyph (images/badges/<icon>.png) in the text's colour, iconSize square.
+function overlayIcon(node as Object, icon as String, size as Float, color as String) as Object
+    overlayPart(node, "icon", "Poster")
+    node.icon.setFields(overlayTint(color, "blendColor", { visible: true, uri: "pkg:/images/badges/" + icon.Replace("-", "_") + ".png", width: overlayWhole(size), height: overlayWhole(size) }))
+    return [overlayWhole(size), overlayWhole(size)]
+end function
+
+' A wordmark (HDR10, ATMOS) as heavy text at the mark's height, as the
+' web's inline marks set it: 10 units of a 12-unit mark (ATMOS 9).
+function overlayMark(node as Object, text as String, icon as String, iconSize as Float, color as String) as Object
+    overlayPart(node, "mark", "Label")
+    units = 10
+    if icon = "atmos" then units = 9
+    font = overlayFont(800, overlayPx(iconSize * units / 12))
+    node.mark.setFields(overlayTint(color, "color", { visible: true, text: text, font: font, width: 0 }))
+    width = node.mark.boundingRect().width
+    node.mark.setFields({ width: width, height: overlayWhole(iconSize) })
+    return [width, overlayWhole(iconSize)]
+end function
+
+' A rating's source mark on a chip in its accent, the plate look's.
+function overlayChip(node as Object, badge as Object, font as Object, fontSize as Integer) as Object
+    overlayPart(node, "chipFill", "Poster")
+    overlayPart(node, "chipText", "Label").horizAlign = "center"
+    chipColor = badge.accent
+    if chipColor = "" then chipColor = "#FFFFFF"
+    textColor = catalog.overlays.readableOn(chipColor)
+    node.chipText.setFields({ visible: true, text: badge.chip, font: font, width: 0, color: catalog.overlays.rokuColor(textColor) })
+    textWidth = node.chipText.boundingRect().width
+    padX = fontSize * 0.35
+    padY = fontSize * 0.15
+    width = textWidth + 2 * padX
+    height = fontSize + 2 * padY
+    overlayPatch(node.chipFill, overlayFillUri("round", overlayRadius(fontSize * 0.2)), catalog.overlays.opaque(chipColor), 0, 0, width, height)
+    node.chipText.setFields({ width: width, height: height })
+    return [width, height]
+end function
+
+' An uploaded image height px tall in its own proportions (the overlay
+' config's width and height), at most maxWidth wide.
+function overlayImage(node as Object, ref as String, ctx as Object, height as Float, maxWidth as Float) as Object
+    if node.image = invalid
+        overlayPart(node, "image", "Poster")
+        node.image.loadDisplayMode = "scaleToFit"
+        node.image.observeField("loadStatus", "onOverlayImage")
+    end if
+    dims = ctx.images[ref]
+    width = height
+    if util.isObject(dims) and util.isNumber(dims.width) and util.isNumber(dims.height) and dims.height > 0 then width = height * dims.width / dims.height
+    if width > maxWidth then width = maxWidth
+    uri = ctx.origin + catalog.overlays.IMAGE_PATH + ref
+    node.image.setFields({ visible: true, width: overlayWhole(width), height: overlayWhole(height), loadWidth: overlayWhole(width), loadHeight: overlayWhole(height), uri: uri })
+    return [overlayWhole(width), overlayWhole(height)]
+end function
+
+' An image that did not load (the administrator deleted it) falls back to
+' what the badge draws without it.
+sub onOverlayImage(event as Object)
+    poster = event.getRoSGNode()
+    if poster.loadStatus <> "failed" then return
+    uri = poster.uri
+    ref = Mid(uri, Instr(1, uri, catalog.overlays.IMAGE_PATH) + Len(catalog.overlays.IMAGE_PATH))
+    if ref = "" or m.ovFailed.DoesExist(ref) then return
+    m.ovFailed[ref] = true
+    item = m.top.itemContent
+    if item <> invalid then overlayShow(item)
+end sub
+
+' --- The watch-status corner --------------------------------------------
+
+' A poster's top-right corner: the episodes a started series or season has
+' left, on a dark disc the size of the check disc in its place (the web's
+' CardWatchStatus, at Roku's check size). It shows whether or not badges are
+' on; a played item shows the check instead.
+sub overlayCount(item as Object)
+    count = 0
+    if m.shape = catalog.shape.POSTER and not item.played and item.itemType <> catalog.cards.MORE then count = item.remaining
+    if count <= 0
+        if m.ovCount <> invalid then m.ovCount.group.visible = false
+        return
+    end if
+    size = theme.size.CHECK_DISC
+    if m.ovCount = invalid
+        group = m.card.createChild("Group")
+        group.id = "remaining"
+        fill = group.createChild("Poster")
+        ring = group.createChild("Poster")
+        label = group.createChild("Label")
+        label.setFields({ horizAlign: "center", vertAlign: "center", color: "0xFFFFFFFF", font: overlayFont(700, overlayPx(size / 2)) })
+        m.ovCount = { group: group, fill: fill, ring: ring, label: label }
+    end if
+    label = m.ovCount.label
+    label.setFields({ text: count.ToStr(), width: 0 })
+    width = label.boundingRect().width + 0.8 * size / 2
+    if width < size then width = size
+    radius = overlayRadius(size / 2)
+    overlayPatch(m.ovCount.fill, overlayFillUri("round", radius), "#000000A6", 0, 0, width, size)
+    overlayPatch(m.ovCount.ring, overlayRingUri("round", radius, 1), "#FFFFFF33", 0, 0, width, size)
+    label.setFields({ width: width, height: size })
+    inset = theme.browse.CHECK_INSET
+    m.ovCount.group.translation = [m.cardSize[0] - inset - width, inset]
+    m.ovCount.group.visible = true
+end sub
+
+' --- Helpers ------------------------------------------------------------
+
+' The packaged Inter at weight (400 to 800; 800 draws in Bold, the heaviest
+' packaged) and size px, shared through the theme's Font nodes.
+function overlayFont(weight as Integer, size as Integer) as Object
+    name = theme.fontWeight.REGULAR
+    if weight >= 500 then name = theme.fontWeight.MEDIUM
+    if weight >= 600 then name = theme.fontWeight.SEMIBOLD
+    if weight >= 700 then name = theme.fontWeight.BOLD
+    spec = { weight: name, size: size }
+    fonts = m.global.theme
+    key = theme.fontKey(spec)
+    if fonts.hasField(key) then return fonts.getField(key)
+    node = CreateObject("roSGNode", "Font")
+    node.uri = theme.fontUri(name)
+    node.size = size
+    fonts.addField(key, "node", false)
+    fonts.setField(key, node)
+    return node
+end function
+
+' A text size in whole px, at least 6.
+function overlayPx(value as Float) as Integer
+    size = Int(value + 0.5)
+    if size < 6 then size = 6
+    return size
+end function
+
+' A length on a whole pixel.
+function overlayWhole(value as Float) as Integer
+    return Int(value + 0.5)
+end function

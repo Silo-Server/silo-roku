@@ -850,6 +850,27 @@ their existing HD/FHD assets.
     at `silo-apple` revision `b514800f`.
   - Played items carry a watched check (a 40 px `#EDEDED` disc with a black
     check, 12 px from the top right; 14 px on landscape cards).
+  - Card overlays (silo-server `docs/architecture/card-overlays.md`; the web
+    client's `CardOverlays` at silo-server `ae3bac00c9`): posters, landscape
+    cards, and episode stills carry the badges the profile's
+    `ui.card_overlays` document picks, or the server's default from
+    `GET /api/v2/settings/overlay-config`, while `ui.card_overlays_enabled`
+    (else the config's `enabled`) is on. Every badge, preset (minimal,
+    classic, vibrant, pill, square, plate, band), `style` override, position
+    (three corners and the two edge rails), cap (three a corner, four a
+    rail), shared bottom row, and uploaded image (`image`, `valueImages`,
+    from `/api/v2/overlay-images/{ref}`) follows the contract and the web's
+    renderer. A poster scales the web's lengths by its width over 185 px; a
+    landscape card or episode still draws them at 1 and lifts its bottom row
+    over a progress bar. The top row stops short of the watched check's
+    corner. Roku reads the document and never writes it; the web client is
+    its editor. The shell reads it again each time a page with the top bar
+    starts, and a profile without an answer yet shows no badges.
+  - A started, unfinished series or season poster (`user_state.watched_count`
+    above 0 and `unplayed_count` above 0) shows the episodes left in the
+    check's place: the number in Inter Bold 20 on a black 65% disc of the
+    check's size with a 1 px white 20% ring, widening to a capsule for more
+    digits. It shows whether or not badges are on.
   - OK on any card opens the detail page; from Continue Watching, the detail
     page opens with that episode selected.
   - Explore all (tvOS's `SectionExploreAllCard`, silo-apple `a65867ef`; Android
@@ -2286,7 +2307,12 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The hero's logo shows as soon as it is decoded | The logo loads once focus rests 150 ms on the card, with the backdrop; the text title shows until then | Decoding a logo for every card passed while scrolling churns texture memory on 512 MB devices |
 | The hero's meta line shows the IMDb or TMDB mark before the score | The source's name as text ("IMDb 8.3") | No logo art ships for rating sources |
 | Runtimes read "45m" and "1h 0m" | "45 min" and "1h", as Android TV writes them | The `catalog.` runtime strings serve Home, detail, and Up Next alike; a copy change of its own moves them |
-| Cards carry resolution, HDR, audio, and release-type overlays | No overlays | The node budget per card (plan section 4.6); the server's overlay preferences are not read |
+| Card overlay text in the 800 weight (plate, band, `extrabold`, the HDR10 and ATMOS wordmarks) | Inter Bold (700) | Bold is the heaviest packaged weight |
+| Card overlay badges letter-space their text, and the minimal and band looks blur a text shadow, as vibrant and plate blur a drop shadow | No letter-spacing; a text shadow is one copy of the text offset 1 px at 60% of the shadow's opacity, and a drop shadow the badge's shape in the shadow's colour, offset and spread by a quarter of the blur, at 60% | Roku `Label` has no tracking, and SceneGraph has no blur |
+| A badge's corner radius scales freely with the card and the look's size | The radius rounds down to a packaged 9-patch's (1 to 16 px, then even to 32 px), and a border to a whole 1 to 4 px | Roku draws a 9-patch's corners at device pixels whatever the node's scale, so each radius needs its own texture (`scripts/badge-art.py`) |
+| The watch-status corner is a 22 px emerald check on posters only, scaled with the card, and the episodes left on a 22 px disc | Roku keeps tvOS's 40 px check disc on every card shape, and draws the episodes left at its size | The check disc follows tvOS (section 5.5); the episodes left take its place |
+| The request-status badge and its download bar mark watchlist titles outside the library | Not drawn | Roku lists no watchlist titles outside the library, so no card has the badge's data |
+| Card overlay settings (badges on or off, presets, positions, colours, images) | Not offered; Roku draws what the web client saved | The web client is the only editor the contract names; tvOS reads the setting only too |
 | A row whose items are all episodes, seasons, or series shows landscape stills (`SectionRow.isEpisodeRow`) | Only Continue Watching, in-progress, and "next" sections show landscape cards; a row of episodes, such as Recently Added TV, shows posters | Maintainer's choice (PR #38): landscape cards mark the rows that resume or continue watching, and the rest of Home stays posters |
 | Continue Watching's header has an icon | Text only | No icon art ships, and `RowList` row labels are text |
 | A card without artwork shows its ThumbHash, or brand glows with a film or TV icon | The brand glows without an icon | Decoding a ThumbHash image costs CPU per card on low-cost hardware, and an icon would add a node to every card |
