@@ -150,6 +150,21 @@ namespace tests
             m.assertEqual(loop.delivered.u2.error.kind, "invalid_request")
         end sub
 
+        @it("closes the open account's profile so its picker waits when it is chosen again")
+        sub _()
+            loop = tests.sessions.create(tests.sessions.signedIn())
+            tests.sessions.send(loop, { requestId: "sel", session: "selectProfile", profile: { id: "p-1", name: "Sam" } })
+            tests.sessions.send(loop, { requestId: "u0", session: "useAccount", accountId: "1" })
+            m.assertEqual(loop.delivered.u0.body, { changed: false })
+            m.assertEqual(api.auth.coordinator.view(loop.session).profile.id, "p-1", "without choose nothing changes")
+            tests.sessions.send(loop, { requestId: "u1", session: "useAccount", accountId: "1", profileId: "", choose: true })
+            m.assertEqual(loop.delivered.u1.body, { changed: true })
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.accountId, view.profile, view.launch.asks], ["signed_in", "1", invalid, true])
+            m.assertTrue(playback.worker.changesIdentity({ session: "useAccount", accountId: "1", choose: true }, { server: "https://silo.example", account: "1", profile: "p-1" }))
+            m.assertFalse(playback.worker.changesIdentity({ session: "useAccount", accountId: "1" }, { server: "https://silo.example", account: "1", profile: "p-1" }))
+        end sub
+
         @it("signs out of the open account only, keeping its server and the other account")
         sub _()
             loop = tests.sessions.create(tests.sessions.signedIn())
@@ -455,6 +470,59 @@ namespace tests
             end for
             raw = storage.encodeAccounts(record, tests.sessions.NOW)
             m.assertTrue(storage.bytes(raw) <= storage.ACCOUNTS_BUDGET_BYTES)
+        end sub
+
+        ' A companion session's sign-ins are the most recently used accounts
+        ' on the most recently used servers (docs/companion-pairing.md
+        ' section 3, lim).
+        @it("keeps the session of every account one phone's session can sign in")
+        sub _()
+            limit = storage.sessionSignIns()
+            m.assertEqual(limit, 8)
+            record = tests.sessions.signedIn()
+            record.accounts = []
+            record.servers = []
+            ' The session's sign-ins, the last one open, each on its own
+            ' server, at the bytes budgeted for one, with a profile list.
+            signIns = []
+            for i = 1 to limit
+                account = m.savedHome()
+                account.id = "session-" + i.ToStr()
+                account.origin = "https://server-" + i.ToStr() + ".example.org"
+                account.serverUserId = "user-" + i.ToStr()
+                account.username = "household-member-" + i.ToStr()
+                account.usedAt = tests.sessions.NOW - limit + i
+                account.accessToken = string(900, "a")
+                account.refreshToken = string(900, "r")
+                account.profileTokens = [{ id: "p-owner", token: string(120, "t") }, { id: "p-kid", token: string(120, "k") }]
+                m.assertTrue(Len(FormatJson(storage.accountEntry(account))) <= storage.SIGN_IN_BYTES, "within the bytes budgeted for one")
+                account.profiles = [{ id: "p", name: string(100, "n"), hasPin: false, isChild: false, avatarUrl: "https://a.example/" + string(400, "x") }]
+                signIns.Unshift(account)
+            end for
+            storage.unpack(record, signIns[0])
+            record.origin = signIns[0].origin
+            for i = 1 to signIns.Count() - 1
+                record.accounts.Push(signIns[i])
+                record.servers.Push({ origin: signIns[i].origin, name: string(40, "n"), label: "", usedAt: signIns[i].usedAt })
+            end for
+            ' Accounts saved before the session, with large sessions.
+            for i = 1 to storage.MAX_ACCOUNTS - limit
+                older = m.savedHome()
+                older.id = "older-" + i.ToStr()
+                older.origin = signIns.Peek().origin
+                older.usedAt = tests.sessions.NOW - 600 - i
+                older.accessToken = string(storage.MAX_TOKEN_BYTES, "o")
+                older.refreshToken = string(storage.MAX_TOKEN_BYTES, "p")
+                record.accounts.Push(older)
+            end for
+            raw = storage.encodeAccounts(record, tests.sessions.NOW)
+            m.assertTrue(storage.bytes(raw) <= storage.ACCOUNTS_BUDGET_BYTES, "bytes " + storage.bytes(raw).ToStr())
+            decoded = storage.decode(storage.encode(record), raw)
+            m.assertEqual([decoded.accountId, decoded.accessToken <> ""], ["session-" + limit.ToStr(), true])
+            m.assertEqual(decoded.servers.Count(), limit - 1, "every server signed in to stays")
+            for i = 0 to limit - 2
+                m.assertEqual([decoded.accounts[i].id, decoded.accounts[i].accessToken], [signIns[i + 1].id, signIns[i + 1].accessToken])
+            end for
         end sub
 
         @it("keeps every section within Roku's 32 KB")

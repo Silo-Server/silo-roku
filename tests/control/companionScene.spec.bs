@@ -120,6 +120,197 @@ namespace tests
             m.assertEqual(state.offerChecks, 1, "Home may have rendered under it: the offer is checked again")
         end sub
 
+        @describe("several sign-ins in one phone's session")
+
+        function approved(accountId as String, username = "sam" as String) as Object
+            return { requestId: "c1", ok: true, status: 200, headers: {}, body: { status: "approved", pollAfter: 0, accountId: accountId, username: username, origin: "https://silo.example" } }
+        end function
+
+        function ok(body = {} as Object) as Object
+            return { requestId: "c1", ok: true, status: 200, headers: {}, body: body }
+        end function
+
+        ' The poll in flight collects an approval as accountId, whose session
+        ' then moves the app on to its picker, under the Companion screen.
+        function signIn(probe as Object, accountId as String, username = "sam" as String) as Object
+            probe.callFunc("probePolled", m.approved(accountId, username))
+            return probe.callFunc("probeSession", accountId)
+        end function
+
+        ' The phone's next push, as accountName, checked and started, its
+        ' first poll in flight.
+        function next(probe as Object, url as String, accountName as String, userCode as String) as Object
+            probe.callFunc("probePush", { url: url, name: "Lake", identity: "srv-2", accountName: accountName, endpoints: [] })
+            probe.callFunc("probeChecked", m.ok({ origin: url, serverIdentity: "srv-2" }))
+            probe.callFunc("probeStarted", m.ok({ userCode: userCode, matchCode: "", interval: 4, expiresIn: 600 }))
+            return probe.callFunc("probeTimer")
+        end function
+
+        ' A session that signed in a1 (sam) and then a2 (alex) on Lake.
+        function twoSignedIn() as Object
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeWaiting")
+            m.signIn(probe, "a1")
+            m.next(probe, "https://lake.example", "alex", "22223333")
+            m.signIn(probe, "a2", "alex")
+            return probe
+        end function
+
+        @it("advertises several accounts and its limit on the server screen")
+        sub _()
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            config = probe.callFunc("probeConfig")
+            m.assertEqual([config.state, config.limit], ["setup", storage.sessionSignIns()])
+        end sub
+
+        @it("takes the next push after a sign-in, shows its code and the phone's account name, and binds it to the same session")
+        sub _()
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeWaiting")
+            state = m.signIn(probe, "a1")
+            m.assertEqual([state.stage, state.heard.status, state.status.signedInAs], ["signedIn", "signedIn", "sam"])
+            m.assertEqual(state.routes, [nav.route.PROFILE, nav.route.COMPANION])
+            probe.callFunc("probePush", { url: "https://lake.example", name: "Lake", identity: "srv-2", accountName: "alex", endpoints: [] })
+            state = probe.callFunc("probeState")
+            m.assertEqual([state.stage, state.sent.Peek(), state.status.accountName], ["reaching", "companionServer", "alex"])
+            m.assertEqual(state.requests.Peek().pairing, "pair-1", "the same session's binding secret")
+            probe.callFunc("probeChecked", m.ok({ origin: "https://lake.example", serverIdentity: "srv-2" }))
+            state = probe.callFunc("probeStarted", m.ok({ userCode: "22223333", matchCode: "", interval: 4, expiresIn: 600 }))
+            m.assertEqual([state.stage, state.heard.type, state.heard.userCode, state.status.userCode], ["code", "deviceStarted", "22223333", "22223333"])
+            probe.callFunc("probeTimer")
+            state = m.signIn(probe, "a2", "alex")
+            m.assertEqual([state.stage, state.heard.status, state.heard.serverURL, state.status.signedInAs], ["signedIn", "signedIn", "https://lake.example", "alex"])
+            m.assertEqual(state.routes, [nav.route.PROFILE, nav.route.COMPANION])
+        end sub
+
+        @it("opens Change Account over the first account's picker when several signed in")
+        sub _()
+            probe = m.twoSignedIn()
+            state = probe.callFunc("probeLeft")
+            m.assertEqual([state.stage, state.status.accounts], ["completed", 2])
+            state = probe.callFunc("probeAct", "continue")
+            m.assertEqual([state.mode, state.routes], ["", [nav.route.PROFILE]])
+            m.assertEqual([state.sent.Peek(), state.requests.Peek().accountId, state.requests.Peek().choose], ["useAccount", "a1", true], "the first account is opened, its picker waiting")
+            ' The session opens it and the app starts over on its picker.
+            state = probe.callFunc("probeSession", "a1")
+            m.assertEqual(state.routes, [nav.route.PROFILE, nav.route.ACCOUNTS])
+            state = probe.callFunc("probeSession", "a1")
+            m.assertEqual(state.routes, [nav.route.PROFILE], "once")
+        end sub
+
+        @it("opens the first account's picker, waiting, when it also signed in last")
+        sub _()
+            probe = m.twoSignedIn()
+            m.next(probe, "https://silo.example", "sam", "44445555")
+            m.signIn(probe, "a1")
+            ' Its only profile opened on its own, under the Companion screen.
+            probe.callFunc("probeSession", "a1", "p1")
+            state = probe.callFunc("probeLeft")
+            m.assertEqual(state.status.accounts, 2)
+            state = probe.callFunc("probeAct", "continue")
+            m.assertEqual(state.routes, [nav.route.HOME])
+            m.assertEqual([state.sent.Peek(), state.requests.Peek().accountId, state.requests.Peek().choose], ["useAccount", "a1", true], "its picker is asked to wait, though it is open")
+            state = probe.callFunc("probeAccount", m.ok({ changed: true }))
+            m.assertEqual(state.routes, [nav.route.HOME], "not over Home, where Back would land")
+            state = probe.callFunc("probeSession", "a1")
+            m.assertEqual(state.routes, [nav.route.PROFILE, nav.route.ACCOUNTS])
+        end sub
+
+        @it("forgets a Change Account still waiting when the receiver stops")
+        sub _()
+            probe = m.twoSignedIn()
+            probe.callFunc("probeLeft")
+            probe.callFunc("probeAct", "continue")
+            probe.callFunc("probeStop")
+            state = probe.callFunc("probeAccount", m.ok({ changed: true }))
+            m.assertEqual(state.routes, [nav.route.PROFILE])
+            state = probe.callFunc("probeSession", "a1")
+            m.assertEqual(state.routes, [nav.route.PROFILE], "never pushed later, unprompted")
+        end sub
+
+        @it("shows Change Account at once when the first account could not be opened")
+        sub _()
+            probe = m.twoSignedIn()
+            probe.callFunc("probeLeft")
+            probe.callFunc("probeAct", "continue")
+            state = probe.callFunc("probeAccount", { requestId: "c9", ok: false, status: 0, headers: {}, body: invalid, error: { kind: "invalid_request" } })
+            m.assertEqual(state.routes, [nav.route.PROFILE, nav.route.ACCOUNTS])
+        end sub
+
+        @it("opens the picker as before when one account signed in, even twice")
+        sub _()
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeWaiting")
+            m.signIn(probe, "a1")
+            m.next(probe, "https://silo.example", "sam", "22223333")
+            m.signIn(probe, "a1")
+            state = probe.callFunc("probeLeft")
+            m.assertEqual(state.status.accounts, 1)
+            state = probe.callFunc("probeAct", "continue")
+            m.assertEqual([state.mode, state.routes], ["", [nav.route.PROFILE]])
+            m.assertFalse(state.sent.Peek() = "useAccount")
+        end sub
+
+        @it("ends the session with what signed in when a later push fails, or the viewer presses Back")
+        sub _()
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeWaiting")
+            m.signIn(probe, "a1")
+            m.next(probe, "https://lake.example", "alex", "22223333")
+            state = probe.callFunc("probePolled", m.ok({ status: "denied", pollAfter: 0 }))
+            m.assertEqual([state.stage, state.heard.error], ["failed", "denied"])
+            state = probe.callFunc("probeLeft")
+            m.assertEqual([state.stage, state.status.accounts], ["completed", 1])
+            ' Back while it waits for the next push.
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeWaiting")
+            m.signIn(probe, "a1")
+            state = probe.callFunc("probeAct", "cancel")
+            m.assertEqual([state.stage, state.phone], ["completed", ""])
+            ' Back while a later push shows its code withdraws that login.
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeWaiting")
+            m.signIn(probe, "a1")
+            m.next(probe, "https://lake.example", "alex", "22223333")
+            state = probe.callFunc("probeAct", "cancel")
+            m.assertEqual([state.stage, state.sent.Peek()], ["completed", "companionCancel"])
+        end sub
+
+        @it("refuses a push past its limit with limit_reached, keeping the session's sign-ins")
+        sub _()
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeWaiting")
+            state = m.signIn(probe, "a1")
+            for i = 2 to storage.sessionSignIns()
+                m.next(probe, "https://s" + i.ToStr() + ".example", "u" + i.ToStr(), "22223333")
+                state = m.signIn(probe, "a" + i.ToStr())
+                m.assertEqual(state.stage, "signedIn", i.ToStr())
+            end for
+            sent = state.sent.Count()
+            state = probe.callFunc("probePush", { url: "https://more.example", name: "More", identity: "srv-9", accountName: "", endpoints: [] })
+            m.assertEqual([state.heard.type, state.heard.status, state.heard.error, state.heard.serverURL], ["serverResult", "failed", "limit_reached", "https://more.example"])
+            m.assertEqual([state.stage, state.sent.Count(), state.status.accounts], ["signedIn", sent, storage.sessionSignIns()], "nothing started, nothing lost")
+        end sub
+
+        @it("refuses a second push on the sign-in screen with limit_reached")
+        sub _()
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            probe.callFunc("probeRelay", m.code("waiting", "4821-7730"))
+            probe.callFunc("probeSignedIn")
+            state = probe.callFunc("probePush", m.server())
+            m.assertEqual([state.stage, state.heard.error], ["signedIn", "limit_reached"])
+        end sub
+
+        @it("gives each phone's session its own binding secret")
+        sub _()
+            probe = CreateObject("roSGNode", "CompanionProbe")
+            first = probe.callFunc("probeConnected").pairing
+            probe.callFunc("probeLeft")
+            second = probe.callFunc("probeConnected").pairing
+            m.assertEqual([Len(first) > 0, Len(second) > 0], [true, true])
+            m.assertNotEqual(first, second)
+        end sub
+
         @describe("the sign-in screen's code, which the phone confirms")
 
         @it("sends the phone the code on screen and starts no login of its own")

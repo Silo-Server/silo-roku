@@ -6,6 +6,7 @@ import "pkg:/source/nav/stack.bs"
 import "pkg:/source/onboarding/address.bs"
 import "pkg:/source/onboarding/deviceCode.bs"
 import "pkg:/source/platform/topics.bs"
+import "pkg:/source/storage/registry.bs"
 import "pkg:/source/util/i18n.bs"
 import "pkg:/source/util/log.bs"
 import "pkg:/source/util/values.bs"
@@ -19,15 +20,24 @@ import "pkg:/source/util/values.bs"
 ' operations (source/auth/companion.bs). On the sign-in screen there is no
 ' second login: the phone confirms the code that screen shows and polls
 ' (companionCode), as on tvOS. The session a sign-in installs moves the app
-' on to the profile picker. Built only with bs_const companion.
+' on to the profile picker.
+'
+' On the server screen a phone's session signs in as many accounts as it
+' pushes, on any servers, each kept as its own account (TXT acct), up to
+' storage.sessionSignIns (lim); a push past that, or any after the sign-in
+' screen's one, gets limit_reached. Every device login a session starts
+' carries one binding (source/auth/binding.bs). When the session ends with
+' one account signed in, its picker shows; with several, the first one to
+' sign in is opened and Change Account shows over its picker, focused on
+' it (companionComplete). Built only with bs_const companion.
 
 const COMPANION_OWNER = "companion"
 ' Section 4: a phone that sends nothing this long, with no attempt in
 ' flight, is closed.
 const COMPANION_IDLE_SECONDS = 180
 ' Section 5 step 5: after a sign-in the receiver waits this long for the
-' phone's done before it stops.
-const COMPANION_FINISH_SECONDS = 3
+' phone's next push or its done before it finishes.
+const COMPANION_FINISH_SECONDS = 10
 ' tvOS's "You're all set" waits this long for Continue, then moves on.
 const COMPANION_COMPLETE_SECONDS = 2
 ' Section 5 step 3: how long a phone on the sign-in screen waits for that
@@ -35,7 +45,7 @@ const COMPANION_COMPLETE_SECONDS = 2
 const COMPANION_CODE_WAIT_SECONDS = 15
 
 sub companionInit()
-    m.companion = { task: invalid, taskReady: false, queued: [], retiring: [], mode: "", serverIdentity: "", identityOrigin: "", identityHandle: invalid, sid: "", phone: "", consented: false, push: invalid, stage: "idle", alternate: invalid, probing: [], userCode: "", matchCode: "", screenCode: invalid, failure: "", help: "", handle: invalid, requestOpen: false, clock: CreateObject("roTimespan"), deadline: 0, interval: 5, signedIn: false, finishing: false }
+    m.companion = { task: invalid, taskReady: false, queued: [], retiring: [], mode: "", serverIdentity: "", identityOrigin: "", identityHandle: invalid, sid: "", phone: "", consented: false, push: invalid, stage: "idle", alternate: invalid, probing: [], userCode: "", matchCode: "", screenCode: invalid, failure: "", help: "", handle: invalid, requestOpen: false, clock: CreateObject("roTimespan"), deadline: 0, interval: 5, signedIn: false, finishing: false, signedInAs: "", pairing: "", signIns: [], accountsFor: "", accountsHandle: invalid }
     m.companionPollTimer = m.top.findNode("companionPollTimer")
     m.companionIdleTimer = m.top.findNode("companionIdleTimer")
     m.companionFinishTimer = m.top.findNode("companionFinishTimer")
@@ -55,6 +65,7 @@ sub companionRefresh()
         ' so and the Companion screen comes back on top.
         if m.companion.screenCode = invalid then companionRelay()
         companionKeepScreen()
+        companionAccountsDue()
         wanted = companionWanted()
         if wanted = m.companion.mode then return
         if m.companion.mode <> "" then companionStop("receiver_cancelled")
@@ -143,7 +154,9 @@ sub companionRun()
 end sub
 
 function companionConfig() as Object
-    return { deviceName: controlDeviceName(), deviceId: util.text(m.apiSession.deviceId), state: m.companion.mode }
+    config = { deviceName: controlDeviceName(), deviceId: util.text(m.apiSession.deviceId), state: m.companion.mode }
+    if m.companion.mode = "setup" then config.limit = storage.sessionSignIns()
+    return config
 end function
 
 ' Stops the receiver: a phone mid-attempt hears reason (cancel), an open
@@ -171,10 +184,21 @@ sub companionStop(reason as String)
     m.companion.stage = "idle"
     m.companion.signedIn = false
     m.companion.finishing = false
+    m.companion.pairing = ""
+    m.companion.signIns = []
+    companionDropAccounts()
     m.companionIdleTimer.control = "stop"
     m.companionFinishTimer.control = "stop"
     companionLeaveScreen()
     log.info("companion", "receiver stopped")
+end sub
+
+' Change Account, waiting from a session before, is no longer due.
+sub companionDropAccounts()
+    m.companion.accountsFor = ""
+    if m.companion.accountsHandle = invalid then return
+    m.companion.accountsHandle.unobserveField("status")
+    m.companion.accountsHandle = invalid
 end sub
 
 sub companionCommand(command as Object)
@@ -230,11 +254,13 @@ sub onCompanionEvent(event as Object)
 end sub
 
 ' A phone connected: tvOS's linked state, the person continuing on the
-' phone until it pushes a server.
+' phone until it pushes a server. Each phone's session has its own binding
+' secret, which pairing names to the coordinator.
 sub companionPhoneConnected(id as String)
     m.companion.phone = id
     m.companion.consented = false
     companionArmIdle()
+    if not m.companion.signedIn then m.companion.pairing = LCase(CreateObject("roDeviceInfo").GetRandomUUID())
     if m.companion.stage = "idle" and not m.companion.signedIn
         m.companion.stage = "linked"
         companionShowScreen()
@@ -281,9 +307,11 @@ sub onCompanionIdle()
     end if
 end sub
 
-' The phone sent done or cancel, or left.
+' The phone sent done or cancel, or left: after a sign-in, the session
+' ends (section 5 step 5), and an attempt still in flight is withdrawn.
 sub companionPhoneLeft(gone as Boolean)
     if m.companion.signedIn
+        if gone then m.companion.phone = ""
         companionFinish()
         return
     end if
@@ -305,19 +333,32 @@ end sub
 
 sub companionPush(server as Dynamic)
     if not util.isObject(server) then return
-    ' A Roku keeps one server (section 4). A receiver kept only for a
-    ' poll's answer, its screen gone with the session it began under,
-    ' starts no other attempt.
-    if m.companion.signedIn or companionScreenMode() <> m.companion.mode
+    ' A receiver kept only for a poll's answer, its screen gone with the
+    ' session it began under, starts no other attempt, nor does a session
+    ' that is finishing.
+    if m.companion.stage = "completed" or companionScreenMode() <> m.companion.mode
         companionSend(silocontrol.pairing.serverResult(util.text(server.url), "auth_failed"))
         return
     end if
-    ' A new push replaces the one in flight.
+    ' The sign-in screen signs in one account; the server screen as many as
+    ' the registry keeps (section 4, lim) without pushing out one this
+    ' session signed in.
+    if m.companion.signedIn and (m.companion.mode = "login" or m.companion.signIns.Count() >= storage.sessionSignIns())
+        companionSend(silocontrol.pairing.serverResult(util.text(server.url), "limit_reached"))
+        log.info("companion", "push refused", { code: "limit_reached" })
+        return
+    end if
+    ' A new push replaces the one in flight, and one after a sign-in starts
+    ' the next.
     companionAbandon()
+    m.companionFinishTimer.control = "stop"
     m.companion.push = server
     m.companion.alternate = invalid
     m.companion.failure = ""
     m.companion.help = ""
+    m.companion.userCode = ""
+    m.companion.matchCode = ""
+    m.companion.signedInAs = ""
     if m.companion.consented
         companionBegin()
     else
@@ -353,7 +394,7 @@ sub companionBegin()
     end if
     m.companion.stage = "reaching"
     companionShowScreen()
-    companionRequest({ session: "companionServer", address: push.url, identity: push.identity }, "onCompanionServer")
+    companionRequest({ session: "companionServer", address: push.url, identity: push.identity, pairing: m.companion.pairing }, "onCompanionServer")
 end sub
 
 ' The sign-in screen's code on each change (SignInScreen reportCode), or
@@ -377,7 +418,7 @@ sub companionRelay()
     ' before the screen hears that poll's answer, and the screen goes with
     ' it.
     if stage = "code" and util.text(m.apiSession.status) = "signed_in"
-        companionSignedIn()
+        companionSignedIn(util.text(m.apiSession.accountId), util.text(m.apiSession.username))
         return
     end if
     code = m.companion.screenCode
@@ -386,7 +427,7 @@ sub companionRelay()
     if code = invalid then return
     status = util.text(code.status)
     if status = onboarding.deviceCode.APPROVED and stage = "code"
-        companionSignedIn()
+        companionSignedIn(util.text(m.apiSession.accountId), util.text(m.apiSession.username))
         return
     end if
     if onboarding.deviceCode.isTerminal(status)
@@ -482,7 +523,7 @@ sub companionProbeNext()
         return
     end if
     endpoint = m.companion.probing[0]
-    companionRequest({ session: "companionServer", address: endpoint.url, identity: m.companion.push.identity }, "onCompanionProbed")
+    companionRequest({ session: "companionServer", address: endpoint.url, identity: m.companion.push.identity, pairing: m.companion.pairing }, "onCompanionProbed")
 end sub
 
 sub onCompanionProbed(event as Object)
@@ -562,10 +603,14 @@ sub onCompanionPolled(event as Object)
         return
     end if
     if result.ok <> true
-        ' A network blip or a 5xx while the phone approves: poll again.
-        if companionErrorKind(result) = "handoff_gone"
+        ' A network blip or a 5xx while the phone approves: poll again. A
+        ' refused binding secret cannot change; the request is withdrawn.
+        kind = companionErrorKind(result)
+        if kind = "handoff_gone"
             m.companion.requestOpen = false
             companionFail("expired")
+        else if kind = "binding_mismatch"
+            companionFail("auth_failed")
         else
             companionSchedulePoll(m.companion.interval)
         end if
@@ -579,7 +624,7 @@ sub onCompanionPolled(event as Object)
     end if
     m.companion.requestOpen = false
     if status = "approved"
-        companionSignedIn()
+        companionSignedIn(util.text(result.body.accountId), util.text(result.body.username))
     else if status = "denied"
         companionFail("denied")
     else if status = "invalid"
@@ -589,15 +634,23 @@ sub onCompanionPolled(event as Object)
     end if
 end sub
 
-' Step 5: the session is installed; the phone hears so, and the screen says
-' "You're all set" after the phone's done or COMPANION_FINISH_SECONDS, and
-' the receiver stops when the viewer continues or COMPANION_COMPLETE_SECONDS
-' pass.
-sub companionSignedIn()
-    if m.companion.signedIn then return
+' Step 5: the session is installed as accountId, the saved account it
+' signed in (or refreshed), whose username is shown; the phone hears so.
+' The screen says "You're all set" after the phone's done, or
+' COMPANION_FINISH_SECONDS without its next push, and the receiver stops
+' when the viewer continues or COMPANION_COMPLETE_SECONDS pass. signIns
+' keeps the session's accounts in the order they first signed in.
+sub companionSignedIn(accountId as String, username as String)
+    if m.companion.stage = "signedIn" then return
+    m.companion.signedInAs = username
     m.companion.signedIn = true
     m.companion.finishing = true
     m.companion.stage = "signedIn"
+    known = false
+    for each entry in m.companion.signIns
+        if entry = accountId then known = true
+    end for
+    if not known then m.companion.signIns.Push(accountId)
     companionSend(silocontrol.pairing.serverResult(m.companion.push.url, ""))
     ' The new session has already moved the app on (Home or the picker is
     ' under it); the screen comes back on top for tvOS's "Signed in" and
@@ -607,27 +660,80 @@ sub companionSignedIn()
     log.info("companion", "signed in")
 end sub
 
-' The phone is done, or it did not say so in time: "You're all set" (tvOS's
-' completed state). A second call, as the phone leaves, changes nothing.
+' The phone is done, or it did not push again in time: "You're all set"
+' (tvOS's completed state). An attempt after the last sign-in that is
+' still in flight is withdrawn. A second call, as the phone leaves,
+' changes nothing.
 sub companionFinish()
-    if not m.companion.finishing or m.companion.stage <> "signedIn" then return
+    if not m.companion.finishing or m.companion.stage = "completed" then return
+    companionAbandon()
     m.companion.stage = "completed"
-    companionPublish()
+    companionShowScreen()
     companionRestartTimer(m.companionFinishTimer, COMPANION_COMPLETE_SECONDS)
 end sub
 
 sub onCompanionFinishTimer()
-    if m.companion.stage = "completed" then companionComplete() else companionFinish()
+    if m.companion.stage = "completed"
+        companionComplete()
+    else if m.companion.stage = "signedIn"
+        companionFinish()
+    end if
 end sub
 
-' Continue, or the end of the wait: the receiver stops and the app moves on.
+' Continue, or the end of the wait: the receiver stops and the app moves on,
+' to the picker of the one account signed in, or with several, to Change
+' Account over the first one's (companionOpenAccounts).
 sub companionComplete()
     if not m.companion.finishing then return
     m.companion.finishing = false
+    first = ""
+    if m.companion.signIns.Count() > 1 then first = m.companion.signIns[0]
     companionStop("")
     companionRefresh()
+    if first <> "" then companionOpenAccounts(first)
     ' Home may have rendered under the Companion screen, where the offer waits.
     launchOfferCheck()
+end sub
+
+' Several accounts signed in (section 5 step 5): the first is made the open
+' one, its picker waiting for the viewer, so it shows as Current and Back
+' from Change Account opens its picker; Change Account then shows over it,
+' on its server with focus on its card (AccountsScreen starts on the open
+' account). The first may also be the last to sign in, its profile perhaps
+' open already: useAccount closes it all the same. Change Account shows
+' once the session has that account open on its picker
+' (companionAccountsDue), or at once if it could not be opened.
+sub companionOpenAccounts(accountId as String)
+    m.companion.accountsFor = accountId
+    handle = api.newHandle(COMPANION_OWNER)
+    handle.observeField("status", "onCompanionAccount")
+    m.companion.accountsHandle = handle
+    apiSend({ session: "useAccount", accountId: accountId, profileId: "", choose: true }, handle)
+end sub
+
+sub onCompanionAccount(event as Object)
+    handle = event.getRoSGNode()
+    if m.companion.accountsHandle = invalid or not handle.isSameNode(m.companion.accountsHandle) then return
+    m.companion.accountsHandle = invalid
+    result = api.resultOf(handle)
+    if result = invalid or result.ok <> true or companionOnPicker() then companionShowAccounts()
+end sub
+
+sub companionAccountsDue()
+    if m.companion.accountsFor <> "" and companionOnPicker() then companionShowAccounts()
+end sub
+
+' Whether the session has the account Change Account waits for open, with
+' no profile chosen yet.
+function companionOnPicker() as Boolean
+    return util.text(m.apiSession.accountId) = m.companion.accountsFor and not util.isObject(m.apiSession.profile)
+end function
+
+sub companionShowAccounts()
+    if m.companion.accountsFor = "" then return
+    m.companion.accountsFor = ""
+    top = nav.stack.topEntry(m.navStack)
+    if top <> invalid and top.route <> nav.route.ACCOUNTS then navPush(nav.route.ACCOUNTS, { pushed: true })
 end sub
 
 ' A failure stays on screen until the viewer acts; the phone hears why.
@@ -678,7 +784,9 @@ sub companionPublish()
     end if
     alternate = ""
     if m.companion.alternate <> invalid then alternate = m.companion.alternate.url
-    status = { stage: m.companion.stage, serverName: name, address: address, http: LCase(Left(address, 7)) = "http://", userCode: m.companion.userCode, matchCode: m.companion.matchCode, failure: m.companion.failure, alternate: alternate, signIn: m.companion.mode = "login" }
+    accountName = ""
+    if push <> invalid then accountName = util.text(push.accountName)
+    status = { stage: m.companion.stage, serverName: name, accountName: accountName, signedInAs: m.companion.signedInAs, accounts: m.companion.signIns.Count(), address: address, http: LCase(Left(address, 7)) = "http://", userCode: m.companion.userCode, matchCode: m.companion.matchCode, failure: m.companion.failure, alternate: alternate, signIn: m.companion.mode = "login" }
     m.top.companionStatus = status
     platformPublish({ type: platform.topic.COMPANION_STATUS, status: status })
 end sub
@@ -716,16 +824,25 @@ sub companionAct(action as String)
         companionBegin()
     else if action = "continue" and stage = "completed"
         companionComplete()
-    else if action = "cancel" and stage <> "signedIn" and stage <> "completed"
+    else if action = "cancel" and stage <> "completed"
+        ' After a sign-in, the session ends with what it signed in.
         companionAbandon()
         if stage = "unreachable" and m.companion.push <> invalid then companionSend(silocontrol.pairing.serverResult(m.companion.push.url, "unreachable"))
         companionClosePhone(silocontrol.pairing.cancel("receiver_cancelled"))
+        if m.companion.signedIn
+            companionFinish()
+            return
+        end if
         m.companion.stage = "idle"
         companionLeaveScreen()
     else if action = "dismiss" and stage = "failed"
         ' tvOS's Try again ends the session; the phone starts over, and its
         ' next push asks for consent again.
         companionClosePhone(silocontrol.pairing.cancel("receiver_cancelled"))
+        if m.companion.signedIn
+            companionFinish()
+            return
+        end if
         m.companion.consented = false
         m.companion.stage = "idle"
         m.companion.failure = ""

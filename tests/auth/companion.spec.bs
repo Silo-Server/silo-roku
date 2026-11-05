@@ -21,16 +21,20 @@ namespace tests
             return tests.sessions.create(record)
         end function
 
-        ' Checks address (https://other.example), whose identity is srv-1.
-        function checked(loop as Object, identity = "srv-1" as String, address = "https://other.example" as String) as Object
-            tests.sessions.send(loop, { requestId: "s1", session: "companionServer", address: address, identity: "srv-1" })
+        ' Checks address (https://other.example), whose identity is srv-1,
+        ' for the phone's session pairing; the server takes session binding
+        ' when bound.
+        function checked(loop as Object, identity = "srv-1" as String, address = "https://other.example" as String, bound = false as Boolean, pairing = "pair-1" as String) as Object
+            tests.sessions.send(loop, { requestId: "s1", session: "companionServer", address: address, identity: "srv-1", pairing: pairing })
             tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, tests.sessions.systemInfo(address))
             tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/system/identity"), 200, { server_id: identity })
+            capability = tests.sessions.runningId(loop, api.auth.coordinator.CAPABILITY_PATH)
+            if capability <> invalid then tests.sessions.respond(loop, capability, 200, { state: "available", cancel: true, session_binding: bound })
             return loop.delivered.s1
         end function
 
-        function begun(loop as Object, address = "https://other.example" as String) as Object
-            m.checked(loop, "srv-1", address)
+        function begun(loop as Object, address = "https://other.example" as String, bound = false as Boolean, pairing = "pair-1" as String) as Object
+            m.checked(loop, "srv-1", address, bound, pairing)
             tests.sessions.send(loop, { requestId: "d1", session: "companionStart", deviceName: "Living Room" })
             tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, m.started())
             return loop.delivered.d1
@@ -74,6 +78,7 @@ namespace tests
             info.Delete(api.auth.server.ORIGIN_MEMBER)
             tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, info)
             tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/system/identity"), 200, { server_id: "srv-1" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.coordinator.CAPABILITY_PATH), 404)
             m.assertEqual(loop.delivered.s1.body, { origin: "https://other.example", serverIdentity: "srv-1" })
         end sub
 
@@ -224,6 +229,145 @@ namespace tests
             m.assertEqual(view.origin, "https://other.example")
             m.assertEqual([view.accountId <> "", loop.session.saved.serverUserId], [true, "7"])
             m.assertEqual(loop.session.saved.refreshToken, "cref")
+        end sub
+
+        @describe("several sign-ins in one phone's session")
+
+        ' A running request's body as the server would see it.
+        function bodyOf(loop as Object, path as String) as Object
+            return loop.running[tests.sessions.runningId(loop, path)].request.body
+        end function
+
+        ' Checks address and starts a login there; gives the start's body.
+        function startBody(loop as Object, address as String, bound as Boolean, pairing = "pair-1" as String) as Object
+            m.checked(loop, "srv-1", address, bound, pairing)
+            tests.sessions.send(loop, { requestId: "d1", session: "companionStart", deviceName: "Living Room" })
+            body = m.bodyOf(loop, "/api/v2/auth/device/start")
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/start"), 201, m.started())
+            return body
+        end function
+
+        function approvedAs(id as String, username as String) as Object
+            approval = m.approved()
+            approval.tokens.user = { id: id, username: username, role: "user" }
+            approval.tokens.access_token = "acc-" + id
+            return approval
+        end function
+
+        ' Begins a login and polls it to an approval as user id.
+        function signInAs(loop as Object, address as String, id as String, username as String) as Object
+            m.begun(loop, address)
+            tests.sessions.send(loop, { requestId: "p-" + id, session: "companionPoll" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, m.approvedAs(id, username))
+            return loop.delivered["p-" + id]
+        end function
+
+        @it("keeps each sign-in as its own account, on any server, and the same account twice as one")
+        sub _()
+            loop = m.fresh()
+            sam = m.signInAs(loop, "https://other.example", "7", "sam")
+            alex = m.signInAs(loop, "https://other.example", "8", "alex")
+            lake = m.signInAs(loop, "https://lake.example", "8", "alex")
+            m.assertEqual([sam.body.status, sam.body.username, sam.body.origin], ["approved", "sam", "https://other.example"])
+            m.assertNotEqual(sam.body.accountId, alex.body.accountId)
+            m.assertNotEqual(alex.body.accountId, lake.body.accountId, "the same user on another server is another account")
+            m.assertEqual(lake.body.accountId, loop.session.saved.accountId, "the last sign-in is open")
+            again = m.signInAs(loop, "https://other.example", "7", "sam")
+            m.assertEqual(again.body.accountId, sam.body.accountId, "signing in again refreshes the saved account")
+            m.assertEqual(api.auth.coordinator.accountsOn(loop.session, "https://other.example"), 2)
+            m.assertEqual(api.auth.coordinator.accountsOn(loop.session, "https://lake.example"), 1)
+        end sub
+
+        @it("binds every login of a session to one secret on servers that take it, and proves it on each poll")
+        sub _()
+            loop = m.fresh()
+            start = m.startBody(loop, "https://other.example", true)
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            poll = m.bodyOf(loop, "/api/v2/auth/device/poll")
+            m.assertEqual([Len(start.binding), Len(poll.binding_secret)], [43, 43])
+            m.assertTrue(CreateObject("roRegex", "^[A-Za-z0-9_-]{43}$", "").IsMatch(start.binding))
+            secret = CreateObject("roByteArray")
+            secret.FromBase64String(poll.binding_secret.Replace("-", "+").Replace("_", "/") + "=")
+            m.assertEqual(secret.Count(), 32)
+            m.assertEqual(api.auth.binding.encode(api.auth.binding.digest(secret)), start.binding, "the binding is SHA-256 of the secret")
+            m.assertFalse(FormatJson(loop.delivered).Instr(poll.binding_secret) >= 0, "the secret never reaches the render thread")
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 200, m.approved())
+            ' The next login of the same session, on another server, carries
+            ' the same binding; another phone's session gets its own.
+            m.assertEqual(m.startBody(loop, "https://lake.example", true).binding, start.binding)
+            tests.sessions.send(loop, { requestId: "c1", session: "companionCancel" })
+            m.assertNotEqual(m.startBody(loop, "https://lake.example", true, "pair-2").binding, start.binding)
+        end sub
+
+        @it("sends no binding to a server that does not take it, or whose capability cannot be read")
+        sub _()
+            loop = m.fresh()
+            m.assertEqual(m.startBody(loop, "https://other.example", false), { device_name: "Living Room", device_platform: "roku" })
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            m.assertEqual(m.bodyOf(loop, "/api/v2/auth/device/poll"), { device_code: "dev-secret" })
+            loop = m.fresh()
+            tests.sessions.send(loop, { requestId: "s1", session: "companionServer", address: "https://other.example", identity: "srv-1", pairing: "pair-1" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, tests.sessions.systemInfo("https://other.example"))
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/system/identity"), 200, { server_id: "srv-1" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.coordinator.CAPABILITY_PATH), 503)
+            m.assertTrue(loop.delivered.s1.ok, "a failed capability read is no binding, not a failure")
+            tests.sessions.send(loop, { requestId: "d1", session: "companionStart", deviceName: "Living Room" })
+            m.assertFalse(m.bodyOf(loop, "/api/v2/auth/device/start").DoesExist("binding"))
+        end sub
+
+        @it("reads a capability without session_binding, as today's servers answer, as no binding")
+        sub _()
+            loop = m.fresh()
+            tests.sessions.send(loop, { requestId: "s1", session: "companionServer", address: "https://other.example", identity: "srv-1", pairing: "pair-1" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, tests.sessions.systemInfo("https://other.example"))
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/system/identity"), 200, { server_id: "srv-1" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.coordinator.CAPABILITY_PATH), 200, { state: "available", cancel: true })
+            m.assertEqual(loop.delivered.s1.body, { origin: "https://other.example", serverIdentity: "srv-1" })
+            tests.sessions.send(loop, { requestId: "d1", session: "companionStart", deviceName: "Living Room" })
+            m.assertEqual(m.bodyOf(loop, "/api/v2/auth/device/start"), { device_name: "Living Room", device_platform: "roku" })
+        end sub
+
+        @it("sends no binding or secret over plain HTTP, even to a server that takes binding")
+        sub _()
+            loop = m.fresh()
+            m.assertEqual(m.startBody(loop, "http://nas.local:8096", true), { device_name: "Living Room", device_platform: "roku" })
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            m.assertEqual(m.bodyOf(loop, "/api/v2/auth/device/poll"), { device_code: "dev-secret" })
+        end sub
+
+        @it("answers binding_mismatch when the server refuses the secret, and keeps the request to withdraw")
+        sub _()
+            loop = m.fresh()
+            m.begun(loop, "https://other.example", true)
+            tests.sessions.send(loop, { requestId: "p1", session: "companionPoll" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/auth/device/poll"), 403, { type: "https://siloserver.org/docs/api/v2/problems/device_binding_mismatch", title: "Device binding mismatch", status: 403, detail: "x", instance: "urn:silo:request:9" })
+            m.assertEqual(loop.delivered.p1.error.kind, "binding_mismatch")
+            tests.sessions.send(loop, { requestId: "c1", session: "companionCancel" })
+            m.assertEqual(m.bodyOf(loop, "/api/v2/auth/device/cancel"), { device_code: "dev-secret" })
+        end sub
+
+        @describe("the binding secret")
+
+        @it("hashes a secret as the server checks it, base64url without padding")
+        sub _()
+            zeros = CreateObject("roByteArray")
+            for i = 1 to 32
+                zeros.Push(0)
+            end for
+            m.assertEqual(api.auth.binding.forSecret(zeros), { secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", binding: "Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU" })
+            counting = CreateObject("roByteArray")
+            for i = 0 to 31
+                counting.Push(i)
+            end for
+            m.assertEqual(api.auth.binding.forSecret(counting), { secret: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", binding: "Yw3NKWbEM2aRElRIu7JbT_QSpJxzLbLIq8G4WBvXEN0" })
+        end sub
+
+        @it("makes a new 32-byte secret each time")
+        sub _()
+            first = api.auth.binding.newSecret("device-1")
+            second = api.auth.binding.newSecret("device-1")
+            m.assertEqual([first.Count(), second.Count()], [32, 32])
+            m.assertNotEqual(first.ToHexString(), second.ToHexString())
         end sub
 
         @describe("competing sign-ins")

@@ -556,7 +556,9 @@ needs an IV. `tests/control/sealed.spec.bs` holds vectors from Node's
 
 ### 9.3 What depends on randomness
 
-Only the pairing key needs secret randomness. The Roku makes it as SHA-256 of
+Only the pairing key, and companion sign-in's session binding secret
+([`companion-pairing.md`](companion-pairing.md) section 5.1, made the same
+way from eight UUIDs), need secret randomness. The Roku makes the key as SHA-256 of
 four `GetRandomUUID()` values, the installation ID, and the uptime in
 milliseconds, and keeps the first 16 bytes. Nonces only need to be unique,
 and the Roku makes its nonce from a registry counter plus a UUID. Roku does

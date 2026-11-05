@@ -10,16 +10,25 @@ import "pkg:/source/util/values.bs"
 ' api.auth.coordinator, whose decisions it returns.
 '
 ' Session operations:
-'   { session: "companionServer", address, identity }  checks a pushed
-'       server as setup checks a typed one (system/info with api_major 2 and
-'       request_origin), then reads its deployment identity, which must be
-'       identity when that is given; answers { origin, serverIdentity }. The
-'       origin is then confirmed for this attempt, and nothing is stored.
+'   { session: "companionServer", address, identity, pairing }  checks a
+'       pushed server as setup checks a typed one (system/info with
+'       api_major 2 and request_origin), then reads its deployment identity,
+'       which must be identity when that is given, and whether it takes
+'       session binding (auth/device/capability's session_binding, at an
+'       https origin only; a failed read is no); answers { origin,
+'       serverIdentity }. The origin is then confirmed for this attempt, and
+'       nothing is stored. pairing names the phone's session: the first
+'       check of a new one makes its binding secret (api.auth.binding),
+'       which every later attempt in it uses.
 '   { session: "companionStart", deviceName }  starts a device login at the
-'       confirmed origin; answers { userCode, matchCode, interval, expiresIn }
-'   { session: "companionPoll" }  polls once; answers { status, pollAfter }.
-'       An approval installs the session as a password sign-in does, with
-'       that origin as the Roku's server.
+'       confirmed origin, with the session's binding when that server takes
+'       it; answers { userCode, matchCode, interval, expiresIn }
+'   { session: "companionPoll" }  polls once, proving the binding secret
+'       when the login carries a binding; answers { status, pollAfter }, and
+'       on an approval also { accountId, username, origin }: the saved account it
+'       installed, as a password sign-in does, with that origin as the
+'       Roku's server. A poll the server refuses for its binding secret
+'       answers the error binding_mismatch.
 '   { session: "companionCancel" }  ends the attempt and withdraws its open
 '       request, best effort; a start still in flight is withdrawn when it
 '       answers
@@ -33,12 +42,15 @@ import "pkg:/source/util/values.bs"
 namespace api.auth.coordinator
     const IDENTITY_PATH = "/api/v2/system/identity"
     const COMPANION_TIMEOUT_MS = 15000
+    ' The poll's refusal of a wrong or missing binding_secret.
+    const BINDING_MISMATCH = "device_binding_mismatch"
 
     function companionServer(state as Object, input as Object) as Object
         address = api.auth.server.normalize(input.address, true)
         if address.error <> invalid then return [reply(api.response.failure(input, address.error))]
         state.companion = invalid
         state.companionAttempt += 1
+        companionPairing(state, util.text(input.pairing))
         request = build(state, { owner: util.text(input.owner) }, { method: "GET", url: address.url + api.auth.server.INFO_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "companionInfo", origin: address.url, attempt: state.companionAttempt, input: input })
         return [submit(request)]
     end function
@@ -62,15 +74,36 @@ namespace api.auth.coordinator
         found = util.text(result.body.server_id).Trim()
         wanted = util.text(input.identity).Trim()
         if found = "" or (wanted <> "" and found <> wanted) then return [reply(api.response.failure(input, "identity_mismatch"))]
-        state.companion = { origin: op.origin, check: op.check, deviceCode: "", attempt: op.attempt }
-        return [reply(succeeded(input, { origin: op.origin, serverIdentity: found }, result.status))]
+        request = build(state, { owner: util.text(input.owner) }, { method: "GET", url: op.origin + CAPABILITY_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "companionCapability", origin: op.origin, attempt: op.attempt, check: op.check, serverIdentity: found, input: input })
+        return [submit(request)]
     end function
+
+    ' Whether the server takes session binding; any failure to say so is
+    ' no, and the login goes without one. Only an https origin gets it: on
+    ' plain HTTP the secret would reach the on-path attacker it defends
+    ' against.
+    function companionCapable(state as Object, op as Object, result as Object) as Object
+        input = op.input
+        if op.attempt <> state.companionAttempt then return [reply(api.response.failure(input, "handoff_gone"))]
+        binding = invalid
+        if result.ok = true and util.isObject(result.body) and util.isTrue(result.body.session_binding) and LCase(Left(op.origin, 8)) = "https://" and state.companionPairing <> invalid then binding = state.companionPairing.binding
+        state.companion = { origin: op.origin, check: op.check, deviceCode: "", attempt: op.attempt, binding: binding }
+        return [reply(succeeded(input, { origin: op.origin, serverIdentity: op.serverIdentity }, 200))]
+    end function
+
+    ' The phone's session pairing: a new one gets a new binding secret.
+    sub companionPairing(state as Object, sessionId as String)
+        if state.companionPairing <> invalid and state.companionPairing.id = sessionId then return
+        state.companionPairing = { id: sessionId, binding: api.auth.binding.forSecret(api.auth.binding.newSecret(util.text(state.saved.deviceId))) }
+    end sub
 
     function companionStart(state as Object, input as Object) as Object
         companion = state.companion
         if companion = invalid then return [reply(api.response.failure(input, "origin_unverified"))]
         name = api.auth.headers.clampName(input.deviceName)
-        request = build(state, { owner: util.text(input.owner) }, { method: "POST", url: companion.origin + DEVICE_START_PATH, body: { device_name: name, device_platform: api.auth.headers.DEVICE_PLATFORM }, timeoutMs: COMPANION_TIMEOUT_MS }, { kind: "companionStart", origin: companion.origin, attempt: companion.attempt, input: input })
+        body = { device_name: name, device_platform: api.auth.headers.DEVICE_PLATFORM }
+        if companion.binding <> invalid then body.binding = companion.binding.binding
+        request = build(state, { owner: util.text(input.owner) }, { method: "POST", url: companion.origin + DEVICE_START_PATH, body: body, timeoutMs: COMPANION_TIMEOUT_MS }, { kind: "companionStart", origin: companion.origin, attempt: companion.attempt, input: input })
         return [submit(request)]
     end function
 
@@ -98,7 +131,9 @@ namespace api.auth.coordinator
     function companionPoll(state as Object, input as Object) as Object
         companion = state.companion
         if companion = invalid or companion.deviceCode = "" then return [reply(api.response.failure(input, "handoff_gone"))]
-        request = build(state, { owner: util.text(input.owner) }, { method: "POST", url: companion.origin + DEVICE_POLL_PATH, body: { device_code: companion.deviceCode }, timeoutMs: COMPANION_TIMEOUT_MS }, { kind: "companionPoll", origin: companion.origin, deviceCode: companion.deviceCode, input: input })
+        body = { device_code: companion.deviceCode }
+        if companion.binding <> invalid then body.binding_secret = companion.binding.secret
+        request = build(state, { owner: util.text(input.owner) }, { method: "POST", url: companion.origin + DEVICE_POLL_PATH, body: body, timeoutMs: COMPANION_TIMEOUT_MS }, { kind: "companionPoll", origin: companion.origin, deviceCode: companion.deviceCode, input: input })
         return [submit(request)]
     end function
 
@@ -110,6 +145,9 @@ namespace api.auth.coordinator
         companion = state.companion
         if companion = invalid or companion.deviceCode <> op.deviceCode then return [reply(api.response.failure(input, "handoff_gone"))]
         body = result.body
+        ' The request stays open on the server, and polling again cannot
+        ' help; the caller withdraws it.
+        if result.ok <> true and util.isObject(result.error) and util.text(result.error.problemType) = BINDING_MISMATCH then return [reply(api.response.failure(input, "binding_mismatch"))]
         if result.ok <> true or not util.isObject(body) then return [reply(answerFor(input, result))]
         status = util.text(body.status)
         pollAfter = 0
@@ -147,6 +185,10 @@ namespace api.auth.coordinator
             decisions.Append(withdraw)
         end if
         decisions.Append(installAccount(state, user, tokens, now))
+        ' The render thread keeps the session's sign-ins (AppSceneCompanion).
+        answer.accountId = state.saved.accountId
+        answer.username = state.saved.username
+        answer.origin = companion.origin
         decisions.Append(originSettled(state, companion.origin, companion.check))
         decisions.Append([persist(), publish(), reply(succeeded(input, answer, status))])
         return decisions
@@ -178,7 +220,7 @@ namespace api.auth.coordinator
     ' attempt confirmed that origin.
     function companionCredentials(state as Object, op as Object, url as String) as Object
         if not api.request.isSameOrigin(url, op.origin) then return { headers: {}, error: "invalid_request" }
-        if op.kind = "companionInfo" or op.kind = "companionIdentity" then return { headers: api.auth.headers.identity(state.facts, false), error: invalid }
+        if op.kind = "companionInfo" or op.kind = "companionIdentity" or op.kind = "companionCapability" then return { headers: api.auth.headers.identity(state.facts, false), error: invalid }
         ' A withdrawal goes where its request was started, after the attempt ended.
         if op.kind = "companionCancel" then return { headers: api.auth.headers.identity(state.facts, true), error: invalid }
         if state.companion = invalid or state.companion.origin <> op.origin then return { headers: {}, error: "origin_unverified" }
