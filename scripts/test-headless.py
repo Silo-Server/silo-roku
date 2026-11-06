@@ -61,6 +61,10 @@ SHARDS = [
     ("detail-tracks", ["views/detailTracks.spec.bs", "auth", "control"]),
     ("views", ["views"]),
     ("player", ["player"]),
+    # The player shard sat at its heap limit (it ran out at 1,900 MB before
+    # the shared catalog arrived), and the catalog's larger tables tipped it
+    # over on CI: the card overlay specs run on their own.
+    ("player-overlays", ["player/overlays.spec.bs"]),
     # The party player's specs outgrew the player shard's heap once main's
     # rendition and native-subtitle specs joined it.
     ("player-party", ["player/party.spec.bs"]),

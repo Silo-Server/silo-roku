@@ -18,7 +18,9 @@ values and compares them:
   new key at 1 and at 2.
 
 Every {placeholder} gets the count, so a ".one" text that spelled out "1"
-compares equal to the new "{count} ..." at 1. Exits 1 and lists each mismatch.
+compares equal to the new "{count} ..." at 1. The placeholders must also come
+in the same order under the same names; the new text may add one, the count
+an old ".one" text spelled out. Exits 1 and lists each mismatch.
 """
 import argparse
 import json
@@ -36,6 +38,14 @@ def english_category(count):
 
 def render(text, count):
     return PLACEHOLDER.sub(str(count), text)
+
+
+def same_placeholders(old, new):
+    """Whether new names old's placeholders in old's order, plus at most one
+    more: the count a ".one" text spelled out."""
+    was, now = PLACEHOLDER.findall(old), PLACEHOLDER.findall(new)
+    added = [name for name in now if name not in was]
+    return len(added) <= 1 and [name for name in now if name in was] == was
 
 
 def main():
@@ -73,6 +83,8 @@ def main():
                 failures.append(f"{key}: {new_key} is missing")
             elif render(got, count if count is not None else 7) != want:
                 failures.append(f"{key} -> {new_key}: {want!r} != {render(got, count or 7)!r}")
+            elif not same_placeholders(text, got):
+                failures.append(f"{key} -> {new_key}: placeholders {text!r} != {got!r}")
     for line in failures:
         print(line, file=sys.stderr)
     print(f"{len(old)} old keys, {len(renames)} renamed or plural, {len(failures)} mismatches")
