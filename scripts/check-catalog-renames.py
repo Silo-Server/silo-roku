@@ -19,8 +19,8 @@ values and compares them:
 
 Every {placeholder} gets the count, so a ".one" text that spelled out "1"
 compares equal to the new "{count} ..." at 1. The placeholders must also come
-in the same order under the same names; the new text may add one, the count
-an old ".one" text spelled out. Exits 1 and lists each mismatch.
+in the same order under the same names; a plural form may add one, the count
+an old ".one" text spelled out, which its ".other" form must also show. Exits 1 and lists each mismatch.
 """
 import argparse
 import json
@@ -40,12 +40,17 @@ def render(text, count):
     return PLACEHOLDER.sub(str(count), text)
 
 
-def same_placeholders(old, new):
+def same_placeholders(old, new, counts):
     """Whether new names old's placeholders in old's order, plus at most one
-    more: the count a ".one" text spelled out."""
+    of counts: the plural's count, which a ".one" text spelled out."""
     was, now = PLACEHOLDER.findall(old), PLACEHOLDER.findall(new)
     added = [name for name in now if name not in was]
-    return len(added) <= 1 and [name for name in now if name in was] == was
+    return len(added) <= 1 and set(added) <= counts and [name for name in now if name in was] == was
+
+
+def plural_counts(new, key):
+    """The placeholders of key's ".other" form, one of which is its count."""
+    return set(PLACEHOLDER.findall(new.get(key + ".other", "")))
 
 
 def main():
@@ -83,7 +88,7 @@ def main():
                 failures.append(f"{key}: {new_key} is missing")
             elif render(got, count if count is not None else 7) != want:
                 failures.append(f"{key} -> {new_key}: {want!r} != {render(got, count or 7)!r}")
-            elif not same_placeholders(text, got):
+            elif not same_placeholders(text, got, plural_counts(new, entry["key"]) if count is not None else set()):
                 failures.append(f"{key} -> {new_key}: placeholders {text!r} != {got!r}")
     for line in failures:
         print(line, file=sys.stderr)
