@@ -2193,7 +2193,14 @@ seven-row scrolling window.
   "Show Who's Watching whenever you return to Silo.", "Show Who's Watching
   when you've been away from Silo for 1 hour.", and for 12 hours). It is
   this device's, saved on the Roku, and shows even when the server's
-  settings fail to load. Then Show Title Art; Play Theme Music and Loop
+  settings fail to load. Then, under Appearance, App language
+  (`ui.app_language`, written for the profile, where the server's contract
+  lists it): "Match device" (no value) and each language the package
+  ships, named in its own language and script (English, Español, Deutsch,
+  Français, Português (Brasil), 日本語, 简体中文). A stored language Roku
+  does not ship (Arabic, or a regional tag such as `es-MX`) stays selected
+  under its name and is never rewritten as Match device. Then Show Title
+  Art; Play Theme Music and Loop
   Theme Music, under
   Theme Music, when the server offers theme music
   (`GET /api/v2/catalog/themes/capabilities`), each written for this Roku
@@ -2316,7 +2323,12 @@ Roku as it is, and the work package that builds the change deletes the row.
 | SF Pro, and SF Mono for small uppercase headers | Inter, as on Android TV | SF Pro and SF Mono cannot ship outside Apple platforms |
 | Heavy and Black titles; the detail title in Black Compressed at 92 px | Inter Bold; the detail title at 84 px | Package size: four weights only, and Inter ships no compressed width at that weight |
 | Letter-spaced small text (badge chips, uppercase headers) | Spacing approximated with hair spaces (`theme.tracked`) | Roku `Label` has no letter-spacing field |
-| System fonts cover every script | Titles in scripts outside Latin, Greek, Cyrillic, and Vietnamese (for example CJK and Arabic) render as boxes | Neither the packaged Inter subset nor Roku's system font covers them, and a CJK font does not fit the 4 MB package |
+| System fonts cover every script | Titles in scripts outside Latin, Greek, Cyrillic, and Vietnamese (for example CJK and Arabic) render as boxes, except in Japanese and Simplified Chinese, where the characters the interface itself uses draw | Neither the packaged Inter subset nor Roku's system font covers them, and a full CJK font does not fit the 4 MB package; a font the server serves for metadata is a later follow-up |
+| The app follows the system language, and Arabic lays out right to left | Arabic is not offered; a profile or device set to Arabic gets the device's other language or English | Roku documents no right-to-left layout or Arabic shaping in SceneGraph, and every screen places its controls by fixed x positions |
+| One system font draws every language | Japanese and Simplified Chinese replace Inter everywhere with one weight of Noto Sans JP or SC, subset to the characters the interface uses (`scripts/subset-cjk-fonts.sh`); Latin text in those languages draws in Noto, timecodes stay in Inter's tabular digits, and letter-spaced text is not spaced | SceneGraph has no font fallback, so a locale's font must cover all its text; package size allows one weight per language; Noto has no hair space |
+| tvOS shows an in-app language picker in its settings (where it has one) | App language sits in General under Appearance, the manifest's category for it | tvOS has no App language row yet; revisit when it does |
+| A new app language applies in place | Settings rebuilds every screen, with Settings on top again; a profile's first screen waits up to 3 seconds for its language, and an answer that comes later applies at the next launch | Screens copy their strings and fonts when they are built; a later rebuild would tear down a player a deep link or Watch Party opened |
+| `pt-PT` and other Portuguese tags fall back to English where only `pt-BR` ships | Any Portuguese tag gets Português (Brasil) | Closer to the viewer's language than English; Roku's device list has no `pt-PT` of its own |
 | Panels, buttons, cards, and the hero's title cast soft shadows, and a focused card's caption glows; focused controls change over 120 ms or more | Cards use a shadow 9-patch (5.2) and lift with the list's own focus animation; panels open with tvOS's 0.12 s fade; panels, buttons, and the title have no shadow, captions no glow; detail action circles animate width and label reveal on the normal tier (5.6), while the low tier snaps | Roku has no blur, and animations cost frames on 512 MB devices |
 | Focused cards lift on every device, with a white outline at 70% | On the low tier, cards do not scale and the list draws its 9-patch ring (`#EDEDED`, opaque) in place of the outline | Plan section 4.6: frame rate on 512 MB and non-OpenGL devices |
 | A focused card scales by one factor (1.05) about its centre | Each side grows by whole px, so the two axes differ slightly: a row's poster lifts to 184×278, Browse's to 274×410, Search's to 252×378, a landscape card or detail episode still to 378×210. The card and its outline scale about its top-left corner and move back by that lift (a landscape card 9 and 5 px), so their left and top edges are whole px exactly | At a fractional edge Roku drew the art a pixel past the 9-patch frame that rounds the corners, a white line down a lifted card's right edge (hardware run 26). Scaled about its centre, a float's 1.2 put the first Continue Watching card's left edge at x 43.99998, and Roku drew its progress bar, a Rectangle, from x 43, a tick left of the frame's corner (runs 26 and 27) |
@@ -2676,7 +2688,8 @@ components/
   tasks/                   network and decoding Task nodes
   views/                   reusable rows, cards, dialogs, empty/error states
 images/                    packaged icons and splash artwork
-locale/                    localized strings
+locale/                    localized strings, generated by silo-translations
+i18n-charsets/             each language's characters, for the CJK font subset
 tests/                     Rooibos unit, contract, and device-flow tests
   fixtures/                vendored server fixtures with a SOURCE pin
 docs/
@@ -2931,7 +2944,9 @@ Every authenticated request carries:
   `.`, `_`, `:`, and `-`, at most 128 characters;
 - `X-Silo-Device-Name` and `X-Silo-Device-Platform: roku`;
 - `X-Silo-Client: Silo Roku`, `X-Silo-Client-Version`, `X-Silo-Client-Build`,
-  and `X-Silo-Client-Channel` (`release`, `beta`, `sideload`, or `dev`).
+  and `X-Silo-Client-Channel` (`release`, `beta`, `sideload`, or `dev`);
+- `Accept-Language: <applied language>` (`en`, `es`, `de`, `fr`, `pt-BR`,
+  `ja`, `zh-Hans`), only to the configured server, like the client headers.
 
 Settings reads and writes also send `X-Silo-Client-Family: tv`.
 

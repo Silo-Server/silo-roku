@@ -190,6 +190,33 @@ and are stored only in a temporary, private curl configuration during upload.
 
 Sideloaded builds are for development only; they are not release evidence.
 
+## Translations
+
+The interface strings come from the shared catalog in `Silo-Server/silo-translations`.
+`locale/<folder>/strings.json`, `source/util/pluralRules.bs`, and
+`i18n-charsets/<folder>.txt` are generated there; never edit them here. A new
+string, or a change to an English one, starts as a pull request to that repository.
+`scripts/sync-translations` (vendored from its `tools/sync-translations.sh`; keep the
+copies identical) installs a release and records it in `.silo-translations`:
+
+```sh
+scripts/sync-translations --version <release>         # needs gh access to the repository
+scripts/sync-translations --local <silo-translations checkout>   # unreleased output
+scripts/subset-cjk-fonts.sh                            # when i18n-charsets/ja or zh_Hans changed
+```
+
+Commit the generated files, `.silo-translations`, and any rebuilt `fonts/` together.
+`npm run check:fonts` (in `npm run ci`) fails when a charset changed and the
+Japanese or Chinese font was not rebuilt. Plurals are `key.<category>` entries;
+read them with `i18n.plural(key, count, values)` (or `i18n.pluralIn(table, ...)` in a
+Task), never with a `count = 1` test. Keys whose last segment is a CLDR category
+(`one`, `other`, ...) are reserved for plurals.
+
+`scripts/check-catalog-renames.py` shows that the generated English renders every key
+of the last hand-written catalog (1dc62a8d) the same way, through
+`scripts/catalog-renames.json`. It is a record of that move, not a CI check: English
+wording changes on purpose in later catalog pull requests.
+
 ## Signed packages
 
 Roku signs packages only on a device in Developer Mode, with a key made once by
