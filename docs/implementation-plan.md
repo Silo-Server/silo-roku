@@ -914,7 +914,8 @@ only from Settings or the prompt after a crash.
 - **Beacons:** `AppDialogInitiate`/`AppDialogComplete` around server entry,
   sign-in, profile picker, PIN, and any pre-Home error dialog the user must
   dismiss. `AppLaunchComplete` once per launch, when Home is fully rendered: the
-  hero and the visible rows have content and their artwork has loaded or failed.
+  hero shows a card and the visible rows have their cards. Artwork is not
+  waited for (AG-57).
   For a deep link, once playback has started and accepts remote keys. The port
   8085 beacon report is the primary measurement.
 - **Deep links** (criteria 5.1, 5.2): `Main(args)` and `roInput` events with
