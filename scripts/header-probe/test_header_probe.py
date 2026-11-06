@@ -26,6 +26,10 @@ SECRET_QUERY = "st=SECRET-SIGNED-TOKEN"
 # before a client that reads little and hangs up is noticed.
 LONG_ENTRIES = 200_000
 BIG_BODY = 8 * 1024 * 1024
+# What endless.ts promises. Hosts may raise their TCP buffer ceilings far past
+# BIG_BODY (64 MiB on the Silo dev hosts), so a cut test cannot rely on a fixed
+# body outlasting the buffers; endless.ts writes until its connection breaks.
+ENDLESS_BODY = 1024 * 1024 * 1024
 DRIP_CHUNK = b"\0" * 1024
 DRIP_INTERVAL = 0.05
 
@@ -301,6 +305,9 @@ class Upstream(http.server.BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(query)
             self.drip(float(params.get("s", ["5"])[0]), int(params.get("kib", ["1"])[0]))
             return
+        if path.endswith("/endless.ts"):
+            self.endless()
+            return
         if path.endswith("/short.m3u8"):
             # Promises more than it sends, then closes: a truncated read.
             self.close_connection = True
@@ -324,6 +331,20 @@ class Upstream(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         except OSError:
             Upstream.dropped.set()  # the probe hung up after its client did, or a cut
+
+    def endless(self):
+        """A body larger than any socket buffer: ENDLESS_BODY bytes, a MiB at a
+        time, until the connection breaks."""
+        chunk = b"\0" * (1024 * 1024)
+        self.send_response(200)
+        self.send_header("Content-Length", str(ENDLESS_BODY))
+        self.end_headers()
+        for _ in range(ENDLESS_BODY // len(chunk)):
+            try:
+                self.wfile.write(chunk)
+            except OSError:
+                Upstream.dropped.set()
+                return
 
     def drip(self, seconds, kib=1):
         """A body sent slowly over `seconds`, as a long range request is read:
@@ -736,14 +757,14 @@ class EndToEndTests(unittest.TestCase):
         origin, _ = self.start()
         # Roku stops reading an original while its buffer is full: the relay
         # waits on the client, not on the upstream.
-        client, head = self.open_get(origin, "/api/v2/stream/s1/big.ts", rcvbuf=4096)
+        client, head = self.open_get(origin, "/api/v2/stream/s1/endless.ts", rcvbuf=4096)
         self.assertTrue(head.startswith(b"HTTP/1.1 200 "))
         time.sleep(0.5)
         self.control("refuse-media", "close")
         time.sleep(1)
         received, how = self.finish_get(client)
         self.assertEqual(how, "close")
-        self.assertLess(received, BIG_BODY)
+        self.assertLess(received, ENDLESS_BODY)
         self.assertTrue(Upstream.dropped.wait(5), "the upstream connection is closed too")
         [entry] = [entry for entry in self.entries() if "time" in entry]
         self.assertEqual((entry["class"], entry["action"], entry["status"], entry["refusal"], entry["open"]), ("stream", "refuse", 0, "close", True))
