@@ -1,15 +1,102 @@
+import "pkg:/source/util/pluralRules.bs"
 import "pkg:/source/util/values.bs"
 
 ' User-facing copy (plan section 4.9). Strings live in
-' locale/<locale>/strings.json as { "key": "text" }, English in en_US. A
-' locale's file overrides English key by key, and a key missing everywhere
-' shows as itself. "{name}" in a string is replaced by values.name; names are
-' lowercase.
+' locale/<folder>/strings.json as { "key": "text" }, generated from the
+' shared silo-translations catalog (scripts/sync-translations; never edit
+' them by hand), English in en_US. A language's file overrides English key by
+' key, and a key missing everywhere shows as itself. "{name}" in a string is
+' replaced by values.name; names are lowercase.
 '
 '     label.text = i18n.text("setup.connect")
 '     label.text = i18n.text("signIn.body", { server: host })
+'     label.text = i18n.plural("search.result", total)
+'
+' A plural is one entry per CLDR category of the language, "key.one",
+' "key.other", ... (pluralRules.category picks one). A loaded table also holds
+' "@locale", its folder, and "@plural.<key>" = "en_US" for each plural its
+' language's file has not translated, which then reads English's entries with
+' English's category (the silo-translations README's Roku contract).
 namespace i18n
     const FALLBACK_LOCALE = "en_US"
+    const UNUSED_PREFIX = "settingsManifest."
+    const UNUSED_PREFIX_LENGTH = 17
+
+    ' The languages this package ships, in picker order: the locale folder,
+    ' its BCP 47 tag (Accept-Language, ui.app_language), and its own name.
+    ' Roku leaves out Arabic, which it cannot lay out right to left (decision
+    ' D9). The en_XA pseudo-locale is generated but not offered.
+    function languages() as Object
+        return [
+            { folder: "en_US", tag: "en", name: "English" },
+            { folder: "es", tag: "es", name: "Español" },
+            { folder: "de", tag: "de", name: "Deutsch" },
+            { folder: "fr", tag: "fr", name: "Français" },
+            { folder: "pt_BR", tag: "pt-BR", name: "Português (Brasil)" },
+            { folder: "ja", tag: "ja", name: "日本語" },
+            { folder: "zh_Hans", tag: "zh-Hans", name: "简体中文" }
+        ]
+    end function
+
+    ' The shipped folder for a language tag in BCP 47 or Roku form ("es-MX",
+    ' "es_MX", "zh-Hans-CN"), or "" when none ships. An exact tag or folder
+    ' wins; then Chinese in Simplified script or from mainland China or
+    ' Singapore (no Hant) gets zh_Hans; then any other regional tag gets its
+    ' language's folder ("es-MX" es, "pt-PT" pt_BR, "en-GB" en_US). Pure.
+    function match(tag as Dynamic) as String
+        if not util.isString(tag) then return ""
+        wanted = LCase(tag.Trim()).Replace("_", "-")
+        if wanted = "" then return ""
+        parts = wanted.Split("-")
+        language = parts[0]
+        script = ""
+        region = ""
+        for i = 1 to parts.Count() - 1
+            part = parts[i]
+            if Len(part) = 4 and script = "" and region = ""
+                script = part
+            else if (Len(part) = 2 or Len(part) = 3) and region = ""
+                region = part
+            end if
+        end for
+        shipped = languages()
+        for each entry in shipped
+            if wanted = LCase(entry.tag) or wanted = LCase(entry.folder.Replace("_", "-")) then return entry.folder
+        end for
+        if language = "zh"
+            if script = "hant" then return ""
+            if script <> "hans" and region <> "" and region <> "cn" and region <> "sg" then return ""
+        end if
+        for each entry in shipped
+            if LCase(entry.tag.Split("-")[0]) = language then return entry.folder
+        end for
+        return ""
+    end function
+
+    ' The folder to show: the profile's ui.app_language when this package
+    ' ships it, else the device locale's (GetCurrentLocale, "es_MX"), else
+    ' English (spec "Choosing the language at runtime"; decisions D6 and D9).
+    ' Pure.
+    function resolve(override as Dynamic, deviceLocale as Dynamic) as String
+        folder = match(override)
+        if folder = "" then folder = match(deviceLocale)
+        if folder = "" then folder = FALLBACK_LOCALE
+        return folder
+    end function
+
+    ' The BCP 47 tag of a shipped folder, "en" for any other.
+    function tagOf(folder as String) as String
+        for each entry in languages()
+            if entry.folder = folder then return entry.tag
+        end for
+        return "en"
+    end function
+
+    ' The applied folder (AppScene's i18n.apply), else the device locale's.
+    function locale() as String
+        if m.global <> invalid and m.global.hasField("appLocale") and m.global.appLocale <> "" then return m.global.appLocale
+        return resolve(invalid, CreateObject("roDeviceInfo").GetCurrentLocale())
+    end function
 
     ' The template with each {name} replaced by values[name] as text. Pure.
     function format(template as String, values = invalid as Dynamic) as String
@@ -28,36 +115,114 @@ namespace i18n
         return key
     end function
 
-    ' The strings for a locale such as "fr_CA": English, overridden by the
-    ' locale's own file when the package has one.
-    function load(locale as String) as Object
+    ' Whether a strings table has key, rather than lookup's echo. Pure.
+    function has(strings as Object, key as String) as Boolean
+        return util.isString(strings[key])
+    end function
+
+    ' The plural message key at count in a strings table, with values (and
+    ' {count}, unless values names it) filled in: the entry of count's CLDR
+    ' category in the table's language, or English's for a plural the
+    ' language has not translated; then key.other; then key as a plain
+    ' message (lookup). Pure.
+    function pluralIn(strings as Object, key as String, count as Dynamic, values = invalid as Dynamic) as String
+        n = 0
+        if util.isNumber(count) then n = Int(count)
+        language = strings["@plural." + key]
+        if not util.isString(language) then language = strings["@locale"]
+        if not util.isString(language) then language = FALLBACK_LOCALE
+        found = strings[key + "." + pluralRules.category(language, n)]
+        if not util.isString(found) then found = strings[key + ".other"]
+        if not util.isString(found) then found = lookup(strings, key)
+        filled = { count: n }
+        if util.isObject(values) then filled.Append(values)
+        return format(found, filled)
+    end function
+
+    ' The entries pluralIn reads for key, to copy into a projection of a
+    ' strings table (catalog.cards.words and the like). Pure.
+    function pluralEntries(strings as Object, key as String) as Object
+        out = {}
+        for each category in ["zero", "one", "two", "few", "many", "other"]
+            found = strings[key + "." + category]
+            if util.isString(found) then out[key + "." + category] = found
+        end for
+        for each marker in ["@plural." + key, "@locale"]
+            if util.isString(strings[marker]) then out[marker] = strings[marker]
+        end for
+        return out
+    end function
+
+    ' The strings for a locale folder such as "pt_BR": English, overridden by
+    ' the folder's own file, with the markers pluralIn reads. A folder the
+    ' package lacks reads as English.
+    function load(folder as String) as Object
         strings = readFile(FALLBACK_LOCALE)
-        if locale <> FALLBACK_LOCALE then strings.Append(readFile(locale))
+        if folder <> FALLBACK_LOCALE
+            own = readFile(folder)
+            for each key in strings
+                if Right(key, 6) = ".other" and not own.DoesExist(key) then own["@plural." + Left(key, Len(key) - 6)] = FALLBACK_LOCALE
+            end for
+            strings.Append(own)
+        end if
+        strings["@locale"] = folder
         return strings
     end function
 
-    function readFile(locale as String) as Object
-        raw = ReadAsciiFile("pkg:/locale/" + locale + "/strings.json")
+    function readFile(folder as String) as Object
+        raw = ReadAsciiFile("pkg:/locale/" + folder + "/strings.json")
         if raw = "" then return {}
         parsed = ParseJson(raw)
         if not util.isObject(parsed) then return {}
+        ' The settings manifest's labels (settingsManifest.*), which no Roku
+        ' screen reads yet, would make every component's copy of the table a
+        ' third larger.
+        unused = []
+        for each key in parsed
+            if Left(key, UNUSED_PREFIX_LENGTH) = UNUSED_PREFIX then unused.Push(key)
+        end for
+        for each key in unused
+            parsed.Delete(key)
+        end for
         return parsed
     end function
 
-    ' Render thread: puts the device locale's strings in m.global, once; the
-    ' first i18n.text call does it when nothing has.
+    ' Render thread: puts the applied language's strings in m.global, once;
+    ' the first i18n.text call does it when nothing has.
     sub install()
         if m.global.hasField("strings") then return
-        m.global.addFields({ strings: load(CreateObject("roDeviceInfo").GetCurrentLocale()) })
+        folder = locale()
+        m.global.addFields({ appLocale: folder, strings: load(folder) })
+    end sub
+
+    ' Render thread: makes folder the applied language. Components already
+    ' built keep the strings they copied; AppScene rebuilds its screens.
+    sub apply(folder as String)
+        if not m.global.hasField("strings")
+            m.global.addFields({ appLocale: folder, strings: load(folder) })
+        else
+            m.global.setFields({ appLocale: folder, strings: load(folder) })
+        end if
+        m.i18nStrings = invalid
     end sub
 
     ' Render thread: the string for key, with values filled in. Each component
     ' copies the table from m.global once.
     function text(key as String, values = invalid as Dynamic) as String
+        return format(lookup(table(), key), values)
+    end function
+
+    ' Render thread: pluralIn over the component's copy of the table.
+    function plural(key as String, count as Dynamic, values = invalid as Dynamic) as String
+        return pluralIn(table(), key, count, values)
+    end function
+
+    ' Render thread: the component's copy of the applied table.
+    function table() as Object
         if m.i18nStrings = invalid
             install()
             m.i18nStrings = m.global.strings
         end if
-        return format(lookup(m.i18nStrings, key), values)
+        return m.i18nStrings
     end function
 end namespace
