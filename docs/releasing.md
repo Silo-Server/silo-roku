@@ -18,8 +18,11 @@ and publishes a GitHub prerelease, `Silo Roku 1.0.0 (12)`, whose notes list
 the pull requests merged since the previous build, grouped by label
 (`.github/release.yml`).
 
-Download the `silo-roku-1.0.0-12-beta` artifact from the run and upload its
-`.pkg` to the beta app in the Roku Developer Dashboard. The run's summary has
+Download the `silo-roku-1.0.0-12-beta.pkg` artifact from the run and upload
+it to the beta app in the Roku Developer Dashboard. Release builds before
+1.0.0 (2) stored packages zipped (artifacts named without `.pkg`): unzip
+those and upload the `.pkg` inside, since the dashboard rejects the zip as
+"incorrectly packaged". The run's summary has
 release notes cut to Roku's 1,500 characters. Packages never go on the public
 prerelease.
 
