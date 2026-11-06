@@ -2194,7 +2194,8 @@ seven-row scrolling window.
   when you've been away from Silo for 1 hour.", and for 12 hours). It is
   this device's, saved on the Roku, and shows even when the server's
   settings fail to load. Then, under Appearance, App language
-  (`ui.app_language`, written for the profile, where the server's contract
+  (`ui.app_language`, written for the profile after clearing this Roku's own
+  value, so the choice follows the person; where the server's contract
   lists it): "Match device" (no value) and each language the package has
   translations for, named in its own language and script (English,
   Español, Deutsch, Français, Português (Brasil), 日本語, 简体中文 as they
