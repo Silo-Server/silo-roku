@@ -2195,11 +2195,14 @@ seven-row scrolling window.
   this device's, saved on the Roku, and shows even when the server's
   settings fail to load. Then, under Appearance, App language
   (`ui.app_language`, written for the profile, where the server's contract
-  lists it): "Match device" (no value) and each language the package
-  ships, named in its own language and script (English, Español, Deutsch,
-  Français, Português (Brasil), 日本語, 简体中文). A stored language Roku
-  does not ship (Arabic, or a regional tag such as `es-MX`) stays selected
-  under its name and is never rewritten as Match device. Then Show Title
+  lists it): "Match device" (no value) and each language the package has
+  translations for, named in its own language and script (English,
+  Español, Deutsch, Français, Português (Brasil), 日本語, 简体中文 as they
+  arrive). A stored language the list lacks (Arabic, one not translated
+  yet, or a regional tag such as `es-MX`) stays selected under its name and
+  is never rewritten as Match device. Match device follows the Roku's
+  language only once that language has translations; a stored choice
+  applies any language the package carries. Then Show Title
   Art; Play Theme Music and Loop
   Theme Music, under
   Theme Music, when the server offers theme music
