@@ -1,0 +1,140 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/nav/phase.bs"
+import "pkg:/source/nav/routes.bs"
+import "pkg:/source/nav/stack.bs"
+import "pkg:/source/settings/appLanguage.bs"
+import "pkg:/source/util/i18n.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' AppScene's language (spec "Choosing the language at runtime";
+' source/settings/appLanguage.bs). Before sign-in the screens use the last
+' override applied, kept in the registry, else the device's language. When a
+' profile opens, the main shell's first screen waits up to
+' LANGUAGE_WAIT_SECONDS for the profile's ui.app_language, so Home builds once,
+' in its language: screens copy their strings and fonts when they are built.
+' Any navigation in that wait (a deep link, a phone, Watch Party) goes ahead
+' at once, and an answer that comes after only keeps the override for the
+' next launch, so no player is torn down for a language. Settings' App
+' language row reads the value again after a change, and a new language
+' then rebuilds the stack, with Settings on top again.
+
+const LANGUAGE_OWNER = "language"
+const LANGUAGE_WAIT_SECONDS = 3
+
+sub languageInit()
+    ' The ui.app_language applied, "" for the device's language.
+    m.languageOverride = ""
+    ' The reset that waits: { decision }.
+    m.languageHeld = invalid
+    ' The read under way: { handle, identity, rebuild }; rebuild for one
+    ' after Settings changed the value.
+    m.languageRead = invalid
+    m.languageTimer = m.top.findNode("languageTimer")
+    m.languageTimer.duration = LANGUAGE_WAIT_SECONDS
+    m.languageTimer.observeField("fire", "onLanguageWait")
+end sub
+
+' callFunc("languageStart", override) from Main, before ApiTask starts:
+' the kept override (appLanguage.read), "" for none.
+sub languageStart(override as String)
+    m.languageOverride = override
+    languageApply(i18n.resolve(override, CreateObject("roDeviceInfo").GetCurrentLocale()))
+end sub
+
+' Makes folder the applied language for screens built from now on, ApiTask's
+' answers, and Accept-Language. Gives whether it changed.
+function languageApply(folder as String) as Boolean
+    if m.global.hasField("appLocale") and m.global.appLocale = folder and m.global.hasField("strings") then return false
+    i18n.apply(folder)
+    apiConfigure({ locale: folder, language: i18n.tagOf(folder) })
+    log.info("language", "applied", { folder: folder })
+    return true
+end function
+
+' navShellChanged: whether decision's reset waits for the profile's app
+' language, which it does for a profile opening in the main shell. A newer
+' decision replaces one that waits.
+function languageHolds(decision as Object) as Boolean
+    m.languageHeld = invalid
+    m.languageTimer.control = "stop"
+    if decision.shell.phase <> nav.phase.MAIN then return false
+    languageSendRead(false)
+    m.languageHeld = { decision: decision }
+    m.languageTimer.control = "start"
+    return true
+end function
+
+' callFunc("languageChanged") from Settings after it saved ui.app_language:
+' the effective value can differ (a profile_device value outranks a profile
+' one), so it is read again.
+sub languageChanged()
+    languageSendRead(true)
+end sub
+
+' Sends the effective read, fenced to the identity it is for, in place of
+' any under way.
+sub languageSendRead(rebuild as Boolean)
+    if m.languageRead <> invalid then apiCancel(m.languageRead.handle.requestId)
+    handle = api.newHandle(LANGUAGE_OWNER)
+    handle.observeField("status", "onLanguageRead")
+    request = appLanguage.readRequest()
+    request.fence = sessionIdentity()
+    m.languageRead = { handle: handle, identity: request.fence, rebuild: rebuild }
+    apiSend(request, handle)
+end sub
+
+' Navigation in the wait (navPush and the rest), or the wait running out:
+' the held reset goes now, in the language already applied.
+sub languageFlush()
+    if m.languageHeld = invalid then return
+    log.info("language", "went ahead without the app language")
+    languageRelease()
+end sub
+
+' The held reset, if any, goes now.
+sub languageRelease()
+    held = m.languageHeld
+    if held = invalid then return
+    m.languageHeld = invalid
+    m.languageTimer.control = "stop"
+    navReset(held.decision)
+end sub
+
+sub onLanguageWait()
+    languageFlush()
+end sub
+
+sub onLanguageRead(event as Object)
+    read = m.languageRead
+    if read = invalid or not read.handle.isSameNode(event.getRoSGNode()) then return
+    m.languageRead = invalid
+    ' An answer for an identity no longer open is not this profile's.
+    if not languageSameIdentity(read.identity, sessionIdentity()) then return
+    tag = appLanguage.tagOf(api.resultOf(read.handle))
+    holding = m.languageHeld <> invalid
+    if tag <> invalid
+        if tag <> m.languageOverride then apiSend(appLanguage.cacheRequest(tag), api.newHandle(LANGUAGE_OWNER))
+        m.languageOverride = tag
+        ' An answer late for the wait is kept for the next launch, applied
+        ' then.
+        if holding or read.rebuild
+            changed = languageApply(i18n.resolve(tag, CreateObject("roDeviceInfo").GetCurrentLocale()))
+            if changed and not holding then languageRebuild()
+        end if
+    end if
+    languageRelease()
+end sub
+
+' After Settings changed the language: the stack starts over at the main
+' shell's root, with Settings on top, so every screen shows the new one.
+sub languageRebuild()
+    if m.navShell.phase <> nav.phase.MAIN then return
+    root = nav.phase.rootRoute(m.navShell.phase)
+    navApply(nav.stack.reset(m.navStack, root, {}))
+    navApply(nav.stack.push(m.navStack, nav.route.SETTINGS, {}))
+end sub
+
+function languageSameIdentity(a as Object, b as Object) as Boolean
+    return a.server = b.server and a.account = b.account and a.profile = b.profile
+end function

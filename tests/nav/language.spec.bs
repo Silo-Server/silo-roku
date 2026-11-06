@@ -1,0 +1,131 @@
+namespace tests
+
+    ' AppScene's language (components/AppSceneLanguage.bs) in LanguageProbe.
+    @suite("app language at runtime")
+    class AppLanguageSceneTests extends rooibos.BaseTestSuite
+
+        @describe("language")
+
+        @afterEach
+        sub restore()
+            i18n.apply("en_US")
+        end sub
+
+        function effective(value as Dynamic) as Object
+            return { ok: true, status: 200, body: { items: [{ key: "ui.app_language", value: value, source: "profile" }] } }
+        end function
+
+        @it("starts in the kept override before sign-in, else in the device's language")
+        sub _()
+            probe = CreateObject("roSGNode", "LanguageProbe")
+            probe.callFunc("probeStart", "ja")
+            state = probe.callFunc("probeState")
+            m.assertEqual(state.locale, "ja")
+            m.assertEqual(state.config[0], { locale: "ja", language: "ja" })
+            probe.callFunc("probeStart", "ar")
+            m.assertEqual(probe.callFunc("probeState").locale, i18n.resolve(invalid, CreateObject("roDeviceInfo").GetCurrentLocale()))
+        end sub
+
+        @it("holds a profile's first screen for its app language, then builds it in that language")
+        sub _()
+            probe = CreateObject("roSGNode", "LanguageProbe")
+            probe.callFunc("probeStart", "")
+            m.assertFalse(probe.callFunc("probeShell", nav.phase.PROFILE, ""))
+            m.assertTrue(probe.callFunc("probeShell", nav.phase.MAIN, "p1"))
+            state = probe.callFunc("probeState")
+            m.assertTrue(state.held)
+            m.assertEqual(state.resets.Count(), 1)
+            read = state.sent[0]
+            m.assertEqual(read.path, "/api/v2/settings/values/effective")
+            m.assertEqual(read.query.keys, ["ui.app_language"])
+            m.assertEqual(read.fence, { server: "https://silo.example", account: "a1", profile: "p1" })
+            probe.callFunc("probeAnswer", 0, m.effective("pt-BR"))
+            state = probe.callFunc("probeState")
+            m.assertFalse(state.held)
+            m.assertEqual(state.resets[1], { phase: nav.phase.MAIN, locale: "pt_BR" })
+            m.assertEqual(state.config[state.config.Count() - 1], { locale: "pt_BR", language: "pt-BR" })
+            ' The override is kept for the next launch.
+            m.assertEqual(state.sent[1], { storage: "appLanguage", tag: "pt-BR" })
+        end sub
+
+        @it("follows the device for a profile without one, or a server without the setting, and keeps no override")
+        sub _()
+            device = i18n.resolve(invalid, CreateObject("roDeviceInfo").GetCurrentLocale())
+            state = invalid
+            for each answer in [m.effective(invalid), { ok: false, status: 404, body: invalid }, m.effective("ar")]
+                probe = CreateObject("roSGNode", "LanguageProbe")
+                probe.callFunc("probeStart", "ja")
+                probe.callFunc("probeShell", nav.phase.MAIN, "p1")
+                probe.callFunc("probeAnswer", 0, answer)
+                state = probe.callFunc("probeState")
+                m.assertEqual(state.resets[0].locale, device)
+            end for
+            m.assertEqual(state.sent[1], { storage: "appLanguage", tag: "ar" })
+        end sub
+
+        @it("goes ahead in the language it has when the read fails or the wait runs out")
+        sub _()
+            probe = CreateObject("roSGNode", "LanguageProbe")
+            probe.callFunc("probeStart", "de")
+            probe.callFunc("probeShell", nav.phase.MAIN, "p1")
+            probe.callFunc("probeAnswer", 0, { ok: false, status: 503, body: invalid })
+            state = probe.callFunc("probeState")
+            m.assertEqual(state.resets[0].locale, "de")
+            m.assertEqual(state.sent.Count(), 1)
+            probe = CreateObject("roSGNode", "LanguageProbe")
+            probe.callFunc("probeStart", "de")
+            probe.callFunc("probeShell", nav.phase.MAIN, "p1")
+            probe.callFunc("probeWait")
+            m.assertEqual(probe.callFunc("probeState").resets[0].locale, "de")
+        end sub
+
+        @it("lets navigation in the wait go first, and only keeps a late answer for the next launch")
+        sub _()
+            probe = CreateObject("roSGNode", "LanguageProbe")
+            probe.callFunc("probeStart", "")
+            probe.callFunc("probeShell", nav.phase.MAIN, "p1")
+            probe.callFunc("probeNavigate")
+            state = probe.callFunc("probeState")
+            m.assertFalse(state.held)
+            m.assertEqual(state.routes, [nav.route.HOME, nav.route.PLAYER])
+            probe.callFunc("probeAnswer", 0, m.effective("ja"))
+            state = probe.callFunc("probeState")
+            ' The player stays; the language waits for the next launch.
+            m.assertEqual(state.routes, [nav.route.HOME, nav.route.PLAYER])
+            m.assertEqual(state.resets.Count(), 1)
+            m.assertNotEqual(state.locale, "ja")
+            m.assertEqual(state.sent[1], { storage: "appLanguage", tag: "ja" })
+        end sub
+
+        @it("drops an answer for a profile no longer open")
+        sub _()
+            probe = CreateObject("roSGNode", "LanguageProbe")
+            probe.callFunc("probeStart", "")
+            probe.callFunc("probeShell", nav.phase.MAIN, "p1")
+            probe.callFunc("probeShell", nav.phase.MAIN, "p2")
+            state = probe.callFunc("probeState")
+            m.assertEqual(state.cancelled, ["l1"])
+            probe.callFunc("probeAnswer", 0, m.effective("ja"))
+            state = probe.callFunc("probeState")
+            m.assertTrue(state.held)
+            m.assertEqual(state.sent.Count(), 2)
+            probe.callFunc("probeAnswer", 1, m.effective("fr"))
+            m.assertEqual(probe.callFunc("probeState").locale, "fr")
+        end sub
+
+        @it("rebuilds the stack with Settings on top after Settings changes the language")
+        sub _()
+            probe = CreateObject("roSGNode", "LanguageProbe")
+            probe.callFunc("probeStart", "")
+            probe.callFunc("probeShell", nav.phase.MAIN, "p1")
+            probe.callFunc("probeAnswer", 0, m.effective(invalid))
+            probe.callFunc("probeChanged")
+            state = probe.callFunc("probeState")
+            m.assertEqual(state.sent[state.sent.Count() - 1].fence.profile, "p1")
+            probe.callFunc("probeAnswer", state.sent.Count() - 1, m.effective("es"))
+            state = probe.callFunc("probeState")
+            m.assertEqual(state.locale, "es")
+            m.assertEqual(state.routes, [nav.route.HOME, nav.route.SETTINGS])
+        end sub
+    end class
+end namespace
