@@ -199,7 +199,13 @@ ships, with a folder and a charset, once it has strings; `i18n.languages()` read
 `locale/languages.json`, and `i18n.known()` gives each language's tag and name (add
 one there before its folder ships). Only the dev build carries the `en_XA`
 pseudo-locale, and offers it last in Settings > App language, for checking
-longer text on the device. A new
+longer text on the device. Dates use Roku's own formats for the device
+locale unless the profile chose a language the device doesn't speak; then
+the catalog's words write them (`catalog.detail.dateText`,
+`i18n.nativeFormats`). Text that leaves the Roku or is compared stays English
+in every language: the episode line and title sent to a phone, the stream's
+title, and the server's "Season N" titles that `catalog.series.ownTitle`
+matches. A new
 string, or a change to an English one, starts as a pull request to that repository.
 `scripts/sync-translations` (vendored from its `tools/sync-translations.sh`; keep the
 copies identical) installs a release, records it in `.silo-translations`, and lists
