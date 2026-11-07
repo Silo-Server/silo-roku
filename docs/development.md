@@ -193,21 +193,27 @@ Sideloaded builds are for development only; they are not release evidence.
 ## Translations
 
 The interface strings come from the shared catalog in `Silo-Server/silo-translations`.
-`locale/<folder>/strings.json`, `source/util/pluralRules.bs`, and
-`i18n-charsets/<folder>.txt` are generated there; never edit them here. A new
+`locale/<folder>/strings.json`, `locale/languages.json`, `source/util/pluralRules.bs`,
+and `i18n-charsets/<folder>.txt` are generated there; never edit them here. A language
+ships, with a folder and a charset, once it has strings; `i18n.languages()` reads
+`locale/languages.json`, and `i18n.known()` gives each language's tag and name (add
+one there before its folder ships). A new
 string, or a change to an English one, starts as a pull request to that repository.
 `scripts/sync-translations` (vendored from its `tools/sync-translations.sh`; keep the
-copies identical) installs a release and records it in `.silo-translations`:
+copies identical) installs a release, records it in `.silo-translations`, and lists
+its files in `.silo-translations-files`, removing those of a language that stopped
+shipping:
 
 ```sh
 scripts/sync-translations --version <release>         # needs gh access to the repository
 scripts/sync-translations --local <silo-translations checkout>   # unreleased output
-scripts/subset-cjk-fonts.sh                            # when i18n-charsets/ja or zh_Hans changed
+scripts/subset-cjk-fonts.sh                            # when i18n-charsets/ja or zh_Hans changed, came or went
 ```
 
-Commit the generated files, `.silo-translations`, and any rebuilt `fonts/` together.
-`npm run check:fonts` (in `npm run ci`) fails when a charset changed and the
-Japanese or Chinese font was not rebuilt. Plurals are `key.<category>` entries;
+Commit the generated files, `.silo-translations`, `.silo-translations-files`, and any
+rebuilt `fonts/` together. A Japanese or Chinese font ships only with its language.
+`npm run check:fonts` (in `npm run ci`) fails when a charset changed and the font was
+not rebuilt, or when a font is left without its charset. Plurals are `key.<category>` entries;
 read them with `i18n.plural(key, count, values)` (or `i18n.pluralIn(table, ...)` in a
 Task), never with a `count = 1` test. Keys whose last segment is a CLDR category
 (`one`, `other`, ...) are reserved for plurals.

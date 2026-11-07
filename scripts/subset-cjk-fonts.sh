@@ -5,13 +5,17 @@
 # language (i18n-charsets/<folder>.txt, written by scripts/sync-translations)
 # and the language's own name for the App language picker, which it must draw,
 # plus what the source has of the ranges in EXTRA. SceneGraph has no font fallback, so in
-# those languages these fonts replace Inter everywhere (theme.fontUri).
+# those languages these fonts replace Inter everywhere (theme.fontUri). A language
+# ships only once it has strings, and only a shipped one gets a charset; without one
+# its font is removed (and the license, when no font is left), since nothing could
+# apply that language.
 #
 #   scripts/subset-cjk-fonts.sh            rebuild fonts/NotoSans{JP,SC}-Medium.ttf
 #   scripts/subset-cjk-fonts.sh --check    fail when a charset or font changed
-#                                          since the last rebuild (no network)
+#                                          since the last rebuild, or a font is
+#                                          left without its charset (no network)
 #
-# Rerun after every sync that changes i18n-charsets/ja.txt or zh_Hans.txt, and
+# Rerun after every sync that adds, changes or removes i18n-charsets/ja.txt or zh_Hans.txt, and
 # commit fonts/ with it. The sources are Google Fonts' TrueType builds (not the
 # CFF .otf of notofonts/noto-cjk, which Roku has not been shown to draw),
 # downloaded at a pinned google/fonts commit into a fresh temporary directory
@@ -57,6 +61,13 @@ if [ "${1:-}" = "--check" ]; then
     status=0
     for entry in "${LANGUAGES[@]}"; do
         read -r folder stem _ <<< "$entry"
+        if [ ! -f "i18n-charsets/$folder.txt" ]; then
+            if [ -f "fonts/$stem-$WEIGHT_NAME.ttf" ]; then
+                echo "fonts/$stem-$WEIGHT_NAME.ttf ships but $folder does not (no i18n-charsets/$folder.txt); run scripts/subset-cjk-fonts.sh and commit fonts/" >&2
+                status=1
+            fi
+            continue
+        fi
         for file in "i18n-charsets/$folder.txt" "fonts/$stem-$WEIGHT_NAME.ttf"; do
             want=$(sed -n "s|^  $file  sha256 \([0-9a-f]*\).*|\1|p" "$RECORD")
             if [ ! -f "$file" ] || [ "$(sha256 "$file")" != "$want" ]; then
@@ -86,15 +97,29 @@ fetch() {
     printf '%s' "$out"
 }
 
-python3 -m venv "$work/venv"
-printf 'fonttools==%s --hash=sha256:%s\n' "$FONTTOOLS_VERSION" "$FONTTOOLS_SHA256" > "$work/requirements.txt"
-"$work/venv/bin/pip" install --quiet --disable-pip-version-check --no-deps --only-binary :all: \
-    --require-hashes -r "$work/requirements.txt"
-
-license=$(fetch "$LICENSE_SOURCE" "$LICENSE_SHA256")
-cp "$license" fonts/OFL-Noto.txt
 outputs=()
+building=()
 for entry in "${LANGUAGES[@]}"; do
+    read -r folder stem _ <<< "$entry"
+    if [ -f "i18n-charsets/$folder.txt" ]; then
+        building+=("$entry")
+    else
+        rm -f "fonts/$stem-$WEIGHT_NAME.ttf"
+        outputs+=("  i18n-charsets/$folder.txt  absent: $folder does not ship, so fonts/$stem-$WEIGHT_NAME.ttf is not built")
+    fi
+done
+
+if [ "${#building[@]}" = 0 ]; then
+    rm -f fonts/OFL-Noto.txt
+else
+    python3 -m venv "$work/venv"
+    printf 'fonttools==%s --hash=sha256:%s\n' "$FONTTOOLS_VERSION" "$FONTTOOLS_SHA256" > "$work/requirements.txt"
+    "$work/venv/bin/pip" install --quiet --disable-pip-version-check --no-deps --only-binary :all: \
+        --require-hashes -r "$work/requirements.txt"
+    license=$(fetch "$LICENSE_SOURCE" "$LICENSE_SHA256")
+    cp "$license" fonts/OFL-Noto.txt
+fi
+for entry in ${building[@]+"${building[@]}"}; do
     read -r folder stem path want name <<< "$entry"
     source=$(fetch "$path" "$want")
     charset=i18n-charsets/$folder.txt
