@@ -973,8 +973,14 @@ their existing HD/FHD assets.
     18 px SemiBold at 60%. Rows are 57 px with 26 px Regular labels. A
     focused row is `#EDEDED` with radius 12, and the current sort shows its
     direction and arrow.
-  - Sort options: Title, Date Added, Release Date, Year, Rating, Runtime, and
-    Resolution. Choosing the active sort again reverses it.
+  - Sort options: the web client's list, in its order and with its names:
+    Title, Date Added, Release Date, Latest Episode Air Date and Latest
+    Episode Added (series libraries only), Year, Content Rating, Duration,
+    IMDb Rating, TMDB Rating, Resolution, Bitrate, Progress, Date Viewed,
+    and Plays. The web's RT Critic and RT Audience sorts are left out until
+    this client reads the server's ratings capability (Roku deviation). The
+    menu shows 8 rows and scrolls. Choosing the active sort again reverses
+    it.
   - Filter pill: "Filter" in the Sort pill's style. While filters are set,
     their number (facets with a value; HDR and Dolby Vision count once)
     follows the label 10 px after it, 18 px Bold in a 26 px black 25%
