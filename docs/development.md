@@ -197,7 +197,9 @@ The interface strings come from the shared catalog in `Silo-Server/silo-translat
 and `i18n-charsets/<folder>.txt` are generated there; never edit them here. A language
 ships, with a folder and a charset, once it has strings; `i18n.languages()` reads
 `locale/languages.json`, and `i18n.known()` gives each language's tag and name (add
-one there before its folder ships). A new
+one there before its folder ships). Only the dev build carries the `en_XA`
+pseudo-locale, and offers it last in Settings > App language, for checking
+longer text on the device. A new
 string, or a change to an English one, starts as a pull request to that repository.
 `scripts/sync-translations` (vendored from its `tools/sync-translations.sh`; keep the
 copies identical) installs a release, records it in `.silo-translations`, and lists
