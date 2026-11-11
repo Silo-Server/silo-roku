@@ -16,6 +16,11 @@ namespace tests
             return nav.phase.onSession(nav.phase.create(), session)
         end function
 
+        ' after(), once Main's launch event has been handled.
+        function launchedWith(session as Object) as Object
+            return nav.phase.onSession(nav.phase.onLaunchEvent(nav.phase.create()).shell, session)
+        end function
+
         '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         @describe("phases from the session")
         '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -99,6 +104,115 @@ namespace tests
         end sub
 
         '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("Change Account in the picker's place (docs/spec.md section 7.5)")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("shows Change Account for a signed-in session that asks for the account first")
+        sub _()
+            asking = m.view("signed_in", "")
+            asking.launch = { behavior: "askEveryLaunch", asks: true, chooseAccount: true }
+            decision = m.launchedWith(asking)
+            m.assertEqual([decision.shell.phase, decision.root], [nav.phase.ACCOUNTS, nav.route.ACCOUNTS])
+            m.assertTrue(decision.reset)
+
+            ' One saved account, or Automatic: the picker, as before.
+            waiting = m.view("signed_in", "")
+            waiting.launch = { behavior: "askEveryLaunch", asks: true, chooseAccount: false }
+            m.assertEqual(m.after(waiting).shell.phase, nav.phase.PROFILE)
+            m.assertEqual(m.after(m.view("signed_in", "")).shell.phase, nav.phase.PROFILE, "a session without launch")
+        end sub
+
+        @it("starts over on the account's picker once it is chosen, the one already open included")
+        sub _()
+            asking = m.view("signed_in", "")
+            asking.launch = { asks: true, chooseAccount: true }
+            decision = m.launchedWith(asking)
+            ' The open account chosen again: the same identity, another phase.
+            chosen = m.view("signed_in", "")
+            chosen.launch = { asks: true, chooseAccount: false }
+            decision = nav.phase.onSession(decision.shell, chosen)
+            m.assertEqual([decision.shell.phase, decision.root], [nav.phase.PROFILE, nav.route.PROFILE])
+            m.assertTrue(decision.reset)
+        end sub
+
+        @it("never shows it with a profile open")
+        sub _()
+            opened = m.view("signed_in", "p1")
+            opened.launch = { asks: false, chooseAccount: true }
+            m.assertEqual(m.after(opened).shell.phase, nav.phase.MAIN)
+            m.assertEqual(m.launchedWith(opened).shell.phase, nav.phase.MAIN)
+        end sub
+
+        @it("shows no screen until Main's launch event, so a launch's deep link is known before Change Account is built")
+        sub _()
+            asking = m.view("signed_in", "")
+            asking.launch = { asks: true, chooseAccount: true }
+            ' The session arrived first.
+            decision = m.after(asking)
+            m.assertEqual([decision.shell.phase, decision.root], [nav.phase.LAUNCH, ""])
+            m.assertFalse(decision.reset)
+            ' No link came with the launch.
+            plain = nav.phase.onLaunchEvent(decision.shell)
+            m.assertEqual([plain.shell.phase, plain.root], [nav.phase.ACCOUNTS, nav.route.ACCOUNTS])
+            m.assertTrue(plain.reset)
+            ' A link did: the profile step, then the launch event changes nothing.
+            linked = nav.phase.onDeepLink(decision.shell, true)
+            m.assertEqual([linked.shell.phase, linked.root], [nav.phase.PROFILE, nav.route.PROFILE])
+            m.assertTrue(linked.reset)
+            settled = nav.phase.onLaunchEvent(linked.shell)
+            m.assertEqual(settled.shell.phase, nav.phase.PROFILE)
+            m.assertFalse(settled.reset)
+            ' The picker, and every other phase, never waits for it.
+            waiting = m.view("signed_in", "")
+            waiting.launch = { asks: true, chooseAccount: false }
+            m.assertEqual(m.after(waiting).shell.phase, nav.phase.PROFILE)
+            m.assertEqual(m.after(m.view("signed_out", "")).shell.phase, nav.phase.SIGN_IN)
+        end sub
+
+        @it("gives way to a deep link, which opens a profile without a screen, and comes back when the link ends without one")
+        sub _()
+            asking = m.view("signed_in", "")
+            asking.launch = { asks: true, chooseAccount: true }
+            ' The link arrived before the session: the profile step from the start.
+            linked = nav.phase.onDeepLink(nav.phase.create(), true)
+            m.assertEqual(linked.shell.phase, nav.phase.LAUNCH)
+            m.assertFalse(linked.reset)
+            linked = nav.phase.onLaunchEvent(linked.shell)
+            decision = nav.phase.onSession(linked.shell, asking)
+            m.assertEqual([decision.shell.phase, decision.root], [nav.phase.PROFILE, nav.route.PROFILE])
+            ' The link ended with no profile open.
+            decision = nav.phase.onDeepLink(decision.shell, false)
+            m.assertEqual([decision.shell.phase, decision.root], [nav.phase.ACCOUNTS, nav.route.ACCOUNTS])
+            m.assertTrue(decision.reset)
+            ' A link that arrives while Change Account shows.
+            decision = nav.phase.onDeepLink(decision.shell, true)
+            m.assertEqual(decision.shell.phase, nav.phase.PROFILE)
+            m.assertTrue(decision.reset)
+        end sub
+
+        @it("leaves every other phase alone when a link starts or ends")
+        sub _()
+            for each c in [["no_server", "", nav.phase.SETUP], ["signed_out", "", nav.phase.SIGN_IN], ["signed_in", "", nav.phase.PROFILE], ["signed_in", "p1", nav.phase.MAIN]]
+                decision = m.after(m.view(c[0], c[1]))
+                for each busy in [true, false]
+                    decision = nav.phase.onDeepLink(decision.shell, busy)
+                    m.assertEqual(decision.shell.phase, c[2], c[0])
+                    m.assertFalse(decision.reset, c[0])
+                end for
+                decision = nav.phase.onLaunchEvent(decision.shell)
+                m.assertEqual(decision.shell.phase, c[2], c[0])
+                m.assertFalse(decision.reset, c[0])
+            end for
+            ' No account open while another has a session: the link waits.
+            none = m.view("signed_out", "")
+            none.accountId = ""
+            none.accounts = [{ id: "2", signedIn: true }]
+            decision = nav.phase.onDeepLink(m.after(none).shell, true)
+            m.assertEqual(decision.shell.phase, nav.phase.ACCOUNTS)
+            m.assertFalse(decision.reset)
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         @describe("server update required")
         '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
@@ -140,6 +254,8 @@ namespace tests
             shell = m.after(m.view("signed_out", "")).shell
             before = FormatJson(shell)
             nav.phase.onUpdateRequired(shell, true)
+            nav.phase.onDeepLink(shell, true)
+            nav.phase.onLaunchEvent(shell)
             nav.phase.onSession(shell, m.view("no_server", ""))
             m.assertEqual(FormatJson(shell), before)
         end sub

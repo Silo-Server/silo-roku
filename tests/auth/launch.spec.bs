@@ -148,6 +148,118 @@ namespace tests
             m.assertFalse(m.launch(loop).asks)
         end sub
 
+        @describe("account first (docs/spec.md section 7.5)")
+
+        @it("asks for the account at a launch that asks who's watching, with more than one saved account")
+        sub _()
+            now = tests.sessions.NOW
+            cases = [
+                { behavior: onboarding.launch.EVERY_TIME, usedAt: 0, others: 1, account: true },
+                { behavior: onboarding.launch.EVERY_TIME, usedAt: 0, others: 0, account: false },
+                { behavior: onboarding.launch.AUTOMATIC, usedAt: now - 999999, others: 1, account: false },
+                { behavior: onboarding.launch.AFTER_ONE_HOUR, usedAt: now - 3599, others: 1, account: false },
+                { behavior: onboarding.launch.AFTER_ONE_HOUR, usedAt: now - 3600, others: 1, account: true },
+                { behavior: onboarding.launch.AFTER_TWELVE_HOURS, usedAt: now - 43200, others: 0, account: false }
+            ]
+            for each c in cases
+                record = m.remembering(c.behavior)
+                record.usedAt = c.usedAt
+                if c.others > 0 then m.onOther(record, true)
+                loop = tests.sessions.create(record)
+                view = api.auth.coordinator.view(loop.session)
+                label = c.behavior + " " + c.others.ToStr()
+                m.assertEqual(view.launch.chooseAccount, c.account, label)
+                m.assertEqual([view.status, view.accountId], ["signed_in", "1"], label + ": the last account stays the open one")
+                m.assertInvalid(view.profile, label)
+                phase = nav.phase.PROFILE
+                if c.account then phase = nav.phase.ACCOUNTS
+                m.assertEqual(nav.phase.onSession(nav.phase.onLaunchEvent(nav.phase.create()).shell, view).shell.phase, phase, label)
+            end for
+        end sub
+
+        @it("counts a saved account that must sign in again, on any server")
+        sub _()
+            record = m.remembering(onboarding.launch.EVERY_TIME)
+            m.onOther(record, false)
+            loop = tests.sessions.create(record)
+            view = api.auth.coordinator.view(loop.session)
+            m.assertTrue(view.launch.chooseAccount)
+            m.assertEqual([view.accounts[0].current, view.accounts[0].signedIn, view.accounts[1].signedIn], [true, true, false])
+        end sub
+
+        @it("opens the chosen account's picker, the open account's included, and never asks again until the next launch")
+        sub _()
+            ' The account already open, chosen on Change Account.
+            record = m.remembering(onboarding.launch.EVERY_TIME)
+            m.onOther(record, true)
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "u1", session: "useAccount", accountId: "1", profileId: "", choose: true })
+            m.assertEqual(loop.delivered.u1.body, { changed: true })
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.accountId, view.launch.chooseAccount, view.launch.asks, view.launch.afterSignIn], ["1", false, true, false])
+            m.assertEqual(nav.phase.onSession(nav.phase.create(), view).shell.phase, nav.phase.PROFILE)
+
+            ' Another account.
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "u2", session: "useAccount", accountId: "2", profileId: "", choose: true })
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.accountId, view.origin, view.launch.chooseAccount, view.launch.asks], ["2", "https://other.example", false, true])
+            m.assertEqual(api.auth.coordinator.record(loop.session).profileTokens, [], "Every Time asks its PIN again")
+            ' Change Account from the picker's footer goes back to the picker.
+            tests.sessions.send(loop, { requestId: "u3", session: "useAccount", accountId: "1", profileId: "", choose: true })
+            m.assertFalse(api.auth.coordinator.view(loop.session).launch.chooseAccount)
+        end sub
+
+        @it("gives way to a profile opened without a screen, as a deep link opens one")
+        sub _()
+            record = m.remembering(onboarding.launch.EVERY_TIME)
+            m.onOther(record, true)
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: { id: "p-free", name: "Sam", hasPin: false, isChild: false, avatarUrl: "" } })
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual(view.profile.id, "p-free")
+            m.assertFalse(view.launch.chooseAccount)
+            m.assertInvalid(view.launch.offer)
+        end sub
+
+        @it("asks for the account again when Silo comes back after time away, and not after a sign-in or a change of server")
+        sub _()
+            record = m.remembering(onboarding.launch.AUTOMATIC)
+            m.onOther(record, true)
+            loop = tests.sessions.create(record)
+            m.assertFalse(m.launch(loop).chooseAccount, "Automatic reopens the last account and profile")
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: m.owner() })
+            tests.sessions.send(loop, { requestId: "r2", session: "requireSelection", profileId: "p-owner" })
+            view = api.auth.coordinator.view(loop.session)
+            m.assertInvalid(view.profile)
+            m.assertEqual([view.accountId, view.launch.asks, view.launch.chooseAccount], ["1", true, true])
+
+            ' With one saved account, the picker as before.
+            loop = tests.sessions.create(m.remembering(onboarding.launch.AUTOMATIC))
+            tests.sessions.send(loop, { requestId: "r1", session: "selectProfile", profile: m.owner() })
+            tests.sessions.send(loop, { requestId: "r2", session: "requireSelection", profileId: "p-owner" })
+            m.assertFalse(m.launch(loop).chooseAccount)
+
+            ' A sign-in names the account itself: its picker follows.
+            record = tests.sessions.signedOut()
+            record.launchBehavior = onboarding.launch.EVERY_TIME
+            m.onOther(record, true)
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "r1", session: "signIn", username: "laura", password: "hunter2" })
+            tests.sessions.respond(loop, "r1", 200, tests.sessions.fixture("login_ok"))
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.status, view.launch.asks, view.launch.chooseAccount], ["signed_in", true, false])
+
+            ' So does a saved server chosen from the list.
+            record = m.remembering(onboarding.launch.EVERY_TIME)
+            m.onOther(record, true)
+            loop = tests.sessions.create(record)
+            tests.sessions.send(loop, { requestId: "s1", session: "server", address: "https://other.example", allowHttp: false })
+            tests.sessions.respond(loop, "s1", 200, tests.sessions.systemInfo("https://other.example"))
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual([view.origin, view.accountId, view.launch.asks, view.launch.chooseAccount], ["https://other.example", "2", true, false])
+        end sub
+
         @describe("offer")
 
         @it("offers the profile the viewer picks while the offer is due, never one a deep link opens")

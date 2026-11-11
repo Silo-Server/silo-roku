@@ -102,7 +102,8 @@ Account and setup:
 - creating a profile from the picker's Add profile, as the household's
   primary profile (sections 5.4 and 7.3);
 - profile at launch: Profile Selection (Automatic, Every Time, After 1 Hour,
-  After 12 Hours) and, on a new TV, "Open {name} automatically?" after the
+  After 12 Hours), which asks for the account first when several are saved
+  (section 7.5), and, on a new TV, "Open {name} automatically?" after the
   first pick (sections 5.4 and 7.3);
 - switch profile, switch server, and sign out;
 - companion sign-in: a Silo phone app on the network signs a new Roku in
@@ -684,6 +685,11 @@ their existing HD/FHD assets.
   - Whenever the picker is shown this way, focus starts on the remembered
     profile, and the device forgets its profile tokens, so a PIN-locked
     profile asks for its PIN again.
+  - With two or more saved accounts on this Roku, a launch that asks this
+    way, and a return from sleep that does (below), show Change Account in
+    the picker's place, so the viewer says whose account before a profile
+    opens (section 7.5). With one saved account nothing changes, and
+    Automatic reopens the last account and profile however many are saved.
   - A new TV starts on Every Time. The first profile opened from the picker
     on it is offered as tvOS offers it: one the viewer picks, on the picker
     or with its PIN (a child profile too), or the account's only profile
@@ -2709,6 +2715,9 @@ server setup -> sign-in -> profile selection -> main shell -> detail -> player
       \-> server update required
 ```
 
+Profile selection starts on Change Account when the session asks for the
+account first (section 7.5).
+
 The scene owns one navigation stack. Each stack entry records its route,
 parameters, and focus restoration key. Back behavior follows section 5.3. No
 screen may infer its previous screen from global flags. A screen's own
@@ -2895,7 +2904,8 @@ analytics, or copied diagnostic payloads.
 After sign-in the client loads `GET /api/v2/profiles`. Under Profile
 Selection's Automatic, launches reopen the last profile chosen on this
 device (section 5.4), after checking that it still exists and remains
-permitted; Every Time and the timed choices show the picker instead, as
+permitted; Every Time and the timed choices show the picker instead, or
+Change Account when several accounts are saved (section 7.5), as
 section 5.4 says, and forget the device's profile tokens first. Profile
 Selection, the offer, and the time of last use are kept in the registry on
 this device only, across sign-outs, and are never sent to the server, as
@@ -3008,9 +3018,29 @@ instead of the picker. Add, after the profiles, opens a sheet of three
 choices: Add a profile (when the household has a primary profile, as
 before), Add an account (Change Account, on the active server's Add an
 account), and Add a server. After a sign-in, an account with one profile
-and no PIN opens; otherwise its picker shows. Profile Selection applies as
-before: Automatic restores the last account and profile, and a single
-profile without a PIN never shows the picker.
+and no PIN opens; otherwise its picker shows. Under Profile Selection,
+Automatic restores the last account and profile, and a single profile
+without a PIN never shows the picker.
+
+**Change Account in the picker's place.** When Profile Selection asks who's
+watching, at a launch under Every Time or after a timed choice ran out, and
+when Silo comes back from a sleep that asks (section 5.4), a Roku with two
+or more saved accounts shows Change Account as the root screen where the
+picker would have shown or the only profile would have opened. Saved
+accounts are counted across every saved server, those that must sign in
+again included. No profile is open while it shows. It opens as it does
+elsewhere: the account used last is badged Current, its server is selected,
+and its card has focus. OK on an account, Current included, opens it as any
+choice on Change Account does: its only profile without a PIN opens
+directly; otherwise its picker shows and waits for a choice; an account
+that must sign in again goes to sign-in with its username filled in (one
+whose password must change says so on its picker, as before). Back leaves
+the app from the accounts or the servers, as it does on the launch picker;
+there is nothing to return to. With one saved account nothing changes, and
+neither does Automatic. A sign-in, a saved server chosen from the list, and
+Switch Profile go to the account's picker as before, and a deep link still
+opens a profile without a screen (section 10.1). The first profile opened
+on a new TV is offered as "Open {name} automatically?" as before.
 
 **Signing out.** The avatar menu's Switch Server is now Change Account. Its
 header adds the username after the server while the active server has more
@@ -4188,8 +4218,11 @@ does not hold until Roku says whether a PIN prompt is allowed; if that profile
 cannot see the content (`403`/`404`), it tries the next allowed one, and when
 none can, it stays on Home. While a profile is open, a deep link keeps it.
 Profile Selection does not apply to a deep link, which never shows the
-picker; under Every Time and the timed choices the device holds no profile
-token at launch, so PIN-locked profiles are skipped. Content IDs are opaque Silo identifiers and
+picker, nor Change Account in its place (section 7.5): the profile rule
+runs on the account used last, and a link that ends before a profile opens
+gives the viewer that screen back. Under Every Time and the timed choices
+the device holds no profile token at launch, so PIN-locked profiles are
+skipped. Content IDs are opaque Silo identifiers and
 must not embed a server origin, access token, profile ID, or title metadata.
 
 ### 10.2 Certification materials

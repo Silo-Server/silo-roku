@@ -931,7 +931,7 @@ only from Settings or the prompt after a crash.
   | App state when `roInput` arrives | Action |
   | --- | --- |
   | No session (setup, sign-in) | Store the link; continue it after sign-in |
-  | Profile picker or PIN at launch | Apply the profile rule and play; leave the picker |
+  | Profile picker or PIN at launch, or Change Account in the picker's place | Apply the profile rule and play; leave the picker |
   | Keyboard or dialog open | Close it, then handle the link |
   | Browse screens | Push the player above the current stack |
   | Player or Up Next | Hand the stop and final progress to `ApiTask`, then start the new item |
