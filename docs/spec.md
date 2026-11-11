@@ -481,9 +481,11 @@ their existing HD/FHD assets.
     account limited to one profile never offers Add Profile. Each page
     with the bar reads the list again as it starts, as the launch's profile
     step does without drawing the picker, so a profile added or removed
-    elsewhere, or a changed limit, shows without the picker. The limit is
-    unknown only for a server that does not send it, or before any list
-    was read.
+    elsewhere, or a changed limit, shows without the picker; a menu already
+    open when the answer arrives is built again, keeping its highlighted
+    row. When several reads of the list are in flight, the answer to the
+    one sent last stands. The limit is unknown only for a server that does
+    not send it, or before any list was read.
   - Change Account always shows; accounts and servers are added there. The
     menu is the Roku's own account's: a phone's profile handoff
     ([`silocontrol.md`](silocontrol.md) section 8) borrows an identity for
