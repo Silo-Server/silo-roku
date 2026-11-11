@@ -1263,7 +1263,7 @@ their existing HD/FHD assets.
     in a fixed 435 px block, so the row stays at y 557.
 - **Action row.** Play, or "Resume 1:02:03" ("Resume 12:34" under an hour), or
   for a series "Play S2:E3" or "Resume S1:E3", then Start Over when a resume
-  point exists, then Versions, Audio Tracks, and Subtitles, then Watchlist
+  point exists, then Version, Audio, and Subtitles, then Watchlist
   and More once the item is read. Resume appears
   once the saved position passes 30 seconds and is more than 5 seconds from
   the end, whether or not the server counts the item played: the server
@@ -1292,7 +1292,7 @@ their existing HD/FHD assets.
     watchlist" or "Remove from watchlist". OK changes it at once and sends
     `PUT` or `DELETE /api/v2/watchlist/{id}`. It shows only when the server
     offers the lists (section 5.3).
-  - More is a circle with three dots. OK opens its menu, the Versions
+  - More is a circle with three dots. OK opens its menu, the Version
     menu's popover with the title "MORE" and no check marks: on a series
     first "Shuffle Season 2" (the season shown, named by its number even
     when the server titles it, Specials by its title; once its episodes
@@ -1401,8 +1401,8 @@ their existing HD/FHD assets.
   the line would pass 1031 px, the longest values share what is left and
   end in an ellipsis. Until the item's watch state is read, each value is
   a white 14% bar and the three circles are dimmed and passed over by Left and Right
-  (tvOS disables them); once read, Versions and Subtitles always open, and
-  Audio Tracks opens when the version has an audio track. Each opens its
+  (tvOS disables them); once read, Version and Subtitles always open, and
+  Audio opens when the version has an audio track. Each opens its
   menu, tvOS's 560 px popover: 14 px under the button when its rows fit
   above the screen's 48 px inset, else 14 px above the readout when they
   fit there, else on the side with room for more rows, showing those and
@@ -1414,7 +1414,7 @@ their existing HD/FHD assets.
   button, which stays drawn focused while its menu is open. Track rows use
   tvOS's vocabulary (`TrackLabels`): a track's own title shows only when it
   says something its language, codec, layout, and flags do not.
-  - Versions offers Auto ("Best match for this device") and every version:
+  - Version offers Auto ("Best match for this device") and every version:
     "2160p · HEVC · DV · TrueHD" (resolution, video codec, DV or HDR, audio
     codec) over its edition, video codec, container, and size ("Director's
     Cut · HEVC · MKV · 58.31 GB"). Auto plays the version the start path
@@ -1422,7 +1422,7 @@ their existing HD/FHD assets.
     the first). The readout shows resolution and range: "Auto · 2160p · DV",
     or "1080p" for a version chosen. A version chosen is pinned: the start
     sends `allow_alternate_versions: false`, as tvOS does.
-  - Audio Tracks offers Auto ("Use your Playback audio preference") and
+  - Audio offers Auto ("Use your Playback audio preference") and
     each track in the version's order, by language, with its title,
     codec, layout, Default, and Preferred (the server's
     `effective_audio_track_index`); under Auto the menu marks Auto and the
@@ -2311,7 +2311,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | "Type on your phone": a keyboard notification appears on nearby iPhones and iPads | The same title over the Roku mobile app's keyboard | Roku's phone keyboard is its mobile app's |
 | A code approved on a phone shows "Signed in as {account}" for a second before the profiles | The profiles open as soon as the session is installed, as after a password sign-in | The session's change moves the app on (section 6.2); a held navigation would be a second path into the picker |
 | A failed password sign-in shakes the fields | The error line alone | Roku `Group` animations would add a frame-time cost to the form for one cue |
-| The code is 72 pt Bold monospaced, its slashed zero apart from O | 72 px SemiBold tabular Inter, two spaces between its groups; letter codes from older servers in Bold | No monospaced face ships (the Versions menu row below) |
+| The code is 72 pt Bold monospaced, its slashed zero apart from O | 72 px SemiBold tabular Inter, two spaces between its groups; letter codes from older servers in Bold | No monospaced face ships (the Version menu row below) |
 | The spinner is the system's spokes | The packaged arc spinner (section 5.8) | No system spinner on Roku |
 | Choosing HTTP, or typing `http://`, connects without asking | "Connect without encryption?" asks first | Plain HTTP always asks on Roku (row below) |
 | The Companion screen's consent and unreachable steps say nothing more | An `http` address adds "This connection isn't encrypted."; an alternate adds "{server} also answers at {alternate}." | `companion-pairing.md` section 5: the Roku reads both before its consent or choice |
@@ -2378,7 +2378,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The focused top bar avatar scales to 1.05 inside its ring | It is redrawn at 60 px (1.034), one whole px larger on each side, and its ring art has a 2 px transparent margin | Scaled to 1.05, its 58 px circle's edges fell between pixels and Roku clipped the ring flat at its sides, where the circle met the image's edge |
 | The detail Subtitles menu leads with the profile's subtitle language; the player's list with the watch projection's effective subtitle language | Both lead with the projection's `effective_subtitle_language`, so the detail menu and Options' Subtitles list the same tracks in the same order and words. Each lists its own source, as on tvOS: the detail menu the version's tracks, Options the plan's inventory, so a sidecar only the plan names shows only in Options | The two lists disagreed on hardware run 27: Options listed the server's order and hid titles the detail menu showed. A detail pick is an ordinal into the projection's list, so the detail menu cannot offer a track the projection does not name |
 | A subtitle's title shows unless it is a release name, a format, a flag, or its language | A title that is a subtitle file's name ("Heat (1995).en.srt") is dropped too, on the detail menu and in Options | The server gives an untitled sidecar its file's name as its title and its inventory label (hardware run 6) |
-| Avatar menu rows, and the detail page's More menu rows, have an icon before the label | Labels without icons; More's rows keep the Versions menu's empty check column | No icon art ships for the menus; More reuses the Versions menu (section 5.6) |
+| Avatar menu rows, and the detail page's More menu rows, have an icon before the label | Labels without icons; More's rows keep the Version menu's empty check column | No icon art ships for the menus; More reuses the Version menu (section 5.6) |
 | The library list marks the current library with a check mark and gives each library and section an icon; the sort menu checks the current sort | The current library has the selected tab's white 14% fill, without icons; the current sort shows only its direction and arrow | The packaged Inter subset has no check mark, and no icon art ships |
 | Switching tabs cross-fades the page over 200 ms while the top bar stays | The new page appears at once | Each root page draws its own top bar (one root page alive, plan sections 4.5 and 4.7), so fading the page would blink the bar |
 | The hero's logo shows as soon as it is decoded | The logo loads once focus rests 150 ms on the card, with the backdrop; the text title shows until then | Decoding a logo for every card passed while scrolling churns texture memory on 512 MB devices |
@@ -2424,15 +2424,15 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The detail metadata line leads with the content rating in an outlined 18 px Bold chip, and its 45% dots are 22 px SemiBold | The rating sits in Home's hero chip (15 px SemiBold on a white 7% fill, 5.5), and the dots are in the line's 24 px Medium | One chip for both heroes (AG-292), and the type scale has no 22 px SemiBold dot style |
 | TMDB's score in the metadata line carries TMDB's logo | "TMDB 7.8" in text, as IMDb and RT are | No logo art ships |
 | The detail title's subtitle is letter-spaced 1.5 pt | It is not letter-spaced | Roku `Label` has no tracking, and hair spaces (`theme.tracked`) would space 40 px capitals about twice as wide |
-| A focused round button (Start Over, Versions, Audio Tracks, Subtitles) widens with an animation | Native 280 ms width and position animation with delayed label reveal on the normal tier; immediate layout on the low tier | Native interpolators keep motion off script-driven per-frame layout; low-memory devices avoid the extra animation work |
-| The Versions, Audio Tracks, and Subtitles menu is Liquid Glass tinted black 45%, with a 14 px monospaced header, and opens and closes over 0.18 s | The menu panel's gradient art (`theme.art.PANEL`), the header in Inter Medium spaced with hair spaces, shown and hidden at once | Roku has no blur and ships no monospaced face; animations cost frames on 512 MB devices |
+| A focused round button (Start Over, Version, Audio, Subtitles) widens with an animation | Native 280 ms width and position animation with delayed label reveal on the normal tier; immediate layout on the low tier | Native interpolators keep motion off script-driven per-frame layout; low-memory devices avoid the extra animation work |
+| The Version, Audio, and Subtitles menu is Liquid Glass tinted black 45%, with a 14 px monospaced header, and opens and closes over 0.18 s | The menu panel's gradient art (`theme.art.PANEL`), the header in Inter Medium spaced with hair spaces, shown and hidden at once | Roku has no blur and ships no monospaced face; animations cost frames on 512 MB devices |
 | The readout's items sit in slots 313, 364, and 338 px wide (`TVPlaybackSelectionSummaryView`), a value too long for its slot shrinks to 75%, and its labels are letter-spaced | The items flow inline, 20 px apart, as tvOS's `movie-detail.jpg` shows them; a line that would pass 1031 px cuts its longest values with an ellipsis; the labels are not letter-spaced | Decision AG-292 (3) from the reference screenshots; Roku `Label` has neither a minimum scale nor tracking |
 | A menu that fits neither below its button nor above it is pinned 48 px from the screen's foot | It opens below the button or above the readout, on the side with room for more rows, and shows as many rows as fit there, scrolling the rest | Pinned, a long Subtitles menu covered its own button and the readout (hardware run 26, AG-292) |
 | After Auto clears a title's subtitle choice, the readout resolves Auto with the profile's subtitle language from the app's preference store, without a mode or the item's remembered track | At once it resolves Auto without the remembered track, with the language and mode the page read; once an Auto pick's write lands (audio or subtitles), the page reads the item's tracks again and names what the server's preferences now play | The watch projection carries the series' own language and mode without the profile's, and the client keeps no preference store; until the read answers, a series' language or mode can still show (AG-292) |
-| A version's row in the Versions menu names its codec, container, and size | It names the version's edition first ("Director's Cut · HEVC · MKV · 58.31 GB") | tvOS ships no Edition selector (section 3.3), so two cuts at the same quality would otherwise read the same (assumption AG-223) |
+| A version's row in the Version menu names its codec, container, and size | It names the version's edition first ("Director's Cut · HEVC · MKV · 58.31 GB") | tvOS ships no Edition selector (section 3.3), so two cuts at the same quality would otherwise read the same (assumption AG-223) |
 | A selector that cannot open yet is disabled | It is dimmed to 40%, and Left and Right pass over it | Roku draws its own focus (section 5.1) and has no disabled state |
 | A remembered audio track applies through the server whenever a start names none | The page reads the remembered track (`GET /api/v2/audio-prefs/{key}`) and starts on it as the viewer's choice | Built when Roku's start named the profile's language's track under Auto (assumption AG-227); Auto now names the server's effective track (section 9.7), which follows the remembered one, so the read only changes how the page marks it (assumption AG-284) |
-| OK on the value a Subtitles or Audio Tracks menu already shows saves it again, so a seeded Off becomes the title's own preference (`TVActionPopoverMenu`, `persistSubtitleSelection`) | A pick that changes nothing saves nothing | The page seeds Off from the profile's settings; saving it again would keep the title Off after the profile's subtitle setting changes (assumption AG-288) |
+| OK on the value a Subtitles or Audio menu already shows saves it again, so a seeded Off becomes the title's own preference (`TVActionPopoverMenu`, `persistSubtitleSelection`) | A pick that changes nothing saves nothing | The page seeds Off from the profile's settings; saving it again would keep the title Off after the profile's subtitle setting changes (assumption AG-288) |
 | The episode rail keeps the five seasons nearest the one shown, and reads the seasons either side in the background | It keeps three, and reads the next (or previous) season once focus is two cards from the rail's end | Implementation plan section 4.8 bounds the metadata and cards kept on 512 MB devices |
 | Resting on a season pill switches season after 70 ms | After 300 ms | A season not yet read is read when the viewer stops on it, and its cards replace the rail's; switching only where the viewer stops keeps requests and texture churn down on 512 MB devices |
 | While a series' episodes load, Play reads "Loading episodes…" and is disabled | Play plays the server's play target at once and names its episode when the episodes arrive | The server names the play target (section 8.3), so nothing has to wait |
@@ -3281,7 +3281,7 @@ with ordered, identity-fenced writes.
 The client also writes the audio and subtitle picks below, as tvOS saves them
 (decision D2, AG-222).
 
-A detail page's Audio Tracks and Subtitles choices (section 5.6) are
+A detail page's Audio and Subtitles choices (section 5.6) are
 remembered as tvOS remembers them (silo-apple `b90a86ea`,
 `TrackSelectionPersistence`), in the server's per-series track preferences
 rather than settings: the key is the episode's series, else the movie
@@ -3416,7 +3416,7 @@ Dolby Vision on AV1 (profile 10) is not claimed.
    `playback_attempt_id`, `quality_preference`,
    `subtitle_fidelity_preference`, `metered`, `client_capabilities`, and
    `client_playback_context`. `file_id` is the version the detail page's
-   Versions menu chose, else the start path's (the version last played,
+   Version menu chose, else the start path's (the version last played,
    else the server's default variant, else the first); a version the
    viewer chose also sends `allow_alternate_versions: false`, as tvOS's
    pinned version does, so a buffering search keeps it, and Auto omits the
@@ -3758,7 +3758,7 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   version's `audio_tracks`, the server's audio ordinal. The server refuses
   `index` alone (`TrackIdentityV3` requires `id`; hardware run 6). A start
   names Detail's audio pick by `audio_track_index`, which the start body
-  accepts, for the version Detail read: the version chosen in its Versions
+  accepts, for the version Detail read: the version chosen in its Version
   menu, which the player then starts (`nav.player.pinnedFile`), or Auto's
   when it is still the one the player chooses. Under Auto, against a server
   whose capabilities list `codec_channel_ceilings_v1`, it names no audio
@@ -4529,7 +4529,7 @@ is):
 | Roku's keyboards and PIN pad speak themselves | All | None |
 | The "Connect without encryption?" dialog says its title and message, then the highlighted button, and each button as the highlight moves, through `roAudioGuide` (as the sign-out dialog does) | All | None; not yet heard on a device |
 | Lists read each card's `audioGuideText` (title, season and episode, rating, year, runtime) and each profile's name, PIN, and Kids marks | All | None |
-| Custom controls say their label when focused, through `roAudioGuide`: setup and sign-in fields, the top bar and avatar menu, the library list, sort, alphabet rail, Search filter and result count, Detail's buttons (Versions, Audio Tracks, and Subtitles with their values), seasons, and menus, the player's controls with the position, Options tabs and rows (with "selected"), Skip Intro, Skip Recap, Skip Credits, Up Next, and the player error's buttons | All | None |
+| Custom controls say their label when focused, through `roAudioGuide`: setup and sign-in fields, the top bar and avatar menu, the library list, sort, alphabet rail, Search filter and result count, Detail's buttons (Version, Audio, and Subtitles with their values), seasons, and menus, the player's controls with the position, Options tabs and rows (with "selected"), Skip Intro, Skip Recap, Skip Credits, Up Next, and the player error's buttons | All | None |
 | Setup, sign-in, the profile picker, and PIN say their inline errors as they appear | All | None |
 | Full-screen errors and empty states say their title and message, then the focused action, as they appear, at once and again when they repeat (assumption AG-176): the player's error with Retry (Try again for a lost connection), Try Anyway, or Go Back; the shared empty and error state on Home, a library, Search, and Detail, with its Retry or Refresh once it has focus; Detail's episode message; "Server update required" and the other first-run messages, on each show; sign-in's "Can't reach {server}" before Try again | All | Headless only (`tests/views/audioGuide.spec.bs`) |
 | The spinner says "Loading" and the busy capsule its state once it shows ("Playback progress is pending…", "Loading subtitles…", "Stopping…"), after what is being said, at once when it replaces an earlier state; a notice card says its title and message ("Reconnecting… The connection to the server was lost…", a refused track or quality change); neither says anything while the player's error covers it | All | Headless only |
