@@ -148,10 +148,10 @@ namespace tests
 
         @describe("avatar menu")
 
-        @it("offers Switch Profile, History, Settings, Change Account and Sign Out, and Diagnostics only in development builds")
+        @it("offers the profile row, Change Account under it, and History, then Settings and Sign Out, and Diagnostics only in development builds")
         sub _()
-            m.assertEqual(mainShell.menuGroups(false), [["switchProfile", "history"], ["settings", "changeAccount", "signOut"]])
-            m.assertEqual(mainShell.menuGroups(true), [["switchProfile", "history"], ["settings", "changeAccount", "signOut"], ["diagnostics"]])
+            m.assertEqual(mainShell.menuGroups(false), [["switchProfile", "changeAccount", "history"], ["settings", "signOut"]])
+            m.assertEqual(mainShell.menuGroups(true), [["switchProfile", "changeAccount", "history"], ["settings", "signOut"], ["diagnostics"]])
             ' Removing the menu entry leaves the pairing route available.
             m.assertEqual(mainShell.menuAction("connectPhone"), { kind: "push", route: nav.route.CONNECT_PHONE, params: {} })
         end sub
@@ -159,7 +159,7 @@ namespace tests
         @it("adds Watch Party after History while the server offers it, and leaves Watchlist and Favorites to For You")
         sub _()
             ' Watch Party follows History (docs/watch-party.md section 4.1).
-            m.assertEqual(mainShell.menuGroups(false, true), [["switchProfile", "history", "watchParty"], ["settings", "changeAccount", "signOut"]])
+            m.assertEqual(mainShell.menuGroups(false, true), [["switchProfile", "changeAccount", "history", "watchParty"], ["settings", "signOut"]])
             m.assertEqual(mainShell.menuAction("watchParty"), { kind: "push", route: nav.route.WATCH_PARTY, params: {} })
             for each group in mainShell.menuGroups(true, true, true)
                 for each key in group
@@ -170,11 +170,88 @@ namespace tests
 
         @it("lists Requests after History, before Watch Party, while the server offers it, and pushes its page")
         sub _()
-            m.assertEqual(mainShell.menuGroups(false, false, true)[0], ["switchProfile", "history", "requests"])
-            m.assertEqual(mainShell.menuGroups(false, true, true)[0], ["switchProfile", "history", "requests", "watchParty"])
+            m.assertEqual(mainShell.menuGroups(false, false, true)[0], ["switchProfile", "changeAccount", "history", "requests"])
+            m.assertEqual(mainShell.menuGroups(false, true, true)[0], ["switchProfile", "changeAccount", "history", "requests", "watchParty"])
             m.assertEqual(mainShell.menuAction("requests"), { kind: "push", route: nav.route.REQUESTS, params: {} })
             ' Requests is not a bar tab: its route selects no tab of its own.
             m.assertEqual(mainShell.selectedTab(nav.route.REQUESTS, {}), "home")
+        end sub
+
+        ' A session whose open account lists count profiles, the first its
+        ' primary one, and may have maxProfiles (0 while unknown).
+        function listing(count as Integer, maxProfiles as Integer, hasPin = false as Boolean) as Object
+            profiles = []
+            for i = 1 to count
+                profiles.Push({ id: "p-" + i.ToStr(), name: "Profile " + i.ToStr(), hasPin: hasPin and i = 1, isChild: false, isPrimary: i = 1, avatarUrl: "" })
+            end for
+            return {
+                status: "signed_in",
+                maxProfiles: maxProfiles,
+                accounts: [{ id: "a", current: true, signedIn: true, profiles: profiles }, { id: "b", current: false, signedIn: true, profiles: [{ id: "x" }, { id: "y" }] }]
+            }
+        end function
+
+        @it("picks the profile row from the open account's profile list and its limit")
+        sub _()
+            cases = [
+                { count: 2, max: 5, row: "switchProfile" },
+                { count: 5, max: 5, row: "switchProfile" },
+                { count: 2, max: 1, row: "switchProfile" },
+                { count: 1, max: 5, row: "addProfile" },
+                { count: 1, max: 2, row: "addProfile" },
+                { count: 1, max: 0, row: "addProfile" },
+                { count: 1, max: 1, row: "" },
+                { count: 0, max: 5, row: "switchProfile" },
+                { count: 0, max: 1, row: "switchProfile" },
+                { count: 0, max: 0, row: "switchProfile" }
+            ]
+            for each c in cases
+                m.assertEqual(mainShell.profileRow(m.listing(c.count, c.max)), c.row, c.count.ToStr() + " of " + c.max.ToStr())
+            end for
+            ' An older session view, or none: Switch Profile, as before.
+            m.assertEqual(mainShell.profileRow(invalid), "switchProfile")
+            m.assertEqual(mainShell.profileRow({ status: "signed_in" }), "switchProfile")
+            ' Only the open account's list counts.
+            other = m.listing(2, 5)
+            other.accounts[0].current = false
+            other.accounts[1].current = true
+            other.accounts[1].profiles = [{ id: "x" }]
+            m.assertEqual(mainShell.profileRow(other), "addProfile")
+            ' A limit the server did not send as a number is unknown.
+            unsent = m.listing(1, 0)
+            unsent.Delete("maxProfiles")
+            m.assertEqual(mainShell.profileRow(unsent), "addProfile")
+        end sub
+
+        @it("puts Add Profile in Switch Profile's place, and Change Account first when there is no profile row")
+        sub _()
+            m.assertEqual(mainShell.menuGroups(false, true, true, "addProfile"), [["addProfile", "changeAccount", "history", "requests", "watchParty"], ["settings", "signOut"]])
+            m.assertEqual(mainShell.menuGroups(true, false, false, ""), [["changeAccount", "history"], ["settings", "signOut"], ["diagnostics"]])
+            for each row in ["switchProfile", "addProfile", ""]
+                groups = mainShell.menuGroups(false, false, false, row)
+                count = 0
+                for each key in groups[0]
+                    if key = "changeAccount" then count = count + 1
+                end for
+                m.assertEqual(count, 1, "Change Account always shows: " + row)
+                m.assertEqual(groups[1], ["settings", "signOut"])
+            end for
+        end sub
+
+        @it("opens New Profile from Add Profile, after the primary profile's PIN when it has one, and the picker once it is done")
+        sub _()
+            session = m.listing(1, 5)
+            primary = session.accounts[0].profiles[0]
+            m.assertEqual(mainShell.menuAction("addProfile", session), { kind: "push", route: nav.route.CREATE_PROFILE, params: { primary: primary, openPicker: true } })
+            locked = m.listing(1, 5, true)
+            m.assertEqual(mainShell.menuAction("addProfile", locked), { kind: "push", route: nav.route.PIN, params: { profile: locked.accounts[0].profiles[0], purpose: "manage", openPicker: true } })
+            ' Without a profile list there is no primary profile to act as.
+            m.assertInvalid(mainShell.menuAction("addProfile", m.listing(0, 5)))
+            m.assertInvalid(mainShell.menuAction("addProfile"))
+            ' An only profile is the primary one, marked or not.
+            unmarked = m.listing(1, 5)
+            unmarked.accounts[0].profiles[0].isPrimary = false
+            m.assertEqual(mainShell.menuAction("addProfile", unmarked).route, nav.route.CREATE_PROFILE)
         end sub
 
         @it("pushes each list's page")
