@@ -453,14 +453,15 @@ their existing HD/FHD assets.
   - Panel: 460 px wide, top at 132, right edge at the right inset, padding 14.
   - Header: a 44 px avatar; the profile's name in 24 px SemiBold; the
     server's display name in uppercase, 14 px, letter-spaced, at 38%.
-  - Rows: the profile row, Change Account (section 7.5) directly under it,
-    History, Requests (while the server offers Requests, section 5.11), and
-    Watch Party ("Return to Watch Party" in a party, while the server offers
-    one: [`watch-party.md`](watch-party.md) section 4.1); then Settings and
-    Sign Out. Watchlist and Favorites are in the For You menu only. They are
-    54 px tall (22 px SemiBold, 16 px inset), 10 px apart. A focused row gets
-    a white fill with radius 14; resting labels are at 86%, and Sign Out is
-    red at 90%. The menu opens on its first row.
+  - Rows: History, Requests (while the server offers Requests, section
+    5.11), and Watch Party ("Return to Watch Party" in a party, while the
+    server offers one: [`watch-party.md`](watch-party.md) section 4.1); then
+    Settings, the profile row, Change Account (section 7.5) directly under
+    it, and Sign Out, the same order on tvOS and Android TV. Watchlist and
+    Favorites are in the For You menu only. They are 54 px tall (22 px
+    SemiBold, 16 px inset), 10 px apart. A focused row gets a white fill with
+    radius 14; resting labels are at 86%, and Sign Out is red at 90%. The
+    menu opens on its first row, History.
   - The profile row follows the open account's profile list as the client
     last read it, without a restart:
     - Switch Profile while the list has two or more profiles, and before
@@ -473,7 +474,7 @@ their existing HD/FHD assets.
       profile on the picker; Cancel and Back return to the page the menu
       was on.
     - No row while the list has one profile and `max_profiles` is 1: there
-      is nothing to switch to or add, and Change Account is the first row.
+      is nothing to switch to or add, and Change Account follows Settings.
 
     The limit is saved with the account's profile list (section 7.5), so
     the row is right as soon as the app starts, and after a restart an

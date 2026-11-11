@@ -122,7 +122,7 @@ Home (`components/screens/home/`) and the library tab pages
 (`components/screens/library/`) share the main shell in
 `components/screens/home/shell.bs`: the top bar with its library tabs
 (`user/libraries` without the profile's hidden libraries), the avatar menu
-(Switch Profile or Add Profile, Change Account, History, Settings, Sign
+(History, Settings, Switch Profile or Add Profile, Change Account, Sign
 Out), each library tab's list of
 libraries with Recommended and Browse, and focus between bar and content.
 Settings uses the TV clients’ split category rail and detail pane. It exposes
