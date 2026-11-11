@@ -38,6 +38,9 @@ import "pkg:/source/util/values.bs"
 '                  current login session verified
 '   profiles       the account's profiles as last listed, for the picker:
 '                  [{ id, name, hasPin, isChild, isPrimary, avatarUrl }]
+'   maxProfiles    how many profiles the account may have, as that list
+'                  said (api.auth.profiles.limit), 0 when it did not;
+'                  kept and dropped with the list
 '   addedAt        when it was saved here, in wall-clock seconds
 '   legacyKeys     its local data kept the keys it had before accounts
 '                  (an account made by the migration), which have no
@@ -47,7 +50,8 @@ import "pkg:/source/util/values.bs"
 '   accounts       the other saved accounts, most recently used first, each
 '                  { id, origin, serverUserId, username, accessToken,
 '                  refreshToken, expiresAt, refreshAt, profileId,
-'                  profileTokens, profiles, addedAt, usedAt, legacyKeys }
+'                  profileTokens, profiles, maxProfiles, addedAt, usedAt,
+'                  legacyKeys }
 ' The device's values live in SECTION_NAME, each as a string under its KEYS
 ' name; servers and accounts in ACCOUNTS_SECTION: the servers as one JSON
 ' list under SERVERS_KEY, the active server first, and each account as JSON
@@ -117,7 +121,7 @@ namespace storage
 
     ' An account with nothing but its ID and server.
     function newAccount(id as String, origin as String, now = 0 as Integer) as Object
-        return { id: id, origin: origin, serverUserId: "", username: "", accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileId: "", profileTokens: [], profiles: [], addedAt: now, usedAt: now, legacyKeys: false }
+        return { id: id, origin: origin, serverUserId: "", username: "", accessToken: "", refreshToken: "", expiresAt: 0, refreshAt: 0, profileId: "", profileTokens: [], profiles: [], maxProfiles: 0, addedAt: now, usedAt: now, legacyKeys: false }
     end function
 
     ' The most accounts one companion session can sign in without the
@@ -145,7 +149,7 @@ namespace storage
         if record.accountId = "" then return invalid
         tokens = []
         tokens.Append(record.profileTokens)
-        return { id: record.accountId, origin: record.origin, serverUserId: record.serverUserId, username: record.username, accessToken: record.accessToken, refreshToken: record.refreshToken, expiresAt: record.expiresAt, refreshAt: record.refreshAt, profileId: record.profileId, profileTokens: tokens, profiles: record.profiles, addedAt: record.addedAt, usedAt: now, legacyKeys: record.legacyKeys }
+        return { id: record.accountId, origin: record.origin, serverUserId: record.serverUserId, username: record.username, accessToken: record.accessToken, refreshToken: record.refreshToken, expiresAt: record.expiresAt, refreshAt: record.refreshAt, profileId: record.profileId, profileTokens: tokens, profiles: record.profiles, maxProfiles: record.maxProfiles, addedAt: record.addedAt, usedAt: now, legacyKeys: record.legacyKeys }
     end function
 
     ' Makes account (packed) the record's active one; invalid clears it.
@@ -161,6 +165,7 @@ namespace storage
         record.profileId = account.profileId
         record.profileTokens = account.profileTokens
         record.profiles = account.profiles
+        record.maxProfiles = account.maxProfiles
         record.addedAt = account.addedAt
         record.legacyKeys = account.legacyKeys
     end sub
@@ -365,7 +370,7 @@ namespace storage
         for i = 0 to entries.Count() - 1
             entry = {}
             entry.Append(entries[i].entry)
-            entry.Delete("profiles")
+            dropProfiles(entry)
             if i > last then signOutEntry(entry)
             raw[entries[i].key] = FormatJson(entry)
         end for
@@ -378,7 +383,7 @@ namespace storage
     function shed(entries as Object) as Boolean
         for i = entries.Count() - 1 to 0 step -1
             if entries[i].entry.DoesExist("profiles")
-                entries[i].entry.Delete("profiles")
+                dropProfiles(entries[i].entry)
                 return true
             end if
         end for
@@ -601,6 +606,7 @@ namespace storage
         account.profileId = boundedText(entry.profile, MAX_ID_BYTES)
         account.legacyKeys = entry.legacy = "1"
         account.profiles = decodeProfiles(entry.profiles)
+        if account.profiles.Count() > 0 then account.maxProfiles = seconds(entry.max_profiles)
         access = boundedText(entry.access_token, MAX_TOKEN_BYTES)
         refresh = boundedText(entry.refresh_token, MAX_TOKEN_BYTES)
         if access = "" or refresh = "" then return account
@@ -626,7 +632,11 @@ namespace storage
         if util.isNumber(account.usedAt) and account.usedAt > 0 then out.used_at = account.usedAt.ToStr()
         if util.isTrue(account.legacyKeys) then out.legacy = "1"
         profiles = encodeProfiles(account.profiles)
-        if profiles.Count() > 0 then out.profiles = profiles
+        if profiles.Count() > 0
+            out.profiles = profiles
+            ' The list's own limit, a whole number like the times above.
+            if util.isNumber(account.maxProfiles) and account.maxProfiles > 0 then out.max_profiles = Int(account.maxProfiles).ToStr()
+        end if
         put(out, "access_token", account.accessToken, MAX_TOKEN_BYTES)
         put(out, "refresh_token", account.refreshToken, MAX_TOKEN_BYTES)
         if not out.DoesExist("access_token") or not out.DoesExist("refresh_token")
@@ -639,6 +649,13 @@ namespace storage
         if tokens <> "" then out.profile_tokens = tokens
         return out
     end function
+
+    ' A stored account without its profile list, and so without the limit
+    ' that list gave.
+    sub dropProfiles(entry as Object)
+        entry.Delete("profiles")
+        entry.Delete("max_profiles")
+    end sub
 
     ' A stored account without its session; its username, profile, and
     ' profile list stay, so its tiles show "Sign in again".

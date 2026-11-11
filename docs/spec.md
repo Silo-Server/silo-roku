@@ -474,6 +474,15 @@ their existing HD/FHD assets.
       was on.
     - No row while the list has one profile and `max_profiles` is 1: there
       is nothing to switch to or add, and Change Account is the first row.
+
+    The limit is saved with the account's profile list (section 7.5), so
+    the row is right as soon as the app starts, and after a restart an
+    account limited to one profile never offers Add Profile. Each page
+    with the bar reads the list again as it starts, as the launch's profile
+    step does without drawing the picker, so a profile added or removed
+    elsewhere, or a changed limit, shows without the picker. The limit is
+    unknown only for a server that does not send it, or before any list
+    was read.
   - Change Account always shows; accounts and servers are added there. The
     menu is the Roku's own account's: a phone's profile handoff
     ([`silocontrol.md`](silocontrol.md) section 8) borrows an identity for
@@ -3002,7 +3011,8 @@ use) and `active`, the active account's `localAccountId`. `silo.accounts`
 (21 KB) holds the saved servers as one JSON list (`servers`: origin, name,
 the viewer's label, last use) and one JSON entry per account under
 `a.<localAccountId>`: server, the server's user ID, username, tokens,
-remembered profile, PIN proofs, the last profile list (for the picker),
+remembered profile, PIN proofs, the last profile list (for the picker)
+with the profile limit that list gave (for the avatar menu, section 5.3),
 when it was added and last used. `localAccountId` is a UUID made on this
 device and every local key uses it; the server's user ID only finds a saved
 account again when the same person signs in, which refreshes that account
