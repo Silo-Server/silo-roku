@@ -1,0 +1,67 @@
+<!-- Follow the Contributing section of README.md: plain summary first, no restated
+diff, no working history. -->
+
+## Problem
+
+Closes #NNN
+<!-- One "Closes #NNN" line per issue this change fully resolves, so GitHub closes it
+when the PR merges into main. Use "Closes Silo-Server/<repo>#NNN" for an issue in
+another repository. Delete the line when the PR only partly addresses an issue. -->
+Related issue: #NNN
+<!-- An epic, sub-issue, or partly addressed issue this work serves and that should
+stay open, or "N/A". An open issue is not required — the Problem section below must
+stand on its own — except for a feat PR from someone without triage or write access,
+which must link an issue in this repository labeled `accepted`. -->
+
+A short plain-language summary: what goes wrong, who it affects, and what this
+change does about it. Details come after.
+
+## Approach
+
+What changed and why this way, and which surfaces and repositories it affects.
+Mention an alternative only if a reviewer would ask about it. Do not walk through
+the diff.
+
+## Validation
+
+One line per kind of check and its result; do not list tests by name. Name required
+checks that were not run or did not pass. Include a short output excerpt only when it
+explains a failure.
+<!-- Do not include private domains, hostnames, IPs, Tailscale or Report Shelf URLs,
+local paths, credentials, personal data, or private media details. -->
+
+## Evidence
+
+| Before | After |
+| ------ | ----- |
+| | |
+
+Roku model, Roku OS, and build:
+<!-- Every pull request needs evidence; a contributor's pull request still without it
+24 hours after opening is closed. For a change a user can see, use before-and-after
+screenshots of the same screen and data from a Roku device, and a short recording when
+motion, timing, or focus matters. `npm run roku -- screenshot` captures the screen
+after a sideload. Crop or blur private details in anything attached here. To keep
+captures private instead, publish them to evidence.siloserver.org, where only you and
+Silo maintainers can open them, and replace the table with
+`Evidence: https://evidence.siloserver.org/r/silo-roku/pr-<number>/`. When nothing
+visible changes, replace the table with how you checked the change: the steps you ran,
+the build or commit, and trimmed test or lint results. -->
+
+## Risks
+
+Compatibility, playback, certification, or release impact, or "None identified".
+
+## Checklist
+
+- [ ] I read and can explain the complete diff.
+- [ ] This pull request addresses one concern.
+- [ ] The Evidence section shows every change a user can see, or how I checked a change nobody sees.
+
+## AI Disclosure
+
+- Harness: exact agent harness or application, or "none"
+- Tool(s): exact tool name(s), or "none"
+- Model(s): exact model identifier(s) reported by each tool, or "n/a"
+- Involvement: Fully AI-generated, human verified | AI-assisted | Human-written, AI-reviewed | No AI used
+- Adversarial review: scope, method, findings, and resolutions, or "n/a" when this change does not require independent or adversarial review

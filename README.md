@@ -164,6 +164,34 @@ maintainer to reopen the closed one. If a maintainer asked you for a pull
 request and you haven't had one merged yet, the workflow still closes it when it
 opens; the maintainer reopens it, and the check leaves it alone from then on.
 
+Two more rules apply to pull requests from anyone without triage or write
+access, including invited ones. Open the pull request ready for review: the
+workflow closes drafts, both when they open and when they are converted to
+drafts. And every pull request needs evidence. One whose `Evidence` check still
+asks for evidence 24 hours after it opens, or after a maintainer reopens it, is
+closed without review, so publish or attach evidence soon after you open it.
+
+Evidence shows reviewers the change working without building the branch:
+
+- **A change users can see:** before-and-after screenshots of the same screen
+  with the same data, taken on a Roku device, and a short recording when motion,
+  timing, or focus matters. After a sideload, `npm run roku -- screenshot`
+  captures the screen. Name the Roku model, Roku OS version, and build for each
+  capture.
+- **A change nothing shows:** the steps you ran, the build or commit, and
+  trimmed test or lint results that show it does what the description says.
+
+Attach evidence under the pull request's Evidence heading, cropping or blurring
+server addresses, account names, and personal library contents, since GitHub is
+public. Or publish it to [evidence.siloserver.org](https://evidence.siloserver.org/),
+where only you and Silo maintainers can open it after signing in with GitHub:
+upload from the Details link of the pull request's `Evidence` check, or run
+`npx @silo-server/evidence publish <folder> --pr <number>` (Node.js 22 or later,
+after `npx @silo-server/evidence login`), then write
+`Evidence: https://evidence.siloserver.org/r/silo-roku/pr-<number>/` under the
+Evidence heading. A maintainer can waive evidence with the `evidence-not-needed`
+label, for example for an automated dependency update.
+
 ## License and trademarks
 
 Silo Roku is licensed under `AGPL-3.0-or-later`. See [LICENSE](LICENSE).
