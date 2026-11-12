@@ -152,24 +152,50 @@ Feature ideas go in
 not issues. Search first and upvote an existing idea rather than repeating it.
 Maintainers open an issue for an idea when they plan to build it.
 
-Pull requests are still welcome from contributors who've had one merged in a
-Silo repository, or when a maintainer asks for one. A feature pull request (a
-`feat` title) from someone without triage or write access must also link, in
-its description, an issue in this repository that a maintainer has labeled
-`accepted`. A workflow closes other pull
-requests without review when they open. That isn't a judgment of the work: if
-the problem still matters, open an issue and link the closed pull request. Once
-a feature's issue is labeled `accepted`, link it in a new pull request, or ask a
-maintainer to reopen the closed one. If a maintainer asked you for a pull
-request and you haven't had one merged yet, the workflow still closes it when it
-opens; the maintainer reopens it, and the check leaves it alone from then on.
+### Pull requests
 
-Two more rules apply to pull requests from anyone without triage or write
-access, including invited ones. Open the pull request ready for review: the
-workflow closes drafts, both when they open and when they are converted to
-drafts. And every pull request needs evidence. One whose `Evidence` check still
-asks for evidence 24 hours after it opens, or after a maintainer reopens it, is
-closed without review, so publish or attach evidence soon after you open it.
+These rules apply to every pull request from someone without triage or write
+access. A pull request that follows them can still be closed; we don't owe a
+review or a merge.
+
+- **Fix a bug.** Give the pull request a `fix` or `perf` title. A crash, a
+  regression, wrong behavior, and a real performance problem are bugs; a change
+  to how Silo behaves is a feature, even when the pull request calls it a fix.
+  Anything else, including features, refactors, and test or documentation
+  changes, needs a maintainer to ask for it by labeling an issue in this
+  repository `accepted`; link that issue in the description. A pull request of
+  yours that merged before doesn't change this.
+- **Open it ready for review.** Drafts are closed, both when they open and when
+  they are converted to drafts.
+- **Keep three or fewer open.** A fourth open pull request of yours in the same
+  repository is closed when it opens. Get one merged or closed first.
+- **Show evidence.** Every pull request needs evidence, as
+  [Evidence](#evidence) below describes. A pull request whose `Evidence` check
+  still asks for evidence 24 hours after it opens, or after a maintainer
+  reopens it, is closed without review. Publish or attach evidence soon after
+  you open it.
+
+A workflow applies these rules when a pull request opens. Closing isn't a
+judgment of the work. If the problem still matters, open an issue for it, or
+post a feature idea in Ideas, and link the closed pull request; we may use the
+code as a reference. A maintainer who wants a closed pull request reopens it,
+and the workflow leaves it alone from then on, apart from the evidence deadline.
+
+### Help us close things
+
+Finding what can be closed helps more than another pull request:
+
+- **Duplicates:** comment on the newer issue or pull request with a link to the
+  original.
+- **Fixed bugs:** if an open issue no longer happens on the latest build, say so
+  and give the build.
+- **Dead pull requests:** if a pull request was superseded or abandoned, link
+  what replaced it.
+
+If an open pull request already covers your bug, test it and comment with what
+you saw instead of opening another.
+
+### Evidence
 
 Evidence shows reviewers the change working without building the branch:
 
