@@ -10,8 +10,9 @@ another repository. Delete the line when the PR only partly addresses an issue. 
 Related issue: #NNN
 <!-- An epic, sub-issue, or partly addressed issue this work serves and that should
 stay open, or "N/A". An open issue is not required — the Problem section below must
-stand on its own — except for a feat PR from someone without triage or write access,
-which must link an issue in this repository labeled `accepted`. -->
+stand on its own — except for a pull request from someone without triage or write
+access that isn't a bug fix, which must link an issue in this repository labeled
+`accepted`. -->
 
 A short plain-language summary: what goes wrong, who it affects, and what this
 change does about it. Details come after.
