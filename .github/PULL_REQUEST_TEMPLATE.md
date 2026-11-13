@@ -13,6 +13,10 @@ stay open, or "N/A". An open issue is not required — the Problem section below
 stand on its own — except for a feat PR from someone without triage or write access,
 which must link an issue in this repository labeled `accepted`. -->
 
+Other clients: Apple Silo-Server/silo-apple#NNN; Android Silo-Server/silo-android#NNN; Web N/A (reason)
+<!-- One entry each for Apple, Android, and Web: a parity issue or pull request link,
+or "N/A" with the reason. See "Cross-client parity" in AGENTS.md. -->
+
 A short plain-language summary: what goes wrong, who it affects, and what this
 change does about it. Details come after.
 

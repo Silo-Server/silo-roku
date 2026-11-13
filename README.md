@@ -164,6 +164,14 @@ maintainer to reopen the closed one. If a maintainer asked you for a pull
 request and you haven't had one merged yet, the workflow still closes it when it
 opens; the maintainer reopens it, and the check leaves it alone from then on.
 
+A change users can notice is not done until the other Silo clients (Apple,
+Android, and Web) have it or have a reason not to. For each one that needs the
+same change, open an issue in its repository at minimum, linking your pull
+request; search first and add to an existing issue when there is one. Open a
+pull request there too if you can build and verify that client and its
+contribution rules let you. List the outcome on the template's `Other clients:`
+line. [Cross-client parity](AGENTS.md#cross-client-parity) has the details.
+
 Two more rules apply to pull requests from anyone without triage or write
 access, including invited ones. Open the pull request ready for review: the
 workflow closes drafts, both when they open and when they are converted to
