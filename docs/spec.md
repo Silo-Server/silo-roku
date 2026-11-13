@@ -2447,6 +2447,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The readout's items sit in slots 313, 364, and 338 px wide (`TVPlaybackSelectionSummaryView`), a value too long for its slot shrinks to 75%, and its labels are letter-spaced | The items flow inline, 20 px apart, as tvOS's `movie-detail.jpg` shows them; a line that would pass 1031 px cuts its longest values with an ellipsis; the labels are not letter-spaced | Decision AG-292 (3) from the reference screenshots; Roku `Label` has neither a minimum scale nor tracking |
 | A menu that fits neither below its button nor above it is pinned 48 px from the screen's foot | It opens below the button or above the readout, on the side with room for more rows, and shows as many rows as fit there, scrolling the rest | Pinned, a long Subtitles menu covered its own button and the readout (hardware run 26, AG-292) |
 | After Auto clears a title's subtitle choice, the readout resolves Auto with the profile's subtitle language from the app's preference store, without a mode or the item's remembered track | At once it resolves Auto without the remembered track, with the language and mode the page read; once an Auto pick's write lands (audio or subtitles), the page reads the item's tracks again and names what the server's preferences now play | The watch projection carries the series' own language and mode without the profile's, and the client keeps no preference store; until the read answers, a series' language or mode can still show (AG-292) |
+| Versions opens whenever the item has a version, and Auto picks across every file (tvOS `b90a86ea`) | Versions opens only when the current edition has two files or more, and Auto stays in that edition | The owner's rule for every client (silo-roku#62; silo-apple#1140 brings tvOS to it) |
 | The Edition button's glyph is `rectangle.stack` | A film frame (`images/detail/edition.png`) | Roku's Versions glyph is already a stack of frames (tvOS's earlier `square.stack`), so a stack would make the two circles read alike (assumption AG-225) |
 | A selector that cannot open yet is disabled | It is dimmed to 40%, and Left and Right pass over it | Roku draws its own focus (section 5.1) and has no disabled state |
 | A remembered audio track applies through the server whenever a start names none | The page reads the remembered track (`GET /api/v2/audio-prefs/{key}`) and starts on it as the viewer's choice | Built when Roku's start named the profile's language's track under Auto (assumption AG-227); Auto now names the server's effective track (section 9.7), which follows the remembered one, so the read only changes how the page marks it (assumption AG-284) |
@@ -3433,12 +3434,14 @@ Dolby Vision on AV1 (profile 10) is not claimed.
    `client_features`, `file_id`, the active `profile_id`, a fresh
    `playback_attempt_id`, `quality_preference`,
    `subtitle_fidelity_preference`, `metered`, `client_capabilities`, and
-   `client_playback_context`. `file_id` is the version the detail page's
-   Versions menu chose, else the start path's (the version last played,
-   else the server's default variant, else the first); a version the
-   viewer chose also sends `allow_alternate_versions: false`, as tvOS's
-   pinned version does, so a buffering search keeps it, and Auto omits the
-   member. The audio and subtitle chosen go as `audio_track_index` and
+   `client_playback_context`. `file_id` is the file the detail page
+   shows: the version its Versions menu chose, else Auto's file of its
+   edition (section 5.6); a start without the page plays the start path's
+   (the version last played, else the server's default variant, else the
+   first). A version the viewer chose also sends
+   `allow_alternate_versions: false`, as tvOS's pinned version does, so a
+   buffering search keeps it, and Auto omits the member, so the server's
+   fallback stays in the file's edition. The audio and subtitle chosen go as `audio_track_index` and
    `subtitle_track_index` (section 9.7).
 2. Start answers `201` even when the decision is terminal. The client shows
    `terminal.message`. A retryable `session_expired` mints a new attempt.
@@ -3776,9 +3779,9 @@ original 0.6 s before its first frame, to `decoder_no_output`.
   version's `audio_tracks`, the server's audio ordinal. The server refuses
   `index` alone (`TrackIdentityV3` requires `id`; hardware run 6). A start
   names Detail's audio pick by `audio_track_index`, which the start body
-  accepts, for the version Detail read: the version chosen in its Versions
-  menu, which the player then starts (`nav.player.pinnedFile`), or Auto's
-  when it is still the one the player chooses. Under Auto, against a server
+  accepts, for the version Detail read: the file Detail shows, which the
+  player then starts (`nav.player.startFile`), pinned when its Versions
+  menu chose it. Under Auto, against a server
   whose capabilities list `codec_channel_ceilings_v1`, it names no audio
   track: the server resolves the profile's audio language and the series'
   or movie's remembered track, then, unless that remembered track decides,
