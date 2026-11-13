@@ -3,10 +3,11 @@
 
   play.png       a triangle pointing right: Play and Resume
   restart.png    an arrow turning back on itself: Start Over
-  versions.png   a rounded frame with two layers stacked behind it: Versions
-  edition.png    a film frame with sprocket holes down both sides, in the
-                 glyphs' stroke: Edition (tvOS draws rectangle.stack, which
-                 reads like Roku's Version glyph; spec section 5.9)
+  versions.png   a rounded frame holding a play triangle, with a second
+                 frame behind it: Version (tvOS's
+                 play.rectangle.on.rectangle)
+  edition.png    a rounded frame with two layers stacked behind it: Edition
+                 (tvOS's rectangle.stack)
   audio.png      a speaker with two sound waves: Audio
   subtitles.png  a rounded frame with two lines of text: Subtitles
   bookmark.png   a bookmark's outline: Watchlist, not on the list
@@ -18,8 +19,8 @@
                  heart.fill)
   sparkles.png   a large four-pointed star with two small ones: For You's
                  Recommendations (tvOS's sparkles)
-  check.png      a bold check mark, 26 px: the choice in the Version, Audio
-                 Tracks, and Subtitles menus (tvOS's 20 pt bold checkmark in
+  check.png      a bold check mark, 26 px: the choice in the Edition, Version,
+                 Audio, and Subtitles menus (tvOS's 20 pt bold checkmark in
                  its 26 pt column)
   film.png       a film frame with sprocket holes down both sides, 48 px:
                  a Trailers & More card without a still (tvOS's 48 pt film)
@@ -119,24 +120,47 @@ def restart(size):
     return coverage(size, covered, GLYPH_SCALE)
 
 
-def versions(size):
+def rounded_rect_distance(x, y, cx, cy, half_w, half_h, radius):
+    """Signed distance from a point to a rounded rectangle's edge."""
+    qx = abs(x - cx) - (half_w - radius)
+    qy = abs(y - cy) - (half_h - radius)
+    return math.hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - radius
+
+
+def stack(size):
     """A rounded frame in a 3.4 px stroke, with two shorter lines above it for
-    the layers behind, as tvOS's square.stack draws a stack."""
+    the layers behind, about 2 px apart so they stay separate at 34 px, as
+    tvOS's rectangle.stack draws a stack."""
     cx = size / 2
-    top, bottom = size * 0.38, size * 0.88
+    top, bottom = size * 0.42, size * 0.88
     half_w, radius = size * 0.36, size * 0.10
     cy, half_h = (top + bottom) / 2, (bottom - top) / 2
-    layers = ((size * 0.24, size * 0.25, size * 0.76, size * 0.25), (size * 0.34, size * 0.12, size * 0.66, size * 0.12))
-
-    def frame_distance(x, y):
-        qx = abs(x - cx) - (half_w - radius)
-        qy = abs(y - cy) - (half_h - radius)
-        return math.hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - radius
+    layers = ((size * 0.24, size * 0.26, size * 0.76, size * 0.26), (size * 0.34, size * 0.10, size * 0.66, size * 0.10))
 
     def covered(x, y):
-        if abs(frame_distance(x, y)) <= STROKE / 2:
+        if abs(rounded_rect_distance(x, y, cx, cy, half_w, half_h, radius)) <= STROKE / 2:
             return True
         return any(segment_distance(x, y, *line) <= STROKE / 2 for line in layers)
+    return coverage(size, covered, GLYPH_SCALE)
+
+
+def play_on_rectangle(size):
+    """tvOS's play.rectangle.on.rectangle: a rounded frame low on the left
+    holding a filled play triangle, and a second frame up and to the right
+    behind it, whose top and right edges show clear of the front one. Both
+    frames are in a 3.4 px stroke."""
+    front = (size * 0.40, size * 0.60, size * 0.34, size * 0.27, size * 0.09)
+    back = (size * 0.60, size * 0.37, size * 0.34, size * 0.27, size * 0.09)
+    cx, cy = front[0], front[1]
+    triangle = ((cx - size * 0.09, cy - size * 0.13), (cx + size * 0.14, cy), (cx - size * 0.09, cy + size * 0.13))
+
+    def covered(x, y):
+        d_front = rounded_rect_distance(x, y, *front)
+        if abs(d_front) <= STROKE / 2:
+            return True
+        if d_front > STROKE * 1.2 and abs(rounded_rect_distance(x, y, *back)) <= STROKE / 2:
+            return True
+        return inside_triangle(x, y, triangle)
     return coverage(size, covered, GLYPH_SCALE)
 
 
@@ -253,10 +277,10 @@ def check(size):
     return coverage(size, covered, GLYPH_SCALE)
 
 
-def film(size, stroke=4.0):
+def film(size):
     """SF Symbols' film: a rounded frame, a band down each side cut off by a
-    line, and three sprocket holes in each band, in a 4 px stroke (the
-    action row's Edition glyph: its 3.4 px)."""
+    line, and three sprocket holes in each band, in a 4 px stroke."""
+    stroke = 4.0
     cx, cy = size / 2, size / 2
     half_w, half_h, radius = size * 0.42, size * 0.34, size * 0.09
     bands = (size * 0.29, size * 0.71)
@@ -422,8 +446,8 @@ def png(rows):
 def images():
     yield "play.png", play(GLYPH)
     yield "restart.png", restart(GLYPH)
-    yield "versions.png", versions(GLYPH)
-    yield "edition.png", film(GLYPH, STROKE)
+    yield "versions.png", play_on_rectangle(GLYPH)
+    yield "edition.png", stack(GLYPH)
     yield "audio.png", audio(GLYPH)
     yield "subtitles.png", subtitles(GLYPH)
     yield "bookmark.png", bookmark_outline(GLYPH)
