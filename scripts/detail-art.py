@@ -6,7 +6,7 @@
   versions.png   a rounded frame with two layers stacked behind it: Versions
   edition.png    a film frame with sprocket holes down both sides, in the
                  glyphs' stroke: Edition (tvOS draws rectangle.stack, which
-                 reads like Roku's Versions glyph; spec section 5.9)
+                 reads like Roku's Version glyph; spec section 5.9)
   audio.png      a speaker with two sound waves: Audio
   subtitles.png  a rounded frame with two lines of text: Subtitles
   bookmark.png   a bookmark's outline: Watchlist, not on the list
