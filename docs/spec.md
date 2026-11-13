@@ -114,8 +114,9 @@ Browse:
 - Home built from the server's home sections, including the Continue Watching
   and Next Up rows the server provides;
 - Home and library rows of at most 20 cards, each ending with an Explore all
-  card that opens the row's full, paged page (section 5.5; added at the
-  owner's request on 2026-10-28, after tvOS and Android TV);
+  card that opens the row's full, paged page, except a Continue Watching or
+  Next Up row that shows its whole list (section 5.5; added at the owner's
+  request on 2026-10-28, after tvOS and Android TV);
 - Movies and Series library tabs, each with Recommended rows, a Browse
   grid with sort, filters, and an alphabet rail, and read-only Collections
   pages;
@@ -934,18 +935,30 @@ their existing HD/FHD assets.
     page opens with that episode selected.
   - Explore all (tvOS's `SectionExploreAllCard`, silo-apple `a65867ef`; Android
     TV's `TvExploreAllCard`): Home's and a library's Recommended rows show at
-    most 20 cards, and every row with cards ends with an Explore all card,
-    even a row that shows all it has, since Home drops titles another row
-    already shows. The card is the row's only way to its page; row titles
-    take no focus. It has the row's card shape (a 176×264 poster, or a
-    360×200 landscape card in a landscape row) and lifts like the cards
-    beside it, on the raised surface (`#15171C`) with no artwork and no
-    caption: tvOS's mark, a 30 px arrow on a 66 px white 12% disc, centred
-    18 px above "Explore all" in the focused card title style at `#EDEDED`.
+    most 20 cards, and a row with cards ends with an Explore all card, even
+    a short one, since the server drops titles another row already shows
+    and counts what is left: the row's page can hold more. A Continue
+    Watching or Next Up row that shows its whole list has no card (owner's
+    request, 2026-11-13, on every Silo client), since its page would hold
+    the same cards. A row shows its whole list when its `section_type` is
+    `continue_watching`, `in_progress`, or `next_up`, its `total_count` is a
+    number no greater than the items the server sent (counted before the
+    cut to 20), and it sent fewer items than the row's limit: 20, or the
+    section's `item_limit` when that is positive and lower. A row filled to
+    its limit was cut there, whatever `total_count` says, and a row without
+    a `total_count` keeps the card. The card is the row's only way to its
+    page; row titles take no focus. It has the row's card shape (a 176×264
+    poster, or a 360×200 landscape card in a landscape row) and lifts like
+    the cards beside it, on the raised surface (`#15171C`) with no artwork
+    and no caption: tvOS's mark, a 30 px arrow on a 66 px white 12% disc,
+    centred 18 px above "Explore all" in the focused card title style at
+    `#EDEDED`.
     The audio guide says "Explore all, {row title}". Focus on it leaves the
     hero on the card it showed; Options (*) on it does nothing. OK opens the
-    row's page; Back returns focus to the card. A row loaded later (5.8)
-    gets its card with its items. For You and the Calendar have no card.
+    row's page; Back returns focus to the card, or to the row's last card
+    when the row came back without one. A row loaded later (5.8) gets its
+    card with its items, by the same rule. For You and the Calendar have no
+    card.
   - Short rows: when `GET /api/v2/home/capabilities` reports
     `section_item_limit_max`, the Home and library section reads carry
     `item_limit` of 20 (or that maximum, if lower), so the server sends no
