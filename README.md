@@ -164,8 +164,8 @@ maintainer to reopen the closed one. If a maintainer asked you for a pull
 request and you haven't had one merged yet, the workflow still closes it when it
 opens; the maintainer reopens it, and the check leaves it alone from then on.
 
-A change users can notice is not done until the other Silo clients (Apple,
-Android, and Web) have it or have a reason not to. For each one that needs the
+A change users can notice is not done until each other Silo client (Apple,
+Android, and Web) has been handled or ruled out. For each one that needs the
 same change, open an issue in its repository at minimum, linking your pull
 request; search first and add to an existing issue when there is one. Open a
 pull request there too if you can build and verify that client and its
