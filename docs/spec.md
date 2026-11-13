@@ -1423,17 +1423,28 @@ their existing HD/FHD assets.
     versions"), with no Auto row; editions are the versions' `edition_key`s
     in server order, a later part of a multipart file left out. It opens on
     the edition the profile last played (`user_data.last_edition_key`, else
-    the edition of `last_file_id`), else the one holding the best file for
-    `playback.preferred_quality`. Picking an edition puts Version back on
-    Auto. Its spoken value is the edition's name.
+    the edition of `last_file_id`). With nothing played, it compares each
+    edition's Auto file: a file within `playback.preferred_quality` (or
+    with no preference) before one above it, before an unknown resolution;
+    then the higher resolution within the preference, or the lower above
+    it; then HDR before SDR; then the edition's name (the unnamed edition
+    or a standard or default cut, then a theatrical one, then any other);
+    then the server's edition order. File size is not compared across cuts.
+    Picking an edition puts Version back on Auto. Its spoken value is the
+    edition's name.
   - Versions offers Auto ("Best match for this device") and the current
     edition's files: "2160p · HEVC · DV · TrueHD" (resolution, video codec,
     DV or HDR, audio codec) over its video codec, container, and size
     ("HEVC · MKV · 58.31 GB"). Auto plays the best file of the current
     edition for `playback.preferred_quality`, never another edition's: the
-    highest resolution the preference allows (silo-server's ranks, 480p to
-    4320p), else the closest above it, else the first, ties in server order
-    (`playback.intent.bestOf`). Play starts the file the page shows, unpinned,
+    first file in silo-server's version order (resolution rank, 480p to
+    4320p, then HDR before SDR, then the larger file, then list order)
+    among those the preference allows, else the lowest resolution above it,
+    else a file of unknown resolution (`playback.intent.bestOf`). A later
+    part of a multipart file is not Auto's choice, except that when the
+    profile last played one in the current edition, Auto resumes it and
+    Start Over starts that presentation's first part. Play starts the file
+    the page shows, unpinned,
     naming its edition so a file gone since the page read it is replaced
     within that edition. The readout shows resolution and range: "Auto ·
     2160p · DV", or "1080p" for a version chosen. A version chosen is

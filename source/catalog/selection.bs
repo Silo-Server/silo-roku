@@ -14,29 +14,39 @@ import "pkg:/source/util/values.bs"
 ' audio_tracks), and subtitle ordinals in the combined order
 ' (playback.tracks). A selection is
 '
-'     { key, versions, editions, editionOptions, lastEdition }
+'     { key, versions, editions, editionOptions, lastEdition, laterPart,
+'       laterPartStarts }
 '
 ' key names the item's track preferences (its series, else itself, as tvOS
 ' and the web keep them). editions are the item's cuts in server order,
 ' each
 '
-'     { key, name, files, versionOptions }
+'     { key, name, files, versionOptions, preference, order }
 '
 ' key its edition_key ("" for the unnamed one), name what the Edition
 ' button shows (catalog.pickers.editionName), files the places in versions
 ' of the files a viewer chooses (playback.intent.isChoosable: not a later
 ' part of a multipart file), and versionOptions its Version menu: Auto,
-' then those files, each valued by its place in versions. editionOptions
-' is the Edition menu, valued by place in editions. lastEdition is the key
-' of the edition the profile last played (user_data.last_edition_key, else
-' the edition of last_file_id), or invalid when it played none listed;
-' catalog.choice resolves Auto from these (silo-roku#62). Each version is
+' then those files, each valued by its place in versions. preference
+' (editionPreference) and order, its place in the server's edition order
+' (the playback variants', then first appearance in versions), break a tie
+' between editions with nothing played. editionOptions is the Edition
+' menu, valued by place in editions. lastEdition is the key of the edition
+' the profile last played (user_data.last_edition_key, else the edition of
+' last_file_id), or invalid when it played none listed. laterPart is the
+' place in versions of last_file_id when it is a later part of a multipart
+' presentation, else -1, and laterPartStarts the places of that
+' presentation's first parts (the same edition and presentation_group_key);
+' Auto resumes the later part in its edition, and Start Over starts its
+' first part. catalog.choice resolves Auto from these (silo-roku#62). Each
+' version is
 '
-'     { fileId, editionKey, rank, compact, audio, audioOptions, autoAudio,
-'       audioByLanguage, subtitles, subtitleOptions, autoSubtitles,
-'       clearedAutoSubtitles, subtitleSeed }
+'     { fileId, editionKey, rank, hdr, size, compact, audio, audioOptions,
+'       autoAudio, audioByLanguage, subtitles, subtitleOptions,
+'       autoSubtitles, clearedAutoSubtitles, subtitleSeed }
 '
-' rank is its resolution's (playback.intent.resolutionRank); compact is the readout's value; audio and subtitles are per track, in
+' rank, hdr, and size are what Auto compares (playback.intent.fileFacts);
+' compact is the readout's value; audio and subtitles are per track, in
 ' ordinal order, { summary, pref }: the readout's value and the body of the
 ' track preference that remembers it (PUT /api/v2/{audio,subtitle}-prefs,
 ' as tvOS's TrackSelectionPersistence writes it). autoAudio is the track
@@ -67,24 +77,43 @@ namespace catalog.selection
         lastFile = ""
         if util.isObject(watch.user_data) then lastFile = util.text(watch.user_data.last_file_id)
         lastEdition = invalid
+        laterPart = -1
+        ' Each listed file's presentation_group_key, for laterPartStarts.
+        groups = []
         for each version in watch.versions
             if util.isObject(version) and util.text(version.file_id) <> ""
                 entry = fromVersion(version, watch, prefs, preferredLanguage, copy)
                 if playback.intent.isChoosable(version)
                     edition = byKey["e:" + entry.editionKey]
                     if edition = invalid
-                        edition = { key: entry.editionKey, name: catalog.pickers.editionName(version.edition_raw, copy), files: [], versionOptions: [catalog.pickers.option(catalog.pickers.AUTO, i18n.lookup(copy, "detail.auto"), i18n.lookup(copy, "detail.autoVersion"))] }
+                        edition = { key: entry.editionKey, name: catalog.pickers.editionName(version.edition_raw, copy), files: [], versionOptions: [catalog.pickers.option(catalog.pickers.AUTO, i18n.lookup(copy, "detail.auto"), i18n.lookup(copy, "detail.autoVersion"))], preference: editionPreference(version.edition_key, version.edition_raw), order: -1 }
                         byKey["e:" + entry.editionKey] = edition
                         editions.Push(edition)
                     end if
                     edition.files.Push(versions.Count())
                     edition.versionOptions.Push(catalog.pickers.versionOption(versions.Count(), version, copy))
                 end if
-                if entry.fileId = lastFile then lastEdition = entry.editionKey
+                if entry.fileId = lastFile
+                    lastEdition = entry.editionKey
+                    if not playback.intent.isChoosable(version) then laterPart = versions.Count()
+                end if
+                groups.Push(util.text(version.presentation_group_key))
                 versions.Push(entry)
             end if
         end for
         if editions.Count() = 0 then return invalid
+        orderEditions(watch, editions, byKey)
+        laterPartStarts = []
+        if laterPart >= 0
+            ' A later part of a cut with no first part listed resumes nothing.
+            partOf = byKey["e:" + versions[laterPart].editionKey]
+            if partOf = invalid then laterPart = -1
+            if partOf <> invalid and groups[laterPart] <> ""
+                for each at in partOf.files
+                    if groups[at] = groups[laterPart] then laterPartStarts.Push(at)
+                end for
+            end if
+        end if
         if lastEdition <> invalid and not byKey.DoesExist("e:" + lastEdition) then lastEdition = invalid
         ' The edition the profile last played names the cut; the file only
         ' stands in for a server that does not record it.
@@ -100,7 +129,47 @@ namespace catalog.selection
         end for
         key = util.text(watch.series_id)
         if key = "" then key = util.text(watch.content_id)
-        return { key: key, versions: versions, editions: editions, editionOptions: editionOptions, lastEdition: lastEdition }
+        return { key: key, versions: versions, editions: editions, editionOptions: editionOptions, lastEdition: lastEdition, laterPart: laterPart, laterPartStarts: laterPartStarts }
+    end function
+
+    ' Numbers each edition's order: the playback variants' order, then, for
+    ' an edition no variant names, first appearance in versions.
+    sub orderEditions(watch as Object, editions as Object, byKey as Object)
+        order = 0
+        if playback.values.isArray(watch.playback_variants)
+            for each variant in watch.playback_variants
+                if util.isObject(variant)
+                    edition = byKey["e:" + util.text(variant.edition_key)]
+                    if edition <> invalid and edition.order < 0
+                        edition.order = order
+                        order = order + 1
+                    end if
+                end if
+            end for
+        end if
+        for each edition in editions
+            if edition.order < 0
+                edition.order = order
+                order = order + 1
+            end if
+        end for
+    end sub
+
+    ' How the clients rank an edition when nothing was played: 0 for the
+    ' unnamed one (key "") or a standard cut (key or raw name, trimmed and in
+    ' lower case, "standard" or "default", starting "standard " or ending
+    ' " standard"), 1 for a theatrical one (containing "theatrical"), 2 for
+    ' any other.
+    function editionPreference(key as Dynamic, raw as Dynamic) as Integer
+        names = [LCase(util.text(key).Trim()), LCase(util.text(raw).Trim())]
+        if names[0] = "" then return 0
+        for each name in names
+            if name = "standard" or name = "default" or Left(name, 9) = "standard " or Right(name, 9) = " standard" then return 0
+        end for
+        for each name in names
+            if Instr(1, name, "theatrical") > 0 then return 1
+        end for
+        return 2
     end function
 
     function fromVersion(version as Object, watch as Object, prefs as Object, preferredLanguage as String, copy as Object) as Object
@@ -115,10 +184,13 @@ namespace catalog.selection
         subtitles = playback.tracks.subtitleTracks(version.subtitle_tracks)
         preferred = -1
         if util.isNumber(version.effective_audio_track_index) then preferred = Int(version.effective_audio_track_index)
+        facts = playback.intent.fileFacts(version)
         out = {
             fileId: util.text(version.file_id),
             editionKey: util.text(version.edition_key),
-            rank: playback.intent.resolutionRank(version.resolution),
+            rank: facts.rank,
+            hdr: facts.hdr,
+            size: facts.size,
             compact: catalog.pickers.versionCompact(version, copy),
             audio: [],
             audioOptions: catalog.pickers.audioOptions(audio, preferred, copy),

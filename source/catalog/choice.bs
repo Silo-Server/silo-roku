@@ -14,11 +14,11 @@ import "pkg:/source/util/values.bs"
 '     { edition, quality, fileId, audio, subtitle, cleared }
 '
 ' edition is the key of the cut the page plays (silo-roku#62): the one the
-' profile last played, else the one holding the best file for its quality
-' preference, until the viewer picks another in the Edition menu. quality
-' is playback.preferred_quality ("auto" or a resolution). fileId is the
-' version the viewer chose, or "" for Auto, which plays the best file of
-' the edition for quality (autoFile) and never another edition's; audio an
+' profile last played, else the one whose Auto file compares best
+' (openingEdition), until the viewer picks another in the Edition menu.
+' quality is playback.preferred_quality ("auto" or a resolution). fileId is
+' the version the viewer chose, or "" for Auto, which plays the best file
+' of the edition for quality (autoFile) and never another edition's; audio an
 ' ordinal or playback.tracks.AUTO;
 ' subtitle an ordinal, playback.tracks.OFF, or AUTO; cleared whether the
 ' viewer's last Subtitles pick on the page was Auto, which deleted the
@@ -38,7 +38,7 @@ namespace catalog.choice
         if util.isString(selection.lastEdition)
             out.edition = selection.lastEdition
         else
-            out.edition = bestFile(selection, allFiles(selection), quality).editionKey
+            out.edition = openingEdition(selection, quality)
         end if
         out.subtitle = versionOf(selection, out).subtitleSeed
         return out
@@ -54,33 +54,75 @@ namespace catalog.choice
         return autoFile(selection, choice)
     end function
 
-    ' The file Auto plays: the best of the choice's edition for its quality
-    ' (playback.intent.bestOf).
+    ' The file Auto plays: the later part of a multipart presentation the
+    ' profile last played (catalog.selection's laterPart) when it is in the
+    ' choice's edition, so Resume continues it; else the best of the
+    ' edition for its quality (playback.intent.bestOf).
     function autoFile(selection as Object, choice as Object) as Object
-        return bestFile(selection, editionOf(selection, choice).files, choice.quality)
+        edition = editionOf(selection, choice)
+        if resumesLaterPart(selection, edition) then return selection.versions[selection.laterPart]
+        return bestFile(selection, edition.files, choice.quality)
+    end function
+
+    function resumesLaterPart(selection as Object, edition as Object) as Boolean
+        return selection.laterPart >= 0 and selection.versions[selection.laterPart].editionKey = edition.key
+    end function
+
+    ' The version Start Over plays: the one the choice plays, but for a
+    ' later part Auto resumes, the best first part of its presentation
+    ' (catalog.selection's laterPartStarts), else the edition's best file.
+    function startOverFile(selection as Object, choice as Object) as Object
+        edition = editionOf(selection, choice)
+        if choice.fileId <> "" or not resumesLaterPart(selection, edition) then return versionOf(selection, choice)
+        if selection.laterPartStarts.Count() > 0 then return bestFile(selection, selection.laterPartStarts, choice.quality)
+        return bestFile(selection, edition.files, choice.quality)
     end function
 
     ' The best version among files (places in the selection's versions) for
     ' quality, else the first version.
     function bestFile(selection as Object, files as Object, quality as String) as Object
-        ranks = []
+        facts = []
         for each at in files
-            ranks.Push(selection.versions[at].rank)
+            facts.Push(selection.versions[at])
         end for
-        found = playback.intent.bestOf(ranks, quality)
+        found = playback.intent.bestOf(facts, quality)
         if found < 0 then return selection.versions[0]
         return selection.versions[files[found]]
     end function
 
-    ' Every choosable file, in the server's order, so a tie between
-    ' editions goes to the file listed first (playback.intent.bestOf).
-    function allFiles(selection as Object) as Object
-        out = []
+    ' The edition a page opens on when the profile played none: each
+    ' edition's Auto file compared across the cuts, by its fit (within the
+    ' preference, or no preference, then above it, then an unknown
+    ' resolution), its rank (the higher within the preference, the lower
+    ' above it), HDR before SDR, then the edition's preference
+    ' (catalog.selection.editionPreference) and the server's edition order.
+    ' File size is not compared across cuts.
+    function openingEdition(selection as Object, quality as String) as String
+        cap = playback.intent.resolutionRank(quality)
+        best = invalid
         for each edition in selection.editions
-            out.Append(edition.files)
+            file = bestFile(selection, edition.files, quality)
+            fit = 0
+            if file.rank = 0
+                fit = 2
+            else if cap > 0 and file.rank > cap
+                fit = 1
+            end if
+            candidate = { key: edition.key, fit: fit, rank: file.rank, hdr: file.hdr, preference: edition.preference, order: edition.order }
+            if best = invalid or opensBefore(candidate, best) then best = candidate
         end for
-        out.Sort()
-        return out
+        return best.key
+    end function
+
+    function opensBefore(a as Object, b as Object) as Boolean
+        if a.fit <> b.fit then return a.fit < b.fit
+        if a.rank <> b.rank
+            if a.fit = 1 then return a.rank < b.rank
+            return a.rank > b.rank
+        end if
+        if a.hdr <> b.hdr then return a.hdr
+        if a.preference <> b.preference then return a.preference < b.preference
+        return a.order < b.order
     end function
 
     ' The choice's edition, else the first (a key a re-read no longer
