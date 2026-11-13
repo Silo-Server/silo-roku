@@ -3,9 +3,10 @@ name: Release
 # Makes a tester build, numbered as silo-apple and silo-android number theirs:
 # tags the commit vX.Y.Z-beta.B, builds and signs a beta and a release package
 # of it, and publishes a GitHub prerelease with notes on what changed since the
-# last build. Upload the beta package to the beta app in the Roku Developer
-# Dashboard; promote.yml later turns the same build into a store release
-# without rebuilding. See docs/releasing.md.
+# last build and the unsigned store zip, which anyone can sideload. Upload the
+# beta package to the beta app in the Roku Developer Dashboard; promote.yml
+# later turns the same build into a store release without rebuilding. See
+# docs/releasing.md.
 
 on:
   workflow_dispatch:
@@ -214,10 +215,13 @@ jobs:
           scripts/package.sh "$RUNNER_TEMP/zips/silo-roku-beta.zip" "out/$NAME-beta.pkg"
           scripts/package.sh "$RUNNER_TEMP/zips/silo-roku.zip" "out/$NAME.pkg"
 
-      # Packages stay off the public prerelease: they go to the Roku Developer
-      # Dashboard by hand, and promote.yml attaches the store one to the draft
-      # release. archive: false keeps each .pkg as it is, named after its file,
-      # because the dashboard rejects the zip GitHub otherwise wraps it in.
+      # Signed packages stay off the public prerelease: each carries the
+      # signing key, protected only by its password (rekeying a Roku takes a
+      # package and that password); sideloading uses the zip instead. They go
+      # to the Roku Developer Dashboard by hand, and promote.yml attaches the
+      # store one to the draft release. archive: false keeps each .pkg as it
+      # is, named after its file, because the dashboard rejects the zip GitHub
+      # otherwise wraps it in.
       # overwrite lets Re-run failed jobs replace what a failed attempt
       # uploaded. It deletes the artifact called `name`, which archive: false
       # ignores for the upload itself, so `name` repeats the file name. 90 days
@@ -258,15 +262,38 @@ jobs:
       BUILD: ${{ needs.prepare.outputs.build }}
       TAG: ${{ needs.prepare.outputs.tag }}
       PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
+      ZIP: silo-roku-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.build }}.zip
+      BETA_LATEST: beta-latest
+      LATEST_ZIP: silo-roku-latest-beta.zip
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      # The store zip the build job stamped and ran Static Analysis on, for
+      # sideloading. It is unsigned, so it carries no key, and sideloaded it
+      # reports X-Silo-Client-Channel: sideload. The beta zip differs only in
+      # that header, which sideloading overrides.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: zips
+          path: ${{ runner.temp }}/zips
+
       - name: Publish the prerelease
         run: |
+          mv "${RUNNER_TEMP}/zips/silo-roku.zip" "${ZIP}"
+          # "Re-run failed jobs" re-runs this whole job. When this run already
+          # created the prerelease, upload the zip only if it lacks one
+          # (--clobber would delete a good copy first), then publish it: gh
+          # release create leaves a draft when an upload fails.
           if gh release view "${TAG}" > /dev/null 2>&1; then
-            echo "${TAG} is already published."
+            uploaded="$(gh release view "${TAG}" --json assets --jq '.assets[] | select(.state == "uploaded") | .name')"
+            if ! grep -qxF "${ZIP}" <<< "${uploaded}"; then
+              # A failed upload can leave a broken asset under this name.
+              gh release upload "${TAG}" --clobber "${ZIP}"
+            fi
+            gh release edit "${TAG}" --draft=false --prerelease
+            echo "${TAG} is published with ${ZIP}."
             exit 0
           fi
           gh api "repos/${GH_REPO}/releases/generate-notes" \
@@ -275,11 +302,15 @@ jobs:
             echo "Tester build ${VERSION} (${BUILD}) for the Roku beta app."
             echo
             cat generated.md
+            echo
+            echo "### Sideload"
+            echo
+            echo "Download \`${ZIP}\` and install it from a browser: [Sideload a build](https://github.com/${GH_REPO}/blob/main/docs/sideloading.md). The [latest tester build](https://github.com/${GH_REPO}/releases/tag/${BETA_LATEST}) release always has the newest one as \`${LATEST_ZIP}\`."
           } > notes.md
           # A prerelease never becomes Latest, so releases/latest keeps pointing
           # at the store release.
           gh release create "${TAG}" --verify-tag --prerelease \
-            --title "Silo Roku ${VERSION} (${BUILD})" --notes-file notes.md
+            --title "Silo Roku ${VERSION} (${BUILD})" --notes-file notes.md "${ZIP}"
           {
             echo "### Upload to the Roku beta app"
             echo
@@ -289,3 +320,76 @@ jobs:
             echo
             python3 -I scripts/release-version.py store-notes 1500 < generated.md | sed 's/^/    /'
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      # One prerelease, tag beta-latest, always holds the newest tester build as
+      # silo-roku-latest-beta.zip, so one link
+      # (releases/download/beta-latest/silo-roku-latest-beta.zip) always gets
+      # it. GitHub's releases/latest links skip prereleases, so they can't do
+      # this. Version tags start with v, so release-version.py and Promote
+      # never see this one. silo-android's release.yml does the same.
+      - name: Update the latest tester build
+        run: |
+          # A re-run of an older build must not replace a newer one.
+          newest="$(gh release list --limit 100 --json tagName,isPrerelease \
+            --jq '[.[] | select(.isPrerelease and (.tagName | test("-beta[.][0-9]+$")))][0].tagName')"
+          if [[ "${newest}" != "${TAG}" ]]; then
+            echo "${newest} is newer than ${TAG}; leaving ${BETA_LATEST} alone."
+            exit 0
+          fi
+
+          # The first run creates the tag and the release.
+          if ! gh api "repos/${GH_REPO}/git/refs/tags/${BETA_LATEST}" > /dev/null 2>&1; then
+            gh api "repos/${GH_REPO}/git/refs" -f ref="refs/tags/${BETA_LATEST}" -f sha="${GITHUB_SHA}" --silent
+          fi
+          if ! gh release view "${BETA_LATEST}" > /dev/null 2>&1; then
+            gh release create "${BETA_LATEST}" --verify-tag --prerelease --title "Latest tester build" --notes "Being updated."
+          fi
+
+          # Upload under a staging name, then swap it in, so a failed upload
+          # never leaves the link without a file. The old file steps aside as
+          # previous-<name> and comes back if the swap fails. Every step is
+          # safe to repeat on a re-run.
+          release_id="$(gh release view "${BETA_LATEST}" --json databaseId --jq .databaseId)"
+          asset_id() {
+            gh api "repos/${GH_REPO}/releases/${release_id}/assets" --paginate \
+              --jq ".[] | select(.name == \"$1\") | .id"
+          }
+          rename_asset() {
+            gh api -X PATCH "repos/${GH_REPO}/releases/assets/$1" -f name="$2" --silent
+          }
+          delete_asset() {
+            gh api -X DELETE "repos/${GH_REPO}/releases/assets/$1" --silent
+          }
+          staged="next-${LATEST_ZIP}"
+          previous="previous-${LATEST_ZIP}"
+          cp "${ZIP}" "${staged}"
+          gh release upload "${BETA_LATEST}" --clobber "${staged}"
+          staged_id="$(asset_id "${staged}")"
+          current_id="$(asset_id "${LATEST_ZIP}")"
+          if [[ -n "${current_id}" ]]; then
+            # The live file is safe, so a copy left by an interrupted run can go.
+            stale_id="$(asset_id "${previous}")"
+            if [[ -n "${stale_id}" ]]; then
+              delete_asset "${stale_id}"
+            fi
+            rename_asset "${current_id}" "${previous}"
+          fi
+          if ! rename_asset "${staged_id}" "${LATEST_ZIP}"; then
+            # Put the old file back, whether this run or an interrupted one
+            # moved it aside.
+            restore_id="$(asset_id "${previous}")"
+            if [[ -n "${restore_id}" ]]; then
+              rename_asset "${restore_id}" "${LATEST_ZIP}"
+            fi
+            echo "::error::Couldn't swap in ${LATEST_ZIP}; the previous file is still served. Re-run failed jobs."
+            exit 1
+          fi
+          for old_id in $(asset_id "${previous}"); do
+            delete_asset "${old_id}"
+          done
+
+          # Point the tag and title at this build only once its file is live.
+          gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/${BETA_LATEST}" -f sha="${GITHUB_SHA}" -F force=true --silent
+          gh release edit "${BETA_LATEST}" --prerelease \
+            --title "Latest tester build: ${VERSION} (${BUILD})" \
+            --notes "The newest tester build, ${TAG}, as \`${LATEST_ZIP}\` at a link that never changes. To install it, see [Sideload a build](https://github.com/${GH_REPO}/blob/main/docs/sideloading.md). Release notes and the versioned zip are on [${TAG}](https://github.com/${GH_REPO}/releases/tag/${TAG})."

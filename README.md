@@ -42,9 +42,11 @@ client renders what the server returns and plays the plan it chooses.
 
 ## Install
 
-There is no store or beta release yet. To run the app, sideload a
-development build onto a Roku in Developer Mode (see
-[Build and sideload](#build-and-sideload)).
+The app is not in the Roku Channel Store yet. Each tester build on the
+[Releases page](https://github.com/Silo-Server/silo-roku/releases) includes a
+zip you can sideload onto a Roku in Developer Mode from a web browser:
+[`docs/sideloading.md`](docs/sideloading.md) walks through it. To build it
+yourself, see [Build and sideload](#build-and-sideload).
 
 ## Features
 

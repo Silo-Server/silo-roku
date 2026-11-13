@@ -16,15 +16,23 @@ Roku behind the `roku-signer` runner ("Signed packages" in
 [`development.md`](development.md)), keeps them as run artifacts for 90 days,
 and publishes a GitHub prerelease, `Silo Roku 1.0.0 (12)`, whose notes list
 the pull requests merged since the previous build, grouped by label
-(`.github/release.yml`).
+(`.github/release.yml`). The prerelease carries `silo-roku-1.0.0-12.zip`, the
+unsigned store zip, which anyone can sideload from a browser
+([`sideloading.md`](sideloading.md)); sideloaded, it reports
+`X-Silo-Client-Channel: sideload`. The run also puts that zip on the
+`beta-latest` prerelease as `silo-roku-latest-beta.zip`, so
+`releases/download/beta-latest/silo-roku-latest-beta.zip` always gets the
+newest tester build (GitHub's `releases/latest` skips prereleases). A re-run of
+an older build leaves it alone.
 
 Download the `silo-roku-1.0.0-12-beta.pkg` artifact from the run and upload
 it to the beta app in the Roku Developer Dashboard. Release builds before
 1.0.0 (2) stored packages zipped (artifacts named without `.pkg`): unzip
 those and upload the `.pkg` inside, since the dashboard rejects the zip as
 "incorrectly packaged". The run's summary has
-release notes cut to Roku's 1,500 characters. Packages never go on the public
-prerelease.
+release notes cut to Roku's 1,500 characters. Signed packages never go on a
+public release: each one carries the signing key, protected only by its
+password, since rekeying a Roku takes a package and that password.
 
 It requires **CI** to have passed on the commit, so run it once `main` is
 green. The build job runs Static Analysis on the stamped store package.
@@ -43,13 +51,14 @@ don't skip changes no tester got.
 
 1. Actions → **Promote** → enter the tester build, such as `v1.0.0-beta.12`.
    Nothing is rebuilt: GitHub gets a draft release `v1.0.0` on the same
-   commit, with the store package that build's Release run signed. Drafts are
-   visible only to maintainers.
+   commit, with the store package that build's Release run signed and the
+   tester build's sideload zip. Drafts are visible only to maintainers.
 2. Upload that `.pkg` to the public app in the Roku Developer Dashboard, paste
    the release notes from the run's summary, and submit it for certification
    ([`release-checklist.md`](release-checklist.md)).
 3. On GitHub → Releases, edit the `v1.0.0` draft notes.
-4. When Roku approves and publishes the app, publish the GitHub release.
+4. When Roku approves and publishes the app, delete the `.pkg` from the draft
+   and publish the GitHub release with the zip.
 
 Release runs keep packages for 90 days. Promote a build older than that by
 running Release again with its version (`version: 1.0.0`) and promoting the
