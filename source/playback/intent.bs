@@ -18,9 +18,12 @@ namespace playback.intent
     ' { itemId, title, fileId, pinned, runtime, audioTracks,
     ' effectiveAudioIndex, versions, resumeSeconds, kind, name, seriesTitle,
     ' seasonNumber, episodeNumber, year }. The
-    ' version is pinnedFile when the projection lists it (a detail page's
-    ' Version choice, nav.player.pinnedFile), which pinned then says; else
-    ' chooseVersion's. audioTracks are { index, codec, channels, language, title,
+    ' version is startFile when the projection lists it (the file a detail
+    ' page or a phone resolved, nav.player.startFile), pinned when pins says
+    ' so (a Version choice, nav.player.pinnedFile); else, with edition (the
+    ' page's edition key, nav.player.editionOf), the best file of that
+    ' edition (bestInEdition), so a file gone since the page read it never
+    ' moves the start to another cut; else chooseVersion's. audioTracks are { index, codec, channels, language, title,
     ' default, bitrate }, what playback.options.initialAudio ranks: title is
     ' the track's title, else its embedded title; effectiveAudioIndex is the
     ' version's effective_audio_track_index (the track the server's
@@ -31,11 +34,12 @@ namespace playback.intent
     ' position to resume (resumeOf), or invalid. kind is the projection's
     ' type ("movie", "episode"), and name its own title; playback.markers
     ' reads the version's markers.
-    function fromWatch(detail as Dynamic, itemId as String, pinnedFile = "" as String) as Dynamic
+    function fromWatch(detail as Dynamic, itemId as String, startFile = "" as String, pins = false as Boolean, edition = invalid as Dynamic) as Dynamic
         if not util.isObject(detail) or not playback.values.isArray(detail.versions) then return invalid
-        version = listedVersion(detail, pinnedFile)
-        pinned = version <> invalid
-        if not pinned then version = chooseVersion(detail)
+        version = listedVersion(detail, startFile)
+        pinned = pins and version <> invalid
+        if version = invalid and util.isString(edition) then version = bestInEdition(detail, edition)
+        if version = invalid then version = chooseVersion(detail)
         if version = invalid then return invalid
         file = fileTracks(version)
         runtime = invalid
@@ -150,9 +154,70 @@ namespace playback.intent
         return invalid
     end function
 
+    ' --- Editions and Auto (silo-roku#62) -----------------------------------
+
+    ' A resolution's rank as silo-server ranks it (internal/access/quality.go):
+    ' 480p 1, 720p 2, 1080p 3, 2160p 4, 4320p 5, anything else 0 (unknown).
+    function resolutionRank(resolution as Dynamic) as Integer
+        ranks = { "480P": 1, "720P": 2, "1080P": 3, "2160P": 4, "4320P": 5 }
+        rank = ranks[UCase(util.text(resolution).Trim())]
+        if rank = invalid then return 0
+        return rank
+    end function
+
+    ' The place in ranks (resolutionRank's, one per file in server order) of
+    ' the file Auto plays for quality, playback.preferred_quality ("auto" or a
+    ' resolution, playback.preferences): the highest rank the preference
+    ' allows; else, when none fits, the lowest rank above it (the closest);
+    ' else, when no rank is known, the first. Ties go to the first. -1 for no
+    ' files. The detail page (catalog.choice) and the start (bestInEdition)
+    ' both ask here.
+    function bestOf(ranks as Object, quality as String) as Integer
+        cap = resolutionRank(quality)
+        if cap = 0 then cap = 99
+        fits = -1
+        above = -1
+        for i = 0 to ranks.Count() - 1
+            rank = ranks[i]
+            if rank > 0 and rank <= cap
+                if fits < 0 or rank > ranks[fits] then fits = i
+            else if rank > cap
+                if above < 0 or rank < ranks[above] then above = i
+            end if
+        end for
+        if fits >= 0 then return fits
+        if above >= 0 then return above
+        if ranks.Count() > 0 then return 0
+        return -1
+    end function
+
+    ' Whether a watch version is a file a viewer chooses: not a later part
+    ' of a multipart presentation, which follows its first part.
+    function isChoosable(version as Dynamic) as Boolean
+        if not util.isObject(version) or util.text(version.file_id) = "" then return false
+        return not util.isNumber(version.presentation_part_index) or version.presentation_part_index <= 1
+    end function
+
+    ' The best file (bestOf, under Auto) among the projection's versions in
+    ' the edition with key edition ("" for the unnamed one), or invalid when
+    ' it lists none.
+    function bestInEdition(detail as Object, edition as String) as Dynamic
+        candidates = []
+        ranks = []
+        for each version in detail.versions
+            if isChoosable(version) and util.text(version.edition_key) = edition
+                candidates.Push(version)
+                ranks.Push(resolutionRank(version.resolution))
+            end if
+        end for
+        at = bestOf(ranks, "auto")
+        if at < 0 then return invalid
+        return candidates[at]
+    end function
+
     ' The version last played, else the server's default variant, else the
-    ' first: what a start plays unless a detail page pinned one, and Auto on
-    ' a detail page's Version button.
+    ' first: what a start plays when nothing chose a file (Continue
+    ' Watching, a deep link, Up Next), so a resume keeps the file played.
     function chooseVersion(detail as Object) as Dynamic
         lastPlayed = ""
         if util.isObject(detail.user_data) then lastPlayed = util.text(detail.user_data.last_file_id)

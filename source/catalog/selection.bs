@@ -14,18 +14,29 @@ import "pkg:/source/util/values.bs"
 ' audio_tracks), and subtitle ordinals in the combined order
 ' (playback.tracks). A selection is
 '
-'     { key, defaultFile, versions, versionOptions }
+'     { key, versions, editions, editionOptions, lastEdition }
 '
 ' key names the item's track preferences (its series, else itself, as tvOS
-' and the web keep them); defaultFile is the file Auto plays, the one the
-' player's start chooses (playback.intent.chooseVersion); versionOptions is
-' the Version menu (catalog.pickers). Each version is
+' and the web keep them). editions are the item's cuts in server order,
+' each
 '
-'     { fileId, compact, audio, audioOptions, autoAudio, audioByLanguage,
-'       subtitles, subtitleOptions, autoSubtitles, clearedAutoSubtitles,
-'       subtitleSeed }
+'     { key, name, files, versionOptions }
 '
-' compact is the readout's value; audio and subtitles are per track, in
+' key its edition_key ("" for the unnamed one), name what the Edition
+' button shows (catalog.pickers.editionName), files the places in versions
+' of the files a viewer chooses (playback.intent.isChoosable: not a later
+' part of a multipart file), and versionOptions its Version menu: Auto,
+' then those files, each valued by its place in versions. editionOptions
+' is the Edition menu, valued by place in editions. lastEdition is the key
+' of the edition the profile last played (user_data.last_edition_key, else
+' the edition of last_file_id), or invalid when it played none listed;
+' catalog.choice resolves Auto from these (silo-roku#62). Each version is
+'
+'     { fileId, editionKey, rank, compact, audio, audioOptions, autoAudio,
+'       audioByLanguage, subtitles, subtitleOptions, autoSubtitles,
+'       clearedAutoSubtitles, subtitleSeed }
+'
+' rank is its resolution's (playback.intent.resolutionRank); compact is the readout's value; audio and subtitles are per track, in
 ' ordinal order, { summary, pref }: the readout's value and the body of the
 ' track preference that remembers it (PUT /api/v2/{audio,subtitle}-prefs,
 ' as tvOS's TrackSelectionPersistence writes it). autoAudio is the track
@@ -45,22 +56,47 @@ namespace catalog.selection
     ' The selection for a watch body, or invalid when it lists no version.
     function fromWatch(watch as Dynamic, copy as Object) as Dynamic
         if not util.isObject(watch) or not playback.values.isArray(watch.versions) then return invalid
-        chosen = playback.intent.chooseVersion(watch)
-        if chosen = invalid then return invalid
         prefs = playback.options.subtitlePreferences(watch, {})
         ' The language the Subtitles menu leads with, as Options' list does.
         preferredLanguage = playback.options.subtitleOrderLanguage(watch)
         versions = []
-        options = [catalog.pickers.option(catalog.pickers.AUTO, i18n.lookup(copy, "detail.auto"), i18n.lookup(copy, "detail.autoVersion"))]
+        editions = []
+        byKey = {}
+        lastFile = ""
+        if util.isObject(watch.user_data) then lastFile = util.text(watch.user_data.last_file_id)
+        lastEdition = invalid
         for each version in watch.versions
             if util.isObject(version) and util.text(version.file_id) <> ""
-                options.Push(catalog.pickers.versionOption(versions.Count(), version, copy))
-                versions.Push(fromVersion(version, watch, prefs, preferredLanguage, copy))
+                entry = fromVersion(version, watch, prefs, preferredLanguage, copy)
+                if playback.intent.isChoosable(version)
+                    edition = byKey["e:" + entry.editionKey]
+                    if edition = invalid
+                        edition = { key: entry.editionKey, name: catalog.pickers.editionName(version.edition_raw, copy), files: [], versionOptions: [catalog.pickers.option(catalog.pickers.AUTO, i18n.lookup(copy, "detail.auto"), i18n.lookup(copy, "detail.autoVersion"))] }
+                        byKey["e:" + entry.editionKey] = edition
+                        editions.Push(edition)
+                    end if
+                    edition.files.Push(versions.Count())
+                    edition.versionOptions.Push(catalog.pickers.versionOption(versions.Count(), version, copy))
+                end if
+                if entry.fileId = lastFile then lastEdition = entry.editionKey
+                versions.Push(entry)
             end if
+        end for
+        if versions.Count() = 0 then return invalid
+        if lastEdition <> invalid and not byKey.DoesExist("e:" + lastEdition) then lastEdition = invalid
+        ' The edition the profile last played names the cut; the file only
+        ' stands in for a server that does not record it.
+        if util.isObject(watch.user_data)
+            named = util.text(watch.user_data.last_edition_key)
+            if named <> "" and byKey.DoesExist("e:" + named) then lastEdition = named
+        end if
+        editionOptions = []
+        for i = 0 to editions.Count() - 1
+            editionOptions.Push(catalog.pickers.editionOption(i, editions[i].name, editions[i].files.Count(), copy))
         end for
         key = util.text(watch.series_id)
         if key = "" then key = util.text(watch.content_id)
-        return { key: key, defaultFile: util.text(chosen.file_id), versions: versions, versionOptions: options }
+        return { key: key, versions: versions, editions: editions, editionOptions: editionOptions, lastEdition: lastEdition }
     end function
 
     function fromVersion(version as Object, watch as Object, prefs as Object, preferredLanguage as String, copy as Object) as Object
@@ -77,6 +113,8 @@ namespace catalog.selection
         if util.isNumber(version.effective_audio_track_index) then preferred = Int(version.effective_audio_track_index)
         out = {
             fileId: util.text(version.file_id),
+            editionKey: util.text(version.edition_key),
+            rank: playback.intent.resolutionRank(version.resolution),
             compact: catalog.pickers.versionCompact(version, copy),
             audio: [],
             audioOptions: catalog.pickers.audioOptions(audio, preferred, copy),

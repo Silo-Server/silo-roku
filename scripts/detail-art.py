@@ -4,6 +4,9 @@
   play.png       a triangle pointing right: Play and Resume
   restart.png    an arrow turning back on itself: Start Over
   versions.png   a rounded frame with two layers stacked behind it: Versions
+  edition.png    a film frame with sprocket holes down both sides, in the
+                 glyphs' stroke: Edition (tvOS draws rectangle.stack, which
+                 reads like Roku's Versions glyph; spec section 5.9)
   audio.png      a speaker with two sound waves: Audio
   subtitles.png  a rounded frame with two lines of text: Subtitles
   bookmark.png   a bookmark's outline: Watchlist, not on the list
@@ -250,10 +253,10 @@ def check(size):
     return coverage(size, covered, GLYPH_SCALE)
 
 
-def film(size):
+def film(size, stroke=4.0):
     """SF Symbols' film: a rounded frame, a band down each side cut off by a
-    line, and three sprocket holes in each band, in a 4 px stroke."""
-    stroke = 4.0
+    line, and three sprocket holes in each band, in a 4 px stroke (the
+    action row's Edition glyph: its 3.4 px)."""
     cx, cy = size / 2, size / 2
     half_w, half_h, radius = size * 0.42, size * 0.34, size * 0.09
     bands = (size * 0.29, size * 0.71)
@@ -420,6 +423,7 @@ def images():
     yield "play.png", play(GLYPH)
     yield "restart.png", restart(GLYPH)
     yield "versions.png", versions(GLYPH)
+    yield "edition.png", film(GLYPH, STROKE)
     yield "audio.png", audio(GLYPH)
     yield "subtitles.png", subtitles(GLYPH)
     yield "bookmark.png", bookmark_outline(GLYPH)

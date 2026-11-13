@@ -242,8 +242,6 @@ Not decided yet, and deferred until the owner chooses:
 - subtitle translation and sync (tvOS, Android TV);
 - local-network discovery of Silo servers (tvOS, Android TV), and DIAL;
 - Home row editing (Android TV);
-- an edition picker (Android TV); the Version menu names each version's
-  edition (section 5.6);
 - Home's hero line for the focused item's air date and cast, which costs an
   item read per card the viewer rests on.
 
@@ -1388,21 +1386,25 @@ their existing HD/FHD assets.
   - The player over the page, or Back, stops a run; an automatic one starts
     again when the page shows. A failed run does not start again on its own.
 
-- **Version, audio, and subtitles.** As tvOS ships them (D1; silo-apple
+- **Edition, version, audio, and subtitles.** As tvOS ships them (D1; silo-apple
   `b90a86ea`, `TVPlaybackSelectorRow.swift` and `TVDetailHero.swift`; the
-  design spec's squared selector row with an Edition selector was not
-  what shipped, and Roku ships no Edition control). On a movie, and on a
-  series for its active episode, the three circles after Play and Start Over
-  choose what the start plays, and a readout above the action row shows the
+  design spec's squared selector row was not what shipped), with the
+  Edition circle every Silo client shows for a title with two editions or
+  more (silo-roku#62; silo-apple#1127). On a movie, and on a series for its
+  active episode, the circles after Play and Start Over choose what the
+  start plays, and a readout above the action row shows the
   choice. The readout takes no focus: the labels VERSION, AUDIO, and
   SUBTITLES at white 48% (23 px Bold), each followed 6 px later by its
   value at white 82% (23 px Medium), inline, 20 px from one value to the
   next label, within 1031 px, 44 px tall, 18 px above the row (5.9). When
   the line would pass 1031 px, the longest values share what is left and
-  end in an ellipsis. Until the item's watch state is read, each value is
+  end in an ellipsis. Until the item's watch state and the profile's
+  `playback.preferred_quality` are read, each value is
   a white 14% bar and the three circles are dimmed and passed over by Left and Right
-  (tvOS disables them); once read, Versions and Subtitles always open, and
-  Audio Tracks opens when the version has an audio track. Each opens its
+  (tvOS disables them), and Edition is not there; once read, Edition shows
+  for two editions or more, Versions opens when the current edition has two
+  files or more, Subtitles always opens, and Audio Tracks opens when the
+  version has an audio track. A circle that is not there never takes focus. Each opens its
   menu, tvOS's 560 px popover: 14 px under the button when its rows fit
   above the screen's 48 px inset, else 14 px above the readout when they
   fit there, else on the side with room for more rows, showing those and
@@ -1414,14 +1416,30 @@ their existing HD/FHD assets.
   button, which stays drawn focused while its menu is open. Track rows use
   tvOS's vocabulary (`TrackLabels`): a track's own title shows only when it
   says something its language, codec, layout, and flags do not.
-  - Versions offers Auto ("Best match for this device") and every version:
-    "2160p · HEVC · DV · TrueHD" (resolution, video codec, DV or HDR, audio
-    codec) over its edition, video codec, container, and size ("Director's
-    Cut · HEVC · MKV · 58.31 GB"). Auto plays the version the start path
-    chooses (the one last played, else the server's default variant, else
-    the first). The readout shows resolution and range: "Auto · 2160p · DV",
-    or "1080p" for a version chosen. A version chosen is pinned: the start
-    sends `allow_alternate_versions: false`, as tvOS does.
+  - Edition is the cut the viewer watches, Version which file of that cut
+    plays (silo-roku#62, the rule every client follows). Edition, before
+    Versions, offers each edition by its `edition_raw` ("Director's Cut",
+    or "Standard" for the unnamed one) over how many versions it has ("2
+    versions"), with no Auto row; editions are the versions' `edition_key`s
+    in server order, a later part of a multipart file left out. It opens on
+    the edition the profile last played (`user_data.last_edition_key`, else
+    the edition of `last_file_id`), else the one holding the best file for
+    `playback.preferred_quality`. Picking an edition puts Version back on
+    Auto. Its spoken value is the edition's name.
+  - Versions offers Auto ("Best match for this device") and the current
+    edition's files: "2160p · HEVC · DV · TrueHD" (resolution, video codec,
+    DV or HDR, audio codec) over its video codec, container, and size
+    ("HEVC · MKV · 58.31 GB"). Auto plays the best file of the current
+    edition for `playback.preferred_quality`, never another edition's: the
+    highest resolution the preference allows (silo-server's ranks, 480p to
+    4320p), else the closest above it, else the first, ties in server order
+    (`playback.intent.bestOf`). Play starts the file the page shows, unpinned,
+    naming its edition so a file gone since the page read it is replaced
+    within that edition. The readout shows resolution and range: "Auto ·
+    2160p · DV", or "1080p" for a version chosen. A version chosen is
+    pinned: the start sends `allow_alternate_versions: false`, as tvOS does.
+    A start without the page (Continue Watching, a deep link, Up Next)
+    still plays the file last played.
   - Audio Tracks offers Auto ("Use your Playback audio preference") and
     each track in the version's order, by language, with its title,
     codec, layout, Default, and Preferred (the server's
@@ -2429,7 +2447,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The readout's items sit in slots 313, 364, and 338 px wide (`TVPlaybackSelectionSummaryView`), a value too long for its slot shrinks to 75%, and its labels are letter-spaced | The items flow inline, 20 px apart, as tvOS's `movie-detail.jpg` shows them; a line that would pass 1031 px cuts its longest values with an ellipsis; the labels are not letter-spaced | Decision AG-292 (3) from the reference screenshots; Roku `Label` has neither a minimum scale nor tracking |
 | A menu that fits neither below its button nor above it is pinned 48 px from the screen's foot | It opens below the button or above the readout, on the side with room for more rows, and shows as many rows as fit there, scrolling the rest | Pinned, a long Subtitles menu covered its own button and the readout (hardware run 26, AG-292) |
 | After Auto clears a title's subtitle choice, the readout resolves Auto with the profile's subtitle language from the app's preference store, without a mode or the item's remembered track | At once it resolves Auto without the remembered track, with the language and mode the page read; once an Auto pick's write lands (audio or subtitles), the page reads the item's tracks again and names what the server's preferences now play | The watch projection carries the series' own language and mode without the profile's, and the client keeps no preference store; until the read answers, a series' language or mode can still show (AG-292) |
-| A version's row in the Versions menu names its codec, container, and size | It names the version's edition first ("Director's Cut · HEVC · MKV · 58.31 GB") | tvOS ships no Edition selector (section 3.3), so two cuts at the same quality would otherwise read the same (assumption AG-223) |
+| The Edition button's glyph is `rectangle.stack` | A film frame (`images/detail/edition.png`) | Roku's Versions glyph is already a stack of frames (tvOS's earlier `square.stack`), so a stack would make the two circles read alike (assumption AG-225) |
 | A selector that cannot open yet is disabled | It is dimmed to 40%, and Left and Right pass over it | Roku draws its own focus (section 5.1) and has no disabled state |
 | A remembered audio track applies through the server whenever a start names none | The page reads the remembered track (`GET /api/v2/audio-prefs/{key}`) and starts on it as the viewer's choice | Built when Roku's start named the profile's language's track under Auto (assumption AG-227); Auto now names the server's effective track (section 9.7), which follows the remembered one, so the read only changes how the page marks it (assumption AG-284) |
 | OK on the value a Subtitles or Audio Tracks menu already shows saves it again, so a seeded Off becomes the title's own preference (`TVActionPopoverMenu`, `persistSubtitleSelection`) | A pick that changes nothing saves nothing | The page seeds Off from the profile's settings; saving it again would keep the title Off after the profile's subtitle setting changes (assumption AG-288) |

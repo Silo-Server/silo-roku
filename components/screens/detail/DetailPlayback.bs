@@ -5,10 +5,11 @@ import "pkg:/source/catalog/requests.bs"
 import "pkg:/source/catalog/series.bs"
 import "pkg:/source/nav/client.bs"
 import "pkg:/source/nav/player.bs"
+import "pkg:/source/playback/preferences.bs"
 import "pkg:/source/util/i18n.bs"
 import "pkg:/source/util/log.bs"
 
-' The detail page's action row, its Version, Audio, and Subtitles menus and
+' The detail page's action row, its Edition, Version, Audio, and Subtitles menus and
 ' the readout above it, the player handoff, and the refresh after the player
 ' closes (spec section 5.6, plan section 4.5).
 
@@ -42,17 +43,51 @@ function currentWatch() as Dynamic
     return m.watch
 end function
 
-' The target's selection (catalog.selection) once read, or invalid, as for
-' an item without a version.
+' The target's selection (catalog.selection) once read and seeded with
+' the profile's quality preference (seedChoice), or invalid, as for an item
+' without a version: until then the selectors stay closed, so nothing a
+' late answer changes can sit under an open menu.
 function currentSelection() as Dynamic
     watch = currentWatch()
-    if watch = invalid then return invalid
+    if watch = invalid or not util.isTrue(m.seeded) then return invalid
     return watch.selection
 end function
 
 ' A new target starts with Auto everywhere until its selection is read.
 sub resetChoices()
     m.choice = catalog.choice.initial(invalid)
+    m.seeded = false
+end sub
+
+' Reads the profile's playback.preferred_quality, once per page, beside the
+' item (playback.preferences, as the player reads it): the edition the page
+' opens on and the file Auto plays follow it (catalog.choice). A failed
+' read is Auto's, as for the player.
+sub loadQuality()
+    if m.quality <> invalid then return
+    send(playback.preferences.request(), { kind: "quality" })
+end sub
+
+sub onQuality(result as Object)
+    body = invalid
+    if result.ok = true then body = result.body
+    m.quality = playback.preferences.parse(body).preferredQuality
+    watch = currentWatch()
+    if watch <> invalid and watch.selection <> invalid and not util.isTrue(m.seeded) then seedChoice(watch.selection)
+    updateActions()
+end sub
+
+' Starts the target's choice once its selection and the quality preference
+' are both read: the edition the profile last played, else the one with
+' the best file for the preference, Auto everywhere, the subtitle the
+' profile chose on the item, and the audio track it chose for the series or
+' movie once that is read (seedAudio).
+sub seedChoice(selection as Object)
+    if m.quality = invalid then return
+    m.choice = catalog.choice.initial(selection, m.quality)
+    m.seeded = true
+    seedAudio()
+    readAudioPreference(selection.key)
 end sub
 
 ' Reads id's resume point and tracks, replacing the read for an earlier
@@ -70,16 +105,15 @@ sub loadWatch(id as String, afterPlayback as Boolean)
     send(catalog.request.watch(id), { kind: kind, id: id, afterPlayback: afterPlayback, finished: finished, tag: readTag("watch|" + id) })
 end sub
 
-' A first read starts the target's choice as tvOS does: the subtitle the
-' profile chose on the item, and the audio track it chose for the series or
-' movie once that is read (seedAudio). A read after the player closed keeps
+' A first read starts the target's choice (seedChoice), once the quality
+' preference is read too. A read after the player closed keeps
 ' what the viewer chose, as tvOS's selectors outlive its player, where the
 ' item still has it (catalog.choice.withVersion).
 sub onWatch(entry as Object, result as Object)
     if result.ok <> true then return
     if entry.afterPlayback and advanceAfterPlayback(entry.id, entry.finished) then return
     if m.target = invalid or entry.id <> m.target.contentId or not readCurrent("watch|" + entry.id, entry.tag) then return
-    kept = currentWatch() <> invalid
+    kept = currentSelection() <> invalid
     m.watch = result.body
     keepPendingWatched(m.watch)
     m.target.resumeSeconds = m.watch.resumeSeconds
@@ -88,9 +122,7 @@ sub onWatch(entry as Object, result as Object)
         if kept
             m.choice = catalog.choice.withVersion(selection, m.choice, catalog.choice.versionValue(selection, m.choice))
         else
-            m.choice = catalog.choice.initial(selection)
-            seedAudio()
-            readAudioPreference(selection.key)
+            seedChoice(selection)
         end if
     end if
     updateActions()
@@ -127,7 +159,7 @@ sub onAction()
     key = m.actions.activated
     if key = catalog.action.PLAY or key = catalog.action.START_OVER
         play(key)
-    else if key = catalog.action.VERSION or key = catalog.action.AUDIO or key = catalog.action.SUBTITLES
+    else if key = catalog.action.EDITION or key = catalog.action.VERSION or key = catalog.action.AUDIO or key = catalog.action.SUBTITLES
         openPicker(key)
     else if key = catalog.action.WATCHLIST
         toggleWatchlist()
@@ -157,6 +189,7 @@ function playIntent(key as String) as Dynamic
     if selection <> invalid
         version = catalog.choice.versionOf(selection, m.choice)
         nav.player.withTracks(wanted, version.fileId, m.choice.audio, m.choice.subtitle, m.choice.fileId <> "")
+        wanted.tracks.edition = m.choice.edition
     end if
     return wanted
 end function
@@ -168,8 +201,11 @@ sub openPicker(key as String)
     if selection = invalid then return
     version = catalog.choice.versionOf(selection, m.choice)
     m.pickerKey = key
-    if key = catalog.action.VERSION
-        m.picker.setFields({ title: i18n.text("detail.version"), options: { items: selection.versionOptions }, chosen: catalog.choice.versionValue(selection, m.choice) })
+    if key = catalog.action.EDITION
+        m.picker.setFields({ title: i18n.text("detail.edition"), options: { items: selection.editionOptions }, chosen: catalog.choice.editionValue(selection, m.choice) })
+    else if key = catalog.action.VERSION
+        ' Auto and the current edition's files.
+        m.picker.setFields({ title: i18n.text("detail.version"), options: { items: catalog.choice.editionOf(selection, m.choice).versionOptions }, chosen: catalog.choice.versionValue(selection, m.choice) })
     else if key = catalog.action.AUDIO
         items = []
         resolved = -1
@@ -202,7 +238,8 @@ sub onActionPosition()
     m.picker.anchor = [row[0] + m.actions.highlightX, row[1] + m.page.translation[1]]
 end sub
 
-' A menu's choice. Version re-resolves the tracks for the version chosen
+' A menu's choice. Edition moves to that cut with Version on Auto
+' (catalog.choice.withEdition). Version re-resolves the tracks for the version chosen
 ' (catalog.choice.withVersion); Audio and Subtitles are remembered for the
 ' series or movie (catalog.choice.preferenceWrite) when they change: OK on
 ' the value already chosen, a seeded Off included, writes nothing, so the
@@ -220,7 +257,10 @@ sub onPicked()
     selection = currentSelection()
     if selection = invalid then return
     picked = m.picker.picked
-    if m.pickerKey = catalog.action.VERSION
+    if m.pickerKey = catalog.action.EDITION
+        ' Another cut, with Version back on Auto (silo-roku#62).
+        m.choice = catalog.choice.withEdition(selection, m.choice, picked)
+    else if m.pickerKey = catalog.action.VERSION
         m.choice = catalog.choice.withVersion(selection, m.choice, picked)
     else if m.pickerKey = catalog.action.AUDIO
         if picked = m.choice.audio then return

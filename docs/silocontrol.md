@@ -382,7 +382,8 @@ Roku has accepted.
 ### 7.2 What a launch does
 
 - `playback` maps onto the player's existing intent: `contentId`; `fileId`
-  with `pinsVersion`; `audioTrackIndex` and `subtitleTrackIndex` as server
+  with `pinsVersion` (the start plays `fileId` either way, and pins it only
+  with `pinsVersion`); `audioTrackIndex` and `subtitleTrackIndex` as server
   ordinals (`nav.player.withTracks`), applied to the version the player
   chooses when `fileId` is absent; `startFromBeginning` or
   `resumePosition`. `libraryId` is ignored.

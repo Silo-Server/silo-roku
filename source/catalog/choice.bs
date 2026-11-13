@@ -1,6 +1,8 @@
 import "pkg:/source/catalog/pickers.bs"
 import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/playback/intent.bs"
 import "pkg:/source/playback/tracks.bs"
+import "pkg:/source/playback/values.bs"
 import "pkg:/source/util/i18n.bs"
 import "pkg:/source/util/values.bs"
 
@@ -9,10 +11,15 @@ import "pkg:/source/util/values.bs"
 ' tvOS makes them (silo-apple b90a86ea, TVItemDetailView and
 ' TVPlaybackSelectorRow). A choice is
 '
-'     { fileId, audio, subtitle, cleared }
+'     { edition, quality, fileId, audio, subtitle, cleared }
 '
-' fileId is the version the viewer chose, or "" for Auto, which plays the
-' selection's defaultFile; audio an ordinal or playback.tracks.AUTO;
+' edition is the key of the cut the page plays (silo-roku#62): the one the
+' profile last played, else the one holding the best file for its quality
+' preference, until the viewer picks another in the Edition menu. quality
+' is playback.preferred_quality ("auto" or a resolution). fileId is the
+' version the viewer chose, or "" for Auto, which plays the best file of
+' the edition for quality (autoFile) and never another edition's; audio an
+' ordinal or playback.tracks.AUTO;
 ' subtitle an ordinal, playback.tracks.OFF, or AUTO; cleared whether the
 ' viewer's last Subtitles pick on the page was Auto, which deleted the
 ' subtitle the profile last chose on the item, so Auto no longer plays it
@@ -25,20 +32,80 @@ namespace catalog.choice
     ' subtitle the profile chose on this item (catalog.selection's
     ' subtitleSeed). The remembered audio track arrives separately
     ' (seedAudio).
-    function initial(selection as Dynamic) as Object
-        out = { fileId: "", audio: playback.tracks.AUTO, subtitle: playback.tracks.AUTO, cleared: false }
-        if selection <> invalid then out.subtitle = versionOf(selection, out).subtitleSeed
+    function initial(selection as Dynamic, quality = "auto" as String) as Object
+        out = { edition: "", quality: quality, fileId: "", audio: playback.tracks.AUTO, subtitle: playback.tracks.AUTO, cleared: false }
+        if selection = invalid then return out
+        if util.isString(selection.lastEdition)
+            out.edition = selection.lastEdition
+        else
+            out.edition = bestFile(selection, allFiles(selection), quality).editionKey
+        end if
+        out.subtitle = versionOf(selection, out).subtitleSeed
         return out
     end function
 
     ' The version the choice plays: the one chosen, else Auto's.
     function versionOf(selection as Object, choice as Object) as Object
-        wanted = choice.fileId
-        if wanted = "" then wanted = selection.defaultFile
-        for each entry in selection.versions
-            if entry.fileId = wanted then return entry
+        if choice.fileId <> ""
+            for each entry in selection.versions
+                if entry.fileId = choice.fileId then return entry
+            end for
+        end if
+        return autoFile(selection, choice)
+    end function
+
+    ' The file Auto plays: the best of the choice's edition for its quality
+    ' (playback.intent.bestOf).
+    function autoFile(selection as Object, choice as Object) as Object
+        return bestFile(selection, editionOf(selection, choice).files, choice.quality)
+    end function
+
+    ' The best version among files (places in the selection's versions) for
+    ' quality, else the first version.
+    function bestFile(selection as Object, files as Object, quality as String) as Object
+        ranks = []
+        for each at in files
+            ranks.Push(selection.versions[at].rank)
         end for
-        return selection.versions[0]
+        found = playback.intent.bestOf(ranks, quality)
+        if found < 0 then return selection.versions[0]
+        return selection.versions[files[found]]
+    end function
+
+    ' Every choosable file, edition by edition.
+    function allFiles(selection as Object) as Object
+        out = []
+        for each edition in selection.editions
+            out.Append(edition.files)
+        end for
+        return out
+    end function
+
+    ' The choice's edition, else the first (a key a re-read no longer
+    ' lists).
+    function editionOf(selection as Object, choice as Object) as Object
+        at = editionValue(selection, choice)
+        if at < 0 then return { key: "", name: "", files: [], versionOptions: [] }
+        return selection.editions[at]
+    end function
+
+    ' The Edition menu's value for the choice: its edition's place, else 0;
+    ' -1 without editions.
+    function editionValue(selection as Object, choice as Object) as Integer
+        for i = 0 to selection.editions.Count() - 1
+            if selection.editions[i].key = choice.edition then return i
+        end for
+        if selection.editions.Count() = 0 then return -1
+        return 0
+    end function
+
+    ' The choice after the Edition menu's value: that edition, with Version
+    ' back on Auto (a chosen file goes), its tracks kept as withVersion
+    ' keeps them.
+    function withEdition(selection as Object, choice as Object, value as Integer) as Object
+        moved = playback.values.copy(choice)
+        if value >= 0 and value < selection.editions.Count() then moved.edition = selection.editions[value].key
+        return withVersion(selection, moved, playback.tracks.AUTO)
     end function
 
     ' The Version menu's value for the choice: its place in the versions,
@@ -55,8 +122,11 @@ namespace catalog.choice
     ' tvOS, an audio or subtitle choice stays when the version has a track
     ' at the same ordinal, and otherwise goes back to Auto; Auto stays Auto.
     function withVersion(selection as Object, choice as Object, value as Integer) as Object
-        out = { fileId: "", audio: choice.audio, subtitle: choice.subtitle, cleared: util.isTrue(choice.cleared) }
-        if value >= 0 and value < selection.versions.Count() then out.fileId = selection.versions[value].fileId
+        out = { edition: util.text(choice.edition), quality: util.text(choice.quality), fileId: "", audio: choice.audio, subtitle: choice.subtitle, cleared: util.isTrue(choice.cleared) }
+        if value >= 0 and value < selection.versions.Count()
+            out.fileId = selection.versions[value].fileId
+            out.edition = selection.versions[value].editionKey
+        end if
         entry = versionOf(selection, out)
         if out.audio >= entry.audio.Count() then out.audio = playback.tracks.AUTO
         if out.subtitle >= entry.subtitles.Count() then out.subtitle = playback.tracks.AUTO
@@ -83,7 +153,9 @@ namespace catalog.choice
     ' The readout above the action row, { version, audio, subtitles }, as
     ' tvOS's TVPlaybackSelectionSummary words it: "Auto · 2160p · DV",
     ' "Auto · English · EAC3 · 5.1", "Auto · None" or "Off" or "English
-    ' (SDH) · SRT". A value Auto chose carries "Auto · ".
+    ' (SDH) · SRT". A value Auto chose carries "Auto · ". edition, the
+    ' edition's name, is for the Edition button's speech; the readout shows
+    ' only the other three (SelectionSummary).
     function readout(selection as Object, choice as Object, copy as Object) as Object
         entry = versionOf(selection, choice)
         auto = i18n.lookup(copy, "detail.auto")
@@ -103,15 +175,17 @@ namespace catalog.choice
             if resolved >= 0 then name = entry.subtitles[resolved].summary
             subtitles = catalog.pickers.autoValue(name, copy)
         end if
-        return { version: version, audio: audio, subtitles: subtitles }
+        return { edition: editionOf(selection, choice).name, version: version, audio: audio, subtitles: subtitles }
     end function
 
-    ' Which buttons open a menu, as tvOS enables them: Version once the
-    ' item has a version, Audio when the version has a track, and Subtitles
-    ' always, since Auto may play none.
+    ' Which buttons open a menu: Edition (which the row shows only then)
+    ' when the item has two editions or more, and Version when the edition
+    ' has two files or more (silo-roku#62); Audio when the version has a
+    ' track, and Subtitles always, since Auto may play none, as tvOS
+    ' enables them.
     function enabled(selection as Dynamic, choice as Object) as Object
-        if selection = invalid then return { version: false, audio: false, subtitles: false }
-        return { version: true, audio: versionOf(selection, choice).audio.Count() > 0, subtitles: true }
+        if selection = invalid then return { edition: false, version: false, audio: false, subtitles: false }
+        return { edition: selection.editions.Count() > 1, version: editionOf(selection, choice).files.Count() > 1, audio: versionOf(selection, choice).audio.Count() > 0, subtitles: true }
     end function
 
     ' The audio a page starts with when the profile chose a track for this

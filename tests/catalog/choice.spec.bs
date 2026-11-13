@@ -13,8 +13,10 @@ namespace tests
             return catalog.selection.fromWatch(tests.catalogData.selectionWatch(extra), m.copy())
         end function
 
+        ' A choice in the fixture's one edition (the Director's Cut), under Auto
+        ' quality.
         function choice(fileId as String, audio as Integer, subtitle as Integer, cleared = false as Boolean) as Object
-            return { fileId: fileId, audio: audio, subtitle: subtitle, cleared: cleared }
+            return { edition: "directors-cut", quality: "auto", fileId: fileId, audio: audio, subtitle: subtitle, cleared: cleared }
         end function
 
         @describe("the readout (tvOS TVPlaybackSelectionSummary)")
@@ -24,7 +26,7 @@ namespace tests
             selection = m.selection()
             auto = catalog.choice.initial(selection)
             m.assertEqual(auto, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO))
-            m.assertEqual(catalog.choice.readout(selection, auto, m.copy()), { version: "Auto · 2160p · DV", audio: "Auto · English · EAC3 · 5.1", subtitles: "Auto · English (Forced) · PGS" })
+            m.assertEqual(catalog.choice.readout(selection, auto, m.copy()), { edition: "Director's Cut", version: "Auto · 2160p · DV", audio: "Auto · English · EAC3 · 5.1", subtitles: "Auto · English (Forced) · PGS" })
             ' Japanese audio: Auto's subtitle follows it.
             m.assertEqual(catalog.choice.readout(selection, m.choice("", 2, catalog.pickers.AUTO), m.copy()).subtitles, "Auto · English · SRT")
             ' A version whose Auto plays no subtitle.
@@ -55,7 +57,7 @@ namespace tests
         @it("names what the viewer chose without Auto")
         sub _()
             selection = m.selection()
-            m.assertEqual(catalog.choice.readout(selection, m.choice("102", 0, playback.tracks.OFF), m.copy()), { version: "1080p", audio: "English · AC3 · 5.1", subtitles: "Off" })
+            m.assertEqual(catalog.choice.readout(selection, m.choice("102", 0, playback.tracks.OFF), m.copy()), { edition: "Director's Cut", version: "1080p", audio: "English · AC3 · 5.1", subtitles: "Off" })
             m.assertEqual(catalog.choice.readout(selection, m.choice("", catalog.pickers.AUTO, 0), m.copy()).subtitles, "Spanish · SRT")
         end sub
 
@@ -64,13 +66,12 @@ namespace tests
             body = tests.catalogData.selectionWatch()
             body.versions[1].Delete("audio_tracks")
             body.versions[1].Delete("resolution")
-            body.playback_variants[0].default_file_id = "102"
             selection = catalog.selection.fromWatch(body, m.copy())
-            values = catalog.choice.readout(selection, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO), m.copy())
+            values = catalog.choice.readout(selection, m.choice("102", catalog.pickers.AUTO, catalog.pickers.AUTO), m.copy())
             m.assertEqual([values.version, values.audio], ["Auto", "Auto · Unknown"])
             m.assertEqual(catalog.choice.readout(selection, m.choice("101", catalog.pickers.AUTO, catalog.pickers.AUTO), m.copy()).version, "2160p · DV")
-            m.assertEqual(catalog.choice.enabled(selection, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO)), { version: true, audio: false, subtitles: true })
-            m.assertEqual(catalog.choice.enabled(invalid, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO)), { version: false, audio: false, subtitles: false })
+            m.assertEqual(catalog.choice.enabled(selection, m.choice("102", catalog.pickers.AUTO, catalog.pickers.AUTO)), { edition: false, version: true, audio: false, subtitles: true })
+            m.assertEqual(catalog.choice.enabled(invalid, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO)), { edition: false, version: false, audio: false, subtitles: false })
         end sub
 
         @describe("changing the version (spec section 5.6)")
@@ -93,6 +94,58 @@ namespace tests
             m.assertEqual(catalog.choice.versionValue(selection, m.choice("", catalog.pickers.AUTO, catalog.pickers.AUTO)), catalog.pickers.AUTO)
             m.assertEqual(catalog.choice.versionValue(selection, m.choice("102", catalog.pickers.AUTO, catalog.pickers.AUTO)), 1)
             m.assertEqual(catalog.choice.versionOf(selection, m.choice("gone", catalog.pickers.AUTO, catalog.pickers.AUTO)).fileId, "101", "a file no longer listed falls back")
+        end sub
+
+        @describe("editions: Auto stays within the edition (silo-roku#62)")
+
+        function editions(extra = invalid as Dynamic) as Object
+            return catalog.selection.fromWatch(tests.catalogData.editionWatch(extra), m.copy())
+        end function
+
+        @it("opens on the edition with the best file for the quality preference when nothing was played")
+        sub _()
+            selection = m.editions()
+            auto = catalog.choice.initial(selection)
+            m.assertEqual([auto.edition, auto.fileId, catalog.choice.versionOf(selection, auto).fileId], ["director_cut", "", "202"])
+            capped = catalog.choice.initial(selection, "1080p")
+            m.assertEqual([capped.edition, catalog.choice.versionOf(selection, capped).fileId], ["theatrical", "201"], "2160p is above the preference")
+            m.assertEqual(catalog.choice.versionOf(selection, catalog.choice.initial(selection, "720p")).fileId, "203")
+        end sub
+
+        @it("opens on the edition last played, and Auto plays that edition's best file, not the file played")
+        sub _()
+            selection = m.editions({ user_data: { last_file_id: "203", played: false } })
+            opened = catalog.choice.initial(selection)
+            m.assertEqual([opened.edition, catalog.choice.versionOf(selection, opened).fileId], ["theatrical", "201"])
+        end sub
+
+        @it("keeps Auto in the chosen edition, taking the closest file when none fits the preference")
+        sub _()
+            selection = m.editions()
+            theatrical = catalog.choice.withEdition(selection, catalog.choice.initial(selection), 0)
+            m.assertEqual([theatrical.edition, theatrical.fileId, catalog.choice.versionOf(selection, theatrical).fileId], ["theatrical", "", "201"], "not the Director's Cut's better file")
+            capped = catalog.choice.withEdition(selection, catalog.choice.initial(selection, "1080p"), 1)
+            m.assertEqual(catalog.choice.versionOf(selection, capped).fileId, "202", "the Director's Cut has only 2160p")
+            m.assertEqual(catalog.choice.readout(selection, capped, m.copy()).edition, "Directors Cut")
+        end sub
+
+        @it("puts Version back on Auto when another edition is picked")
+        sub _()
+            selection = m.editions()
+            pinned = catalog.choice.withVersion(selection, catalog.choice.initial(selection), 2)
+            m.assertEqual([pinned.edition, pinned.fileId], ["theatrical", "203"])
+            moved = catalog.choice.withEdition(selection, pinned, 1)
+            m.assertEqual([moved.edition, moved.fileId, catalog.choice.versionValue(selection, moved)], ["director_cut", "", catalog.pickers.AUTO])
+            m.assertEqual(catalog.choice.editionValue(selection, moved), 1)
+        end sub
+
+        @it("shows Edition with two editions, and opens Version only with two files in the edition")
+        sub _()
+            selection = m.editions()
+            directors = catalog.choice.initial(selection)
+            m.assertEqual(catalog.choice.enabled(selection, directors), { edition: true, version: false, audio: true, subtitles: true })
+            theatrical = catalog.choice.withEdition(selection, directors, 0)
+            m.assertEqual(catalog.choice.enabled(selection, theatrical).version, true)
         end sub
 
         @describe("the remembered audio track (silo-server SelectAudioTrack)")
