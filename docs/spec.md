@@ -1441,9 +1441,12 @@ their existing HD/FHD assets.
     4320p, then HDR before SDR, then the larger file, then list order)
     among those the preference allows, else the lowest resolution above it,
     else a file of unknown resolution (`playback.intent.bestOf`). A later
-    part of a multipart file is not Auto's choice, except that when the
-    profile last played one in the current edition, Auto resumes it and
-    Start Over starts that presentation's first part. Play starts the file
+    part of a multipart file is not Auto's choice, except that while the
+    item has a resume point (a saved position, played or not, as Resume
+    reads it) and the profile last played one in the current edition,
+    Auto resumes it and Start Over starts that presentation's first part.
+    A finished item (the server zeroes its position) or an unstarted one
+    starts at part 1. Play starts the file
     the page shows, unpinned,
     naming its edition so a file gone since the page read it is replaced
     within that edition. The readout shows resolution and range: "Auto ·
