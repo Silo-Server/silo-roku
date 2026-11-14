@@ -383,7 +383,7 @@ on 2026-10-25.
 | Hairlines | white at 12% (Details rows white 8%) |
 | Resting chrome (chips, pills, menus) | white 7% fill, 1 px white 9% border; selected white 14% fill, white 10% border |
 | Accent | none; the UI is monochrome. Errors `#FF6961`, warnings `#F4C869`, Sign Out the system red `#FF453A` at 90% |
-| Progress bar | `#EDEDED` over white 20%, 3 px on tvOS (Roku 4 px, even for HD scaling), on the artwork's bottom edge |
+| Progress bar | An inset capsule, as on web, iOS, tvOS, and Android: 10 px in from the card's sides and 8 px up from its foot, 4 pt on tvOS (Roku 6 px, 4 px exactly in HD); a black 55% track with a 1 px black 35% keyline and a soft shadow; a `#EDEDED` fill. Drawn over the frame and the card overlays' images (under the played dim and check), whose bottom row sits 16 px up on a card with progress |
 | Font | Inter: Regular, Medium, SemiBold, Bold (Heavy and Black fall back to Bold, 5.9) |
 | Side inset | 88 px for the top bar and Home hero; 80 px for row headers and Browse; 100 px on detail pages |
 | Poster card | 176×264 px in rows; 260×390 in Browse; 240×360 in Search results |
@@ -900,9 +900,10 @@ their existing HD/FHD assets.
     from `/api/v2/overlay-images/{ref}`) follows the contract and the web's
     renderer. A poster scales the web's lengths by its width over 185 px; a
     landscape card or episode still draws them at 1 and lifts its bottom row
-    over a progress bar. The top row stops short of the watched check's
-    corner. Roku reads the document and never writes it; the web client is
-    its editor. The shell reads it again each time a page with the top bar
+    16 px clear of the card's foot when it has a progress bar, above the
+    bar. The top row stops short of the watched check's corner. Roku
+    reads the document and never writes it; the web client is its editor.
+    The shell reads it again each time a page with the top bar
     starts, and a profile without an answer yet shows no badges. A failed
     read keeps what applies; a 404 (a server without the endpoint) falls
     back to the server's default, or to the built-in document. The uploaded
@@ -1528,7 +1529,7 @@ their existing HD/FHD assets.
     nothing shows left of x 100. The focused still holds the leading slot
     until the last one is fully visible.
   - Played episodes are dimmed by black 35% and carry a 40 px check disc. A
-    5 px progress bar shows the resume point.
+    progress bar (5.2) shows the resume point.
   - Captions, 18 px below: "S01E02 · Title" in 20 px SemiBold at 45%, over
     "Feb 18, 2026 · 52m" in 17 px Medium at 32%, white and white 92% when
     focused or current, as other card captions; they do not drop.

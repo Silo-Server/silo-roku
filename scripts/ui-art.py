@@ -56,9 +56,15 @@ tvOS's shared art (spec section 5, silo-apple b90a86ea; AG-222):
                              the backdrop's two fades in white, alpha as
                              scrim_left.png and backdrop_fade_bottom.png, for
                              the ambient wash's flat base (spec 5.5)
-  progress_{12_4,18_6}.9.png a progress track where a card rounds its own
-                             corners: white, 4 px (6 px) tall, its bottom
-                             corners on a radius-12 (18) card's curve; FHD only
+  progress_track_{fhd,hd}.9.png
+                             the watch-progress bar's track, as the web, Apple,
+                             and Android clients draw it: a PROGRESS_HEIGHT
+                             capsule in black 55% under a 1 px black 35%
+                             keyline and a soft shadow 1 px lower, both outside
+                             the capsule only, in a PROGRESS_MARGIN clear border
+  progress_fill_{fhd,hd}.9.png
+                             its fill: a white PROGRESS_HEIGHT capsule, for
+                             blendColor
   still_frame_{fhd,hd}.9.png card_frame at radius 18, for detail episode stills
   card_shadow_{fhd,hd}.9.png a focused card's shadow, black 50% blurred with a
                              10 px sigma (EpisodeThumbCard's radius 20, read as
@@ -149,6 +155,11 @@ PANEL_BOTTOM = ((0x14, 0x15, 0x19), 0.95, 0.05)
 PANEL_BAND = 64  # gradient rows that stretch
 TAB = 56  # capsule height, FHD px
 CHECK_DISC = 40
+PROGRESS_HEIGHT = 6  # the progress bar, FHD px (theme.browse.PROGRESS_HEIGHT)
+PROGRESS_MARGIN = 3  # clear border around the track for its keyline and shadow
+# The track's shadow: (spread, alpha) capsules 1 px lower, stacked, as Android's
+# WatchProgressBar draws its blur; one capsule in HD's 2 px margin.
+PROGRESS_SHADOW = {"fhd": ((1, 0.12), (2, 0.08)), "hd": ((1, 0.18),)}
 EXPLORE = (66, 30, 0.12)  # Explore all disc and arrow, FHD px, and the disc's alpha (tvOS SectionExploreAllCard)
 ROW_RADII = (14, 12)  # menu row fills: library and avatar rows, flyout sections
 BUTTON = (14, (WHITE, 0.07), (WHITE, 0.09))  # radius, fill, border (siloChromeResting*)
@@ -196,12 +207,37 @@ def focus_ring(radius, width):
     return coverage(2 * radius + STRETCH, covered)
 
 
-def progress_track(radius, height):
-    """The bottom height rows of a rounded rectangle 2 * radius + STRETCH wide."""
-    tall = 4 * radius
-    width = 2 * radius + STRETCH
-    alpha = coverage(width, lambda x, y, size: inside_rounded_rect(x, y + tall - height, size, 0, radius, tall), height)
-    return nine_patch_rgba([[WHITE + (a,) for a in line] for line in alpha], band=height)
+def progress_track(height, margin, shadow):
+    """Black RGBA rows: a height-tall capsule margin px inside the image, in
+    black 55%, with a 1 px black 35% keyline and shadow capsules ((spread,
+    alpha), 1 px lower) drawn only outside it."""
+    width, tall = 2 * margin + height + STRETCH, 2 * margin + height
+    radius = height / 2
+
+    def capsule_at(grow, drop=0):
+        return coverage(width, lambda x, y, size: inside_rounded_rect(x, y - drop, size, margin - grow, radius + grow, tall), tall)
+    track = capsule_at(0)
+    keyline = capsule_at(1)
+    shadows = [(capsule_at(spread, 1), alpha) for spread, alpha in shadow]
+    rows = []
+    for y in range(tall):
+        row = []
+        for x in range(width):
+            inside = track[y][x] / 255
+            clear = 1.0
+            for layer, alpha in shadows:
+                clear *= 1 - alpha * layer[y][x] / 255
+            clear = 1 - (1 - clear) * (1 - inside)
+            clear *= 1 - 0.35 * max(keyline[y][x] / 255 - inside, 0)
+            clear *= 1 - 0.55 * inside
+            row.append(BACKGROUND + (round(255 * (1 - clear)),))
+        rows.append(row)
+    return rows
+
+
+def progress_fill(height):
+    """A height-tall capsule's alpha, height + STRETCH wide."""
+    return coverage(height + STRETCH, lambda x, y, size: inside_rounded_rect(x, y, size, 0, height / 2, height), height)
 
 
 def nine_patch(alpha, rgb):
@@ -509,8 +545,8 @@ def images():
             yield f"panel_{radius}_{res}.9.png", nine_patch_rgba(panel(scale(radius)), PANEL_BAND)
         yield f"tab_fill_{res}.9.png", nine_patch(capsule(scale(TAB), 0), WHITE)
         yield f"tab_ring_{res}.9.png", nine_patch(capsule(scale(TAB), 1), WHITE)
-    for radius, height in ((CARD_RADIUS, 4), (STILL_RADIUS, 6)):
-        yield f"progress_{radius}_{height}.9.png", progress_track(radius, height)
+        yield f"progress_track_{res}.9.png", nine_patch_rgba(progress_track(scale(PROGRESS_HEIGHT), scale(PROGRESS_MARGIN), PROGRESS_SHADOW[res]))
+        yield f"progress_fill_{res}.9.png", nine_patch(progress_fill(scale(PROGRESS_HEIGHT)), WHITE)
     yield "check_disc.png", check_disc(CHECK_DISC)
     yield "explore_all.png", explore_all(*EXPLORE)
     yield f"avatar_ring_{AVATAR_RING[0]}.png", circle_ring(*AVATAR_RING)
