@@ -1709,7 +1709,8 @@ their existing HD/FHD assets.
   - Sections are 64 px apart, with 140 px below the last.
 - **After the player closes** (D8). Focus stays on the same episode when it
   was stopped partway, a rewatch included. When this playback finished it
-  (its video ended, Up Next was showing in its prompt window, or Skip
+  (its video reached its end rather than ending early, section 5.7; Up
+  Next was showing in its prompt window and the video did not end early; or Skip
   Credits skipped credits that run to the end and playback was still in
   them), whether or not the server already counted it watched, focus moves
   to the next episode in play order, played or not. If that episode is in the next numbered season (by
@@ -2094,6 +2095,15 @@ Subtitles tab (criterion 4.8).
   stay dismissed while inside the window, so with the default window the end
   that follows opens without a countdown (a window under 10 seconds starts
   the replay outside it, and entering it counts down again, as on tvOS).
+  An early end, where the video stops more than 8 seconds and 1.5% short of
+  the file's duration (the plan's `source.duration_seconds`; never the
+  catalog runtime) because the source stopped delivering, opens Up Next the same
+  way but starts nothing, and the item is not finished. Keep Watching and
+  Back then start the item again where it stopped, at most 10 seconds
+  before its end, even with nothing to play; a restart short of the prompt
+  window counts down at the real end, even with the window at 0, unless
+  the viewer had turned the countdown off before the source stopped (as on
+  tvOS after Silo-Server/silo-apple#765).
   Play/Pause is Play Now.
   Auto-play needs the profile's `playback.auto_play_next`, Roku's autoplay
   setting, and the panel's toggle, which writes `playback.auto_play_next`
@@ -2534,7 +2544,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A shuffle's next pick that fails to start returns to Up Next with "Couldn't start the next pick. Try again or go back." | The player's failure screen shows, with Retry and Go Back, as for any next item | Roku starts the next item as a new session of the same player (assumption AG-100), whose failure screen serves every start (assumption AG-381) |
 | A shuffle plays every part of a multi-part item before moving on | A multi-part pick plays as its start plans it, from its beginning | The Roku player chains no parts on any start (assumption AG-381) |
 | The auto-play toggle shows with any pick | It is hidden, and nothing counts down, while Roku's autoplay setting is off | Plan section 6.10 (certification) |
-| Back on Finished (nothing to play) replays the end, as Keep Watching does | It leaves the player | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
+| Back on Finished (nothing to play) replays the end, as Keep Watching does | It leaves the player, except after an early end (section 5.7), when it resumes where the video stopped | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
 | Keep Watching after the end replays the last 10 s in the same session | It starts the item again 10 s before its end, as a new session | Roku's session has stopped by the time its video ends |
 | Siri (tvOS) and the Google Assistant (Android TV) drive the system player's transport | Roku voice transport commands (`roInput.EnableTransportEvents`) take the remote's paths: "play" and "pause", "fast forward" and "rewind" start the speed ladder, "replay" is Replay, "rewind 30 seconds" or "forward 10 minutes" seeks, "start over" seeks to the start, "skip intro" presses Skip Intro, or else the Skip Recap or Skip Credits pill, "next" is Up Next's Play Now, and "stop" leaves the player. A seek or scan while Up Next shows closes it as Keep Watching does; after the end, "start over" and a seek replay the title as a new session. "Turn on captions" changes Roku's global caption mode, which the player already follows (spec 9.7) | Roku delivers voice commands to the app as transport events and expects an answer for each within 5 s (`source/playback/voice.bs`); criterion 4.11 does not require them below its threshold |
 | An On Deck item without a backdrop or still reads its detail for one, and is left out without | It shows as Home's Continue Watching card does, its poster standing in | A detail read per card is avoided; Home's cards make the same choice |
