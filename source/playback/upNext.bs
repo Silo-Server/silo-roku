@@ -22,7 +22,8 @@ import "pkg:/source/playback/values.bs"
 '                       plays if it was paused
 '   { type: "replay", seconds }
 '       Keep Watching after the end: play the item again from seconds (10 s
-'       before its end), with replayCarry(). Last command.
+'       before its end, or where an early end stopped), with replayCarry().
+'       Last command.
 '   { type: "playNext", itemId, auto, chosen, onDeck, carry }
 '       start itemId where its watch state resumes (tvOS's
 '       startFromBeginning false); auto: the countdown started it; chosen:
@@ -78,6 +79,16 @@ import "pkg:/source/playback/values.bs"
 ' than REPLAY_SECONDS starts the replay outside it, and entering it counts
 ' down again, as tvOS's seek to duration - 10 does. Play/Pause is Play Now.
 '
+' An early end (the source stopped short of the end of the item,
+' playback.session.endedEarly; tvOS's premature end of file) opens the
+' panel as the end does, but starts nothing: the next item would meet the
+' same failing connection. The item is not finished (leftFinished), and
+' Keep Watching (the remote's Back key too) resumes where it stopped (at
+' most REPLAY_SECONDS before the end), even with nothing to play; the Back
+' pill still leaves the player. A resume short of the prompt
+' window counts down again at the real end, unless the viewer had stopped
+' the countdown before the source did (replayCarry's armed).
+'
 ' Events, with now in monotonic milliseconds:
 '
 '   { type: "next", next, failed }   the next-episode lookup settled: next
@@ -88,7 +99,11 @@ import "pkg:/source/playback/values.bs"
 '   { type: "timeline", runtime }    the playing file's runtime changed
 '   { type: "prompt", seconds }      the profile's prompt window, read late
 '   { type: "position", seconds, now } source seconds while playing
-'   { type: "ended", now }           the Video node finished
+'   { type: "ended", early, seconds, now }
+'                                    the Video node finished; early: short
+'                                    of the end, at seconds (source
+'                                    seconds, playback.session's
+'                                    "finished")
 '   { type: "open", now }            the controls' Up Next button
 '   { type: "playNow" }, { type: "keepWatching" }
 '   { type: "back" }                 the panel's Back: leave the player, as
@@ -136,7 +151,8 @@ namespace playback.upNext
     ' What one player hands the next through playNext or replay: the toggle
     ' (invalid until the viewer sets it), and whether this is Keep
     ' Watching's replay of the end, which opens dismissed and without a
-    ' countdown. Every other start uses newCarry().
+    ' countdown unless armed (replayCarry). Every other start uses
+    ' newCarry().
     function newCarry() as Object
         return { autoPlay: invalid, replay: false }
     end function
@@ -155,7 +171,8 @@ namespace playback.upNext
         if not util.isObject(carry) then carry = newCarry()
         autoPlay = util.isTrue(options.autoPlayNext)
         if util.isBoolean(carry.autoPlay) then autoPlay = carry.autoPlay
-        replay = util.isTrue(carry.replay)
+        ' A replay opens dismissed and without a countdown, unless armed.
+        quiet = util.isTrue(carry.replay) and not util.isTrue(carry.armed)
         return {
             promptSeconds: promptSeconds(options.promptSeconds),
             runtime: numberOrInvalid(options.runtime),
@@ -179,16 +196,19 @@ namespace playback.upNext
             creditsStart: invalid,
             ' tvOS's nextUpAutoplayCancelled: Keep Watching or the toggle
             ' stopped the countdown.
-            cancelled: replay,
+            cancelled: quiet,
             ' tvOS's nextUpPromptDismissed: Keep Watching closed the panel
             ' inside the prompt window.
-            dismissed: replay,
+            dismissed: quiet,
             ' { clock, endsAt, seconds, total }, or invalid; clock: it
             ' counts wall-clock time to endsAt (at the end, or over the
             ' credits), not the runtime left.
             countdown: invalid,
             ' A playNext, replay, or exit went out; nothing follows it.
             finished: false,
+            ' { seconds, lostSource } once the video ended early, at seconds;
+            ' lostSource: the end, not the viewer, stopped the countdown.
+            earlyEnd: invalid,
             ' A shuffle's picks, and a Pick Another out (hold).
             shuffle: util.isTrue(options.shuffle),
             held: false,
@@ -215,8 +235,7 @@ namespace playback.upNext
             if util.isNumber(event.seconds) then state.position = event.seconds
             present(state, now, out)
         else if t = "ended"
-            if state.runtime <> invalid then state.position = state.runtime
-            beginPostroll(state, true, "automatic", now, out)
+            onEnded(state, event, now, out)
         else if t = "next"
             onNext(state, event.next, util.isTrue(event.failed), now, out)
         else if t = "onDeck"
@@ -277,16 +296,19 @@ namespace playback.upNext
     ' PlayerNextUpCompletionPolicy decides when its player closes: the video
     ' ended, Up Next was open inside the prompt window, or Skip Credits
     ' reached the end of the file and playback is still in those credits
-    ' (tvOS's skippedCreditsToEnd). The detail page moves on only from a
-    ' finished episode (spec section 5.6), never from one the server merely
-    ' reports watched before.
+    ' (tvOS's skippedCreditsToEnd). An early end finishes the item only
+    ' through those credits (tvOS's endedPrematurely). The detail page moves
+    ' on only from a finished episode (spec section 5.6), never from one the
+    ' server merely reports watched before.
     function leftFinished(state as Dynamic, videoEnded as Boolean) as Boolean
-        if videoEnded then return true
+        early = util.isObject(state) and state.earlyEnd <> invalid
+        if videoEnded and not early then return true
         if not util.isObject(state) then return false
         if state.skippedCredits
             if state.creditsStart = invalid then return true
             if util.isNumber(state.position) and state.position >= state.creditsStart then return true
         end if
+        if early then return false
         return state.open and inWindow(state, state.position)
     end function
 
@@ -298,11 +320,16 @@ namespace playback.upNext
         return canShow(state) and not state.ended and not state.finished
     end function
 
-    ' The carry for Keep Watching's replay of the end. skippedCredits is
-    ' playback.skipCredits.skippedKey: the replay does not skip those
-    ' credits again.
-    function replayCarry(state as Object, skippedCredits = "" as String) as Object
-        return { autoPlay: state.autoPlay, replay: true, skippedCredits: skippedCredits }
+    ' The carry for Keep Watching's replay of the end, from seconds.
+    ' skippedCredits is playback.skipCredits.skippedKey: the replay does not
+    ' skip those credits again. armed: an early end stopped the countdown,
+    ' not the viewer, and the replay starts short of the prompt window, so
+    ' it opens as a fresh start does and the real end counts down (tvOS's
+    ' keepWatchingCurrentEpisode, even with the prompt turned off).
+    function replayCarry(state as Object, skippedCredits = "" as String, seconds = invalid as Dynamic) as Object
+        early = state.earlyEnd
+        armed = early <> invalid and early.lostSource and util.isNumber(seconds) and not inWindow(state, seconds)
+        return { autoPlay: state.autoPlay, replay: true, skippedCredits: skippedCredits, armed: armed }
     end function
 
     ' When to send the next tick, or invalid: as the end countdown's number
@@ -471,13 +498,18 @@ namespace playback.upNext
     ' tvOS's keepWatchingCurrentEpisode, which the remote's Back key also
     ' is. After an end with nothing to play (Finished, nothing loading), it
     ' leaves the player instead of replaying the end, as Roku's Back leaves
-    ' playback.
+    ' playback. After an early end it resumes where the video stopped,
+    ' whatever there is to play: the item is not finished.
     sub keepWatching(state as Object, out as Object)
         ended = state.ended
         nothing = state.next = invalid and carousel(state).Count() = 0 and not state.nextLoading and not state.onDeckLoading
         dismiss(state)
         if not ended
             out.Push({ type: "resume" })
+            return
+        end if
+        if state.earlyEnd <> invalid
+            finish(state, { type: "replay", seconds: resumePoint(state) }, out)
             return
         end if
         if nothing or state.runtime = invalid or state.runtime <= 0
@@ -487,6 +519,29 @@ namespace playback.upNext
         seconds = state.runtime - REPLAY_SECONDS
         if seconds < 0 then seconds = 0
         finish(state, { type: "replay", seconds: seconds }, out)
+    end sub
+
+    ' Where Keep Watching resumes after an early end: where the video
+    ' stopped, at most REPLAY_SECONDS before the end, as tvOS's remount.
+    function resumePoint(state as Object) as Dynamic
+        seconds = state.earlyEnd.seconds
+        if state.runtime <> invalid and seconds > state.runtime - REPLAY_SECONDS then seconds = state.runtime - REPLAY_SECONDS
+        if seconds < 0 then seconds = 0
+        return seconds
+    end function
+
+    ' The video ended. An early end stays where it stopped and stops the
+    ' countdown, as tvOS's premature end of file cancels autoplay; the
+    ' panel still opens, as the end's.
+    sub onEnded(state as Object, event as Object, now as Dynamic, out as Object)
+        if util.isTrue(event.early) and util.isNumber(event.seconds)
+            state.earlyEnd = { seconds: event.seconds, lostSource: not state.cancelled }
+            state.position = event.seconds
+            state.cancelled = true
+        else if state.runtime <> invalid
+            state.position = state.runtime
+        end if
+        beginPostroll(state, true, "automatic", now, out)
     end sub
 
     sub dismiss(state as Object)

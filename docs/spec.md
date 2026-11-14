@@ -383,7 +383,7 @@ on 2026-10-25.
 | Hairlines | white at 12% (Details rows white 8%) |
 | Resting chrome (chips, pills, menus) | white 7% fill, 1 px white 9% border; selected white 14% fill, white 10% border |
 | Accent | none; the UI is monochrome. Errors `#FF6961`, warnings `#F4C869`, Sign Out the system red `#FF453A` at 90% |
-| Progress bar | `#EDEDED` over white 20%, 3 px on tvOS (Roku 4 px, even for HD scaling), on the artwork's bottom edge |
+| Progress bar | An inset capsule, as on web, iOS, tvOS, and Android: 10 px in from the card's sides and 8 px up from its foot, 4 pt on tvOS (Roku 6 px, 4 px exactly in HD); a black 55% track with a 1 px black 35% keyline and a soft shadow; a `#EDEDED` fill. Drawn over the frame and the card overlays' images (under the played dim and check), whose bottom row sits 16 px up on a card with progress |
 | Font | Inter: Regular, Medium, SemiBold, Bold (Heavy and Black fall back to Bold, 5.9) |
 | Side inset | 88 px for the top bar and Home hero; 80 px for row headers and Browse; 100 px on detail pages |
 | Poster card | 176×264 px in rows; 260×390 in Browse; 240×360 in Search results |
@@ -900,9 +900,10 @@ their existing HD/FHD assets.
     from `/api/v2/overlay-images/{ref}`) follows the contract and the web's
     renderer. A poster scales the web's lengths by its width over 185 px; a
     landscape card or episode still draws them at 1 and lifts its bottom row
-    over a progress bar. The top row stops short of the watched check's
-    corner. Roku reads the document and never writes it; the web client is
-    its editor. The shell reads it again each time a page with the top bar
+    16 px clear of the card's foot when it has a progress bar, above the
+    bar. The top row stops short of the watched check's corner. Roku
+    reads the document and never writes it; the web client is its editor.
+    The shell reads it again each time a page with the top bar
     starts, and a profile without an answer yet shows no badges. A failed
     read keeps what applies; a 404 (a server without the endpoint) falls
     back to the server's default, or to the built-in document. The uploaded
@@ -1528,7 +1529,7 @@ their existing HD/FHD assets.
     nothing shows left of x 100. The focused still holds the leading slot
     until the last one is fully visible.
   - Played episodes are dimmed by black 35% and carry a 40 px check disc. A
-    5 px progress bar shows the resume point.
+    progress bar (5.2) shows the resume point.
   - Captions, 18 px below: "S01E02 · Title" in 20 px SemiBold at 45%, over
     "Feb 18, 2026 · 52m" in 17 px Medium at 32%, white and white 92% when
     focused or current, as other card captions; they do not drop.
@@ -1709,7 +1710,8 @@ their existing HD/FHD assets.
   - Sections are 64 px apart, with 140 px below the last.
 - **After the player closes** (D8). Focus stays on the same episode when it
   was stopped partway, a rewatch included. When this playback finished it
-  (its video ended, Up Next was showing in its prompt window, or Skip
+  (its video reached its end rather than ending early, section 5.7; Up
+  Next was showing in its prompt window and the video did not end early; or Skip
   Credits skipped credits that run to the end and playback was still in
   them), whether or not the server already counted it watched, focus moves
   to the next episode in play order, played or not. If that episode is in the next numbered season (by
@@ -2095,6 +2097,16 @@ Subtitles tab (criterion 4.8).
   stay dismissed while inside the window, so with the default window the end
   that follows opens without a countdown (a window under 10 seconds starts
   the replay outside it, and entering it counts down again, as on tvOS).
+  An early end, where the video stops more than 8 seconds and 1.5% short of
+  the file's duration (the plan's `source.duration_seconds`; never the
+  catalog runtime) because the source stopped delivering, opens Up Next the same
+  way but starts nothing, and the item is not finished. Keep Watching and
+  the remote's Back key then start the item again where it stopped, at most
+  10 seconds before its end, even with nothing to play (the Back pill still
+  leaves the player); a restart short of the prompt
+  window counts down at the real end, even with the window at 0, unless
+  the viewer had turned the countdown off before the source stopped (as on
+  tvOS after Silo-Server/silo-apple#765).
   Play/Pause is Play Now.
   Auto-play needs the profile's `playback.auto_play_next`, Roku's autoplay
   setting, and the panel's toggle, which writes `playback.auto_play_next`
@@ -2535,7 +2547,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A shuffle's next pick that fails to start returns to Up Next with "Couldn't start the next pick. Try again or go back." | The player's failure screen shows, with Retry and Go Back, as for any next item | Roku starts the next item as a new session of the same player (assumption AG-100), whose failure screen serves every start (assumption AG-381) |
 | A shuffle plays every part of a multi-part item before moving on | A multi-part pick plays as its start plans it, from its beginning | The Roku player chains no parts on any start (assumption AG-381) |
 | The auto-play toggle shows with any pick | It is hidden, and nothing counts down, while Roku's autoplay setting is off | Plan section 6.10 (certification) |
-| The Menu button on Finished (nothing to play) replays the end, as Keep Watching does | The remote's Back key leaves the player | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
+| The Menu button on Finished (nothing to play) replays the end, as Keep Watching does | The remote's Back key leaves the player, except after an early end (section 5.7), when it resumes where the video stopped | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
 | Keep Watching after the end replays the last 10 s in the same session | It starts the item again 10 s before its end, as a new session | Roku's session has stopped by the time its video ends |
 | Siri (tvOS) and the Google Assistant (Android TV) drive the system player's transport | Roku voice transport commands (`roInput.EnableTransportEvents`) take the remote's paths: "play" and "pause", "fast forward" and "rewind" start the speed ladder, "replay" is Replay, "rewind 30 seconds" or "forward 10 minutes" seeks, "start over" seeks to the start, "skip intro" presses Skip Intro, or else the Skip Recap or Skip Credits pill, "next" is Up Next's Play Now, and "stop" leaves the player. A seek or scan while Up Next shows closes it as Keep Watching does; after the end, "start over" and a seek replay the title as a new session. "Turn on captions" changes Roku's global caption mode, which the player already follows (spec 9.7) | Roku delivers voice commands to the app as transport events and expects an answer for each within 5 s (`source/playback/voice.bs`); criterion 4.11 does not require them below its threshold |
 | An On Deck item without a backdrop or still reads its detail for one, and is left out without | It shows as Home's Continue Watching card does, its poster standing in | A detail read per card is avoided; Home's cards make the same choice |
