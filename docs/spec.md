@@ -2087,10 +2087,11 @@ Subtitles tab (criterion 4.8).
   pick at once, and otherwise a 10 second countdown runs. While the
   next-episode lookup runs, the panel says "Finding the next episode". The
   controls' Up Next button opens it with no countdown until 100 seconds are
-  left, then one from 100. Keep Watching and Back close it until playback
-  leaves the prompt window (a seek back), and turn the countdown off for
-  that opening; after the end they play the last 10 seconds again (Back
-  leaves the player instead when there is nothing to play), which
+  left, then one from 100. Its Back pill leaves the player, as on tvOS and
+  Android TV. Keep Watching, and the remote's Back key, close it until
+  playback leaves the prompt window (a seek back), and turn the countdown
+  off for that opening; after the end they play the last 10 seconds again
+  (the key leaves the player instead when there is nothing to play), which
   stay dismissed while inside the window, so with the default window the end
   that follows opens without a countdown (a window under 10 seconds starts
   the replay outside it, and entering it counts down again, as on tvOS).
@@ -2534,7 +2535,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A shuffle's next pick that fails to start returns to Up Next with "Couldn't start the next pick. Try again or go back." | The player's failure screen shows, with Retry and Go Back, as for any next item | Roku starts the next item as a new session of the same player (assumption AG-100), whose failure screen serves every start (assumption AG-381) |
 | A shuffle plays every part of a multi-part item before moving on | A multi-part pick plays as its start plans it, from its beginning | The Roku player chains no parts on any start (assumption AG-381) |
 | The auto-play toggle shows with any pick | It is hidden, and nothing counts down, while Roku's autoplay setting is off | Plan section 6.10 (certification) |
-| Back on Finished (nothing to play) replays the end, as Keep Watching does | It leaves the player | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
+| The Menu button on Finished (nothing to play) replays the end, as Keep Watching does | The remote's Back key leaves the player | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
 | Keep Watching after the end replays the last 10 s in the same session | It starts the item again 10 s before its end, as a new session | Roku's session has stopped by the time its video ends |
 | Siri (tvOS) and the Google Assistant (Android TV) drive the system player's transport | Roku voice transport commands (`roInput.EnableTransportEvents`) take the remote's paths: "play" and "pause", "fast forward" and "rewind" start the speed ladder, "replay" is Replay, "rewind 30 seconds" or "forward 10 minutes" seeks, "start over" seeks to the start, "skip intro" presses Skip Intro, or else the Skip Recap or Skip Credits pill, "next" is Up Next's Play Now, and "stop" leaves the player. A seek or scan while Up Next shows closes it as Keep Watching does; after the end, "start over" and a seek replay the title as a new session. "Turn on captions" changes Roku's global caption mode, which the player already follows (spec 9.7) | Roku delivers voice commands to the app as transport events and expects an answer for each within 5 s (`source/playback/voice.bs`); criterion 4.11 does not require them below its threshold |
 | An On Deck item without a backdrop or still reads its detail for one, and is left out without | It shows as Home's Continue Watching card does, its poster standing in | A detail read per card is avoided; Home's cards make the same choice |
