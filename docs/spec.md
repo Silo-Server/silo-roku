@@ -2450,6 +2450,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Letter-spaced small text (badge chips, uppercase headers) | Spacing approximated with hair spaces (`theme.tracked`) | Roku `Label` has no letter-spacing field |
 | System fonts cover every script | Titles in scripts outside Latin, Greek, Cyrillic, and Vietnamese (for example CJK and Arabic) render as boxes, except in Japanese and Simplified Chinese, where the characters the interface itself uses draw | Neither the packaged Inter subset nor Roku's system font covers them, and a full CJK font does not fit the 4 MB package; a font the server serves for metadata is a later follow-up |
 | The app follows the system language, and Arabic lays out right to left | Arabic is not offered; a profile or device set to Arabic gets the device's other language or English | Roku documents no right-to-left layout or Arabic shaping in SceneGraph, and every screen places its controls by fixed x positions |
+| Korean and Traditional Chinese are interface languages | Neither is offered; a profile set to either, or a device reporting `zh-TW`, `zh-HK` or `zh-Hant`, gets the device's other language or English | Neither the Inter subset nor the Japanese and Simplified Chinese Noto subsets draw Hangul or Traditional characters, SceneGraph has no font fallback, and another CJK subset would cost package budget |
 | One system font draws every language | Japanese and Simplified Chinese replace Inter everywhere with one weight of Noto Sans JP or SC, subset to the characters the interface uses (`scripts/subset-cjk-fonts.sh`) plus what Noto has of Latin-1, Latin Extended-A, and common symbols; Latin text in those languages draws in Noto, and Greek, Cyrillic, Vietnamese, and the accented letters Noto lacks show as boxes there; timecodes stay in Inter's tabular digits, and letter-spaced text is not spaced | SceneGraph has no font fallback, so a locale's font must cover all its text; package size allows one weight per language; Noto has no hair space |
 | tvOS shows an in-app language picker in its settings (where it has one) | App language sits in General under Appearance, the manifest's category for it | tvOS has no App language row yet; revisit when it does |
 | A new app language applies in place | Saving it rebuilds every screen, with Settings on top again, if Settings is still on top when the new value is read back, and otherwise applies at the next launch; a profile's first screen waits up to 3 seconds for its language, and an answer that comes later applies at the next launch | Screens copy their strings and fonts when they are built; a later rebuild would tear down a player a deep link or a phone opened, or a profile form or PIN entry |
@@ -3078,7 +3079,8 @@ Every authenticated request carries:
 - `X-Silo-Client: Silo Roku`, `X-Silo-Client-Version`, `X-Silo-Client-Build`,
   and `X-Silo-Client-Channel` (`release`, `beta`, `sideload`, or `dev`);
 - `Accept-Language: <applied language>` (`en`, `es`, `de`, `fr`, `pt-BR`,
-  `ja`, `zh-Hans`), only to the configured server, like the client headers.
+  `nl`, `ja`, `zh-Hans`, `it`, `ru`, `pl`, `tr`, `sv`, `hr`, `cs`, `uk`,
+  `da`, `nb`, `fi`), only to the configured server, like the client headers.
 
 Settings reads and writes also send `X-Silo-Client-Family: tv`.
 
