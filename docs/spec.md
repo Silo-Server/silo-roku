@@ -1521,8 +1521,11 @@ their existing HD/FHD assets.
     padding 24, 12 px apart. Selected: white 20%; resting: white 5%; focused:
     white with black text. No outline and no scaling. The selected pill is
     centred.
-  - Season order: numbered seasons in order, then Specials. Resting on a pill
-    switches to that season (after 300 ms on Roku; 5.9).
+  - Season order: Specials (season 0) first, then numbered seasons in order,
+    as the server, the web app, and every Silo TV client list them. A
+    series opens on a numbered season, never on Specials unless they are
+    asked for or are its only season. Resting on a pill switches to that
+    season (after 300 ms on Roku; 5.9).
   - The episode rail is one row across adjacent seasons. The pill follows
     focus across a season boundary; a pill moves the row to its season.
   - Stills: 360×200, radius 18, 40 px apart. The first sits at x 116, and
@@ -1715,8 +1718,10 @@ their existing HD/FHD assets.
   Credits skipped credits that run to the end and playback was still in
   them), whether or not the server already counted it watched, focus moves
   to the next episode in play order, played or not. If that episode is in the next numbered season (by
-  number, so gaps are skipped), the page shows that season. A finished
-  finale stays, and play never moves into Specials. After Up Next played on,
+  number, so gaps are skipped), the page shows that season. Specials sit
+  before season 1 on the rail, so the last special moves on to season 1's
+  first episode. A finished finale stays, and a regular episode never moves
+  into Specials. After Up Next played on,
   the same rule applies to the last episode played, and the page switches to
   that episode's season if the chain crossed into another.
 
