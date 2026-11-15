@@ -1800,7 +1800,14 @@ Subtitles tab (criterion 4.8).
   - Scrubber: 7 px tall, 12 px while scrubbing, white at 24% (35% focused,
     48% scrubbing) with the played part white. A 30 px knob shows while the
     scrubber is focused, or 42 px with an 8 px white 55% ring while
-    scrubbing. Intro, recap, and credits ranges are bands (5.9). Each
+    scrubbing. Every intro, recap, credits, and preview range (section 9.8)
+    is a band in TheIntroDB's segment colours, which every Silo client
+    shares: intro #51A2FF, recap #FF8904, credits #C27AFF, preview
+    #00D3F2, at 34% (45% while the scrubber is focused or scrubbing). A
+    band covers its range's share of the runtime, clipped to the track,
+    over the played part and under the knob and preview card, so a range
+    stays visible once the playhead passes it; overlapping ranges are each
+    drawn, and there are no bands while the runtime is unknown. Each
     chapter start after the first is a tick, as tvOS draws it: 3 px wide
     (4 px while scrubbing), 14 px taller than the track, white 85%, over
     the played part.
@@ -2545,7 +2552,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | A subtitle the profile's preferences choose shows at once | It is selected, and shows while Roku's caption mode is on | Roku's caption mode governs captions (criterion 4.8), and the client does not turn it on at load |
 | A sign that an SRT cue places at the top with an override tag (`{\an8}`) shows at the top (Android TV, whose Media3 SubRip decoder reads the tag) | It shows at the bottom, without the tag | Roku documents no placement for SRT cues and prints override tags as text (hardware run 16, Roku drawing an MKV's own track), with no documented way to hide them; the client removes the tags from SRT sidecars and never lets Roku draw a container's track itself (section 9.7) |
 | One intro, credits, recap, and preview per file (Android TV) | Every `marker_segments` range, each skipped or drawn on its own | Section 9.8; the server's collection replaces the single markers |
-| The scrubber has rounded ends, a buffered range, chapter ticks, and one band, the intro's, in cyan | A square track with the played range, the chapter ticks, and the intro (tvOS's cyan), recap, and credits bands | Sections 5.7 and 9.8 name three bands; the ladder's 100 ms tick only moves `Rectangle`s |
+| The scrubber has rounded ends and a buffered range | A square track with the played range | The ladder's 100 ms tick only moves `Rectangle`s |
 | A chapter row's number is 20 pt rounded SemiBold and its time 20 pt; the playing chapter's glyph is SF Symbols' `play.fill` | Both 22 px SemiBold, the setting value's style; the player's own play glyph, 18 px | Roku ships no rounded face, and the panel's existing styles keep the font set small (assumption AG-432) |
 | A seek session started with the controls hidden shows only the top-centre hold indicator | Only a held Left or Right does; Rewind and Fast-forward show the controls and scan on the scrubber, with the 340 px preview card over the scrub point | Testers read the indicator's 480 px thumbnail as small next to the scrubber that Left and Right bring up, and the transport keys are the Roku remote's usual way to scan |
 | Holding Left or Right on the focused scrubber starts a fixed-rate auto-seek; OK there commits a scrub and then toggles play/pause | The same 300 ms hold and rate ladder as with the controls hidden; OK commits, or toggles when nothing is pending | Section 5.7's key table; Roku documents no key repeats for a held key |
@@ -4280,10 +4287,11 @@ creating a second competing caption preference.
 `GET /api/v2/watch/{id}` returns `marker_segments` for each file version: an
 ordered list of `{kind, start_seconds, end_seconds}` with kind `intro`,
 `credits`, `recap`, or `preview`. A kind may occur more than once; the client
-skips only the active range. Intro ranges drive the skip button and automatic
+skips only the active range. Every range of the four kinds is a band on the
+scrubber (section 5.7). Intro ranges drive the skip button and automatic
 skip (section 5.7) according to `playback.intro_skip_mode`. Recap and credits
-ranges are drawn on the scrubber and drive Skip Recap and Skip Credits, with
-`playback.auto_skip_recap` and `playback.auto_skip_credits`.
+ranges drive Skip Recap and Skip Credits, with `playback.auto_skip_recap` and
+`playback.auto_skip_credits`. Preview ranges have no skip control.
 
 The client reads the markers of the version it plays. A server without
 `marker_segments` still sends each version's single `intro`, `credits`,
