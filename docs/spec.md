@@ -1171,7 +1171,9 @@ their existing HD/FHD assets.
     selected collection or title. Ordinary libraries retain all visible
     collection members; only a typed mixed-library view narrows membership.
     Empty and failed reads use the
-    standard empty state or Retry.
+    standard empty state or Retry. The empty state's button reads "Back to
+    collections" on a page opened from this grid, and "Back" on one opened
+    from a row of collections, which returns to Home or Recommended.
   - Shuffle on a collection's page, as tvOS's
     `LibraryCollectionDetailView` and `CollectionDetailView` and Android
     TV's `TvLibraryCollectionDetailScreen` offer it: Browse's Shuffle pill
