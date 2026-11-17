@@ -117,6 +117,9 @@ Browse:
   card that opens the row's full, paged page, except a Continue Watching or
   Next Up row that shows its whole list (section 5.5; added at the owner's
   request on 2026-10-28, after tvOS and Android TV);
+- Home and library rows of collections, where the server has them: one
+  poster card per collection, each opening that collection's page (section
+  5.5; silo-server #4410, issue #92, after the web client);
 - Movies and Series library tabs, each with Recommended rows, a Browse
   grid with sort, filters, and an alphabet rail, and read-only Collections
   pages;
@@ -933,10 +936,50 @@ their existing HD/FHD assets.
     check's size with a 1 px white 20% ring, widening to a capsule for more
     digits. It shows whether or not badges are on.
   - OK on any card opens the detail page; from Continue Watching, the detail
-    page opens with that episode selected.
+    page opens with that episode selected. A collection's card opens its
+    collection's page instead (rows of collections, below).
+  - Rows of collections (`section_type` `collection_posters`; silo-server
+    `docs/catalog-api.md`, "Rows of collections", and the web client's
+    `CollectionsRow`, silo-server #4410): the section carries `collections`
+    rather than `items`, and the row shows one card per collection in the
+    server's order. Each is the Collections grid's poster card (below): the
+    title, and under it the item count when nonzero (`item_count`, the
+    titles the viewer sees), over `poster_url`, which is the assigned poster
+    or the viewer's collage; an empty one shows the poster placeholder.
+    - OK opens the collection's page: a `library` card the server
+      collection `id`, a `user` card the personal collection `id`. From
+      Home the page lists every member the viewer sees, the titles the card
+      counts, and `library_id` is passed but narrows nothing; on a library
+      page, a mixed library's Movies or Series tab narrows it as the
+      Collections grid does.
+    - The row shows every card the server sends (at most 30) and has no
+      Explore all card, so the 20-card cap below does not apply to it: it
+      has no row page to open (the server answers a section page of it with
+      no items), and a cut would leave its last collections out of reach.
+      The client still stops at 40, the rows' memory bound.
+    - It is never the hero. The server never marks it featured, and focus
+      on one of its cards leaves the hero on the title it showed, as on an
+      Explore all card: the hero describes titles, and a collection has no
+      backdrop, synopsis, or meta line to show. It keeps that title's copy
+      as it was read until focus reaches a title again, even when the rows
+      are read again meanwhile. When Home opens on such a
+      row, the hero stays empty until focus reaches a title, and
+      `AppLaunchComplete` does not wait for it. Options (*) on its cards
+      does nothing.
+    - The server leaves out collections the viewer can't see and rows left
+      with none, so a row that arrives shows. The client reads no capability
+      for it: a server without these rows never sends the type, and
+      `GET /api/v2/home/capabilities`'s `collection_rows` matters only to
+      Home row editing, which is deferred (section 3.3). The row is not
+      part of the server's hide-watched or duplicate-title passes, and the
+      client has neither.
+    - Another profile's shared collection has no "by {name}" line under
+      its title (`creator_profile_id` is unused), as the Collections grid
+      has none (section 5.9).
   - Explore all (tvOS's `SectionExploreAllCard`, silo-apple `a65867ef`; Android
     TV's `TvExploreAllCard`): Home's and a library's Recommended rows show at
-    most 20 cards, and a row with cards ends with an Explore all card, even
+    most 20 cards, and a row with cards ends with an Explore all card (a row
+    of collections, above, has neither the cap nor the card), even
     a short one, since the server drops titles another row already shows
     and counts what is left: the row's page can hold more. A Continue
     Watching or Next Up row that shows its whole list has no card (owner's
@@ -968,8 +1011,10 @@ their existing HD/FHD assets.
     takes over 3 seconds counts as none, as on Android TV. A section read
     the server refuses with 422 for the unknown `item_limit` parameter is
     read again without it, and that server gets none for the session. The
-    client cuts each row to 20 cards either way; a section's own items read
-    (`.../sections/{id}/items`) takes no `item_limit`.
+    client cuts each row but a row of collections to 20 cards either way; a
+    section's own items read (`.../sections/{id}/items`) takes no
+    `item_limit`. A row of collections ignores `item_limit` on the server
+    too.
 - **Row page** (tvOS's `SectionCatalogView`). Pushed from a row's Explore
   all card, without the top bar.
   - The row's title at (80, 88) in the collection page's title style, its
@@ -1120,12 +1165,15 @@ their existing HD/FHD assets.
     under the bar, as the personal lists' grid: eight 176×264 posters (the
     rows' size) with the same captions and gaps;
     there is no group pill, sort, or alphabet rail. Up from the grid goes to the bar.
-    Opening a collection shows a paginated poster grid in server order;
+    Opening a collection, here or from a row of collections, shows a
+    paginated poster grid in server order;
     opening a title uses the existing detail page. Back restores the
     selected collection or title. Ordinary libraries retain all visible
     collection members; only a typed mixed-library view narrows membership.
     Empty and failed reads use the
-    standard empty state or Retry.
+    standard empty state or Retry. The empty state's button reads "Back to
+    collections" on a page opened from this grid, and "Back" on one opened
+    from a row of collections, which returns to Home or Recommended.
   - Shuffle on a collection's page, as tvOS's
     `LibraryCollectionDetailView` and `CollectionDetailView` and Android
     TV's `TvLibraryCollectionDetailScreen` offer it: Browse's Shuffle pill
@@ -2491,6 +2539,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Library pages draw skeletons while they load | A centred 128 px spinner | One `Poster` instead of a placeholder per card on 512 MB devices |
 | On a mixed library, each Recommended section shows only the tab's type | Both tabs show every item of a mixed library's sections | Not built (AG-280): the server's section reads refuse a type, so the client would filter each section and refill it page by page, as tvOS does, which `BrowseRows`' loading and dropping of rows around focus does not yet support |
 | Collection groups appear as vertically stacked grids with uppercase headers | One grid of every group's collections in order, without headers | The owner's choice (2026-10-28): no toggle between groups; Roku's bounded grid has no section headers |
+| A row of collections (web's `CollectionsRow`, silo-server #4410; tvOS and Android TV have none yet): the count is a badge on the poster, and another profile's shared collection says "by {name}" under its title | The Collections grid's card: the count under the title, and no owner line | The row reuses the grid's card, so both read alike; tvOS's and Android TV's collection cards name no owner either, and a name needs the login's profile list on Home and a new string (issue #92) |
+| A server collection opened from a Home row of collections (web) lists only its titles in the card's `library_id`, so the page can hold fewer titles than the card counts (silo-server #4410's risks) | Its page lists every member the viewer sees, the titles `item_count` counts | Roku's collection pages narrow only a mixed library's Movies or Series view (above), as tvOS's do; from Home there is no tab to narrow by |
 | The Sort, Filter, and Shuffle pills, each with its icon, are the first item of the Browse grid and scroll away with it | The pills stay above the grid, without icons, and the grid keeps its focused row at the top (fixed focus) instead of scrolling the page | `MarkupGrid` has no full-width header item, and no icon art ships |
 | A collection's Shuffle button, with its shuffle icon, stands beside the item count above the grid | The Shuffle pill, without an icon, has the place Browse's Sort pill has, and the count stays on its own line under the title | Section 5.5; the collection page's title and count already sit where tvOS's large title does, and no icon art ships (AG-550) |
 | The filter panel's rows carry SF Symbols: chevrons, a cross on Clear, an arrow on Reset filters, and a check on Done | Its radio, box, and check marks are drawn art; the chevrons and Clear's cross are Inter's ‹, ›, and ×; Reset filters has no mark | No icon art ships for the rest, and the packaged Inter subset has those three glyphs (assumption AG-380) |
@@ -3209,6 +3259,8 @@ The first release consumes:
 
 - `GET /api/v2/user/libraries` to decide which library tabs exist;
 - `GET /api/v2/home/sections` and `GET /api/v2/home/sections/{id}/items`;
+  a section of type `collection_posters` carries its cards in `collections`
+  on these and the library reads below (section 5.5);
 - `GET /api/v2/library/{id}/sections` and
   `GET /api/v2/library/{id}/sections/{section_id}/items` for a library's
   Recommended rows;
