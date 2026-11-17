@@ -957,13 +957,26 @@ their existing HD/FHD assets.
       has no row page to open (the server answers a section page of it with
       no items), and a cut would leave its last collections out of reach.
       The client still stops at 40, the rows' memory bound.
-    - It is never the hero. The server never marks it featured, and focus
-      on one of its cards leaves the hero on the title it showed, as on an
-      Explore all card: the hero describes titles, and a collection has no
-      backdrop, synopsis, or meta line to show. It keeps that title's copy
-      as it was read until focus reaches a title again, even when the rows
-      are read again meanwhile. When Home opens on such a
-      row, the hero stays empty until focus reaches a title, and
+    - The server never marks it featured. Focus on a server collection's
+      card with a `backdrop_url` (silo-server #4415) shows that backdrop in
+      the hero, washed from `backdrop_thumbhash`, under the collection's
+      title and, as the meta line, its count; there is no synopsis, logo,
+      rating, or badge. The server sends the 1280 px variant the collection
+      page uses, except for a backdrop set to other artwork (such as the
+      collection's poster), which has no wide variant and comes at card
+      thumbnail size, as on the collection page; the hero zooms it to fill
+      its box like any backdrop, so it shows softer, and without a
+      `backdrop_thumbhash` the wash stays black. The card does not say
+      which it is, so the client treats both alike.
+      tvOS's marquee shows a collection's poster where its backdrop goes
+      instead; Roku's hero draws only backdrops, so a card without one (a
+      personal collection never has one, nor does a server collection
+      without a backdrop, or any card from an older server) leaves the
+      hero on the card it showed, as on an Explore all card. It keeps that
+      card's copy as it was read until focus reaches another card the hero
+      shows, even when the rows are read again meanwhile. When Home opens
+      on such a row, the hero shows its first card if that has a backdrop;
+      otherwise it stays empty until focus reaches a card it shows, and
       `AppLaunchComplete` does not wait for it. Options (*) on its cards
       does nothing.
     - The server leaves out collections the viewer can't see and rows left
