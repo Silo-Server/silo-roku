@@ -1510,13 +1510,15 @@ their existing HD/FHD assets.
     versions"), with no Auto row; editions are the versions' `edition_key`s
     in server order, a later part of a multipart file left out. It opens on
     the edition the profile last played (`user_data.last_edition_key`, else
-    the edition of `last_file_id`). With nothing played, it compares each
-    edition's Auto file: a file within `playback.preferred_quality` (or
-    with no preference) before one above it, before an unknown resolution;
-    then the higher resolution within the preference, or the lower above
-    it; then HDR before SDR; then the edition's name (the unnamed edition
-    or a standard or default cut, then a theatrical one, then any other);
-    then the server's edition order. File size is not compared across cuts.
+    the edition of `last_file_id`). With nothing played, it goes by the
+    edition's name first (the unnamed edition or a standard or default cut,
+    then a theatrical one, then any other), since the edition is which film
+    the viewer watches. Among the editions of that name it compares each
+    one's Auto file: a file within `playback.preferred_quality` (or with no
+    preference) before one above it, before an unknown resolution; then the
+    higher resolution within the preference, or the lower above it; then
+    HDR before SDR; then the server's edition order. File size is not
+    compared across cuts.
     Picking an edition puts Version back on Auto. Its spoken value is the
     edition's name.
   - Version offers Auto ("Best match for this device") and the current
