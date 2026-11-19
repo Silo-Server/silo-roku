@@ -1,0 +1,55 @@
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/socket.bs"
+import "pkg:/source/watchparty/wire.bs"
+
+const HOME_EVENTS_PROTOCOL = "silo.events.v2"
+
+sub init()
+    m.top.functionName = "listen"
+end sub
+
+sub listen()
+    binding = m.top.binding
+    m.top.binding = {}
+    if not watchparty.socket.available()
+        m.top.signal = "unsupported"
+        return
+    end if
+    port = CreateObject("roMessagePort")
+    m.top.observeFieldScopedEx("cancelled", port)
+    if m.top.cancelled then return
+    clock = CreateObject("roTimespan")
+    handle = watchparty.socket.open(binding.url, watchparty.wire.protocols(binding.ticket, HOME_EVENTS_PROTOCOL), port, 1, 0)
+    if handle = invalid
+        m.top.signal = "closed"
+        return
+    end if
+    subscribed = false
+    while not m.top.cancelled
+        message = wait(5000, port)
+        if m.top.cancelled then exit while
+        elapsed = clock.TotalMilliseconds()
+        event = watchparty.socket.event(handle, message, elapsed)
+        if event <> invalid
+            if event.kind = "open" and event.protocol <> HOME_EVENTS_PROTOCOL then exit while
+            if event.kind = "close" or event.kind = "error" then exit while
+            if event.kind = "text"
+                frame = ParseJson(event.text)
+                if util.isObject(frame)
+                    if frame.type = "subscribed" and not subscribed and type(frame.channels) = "roArray"
+                        for each channel in frame.channels
+                            if channel = "user_state" then subscribed = true
+                        end for
+                        if subscribed then m.top.signal = "subscribed"
+                    else if subscribed and frame.type = "event" and frame.channel = "user_state" and frame.event = "user_state.changed"
+                        if util.isObject(frame.data) and frame.data.profile_id = binding.profile then m.top.signal = "changed"
+                    end if
+                end if
+            end if
+        end if
+        if not subscribed and elapsed >= 15000 then exit while
+        if elapsed >= binding.lifetime * 1000 or watchparty.socket.isQuiet(handle.live, elapsed) then exit while
+    end while
+    watchparty.socket.close(handle)
+    if not m.top.cancelled then m.top.signal = "closed"
+end sub
