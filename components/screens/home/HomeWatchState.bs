@@ -1,0 +1,114 @@
+import "pkg:/source/api/client.bs"
+import "pkg:/source/api/session.bs"
+import "pkg:/source/util/values.bs"
+import "pkg:/source/watchparty/wire.bs"
+
+const HOME_WATCH_POLL_SECONDS = 120
+const HOME_WATCH_RECONNECT_MAX_SECONDS = 30
+
+sub initHomeWatchState()
+    m.watchRetry = m.top.findNode("watchRetry")
+    m.watchRetry.observeField("fire", "openHomeWatchState")
+    m.watchPoll = m.top.findNode("watchPoll")
+    m.watchPoll.duration = HOME_WATCH_POLL_SECONDS
+    m.watchPoll.observeField("fire", "pollHomeWatchState")
+    m.watchSocketSupported = true
+    m.watchBackoff = 1
+    m.watchSocketLive = false
+end sub
+
+sub showHomeWatchState()
+    m.watchPoll.control = "start"
+    openHomeWatchState()
+end sub
+
+sub hideHomeWatchState()
+    m.watchPoll.control = "stop"
+    m.watchRetry.control = "stop"
+    if m.watchMint <> invalid
+        api.cancel(m.watchMint)
+        m.watchMint = invalid
+    end if
+    if m.watchEvents <> invalid
+        m.watchEvents.unobserveField("signal")
+        m.watchEvents.cancelled = true
+        m.watchEvents = invalid
+    end if
+    m.watchSocketLive = false
+    m.watchBackoff = 1
+end sub
+
+function homeWatchOwner() as Dynamic
+    session = api.session.current()
+    if session = invalid or session.status <> "signed_in" or not util.isObject(session.profile) then return invalid
+    if util.isObject(session.borrowed) then return invalid
+    return { server: session.origin, account: session.accountId, profile: session.profile.id }
+end function
+
+sub openHomeWatchState()
+    if not m.top.visible or not m.top.ready or not m.watchSocketSupported or m.watchMint <> invalid or m.watchEvents <> invalid then return
+    owner = homeWatchOwner()
+    if owner = invalid then return
+    m.watchOwner = owner
+    m.watchMint = api.newHandle(m.top.owner)
+    m.watchMint.observeField("status", "onHomeWatchTicket")
+    api.send({ method: "POST", path: "/api/v2/events/ws-ticket", auth: "profile", secret: true, fence: owner }, m.watchMint)
+end sub
+
+function homeWatchOwnerCurrent() as Boolean
+    owner = homeWatchOwner()
+    return owner <> invalid and m.watchOwner <> invalid and owner.server = m.watchOwner.server and owner.account = m.watchOwner.account and owner.profile = m.watchOwner.profile
+end function
+
+sub onHomeWatchTicket(event as Object)
+    handle = event.getRoSGNode()
+    if m.watchMint = invalid or not m.watchMint.isSameNode(handle) then return
+    m.watchMint = invalid
+    if not m.top.visible or not homeWatchOwnerCurrent() then return
+    result = api.resultOf(handle)
+    ticket = ""
+    if result.ok then ticket = watchparty.wire.ticket(result.body, "silo.events.v2")
+    if ticket = ""
+        retryHomeWatchState()
+        return
+    end if
+    base = m.watchOwner.server
+    if Left(base, 8) = "https://"
+        base = "wss://" + Mid(base, 9)
+    else if Left(base, 7) = "http://"
+        base = "ws://" + Mid(base, 8)
+    else
+        return
+    end if
+    m.watchEvents = CreateObject("roSGNode", "HomeEventsTask")
+    m.watchEvents.observeField("signal", "onHomeWatchSignal")
+    m.watchEvents.binding = { url: base + "/api/v2/events/ws?channels=user_state", ticket: ticket, profile: m.watchOwner.profile, lifetime: result.body.max_connection_seconds }
+    m.watchEvents.control = "run"
+end sub
+
+sub onHomeWatchSignal(event as Object)
+    if m.watchEvents = invalid or not m.watchEvents.isSameNode(event.getRoSGNode()) then return
+    signal = event.getData()
+    if signal = "closed" or signal = "unsupported"
+        m.watchEvents = invalid
+        m.watchSocketLive = false
+        if signal = "unsupported" then m.watchSocketSupported = false
+        retryHomeWatchState()
+    else if m.top.visible and homeWatchOwnerCurrent()
+        m.watchSocketLive = true
+        m.watchBackoff = 1
+        queueExternalHomeRefresh()
+    end if
+end sub
+
+sub retryHomeWatchState()
+    if not m.top.visible or not m.watchSocketSupported then return
+    m.watchRetry.duration = m.watchBackoff
+    m.watchRetry.control = "start"
+    m.watchBackoff = m.watchBackoff * 2
+    if m.watchBackoff > HOME_WATCH_RECONNECT_MAX_SECONDS then m.watchBackoff = HOME_WATCH_RECONNECT_MAX_SECONDS
+end sub
+
+sub pollHomeWatchState()
+    if m.top.visible and m.top.ready and not m.watchSocketLive and homeWatchOwner() <> invalid then queueExternalHomeRefresh()
+end sub
