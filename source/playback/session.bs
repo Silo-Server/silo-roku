@@ -660,6 +660,7 @@ namespace playback.session
         kind = event.kind
         noteResult(state, event)
         sample.sending = false
+        if a.endProbe <> invalid and settleEndProbe(state, a, kind, env, out) then return
         if kind = "offline" or kind = "retry"
             ' Uncertain: the next tick resends this exact body under its sequence.
             sample.failed = true
@@ -690,6 +691,59 @@ namespace playback.session
             progressFailed(a, out)
         end if
     end sub
+
+    ' Media from the configured origin answered 404 or 410, which names no
+    ' cause: the session may have ended for good (an administrator's stop,
+    ' or paused past the administrator's limit) or be gone and worth
+    ' starting again. One progress post asks the server which before the
+    ' player starts again (a.endProbe, { load, sequence }): sequence is the
+    ' post whose answer decides, or invalid while an earlier post is in
+    ' flight, whose answer may predate the end.
+    sub askEnded(state as Object, env as Object, out as Object)
+        a = state.attempt
+        if a = invalid or not playback.values.isText(a.sessionId)
+            restart(state, env, out, { sessionEnded: true })
+            return
+        end if
+        probe = { load: state.plan.load, sequence: invalid }
+        a.endProbe = probe
+        out.Push({ type: "log", level: "info", message: "the media answered that the session ended; asking the server", fields: invalid })
+        sample = a.progress.sample
+        if sample = invalid
+            sendSample(state, a, out)
+            probe.sequence = a.sequence
+        else if not sample.sending
+            ' An uncertain post that waits for the next tick goes now.
+            sample.sending = true
+            probe.sequence = sample.sequence
+            out.Push(progressCommand(a, sample))
+        end if
+    end sub
+
+    ' The answer to the attempt's current progress post while askEnded
+    ' waits; true when it decided what follows. An answer that ends the session or starts it again is the
+    ' server's word, handled as any progress answer is. Any other answer to
+    ' the probe's own post starts again, as the media's answer did before
+    ' (an unreachable server, too: the start retries); one to an earlier
+    ' post sends the probe's.
+    function settleEndProbe(state as Object, a as Object, kind as String, env as Object, out as Object) as Boolean
+        probe = a.endProbe
+        if state.plan = invalid or state.plan.load <> probe.load or kind = "notFound" or kind = "ended" or kind = "pausedTimeout" or kind = "installationChanged"
+            ' A newer load replaced the failed one, or the server answered.
+            a.endProbe = invalid
+            return false
+        end if
+        a.progress.sample = invalid
+        if probe.sequence = invalid
+            sendSample(state, a, out)
+            probe.sequence = a.sequence
+            return true
+        end if
+        a.endProbe = invalid
+        out.Push({ type: "log", level: "info", message: "the server did not end the session the media did; starting again", fields: { kind: kind } })
+        restart(state, env, out, { sessionEnded: true })
+        return true
+    end function
 
     ' --- Progress -------------------------------------------------------------
 
@@ -1029,7 +1083,7 @@ namespace playback.session
     sub recoverLoad(state as Object, kind as String, message as Dynamic, env as Object, out as Object)
         plan = state.plan
         if kind = "ended"
-            restart(state, env, out, { sessionEnded: true })
+            askEnded(state, env, out)
             return
         end if
         if kind = "auth"
@@ -1527,6 +1581,9 @@ namespace playback.session
             ' A media error that names no cause has had its connection retry
             ' since a load last played (mediaKind).
             mediaRetried: false,
+            ' The progress post that asks whether a media 404 or 410
+            ' ended the session (askEnded), or invalid.
+            endProbe: invalid,
             ' The subtitles a replan has reloaded to carry because their
             ' sidecar came after the content started (settleSubtitle).
             subtitleReplans: [],

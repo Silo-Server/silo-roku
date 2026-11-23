@@ -510,6 +510,105 @@ namespace tests
             m.assertEqual(m.wake(state, env, 60000), [])
         end sub
 
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("media that answers the session ended")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        ' Content playing at 900 s whose media answered 404 or 410: the
+        ' reducer asks the server with one progress post before anything
+        ' else. Gives that post.
+        function mediaEnded(state as Object, env as Object) as Object
+            m.position(state, env, tests.dbl(900))
+            cmds = m.failWith(state, env, "ended")
+            m.assertEqual(m.types(cmds), ["log", "progress"], "no start before the server answers")
+            return cmds[1]
+        end function
+
+        @it("leaves, saying why, when the server answers the probe that the session stayed paused too long")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.directPlan("plan-1", "v3:k1"))
+            m.player(state, env, "paused")
+            post = m.mediaEnded(state, env)
+            m.assertEqual(post.session_id, "s-1")
+            body = ParseJson(post.bodyText)
+            m.assertEqual([body.installation_id, body.sequence, body.is_paused], ["inst-1", 1, true])
+            m.assertTrue(body.position = 900, "the position the media failed at")
+            cmds = m.progressResult(state, env, "pausedTimeout")
+            m.assertEqual(m.types(cmds), ["exit", "done"], "no start and no stop")
+            m.assertEqual(cmds[0].reason, "paused_timeout")
+        end sub
+
+        @it("leaves as for an administrator's stop when the server answers the probe that the session ended")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.directPlan("plan-1", "v3:k1"))
+            m.mediaEnded(state, env)
+            cmds = m.progressResult(state, env, "ended")
+            m.assertEqual(m.types(cmds), ["exit", "done"])
+            m.assertEqual(cmds[0].reason, "session_ended")
+        end sub
+
+        @it("starts again at the position when the server answers the probe 404")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.directPlan("plan-1", "v3:k1"))
+            m.mediaEnded(state, env)
+            cmds = m.progressResult(state, env, "notFound")
+            m.assertEqual(m.types(cmds), ["start"], "the ended session gets no stop")
+            m.assertEqual(cmds[0].start_position, tests.dbl(900))
+        end sub
+
+        @it("starts again, as before the probe, when the server accepts it or cannot be reached")
+        sub _()
+            for each kind in ["ok", "offline"]
+                env = tests.fakeEnv()
+                state = m.playing(env, tests.directPlan("plan-1", "v3:k1"))
+                m.mediaEnded(state, env)
+                cmds = m.progressResult(state, env, kind)
+                m.assertEqual(m.types(cmds), ["log", "start"], kind)
+                m.assertEqual(cmds[1].start_position, tests.dbl(900), kind)
+            end for
+        end sub
+
+        @it("asks with a new post once a post already in flight answers, since that answer may predate the end")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.directPlan("plan-1", "v3:k1"))
+            m.position(state, env, tests.dbl(900))
+            m.send(state, env, { type: "tick" })
+            m.assertEqual(m.types(m.failWith(state, env, "ended")), ["log"])
+            cmds = m.progressResult(state, env, "ok")
+            m.assertEqual(m.types(cmds), ["progress"])
+            m.assertEqual(cmds[0].sequence, 2)
+            cmds = m.progressResult(state, env, "pausedTimeout")
+            m.assertEqual(m.types(cmds), ["exit", "done"])
+            m.assertEqual(cmds[0].reason, "paused_timeout")
+        end sub
+
+        @it("sends an uncertain post waiting for the next tick as the probe")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.directPlan("plan-1", "v3:k1"))
+            m.position(state, env, tests.dbl(900))
+            first = m.send(state, env, { type: "tick" })[0]
+            m.progressResult(state, env, "offline")
+            post = m.mediaEnded(state, env)
+            m.assertEqual([post.sequence, post.bodyText], [first.sequence, first.bodyText], "resent byte for byte")
+            m.assertEqual(m.types(m.progressResult(state, env, "notFound")), ["start"])
+        end sub
+
+        @it("stops and leaves on Back while the probe waits, and ignores its answer after")
+        sub _()
+            env = tests.fakeEnv()
+            state = m.playing(env, tests.directPlan("plan-1", "v3:k1"))
+            m.mediaEnded(state, env)
+            session = state.attempt.sessionId
+            sequence = state.attempt.progress.sample.sequence
+            m.assertEqual(m.types(m.send(state, env, { type: "back" })), ["job", "exit", "done"], "the probe in flight is no uncertain post: the stop alone")
+            m.assertEqual(m.send(state, env, { type: "progressResult", session_id: session, sequence: sequence, kind: "pausedTimeout" }), [])
+        end sub
+
         @it("logs progress_conflict and continues with a higher sequence")
         sub _()
             env = tests.fakeEnv()
@@ -1678,8 +1777,10 @@ namespace tests
             m.send(state, env, { type: "qualityChange", quality: "720p-medium" })
             m.failWith(state, env, "ended")
             cmds = m.replanResult(state, env, "rejected", invalid)
-            m.assertEqual(m.types(cmds), ["log", "refused", "start"], "the media said the session ended: no stop")
-            m.assertEqual(cmds[2].start_position, tests.dbl(900))
+            m.assertEqual(m.types(cmds), ["log", "refused", "log", "progress"], "the server is asked whether the session ended")
+            cmds = m.progressResult(state, env, "notFound")
+            m.assertEqual(m.types(cmds), ["start"], "the media said the session ended: no stop")
+            m.assertEqual(cmds[0].start_position, tests.dbl(900))
         end sub
 
         @it("renews where it is when a refused quality change leaves content refused 401")
