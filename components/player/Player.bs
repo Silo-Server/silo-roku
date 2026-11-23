@@ -147,15 +147,19 @@ import "pkg:/source/watchparty/app.bs"
 ' Skip intro (playback.skipIntro, components/player/skip/SkipIntroButton):
 ' positions and the Video state drive it, and the panelTimer its fill. The
 ' button places itself at the bottom right, raised while the controls show.
-' While it shows (the controls reducer's skipButton flag), OK with the
-' controls hidden, or on the pill when it has the controls' focus, arrives
-' as activateSkip() and Back as dismissSkip(). Skip Recap
-' (playback.skipRecap) and Skip Credits (playback.skipCredits) take the
-' same positions, Video state, and markers, and share the segment pill
-' (SkipSegmentButton), Skip Recap first: each shows while playback is inside
-' its range and skips it itself under the profile's
-' playback.auto_skip_recap or playback.auto_skip_credits; the pill's OK
-' arrives as activateSegment. Their seeks, Watch Intro's back to the
+' Skip Recap (playback.skipRecap) and Skip Credits (playback.skipCredits)
+' take the same positions, Video state, markers, and ticks, and share the
+' segment pill (SkipSegmentButton), Skip Recap first; each skips its range
+' itself under the profile's playback.auto_skip_recap or
+' playback.auto_skip_credits. All three are playback.skipOffer's timed
+' offer. While a timed pill shows (the controls reducer's skipButton or
+' segmentButton flag), OK with the controls hidden, or on the pill when it
+' has the controls' focus, arrives as activateSkip() or activateSegment(),
+' and Back as dismissSkip() or dismissSegment(). Once its timer has run
+' out, a pill comes back without one while the controls are up
+' (noteSkipContext; the skipReturned and segmentReturned flags), and only
+' Up reaches it. Up Next's panel covers every pill, and Skip Intro's the
+' segment pill (coverSkipPills). Their seeks, Watch Intro's back to the
 ' intro's start too, go through the session reducer as every seek does
 ' (commitSeek: local or seek_reanchor). Credits that run to the end of the
 ' file open Up Next instead (creditsToEnd).
@@ -199,7 +203,8 @@ import "pkg:/source/watchparty/app.bs"
 ' file and moves only on the room's commands. Its seeks (commitSeek) and
 ' play and pause (togglePause) become transport requests, its exits open
 ' the room panel (exitPlayer), and Up Next, auto-skips, and the buffering
-' card are off (begin).
+' card are off (begin). The skip pills show only to a member who may seek
+' (partySkipOffers).
 
 const LOG_TAG = "player"
 const NOTICE_MS = 4000
@@ -463,6 +468,9 @@ sub init()
     m.skip = invalid
     m.recap = invalid
     m.credits = invalid
+    ' The skip pills' flags the controls reducer was last given
+    ' (flagSkipPill).
+    m.pillFlags = {}
     m.upNext = invalid
     m.upNextPanel = invalid
     m.resolution = invalid
@@ -761,6 +769,7 @@ sub begin(intent as Object)
     m.skip = playback.skipIntro.create(introMode, m.markers)
     m.recap = playback.skipRecap.create(m.preferences.autoSkipRecap and not party, m.markers)
     m.credits = playback.skipCredits.create(m.preferences.autoSkipCredits and not party, m.markers, intent.runtime, playback.skipCredits.carriedKey(carry))
+    if party then partySkipOffers()
     if not chained then carry = playback.upNext.newCarry()
     m.upNext = invalid
     if not party then m.upNext = playback.upNext.create({ promptSeconds: m.preferences.nextUpPromptSeconds, runtime: intent.runtime, lookup: intent.kind = "episode" or isShuffling(), autoPlayNext: m.autoplayNext, deviceAutoplay: CreateObject("roDeviceInfo").IsAutoplayEnabled(), carry: carry, shuffle: isShuffling() })
@@ -2533,6 +2542,7 @@ sub dispatchControls(event as Object)
     m.controlEvents = []
     m.controlsBusy = false
     if m.closed then return
+    noteSkipContext()
     ' Once every queued flag is reduced: a panel a controls command opened
     ' covers the buffering card too.
     noteBufferingCover()
@@ -2583,6 +2593,8 @@ sub executeControl(command as Object)
         activateSegment()
     else if t = "dismissSkip"
         dismissSkip()
+    else if t = "dismissSegment"
+        dismissSegment()
     else if t = "closeOptions"
         closeOptionsPanel()
     else if t = "exit"
@@ -2616,11 +2628,12 @@ sub showBufferingPill(pill as Dynamic)
     setOverlayFlags({ bufferingPill: kind })
 end sub
 
-' The buffering card waits, its timer held, while a skip pill, Up Next,
-' Options, or the error screen covers it (the controller's pill_obscured).
+' The buffering card waits, its timer held, while a skip pill (timed or
+' returned), Up Next, Options, or the error screen covers it (the
+' controller's pill_obscured).
 sub noteBufferingCover()
     c = m.controls
-    covered = c.skipButton or c.segmentButton or c.upNext or c.options or c.picker or m.errorVisible
+    covered = playback.controls.hasSkip(c) or playback.controls.hasSegment(c) or c.upNext or c.options or c.picker or m.errorVisible
     if covered = m.bufferingCovered then return
     m.bufferingCovered = covered
     dispatch({ type: "bufferingObscured", obscured: covered })
@@ -2970,42 +2983,58 @@ end sub
 
 ' Reduces a Skip Intro event at the clock's now and carries out what it
 ' returns; Skip Recap and Skip Credits take the positions, the Video state,
-' and the markers too.
+' the markers, the ticks, and the controls too.
 sub runSkip(event as Object)
-    if m.skip = invalid or m.leaving then return
-    t = event.type
-    if t = "position" or t = "player" or t = "markers"
-        runRecap(event)
-        runCredits(event)
-    end if
+    if m.leaving then return
     event.now = m.env.now()
-    for each command in playback.skipIntro.reduce(m.skip, event)
+    commands = []
+    if m.skip <> invalid then commands = playback.skipIntro.reduce(m.skip, event)
+    for each command in commands
         if command.type = "seek"
             commitSeek(command.seconds)
         else if command.type = "show"
             m.skipButton.mode = command.mode
             m.skipButton.progress = command.progress
-            if not m.skipButton.visible
-                m.skipButton.visible = true
-                setOverlayFlags({ skipButton: true })
-            end if
+            m.skipButton.visible = true
+            flagSkipPill("skipButton", "skipReturned", true, command.timed)
         else if command.type = "hide"
             hideSkip()
         end if
     end for
+    t = event.type
+    if t = "position" or t = "player" or t = "markers" or t = "tick" or t = "controls"
+        runRecap(event)
+        runCredits(event)
+    end if
+    coverSkipPills()
     schedulePanels()
 end sub
 
 sub hideSkip()
     if not m.skipButton.visible then return
     m.skipButton.visible = false
-    setOverlayFlags({ skipButton: false })
+    flagSkipPill("skipButton", "skipReturned", false, false)
+end sub
+
+' Tells the controls reducer which of a skip pill's flags holds: timed,
+' returned without a timer, or neither while it is hidden. What was sent
+' last decides, not the reducer's state, which lags a flags event queued
+' behind a controls command.
+sub flagSkipPill(timedFlag as String, returnedFlag as String, shown as Boolean, timed as Boolean)
+    flags = {}
+    flags[timedFlag] = shown and timed
+    flags[returnedFlag] = shown and not timed
+    sent = m.pillFlags
+    if util.isTrue(sent[timedFlag]) = flags[timedFlag] and util.isTrue(sent[returnedFlag]) = flags[returnedFlag] then return
+    sent.Append(flags)
+    setOverlayFlags(flags)
 end sub
 
 ' Reduces a Skip Recap event (playback.skipRecap): its seeks, a skip or the
 ' profile's auto-skip, go through the session reducer as every seek does.
 sub runRecap(event as Object)
     if m.recap = invalid or m.leaving then return
+    if event.now = invalid then event.now = m.env.now()
     for each command in playback.skipRecap.reduce(m.recap, event)
         if command.type = "seek"
             commitSeek(command.seconds)
@@ -3013,6 +3042,7 @@ sub runRecap(event as Object)
             showSegment()
         end if
     end for
+    schedulePanels()
 end sub
 
 ' Reduces a Skip Credits event (playback.skipCredits): a skip seeks past
@@ -3020,6 +3050,7 @@ end sub
 ' them (creditsToEnd).
 sub runCredits(event as Object)
     if m.credits = invalid or m.leaving then return
+    if event.now = invalid then event.now = m.env.now()
     for each command in playback.skipCredits.reduce(m.credits, event)
         if command.type = "seek"
             commitSeek(command.seconds)
@@ -3029,6 +3060,35 @@ sub runCredits(event as Object)
             showSegment()
         end if
     end for
+    schedulePanels()
+end sub
+
+' What the skip pills take from the controls: whether they are up for a
+' pill whose timer ran out to come back, shown with no Options, Up Next,
+' or seek being chosen (silo-server's intro-skip design, "When the
+' controls are up"; scrub mode is Roku's pending seek); and what covers
+' the pills.
+sub noteSkipContext()
+    c = m.controls
+    up = c.shown and not c.options and not c.upNext and not playback.controls.isScrubbing(c)
+    for each reducer in [m.skip, m.recap, m.credits]
+        if reducer <> invalid and reducer.controls <> up
+            runSkip({ type: "controls", shown: up })
+            exit for
+        end if
+    end for
+    coverSkipPills()
+end sub
+
+' One actionable pill at a time: Up Next's panel covers every skip pill,
+' and Skip Intro's covers the segment pill, which waits behind it with its
+' timer held (a new one starts full once it shows).
+sub coverSkipPills()
+    panel = m.upNextPanel <> invalid
+    if m.skip <> invalid and m.skip.covered <> panel then runSkip({ type: "covered", covered: panel })
+    segment = panel or m.skipButton.visible
+    if m.recap <> invalid and m.recap.covered <> segment then runRecap({ type: "covered", covered: segment })
+    if m.credits <> invalid and m.credits.covered <> segment then runCredits({ type: "covered", covered: segment })
 end sub
 
 ' tvOS's performCreditsSkip at the end of the file: Up Next opens while the
@@ -3044,17 +3104,25 @@ sub creditsToEnd(command as Object)
 end sub
 
 ' The segment pill shows Skip Recap, else Skip Credits, while either
-' reducer shows its pill (tvOS's segmentSkipLabel), except under Up Next,
-' which takes the controls' place as on tvOS, and once Up Next has moved
-' on to another item.
+' reducer shows its pill (tvOS's segmentSkipLabel), with that pill's fill,
+' except once Up Next has moved on to another item. Up Next's panel hides
+' it through its reducer (coverSkipPills), as tvOS hides its controls there.
 sub showSegment()
     kind = segmentKind()
-    if kind <> "" then m.segmentButton.kind = kind
+    pill = invalid
+    if kind = "recap" then pill = playback.skipOffer.pill(m.recap)
+    if kind = "credits" then pill = playback.skipOffer.pill(m.credits)
     movedOn = m.upNext <> invalid and m.upNext.finished
-    shown = kind <> "" and m.upNextPanel = invalid and not movedOn
-    if m.segmentButton.visible = shown then return
+    shown = pill <> invalid and not movedOn
+    timed = false
+    if shown
+        timed = pill.timed
+        m.segmentButton.kind = kind
+        m.segmentButton.timed = timed
+        m.segmentButton.progress = pill.progress
+    end if
     m.segmentButton.visible = shown
-    setOverlayFlags({ segmentButton: shown })
+    flagSkipPill("segmentButton", "segmentReturned", shown, timed)
 end sub
 
 ' "recap", "credits", or "" for neither.
@@ -3064,13 +3132,23 @@ function segmentKind() as String
     return ""
 end function
 
-' OK on the segment pill, for the reducer whose pill it shows.
+' OK on the segment pill.
 sub activateSegment()
+    runSegment({ type: "press" })
+end sub
+
+' Back with the timed segment pill showing.
+sub dismissSegment()
+    runSegment({ type: "back" })
+end sub
+
+' Reduces event in the reducer whose pill the segment pill shows.
+sub runSegment(event as Object)
     kind = segmentKind()
     if kind = "recap"
-        runRecap({ type: "press" })
+        runRecap(event)
     else if kind = "credits"
-        runCredits({ type: "press" })
+        runCredits(event)
     end if
 end sub
 
@@ -3129,11 +3207,13 @@ sub commitSeek(position as Dynamic, resume = false as Boolean)
     dispatch({ type: "seekTo", position: position, resume: resume })
 end sub
 
-' Skip Intro's fill and Up Next's end countdown.
+' The skip pills' fills and Up Next's end countdown.
 sub schedulePanels()
     now = m.env.now()
     wake = invalid
     if m.skip <> invalid then wake = playback.skipIntro.nextWake(m.skip, now)
+    if m.recap <> invalid then wake = sooner(wake, playback.skipRecap.nextWake(m.recap, now))
+    if m.credits <> invalid then wake = sooner(wake, playback.skipCredits.nextWake(m.credits, now))
     if m.upNext <> invalid then wake = sooner(wake, playback.upNext.nextWake(m.upNext, now))
     m.panelTimer.control = "stop"
     if wake = invalid or m.leaving then return
@@ -3297,7 +3377,7 @@ sub showUpNext(command as Object)
     panel.observeField("videoBox", "onUpNextBox")
     setVideoBox(panel.videoBox)
     panel.visible = true
-    showSegment()
+    coverSkipPills()
     setOverlayFlags({ upNext: true })
     dispatchControls({ type: "hide" })
     panel.setFocus(true)
@@ -3331,7 +3411,7 @@ sub closeUpNext()
     m.upNextLayer.removeChild(panel)
     setVideoBox(invalid)
     setOverlayFlags({ upNext: false })
-    showSegment()
+    coverSkipPills()
 end sub
 
 ' Play Now, Keep Watching, or Back on the panel, or OK on an On Deck card.
@@ -3560,7 +3640,8 @@ sub dropRequests()
 end sub
 
 ' The overlays above report themselves: flags has any of skipButton,
-' picker, upNext, and options.
+' segmentButton, skipReturned, segmentReturned, bufferingPill, picker,
+' upNext, and options.
 sub setOverlayFlags(flags as Object)
     event = { type: "flags" }
     event.Append(flags)

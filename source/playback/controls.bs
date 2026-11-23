@@ -24,13 +24,18 @@ import "pkg:/source/playback/seek.bs"
 '   {type: "content", episode}: whether the title is an episode, for the
 '     Up Next button.
 '   {type: "preferences", skipBackSeconds, skipForwardSeconds}
-'   {type: "flags", skipButton, segmentButton, bufferingPill, picker,
-'     upNext, options}: the overlays other components own; only the members
-'     given change. bufferingPill is "prompt", "undo", or "" for the
-'     buffering card (playback.buffering). A skip pill or card that appears
-'     while the controls show takes focus, as tvOS's do, unless a seek is
-'     being chosen or a panel is open; one that goes while focused hands
-'     focus to the scrubber.
+'   {type: "flags", skipButton, segmentButton, skipReturned,
+'     segmentReturned, bufferingPill, picker, upNext, options}: the overlays
+'     other components own; only the members given change. skipButton and
+'     segmentButton are the timed skip pills (playback.skipOffer), which
+'     take OK with the controls hidden, and Back; skipReturned and
+'     segmentReturned the pills that come back without a timer while the
+'     controls are up, which Up reaches and nothing else claims.
+'     bufferingPill is "prompt", "undo", or "" for the buffering card
+'     (playback.buffering). A timed skip pill or the card that appears while
+'     the controls show takes focus, as tvOS's do, unless a seek is being
+'     chosen or a panel is open; a returned pill does not. One that goes
+'     while focused hands focus to the scrubber.
 '   {type: "hide"}: hide them, drop a pending seek, and end Replay's
 '     caption span, as when an error screen or Up Next covers the player.
 '
@@ -44,8 +49,8 @@ import "pkg:/source/playback/seek.bs"
 '   {type: "openOptions", tab}: "video", or LAST_TAB for the tab Options
 '     showed last in this player, which the player remembers.
 '   {type: "openUpNext"}, {type: "activateSkip"}, {type: "activateSegment"},
-'   {type: "dismissSkip"}, {type: "closeOptions"}, {type: "exit"}: exit
-'     stops the session and leaves the player.
+'   {type: "dismissSkip"}, {type: "dismissSegment"}, {type: "closeOptions"},
+'   {type: "exit"}: exit stops the session and leaves the player.
 '   {type: "bufferingSelect", button}: "primary" (Lower quality, Restore
 '     quality) or "secondary" (Keep quality) on the buffering card.
 '   {type: "bufferingBack"}: Back while the card shows.
@@ -101,8 +106,11 @@ namespace playback.controls
             runtime: invalid,
             paused: false,
             busy: false,
+            ' The timed skip pills, and the ones returned without a timer.
             skipButton: false,
             segmentButton: false,
+            skipReturned: false,
+            segmentReturned: false,
             ' The buffering card, "prompt", "undo", or "", and the action
             ' OK takes while the controls are hidden.
             bufferingPill: "",
@@ -351,11 +359,12 @@ namespace playback.controls
 
     ' Back, first match wins (spec section 5.7). Back reaches here while
     ' Options is open only if the panel lost focus; it closes the panel, as
-    ' the panel's own Back does, from its tabs or a list (picker). Only
-    ' Skip Intro's pill takes Back: the segment pill stays through it, as
-    ' tvOS's segment pill stays through Menu (assumption AG-291). The
-    ' buffering card takes Back before Skip Intro, as tvOS's does; it shows
-    ' only while no skip pill, Up Next, or Options covers it.
+    ' the panel's own Back does, from its tabs or a list (picker). A timed
+    ' skip pill takes Back, Skip Intro's first, then the segment pill's
+    ' (assumption AG-661), and nothing else happens: the controls stay as
+    ' they were. A returned pill takes none. The buffering card takes Back
+    ' before Skip Intro, as tvOS's does; it shows only while no skip pill,
+    ' Up Next, or Options covers it.
     sub back(state as Object, out as Object)
         if isScrubbing(state)
             cancel(state)
@@ -364,6 +373,8 @@ namespace playback.controls
             out.Push({ type: "bufferingBack" })
         else if state.skipButton
             out.Push({ type: "dismissSkip" })
+        else if state.segmentButton
+            out.Push({ type: "dismissSegment" })
         else if state.upNext
             out.Push({ type: "upNextBack" })
         else if state.options or state.picker
@@ -394,20 +405,20 @@ namespace playback.controls
         state.focus = list[index]
     end sub
 
-    ' The buttons, then the scrubber, then the skip pills above it: Skip
-    ' Intro, and the segment pill over it when both show.
+    ' The buttons, then the scrubber, then the skip pills above it, timed
+    ' or returned: Skip Intro, and the segment pill over it when both show.
     sub moveUp(state as Object)
         if state.focus = BUFFER_PRIMARY or state.focus = BUFFER_SECONDARY then return
         if state.focus = SCRUBBER
-            if state.skipButton
+            if hasSkip(state)
                 state.focus = SKIP_INTRO
-            else if state.segmentButton
+            else if hasSegment(state)
                 state.focus = SKIP_SEGMENT
             else if state.bufferingPill <> ""
                 state.focus = BUFFER_PRIMARY
             end if
         else if state.focus = SKIP_INTRO
-            if state.segmentButton then state.focus = SKIP_SEGMENT
+            if hasSegment(state) then state.focus = SKIP_SEGMENT
         else if state.focus <> SKIP_SEGMENT
             state.focus = SCRUBBER
         end if
@@ -416,7 +427,7 @@ namespace playback.controls
     sub moveDown(state as Object)
         if state.focus = BUFFER_PRIMARY or state.focus = BUFFER_SECONDARY
             state.focus = SCRUBBER
-        else if state.focus = SKIP_SEGMENT and state.skipButton
+        else if state.focus = SKIP_SEGMENT and hasSkip(state)
             state.focus = SKIP_INTRO
         else if state.focus = SKIP_SEGMENT or state.focus = SKIP_INTRO
             state.focus = SCRUBBER
@@ -425,8 +436,18 @@ namespace playback.controls
         end if
     end sub
 
-    ' Where focus lands as the controls appear: a skip pill that shows,
-    ' else the scrubber (tvOS).
+    ' Skip Intro's pill shows, timed or returned.
+    function hasSkip(state as Object) as Boolean
+        return state.skipButton or state.skipReturned
+    end function
+
+    ' The segment pill shows, timed or returned.
+    function hasSegment(state as Object) as Boolean
+        return state.segmentButton or state.segmentReturned
+    end function
+
+    ' Where focus lands as the controls appear: a timed skip pill that
+    ' shows, else the scrubber (tvOS); a returned pill never takes it.
     function firstFocus(state as Object) as String
         if state.skipButton then return SKIP_INTRO
         if state.segmentButton then return SKIP_SEGMENT
@@ -434,16 +455,18 @@ namespace playback.controls
         return SCRUBBER
     end function
 
-    ' A pill that appears takes focus while the controls show and nothing is
-    ' being chosen; one that goes while focused leaves it on the scrubber.
+    ' A timed pill that appears takes focus while the controls show and
+    ' nothing is being chosen. A timed pill that goes while focused leaves
+    ' focus on the scrubber, also when it comes back at once without its
+    ' timer; a returned pill that goes while focused does the same.
     sub onFlags(state as Object, event as Object)
         appeared = ""
-        for each entry in [["skipButton", SKIP_INTRO], ["segmentButton", SKIP_SEGMENT]]
+        for each entry in [["skipButton", SKIP_INTRO, true], ["segmentButton", SKIP_SEGMENT, true], ["skipReturned", SKIP_INTRO, false], ["segmentReturned", SKIP_SEGMENT, false]]
             name = entry[0]
             if util.isBoolean(event[name]) and event[name] <> state[name]
                 state[name] = event[name]
                 if event[name]
-                    appeared = entry[1]
+                    if entry[2] then appeared = entry[1]
                 else if state.focus = entry[1]
                     state.focus = SCRUBBER
                 end if

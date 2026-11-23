@@ -57,9 +57,11 @@ These never count:
 
 **Cards and the remote:**
 
-- Skip Intro, Skip Recap, Up Next, the Options panel and error screens take
-  priority. A buffering card waits behind them and comes back with the time
-  it had left. Its timer also pauses while playback is paused.
+- Skip Intro, Skip Recap, Skip Credits, Up Next, the Options panel and
+  error screens take priority; a skip pill does while it shows, with its
+  timer or back without one while the controls show. A buffering card
+  waits behind them and comes back with the time it had left. Its timer
+  also pauses while playback is paused.
 - With the controls hidden, OK presses the highlighted button. On the prompt,
   Left and Right move between its two buttons.
 - With the controls shown, the card takes focus, and Down moves to the
@@ -243,7 +245,8 @@ Roku follows tvOS, as `AGENTS.md` requires.
   - Back, in `controls.back()` order after scrubbing and before Skip Intro:
     on the prompt it answers **Keep quality**, on the undo pill it only hides
     the pill. Either way the key is consumed.
-- **Priority.** Skip Intro, Skip Recap, Up Next, the Options panel and the
+- **Priority.** A skip pill (Skip Intro, Skip Recap, or Skip Credits, timed
+  or returned with the controls), Up Next, the Options panel and the
   error panel hide the pill with its timer frozen (`pill_obscured` and
   `pill_unobscured`). A plan change or a viewer pick discards a hidden pill.
 - **Quality menu.** The Options Quality row reads "Auto · limited after

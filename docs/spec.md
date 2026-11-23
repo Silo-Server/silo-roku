@@ -2108,45 +2108,66 @@ Subtitles tab (criterion 4.8).
     no longer plays (playback moved to another version) give way to the
     languages, so a result is only ever downloaded for the file it was
     found for.
-- **Back, first match wins:** cancel a seek or scrub; dismiss Skip Intro's
-  pill; from Up Next, Keep Watching (tvOS); step Search Subtitles back to
-  its languages, then close it; close the Quality picker, then
-  Options; hide the controls while playing; otherwise stop and exit. The
-  segment pill (Skip Recap or Skip Credits) stays through Back, as tvOS's
-  stays through Menu (assumption AG-291).
+- **Back, first match wins:** cancel a seek or scrub; dismiss the timed
+  skip pill, Skip Intro's first, then the segment pill (Skip Recap or Skip
+  Credits), and do nothing else (assumption AG-661); from Up Next, Keep
+  Watching (tvOS); step Search Subtitles back to its languages, then close
+  it; close the Quality picker, then Options; hide the controls while
+  playing; otherwise stop and exit. A pill that came back without its timer
+  takes no Back.
 - **Skip pills.**
   - The profile chooses never, ask, or always for intros (default ask).
   - Skip Intro is a 72 px pill at the bottom right: right edge 1760, bottom
     156 px from the screen's bottom, or 460 px while the controls show. Its
     label is 28 px SemiBold at 62%. At rest it is black 65% with a 2 px white
     25% border; lit, it is white with a 3 px white border, scaled 1.06. A fill
-    grows from left to right over 5 s and pauses while playback is paused.
+    grows from left to right over 10 s and pauses while playback is paused.
   - Always skips, then shows "Intro skipped" in 22 px at 72% above a Watch
-    Intro pill for 5 s.
+    Intro pill for 10 s.
   - Recaps and credits share tvOS's segment pill (76 px, compact): "Skip
     Recap" while playback is inside a recap, "Skip Credits" inside credits,
-    Skip Recap first if both apply. It shows once the title has played its
-    first frame and stays while playback is in the range. Recaps are
-    skipped automatically when the profile's `playback.auto_skip_recap` is
-    on (D10), credits when `playback.auto_skip_credits` is on (default
-    off); a range skipped automatically is not skipped again when the
-    viewer seeks back into it, or in Keep Watching's replay of the end, and
-    the pill shows there instead.
+    Skip Recap first if both apply. Recaps are skipped automatically when
+    the profile's `playback.auto_skip_recap` is on (D10), credits when
+    `playback.auto_skip_credits` is on (default off); a range skipped
+    automatically is not skipped again, and offers no pill, when the
+    viewer seeks back into it or in Keep Watching's replay of the end.
+  - Every skip pill follows silo-server's intro-skip design (its `ask`
+    table and "Recap and credits pills"), whatever
+    `playback.intro_skip_mode` says for the segment pill: entering a range
+    once the title has played its first frame shows the pill with a 10 s
+    timer, which counts only while playing (a rebuffer keeps it running for
+    1.5 s). OK with the controls hidden, or on the focused pill, takes its
+    action in one press; Back dismisses it without seeking. Either resolves
+    the range for the title. When the timer runs out the pill goes, the
+    range keeps playing unresolved, and OK shows the controls again. A seek
+    out of the range takes the pill down; a seek back into an unresolved
+    one starts a full timer. The segment pill's timer is a white fill
+    growing from the left over its capsule, at 16% at rest, and lit, white
+    over a fill of white 70%.
+  - While the controls show, with no Options panel or seek being chosen, a
+    pill whose timer ran out comes back without one, above the scrubber. It
+    takes no focus, so the controls still open on the scrubber; Up reaches
+    it, OK on it takes its action, and it goes when the controls hide. A
+    timer that runs out with the controls already up leaves the pill there
+    in the same way, and focus moves to the scrubber.
+  - A timed pill that appears while the controls show takes focus, unless a
+    seek is being chosen or a panel is open. One pill is actionable at a
+    time, intro first: the segment pill waits while Skip Intro shows and
+    starts its full timer when it first shows. Up Next's panel hides every
+    pill and holds its timer. In a Watch Party only a member who may seek
+    sees a skip pill, which follows the room as that changes. A skip pill,
+    timed or returned, holds the buffering card back while it shows.
   - Skip Credits seeks to the end of the credits. Credits that run to the
     end of the file (ending within 0.5 s of the runtime, or past it) open
     Up Next instead, as tvOS does: the credits keep playing in Up Next's
     video box, its countdown is 10 seconds, and the title counts as
     finished (section 5.6) while playback stays in those credits, after
-    Keep Watching too. With nothing for Up Next to show, the skip seeks to
-    the end, and the end opens Up Next as Finished.
-  - The pills are focusable while the controls show and take focus as they
-    appear. The segment pill is not drawn while Up Next shows, as tvOS
-    hides its controls there.
-  - As on Android TV, each intro range is offered once per title: Skip Intro,
-    Watch Intro (which seeks back to the start), Back, or Watch Intro's 5
-    seconds running out settle it for good, while an Ask pill whose time ran
-    out comes back only after playback leaves the range and returns. A skip
-    is a seek like any other (local or `seek_reanchor`).
+    Keep Watching too, when no pill comes back for them. With nothing for
+    Up Next to show, the skip seeks to the end, and the end opens Up Next
+    as Finished.
+  - As on Android TV, Watch Intro (which seeks back to the start) and Watch
+    Intro's 10 seconds running out settle an intro range for good too. A
+    skip is a seek like any other (local or `seek_reanchor`).
 - **Up Next**, as tvOS's Next Up screen. It opens for movies and episodes
   alike, inside the last `playback.next_up_prompt_seconds` of the runtime
   (default 30, 0 for never), whenever it has something to show; a resume or a
@@ -2631,7 +2652,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The auto-play toggle shows with any pick | It is hidden, and nothing counts down, while Roku's autoplay setting is off | Plan section 6.10 (certification) |
 | The Menu button on Finished (nothing to play) replays the end, as Keep Watching does | The remote's Back key leaves the player, except after an early end (section 5.7), when it resumes where the video stopped | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
 | Keep Watching after the end replays the last 10 s in the same session | It starts the item again 10 s before its end, as a new session | Roku's session has stopped by the time its video ends |
-| Siri (tvOS) and the Google Assistant (Android TV) drive the system player's transport | Roku voice transport commands (`roInput.EnableTransportEvents`) take the remote's paths: "play" and "pause", "fast forward" and "rewind" start the speed ladder, "replay" is Replay, "rewind 30 seconds" or "forward 10 minutes" seeks, "start over" seeks to the start, "skip intro" presses Skip Intro, or else the Skip Recap or Skip Credits pill, "next" is Up Next's Play Now, and "stop" leaves the player. A seek or scan while Up Next shows closes it as Keep Watching does; after the end, "start over" and a seek replay the title as a new session. "Turn on captions" changes Roku's global caption mode, which the player already follows (spec 9.7) | Roku delivers voice commands to the app as transport events and expects an answer for each within 5 s (`source/playback/voice.bs`); criterion 4.11 does not require them below its threshold |
+| Siri (tvOS) and the Google Assistant (Android TV) drive the system player's transport | Roku voice transport commands (`roInput.EnableTransportEvents`) take the remote's paths: "play" and "pause", "fast forward" and "rewind" start the speed ladder, "replay" is Replay, "rewind 30 seconds" or "forward 10 minutes" seeks, "start over" seeks to the start, "skip intro" presses Skip Intro, or else the Skip Recap or Skip Credits pill, while one shows (timed, or returned with the controls up), and with none is "next", which is Up Next's Play Now, and "stop" leaves the player. A seek or scan while Up Next shows closes it as Keep Watching does; after the end, "start over" and a seek replay the title as a new session. "Turn on captions" changes Roku's global caption mode, which the player already follows (spec 9.7) | Roku delivers voice commands to the app as transport events and expects an answer for each within 5 s (`source/playback/voice.bs`); criterion 4.11 does not require them below its threshold |
 | An On Deck item without a backdrop or still reads its detail for one, and is left out without | It shows as Home's Continue Watching card does, its poster standing in | A detail read per card is avoided; Home's cards make the same choice |
 | A screen-level error puts a headline for its cause ("Something went wrong", "Not found") over its message, with Try Again | Home, the libraries, detail, and the profile picker show their one-sentence message as the error's title, without a second line, and Search its own title over a line; the button reads Retry (Try again on the picker) | The client's error copy is one sentence per screen (`locale/`); a copy change of its own adds headlines by cause (assumption AG-285) |
 | The person page scrolls as one view: the header scrolls away as focus moves down the filmography grid | The page moves up once as focus enters the grid, so the grid sits at Browse's place (y 332) with the pills above it; the grid then keeps its focused row at the top (fixed focus), as Browse does | `MarkupGrid` has no header item; one move keeps the pills and the grid's two rows on screen (assumption AG-340) |
