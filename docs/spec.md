@@ -3674,6 +3674,18 @@ would then appear in URLs that proxies and server logs may record.
   any activity (start, a playable replan, progress, or media requests), about
   5 minutes when a proxy node serves the media, and 30 minutes when the last
   report said paused.
+- An administrator can also have the server end a session that stays
+  paused past a limit (`playback.paused_session_timeout_minutes`, 15 by
+  default). Every start and replan advertises `paused_timeout_v1`, so
+  progress and replans then answer `410 playback_session_paused_timeout`
+  instead of an administrator's `410 playback_session_ended`. The player
+  leaves either way, without a stop (the server already ended the session)
+  or a new attempt, and after a paused timeout the screen it returns to
+  shows "Playback stopped because it was paused for too long." Media from
+  the configured origin answers `404` or `410` with no reason, so before it
+  starts again the client asks the server with one progress post: a paused
+  timeout or an administrator's end leaves as above, and a `404` or any
+  other answer starts again as before.
 - `sequence` increases for every sample in a session. `applied`,
   `stale_sample`, and `replayed` are all success. `409 progress_conflict`
   means the client reused a sequence with a different sample, which is a client
