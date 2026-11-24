@@ -3,6 +3,7 @@ import "pkg:/source/util/i18n.bs"
 import "pkg:/source/playback/values.bs"
 import "pkg:/source/playback/media.bs"
 import "pkg:/source/playback/sidecars.bs"
+import "pkg:/source/playback/refusedSubtitles.bs"
 import "pkg:/source/playback/tracks.bs"
 import "pkg:/source/playback/chapters.bs"
 import "pkg:/source/catalog/pickers.bs"
@@ -1005,6 +1006,77 @@ namespace playback.options
         return out
     end function
 
+    ' The audio a start that names none plays, as silo-server resolves it
+    ' (playableStartAudioV3 over PreferUnconvertedAudioTrackV3): preferred,
+    ' the version's effective track, when the device plays it as it is
+    ' (playable); else the main mix in its language the device plays as it
+    ' is with at least the channels the conversion keeps (convertedChannels),
+    ' the most channels first, then Atmos, then the codec (serverCodecRank);
+    ' else preferred, converted. tracks are a version's audio tracks as the
+    ' server sends them, or playback.intent's; device is { codecs,
+    ' multichannelAac }, or invalid to take preferred as it is. A saved
+    ' series track is never refined; the detail page names that one itself.
+    function startAudio(tracks as Object, preferred as Integer, device as Dynamic) as Integer
+        if preferred < 0 or preferred >= tracks.Count() or not util.isObject(device) then return preferred
+        if playsAsIs(tracks, preferred, device) then return preferred
+        language = languageKey(util.text(tracks[preferred].language))
+        floor = convertedChannels(tracks[preferred], device)
+        found = -1
+        for i = 0 to tracks.Count() - 1
+            track = tracks[i]
+            if i <> preferred and not isCommentary(track) and languageKey(util.text(track.language)) = language and playsAsIs(tracks, i, device) and playback.values.number(track.channels, 0) >= floor
+                if found < 0 or betterStartAudio(track, tracks[found]) then found = i
+            end if
+        end for
+        if found < 0 then return preferred
+        return found
+    end function
+
+    ' Whether the device plays the track at position i as it is (playable).
+    function playsAsIs(tracks as Object, i as Integer, device as Object) as Boolean
+        return playable(tracks, [i], device).Count() > 0
+    end function
+
+    ' The channels a converted track keeps on this device: up to six where
+    ' it plays AC-3, E-AC-3, or multichannel AAC, else two.
+    function convertedChannels(track as Object, device as Object) as Integer
+        channels = playback.values.number(track.channels, 2)
+        ceiling = 2
+        if util.contains(device.codecs, "ac3") or util.contains(device.codecs, "eac3") or util.isTrue(device.multichannelAac) then ceiling = 6
+        if channels > ceiling then return ceiling
+        return channels
+    end function
+
+    ' silo-server's betterUnconvertedAudioTrack: more channels, then Atmos,
+    ' then the codec's rank.
+    function betterStartAudio(a as Object, b as Object) as Boolean
+        channelsA = playback.values.number(a.channels, 0)
+        channelsB = playback.values.number(b.channels, 0)
+        if channelsA <> channelsB then return channelsA > channelsB
+        if isAtmos(a) <> isAtmos(b) then return isAtmos(a)
+        return serverCodecRank(util.text(a.codec)) > serverCodecRank(util.text(b.codec))
+    end function
+
+    ' Atmos as silo-server reads it: its profile or layout says Atmos or
+    ' JOC; playback.intent's tracks carry the answer as atmos.
+    function isAtmos(track as Object) as Boolean
+        if util.isBoolean(track.atmos) then return track.atmos
+        detail = LCase(util.text(track.profile) + " " + util.text(track.layout))
+        return Instr(1, detail, "atmos") > 0 or Instr(1, detail, "joc") > 0
+    end function
+
+    ' silo-server's audioCodecQualityRanks: lossless, then DTS, E-AC-3,
+    ' AC-3, and AAC.
+    function serverCodecRank(codec as String) as Integer
+        family = codecFamily(codec)
+        if family = "truehd" or family = "flac" or family = "alac" or Left(LCase(codec), 3) = "pcm" then return 5
+        if family = "dts" or family = "dts_hd" then return 4
+        if family = "eac3" or family = "eac3_joc" then return 3
+        if family = "ac3" then return 2
+        if family = "aac" then return 1
+        return 0
+    end function
+
     ' Android TV's selectBestCompatibleAudioTrackOrdinal: the preferred
     ' language, then English, each tier taking its best main mix the device
     ' plays as is, else its best main mix; with neither language present, a
@@ -1047,9 +1119,11 @@ namespace playback.options
     ' agrees. A picked track the server could not honour stays as the plan
     ' has it (subtitle_track_unavailable). Under the preferences, Android TV's
     ' resolveAutoSubtitle chooses from the plan's inventory against the
-    ' language of the plan's audio, and no choice means off. The content has
-    ' not played, so it reloads.
-    function afterStart(plan as Dynamic, version as Dynamic, initial as Object) as Dynamic
+    ' language of the plan's audio, and no choice means off; refusedStore
+    ' (playback.refusedSubtitles' store) names tracks the server at origin
+    ' refused for a file this session, which Auto does not ask for again. The
+    ' content has not played, so it reloads.
+    function afterStart(plan as Dynamic, version as Dynamic, initial as Object, refusedStore = invalid as Dynamic, origin = "" as String) as Dynamic
         if not util.isObject(plan) or initial.subtitleRule = RULE_PICK then return invalid
         current = playback.media.selectedSubtitle(plan)
         target = ""
@@ -1059,7 +1133,10 @@ namespace playback.options
             audioLanguage = ""
             if index >= 0 then audioLanguage = util.text(tracks[index].language)
             entry = autoSubtitle(subtitleEntries(plan), initial.subtitlePrefs, audioLanguage)
-            if entry <> invalid then target = entry.track_id
+            ' A track the server already refused for this file this
+            ' session (playback.refusedSubtitles) is not asked for again:
+            ' Auto plays none, as the readout says.
+            if entry <> invalid and not playback.refusedSubtitles.noted(refusedStore, origin, util.text(plan.effective_media_file_id), entry.combined_index) then target = entry.track_id
         end if
         if target = current then return invalid
         selection = keepAudio(plan)

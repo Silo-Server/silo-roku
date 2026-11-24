@@ -1563,7 +1563,18 @@ their existing HD/FHD assets.
     (5.7) has the same order and words (5.9). The readout names what Auto plays beside the audio in effect,
     by the profile's preferences (section 9.7) over the version's tracks
     ("Auto · English (Forced) · PGS", or "Auto · None"), "Off", or the track
-    chosen ("English (SDH) · SRT").
+    chosen ("English (SDH) · SRT"). Auto's audio is the track a start that
+    names none plays, as the server resolves it: the effective track, unless
+    this Roku would play it converted and a main mix in its language plays
+    as it is with at least the channels the conversion keeps (most channels,
+    then Atmos, then codec), which the map step works out from the same
+    audio probe a start sends (`playback.options.startAudio`; a TrueHD 7.1
+    default reads "Auto · English · EAC3 · 5.1" beside an E-AC-3 5.1 track).
+    A subtitle the server refused for the file this session (a `subtitle_*`
+    terminal, such as a bitmap track it cannot burn into an HDR video) reads
+    "Auto · None", and the player's Auto does not ask for it again
+    (`playback.refusedSubtitles`); nothing in the watch projection says so
+    before the first plan.
   - Changing the version keeps an audio or subtitle choice the new version
     has at the same ordinal and otherwise goes back to Auto; Auto stays
     Auto, as tvOS re-resolves them.
@@ -2613,6 +2624,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The language list is the app's whole playback-language catalog | 43 languages, the ones the client's strings name | The client names no others (`language.*` in `locale/`); a search takes any language the server knows, so the list can grow with the strings |
 | Options' Subtitles tab has TRACKS and OPTIONS columns | Its second column is CAPTIONS: Off, On, On replay, and On mute (Roku TVs only), Roku's global caption mode; while a subtitle is burned into the video, or captions Off set one aside, only Off and On, and Off asks the server for the stream without it. On mute is checked whether Options or Roku's own menu set it, and stays checked as the TV is muted and unmuted | Criterion 4.8 (plan section 6.10); burned-in pixels cannot follow a caption mode |
 | The remote's Menu or Settings key opens the player's options (Android TV) | Options opens from the controls' Options button and from Down with the controls hidden; on a Roku TV, `*` during playback opens Roku's own menu, whose Accessibility entry holds the caption setting | Roku TVs take `*` during full-screen playback whatever has focus (hardware run 6, assumption AG-117); Roku remotes have no Menu key |
+| The detail readout names the track the server's preferences choose | Under Auto, the readout names the audio the start plays on this Roku (the server's unconverted same-language swap) and reads "Auto · None" for a subtitle the server refused for the file this session | tvOS and Android TV play TrueHD and draw bitmap subtitles themselves, so the server's choice is what they play; on Roku it was not (hardware run on the TCL, 2026-11-24) |
 | Tracks change only in the app's menus | Roku's own `*` overlay, reached with the controls hidden, can change audio and subtitles; a change that names one inventory track becomes a `track_change`, and any other is undone | Criterion 4.4 keeps the overlay; the plan owns track identity (section 9.7) |
 | Turning captions on has no effect on the playing stream | With subtitles Off, turning Roku's captions on (in Options or Roku's own menus) reloads the title at its position, without the subtitle sidecars it carried | With captions on, Roku shows a carried track in the caption language whenever none is selected (`Video.currentSubtitleTrack`) |
 | A subtitle the profile's preferences choose shows at once | It is selected, and shows while Roku's caption mode is on | Roku's caption mode governs captions (criterion 4.8), and the client does not turn it on at load |
@@ -3464,6 +3476,22 @@ pick, not the older answer, carries to the series' later episodes
 (assumption AG-287). The version is not
 remembered beyond the page, as on tvOS; the server's `last_file_id` makes
 the version played Auto's next time.
+
+A track the viewer picks in the player (Options, a phone's Options
+choice, or a track Roku's `*` overlay changes to, section 9.7) is
+remembered the same way, with the same bodies and key, as tvOS's and
+Android TV's players remember theirs, so the series' next episode and the
+next start of the title play it (`playback.trackPrefs`). The player sends
+the write only once a plan plays the pick, as Android TV holds its writes
+until the server commits the switch: a `track_change` the server refuses,
+or answers with another track, is not remembered, and neither is any track
+the player chose by itself (the preferences' subtitle after the first plan,
+a caption-mode follow, a recovery). A subtitle downloaded during playback,
+which the version does not list, is not remembered. Writes go under
+Detail's owner, in the same lines, so a write outlives the player; a phone's
+borrowed profile keeps them under the player's owner, fenced to that
+profile. The page the player leaves to then starts its Audio and Subtitles
+choices again from what the server remembers, keeping the version.
 
 ## 9. Playback protocol v3 over `/api/v2`
 

@@ -19,11 +19,13 @@ import "pkg:/source/playback/options.bs"
 import "pkg:/source/playback/chapters.bs"
 import "pkg:/source/playback/player.bs"
 import "pkg:/source/playback/preferences.bs"
+import "pkg:/source/playback/refusedSubtitles.bs"
 import "pkg:/source/playback/session.bs"
 import "pkg:/source/playback/sidecarCache.bs"
 import "pkg:/source/playback/sidecars.bs"
 import "pkg:/source/playback/skipIntro.bs"
 import "pkg:/source/playback/slot.bs"
+import "pkg:/source/playback/trackPrefs.bs"
 import "pkg:/source/playback/trickplay.bs"
 import "pkg:/source/playback/trickplayFetch.bs"
 import "pkg:/source/playback/upNext.bs"
@@ -68,6 +70,11 @@ import "pkg:/source/watchparty/app.bs"
 ' first plan then gets the subtitle the preferences choose from its
 ' inventory (playback.options.afterStart), with at most one track_change. Nothing at load changes Roku's caption mode (assumption
 ' AG-75): a subtitle the preferences choose shows while captions are on.
+' A track the viewer picks in Options, from a phone, or in Roku's *
+' overlay is remembered in the server's track preferences for the series
+' or movie, as Detail's picks are, once a plan plays it (playback.trackPrefs,
+' settleTrackPicks), as tvOS's and Android TV's players remember theirs; the
+' page the player leaves to reads them again (nav.notePlayed's tracksSaved).
 ' A burned-in subtitle cannot follow the mode, so the plan follows it
 ' instead (followCaptions): captions Off asks for a plan without it and sets
 ' it aside, and any other mode asks for it again. The Video node draws only
@@ -238,6 +245,10 @@ const WRITE_STOPS_QUIET = 2
 const STALE_CAPTION_MS = 3000
 ' The hold indicator's chip stands this far under the preview's tile.
 const HOLD_GAP = 16
+' The owner of the track preference writes the player sends as the Roku's
+' own profile: Detail's (DetailPlayback.bs), never released, so a write
+' outlives the player and waits in its key's line behind Detail's.
+const TRACK_PREFS_OWNER = "trackPreferences"
 
 sub init()
     m.video = m.top.findNode("video")
@@ -350,6 +361,10 @@ sub init()
     m.waiting = invalid
     m.firstPlan = true
     m.identity = invalid
+    ' The viewer's track picks waiting for a plan that plays them, by kind
+    ' (playback.trackPrefs), and whether this player remembered any.
+    m.trackPicks = {}
+    m.tracksSaved = false
     ' The last load number of the sessions before, for the next one's
     ' (playback.session.create).
     m.loads = 0
@@ -854,10 +869,12 @@ sub execute(command as Object)
         if util.isNumber(command.holdMs) then item.holdUntil = m.env.now() + command.holdMs
         prepare(item)
         planLoaded(command.plan)
+        settleTrackPicks(command.plan)
     else if t = "reopen"
         if m.current <> invalid then prepare({ load: command.load, plan: m.current.plan, playStart: command.playerPosition, autoplay: command.autoplay, reopen: true, refresh: util.isTrue(command.refresh), sidecars: m.current.sidecars, sidecarsAt: m.current.sidecarsAt })
     else if t = "retrack"
         retrack(command)
+        settleTrackPicks(command.plan)
     else if t = "seek"
         seekLoad(command.load, command.playerPosition)
     else if t = "refuseAudioCodec"
@@ -890,6 +907,10 @@ sub execute(command as Object)
             log.warn(LOG_TAG, command.message, command.fields)
         end if
     else if t = "refused"
+        if command.operation = "track_change"
+            dropRefusedPicks(command.tracks)
+            noteRefusedSubtitle(command)
+        end if
         refused(command.operation, util.text(command.reason))
     else if t = "bufferingPill"
         showBufferingPill(command.pill)
@@ -990,7 +1011,7 @@ sub planLoaded(plan as Object)
     if m.firstPlan
         m.firstPlan = false
         resolveNext()
-        change = playback.options.afterStart(plan, m.version, playback.options.initialTracks(m.watch, m.preferences, m.picks))
+        change = playback.options.afterStart(plan, m.version, playback.options.initialTracks(m.watch, m.preferences, m.picks), refusedSubtitles(), util.text(m.identity.server))
         if change <> invalid and m.captionMode = playback.options.CAPTION_OFF and playback.options.burnsIn(plan, change.tracks)
             m.burnWanted = change.tracks.subtitle
             change = invalid
@@ -1434,6 +1455,7 @@ sub onVideoTracks()
     else if outcome.kind = playback.options.OUTCOME_TRACKS
         log.info(LOG_TAG, "a track chosen in Roku's overlay", { inPlace: outcome.event.inPlace })
         trackChosen(subtitle)
+        stageTrackPick(outcome.event)
         dispatch(outcome.event)
     else if outcome.kind = playback.options.OUTCOME_REVERT
         log.info(LOG_TAG, "a track chosen in Roku's overlay is not the plan's; it is put back", invalid)
@@ -2295,7 +2317,7 @@ end sub
 ' moved on to another title (advanceWhenDone told it then).
 sub notePlayedLast()
     if m.itemId = "" or m.leftSeries then return
-    nav.notePlayed(m.itemId, playingSeason(), playback.upNext.leftFinished(m.upNext, m.videoEnded))
+    nav.notePlayed(m.itemId, playingSeason(), playback.upNext.leftFinished(m.upNext, m.videoEnded), m.tracksSaved)
 end sub
 
 ' The playing item's season number: its watch projection's, else, for a
@@ -2774,6 +2796,7 @@ sub applyChoice(choice as Object)
         return
     else if kind = playback.options.OUTCOME_TRACKS
         if outcome.captionMode <> invalid then setCaptionMode(outcome.captionMode)
+        stageTrackPick(outcome.event)
         dispatch(outcome.event)
     else if kind = playback.options.OUTCOME_QUALITY
         dispatch(outcome.event)
@@ -2816,6 +2839,78 @@ sub setCaptionMode(mode as String)
     noteWrite()
     m.video.globalCaptionMode = mode
     log.info(LOG_TAG, "caption mode chosen", { mode: mode })
+end sub
+
+' The subtitles the server refused this session (playback.refusedSubtitles),
+' or invalid before the first.
+function refusedSubtitles() as Dynamic
+    if m.global.hasField("refusedSubtitles") then return m.global.refusedSubtitles
+    return invalid
+end function
+
+' A refused track_change: when the server refused its subtitle (a
+' subtitle_* reason), that track of the playing file is noted, so neither
+' this player's next start nor the detail page's readout counts on it.
+sub noteRefusedSubtitle(command as Object)
+    if Left(util.text(command.reason), 9) <> "subtitle_" or not util.isObject(command.tracks) or not util.isObject(command.tracks.subtitle) or m.state = invalid or m.state.plan = invalid then return
+    fileId = playback.intent.playingFile(m.state.plan.data, m.intent.fileId)
+    store = playback.refusedSubtitles.note(refusedSubtitles(), util.text(m.identity.server), fileId, command.tracks.subtitle.index)
+    if not m.global.hasField("refusedSubtitles") then m.global.addFields({ refusedSubtitles: store })
+    m.global.refusedSubtitles = store
+end sub
+
+' Holds the viewer's pick in a trackChange event until a plan plays it
+' (settleTrackPicks); a newer pick of the same kind replaces it.
+sub stageTrackPick(event as Object)
+    pick = playback.trackPrefs.pick(event)
+    if pick <> invalid then m.trackPicks[pick.kind] = pick
+end sub
+
+' A refused track_change drops the picks it asked for
+' (playback.trackPrefs.refusedBy); a pick of the other kind, or a newer
+' one, waits for the plan the reducer asks for next.
+sub dropRefusedPicks(tracks as Dynamic)
+    for each kind in m.trackPicks.Keys()
+        if playback.trackPrefs.refusedBy(m.trackPicks[kind], tracks) then m.trackPicks.Delete(kind)
+    end for
+end sub
+
+' A plan arrived: each pick it plays is remembered for the series or
+' movie (playback.trackPrefs.write), as the profile playing it. A pick
+' the plan does not play yet waits for the next plan; a refused
+' track_change drops the picks it asked for (dropRefusedPicks).
+sub settleTrackPicks(plan as Dynamic)
+    if m.trackPicks.Count() = 0 or m.intent = invalid then return
+    for each kind in m.trackPicks.Keys()
+        pick = m.trackPicks[kind]
+        if playback.trackPrefs.plays(pick, plan)
+            m.trackPicks.Delete(kind)
+            request = playback.trackPrefs.write(pick, plan, m.watch, m.intent.fileId)
+            if request = invalid
+                log.info(LOG_TAG, "a track pick is not remembered: the version does not describe it", { kind: kind })
+            else
+                m.tracksSaved = true
+                ' A phone's borrowed profile keeps its requests under the
+                ' player's owner, which AppScene fences to it.
+                owner = TRACK_PREFS_OWNER
+                if nav.player.identityOf(m.top.entry.params) <> invalid then owner = m.top.owner
+                handle = api.newHandle(owner)
+                handle.addFields({ preferenceKind: kind })
+                handle.observeField("status", "onTrackPreferenceWritten")
+                api.send(request, handle)
+            end if
+        end if
+    end for
+end sub
+
+' A track preference write landed. A failure costs the remembered track,
+' never playback; a write a newer one replaced is not a failure.
+sub onTrackPreferenceWritten(event as Object)
+    handle = event.getRoSGNode()
+    result = api.resultOf(handle)
+    if result = invalid or result.ok = true then return
+    if util.isObject(result.error) and result.error.reason = "superseded" then return
+    log.warn(LOG_TAG, "a track preference was not saved", { kind: handle.preferenceKind, status: result.status })
 end sub
 
 ' The viewer chose a track; a subtitle replaces one captions Off set aside,
@@ -3513,6 +3608,7 @@ sub clearSession()
     m.version = invalid
     m.picks = invalid
     m.firstPlan = true
+    m.trackPicks = {}
     m.current = invalid
     m.activeLoad = invalid
     m.activeProxy = false
