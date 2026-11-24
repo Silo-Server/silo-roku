@@ -2131,7 +2131,9 @@ Subtitles tab (criterion 4.8).
     the profile's `playback.auto_skip_recap` is on (D10), credits when
     `playback.auto_skip_credits` is on (default off); a range skipped
     automatically is not skipped again, and offers no pill, when the
-    viewer seeks back into it. Keep Watching's replay of the end is a new
+    viewer seeks back into it. Where ranges overlap and more than one skips
+    automatically (Always's intro among them), playback lands past every
+    one of them. Keep Watching's replay of the end is a new
     session that carries only the credits range skipped last, which it
     plays without a pill; an earlier range it plays through is skipped or
     offered again.
