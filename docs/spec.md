@@ -2153,7 +2153,8 @@ Subtitles tab (criterion 4.8).
   - A timed pill that appears while the controls show takes focus, unless a
     seek is being chosen or a panel is open. One pill is actionable at a
     time, intro first: the segment pill waits while Skip Intro shows and
-    starts its full timer when it first shows. Up Next's panel hides every
+    starts its full timer when it first shows, and Skip Credits waits in
+    the same way while Skip Recap shows. Up Next's panel hides every
     pill and holds its timer. In a Watch Party only a member who may seek
     sees a skip pill, which follows the room as that changes. A skip pill,
     timed or returned, holds the buffering card back while it shows.
