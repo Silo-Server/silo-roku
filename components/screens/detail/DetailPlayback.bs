@@ -1,4 +1,5 @@
 import "pkg:/source/api/client.bs"
+import "pkg:/source/api/session.bs"
 import "pkg:/source/catalog/actions.bs"
 import "pkg:/source/catalog/choice.bs"
 import "pkg:/source/catalog/requests.bs"
@@ -25,6 +26,13 @@ function refusedSubtitles() as Dynamic
     return invalid
 end function
 
+' The signed-in server's origin, which refusedSubtitles' keys name.
+function sessionOrigin() as String
+    session = api.session.current()
+    if not util.isObject(session) then return ""
+    return util.text(session.origin)
+end function
+
 ' Rebuilds the row and the readout for the target and the selection read for
 ' it. Play keeps one width on movies and series alike, so the buttons after
 ' it stay put as the episode changes (spec section 5.6). The selectors say
@@ -32,7 +40,7 @@ end function
 sub updateActions()
     selection = currentSelection()
     values = {}
-    if selection <> invalid then values = catalog.choice.readout(selection, m.choice, m.copy, refusedSubtitles())
+    if selection <> invalid then values = catalog.choice.readout(selection, m.choice, m.copy, refusedSubtitles(), sessionOrigin())
     items = catalog.actions.row(m.target, catalog.choice.enabled(selection, m.choice), m.copy, personalButtons())
     for each item in items
         if values.DoesExist(item.key) then item.speech = item.label + ", " + values[item.key]
@@ -97,7 +105,7 @@ sub seedChoice(selection as Object)
     if m.quality = invalid then return
     m.choice = catalog.choice.initial(selection, m.quality)
     m.seeded = true
-    m.reseedTracks = false
+    m.reseedTracks = invalid
     seedAudio()
     readAudioPreference(selection.key)
 end sub
@@ -135,7 +143,7 @@ sub onWatch(entry as Object, result as Object)
     if selection <> invalid
         if kept
             m.choice = catalog.choice.withVersion(selection, m.choice, catalog.choice.versionValue(selection, m.choice))
-            if entry.afterPlayback and util.isTrue(m.reseedTracks) then reseedTracks(selection)
+            if entry.afterPlayback and util.isObject(m.reseedTracks) then reseedTracks(selection)
         else
             seedChoice(selection)
         end if
@@ -146,13 +154,20 @@ end sub
 ' The player remembered a track the viewer picked in it, newer than the
 ' page's choices: Audio and Subtitles start again as a first read starts
 ' them, keeping the version, on the subtitle the read projection names and
-' the audio track read again (readAudioPreference).
+' the audio track read again (readAudioPreference). A track the viewer
+' picked on the page since the player closed is newer still, and stays
+' (onPicked clears its member of m.reseedTracks).
 sub reseedTracks(selection as Object)
-    m.reseedTracks = false
-    m.choice.subtitle = catalog.choice.versionOf(selection, m.choice).subtitleSeed
-    m.choice.cleared = false
-    m.choice.audio = playback.tracks.AUTO
-    readAudioPreference(selection.key)
+    wanted = m.reseedTracks
+    m.reseedTracks = invalid
+    if util.isTrue(wanted.subtitle)
+        m.choice.subtitle = catalog.choice.versionOf(selection, m.choice).subtitleSeed
+        m.choice.cleared = false
+    end if
+    if util.isTrue(wanted.audio)
+        m.choice.audio = playback.tracks.AUTO
+        readAudioPreference(selection.key)
+    end if
 end sub
 
 ' The audio track the profile chose for this series or movie, read once per
@@ -300,12 +315,14 @@ sub onPicked()
     else if m.pickerKey = catalog.action.AUDIO
         if picked = m.choice.audio then return
         m.choice.audio = picked
+        if util.isObject(m.reseedTracks) then m.reseedTracks.audio = false
         cancelKind("audioPreference")
         m.audioPreference = catalog.choice.rememberedAudio(selection, m.choice)
         sendPreference("audio", catalog.choice.preferenceWrite(selection, m.choice, "audio"), picked = playback.tracks.AUTO)
     else
         if picked = m.choice.subtitle then return
         m.choice.subtitle = picked
+        if util.isObject(m.reseedTracks) then m.reseedTracks.subtitle = false
         m.choice.cleared = picked = playback.tracks.AUTO
         sendPreference("subtitle", catalog.choice.preferenceWrite(selection, m.choice, "subtitle"), m.choice.cleared)
     end if
@@ -379,7 +396,7 @@ sub returnFromPlayer(played as Dynamic)
     ' (catalog.request.audioPreference); the subtitle comes with the
     ' projection read after playback.
     if util.isObject(played) and util.isTrue(played.tracksSaved)
-        m.reseedTracks = true
+        m.reseedTracks = { audio: true, subtitle: true }
         m.preferenceKey = ""
         m.audioPreference = invalid
     end if
