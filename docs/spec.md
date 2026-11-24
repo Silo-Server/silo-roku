@@ -2212,9 +2212,10 @@ Subtitles tab (criterion 4.8).
     - the air date · runtime, 19 px Medium at 46% (an On Deck pick's
       runtime alone, as tvOS has no air date for it);
     - the overview, 22 px Regular at 58%, three lines, 620 px wide;
-    - Play Next Up, a 76 px pill 260 px wide at rest and 360 px focused, or
-      its label with 40 px each side where a translation needs more, with a
-      58 px countdown ring (3 px) 56 px to its right;
+    - Play Next Up, a 76 px pill at least 260 px wide at rest and 360 px
+      focused, wider where its label needs 40 px each side (English
+      included at rest), with a 58 px countdown ring (3 px) 56 px to its
+      right;
     - 18 px below: Keep Watching (330 px, or its label with 40 px each side
       where a translation needs more) and Back (200 px), 20 px apart;
     - 22 px below: the toggle "Auto-play is On/Off", text only, 19 px
@@ -2631,7 +2632,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | No Replay key | Replay skips back by the skip-back value clamped to 10–25 s, with "Instant replay" captions for the replayed span once its seek commits; a Replay that Back cancels, or whose merged seek lands past where it was pressed, shows none | Certification criteria 4.8 and 4.9 (implementation plan section 6.10) |
 | Scrub previews come from the server's sprite sheets or, without them, from frames the player cuts from the stream | The server's sheets only; a title without them shows the time and "Previews aren't available for this title" | Roku apps cannot read frames from the `Video` node |
 | A sheet decodes at full size, and only the latest one stays decoded | A sheet decodes within 1600 px on each side (a default 300 px thumbnail at 160 px, drawn 320 px wide on the card and 480 px held); the sheet in use and the next one in the direction of travel stay loaded, the sheet in use alone on the low tier | Texture memory on 512 MB devices and sheet changes at 32× (plan sections 4.8 and 6.9; hardware test H20); the drawn size costs no texture |
-| A shuffle's Up Next puts Pick Another between Play Next Up and the countdown ring | Pick Another has a row of its own under Play Next Up and the ring, above Keep Watching and Back, as on Android TV | With Play Next Up's label in most translations the three ran past the safe area's right edge, the ring partly off screen in five languages (decision AG-662) |
+| A shuffle's Up Next puts Pick Another between Play Next Up and the countdown ring | Pick Another has a row of its own under Play Next Up and the ring, above Keep Watching and Back, as on Android TV | With Play Next Up's label in most translations the three ran past the safe area's right edge, the ring partly off screen in ten (decision AG-662) |
 | Up Next's Keep Watching keeps a fixed width | It widens to give a longer label 40 px each side, as Play Next Up does, and Back moves with it | Its Czech and Russian labels are wider than the 330 px pill (decision AG-662) |
 | The next episode's still fills the screen behind Up Next, dimmed, around the video | No still: the rest of the screen is black | Roku draws video beneath the UI, so a full-screen image would cover the shrunken video |
 | A shuffle's next pick that fails to start returns to Up Next with "Couldn't start the next pick. Try again or go back." | The player's failure screen shows, with Retry and Go Back, as for any next item | Roku starts the next item as a new session of the same player (assumption AG-100), whose failure screen serves every start (assumption AG-381) |
