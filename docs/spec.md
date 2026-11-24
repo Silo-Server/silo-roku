@@ -2157,8 +2157,12 @@ Subtitles tab (criterion 4.8).
     seek is being chosen or a panel is open. One pill is actionable at a
     time, intro first: the segment pill waits while Skip Intro shows and
     starts its full timer when it first shows, and Skip Credits waits in
-    the same way while Skip Recap shows. Up Next's panel hides every
-    pill and holds its timer. In a Watch Party only a member who may seek
+    the same way while Skip Recap shows. A segment pill that has shown
+    hides while Skip Intro's pill shows, timed or back with the controls,
+    its timer held, and comes back with the time it had left; one whose
+    timer ran out comes back only without a timer, with the controls, while
+    no Skip Intro pill shows. Up Next's panel hides every pill and holds its
+    timer. In a Watch Party only a member who may seek
     sees a skip pill, which follows the room as that changes. A skip pill,
     timed or returned, holds the buffering card back while it shows.
   - Skip Credits seeks to the end of the credits. Credits that run to the
