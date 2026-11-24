@@ -2215,7 +2215,8 @@ Subtitles tab (criterion 4.8).
     - Play Next Up, a 76 px pill 260 px wide at rest and 360 px focused, or
       its label with 40 px each side where a translation needs more, with a
       58 px countdown ring (3 px) 56 px to its right;
-    - 18 px below: Keep Watching (330 px) and Back (200 px), 20 px apart;
+    - 18 px below: Keep Watching (330 px, or its label with 40 px each side
+      where a translation needs more) and Back (200 px), 20 px apart;
     - 22 px below: the toggle "Auto-play is On/Off", text only, 19 px
       SemiBold at 54% (92% with a 1.5 px outline when focused).
     - With nothing to play, "Almost finished" or "End of playback" (42 px
@@ -2228,9 +2229,10 @@ Subtitles tab (criterion 4.8).
     apart, four across the column; focus moves across them and the strip
     scrolls past the fourth or the first, and home when focus leaves. With
     focus in the row, the screen moves up until its captions clear the safe
-    area, the video's box with it. Down from the buttons goes to the toggle,
-    then the row; Up from the row to the toggle, else the first button; Up
-    from the toggle to Play Next Up.
+    area, the video's box with it. Each row of buttons is entered at its
+    first button. Down from the buttons goes to the toggle, then the row; Up
+    from the row to the toggle, else the first button; Up from the toggle
+    to Play Next Up.
   - The rest of the screen is black (5.9).
 - **Shuffle in the player**, as tvOS's `PlayerViewModel` plays one
   (`PlayerShuffleState`). The player entry of a shuffle names it, and every
@@ -2249,9 +2251,12 @@ Subtitles tab (criterion 4.8).
     "Shuffling Movies" ("Shuffling Severance · Season 1" for a season) at
     78%; the eyebrow reads "UP NEXT AT RANDOM" with a pick and while one
     loads ("Picking at random"); Pick Another, a 330 px pill (Keep
-    Watching's width, as on tvOS) 56 px after Play Next Up, the countdown ring
-    56 px after it; and Stop shuffling, the
-    toggle's style, 12 px after the toggle. A movie pick shows its release
+    Watching's resting width, as on tvOS), alone on a row 18 px under Play
+    Next Up and its ring, with Keep Watching and Back 18 px under it, as
+    Android TV stacks them (section 5.9); and Stop shuffling, the toggle's
+    style, 12 px after the toggle. Down goes from Play Next Up to Pick
+    Another, then to Keep Watching, and Up back; Left and Right on Pick
+    Another do nothing. A movie pick shows its release
     date and runtime as an episode shows its air date and runtime.
   - Play Next Up, the countdown, Play/Pause, and the phone's next-item command
     first send `POST /api/v2/shuffles/{id}/advance` with the item that
@@ -2626,6 +2631,8 @@ Roku as it is, and the work package that builds the change deletes the row.
 | No Replay key | Replay skips back by the skip-back value clamped to 10–25 s, with "Instant replay" captions for the replayed span once its seek commits; a Replay that Back cancels, or whose merged seek lands past where it was pressed, shows none | Certification criteria 4.8 and 4.9 (implementation plan section 6.10) |
 | Scrub previews come from the server's sprite sheets or, without them, from frames the player cuts from the stream | The server's sheets only; a title without them shows the time and "Previews aren't available for this title" | Roku apps cannot read frames from the `Video` node |
 | A sheet decodes at full size, and only the latest one stays decoded | A sheet decodes within 1600 px on each side (a default 300 px thumbnail at 160 px, drawn 320 px wide on the card and 480 px held); the sheet in use and the next one in the direction of travel stay loaded, the sheet in use alone on the low tier | Texture memory on 512 MB devices and sheet changes at 32× (plan sections 4.8 and 6.9; hardware test H20); the drawn size costs no texture |
+| A shuffle's Up Next puts Pick Another between Play Next Up and the countdown ring | Pick Another has a row of its own under Play Next Up and the ring, above Keep Watching and Back, as on Android TV | With Play Next Up's label in most translations the three ran past the safe area's right edge, the ring partly off screen in five languages (decision AG-661) |
+| Up Next's Keep Watching keeps a fixed width | It widens to give a longer label 40 px each side, as Play Next Up does, and Back moves with it | Its Czech and Russian labels are wider than the 330 px pill (decision AG-661) |
 | The next episode's still fills the screen behind Up Next, dimmed, around the video | No still: the rest of the screen is black | Roku draws video beneath the UI, so a full-screen image would cover the shrunken video |
 | A shuffle's next pick that fails to start returns to Up Next with "Couldn't start the next pick. Try again or go back." | The player's failure screen shows, with Retry and Go Back, as for any next item | Roku starts the next item as a new session of the same player (assumption AG-100), whose failure screen serves every start (assumption AG-381) |
 | A shuffle plays every part of a multi-part item before moving on | A multi-part pick plays as its start plans it, from its beginning | The Roku player chains no parts on any start (assumption AG-381) |
