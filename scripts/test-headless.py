@@ -66,8 +66,9 @@ SHARDS = [
     # over on CI: the card overlay specs run on their own.
     ("player-overlays", ["player/overlays.spec.bs"]),
     # The catalog's error.* and home.section.* keys tipped the player shard
-    # over again: the skip-credits specs run on their own too.
-    ("player-credits", ["player/skipCredits.spec.bs"]),
+    # over again: the skip-credits specs run on their own too, and the
+    # skip-recap specs beside them.
+    ("player-credits", ["player/skipCredits.spec.bs", "player/skipRecap.spec.bs"]),
     # The party player's specs outgrew the player shard's heap once main's
     # rendition and native-subtitle specs joined it.
     ("player-party", ["player/party.spec.bs"]),
