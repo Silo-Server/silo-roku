@@ -1,0 +1,118 @@
+namespace tests
+
+    @suite("playback track preferences")
+    class PlaybackTrackPrefsTests extends rooibos.BaseTestSuite
+
+        ' An episode's watch body with one version: two audio tracks, and an
+        ' embedded and an external subtitle (combined order: external 0,
+        ' embedded 1).
+        function episode() as Object
+            return {
+                content_id: "episode:1",
+                series_id: "series:9",
+                type: "episode",
+                versions: [{
+                    file_id: "7",
+                    audio_tracks: [
+                        { language: "eng", codec: "eac3", channels: 6, default: true },
+                        { language: "jpn", codec: "aac", channels: 2, title: "Japanese", default: false }
+                    ],
+                    subtitle_tracks: [
+                        { index: 4, language: "eng", codec: "subrip", forced: false, hearing_impaired: false },
+                        { language: "spa", codec: "subrip", external: true, file_name: "show.es.srt" }
+                    ]
+                }]
+            }
+        end function
+
+        function planned(audio as Dynamic, subtitle as Dynamic) as Object
+            selected = {}
+            if audio <> invalid then selected.audio = audio
+            if subtitle <> invalid then selected.subtitle = subtitle
+            return { effective_media_file_id: "7", selected_tracks: selected }
+        end function
+
+        function audioPick(index as Integer) as Object
+            return playback.trackPrefs.pick({ type: "trackChange", chosen: "audio", tracks: { audio: { id: "file:7:audio:" + index.ToStr(), index: index } } })
+        end function
+
+        @describe("picks")
+
+        @it("takes the member the viewer chose from a trackChange event")
+        sub _()
+            m.assertEqual(m.audioPick(1), { kind: "audio", audio: { id: "file:7:audio:1", index: 1 }, subtitle: invalid })
+            off = playback.trackPrefs.pick({ type: "trackChange", chosen: "subtitle", tracks: { audio: { id: "file:7:audio:0", index: 0 } } })
+            m.assertEqual(off, { kind: "subtitle", audio: invalid, subtitle: invalid }, "a subtitle pick without a subtitle is Off")
+        end sub
+
+        @it("ignores track changes no viewer chose")
+        sub _()
+            ' afterStart's preference pick, followCaptions, and a reload of
+            ' the plan's own selection carry no chosen member.
+            m.assertInvalid(playback.trackPrefs.pick({ type: "trackChange", tracks: { audio: { index: 0 } } }))
+            m.assertInvalid(playback.trackPrefs.pick(invalid))
+        end sub
+
+        @it("is played by a plan naming the same track, by id, else by index")
+        sub _()
+            pick = m.audioPick(1)
+            m.assertTrue(playback.trackPrefs.plays(pick, m.planned({ id: "file:7:audio:1", index: 1 }, invalid)))
+            m.assertTrue(playback.trackPrefs.plays(pick, m.planned({ index: 1 }, invalid)))
+            m.assertFalse(playback.trackPrefs.plays(pick, m.planned({ id: "file:7:audio:0", index: 0 }, invalid)), "the plan still plays the old track")
+            m.assertFalse(playback.trackPrefs.plays(pick, m.planned({ id: "file:8:audio:1", index: 1 }, invalid)), "another file's track")
+            off = { kind: "subtitle", audio: invalid, subtitle: invalid }
+            m.assertTrue(playback.trackPrefs.plays(off, m.planned({ index: 0 }, invalid)))
+            m.assertFalse(playback.trackPrefs.plays(off, m.planned({ index: 0 }, { id: "s1", index: 1 })))
+        end sub
+
+        @describe("writes")
+
+        @it("remembers an audio pick for the series with its ordinal and signature")
+        sub _()
+            request = playback.trackPrefs.write(m.audioPick(1), m.planned({ id: "file:7:audio:1", index: 1 }, invalid), m.episode(), "7")
+            m.assertEqual(request.method, "PUT")
+            m.assertEqual(request.path, "/api/v2/audio-prefs/series:9")
+            m.assertEqual(request.orderKey, request.path)
+            m.assertEqual(request.body, { audio_track_index: 1, audio_language: "jpn", track_signature: { language: "jpn", title: "Japanese", embedded_title: "", codec: "aac", layout: "", channels: 2, default: false } })
+        end sub
+
+        @it("remembers a subtitle by the version's own index, and Off as mode off")
+        sub _()
+            pick = { kind: "subtitle", audio: invalid, subtitle: { id: "s1", index: 1 } }
+            request = playback.trackPrefs.write(pick, m.planned({ index: 0 }, { id: "s1", index: 1 }), m.episode(), "7")
+            m.assertEqual(request.path, "/api/v2/subtitle-prefs/series:9")
+            m.assertEqual(request.body.subtitle_track_index, 4, "the embedded track's stream index, not combined ordinal 1")
+            m.assertEqual(request.body.subtitle_mode, "always")
+            m.assertEqual(request.body.track_signature.source, "embedded")
+            external = playback.trackPrefs.write({ kind: "subtitle", audio: invalid, subtitle: { id: "s0", index: 0 } }, m.planned({ index: 0 }, { id: "s0", index: 0 }), m.episode(), "7")
+            m.assertEqual(external.body.external_subtitle_path, "show.es.srt")
+            off = playback.trackPrefs.write({ kind: "subtitle", audio: invalid, subtitle: invalid }, m.planned({ index: 0 }, invalid), m.episode(), "7")
+            m.assertEqual(off.body, { subtitle_language: "", subtitle_track_index: -1, subtitle_mode: "off" })
+        end sub
+
+        @it("keys a movie by itself")
+        sub _()
+            movie = m.episode()
+            movie.Delete("series_id")
+            movie.content_id = "movie:3"
+            request = playback.trackPrefs.write(m.audioPick(0), m.planned({ index: 0 }, invalid), movie, "7")
+            m.assertEqual(request.path, "/api/v2/audio-prefs/movie:3")
+        end sub
+
+        @it("writes nothing for a track the version does not describe")
+        sub _()
+            ' A subtitle downloaded during playback sits past the version's
+            ' tracks in the combined order.
+            pick = { kind: "subtitle", audio: invalid, subtitle: { id: "d0", index: 2 } }
+            m.assertInvalid(playback.trackPrefs.write(pick, m.planned({ index: 0 }, { id: "d0", index: 2 }), m.episode(), "7"))
+        end sub
+
+        @it("builds the same bodies as a detail page's choices")
+        sub _()
+            selection = catalog.selection.fromWatch(m.episode(), {})
+            entry = selection.versions[0]
+            fromPlayer = playback.trackPrefs.write(m.audioPick(1), m.planned({ index: 1 }, invalid), m.episode(), "7")
+            m.assertEqual(entry.audio[1].pref, fromPlayer.body)
+        end sub
+    end class
+end namespace

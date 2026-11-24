@@ -1,6 +1,7 @@
 import "pkg:/source/catalog/pickers.bs"
 import "pkg:/source/playback/intent.bs"
 import "pkg:/source/playback/options.bs"
+import "pkg:/source/playback/trackPrefs.bs"
 import "pkg:/source/playback/tracks.bs"
 import "pkg:/source/playback/values.bs"
 import "pkg:/source/util/i18n.bs"
@@ -54,7 +55,10 @@ import "pkg:/source/util/values.bs"
 ' ordinal order, { summary, pref }: the readout's value and the body of the
 ' track preference that remembers it (PUT /api/v2/{audio,subtitle}-prefs,
 ' as tvOS's TrackSelectionPersistence writes it). autoAudio is the track
-' the readout names under Auto (autoAudio); audioByLanguage the best track per language key
+' the readout names under Auto: the one a start that names none plays
+' (playback.options.startAudio, from the server's effective track and the
+' device's audio codecs, which fromWatch's device gives; without it, the
+' effective track, autoAudio); audioByLanguage the best track per language key
 ' (playback.options.initialAudio), for a remembered track that moved
 ' (catalog.choice.seedAudio). autoSubtitles[i] is the subtitle Auto plays
 ' beside audio track i (playback.options.autoSubtitle over the version's
@@ -68,7 +72,7 @@ import "pkg:/source/util/values.bs"
 ' tvOS seeds it (DetailPlaybackFormatting.serverPreferredSubtitleIndex).
 namespace catalog.selection
     ' The selection for a watch body, or invalid when it lists no version.
-    function fromWatch(watch as Dynamic, copy as Object) as Dynamic
+    function fromWatch(watch as Dynamic, copy as Object, device = invalid as Dynamic) as Dynamic
         if not util.isObject(watch) or not playback.values.isArray(watch.versions) then return invalid
         prefs = playback.options.subtitlePreferences(watch, {})
         ' The language the Subtitles menu leads with, as Options' list does.
@@ -86,7 +90,7 @@ namespace catalog.selection
         groups = []
         for each version in watch.versions
             if util.isObject(version) and util.text(version.file_id) <> ""
-                entry = fromVersion(version, watch, prefs, preferredLanguage, copy)
+                entry = fromVersion(version, watch, prefs, preferredLanguage, copy, device)
                 if playback.intent.isChoosable(version)
                     edition = byKey["e:" + entry.editionKey]
                     if edition = invalid
@@ -177,7 +181,7 @@ namespace catalog.selection
         return 2
     end function
 
-    function fromVersion(version as Object, watch as Object, prefs as Object, preferredLanguage as String, copy as Object) as Object
+    function fromVersion(version as Object, watch as Object, prefs as Object, preferredLanguage as String, copy as Object, device = invalid as Dynamic) as Object
         ' The tracks as the server sent them, numbered as audio is.
         raw = []
         if playback.values.isArray(version.audio_tracks)
@@ -199,7 +203,7 @@ namespace catalog.selection
             compact: catalog.pickers.versionCompact(version, copy),
             audio: [],
             audioOptions: catalog.pickers.audioOptions(audio, preferred, copy),
-            autoAudio: autoAudio(audio, preferred),
+            autoAudio: playback.options.startAudio(raw, autoAudio(audio, preferred), device),
             audioByLanguage: {},
             subtitles: [],
             subtitleOptions: catalog.pickers.subtitleOptions(subtitles, preferredLanguage, copy),
@@ -208,13 +212,13 @@ namespace catalog.selection
             subtitleSeed: subtitleSeed(watch, subtitles)
         }
         for each track in audio
-            out.audio.Push({ summary: catalog.pickers.audioSummary(track, copy), pref: audioPreference(raw[track.index], track.index) })
+            out.audio.Push({ summary: catalog.pickers.audioSummary(track, copy), pref: playback.trackPrefs.audioBody(raw[track.index], track.index) })
             key = playback.tracks.languageKey(track.language)
             if key <> "" and not out.audioByLanguage.DoesExist(key) then out.audioByLanguage[key] = playback.options.initialAudio(raw, key, invalid)
         end for
         entries = []
         for each track in subtitles
-            out.subtitles.Push({ summary: catalog.pickers.subtitleSummary(track, copy), pref: subtitlePreference(track) })
+            out.subtitles.Push({ summary: catalog.pickers.subtitleSummary(track, copy), pref: playback.trackPrefs.subtitleBody(track) })
             entries.Push(subtitleEntry(track))
         end for
         languages = [""]
@@ -254,52 +258,7 @@ namespace catalog.selection
 
     ' A subtitle track as playback.options reads an inventory entry.
     function subtitleEntry(track as Object) as Object
-        return { language: track.language, codec: track.codec, forced: track.forced, hearing_impaired: track.hearingImpaired, label: labelOf(track), source: sourceOf(track), unplayable: track.unplayable, ordinal: track.index }
-    end function
-
-    ' A subtitle track's title, else its embedded title.
-    function labelOf(track as Object) as String
-        if track.title <> "" then return track.title
-        return track.embeddedTitle
-    end function
-
-    function sourceOf(track as Object) as String
-        if track.external then return "external"
-        return "embedded"
-    end function
-
-    ' --- Track preferences (tvOS TrackSelectionPersistence) -------------------------
-
-    ' PUT /api/v2/audio-prefs/{key}'s body for the version's audio track at
-    ' ordinal (raw, as the server sent it): its ordinal, language, and
-    ' signature, which the server matches when ordinals shift.
-    function audioPreference(raw as Object, ordinal as Integer) as Object
-        signature = signatureOf(raw)
-        signature.default = util.isTrue(raw.default)
-        return { audio_track_index: ordinal, audio_language: signature.language, track_signature: signature }
-    end function
-
-    ' An audio track's signature as the server compares it (an audio track
-    ' or a stored preference's track_signature): language, title, embedded
-    ' title, codec, layout, and channel count.
-    function signatureOf(raw as Object) as Object
-        channels = 0
-        if util.isNumber(raw.channels) then channels = Int(raw.channels)
-        return { language: util.text(raw.language).Trim(), title: util.text(raw.title).Trim(), embedded_title: util.text(raw.embedded_title).Trim(), codec: util.text(raw.codec).Trim(), layout: util.text(raw.layout).Trim(), channels: channels }
-    end function
-
-    ' PUT /api/v2/subtitle-prefs/{key}'s body for a subtitle track: mode
-    ' always, the version's own index for the track (not the combined
-    ' ordinal a start names), an external track's file, and a signature.
-    function subtitlePreference(track as Object) as Object
-        out = {
-            subtitle_language: track.language,
-            subtitle_track_index: track.streamIndex,
-            subtitle_mode: "always",
-            track_signature: { source: sourceOf(track), language: track.language, codec: track.codec, label: labelOf(track), forced: track.forced, hearing_impaired: track.hearingImpaired }
-        }
-        if track.external then out.external_subtitle_path = track.fileName
-        return out
+        return { language: track.language, codec: track.codec, forced: track.forced, hearing_impaired: track.hearingImpaired, label: playback.trackPrefs.labelOf(track), source: playback.trackPrefs.sourceOf(track), unplayable: track.unplayable, ordinal: track.index }
     end function
 
     ' --- The subtitle the page starts with -------------------------------------
@@ -338,7 +297,7 @@ namespace catalog.selection
             if util.isTrue(signature.forced) = track.forced then score = score + 1
             if util.isTrue(signature.hearing_impaired) = track.hearingImpaired then score = score + 1
             if codec <> "" and codec = track.codec then score = score + 1
-            if label <> "" and Instr(1, LCase(labelOf(track)), label) > 0
+            if label <> "" and Instr(1, LCase(playback.trackPrefs.labelOf(track)), label) > 0
                 score = score + 2
                 strong = true
             end if
@@ -360,7 +319,7 @@ namespace catalog.selection
         index = -1
         if util.isNumber(body.audio_track_index) then index = Int(body.audio_track_index)
         signature = invalid
-        if util.isObject(body.track_signature) then signature = signatureOf(body.track_signature)
+        if util.isObject(body.track_signature) then signature = playback.trackPrefs.signature(body.track_signature)
         return { index: index, language: util.text(body.audio_language).Trim(), signature: signature }
     end function
 end namespace

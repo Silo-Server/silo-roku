@@ -1,0 +1,104 @@
+namespace tests
+
+    ' The audio a start that names none plays (silo-server's
+    ' playableStartAudioV3), and the subtitles a server refused this session.
+    @suite("playback start audio")
+    class PlaybackStartAudioTests extends rooibos.BaseTestSuite
+
+        ' A Roku that passes AC-3 and E-AC-3 through, as the TCL does.
+        function passthrough() as Object
+            return { codecs: ["aac", "mp3", "ac3", "eac3"], multichannelAac: false }
+        end function
+
+        function track(language as String, codec as String, channels as Integer, extra = invalid as Dynamic) as Object
+            out = { language: language, codec: codec, channels: channels, default: false }
+            if extra <> invalid then out.Append(extra)
+            return out
+        end function
+
+        @describe("startAudio")
+
+        @it("keeps the effective track when the device plays it as it is")
+        sub _()
+            tracks = [m.track("en", "eac3", 6), m.track("en", "ac3", 6)]
+            m.assertEqual(playback.options.startAudio(tracks, 0, m.passthrough()), 0)
+        end sub
+
+        @it("plays the same language's unconverted track in place of TrueHD (the readout bug on the TCL)")
+        sub _()
+            tracks = [m.track("en", "truehd", 8, { default: true, layout: "7.1" }), m.track("en", "eac3", 6)]
+            m.assertEqual(playback.options.startAudio(tracks, 0, m.passthrough()), 1)
+            ' AC-3 alone, as on The Fellowship of the Ring.
+            tracks = [m.track("en", "truehd", 8), m.track("en", "ac3", 6)]
+            m.assertEqual(playback.options.startAudio(tracks, 0, m.passthrough()), 1)
+        end sub
+
+        @it("ranks the candidates by channels, then Atmos, then codec, as the server does")
+        sub _()
+            tracks = [m.track("en", "truehd", 8), m.track("en", "ac3", 6), m.track("en", "eac3", 6), m.track("en", "eac3", 6, { profile: "Dolby Digital Plus + Dolby Atmos" })]
+            m.assertEqual(playback.options.startAudio(tracks, 0, m.passthrough()), 3, "Atmos wins the tie")
+            tracks = [m.track("en", "truehd", 8), m.track("en", "ac3", 6), m.track("en", "eac3", 6)]
+            m.assertEqual(playback.options.startAudio(tracks, 0, m.passthrough()), 2, "E-AC-3 over AC-3")
+        end sub
+
+        @it("never takes another language, commentary, or fewer channels than the conversion keeps")
+        sub _()
+            tracks = [m.track("en", "truehd", 8), m.track("ja", "eac3", 6), m.track("en", "ac3", 6, { title: "Director's Commentary" }), m.track("en", "aac", 2)]
+            m.assertEqual(playback.options.startAudio(tracks, 0, m.passthrough()), 0, "the converted TrueHD keeps 5.1, which stereo AAC does not reach")
+            ' A device that converts to stereo anyway takes the stereo track.
+            stereo = { codecs: ["aac", "mp3"], multichannelAac: false }
+            m.assertEqual(playback.options.startAudio(tracks, 0, stereo), 3)
+        end sub
+
+        @it("takes the effective track as it is without device facts or tracks")
+        sub _()
+            tracks = [m.track("en", "truehd", 8), m.track("en", "eac3", 6)]
+            m.assertEqual(playback.options.startAudio(tracks, 0, invalid), 0)
+            m.assertEqual(playback.options.startAudio([], -1, m.passthrough()), -1)
+        end sub
+
+        @describe("the detail page's Auto audio")
+
+        @it("names the track the start plays, not the effective TrueHD, once the device is known")
+        sub _()
+            watch = tests.catalogData.selectionWatch()
+            watch.versions[0].effective_audio_track_index = 0
+            copy = i18n.load("en_US")
+            unknown = catalog.selection.fromWatch(watch, copy)
+            m.assertEqual(unknown.versions[0].autoAudio, 0, "without the device, the effective track")
+            known = catalog.selection.fromWatch(watch, copy, m.passthrough())
+            m.assertEqual(known.versions[0].autoAudio, 1, "English E-AC-3 5.1")
+            choice = catalog.choice.initial(known)
+            m.assertEqual(catalog.choice.readout(known, choice, copy).audio, "Auto · English · EAC3 · 5.1")
+        end sub
+
+        @describe("refused subtitles")
+
+        @it("notes a file's refused subtitle by its combined ordinal")
+        sub _()
+            store = playback.refusedSubtitles.create()
+            m.assertFalse(playback.refusedSubtitles.noted(store, "42", 1))
+            noted = playback.refusedSubtitles.note(store, "42", 1)
+            m.assertTrue(playback.refusedSubtitles.noted(noted, "42", 1))
+            m.assertFalse(playback.refusedSubtitles.noted(noted, "42", 0), "another track")
+            m.assertFalse(playback.refusedSubtitles.noted(noted, "43", 1), "another file")
+            m.assertFalse(playback.refusedSubtitles.noted(store, "42", 1), "a new store, as a node field holds a copy")
+            m.assertFalse(playback.refusedSubtitles.noted(invalid, "42", 1))
+            m.assertFalse(playback.refusedSubtitles.noted(noted, "42", invalid))
+        end sub
+
+        @it("reads Auto · None for a subtitle the server refused for the file")
+        sub _()
+            copy = i18n.load("en_US")
+            selection = catalog.selection.fromWatch(tests.catalogData.selectionWatch(), copy)
+            choice = catalog.choice.initial(selection)
+            before = catalog.choice.readout(selection, choice, copy)
+            m.assertEqual(before.subtitles, "Auto · English (Forced) · PGS")
+            entry = catalog.choice.versionOf(selection, choice)
+            refused = playback.refusedSubtitles.note(invalid, entry.fileId, catalog.choice.autoSubtitle(entry, choice))
+            m.assertEqual(catalog.choice.readout(selection, choice, copy, refused).subtitles, "Auto · None")
+            other = playback.refusedSubtitles.note(invalid, "999", catalog.choice.autoSubtitle(entry, choice))
+            m.assertEqual(catalog.choice.readout(selection, choice, copy, other).subtitles, before.subtitles, "another file's refusal")
+        end sub
+    end class
+end namespace

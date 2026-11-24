@@ -1,0 +1,159 @@
+import "pkg:/source/catalog/requests.bs"
+import "pkg:/source/playback/intent.bs"
+import "pkg:/source/playback/tracks.bs"
+import "pkg:/source/playback/values.bs"
+import "pkg:/source/util/values.bs"
+
+' The server's per-series track preferences (spec section 8.5), pure: the
+' bodies of PUT /api/v2/audio-prefs/{key} and /api/v2/subtitle-prefs/{key}
+' as tvOS's TrackSelectionPersistence writes them, and the player's picks
+' that become them.
+'
+' A detail page writes its Audio and Subtitles choices as they are made
+' (catalog.choice.preferenceWrite). The player writes a pick the viewer
+' made in Options, from a phone, or in Roku's * overlay once a plan plays
+' it, as Android TV's player holds its writes until the server commits the
+' switch: a pick the server refuses, or answers with another track, is not
+' remembered, and neither is anything the player chose by itself. A pick is
+'
+'     { kind, audio, subtitle }
+'
+' kind is AUDIO or SUBTITLE; audio the identity { id, index } the viewer
+' asked for, and subtitle the identity asked for, or invalid for Off.
+namespace playback.trackPrefs
+    const AUDIO = "audio"
+    const SUBTITLE = "subtitle"
+
+    ' The key an item's track preferences are kept under: its series for an
+    ' episode, else the item itself, as on tvOS and the web.
+    function key(watch as Dynamic) as String
+        if not util.isObject(watch) then return ""
+        out = util.text(watch.series_id)
+        if out = "" then out = util.text(watch.content_id)
+        return out
+    end function
+
+    ' --- Bodies --------------------------------------------------------------
+
+    ' The audio-prefs body for the version's audio track at ordinal (raw, as
+    ' the server sent it): its ordinal, language, and signature, which the
+    ' server matches when ordinals shift.
+    function audioBody(raw as Object, ordinal as Integer) as Object
+        out = signature(raw)
+        out.default = util.isTrue(raw.default)
+        return { audio_track_index: ordinal, audio_language: out.language, track_signature: out }
+    end function
+
+    ' An audio track's signature as the server compares it (an audio track
+    ' or a stored preference's track_signature): language, title, embedded
+    ' title, codec, layout, and channel count.
+    function signature(raw as Object) as Object
+        channels = 0
+        if util.isNumber(raw.channels) then channels = Int(raw.channels)
+        return { language: util.text(raw.language).Trim(), title: util.text(raw.title).Trim(), embedded_title: util.text(raw.embedded_title).Trim(), codec: util.text(raw.codec).Trim(), layout: util.text(raw.layout).Trim(), channels: channels }
+    end function
+
+    ' The subtitle-prefs body for a subtitle track (playback.tracks
+    ' .subtitleTracks): mode always, the version's own index for the track
+    ' (not the combined ordinal a start names), an external track's file,
+    ' and a signature.
+    function subtitleBody(track as Object) as Object
+        out = {
+            subtitle_language: track.language,
+            subtitle_track_index: track.streamIndex,
+            subtitle_mode: "always",
+            track_signature: { source: sourceOf(track), language: track.language, codec: track.codec, label: labelOf(track), forced: track.forced, hearing_impaired: track.hearingImpaired }
+        }
+        if track.external then out.external_subtitle_path = track.fileName
+        return out
+    end function
+
+    ' The subtitle-prefs body for subtitles Off.
+    function offBody() as Object
+        return { subtitle_language: "", subtitle_track_index: -1, subtitle_mode: "off" }
+    end function
+
+    ' A subtitle track's title, else its embedded title.
+    function labelOf(track as Object) as String
+        if track.title <> "" then return track.title
+        return track.embeddedTitle
+    end function
+
+    function sourceOf(track as Object) as String
+        if track.external then return "external"
+        return "embedded"
+    end function
+
+    ' --- The player's picks --------------------------------------------------
+
+    ' The pick a viewer's trackChange event makes (playback.options
+    ' .trackOutcome, whose chosen names the member the viewer changed), or
+    ' invalid for an event no viewer chose a track in.
+    function pick(event as Dynamic) as Dynamic
+        if not util.isObject(event) or not util.isObject(event.tracks) then return invalid
+        kind = util.text(event.chosen)
+        if kind = AUDIO and util.isObject(event.tracks.audio) then return { kind: AUDIO, audio: event.tracks.audio, subtitle: invalid }
+        if kind = SUBTITLE
+            chosen = invalid
+            if util.isObject(event.tracks.subtitle) then chosen = event.tracks.subtitle
+            return { kind: SUBTITLE, audio: invalid, subtitle: chosen }
+        end if
+        return invalid
+    end function
+
+    ' Whether plan's selected_tracks play what a pick (chosen) asked for:
+    ' the same audio track, or the same subtitle, or none for Off.
+    function plays(chosen as Object, plan as Dynamic) as Boolean
+        if not util.isObject(plan) then return false
+        selected = plan.selected_tracks
+        if not util.isObject(selected) then selected = {}
+        if chosen.kind = AUDIO then return sameTrack(chosen.audio, selected.audio)
+        if chosen.subtitle = invalid then return not util.isObject(selected.subtitle)
+        return sameTrack(chosen.subtitle, selected.subtitle)
+    end function
+
+    ' Two track identities name one track: by id when both have one, else
+    ' by index.
+    function sameTrack(wanted as Dynamic, actual as Dynamic) as Boolean
+        if not util.isObject(wanted) or not util.isObject(actual) then return false
+        if util.text(wanted.id) <> "" and util.text(actual.id) <> "" then return util.text(wanted.id) = util.text(actual.id)
+        return util.isNumber(wanted.index) and util.isNumber(actual.index) and wanted.index = actual.index
+    end function
+
+    ' The write that remembers a pick (chosen), which plan plays (plays),
+    ' for the item of watch (its watch projection); fileId is the file the
+    ' start asked for, should the plan not name its own. Invalid when
+    ' nothing names the key, or the playing version does not describe the
+    ' track, as for a subtitle downloaded during playback.
+    function write(chosen as Object, plan as Object, watch as Dynamic, fileId as String) as Dynamic
+        name = key(watch)
+        if name = "" or not playback.values.isArray(watch.versions) then return invalid
+        version = playback.intent.versionOf(watch, playback.intent.playingFile(plan, fileId))
+        if version = invalid then return invalid
+        body = invalid
+        if chosen.kind = AUDIO
+            index = plan.selected_tracks.audio.index
+            raw = audioList(version)
+            if util.isNumber(index) and index >= 0 and index < raw.Count() then body = audioBody(raw[Int(index)], Int(index))
+        else if chosen.subtitle = invalid
+            body = offBody()
+        else
+            index = plan.selected_tracks.subtitle.index
+            tracks = playback.tracks.subtitleTracks(version.subtitle_tracks)
+            if util.isNumber(index) and index >= 0 and index < tracks.Count() then body = subtitleBody(tracks[Int(index)])
+        end if
+        if body = invalid then return invalid
+        return catalog.request.savePreference(chosen.kind, name, body)
+    end function
+
+    ' A version's audio tracks as the server numbers them: its
+    ' audio_tracks, skipping anything that is not a track.
+    function audioList(version as Object) as Object
+        out = []
+        if not playback.values.isArray(version.audio_tracks) then return out
+        for each track in version.audio_tracks
+            if util.isObject(track) then out.Push(track)
+        end for
+        return out
+    end function
+end namespace
