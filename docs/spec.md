@@ -1913,10 +1913,11 @@ Subtitles tab (criterion 4.8).
     "Playback keeps buffering" over "Try a lower quality to keep watching",
     with Lower quality and Keep quality; the undo card reads "Quality
     lowered to stop buffering" with Restore quality. A 4 px track along its
-    bottom drains over 15 s and stands still while paused. Skip Intro, Skip
-    Recap, Up Next, Options, and the error screen hold it back with its time
-    left. With the controls hidden, OK presses the lit capsule and Left and
-    Right move between the prompt's two; with them shown, the card takes
+    bottom drains over 15 s and stands still while paused. A skip pill
+    (Skip Intro, Skip Recap, or Skip Credits, timed or back with the
+    controls), Up Next, Options, and the error screen hold it back with its
+    time left. With the controls hidden, OK presses the lit capsule and Left
+    and Right move between the prompt's two; with them shown, the card takes
     focus as it appears and Down returns to the scrubber. Back on the
     prompt keeps the quality and on the undo card only hides it, after a
     pending seek and before Skip Intro. "Quality lowered to stop buffering"
@@ -2625,7 +2626,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | The player has a bottom-240 px gradient ending at black 55%, with a shadow behind the title footer | A bottom-600 px gradient ending at black 94%, reaching 72–76% behind the series, title, and episode tag | Covers Roku's fixed title block and preserves muted-text contrast over bright video without additional text nodes |
 | A start or a stall shows only the centred spinner | Roku's own states also show by name in a capsule at the top right: "Stopping…", "Playback progress is pending…", and "Loading subtitles…" (until the content's first frame, section 9.7); a notice waits while the spinner or the capsule shows | The player's durable stop and sidecar downloads have no tvOS counterpart, and a notice that came during a stall expired unseen behind it (hardware run 23; assumption AG-262) |
 | The hold indicator's thumbnail has radius 20 corners and a 1 px white 18% outline; its hint names Siri Remote gestures | Square corners without the outline; the hint names Roku keys ("← → Speed, OK Play, Back Cancel") | Over video Roku can round an image only with a `MaskGroup`, which does not clip on devices without OpenGL (plan section 4.6); a square outline would cross rounded art |
-| The segment pill (Skip Recap, Skip Credits) sits 96 px up, or 156 px over the controls | It sits where Skip Intro does (156 px up, 460 px over the controls, on the safe area), and above it while both show | At tvOS's raised place it would cover the scrubber's right end and the time left; Skip Intro's place clears the controls (assumption AG-260) |
+| The segment pill (Skip Recap, Skip Credits) sits 96 px up, or 156 px over the controls | It sits where Skip Intro does (156 px up, 460 px over the controls, on the safe area); the two never show together (assumption AG-661) | At tvOS's raised place it would cover the scrubber's right end and the time left; Skip Intro's place clears the controls (assumption AG-260) |
 | Skip Credits on credits that run to the end, with nothing for Next Up to show, ends the item there | It seeks to the end, and the end follows when the Video node reaches it, a moment later (a `seek_reanchor` on a remux), then opens Up Next as Finished | The player has no end of its own: Roku's `finished` drives the session's stop and Up Next's end (section 9.5), so the skip reaches it as Skip Forward to the end does (assumption AG-321) |
 | A SiloControl seek moves the playhead under Next Up and leaves it open: over skipped credits its 10 s countdown runs on and starts the next item, and after the end the seek is refused | A phone's seek while Up Next shows is Keep Watching, then the seek; after the end it plays the title again from there, as a new session, as a spoken seek does | The viewer chose to stay with this title, and over skipped credits the countdown counts the clock, not the playhead; every viewer seek takes one path (`viewerSeek`, assumption AG-321) |
 | An item that Skip Credits finished, or that closes with Next Up open in its window, reports its runtime as the final position | The stop's final sample is the position playing (section 9.5) | The session reducer reports only the Video node's position; whether the server then counts the item watched follows its own rule, not checked here (assumption AG-321) |
