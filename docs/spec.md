@@ -2130,7 +2130,10 @@ Subtitles tab (criterion 4.8).
     the profile's `playback.auto_skip_recap` is on (D10), credits when
     `playback.auto_skip_credits` is on (default off); a range skipped
     automatically is not skipped again, and offers no pill, when the
-    viewer seeks back into it or in Keep Watching's replay of the end.
+    viewer seeks back into it. Keep Watching's replay of the end is a new
+    session that carries only the credits range skipped last, which it
+    plays without a pill; an earlier range it plays through is skipped or
+    offered again.
   - Every skip pill follows silo-server's intro-skip design (its `ask`
     table and "Recap and credits pills"), whatever
     `playback.intro_skip_mode` says for the segment pill: entering a range
