@@ -2155,7 +2155,7 @@ Subtitles tab (criterion 4.8).
   It offers an episode's next episode; with none (a movie, a series finale),
   the first On Deck item is the pick instead, unless the next-episode lookup
   failed. An On Deck pick never counts down or plays by itself: it waits for
-  Play Now, and the end reads "Up Next" over it rather than "Playing Next".
+  Play Next Up, and the end reads "Up Next" over it rather than "Playing Next".
   Only the series' next episode, or a shuffle's pick, autoplays, as on
   Android TV and in the Apple apps. The countdown is the runtime left, its
   ring counting from the prompt window: it stops while paused, and the pick
@@ -2187,7 +2187,7 @@ Subtitles tab (criterion 4.8).
   window counts down at the real end, even with the window at 0, unless
   the viewer had turned the countdown off before the source stopped (as on
   tvOS after Silo-Server/silo-apple#765).
-  Play/Pause is Play Now.
+  Play/Pause is Play Next Up.
   Auto-play needs the profile's `playback.auto_play_next`, Roku's autoplay
   setting, and the panel's toggle, which writes `playback.auto_play_next`
   for this device and starts or stops the countdown at once. The next item
@@ -2212,14 +2212,17 @@ Subtitles tab (criterion 4.8).
     - the air date · runtime, 19 px Medium at 46% (an On Deck pick's
       runtime alone, as tvOS has no air date for it);
     - the overview, 22 px Regular at 58%, three lines, 620 px wide;
-    - Play Now, a 76 px pill 260 px wide at rest and 360 px focused, with a
-      58 px countdown ring (3 px) 56 px to its right;
-    - 18 px below: Keep Watching (330 px) and Back (200 px), 20 px apart;
+    - Play Next Up, a 76 px pill at least 260 px wide at rest and 360 px
+      focused, wider where its label needs 40 px each side (English
+      included at rest), with a 58 px countdown ring (3 px) 56 px to its
+      right;
+    - 18 px below: Keep Watching (330 px, or its label with 40 px each side
+      where a translation needs more) and Back (200 px), 20 px apart;
     - 22 px below: the toggle "Auto-play is On/Off", text only, 19 px
       SemiBold at 54% (92% with a 1.5 px outline when focused).
     - With nothing to play, "Almost finished" or "End of playback" (42 px
       Bold) and its reason (22 px Medium at 62%, 560 px wide) in place of
-      the metadata, and no Play Now or toggle; while the lookup runs, a
+      the metadata, and no Play Next Up or toggle; while the lookup runs, a
       spinner and "Finding the next episode" (42 px SemiBold).
   - 34 px under the taller of the video and the panel, the On Deck row: its
     header at x 180, tvOS's play.circle.fill (32 px) 14 px before "On Deck"
@@ -2227,9 +2230,10 @@ Subtitles tab (criterion 4.8).
     apart, four across the column; focus moves across them and the strip
     scrolls past the fourth or the first, and home when focus leaves. With
     focus in the row, the screen moves up until its captions clear the safe
-    area, the video's box with it. Down from the buttons goes to the toggle,
-    then the row; Up from the row to the toggle, else the first button; Up
-    from the toggle to Play Now.
+    area, the video's box with it. Each row of buttons is entered at its
+    first button. Down from the buttons goes to the toggle, then the row; Up
+    from the row to the toggle, else the first button; Up from the toggle
+    to Play Next Up.
   - The rest of the screen is black (5.9).
 - **Shuffle in the player**, as tvOS's `PlayerViewModel` plays one
   (`PlayerShuffleState`). The player entry of a shuffle names it, and every
@@ -2248,13 +2252,16 @@ Subtitles tab (criterion 4.8).
     "Shuffling Movies" ("Shuffling Severance · Season 1" for a season) at
     78%; the eyebrow reads "UP NEXT AT RANDOM" with a pick and while one
     loads ("Picking at random"); Pick Another, a 330 px pill (Keep
-    Watching's width, as on tvOS) 56 px after Play Now, the countdown ring
-    56 px after it; and Stop shuffling, the
-    toggle's style, 12 px after the toggle. A movie pick shows its release
+    Watching's resting width, as on tvOS), alone on a row 18 px under Play
+    Next Up and its ring, with Keep Watching and Back 18 px under it, as
+    Android TV stacks them (section 5.9); and Stop shuffling, the toggle's
+    style, 12 px after the toggle. Down goes from Play Next Up to Pick
+    Another, then to Keep Watching, and Up back; Left and Right on Pick
+    Another do nothing. A movie pick shows its release
     date and runtime as an episode shows its air date and runtime.
-  - Play Now, the countdown, Play/Pause, and the phone's next-item command
+  - Play Next Up, the countdown, Play/Pause, and the phone's next-item command
     first send `POST /api/v2/shuffles/{id}/advance` with the item that
-    played, then start the shuffle's new current item; Play Now and Pick
+    played, then start the shuffle's new current item; Play Next Up and Pick
     Another are dimmed and do nothing until it answers. A failed advance
     leaves the panel open without a countdown and says "Couldn't continue
     the shuffle." (nothing for 409). Keep Watching or Back while it is out,
@@ -2266,8 +2273,8 @@ Subtitles tab (criterion 4.8).
     stops the countdown until the answer, which starts it over with the
     new pick; a failure says "Couldn't pick another." and keeps the pick.
     While it is out, Pick Another stays lit and a repeat press does
-    nothing, and Play Now or Play/Pause still advances, giving it up (tvOS
-    disables Play Now only for an advance, `isStartingNextUp`).
+    nothing, and Play Next Up or Play/Pause still advances, giving it up (tvOS
+    disables Play Next Up only for an advance, `isStartingNextUp`).
   - A failed action's line (white 70%) sits 12 px under Keep Watching and
     Back, above the toggle, where tvOS puts `shuffleActionErrorText`.
   - Stop shuffling sends `DELETE /api/v2/shuffles/{id}` without waiting and
@@ -2600,7 +2607,7 @@ Roku as it is, and the work package that builds the change deletes the row.
 | Skip Credits on credits that run to the end, with nothing for Next Up to show, ends the item there | It seeks to the end, and the end follows when the Video node reaches it, a moment later (a `seek_reanchor` on a remux), then opens Up Next as Finished | The player has no end of its own: Roku's `finished` drives the session's stop and Up Next's end (section 9.5), so the skip reaches it as Skip Forward to the end does (assumption AG-321) |
 | A SiloControl seek moves the playhead under Next Up and leaves it open: over skipped credits its 10 s countdown runs on and starts the next item, and after the end the seek is refused | A phone's seek while Up Next shows is Keep Watching, then the seek; after the end it plays the title again from there, as a new session, as a spoken seek does | The viewer chose to stay with this title, and over skipped credits the countdown counts the clock, not the playhead; every viewer seek takes one path (`viewerSeek`, assumption AG-321) |
 | An item that Skip Credits finished, or that closes with Next Up open in its window, reports its runtime as the final position | The stop's final sample is the position playing (section 9.5) | The session reducer reports only the Video node's position; whether the server then counts the item watched follows its own rule, not checked here (assumption AG-321) |
-| Focused pills grow (Play Now 1.085×, Keep Watching and Back 1.06×, Skip Recap and Skip Credits 1.025×, the failure screen's buttons 1.055×) | They change fill and width only | Section 5.2's pill rule: only the Sort pill, first-run buttons, fields, and Skip Intro scale; the owner's call is open (audit U3, assumption AG-265) |
+| Focused pills grow (Play Next Up 1.085×, Keep Watching and Back 1.06×, Skip Recap and Skip Credits 1.025×, the failure screen's buttons 1.055×) | They change fill and width only | Section 5.2's pill rule: only the Sort pill, first-run buttons, fields, and Skip Intro scale; the owner's call is open (audit U3, assumption AG-265) |
 | The failure screen shows one message at the top of the safe area, as coded | A 30 px title over the message, the stack centred on the screen | Roku's failure copy is a title and a message (`playback.player.errorCopy`), as its other errors are; centred, the stack stays clear of overscan (assumption AG-266) |
 | Info's STREAM column lists Route, Audio, Subtitles, and the chapter; Stats shows buffer, network, and engine figures; Info and Stats page with Down and Up | STREAM adds a File row (container, the plan's bitrate, size) after the chapter, and Route names the plan's delivery; Stats shows the plan's source and the `Video` node's state; the panes do not take focus, and the overview takes the whole lines left, the last ending in an ellipsis | Roku's player reports neither tvOS's buffer and network figures nor an engine name; the device runs read the file facts; with the overview clamped both panes fit the 380 px panel |
 | The HUD's lists scroll natively and end on part of a row at the panel's edge; the Quality picker centres the checked row and shows about four and a quarter rows | Columns and the Quality picker show whole rows only, a column scrolling a row's top to its own and the picker a row at a time; the picker opens with the checked row second of its four where the list allows | Hardware run 26: a row or line cut at the panel's edge read as a fault (decision AG-292 (1); assumptions AG-294, AG-295) |
@@ -2625,13 +2632,15 @@ Roku as it is, and the work package that builds the change deletes the row.
 | No Replay key | Replay skips back by the skip-back value clamped to 10–25 s, with "Instant replay" captions for the replayed span once its seek commits; a Replay that Back cancels, or whose merged seek lands past where it was pressed, shows none | Certification criteria 4.8 and 4.9 (implementation plan section 6.10) |
 | Scrub previews come from the server's sprite sheets or, without them, from frames the player cuts from the stream | The server's sheets only; a title without them shows the time and "Previews aren't available for this title" | Roku apps cannot read frames from the `Video` node |
 | A sheet decodes at full size, and only the latest one stays decoded | A sheet decodes within 1600 px on each side (a default 300 px thumbnail at 160 px, drawn 320 px wide on the card and 480 px held); the sheet in use and the next one in the direction of travel stay loaded, the sheet in use alone on the low tier | Texture memory on 512 MB devices and sheet changes at 32× (plan sections 4.8 and 6.9; hardware test H20); the drawn size costs no texture |
+| A shuffle's Up Next puts Pick Another between Play Next Up and the countdown ring | Pick Another has a row of its own under Play Next Up and the ring, above Keep Watching and Back, as on Android TV | With Play Next Up's label in most translations the three ran past the safe area's right edge, the ring partly off screen in ten (decision AG-662) |
+| Up Next's Keep Watching keeps a fixed width | It widens to give a longer label 40 px each side, as Play Next Up does, and Back moves with it | Its Czech and Russian labels are wider than the 330 px pill (decision AG-662) |
 | The next episode's still fills the screen behind Up Next, dimmed, around the video | No still: the rest of the screen is black | Roku draws video beneath the UI, so a full-screen image would cover the shrunken video |
 | A shuffle's next pick that fails to start returns to Up Next with "Couldn't start the next pick. Try again or go back." | The player's failure screen shows, with Retry and Go Back, as for any next item | Roku starts the next item as a new session of the same player (assumption AG-100), whose failure screen serves every start (assumption AG-381) |
 | A shuffle plays every part of a multi-part item before moving on | A multi-part pick plays as its start plans it, from its beginning | The Roku player chains no parts on any start (assumption AG-381) |
 | The auto-play toggle shows with any pick | It is hidden, and nothing counts down, while Roku's autoplay setting is off | Plan section 6.10 (certification) |
 | The Menu button on Finished (nothing to play) replays the end, as Keep Watching does | The remote's Back key leaves the player, except after an early end (section 5.7), when it resumes where the video stopped | Roku's Back leaves playback; replaying would keep the viewer on a screen whose only button replays |
 | Keep Watching after the end replays the last 10 s in the same session | It starts the item again 10 s before its end, as a new session | Roku's session has stopped by the time its video ends |
-| Siri (tvOS) and the Google Assistant (Android TV) drive the system player's transport | Roku voice transport commands (`roInput.EnableTransportEvents`) take the remote's paths: "play" and "pause", "fast forward" and "rewind" start the speed ladder, "replay" is Replay, "rewind 30 seconds" or "forward 10 minutes" seeks, "start over" seeks to the start, "skip intro" presses Skip Intro, or else the Skip Recap or Skip Credits pill, "next" is Up Next's Play Now, and "stop" leaves the player. A seek or scan while Up Next shows closes it as Keep Watching does; after the end, "start over" and a seek replay the title as a new session. "Turn on captions" changes Roku's global caption mode, which the player already follows (spec 9.7) | Roku delivers voice commands to the app as transport events and expects an answer for each within 5 s (`source/playback/voice.bs`); criterion 4.11 does not require them below its threshold |
+| Siri (tvOS) and the Google Assistant (Android TV) drive the system player's transport | Roku voice transport commands (`roInput.EnableTransportEvents`) take the remote's paths: "play" and "pause", "fast forward" and "rewind" start the speed ladder, "replay" is Replay, "rewind 30 seconds" or "forward 10 minutes" seeks, "start over" seeks to the start, "skip intro" presses Skip Intro, or else the Skip Recap or Skip Credits pill, "next" is Up Next's Play Next Up, and "stop" leaves the player. A seek or scan while Up Next shows closes it as Keep Watching does; after the end, "start over" and a seek replay the title as a new session. "Turn on captions" changes Roku's global caption mode, which the player already follows (spec 9.7) | Roku delivers voice commands to the app as transport events and expects an answer for each within 5 s (`source/playback/voice.bs`); criterion 4.11 does not require them below its threshold |
 | An On Deck item without a backdrop or still reads its detail for one, and is left out without | It shows as Home's Continue Watching card does, its poster standing in | A detail read per card is avoided; Home's cards make the same choice |
 | A screen-level error puts a headline for its cause ("Something went wrong", "Not found") over its message, with Try Again | Home, the libraries, detail, and the profile picker show their one-sentence message as the error's title, without a second line, and Search its own title over a line; the button reads Retry (Try again on the picker) | The client's error copy is one sentence per screen (`locale/`); a copy change of its own adds headlines by cause (assumption AG-285) |
 | The person page scrolls as one view: the header scrolls away as focus moves down the filmography grid | The page moves up once as focus enters the grid, so the grid sits at Browse's place (y 332) with the pills above it; the grid then keeps its focused row at the top (fixed focus), as Browse does | `MarkupGrid` has no header item; one move keeps the pills and the grid's two rows on screen (assumption AG-340) |
