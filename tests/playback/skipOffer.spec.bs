@@ -1,0 +1,291 @@
+namespace tests
+
+    ' playback.skipOffer: silo-server's intro-skip design, its ask table,
+    ' "When the controls are up", and "Recap and credits pills", row by row.
+    ' Each case runs for Skip Intro in ask mode, Skip Recap, and Skip Credits,
+    ' with ranges from 100 s to 190 s and from 600 s to 640 s of a 2600 s
+    ' file. Commands are summarized as "seek:190", "show:20" (the fill in
+    ' percent), "show:untimed" (the returned pill), and "hide".
+    '
+    ' The table's "move focus away" row has no reducer event: focus moving
+    ' tells the reducers nothing, so the timer runs on (the controls spec
+    ' asserts that moving off a pill sends no command). What a press on
+    ' credits that run to the end does, auto-skip, and Watch Intro are in the
+    ' reducers' own specs.
+    @suite("playback skip offer")
+    class PlaybackSkipOfferTests extends rooibos.BaseTestSuite
+
+        function kinds() as Object
+            return ["intro", "recap", "credits"]
+        end function
+
+        function make(kind as String) as Object
+            markers = playback.markers.parse([{ kind: kind, start_seconds: 100, end_seconds: 190 }, { kind: kind, start_seconds: 600, end_seconds: 640 }])
+            if kind = "intro" then return playback.skipIntro.create("ask", markers)
+            if kind = "recap" then return playback.skipRecap.create(false, markers)
+            return playback.skipCredits.create(false, markers, 2600)
+        end function
+
+        function reduce(kind as String, state as Object, event as Object) as Object
+            if kind = "intro" then return playback.skipIntro.reduce(state, event)
+            if kind = "recap" then return playback.skipRecap.reduce(state, event)
+            return playback.skipCredits.reduce(state, event)
+        end function
+
+        ' Feeds events in order and summarizes every command.
+        function feed(kind as String, state as Object, events as Object) as Object
+            out = []
+            for each event in events
+                for each command in m.reduce(kind, state, event)
+                    if command.type = "seek"
+                        out.Push("seek:" + command.seconds.ToStr())
+                    else if command.type = "show" and command.timed
+                        out.Push("show:" + Int(command.progress * 100 + 0.5).ToStr())
+                    else if command.type = "show"
+                        out.Push("show:untimed")
+                    else
+                        out.Push(command.type)
+                    end if
+                end for
+            end for
+            return out
+        end function
+
+        function at(seconds as Dynamic, now as Integer) as Object
+            return { type: "position", seconds: seconds, now: now }
+        end function
+
+        function player(playerState as String, now as Integer) as Object
+            return { type: "player", state: playerState, now: now }
+        end function
+
+        function tick(now as Integer) as Object
+            return { type: "tick", now: now }
+        end function
+
+        function controls(shown as Boolean, now as Integer) as Object
+            return { type: "controls", shown: shown, now: now }
+        end function
+
+        function key(name as String, now as Integer) as Object
+            return { type: name, now: now }
+        end function
+
+        ' A reducer of kind playing from 0 ms at 120 s, its pill just shown.
+        function playingIn(kind as String) as Object
+            state = m.make(kind)
+            m.assertEqual(m.feed(kind, state, [m.player("playing", 0), m.at(120, 0)]), ["show:0"], kind)
+            return state
+        end function
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("the timed pill")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("enters a range: shows the pill with a full timer once playback plays, never before")
+        sub _()
+            for each kind in m.kinds()
+                state = m.make(kind)
+                m.assertEqual(m.feed(kind, state, [m.player("buffering", 0), m.at(120, 0)]), [], kind)
+                m.assertEqual(m.feed(kind, state, [m.player("playing", 500)]), ["show:0"], kind)
+                m.assertTrue(playback.skipOffer.visible(state), kind)
+            end for
+        end sub
+
+        @it("skips on one press: seeks to the range's end and resolves it, so going back in offers nothing")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.assertEqual(m.feed(kind, state, [m.tick(1000), m.tick(2500)]), ["show:10", "show:25"], kind)
+                m.assertEqual(m.feed(kind, state, [m.key("press", 2600)]), ["seek:190", "hide"], kind)
+                m.assertEqual(m.feed(kind, state, [m.at(130, 3000), m.tick(3100), m.controls(true, 3200)]), [], kind)
+            end for
+        end sub
+
+        @it("hides when its 10 s run out without resolving the range: it is offered again, full, after leaving and coming back")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.assertEqual(m.feed(kind, state, [m.tick(9900), m.tick(10000)]), ["show:99", "hide"], kind)
+                m.assertEqual(m.feed(kind, state, [m.at(125, 10500), m.tick(11000)]), [], kind + ": not inside the same range, controls hidden")
+                m.assertEqual(m.feed(kind, state, [m.at(195, 12000), m.at(140, 13000)]), ["show:0"], kind)
+            end for
+        end sub
+
+        @it("dismisses on Back, which resolves the range without seeking")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.assertEqual(m.feed(kind, state, [m.key("back", 1000)]), ["hide"], kind)
+                m.assertEqual(m.feed(kind, state, [m.controls(true, 2000), m.at(195, 2500), m.at(130, 3000)]), [], kind + ": not with the controls, nor back in the range")
+                m.assertEqual(m.feed(kind, state, [m.key("back", 3500)]), [], kind + ": a Back with nothing showing changes nothing")
+            end for
+        end sub
+
+        @it("holds the timer while paused, the pill staying, and through a rebuffer only for 1.5 s")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.assertEqual(m.feed(kind, state, [m.player("paused", 1000), m.tick(3000)]), ["show:10"], kind)
+                m.assertTrue(playback.skipOffer.visible(state), kind)
+                m.assertInvalid(playback.skipOffer.nextWake(state, 3000), kind)
+                m.assertEqual(m.feed(kind, state, [m.player("playing", 3000), m.tick(4000)]), ["show:20"], kind)
+                m.assertEqual(m.feed(kind, state, [m.player("buffering", 4000), m.tick(5000)]), ["show:30"], kind)
+                m.assertEqual(m.feed(kind, state, [m.tick(7000)]), ["show:35"], kind)
+                m.assertEqual(m.feed(kind, state, [m.tick(8000)]), [], kind)
+            end for
+        end sub
+
+        @it("withdraws on a seek out of the range, unresolved, and a seek back in starts a full timer")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.assertEqual(m.feed(kind, state, [m.tick(2000), m.at(195, 2000)]), ["show:20", "hide"], kind)
+                m.assertEqual(m.feed(kind, state, [m.at(140, 3000)]), ["show:0"], kind)
+            end for
+        end sub
+
+        @it("takes a press or Back on the pill it shows when its time runs out before the tick that would hide it")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.feed(kind, state, [m.tick(9900)])
+                m.assertEqual(m.feed(kind, state, [m.key("press", 10050)]), ["seek:190", "hide"], kind)
+                state = m.playingIn(kind)
+                m.feed(kind, state, [m.tick(9900)])
+                m.assertEqual(m.feed(kind, state, [m.key("back", 10050)]), ["hide"], kind)
+                m.assertEqual(m.feed(kind, state, [m.at(195, 11000), m.at(130, 12000)]), [], kind + ": Back resolved the range")
+            end for
+        end sub
+
+        @it("offers a range whose timer ran out again, full, after a seek straight into a resolved range and back")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.assertEqual(m.feed(kind, state, [m.at(610, 1000), m.key("press", 1100)]), ["show:0", "seek:640", "hide"], kind + ": the pill moves to the second range, full")
+                m.assertEqual(m.feed(kind, state, [m.at(120, 2000), m.tick(12000)]), ["show:0", "hide"], kind)
+                m.assertEqual(m.feed(kind, state, [m.at(620, 13000)]), [], kind)
+                m.assertEqual(m.feed(kind, state, [m.at(130, 14000)]), ["show:0"], kind)
+            end for
+        end sub
+
+        @it("offers each range of a file on its own")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.feed(kind, state, [m.key("press", 100)])
+                m.assertEqual(m.feed(kind, state, [m.at(300, 1000), m.at(610, 2000)]), ["show:0"], kind)
+                m.assertEqual(m.feed(kind, state, [m.key("press", 2100)]), ["seek:640", "hide"], kind)
+            end for
+        end sub
+
+        @it("stays through the controls showing and hiding while its timer runs")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.assertEqual(m.feed(kind, state, [m.controls(true, 1000), m.controls(false, 2000)]), ["show:10", "show:20"], kind)
+                m.assertTrue(playback.skipOffer.visible(state), kind)
+            end for
+        end sub
+
+        @it("asks for ticks while the timer runs, up to its end and the rebuffer grace")
+        sub _()
+            for each kind in m.kinds()
+                state = m.make(kind)
+                m.assertInvalid(playback.skipOffer.nextWake(state, 0), kind)
+                state = m.playingIn(kind)
+                m.assertEqual(playback.skipOffer.nextWake(state, 0), 100, kind)
+                m.feed(kind, state, [m.tick(9950)])
+                m.assertEqual(playback.skipOffer.nextWake(state, 9950), 10000, kind)
+                m.feed(kind, state, [m.player("buffering", 9960)])
+                m.assertEqual(playback.skipOffer.nextWake(state, 9960), 10000, kind)
+            end for
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("the returned pill")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("comes back without a timer while the controls are up after the timer ran out, and goes with them")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.assertEqual(m.feed(kind, state, [m.tick(10000), m.controls(true, 11000)]), ["hide", "show:untimed"], kind)
+                m.assertInvalid(playback.skipOffer.nextWake(state, 11000), kind + ": no timer")
+                m.assertEqual(m.feed(kind, state, [m.tick(30000)]), [], kind + ": no timer")
+                m.assertEqual(m.feed(kind, state, [m.controls(false, 31000)]), ["hide"], kind)
+                m.assertEqual(m.feed(kind, state, [m.controls(true, 32000)]), ["show:untimed"], kind)
+                m.assertEqual(m.feed(kind, state, [m.at(195, 33000)]), ["hide"], kind + ": not outside the range")
+            end for
+        end sub
+
+        @it("loses its timer in place when it runs out with the controls already up")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.feed(kind, state, [m.controls(true, 1000)])
+                m.assertEqual(m.feed(kind, state, [m.tick(10000)]), ["show:untimed"], kind)
+            end for
+        end sub
+
+        @it("skips on a press, resolving the range, and lets Back pass over it")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.feed(kind, state, [m.tick(10000), m.controls(true, 11000)])
+                m.assertEqual(m.feed(kind, state, [m.key("back", 11500)]), [], kind + ": Back is not the returned pill's")
+                m.assertTrue(playback.skipOffer.visible(state), kind)
+                m.assertEqual(m.feed(kind, state, [m.key("press", 12000)]), ["seek:190", "hide"], kind)
+                m.assertEqual(m.feed(kind, state, [m.controls(false, 13000), m.controls(true, 14000)]), [], kind)
+            end for
+        end sub
+
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        @describe("what covers it")
+        '+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        @it("hides while covered, its timer held, and shows again with the time it had")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.assertEqual(m.feed(kind, state, [m.tick(2000), { type: "covered", covered: true, now: 2000 }]), ["show:20", "hide"], kind)
+                m.assertFalse(playback.skipOffer.visible(state), kind)
+                m.assertInvalid(playback.skipOffer.nextWake(state, 5000), kind)
+                m.assertEqual(m.feed(kind, state, [m.tick(5000), { type: "covered", covered: false, now: 5000 }, m.tick(6000)]), ["show:20", "show:30"], kind)
+            end for
+        end sub
+
+        @it("starts a range entered while covered with a full timer once uncovered")
+        sub _()
+            for each kind in m.kinds()
+                state = m.make(kind)
+                m.feed(kind, state, [m.player("playing", 0), m.at(50, 0), { type: "covered", covered: true, now: 0 }])
+                m.assertEqual(m.feed(kind, state, [m.at(120, 1000), m.tick(3000)]), [], kind)
+                m.assertEqual(m.feed(kind, state, [{ type: "covered", covered: false, now: 4000 }]), ["show:0"], kind)
+            end for
+        end sub
+
+        @it("brings a pill whose timer ran out back from under cover only without a timer, with the controls")
+        sub _()
+            for each kind in m.kinds()
+                state = m.playingIn(kind)
+                m.assertEqual(m.feed(kind, state, [m.tick(10000)]), ["hide"], kind)
+                m.assertEqual(m.feed(kind, state, [{ type: "covered", covered: true, now: 11000 }, { type: "covered", covered: false, now: 12000 }]), [], kind + ": not timed again")
+                m.assertEqual(m.feed(kind, state, [{ type: "covered", covered: true, now: 13000 }, m.controls(true, 14000)]), [], kind + ": not while covered")
+                m.assertEqual(m.feed(kind, state, [{ type: "covered", covered: false, now: 15000 }]), ["show:untimed"], kind)
+                m.assertEqual(m.feed(kind, state, [{ type: "covered", covered: true, now: 16000 }]), ["hide"], kind)
+            end for
+        end sub
+
+        @it("offers nothing while it may not (a party member who may not seek), and follows the change")
+        sub _()
+            for each kind in ["recap", "credits"]
+                state = m.make(kind)
+                m.feed(kind, state, [{ type: "offers", value: false, now: 0 }])
+                m.assertEqual(m.feed(kind, state, [m.player("playing", 0), m.at(120, 0)]), [], kind)
+                m.assertEqual(m.feed(kind, state, [{ type: "offers", value: true, now: 1000 }]), ["show:0"], kind)
+                m.assertEqual(m.feed(kind, state, [{ type: "offers", value: false, now: 2000 }]), ["hide"], kind)
+            end for
+        end sub
+    end class
+end namespace
