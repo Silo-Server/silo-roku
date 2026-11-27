@@ -4,6 +4,7 @@ import "pkg:/source/api/scheduler.bs"
 import "pkg:/source/auth/accounts.bs"
 import "pkg:/source/auth/binding.bs"
 import "pkg:/source/auth/companion.bs"
+import "pkg:/source/auth/demo.bs"
 import "pkg:/source/auth/deviceSignIn.bs"
 import "pkg:/source/auth/handoff.bs"
 import "pkg:/source/auth/headers.bs"
@@ -159,7 +160,7 @@ namespace api.auth.coordinator
     ' "checking" | "verified" | "refused", problem, url, requestId } for the
     ' base URL url.
     function create(saved as Object, facts as Object, allowUnconfirmedOrigin = false as Boolean) as Object
-        return { saved: saved, facts: facts, verified: {}, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, manager: invalid, signInAsked: false, companion: invalid, companionAttempt: 0, companionPairing: invalid, device: invalid, deviceAttempt: 0, launchAsks: false, chooseAccount: false, afterSignIn: false, offer: invalid, sent: 0, listedOrder: 0, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
+        return { saved: saved, facts: facts, verified: {}, generation: 0, epoch: 0, profile: invalid, verification: invalid, proofs: {}, refreshing: invalid, held: false, ownHold: false, borrowed: invalid, borrowedReason: "", handoffs: {}, handoffStarts: {}, nextHandoff: 0, manager: invalid, signInAsked: false, companion: invalid, companionAttempt: 0, companionPairing: invalid, demoAttempt: 0, demoOrigin: "", device: invalid, deviceAttempt: 0, launchAsks: false, chooseAccount: false, afterSignIn: false, offer: invalid, sent: 0, listedOrder: 0, notBefore: 0, unanswered: false, ops: {}, nextId: 0, reason: "", mediaWaiters: [], originCheck: originState("unverified", "", saved.origin), originHeld: false, originChecks: 0, allowUnconfirmedOrigin: allowUnconfirmedOrigin }
     end function
 
     ' The decisions to carry out once, at launch, before the first publish:
@@ -295,7 +296,7 @@ namespace api.auth.coordinator
     function sendsSecret(state as Object, requestId as String) as Boolean
         op = state.ops[requestId]
         if op = invalid then return false
-        return op.kind = "login" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "pin" or op.kind = "managerPin" or op.kind = "borrowRefresh" or op.kind = "handoffPoll" or op.kind = "handoffCancel" or op.kind = "companionPoll" or op.kind = "companionCancel" or op.kind = "deviceStart" or op.kind = "devicePoll" or op.kind = "deviceCancel"
+        return op.kind = "login" or op.kind = "demoLogin" or op.kind = "refresh" or op.kind = "logoutRefresh" or op.kind = "pin" or op.kind = "managerPin" or op.kind = "borrowRefresh" or op.kind = "handoffPoll" or op.kind = "handoffCancel" or op.kind = "companionPoll" or op.kind = "companionCancel" or op.kind = "deviceStart" or op.kind = "devicePoll" or op.kind = "deviceCancel"
     end function
 
     ' A session operation from the render thread.
@@ -334,6 +335,8 @@ namespace api.auth.coordinator
         if op = "deviceStart" then return deviceStart(state, input)
         if op = "devicePoll" then return devicePoll(state, input)
         if op = "deviceCancel" then return deviceCancel(state, input)
+        if op = "demoSignIn" then return demoSignIn(state, input)
+        if op = "demoCancel" then return demoCancel(state, input)
         return [reply(api.response.failure(input, "invalid_request"))]
     end function
 
@@ -385,10 +388,11 @@ namespace api.auth.coordinator
         end if
         op = state.ops[request.requestId]
         if isCompanionOp(op) then return companionCredentials(state, op, url)
+        if isDemoOp(op) then return demoCredentials(state, op, url)
         expected = state.saved.origin
         if op <> invalid and util.isString(op.origin) then expected = op.origin
         sameOrigin = api.request.isSameOrigin(url, expected)
-        sensitive = request.auth <> "none" or (op <> invalid and op.kind <> "server" and op.kind <> "origin")
+        sensitive = request.auth <> "none" or (op <> invalid and op.kind <> "server" and op.kind <> "serverIdentity" and op.kind <> "origin")
         if sensitive and not sameOrigin then return { headers: {}, error: "invalid_request" }
         if request.auth <> "none" and state.saved.accessToken = "" then return { headers: {}, error: "signed_out" }
         if sensitive and not originConfirmed(state, expected) and not leaving(state, op) then return { headers: {}, error: originError(state) }
@@ -455,6 +459,9 @@ namespace api.auth.coordinator
         if op.kind = "refresh" then return refreshed(state, request, op, result, now)
         if op.kind = "login" then return loggedIn(state, request, op, result, now)
         if op.kind = "server" then return serverChecked(state, request, op, result, now)
+        if op.kind = "serverIdentity" then return serverIdentityChecked(state, op, result, now)
+        if op.kind = "demoInfo" then return demoInfo(state, op, result)
+        if op.kind = "demoLogin" then return demoLoggedIn(state, op, result, now)
         if op.kind = "origin" then return originChecked(state, request, op, result)
         if op.kind = "pin" then return pinChecked(state, request, op, result, now)
         if op.kind = "managerPin" then return managerChecked(state, request, op, result)
@@ -499,7 +506,8 @@ namespace api.auth.coordinator
     function checkServer(state as Object, input as Object) as Object
         address = api.auth.server.normalize(input.address, util.isTrue(input.allowHttp))
         if address.error <> invalid then return [reply(api.response.failure(input, address.error))]
-        request = build(state, input, { method: "GET", url: address.url + api.auth.server.INFO_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "server", origin: address.url })
+        expectedId = util.text(input.expectedServerId).Trim()
+        request = build(state, input, { method: "GET", url: address.url + api.auth.server.INFO_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "server", origin: address.url, expectedServerId: expectedId, input: input })
         return [submit(request)]
     end function
 
@@ -932,9 +940,15 @@ namespace api.auth.coordinator
 
     ' ---- Results of requests built here
 
-    ' A check of the configured server itself also settles its origin.
+    ' A check of the configured server itself also settles its origin. When
+    ' expectedServerId is set (a LAN-discovered server), system/info must
+    ' confirm request_origin strictly and /api/v2/system/identity must match
+    ' expectedServerId before switching saved.origin.
     function serverChecked(state as Object, request as Object, op as Object, result as Object, now as Integer) as Object
-        check = api.auth.server.checkInfo(result, op.origin, state.allowUnconfirmedOrigin)
+        expectedId = util.text(op.expectedServerId)
+        allowUnconfirmed = state.allowUnconfirmedOrigin
+        if expectedId <> "" then allowUnconfirmed = false
+        check = api.auth.server.checkInfo(result, op.origin, allowUnconfirmed)
         changed = op.origin <> state.saved.origin
         if not check.ok
             decisions = []
@@ -945,16 +959,37 @@ namespace api.auth.coordinator
             decisions.Push(reply(failed))
             return decisions
         end if
-        answer = succeeded(request, { origin: op.origin, changed: changed }, result.status)
+        if expectedId <> ""
+            idReq = build(state, { owner: util.text(op.input.owner) }, { method: "GET", url: op.origin + IDENTITY_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "serverIdentity", origin: op.origin, expectedServerId: expectedId, check: check, input: op.input })
+            return [submit(idReq)]
+        end if
+        return commitServer(state, request, op.origin, check, result.status, now)
+    end function
+
+    function serverIdentityChecked(state as Object, op as Object, result as Object, now as Integer) as Object
+        input = op.input
+        if result.ok <> true
+            if result.status = 0 then return [reply(api.response.failure(input, "unreachable"))]
+            return [reply(api.response.failure(input, "identity_mismatch"))]
+        end if
+        found = ""
+        if util.isObject(result.body) then found = util.text(result.body.server_id).Trim()
+        if found = "" or found <> op.expectedServerId then return [reply(api.response.failure(input, "identity_mismatch"))]
+        return commitServer(state, input, op.origin, op.check, result.status, now)
+    end function
+
+    function commitServer(state as Object, target as Object, origin as String, check as Object, status as Integer, now as Integer) as Object
+        changed = origin <> state.saved.origin
+        answer = succeeded(target, { origin: origin, changed: changed }, status)
         decisions = []
         if changed
             ' A companion withdrawal goes after the change cancels every request.
             withdraw = endSignInAttempts(state)
-            decisions = switchServer(state, op.origin, now)
-            decisions.Append([{ kind: "server", origin: op.origin }, persist()])
+            decisions = switchServer(state, origin, now)
+            decisions.Append([{ kind: "server", origin: origin }, persist()])
             decisions.Append(withdraw)
         end if
-        decisions.Append(originSettled(state, op.origin, check))
+        decisions.Append(originSettled(state, origin, check))
         decisions.Push(reply(answer))
         return decisions
     end function

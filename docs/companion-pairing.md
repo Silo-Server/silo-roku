@@ -229,11 +229,13 @@ finish", with its reason in tvOS's words and a "Not finished" card) with
 Try again (back to waiting for a phone, or after a sign-in, the end of the
 session) until the person acts or the phone pushes again; the phone gets
 `serverResult failed` with the code. On a new step the highlight
-starts on its first button. While waiting, the server screen opens on "Set
-up with your phone" with the chip "Looking for a phone or tablet…" and the
-three setup steps, and the sign-in screen says "Have Silo on your phone?
-Open it on the same Wi‑Fi to sign in this TV." under its code (spec
-section 5.4).
+starts on its first button. While waiting, the server screen opens directly on
+on-device address entry (with LAN server discovery and Try the demo) while
+still advertising `_silopair-roku._tcp` in the background, and the sign-in
+screen opens directly on password entry while keeping the device-code loop
+running in the background (showing "Have Silo on your phone? Open it on the
+same Wi‑Fi to sign in this TV." when the viewer opens "Use your phone
+instead", spec section 5.4).
 
 Tokens, device codes, the binding secret, and the poll answer stay inside
 the auth coordinator (`ApiTask`); the receiver and screens see only the

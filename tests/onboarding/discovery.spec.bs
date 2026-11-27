@@ -1,0 +1,129 @@
+namespace tests
+
+    ' Pure LAN server discovery probe state machine (source/onboarding/discovery.bs).
+    @suite("onboarding discovery")
+    class OnboardingDiscoveryTests extends rooibos.BaseTestSuite
+
+        @describe("probe scheduling and deduplication")
+
+        @it("caps tracked candidates at 4 and concurrent in-flight probes at 2")
+        sub _()
+            st = onboarding.discovery.create()
+            raw = []
+            for i = 1 to 6
+                raw.Push({ url: "http://192.168.1." + (10 + i).ToStr() + ":8096", host: "192.168.1." + (10 + i).ToStr() + ":8096", txtName: "S" + i.ToStr() })
+            end for
+            res = onboarding.discovery.sync(st, raw, 1000)
+            m.assertEqual(res.decisions.Count(), 2)
+            m.assertEqual(res.decisions[0].kind, "probeIdentity")
+            m.assertEqual(res.decisions[1].kind, "probeIdentity")
+            ' Only 4 tracked total.
+            count = 0
+            for each _k in st.entries
+                count = count + 1
+            end for
+            m.assertEqual(count, 4)
+        end sub
+
+        @it("cancels in-flight probe on withdrawal and ignores stale answer after withdraw and re-announce")
+        sub _()
+            st = onboarding.discovery.create()
+            url = "http://192.168.1.50:8096"
+            first = onboarding.discovery.sync(st, [{ url: url, host: "192.168.1.50:8096", txtName: "Old" }], 1000)
+            pid1 = first.decisions[0].probeId
+
+            ' Withdraw: emits cancel for pid1.
+            withdrawn = onboarding.discovery.sync(st, [], 1100)
+            m.assertEqual(withdrawn.decisions, [{ kind: "cancel", probeId: pid1 }])
+
+            ' Re-announce same URL: gets fresh monotonic pid2 > pid1.
+            readded = onboarding.discovery.sync(st, [{ url: url, host: "192.168.1.50:8096", txtName: "New" }], 1200)
+            pid2 = readded.decisions[0].probeId
+            m.assertTrue(pid2 > pid1)
+
+            ' Stale answer for pid1 must be ignored.
+            stale = onboarding.discovery.onIdentity(st, pid1, url, { ok: true, status: 200, body: { server_id: "stale-srv" } }, 1250)
+            m.assertFalse(stale.changed)
+            m.assertEqual(onboarding.discovery.list(st), [])
+
+            ' Fresh answer for pid2 is accepted and triggers text-only branding probe.
+            fresh = onboarding.discovery.onIdentity(st, pid2, url, { ok: true, status: 200, body: { server_id: "real-srv" } }, 1300)
+            m.assertTrue(fresh.changed)
+            m.assertEqual(fresh.decisions.Count(), 1)
+            m.assertEqual(fresh.decisions[0].kind, "probeBranding")
+            m.assertEqual(onboarding.discovery.list(st)[0].name, "New")
+
+            ' Branding updates display name only.
+            branded = onboarding.discovery.onBranding(st, fresh.decisions[0].probeId, url, { ok: true, status: 200, body: { server_name: "Living Room Silo", mark_url: "http://evil/logo.png" } }, 1400)
+            m.assertTrue(branded.changed)
+            listed = onboarding.discovery.list(st)
+            m.assertEqual(listed.Count(), 1)
+            m.assertEqual(listed[0].name, "Living Room Silo")
+            m.assertInvalid(listed[0].markUrl)
+        end sub
+
+        @it("backs off failed identity probes at 5s, 15s, and gives up after 3 failures")
+        sub _()
+            st = onboarding.discovery.create()
+            url = "http://192.168.1.77:8096"
+            d1 = onboarding.discovery.sync(st, [{ url: url, host: "192.168.1.77:8096", txtName: "Dead" }], 1000).decisions[0]
+            onboarding.discovery.onIdentity(st, d1.probeId, url, { ok: false, status: 0, body: invalid }, 1100)
+            m.assertEqual(onboarding.discovery.nextRetryDelayMs(st, 1100), 5000)
+            m.assertEqual(onboarding.discovery.tick(st, 6099).decisions, [])
+            d2 = onboarding.discovery.tick(st, 6100).decisions[0]
+            m.assertEqual(d2.kind, "probeIdentity")
+
+            onboarding.discovery.onIdentity(st, d2.probeId, url, { ok: false, status: 500, body: invalid }, 6200)
+            m.assertEqual(onboarding.discovery.nextRetryDelayMs(st, 6200), 15000)
+            d3 = onboarding.discovery.tick(st, 21200).decisions[0]
+            m.assertEqual(d3.kind, "probeIdentity")
+
+            ' Third failure gives up (no further retries).
+            onboarding.discovery.onIdentity(st, d3.probeId, url, { ok: false, status: 500, body: invalid }, 21300)
+            m.assertEqual(onboarding.discovery.nextRetryDelayMs(st, 21300), 0)
+            m.assertEqual(onboarding.discovery.tick(st, 100000).decisions, [])
+        end sub
+
+        @it("deduplicates confirmed endpoints by serverId before capping to top 2 alphabetically")
+        sub _()
+            st = onboarding.discovery.create()
+            raw = [
+                { url: "http://192.168.1.20:8096", host: "192.168.1.20:8096", txtName: "Alpha" },
+                { url: "http://192.168.1.21:8096", host: "192.168.1.21:8096", txtName: "Alpha" },
+                { url: "http://192.168.1.22:8096", host: "192.168.1.22:8096", txtName: "Beta" },
+                { url: "http://192.168.1.23:8096", host: "192.168.1.23:8096", txtName: "Gamma" }
+            ]
+            d = onboarding.discovery.sync(st, raw, 1000).decisions
+            ' Answer all 4 identity probes (2 at a time), where .20 and .21 share srv-alpha.
+            idMap = {
+                "http://192.168.1.20:8096": "srv-alpha",
+                "http://192.168.1.21:8096": "srv-alpha",
+                "http://192.168.1.22:8096": "srv-beta",
+                "http://192.168.1.23:8096": "srv-gamma"
+            }
+            pending = d
+            nowMs = 1100
+            while pending.Count() > 0
+                nextBatch = []
+                for each decision in pending
+                    if decision.kind = "probeIdentity"
+                        res = onboarding.discovery.onIdentity(st, decision.probeId, decision.url, { ok: true, status: 200, body: { server_id: idMap[decision.url] } }, nowMs)
+                        nextBatch.Append(res.decisions)
+                    else if decision.kind = "probeBranding"
+                        res = onboarding.discovery.onBranding(st, decision.probeId, decision.url, { ok: false, status: 404, body: invalid }, nowMs)
+                        nextBatch.Append(res.decisions)
+                    end if
+                    nowMs = nowMs + 10
+                end for
+                pending = nextBatch
+            end while
+
+            listed = onboarding.discovery.list(st)
+            m.assertEqual(listed.Count(), 2)
+            ' Alpha (.20 + .21) collapsed to ONE entry before capping, so Beta appears too!
+            m.assertEqual(listed[0].serverId, "srv-alpha")
+            m.assertEqual(listed[0].url, "http://192.168.1.20:8096")
+            m.assertEqual(listed[1].serverId, "srv-beta")
+        end sub
+    end class
+end namespace

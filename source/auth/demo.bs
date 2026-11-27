@@ -1,0 +1,89 @@
+import "pkg:/source/api/request.bs"
+import "pkg:/source/api/response.bs"
+import "pkg:/source/auth/headers.bs"
+import "pkg:/source/auth/server.bs"
+import "pkg:/source/util/values.bs"
+
+' Public demo sign-in in the account session: connects to the fixed Silo demo
+' origin (DEMO_ORIGIN), confirms its origin strictly via GET /api/v2/system/info
+' (requiring exact request_origin), then signs in to the demo server's shared
+' demo account with an ordinary session via POST /api/v2/auth/demo. Part of
+' api.auth.coordinator, whose decisions it returns.
+'
+' Session operations:
+'   { session: "demoSignIn" }   checks DEMO_ORIGIN and signs in to the shared
+'       demo account; on success installs server + account atomically via
+'       installSignIn and replies { origin, accountId, username }. On failure
+'       or cancellation the saved server and account are untouched.
+'   { session: "demoCancel" }   invalidates any in-flight demo sign-in attempt
+'       so a late answer drops its tokens and changes nothing.
+namespace api.auth.coordinator
+    const DEMO_ORIGIN = "https://demo.siloserver.org"
+    const DEMO_LOGIN_PATH = "/api/v2/auth/demo"
+    const DEMO_LOGIN_TIMEOUT_MS = 20000
+
+    ' Fixed origin owned by the coordinator (never taken from render-thread
+    ' input). state.demoOrigin is reserved for unit tests.
+    function demoOrigin(state as Object) as String
+        if util.isString(state.demoOrigin) and state.demoOrigin <> "" then return state.demoOrigin
+        return DEMO_ORIGIN
+    end function
+
+    function demoSignIn(state as Object, input as Object) as Object
+        origin = demoOrigin(state)
+        state.demoAttempt += 1
+        request = build(state, { owner: util.text(input.owner) }, { method: "GET", url: origin + api.auth.server.INFO_PATH, timeoutMs: SERVER_TIMEOUT_MS }, { kind: "demoInfo", origin: origin, attempt: state.demoAttempt, epoch: state.epoch, input: input })
+        return [submit(request)]
+    end function
+
+    ' system/info answered: require strict request_origin confirmation
+    ' (allowUnconfirmed = false) before calling POST /api/v2/auth/demo.
+    function demoInfo(state as Object, op as Object, result as Object) as Object
+        if op.attempt <> state.demoAttempt or op.epoch <> state.epoch then return [reply(api.response.failure(op.input, "cancelled"))]
+        check = api.auth.server.checkInfo(result, op.origin, false)
+        if not check.ok
+            failed = api.response.failure(op.input, check.error)
+            failed.status = result.status
+            return [reply(failed)]
+        end if
+        request = build(state, { owner: util.text(op.input.owner) }, { method: "POST", url: op.origin + DEMO_LOGIN_PATH, body: {}, timeoutMs: DEMO_LOGIN_TIMEOUT_MS }, { kind: "demoLogin", origin: op.origin, attempt: op.attempt, epoch: op.epoch, check: check, input: op.input })
+        return [submit(request)]
+    end function
+
+    ' POST /api/v2/auth/demo answered: install server + account atomically
+    ' when still current, or drop tokens in memory when cancelled/stale.
+    function demoLoggedIn(state as Object, op as Object, result as Object, now as Integer) as Object
+        if op.attempt <> state.demoAttempt or op.epoch <> state.epoch then return [reply(api.response.failure(op.input, "cancelled"))]
+        if result.ok <> true then return [reply(withoutBody(result))]
+        tokens = parseTokens(result)
+        user = invalid
+        if tokens <> invalid and util.isObject(result.body.user) then user = result.body.user
+        if tokens = invalid or user = invalid or not nonEmpty(user.id) then return [reply(withoutBody(api.response.failure(op.input, "parse")))]
+        decisions = installSignIn(state, op.origin, op.check, user, tokens, now)
+        answer = { origin: op.origin, accountId: state.saved.accountId, username: state.saved.username }
+        decisions.Append([persist(), publish(), reply(succeeded(op.input, answer, result.status))])
+        return decisions
+    end function
+
+    function demoCancel(state as Object, input as Object) as Object
+        endDemo(state)
+        return [reply(succeeded(input, {}))]
+    end function
+
+    sub endDemo(state as Object)
+        state.demoAttempt += 1
+    end sub
+
+    function isDemoOp(op as Dynamic) as Boolean
+        return op <> invalid and Left(util.text(op.kind), 4) = "demo"
+    end function
+
+    ' Headers for demo sign-in requests: strictly scoped to op.origin;
+    ' device identity headers are sent only on demoLogin after checkInfo passed.
+    function demoCredentials(state as Object, op as Object, url as String) as Object
+        if not api.request.isSameOrigin(url, op.origin) then return { headers: {}, error: "invalid_request" }
+        if op.kind = "demoInfo" then return { headers: api.auth.headers.identity(state.facts, false), error: invalid }
+        if op.kind = "demoLogin" then return { headers: api.auth.headers.identity(state.facts, true), error: invalid }
+        return { headers: {}, error: "invalid_request" }
+    end function
+end namespace

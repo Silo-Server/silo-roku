@@ -1,0 +1,305 @@
+import "pkg:/source/util/values.bs"
+
+' Pure LAN server discovery probe state machine for ServerScreen.
+' Tracks up to MAX_TRACKED candidate URLs announced by LanDiscoveryTask,
+' runs at most MAX_IN_FLIGHT concurrent unauthenticated HTTP probes
+' (GET /api/v2/system/identity, then optional GET /api/v2/theme/branding for
+' text server_name only — never remote artwork), assigns a monotonic probeId
+' per probe so stale answers from withdrawn-and-reannounced URLs are ignored,
+' backs off failures (5s, 15s, 30s; max 3 retries), and groups confirmed URLs
+' by serverId before taking the top MAX_DISPLAYED entries alphabetically.
+namespace onboarding.discovery
+    const MAX_TRACKED = 4
+    const MAX_IN_FLIGHT = 2
+    const MAX_DISPLAYED = 2
+    const MAX_RETRIES = 3
+    const IDENTITY_PATH = "/api/v2/system/identity"
+    const BRANDING_PATH = "/api/v2/theme/branding"
+    const PROBE_TIMEOUT_MS = 5000
+
+    function create() as Object
+        return { nextProbeId: 0, entries: {}, inFlight: {} }
+    end function
+
+    function backoffMs(attempt as Integer) as Integer
+        if attempt <= 1 then return 5000
+        if attempt = 2 then return 15000
+        return 30000
+    end function
+
+    ' Reconciles tracked candidates against rawCandidates from LanDiscoveryTask.
+    ' Returns { decisions: [...], changed: Boolean } where decisions are:
+    '   { kind: "cancel", probeId }
+    '   { kind: "probeIdentity", probeId, url }
+    '   { kind: "probeBranding", probeId, url }
+    function sync(state as Object, rawCandidates as Object, nowMs as Integer) as Object
+        decisions = []
+        before = displayKey(state)
+
+        desired = {}
+        desiredOrder = []
+        if type(rawCandidates) = "roArray"
+            for each raw in rawCandidates
+                if not util.isObject(raw) then continue for
+                url = util.text(raw.url).Trim()
+                if url = "" or desired.DoesExist(url) then continue for
+                if desiredOrder.Count() >= MAX_TRACKED then exit for
+                desired[url] = raw
+                desiredOrder.Push(url)
+            end for
+        end if
+
+        ' Withdraw entries no longer advertised; cancel any active probe.
+        for each existingUrl in mapKeys(state.entries)
+            if not desired.DoesExist(existingUrl)
+                entry = state.entries[existingUrl]
+                if entry <> invalid and entry.probeId > 0
+                    pid = entry.probeId
+                    state.inFlight.Delete(pid.ToStr())
+                    decisions.Push({ kind: "cancel", probeId: pid })
+                end if
+                state.entries.Delete(existingUrl)
+            end if
+        end for
+
+        ' Add newly advertised candidates up to MAX_TRACKED.
+        for each url in desiredOrder
+            raw = desired[url]
+            if not state.entries.DoesExist(url)
+                state.entries[url] = {
+                    url: url,
+                    host: util.text(raw.host),
+                    txtName: util.text(raw.txtName).Trim(),
+                    status: "pending",
+                    probeId: 0,
+                    probeKind: "",
+                    retries: 0,
+                    nextRetryMs: 0,
+                    serverId: "",
+                    serverName: "",
+                    brandingDone: false
+                }
+            else
+                ' Keep txtName fresh if branding has not provided a name yet.
+                entry = state.entries[url]
+                freshTxt = util.text(raw.txtName).Trim()
+                if freshTxt <> "" and entry.txtName = "" then entry.txtName = freshTxt
+            end if
+        end for
+
+        scheduleProbes(state, nowMs, decisions)
+        return { decisions: decisions, changed: displayKey(state) <> before }
+    end function
+
+    ' Advances scheduled retries when nowMs passes nextRetryMs.
+    function tick(state as Object, nowMs as Integer) as Object
+        decisions = []
+        scheduleProbes(state, nowMs, decisions)
+        return { decisions: decisions, changed: false }
+    end function
+
+    ' Handles the result of GET <url>/api/v2/system/identity.
+    function onIdentity(state as Object, probeId as Integer, url as String, result as Object, nowMs as Integer) as Object
+        decisions = []
+        before = displayKey(state)
+        state.inFlight.Delete(probeId.ToStr())
+        entry = state.entries[url]
+        if entry = invalid or entry.probeId <> probeId or entry.probeKind <> "identity"
+            scheduleProbes(state, nowMs, decisions)
+            return { decisions: decisions, changed: false }
+        end if
+        entry.probeId = 0
+        entry.probeKind = ""
+
+        serverId = ""
+        if result <> invalid and result.ok = true and util.isObject(result.body)
+            serverId = util.text(result.body.server_id).Trim()
+        end if
+
+        if serverId <> ""
+            entry.status = "verified"
+            entry.serverId = serverId
+            if entry.serverName = ""
+                if entry.txtName <> ""
+                    entry.serverName = entry.txtName
+                else
+                    entry.serverName = entry.host
+                end if
+            end if
+            entry.retries = 0
+            entry.nextRetryMs = 0
+        else
+            entry.retries = entry.retries + 1
+            if entry.retries >= MAX_RETRIES
+                entry.status = "giveup"
+                entry.nextRetryMs = 0
+            else
+                entry.status = "retry"
+                entry.nextRetryMs = nowMs + backoffMs(entry.retries)
+            end if
+        end if
+
+        scheduleProbes(state, nowMs, decisions)
+        return { decisions: decisions, changed: displayKey(state) <> before }
+    end function
+
+    ' Handles optional GET <url>/api/v2/theme/branding (text server_name only;
+    ' never fetches or stores artwork URLs pre-selection).
+    function onBranding(state as Object, probeId as Integer, url as String, result as Object, nowMs as Integer) as Object
+        decisions = []
+        before = displayKey(state)
+        state.inFlight.Delete(probeId.ToStr())
+        entry = state.entries[url]
+        if entry = invalid or entry.probeId <> probeId or entry.probeKind <> "branding"
+            scheduleProbes(state, nowMs, decisions)
+            return { decisions: decisions, changed: false }
+        end if
+        entry.probeId = 0
+        entry.probeKind = ""
+        entry.brandingDone = true
+
+        if result <> invalid and result.ok = true and util.isObject(result.body)
+            brandName = util.text(result.body.server_name).Trim()
+            if brandName = "" then brandName = util.text(result.body.serverName).Trim()
+            if brandName <> "" then entry.serverName = brandName
+        end if
+
+        scheduleProbes(state, nowMs, decisions)
+        return { decisions: decisions, changed: displayKey(state) <> before }
+    end function
+
+    ' Cancels all in-flight probes and clears state (onHide / onRelease).
+    function cancelAll(state as Object) as Object
+        decisions = []
+        for each pidStr in mapKeys(state.inFlight)
+            decisions.Push({ kind: "cancel", probeId: state.inFlight[pidStr] })
+        end for
+        state.inFlight = {}
+        state.entries = {}
+        return decisions
+    end function
+
+    ' Returns at most MAX_DISPLAYED verified servers, deduplicated by serverId
+    ' BEFORE capping, sorted alphabetically by display name then URL.
+    function list(state as Object) as Object
+        byId = {}
+        for each url in mapKeys(state.entries)
+            entry = state.entries[url]
+            if entry = invalid or entry.status <> "verified" or entry.serverId = "" then continue for
+            current = byId[entry.serverId]
+            if current = invalid or entry.url < current.url
+                byId[entry.serverId] = {
+                    serverId: entry.serverId,
+                    name: entry.serverName,
+                    host: entry.host,
+                    url: entry.url
+                }
+            end if
+        end for
+
+        ' Sort deterministically by LCase(name) then url.
+        items = []
+        for each sid in mapKeys(byId)
+            items.Push(byId[sid])
+        end for
+        for i = 0 to items.Count() - 2
+            for j = i + 1 to items.Count() - 1
+                if compareServers(items[j], items[i]) < 0
+                    tmp = items[i]
+                    items[i] = items[j]
+                    items[j] = tmp
+                end if
+            end for
+        end for
+
+        out = []
+        for each item in items
+            if out.Count() >= MAX_DISPLAYED then exit for
+            out.Push(item)
+        end for
+        return out
+    end function
+
+    ' Milliseconds until next scheduled retry, or 0 when none pending.
+    function nextRetryDelayMs(state as Object, nowMs as Integer) as Integer
+        soonest = 0
+        for each url in mapKeys(state.entries)
+            entry = state.entries[url]
+            if entry <> invalid and entry.status = "retry" and entry.probeId = 0 and entry.nextRetryMs > 0
+                remaining = entry.nextRetryMs - nowMs
+                if remaining < 1 then remaining = 1
+                if soonest = 0 or remaining < soonest then soonest = remaining
+            end if
+        end for
+        return soonest
+    end function
+
+    sub scheduleProbes(state as Object, nowMs as Integer, decisions as Object)
+        urls = mapKeys(state.entries)
+        urls.Sort("i")
+        ' First pass: identity probes (new or due retries).
+        for each url in urls
+            if mapCount(state.inFlight) >= MAX_IN_FLIGHT then return
+            entry = state.entries[url]
+            if entry = invalid or entry.probeId > 0 then continue for
+            due = entry.status = "pending" or (entry.status = "retry" and nowMs >= entry.nextRetryMs)
+            if due
+                state.nextProbeId = state.nextProbeId + 1
+                pid = state.nextProbeId
+                entry.probeId = pid
+                entry.probeKind = "identity"
+                state.inFlight[pid.ToStr()] = pid
+                decisions.Push({ kind: "probeIdentity", probeId: pid, url: url })
+            end if
+        end for
+        ' Second pass: optional text-only branding probes for verified servers.
+        for each url in urls
+            if mapCount(state.inFlight) >= MAX_IN_FLIGHT then return
+            entry = state.entries[url]
+            if entry = invalid or entry.probeId > 0 then continue for
+            if entry.status = "verified" and not entry.brandingDone
+                state.nextProbeId = state.nextProbeId + 1
+                pid = state.nextProbeId
+                entry.probeId = pid
+                entry.probeKind = "branding"
+                state.inFlight[pid.ToStr()] = pid
+                decisions.Push({ kind: "probeBranding", probeId: pid, url: url })
+            end if
+        end for
+    end sub
+
+    function compareServers(a as Object, b as Object) as Integer
+        na = LCase(a.name)
+        nb = LCase(b.name)
+        if na < nb then return -1
+        if na > nb then return 1
+        if a.url < b.url then return -1
+        if a.url > b.url then return 1
+        return 0
+    end function
+
+    function displayKey(state as Object) as String
+        items = list(state)
+        parts = []
+        for each item in items
+            parts.Push(item.serverId + "|" + item.name + "|" + item.url)
+        end for
+        return parts.Join(";")
+    end function
+
+    function mapKeys(table as Object) as Object
+        out = []
+        for each k in table
+            out.Push(k)
+        end for
+        return out
+    end function
+
+    function mapCount(table as Object) as Integer
+        n = 0
+        for each _k in table
+            n = n + 1
+        end for
+        return n
+    end function
+end namespace
