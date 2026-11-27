@@ -582,32 +582,26 @@ their existing HD/FHD assets.
     - Primary: a white 8% fill with a white 14% outline.
     - Plain (Back, Change server, Cancel): no capsule at rest, labels at 62%.
     - Focused: an `#EDEDED` fill with black text, scaled 1.06.
-- **Set up with your phone.** Server setup opens here, as tvOS's
-  `TVServerSetupView` does, while the Roku waits for a phone (companion
-  sign-in, [`companion-pairing.md`](companion-pairing.md)): the chip
-  "Looking for a phone or tablet…" with a spinner, 36 px over "Set up with
-  your phone"; "It's the easiest way. There's nothing to type with the
-  remote." in 32 px; "No phone nearby?" 64 px under it in 26 px at 40%; and
-  Enter server address (globe) 18 px under that. On the right, without a
-  card, the three setup steps 30 px apart, 700 px wide: a 168 px tile
-  (radius 34, white 6% under a white 14% outline) holding a picture (the
-  app icon; the phone's setup card with its Set Up button ringed in
-  orange; a green check), its number on a 52 px white disc 16 px outside
-  the tile's top left, and the title in 38 px Bold 34 px to its right:
-  "Open Silo on your phone", "Tap Set Up", "Finish on your phone". The TV's
-  name sits in the top row's chip with a TV glyph.
-- **Server address.** Enter server address swaps in the address entry in
-  place: "Enter your server address", "Type the address you use for Silo.",
-  then the field (globe; placeholder `media.example.com`), then Advanced
-  options (a compact plain button with a gear, "Hide advanced options" while
-  open), which shows the protocol (Auto, HTTPS, HTTP; compact buttons 14 px
-  apart, the chosen one checked) and a 250 px Port field ("Port: auto"),
-  then Connect and Back, which returns to the phone (as does the remote's
-  Back). A chosen protocol replaces a typed one; a port typed in the address
-  wins over the Port field. An address without a scheme tries HTTPS, then
-  HTTP. Before using plain HTTP, the client asks "Connect without
-  encryption?". The address keyboard keeps its `https://`, `http://`, and
-  `.com` chips (5.9).
+- **Server address.** Server setup opens directly on on-device address entry
+  while the Roku continues to advertise `_silopair-roku._tcp` in the
+  background so a phone on the same Wi‑Fi can still discover and set up the
+  TV ([`companion-pairing.md`](companion-pairing.md)). Above the address field,
+  up to two verified Silo servers discovered on the local network
+  (`_silo._tcp.local`, verified via `GET /api/v2/system/identity` and text-only
+  `GET /api/v2/theme/branding`) appear as compact 80 px server cards without
+  moving focus off the address field. Below the field sit Advanced options (a
+  compact plain button with a gear, "Hide advanced options" while open, which
+  shows the protocol Auto/HTTPS/HTTP and a 250 px Port field) and the action
+  row: Connect and Try the demo on first run (opening a demo-scoped session on
+  `https://demo.siloserver.org` via `POST /api/v2/auth/demo` after strict
+  `request_origin` verification), or Connect and Back when Change server pushed
+  the screen. Pressing Back while connecting or opening the demo cancels the
+  in-flight attempt. A chosen protocol replaces a typed one; a port typed in
+  the address wins over the Port field. An address without a scheme tries
+  HTTPS, then HTTP. Before using plain HTTP (typed or discovered on LAN), the
+  client asks "Connect without encryption?", and for discovered LAN servers
+  also confirms `server_id` matches before saving the origin. The address
+  keyboard keeps its `https://`, `http://`, and `.com` chips (5.9).
 - **Saved servers.** Change server (sign-in and the message screens; the
   picker, Settings, and the avatar menu reach servers through Change
   Account, section 7.5) opens this list
@@ -632,24 +626,35 @@ their existing HD/FHD assets.
   - Remove asks "Remove {server}?" (Remove / Cancel). Removing the current
     server signs it out and switches to the most recently used saved
     server, which the dialog names, or to address entry when none is left.
-- **Sign-in.** As tvOS's `TVLoginView`:
+- **Sign-in.** On-device password sign-in leads whenever the server accepts
+  passwords, while the device-code loop runs in the background when the server
+  offers code sign-in so companion phone pairing and "Use your phone instead"
+  stay immediately ready:
   - A server card sits above the headline: an 80 px mark (the server's
     initial), the server's own name (theme/branding's `server_name`, read
     as the screen opens; its host until then) in 34 px Bold, its host in
     23 px at 40%, and a "SECURE" (lock) or "HTTP" (open lock) badge.
     Padding 24, radius 30.
-  - With a code (the server's `auth/device/capability` says available):
-    "Sign in to {server}"; "Scan the code with your phone's camera, or go
-    to {host}/activate and enter it. Approve on your phone and this Roku
-    signs in by itself."; the nearby hint (a phone glyph, "Have Silo on your
-    phone? Open it on the same Wi‑Fi to sign in this TV.", 22 px at 40%);
-    then the state's action (Try again, or Show a new code), Sign in with a
-    password (key; when the server takes passwords), and Change server. The
-    card holds the QR code (360 px on a white frame, radius 24, 30 px
-    margin), the code grouped 4+4 in 72 px, `{host}/activate` in 24 px, and
-    the status line with a small spinner ("Waiting for approval", "Continue
-    on your phone", "Signed in as {account}", …); a state that ended shows a
-    symbol in place of the QR code. Section 7.2 runs the code.
+  - Password form (default when `password_login` is offered): "Sign in with a
+    password"; "Use your {server} username and password." (or "This server
+    only supports password sign-in." without codes); Username (person), then
+    Password (lock) with a 76 px eye button beside it (eye with a slash while
+    shown), then the error line, then Sign in, Use your phone instead (QR
+    code; switches to the code view when offered), and Change server.
+  - Code view (reached via "Use your phone instead", or directly when the
+    server disables passwords while offering codes): "Sign in to {server}";
+    "Scan the code with your phone's camera, or go to {host}/activate and
+    enter it. Approve on your phone and this Roku signs in by itself."; the
+    nearby hint (a phone glyph, "Have Silo on your phone? Open it on the same
+    Wi‑Fi to sign in this TV.", 22 px at 40%); then the state's action (Try
+    again, or Show a new code), Sign in with a password (key; when the server
+    takes passwords), and Change server. Back from the code view returns to
+    the password form without stopping the background code loop. The card
+    holds the QR code (360 px on a white frame, radius 24, 30 px margin), the
+    code grouped 4+4 in 72 px, `{host}/activate` in 24 px, and the status
+    line with a small spinner ("Waiting for approval", "Continue on your
+    phone", "Signed in as {account}", …); a state that ended shows a symbol
+    in place of the QR code. Section 7.2 runs the code.
   - A declined or paused code has none on screen, so the lead reads "Show a
     new code to try again, or sign in with a password." ("Show a new code to
     try again." when the server takes no passwords). A declined code's
@@ -659,12 +664,6 @@ their existing HD/FHD assets.
     row, the row is drawn in the compact button size when it would reach
     the card, so a focused Change server stays clear of it (a Roku fit
     adjustment: tvOS cuts the labels off instead).
-  - Sign in with a password swaps in the form: "Sign in with a password";
-    "Use your {server} username and password." (or "This server only
-    supports password sign-in." without codes); Username (person), then
-    Password (lock) with a 76 px eye button beside it (eye with a slash
-    while shown), then the error line, then Sign in, Use your phone instead
-    (QR code; back to the code, as Back is), and Change server.
   - A failure shows "Incorrect username or password." (tvOS's wording).
 - **Server not ready.** When `GET /api/v2/system/setup` reports
   `needs_setup`, sign-in becomes tvOS's message screen: the server card with
@@ -3015,35 +3014,37 @@ bypass for certificate validation.
 
 ### 7.2 Account sign-in
 
-Sign-in leads with a code, as tvOS's does, and offers the password as the
-alternative (section 5.4). Sign-in first reads
-`GET /api/v2/system/setup`; a server that still needs its first
-administrator (`needs_setup`) gets the "This server isn't ready" screen
-(section 5.4) instead of the form. Any other answer, including an older
-server's 404, goes on:
+Sign-in leads with on-device username and password whenever the server takes
+passwords, and offers "Use your phone instead" as the alternative while
+running the device-code loop in the background for companion phone pairing
+(section 5.4). Sign-in first reads `GET /api/v2/system/setup`; a server that
+still needs its first administrator (`needs_setup`) gets the "This server
+isn't ready" screen (section 5.4) instead of the form. Any other answer,
+including an older server's 404, goes on:
 
-1. `GET /api/v2/auth/providers` lists sign-in modes, and
-   `GET /api/v2/auth/device/capability` says whether the server offers
-   sign-in with a code (`state` "available"). With a code, the screen
-   starts a device login (`POST /api/v2/auth/device/start`) and polls it
-   (`/poll`) as tvOS's `QRLoginViewModel` does: at once, then after each
-   answer's `poll_after`, or the start's `interval` when an answer gives
-   none, at least a second apart; an expired code is replaced in place for up to an hour,
-   then the screen pauses until Show a new code; failures back off from the
-   interval to 30 s, and a streak of 10 s (getting a code) or 30 s
-   (polling) shows "Can't reach", 60 s of 429s "Too many sign-in attempts",
-   while retrying goes on. The code goes on under the Companion screen,
-   whose phone confirms this code ([`companion-pairing.md`](companion-pairing.md)
-   section 5). A password sign-in stops the polling while it
-   runs and withdraws the code when it succeeds; leaving the screen, Change
-   server, or a new code withdraws the one before (`/cancel`). Back that
-   closes the app from this screen withdraws the code too, and the app
-   closes once the withdrawal answers or after 2 seconds: Roku tells an
-   app nothing as it closes. An approval
-   installs the session as a password sign-in does. When `password_login`
-   is false and there is no code, the server offers only browser sign-in,
-   which Roku does not allow: the client explains that the server
-   administrator must enable password sign-in, and stops there.
+1. `GET /api/v2/auth/providers` and `GET /api/v2/auth/device/capability` run
+   in parallel so the screen settles in one round trip and immediately reports
+   a terminal code status to companion pairing when device sign-in is
+   unavailable. When the server offers sign-in with a code (`state`
+   "available"), the screen starts a device login (`POST /api/v2/auth/device/start`)
+   and polls it (`/poll`) in the background (or in the foreground when password
+   login is disabled): at once, then after each answer's `poll_after`, or the
+   start's `interval` when an answer gives none, at least a second apart; an
+   expired code is replaced in place for up to an hour, then the screen pauses
+   until Show a new code; failures back off from the interval to 30 s, and a
+   streak of 10 s (getting a code) or 30 s (polling) shows "Can't reach", 60 s
+   of 429s "Too many sign-in attempts", while retrying goes on. The code goes
+   on under the Companion screen, whose phone confirms this code
+   ([`companion-pairing.md`](companion-pairing.md) section 5). A password
+   sign-in stops the polling while it runs and withdraws the code when it
+   succeeds; leaving the screen, Change server, or a new code withdraws the
+   one before (`/cancel`). Back that closes the app from this screen withdraws
+   the code too, and the app closes once the withdrawal answers or after 2
+   seconds: Roku tells an app nothing as it closes. An approval installs the
+   session as a password sign-in does. When `password_login` is false and
+   there is no code, the server offers only browser sign-in, which Roku does
+   not allow: the client explains that the server administrator must enable
+   password sign-in, and stops there.
 2. The username and password are entered with the Roku voice keyboard and
    posted to `POST /api/v2/auth/login`.
 3. Access and refresh tokens are written to an app-specific registry section

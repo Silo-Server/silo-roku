@@ -1,0 +1,139 @@
+namespace tests
+
+    ' Demo sign-in (source/auth/demo.bs) and LAN setServer identity check
+    ' (source/auth/coordinator.bs) driven through tests.sessions.
+    @suite("auth demo sign-in")
+    class AuthDemoSignInTests extends rooibos.BaseTestSuite
+
+        function fresh() as Object
+            record = storage.empty()
+            record.deviceId = "device-demo-1"
+            return tests.sessions.create(record)
+        end function
+
+        function demoTokens() as Object
+            return { access_token: "demo-acc", refresh_token: "demo-ref", expires_in: 3600, user: { id: "42", username: "demo", role: "user" } }
+        end function
+
+        @describe("demoSignIn")
+
+        @it("uses fixed DEMO_ORIGIN, requires strict request_origin, sends device headers on demoLogin, and installs server and account atomically")
+        sub _()
+            loop = m.fresh()
+            tests.sessions.send(loop, { requestId: "d1", session: "demoSignIn" })
+            infoId = tests.sessions.runningId(loop, api.auth.server.INFO_PATH)
+            m.assertNotInvalid(infoId)
+            m.assertEqual(loop.running[infoId].request.url, api.auth.coordinator.DEMO_ORIGIN + api.auth.server.INFO_PATH)
+
+            tests.sessions.respond(loop, infoId, 200, tests.sessions.systemInfo(api.auth.coordinator.DEMO_ORIGIN))
+            loginId = tests.sessions.runningId(loop, api.auth.coordinator.DEMO_LOGIN_PATH)
+            m.assertNotInvalid(loginId)
+            loginSlot = loop.running[loginId]
+            m.assertEqual(loginSlot.request.url, api.auth.coordinator.DEMO_ORIGIN + api.auth.coordinator.DEMO_LOGIN_PATH)
+            m.assertEqual(loginSlot.request.method, "POST")
+            m.assertEqual(loginSlot.request.timeoutMs, api.auth.coordinator.DEMO_LOGIN_TIMEOUT_MS)
+            m.assertEqual(loginSlot.headers["X-Silo-Device-Id"], "device-1")
+
+            ' Before demoLogin succeeds, saved origin is still empty.
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "no_server")
+
+            tests.sessions.respond(loop, loginId, 200, m.demoTokens())
+            m.assertTrue(loop.delivered.d1.ok)
+            m.assertEqual(loop.delivered.d1.body.origin, api.auth.coordinator.DEMO_ORIGIN)
+            m.assertEqual(loop.delivered.d1.body.username, "demo")
+            m.assertTrue(loop.delivered.d1.body.accountId <> "")
+            ' Tokens never leak across the render-thread reply boundary.
+            m.assertFalse(FormatJson(loop.delivered.d1).Instr("demo-acc") >= 0)
+
+            view = api.auth.coordinator.view(loop.session)
+            m.assertEqual(view.status, "signed_in")
+            m.assertEqual(view.origin, api.auth.coordinator.DEMO_ORIGIN)
+            m.assertEqual(view.accountId, loop.delivered.d1.body.accountId)
+            m.assertEqual(view.username, "demo")
+        end sub
+
+        @it("refuses demo server missing request_origin even in compatibility mode, leaving saved server untouched")
+        sub _()
+            loop = m.fresh()
+            tests.sessions.send(loop, { requestId: "d1", session: "demoSignIn" })
+            infoId = tests.sessions.runningId(loop, api.auth.server.INFO_PATH)
+            info = tests.sessions.systemInfo(api.auth.coordinator.DEMO_ORIGIN)
+            info.Delete(api.auth.server.ORIGIN_MEMBER)
+            tests.sessions.respond(loop, infoId, 200, info)
+
+            m.assertFalse(loop.delivered.d1.ok)
+            m.assertEqual(loop.delivered.d1.error.kind, "origin_unconfirmed")
+            m.assertInvalid(tests.sessions.runningId(loop, api.auth.coordinator.DEMO_LOGIN_PATH))
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "no_server")
+        end sub
+
+        @it("refuses demo server with mismatched request_origin, leaving saved server untouched")
+        sub _()
+            loop = m.fresh()
+            tests.sessions.send(loop, { requestId: "d1", session: "demoSignIn" })
+            infoId = tests.sessions.runningId(loop, api.auth.server.INFO_PATH)
+            tests.sessions.respond(loop, infoId, 200, tests.sessions.systemInfo("https://evil.example"))
+
+            m.assertFalse(loop.delivered.d1.ok)
+            m.assertEqual(loop.delivered.d1.error.kind, "origin_mismatch")
+            m.assertInvalid(tests.sessions.runningId(loop, api.auth.coordinator.DEMO_LOGIN_PATH))
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "no_server")
+        end sub
+
+        @it("drops tokens and leaves saved server untouched when demoCancel arrives before demoLogin finishes")
+        sub _()
+            loop = m.fresh()
+            tests.sessions.send(loop, { requestId: "d1", session: "demoSignIn" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, tests.sessions.systemInfo(api.auth.coordinator.DEMO_ORIGIN))
+            loginId = tests.sessions.runningId(loop, api.auth.coordinator.DEMO_LOGIN_PATH)
+            m.assertNotInvalid(loginId)
+
+            tests.sessions.send(loop, { requestId: "c1", session: "demoCancel" })
+            m.assertTrue(loop.delivered.c1.ok)
+
+            ' Late 200 from demoLogin must drop tokens and never install demo server.
+            tests.sessions.respond(loop, loginId, 200, m.demoTokens())
+            m.assertFalse(loop.delivered.d1.ok)
+            m.assertEqual(loop.delivered.d1.error.kind, "cancelled")
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "no_server")
+        end sub
+
+        @it("enforces same-origin on demoCredentials")
+        sub _()
+            loop = m.fresh()
+            op = { kind: "demoLogin", origin: api.auth.coordinator.DEMO_ORIGIN }
+            bad = api.auth.coordinator.demoCredentials(loop.session, op, "https://other.example/api/v2/auth/demo")
+            m.assertEqual(bad.error, "invalid_request")
+            good = api.auth.coordinator.demoCredentials(loop.session, op, api.auth.coordinator.DEMO_ORIGIN + "/api/v2/auth/demo")
+            m.assertInvalid(good.error)
+            m.assertEqual(good.headers["X-Silo-Device-Id"], "device-1")
+        end sub
+
+        @describe("setServer expectedServerId")
+
+        @it("verifies system/identity matches expectedServerId for discovered LAN servers before committing")
+        sub _()
+            loop = m.fresh()
+            lanUrl = "http://192.168.1.50:8096"
+            tests.sessions.send(loop, { requestId: "s1", session: "server", address: lanUrl, allowHttp: true, expectedServerId: "srv-expected" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, tests.sessions.systemInfo(lanUrl))
+            idReq = tests.sessions.runningId(loop, "/api/v2/system/identity")
+            m.assertNotInvalid(idReq)
+            ' Not committed yet before identity check succeeds.
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "no_server")
+
+            ' Mismatch fails with identity_mismatch and leaves saved origin untouched.
+            tests.sessions.respond(loop, idReq, 200, { server_id: "srv-other" })
+            m.assertFalse(loop.delivered.s1.ok)
+            m.assertEqual(loop.delivered.s1.error.kind, "identity_mismatch")
+            m.assertEqual(api.auth.coordinator.view(loop.session).status, "no_server")
+
+            ' Matching server_id commits the server.
+            tests.sessions.send(loop, { requestId: "s2", session: "server", address: lanUrl, allowHttp: true, expectedServerId: "srv-expected" })
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, api.auth.server.INFO_PATH), 200, tests.sessions.systemInfo(lanUrl))
+            tests.sessions.respond(loop, tests.sessions.runningId(loop, "/api/v2/system/identity"), 200, { server_id: "srv-expected" })
+            m.assertTrue(loop.delivered.s2.ok)
+            m.assertEqual(api.auth.coordinator.view(loop.session).origin, lanUrl)
+        end sub
+    end class
+end namespace

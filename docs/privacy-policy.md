@@ -18,12 +18,20 @@ server. Silo is self-hosted: you, or someone you trust, run the server, and
 you type its address into the app.
 
 - The app sends your sign-in details, what you browse and search for, and
-  what you watch **only to the Silo server you entered**, and to the media and
-  image hosts that server tells it to use.
+  what you watch **only to the Silo server you entered** (or the public Silo
+  demo server at `https://demo.siloserver.org` if you choose **Try the demo**),
+  and to the media and image hosts that server tells it to use.
+- While the server setup screen is open, the app listens for Silo servers
+  advertised on your local Wi‑Fi network (`_silo._tcp.local`) and makes
+  unauthenticated identity and server-name checks only to private/link-local
+  IPv4 addresses on your LAN before you pick a server; it sends no account
+  credentials during discovery.
 - The app sends nothing to the Silo project, to [the publisher], or to any
-  other company, except a diagnostics report when you choose to send one
-  (see "To Silo Diagnostics" below). It contains no analytics, advertising,
-  or tracking software, and it never sends a report on its own.
+  other company, except when you choose **Try the demo** (which connects to
+  `https://demo.siloserver.org` with a temporary demo session) or choose to
+  send a diagnostics report (see "To Silo Diagnostics" below). It contains no
+  analytics, advertising, or tracking software, and it never sends a report on
+  its own.
 - On the Roku device the app keeps the addresses of the servers you saved, a
   random installation ID, and the sign-in tokens each server issued. It never stores your
   password or PIN. Signing out removes the tokens at once, even when the

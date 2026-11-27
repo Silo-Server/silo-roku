@@ -1,0 +1,188 @@
+import "pkg:/source/control/mdns.bs"
+import "pkg:/source/onboarding/mdnsBrowse.bs"
+import "pkg:/source/util/log.bs"
+import "pkg:/source/util/values.bs"
+
+' Active LAN server discovery over multicast DNS (_silo._tcp.local).
+' Sends PTR queries on a bounded backoff schedule (0s, 1s, 3s, 7s, then every
+' 15s), drains up to MAX_DRAIN_PER_WAKE datagrams per wake, checks local IPv4
+' changes every ADDRESS_CHECK_MS, and publishes candidate URLs whenever the
+' resolved table changes.
+const ADDRESS_CHECK_MS = 5000
+const REPEAT_QUERY_MS = 15000
+const INITIAL_GAPS_MS = "1000,2000,4000"
+const MAX_DRAIN_PER_WAKE = 16
+
+sub init()
+    m.top.functionName = "browse"
+end sub
+
+sub browse()
+    m.port = CreateObject("roMessagePort")
+    m.top.observeFieldScopedEx("command", m.port)
+    m.clock = CreateObject("roTimespan")
+    m.packet = filledBuffer(silocontrol.mdns.MAX_PACKET)
+    m.query = onboarding.mdnsBrowse.queryPacket()
+    m.state = onboarding.mdnsBrowse.create()
+    m.mdns = invalid
+    m.address = localAddress()
+    m.queryAt = []
+    m.nextRepeatAt = 0
+    m.addressCheckAt = clockMs() + ADDRESS_CHECK_MS
+
+    openMdns()
+    if m.mdns <> invalid
+        scheduleQueries()
+        sendQuery()
+    end if
+    m.top.ready = true
+
+    while true
+        msg = wait(waitMs(), m.port)
+        msgType = type(msg)
+        if msgType = "roSGNodeEvent" and msg.getField() = "command"
+            cmd = msg.getData()
+            if util.isObject(cmd) and util.text(cmd.kind) = "stop" then exit while
+        else if msgType = "roSocketEvent"
+            if m.mdns <> invalid and msg.getSocketID() = m.mdns.getID() and m.mdns.isReadable()
+                drainPackets()
+            end if
+        end if
+        housekeeping()
+    end while
+
+    if m.mdns <> invalid
+        m.mdns.close()
+        m.mdns = invalid
+    end if
+end sub
+
+function clockMs() as Integer
+    return m.clock.TotalMilliseconds()
+end function
+
+sub openMdns()
+    socket = CreateObject("roDataGramSocket")
+    socket.SetReuseAddr(true)
+    address = CreateObject("roSocketAddress")
+    address.setPort(silocontrol.mdns.PORT)
+    if not socket.setAddress(address)
+        log.warn("discovery", "mDNS browse port unavailable")
+        socket.close()
+        return
+    end if
+    group = CreateObject("roSocketAddress")
+    group.setAddress(silocontrol.mdns.GROUP)
+    if not socket.JoinGroup(group)
+        log.warn("discovery", "mDNS browse group join failed")
+        socket.close()
+        return
+    end if
+    socket.SetMulticastTTL(255)
+    socket.SetMulticastLoop(false)
+    socket.setSendToAddress(group)
+    socket.setMessagePort(m.port)
+    socket.notifyReadable(true)
+    m.mdns = socket
+end sub
+
+sub scheduleQueries()
+    t = clockMs()
+    m.queryAt = []
+    for each gap in INITIAL_GAPS_MS.Split(",")
+        t = t + gap.ToInt()
+        m.queryAt.Push(t)
+    end for
+    m.nextRepeatAt = t + REPEAT_QUERY_MS
+end sub
+
+sub sendQuery()
+    if m.mdns = invalid or m.address = "" then return
+    m.mdns.send(m.query, 0, m.query.Count())
+end sub
+
+sub drainPackets()
+    changed = false
+    nowMs = clockMs()
+    for i = 1 to MAX_DRAIN_PER_WAKE
+        count = m.mdns.receive(m.packet, 0, silocontrol.mdns.MAX_PACKET)
+        if count <= 0 then exit for
+        if onboarding.mdnsBrowse.ingest(m.state, m.packet, count, nowMs) then changed = true
+        if not m.mdns.isReadable() then exit for
+    end for
+    if changed then publishCandidates()
+end sub
+
+sub housekeeping()
+    t = clockMs()
+    if onboarding.mdnsBrowse.expire(m.state, t) then publishCandidates()
+    if m.mdns <> invalid
+        if m.queryAt.Count() > 0 and t >= m.queryAt[0]
+            m.queryAt.Shift()
+            sendQuery()
+        else if m.queryAt.Count() = 0 and m.nextRepeatAt > 0 and t >= m.nextRepeatAt
+            m.nextRepeatAt = t + REPEAT_QUERY_MS
+            sendQuery()
+        end if
+    end if
+    if t >= m.addressCheckAt
+        m.addressCheckAt = t + ADDRESS_CHECK_MS
+        checkAddress()
+    end if
+end sub
+
+sub checkAddress()
+    current = localAddress()
+    if current = m.address then return
+    m.address = current
+    m.state = onboarding.mdnsBrowse.create()
+    publishCandidates()
+    if m.mdns <> invalid
+        m.mdns.close()
+        m.mdns = invalid
+    end if
+    if current <> ""
+        openMdns()
+        if m.mdns <> invalid
+            scheduleQueries()
+            sendQuery()
+        end if
+    end if
+end sub
+
+sub publishCandidates()
+    m.top.candidates = { items: onboarding.mdnsBrowse.list(m.state) }
+end sub
+
+function waitMs() as Integer
+    t = clockMs()
+    due = m.addressCheckAt
+    if m.mdns <> invalid
+        if m.queryAt.Count() > 0 and m.queryAt[0] < due then due = m.queryAt[0]
+        if m.queryAt.Count() = 0 and m.nextRepeatAt > 0 and m.nextRepeatAt < due then due = m.nextRepeatAt
+    end if
+    remaining = due - t
+    if remaining < 50 then remaining = 50
+    return remaining
+end function
+
+function localAddress() as String
+    addresses = CreateObject("roDeviceInfo").GetIPAddrs()
+    if type(addresses) <> "roAssociativeArray" then return ""
+    for each name in addresses
+        value = util.text(addresses[name])
+        if value <> "" and Instr(1, value, ":") = 0 then return value
+    end for
+    return ""
+end function
+
+function filledBuffer(size as Integer) as Object
+    out = CreateObject("roByteArray")
+    out[size - 1] = 0
+    if out.Count() < size
+        for i = out.Count() to size - 1
+            out.Push(0)
+        end for
+    end if
+    return out
+end function

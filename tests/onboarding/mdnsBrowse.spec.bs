@@ -1,0 +1,160 @@
+namespace tests
+
+    ' Pure RFC 6762 mDNS browser for _silo._tcp.local (source/onboarding/mdnsBrowse.bs).
+    @suite("onboarding mdns browse")
+    class OnboardingMdnsBrowseTests extends rooibos.BaseTestSuite
+
+        sub pushRecord(out as Object, name as String, rrtype as Integer, rrclass as Integer, ttl as Integer, rdata as Object)
+            silocontrol.mdns.pushName(out, name)
+            silocontrol.mdns.push16(out, rrtype)
+            silocontrol.mdns.push16(out, rrclass)
+            silocontrol.mdns.push16(out, (ttl >> 16) and &hFFFF)
+            silocontrol.mdns.push16(out, ttl and &hFFFF)
+            silocontrol.mdns.push16(out, rdata.Count())
+            out.Append(rdata)
+        end sub
+
+        ' Builds a complete mDNS response packet with PTR + SRV + TXT + A records.
+        function packet(instance as String, host as String, port as Integer, ips as Object, txtEntries = [] as Object, ttl = 120 as Integer, flush = false as Boolean, rrClass = 1 as Integer) as Object
+            out = CreateObject("roByteArray")
+            total = 3 + ips.Count()
+            ' Header: QR=1, AA=1, ANCOUNT=total.
+            for each word in [0, &h8400, 0, total, 0, 0]
+                silocontrol.mdns.push16(out, word)
+            end for
+            cls = rrClass
+            if flush then cls = cls or &h8000
+            ' PTR: _silo._tcp.local -> instance
+            ptrData = CreateObject("roByteArray")
+            silocontrol.mdns.pushName(ptrData, instance)
+            m.pushRecord(out, onboarding.mdnsBrowse.SERVICE, silocontrol.mdns.TYPE_PTR, rrClass, ttl, ptrData)
+            ' SRV: instance -> host:port
+            srvData = CreateObject("roByteArray")
+            silocontrol.mdns.push16(srvData, 0)
+            silocontrol.mdns.push16(srvData, 0)
+            silocontrol.mdns.push16(srvData, port)
+            silocontrol.mdns.pushName(srvData, host)
+            m.pushRecord(out, instance, silocontrol.mdns.TYPE_SRV, cls, ttl, srvData)
+            ' TXT: instance -> key=value list
+            txtData = CreateObject("roByteArray")
+            for each entry in txtEntries
+                raw = CreateObject("roByteArray")
+                raw.FromAsciiString(entry)
+                txtData.Push(raw.Count())
+                txtData.Append(raw)
+            end for
+            if txtData.Count() = 0 then txtData.Push(0)
+            m.pushRecord(out, instance, silocontrol.mdns.TYPE_TXT, cls, ttl, txtData)
+            ' A: host -> IPv4
+            for each ip in ips
+                addrData = CreateObject("roByteArray")
+                for each part in ip.Split(".")
+                    addrData.Push(Val(part, 10))
+                end for
+                m.pushRecord(out, host, silocontrol.mdns.TYPE_A, cls, ttl, addrData)
+            end for
+            return out
+        end function
+
+        function aRecordPacket(host as String, ips as Object, ttl as Integer, flush = false as Boolean) as Object
+            out = CreateObject("roByteArray")
+            for each word in [0, &h8400, 0, ips.Count(), 0, 0]
+                silocontrol.mdns.push16(out, word)
+            end for
+            cls = 1
+            if flush then cls = cls or &h8000
+            for each ip in ips
+                addrData = CreateObject("roByteArray")
+                for each part in ip.Split(".")
+                    addrData.Push(Val(part, 10))
+                end for
+                m.pushRecord(out, host, silocontrol.mdns.TYPE_A, cls, ttl, addrData)
+            end for
+            return out
+        end function
+
+        @describe("queries, parsing, and table rules")
+
+        @it("builds an RFC 6762 PTR query for _silo._tcp.local")
+        sub _()
+            q = onboarding.mdnsBrowse.queryPacket()
+            ' Header: QR=0, QDCOUNT=1.
+            m.assertEqual(q[2], 0)
+            m.assertEqual(q[5], 1)
+            parsedName = silocontrol.mdns.readName(q, q.Count(), 12)
+            m.assertNotInvalid(parsedName)
+            m.assertEqual(LCase(parsedName.text), onboarding.mdnsBrowse.SERVICE)
+            qtype = (q[parsedName.next] << 8) + q[parsedName.next + 1]
+            qclass = (q[parsedName.next + 2] << 8) + q[parsedName.next + 3]
+            m.assertEqual(qtype, silocontrol.mdns.TYPE_PTR)
+            m.assertEqual(qclass, 1)
+            ' queryPacket itself is rejected as a response by parsePacket.
+            m.assertInvalid(onboarding.mdnsBrowse.parsePacket(q, q.Count()))
+        end sub
+
+        @it("accepts only RFC 1918 and link-local IPv4 addresses")
+        sub _()
+            for each good in ["10.0.0.5", "172.16.0.1", "172.31.255.254", "192.168.1.50", "169.254.12.34"]
+                m.assertTrue(onboarding.mdnsBrowse.isLanIpv4(good), good)
+            end for
+            for each bad in ["127.0.0.1", "8.8.8.8", "172.15.0.1", "172.32.0.1", "100.64.0.1", "224.0.0.251", "0.0.0.0", "192.168.01.1", "not-an-ip", ""]
+                m.assertFalse(onboarding.mdnsBrowse.isLanIpv4(bad), bad)
+            end for
+        end sub
+
+        @it("parses complete announcements, rejects non-IN class and public IPs, and honors cache-flush and TTL=0 goodbyes")
+        sub _()
+            st = onboarding.mdnsBrowse.create()
+
+            ' Non-IN class (CH = 3) is ignored.
+            nonIn = m.packet("Home._silo._tcp.local", "home.local", 8096, ["192.168.1.50"], ["name=Home"], 120, false, 3)
+            m.assertFalse(onboarding.mdnsBrowse.ingest(st, nonIn, nonIn.Count(), 1000))
+            m.assertEqual(onboarding.mdnsBrowse.list(st), [])
+
+            ' Public IP is filtered out so no candidate is created.
+            pub = m.packet("Public._silo._tcp.local", "pub.local", 8096, ["93.184.216.34"], ["name=Pub"], 120)
+            m.assertFalse(onboarding.mdnsBrowse.ingest(st, pub, pub.Count(), 1000))
+            m.assertEqual(onboarding.mdnsBrowse.list(st), [])
+
+            ' Valid LAN announcement with two IPs.
+            okPkt = m.packet("Home._silo._tcp.local", "home.local", 8096, ["192.168.1.50", "192.168.1.51"], ["name=Living Room", "id=srv-1"], 120)
+            m.assertTrue(onboarding.mdnsBrowse.ingest(st, okPkt, okPkt.Count(), 1000))
+            listed = onboarding.mdnsBrowse.list(st)
+            m.assertEqual(listed.Count(), 2)
+            m.assertEqual(listed[0].url, "http://192.168.1.50:8096")
+            m.assertEqual(listed[0].txtName, "Living Room")
+            m.assertEqual(listed[1].url, "http://192.168.1.51:8096")
+
+            ' Cache-flush A record replaces old IP set instead of appending.
+            flushPkt = m.aRecordPacket("home.local", ["10.0.0.9"], 120, true)
+            m.assertTrue(onboarding.mdnsBrowse.ingest(st, flushPkt, flushPkt.Count(), 2000))
+            listed = onboarding.mdnsBrowse.list(st)
+            m.assertEqual(listed.Count(), 1)
+            m.assertEqual(listed[0].url, "http://10.0.0.9:8096")
+
+            ' TTL=0 A goodbye removes the last IP and drops the instance.
+            byeA = m.aRecordPacket("home.local", ["10.0.0.9"], 0, false)
+            m.assertTrue(onboarding.mdnsBrowse.ingest(st, byeA, byeA.Count(), 3000))
+            m.assertEqual(onboarding.mdnsBrowse.list(st), [])
+
+            ' Re-announce then remove with TTL=0 PTR goodbye.
+            m.assertTrue(onboarding.mdnsBrowse.ingest(st, okPkt, okPkt.Count(), 4000))
+            byePtr = m.packet("Home._silo._tcp.local", "home.local", 8096, ["192.168.1.50"], [], 0)
+            m.assertTrue(onboarding.mdnsBrowse.ingest(st, byePtr, byePtr.Count(), 5000))
+            m.assertEqual(onboarding.mdnsBrowse.list(st), [])
+        end sub
+
+        @it("caps instances at 8 and expires stale entries after 35 seconds")
+        sub _()
+            st = onboarding.mdnsBrowse.create()
+            for i = 1 to 10
+                pkt = m.packet("S" + i.ToStr() + "._silo._tcp.local", "s" + i.ToStr() + ".local", 8096, ["192.168.1." + (10 + i).ToStr()], ["name=S" + i.ToStr()], 120)
+                onboarding.mdnsBrowse.ingest(st, pkt, pkt.Count(), 1000)
+            end for
+            m.assertEqual(onboarding.mdnsBrowse.list(st).Count(), onboarding.mdnsBrowse.MAX_INSTANCES)
+            m.assertFalse(onboarding.mdnsBrowse.expire(st, 36000))
+            m.assertTrue(onboarding.mdnsBrowse.expire(st, 36001))
+            m.assertEqual(onboarding.mdnsBrowse.list(st), [])
+        end sub
+    end class
+end namespace

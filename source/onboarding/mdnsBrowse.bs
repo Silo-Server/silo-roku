@@ -1,0 +1,395 @@
+import "pkg:/source/control/mdns.bs"
+import "pkg:/source/util/values.bs"
+
+' Pure RFC 6762 / RFC 6763 mDNS browser for Silo servers (_silo._tcp.local).
+' Zero sockets: LanDiscoveryTask owns the UDP 5353 multicast socket, calls
+' queryPacket() on its query schedule, feeds incoming datagrams to ingest(),
+' calls expire() periodically, and publishes list() when the candidate set
+' changes.
+'
+' Keeps a bounded 8-instance table and assembles complete packets only
+' (silo-server's responder emits PTR + SRV + TXT + A in one packet). Honors
+' IN-class checks, cache-flush replacement, TTL=0 PTR and A goodbyes, and a
+' strict LAN-only IPv4 filter (RFC 1918 + 169.254.0.0/16).
+namespace onboarding.mdnsBrowse
+    const SERVICE = "_silo._tcp.local"
+    const MAX_INSTANCES = 8
+    const MAX_IPS_PER_INSTANCE = 4
+    const MAX_RECORDS_PER_PACKET = 64
+    const STALE_MS = 35000
+    const CLASS_IN = 1
+    const CLASS_MASK = &h7FFF
+    const FLUSH_BIT = &h8000
+
+    function create() as Object
+        return { instances: {} }
+    end function
+
+    ' Builds an RFC 6762 PTR query for _silo._tcp.local (QTYPE=12, QCLASS=1,
+    ' QU=0 for multicast responses).
+    function queryPacket() as Object
+        out = CreateObject("roByteArray")
+        for each word in [0, 0, 1, 0, 0, 0]
+            silocontrol.mdns.push16(out, word)
+        end for
+        silocontrol.mdns.pushName(out, SERVICE)
+        silocontrol.mdns.push16(out, silocontrol.mdns.TYPE_PTR)
+        silocontrol.mdns.push16(out, CLASS_IN)
+        return out
+    end function
+
+    ' Strict LAN-only IPv4 filter: accepts RFC 1918 (10/8, 172.16/12,
+    ' 192.168/16) and IPv4 link-local (169.254/16); rejects loopback,
+    ' multicast, CGNAT, public, and malformed strings.
+    function isLanIpv4(ip as Dynamic) as Boolean
+        if not util.isString(ip) then return false
+        parts = ip.Split(".")
+        if parts.Count() <> 4 then return false
+        octets = []
+        for each part in parts
+            if part = "" or Len(part) > 3 then return false
+            if Len(part) > 1 and Left(part, 1) = "0" then return false
+            for i = 1 to Len(part)
+                ch = Mid(part, i, 1)
+                if ch < "0" or ch > "9" then return false
+            end for
+            valNum = Val(part, 10)
+            if valNum < 0 or valNum > 255 then return false
+            octets.Push(valNum)
+        end for
+        a = octets[0]
+        b = octets[1]
+        if a = 10 then return true
+        if a = 172 and b >= 16 and b <= 31 then return true
+        if a = 192 and b = 168 then return true
+        if a = 169 and b = 254 then return true
+        return false
+    end function
+
+    ' Parses an mDNS response packet into { ptrs, srvs, txts, addrs }, or
+    ' invalid if the packet is a query, malformed, or has a non-zero rcode.
+    function parsePacket(bytes as Object, count as Integer) as Dynamic
+        if bytes = invalid or count < 12 then return invalid
+        flagsHigh = bytes[2]
+        flagsLow = bytes[3]
+        ' Must be a standard response (QR=1, OPCODE=0) with RCODE=0.
+        if (flagsHigh and &h80) = 0 then return invalid
+        if (flagsHigh and &h78) <> 0 then return invalid
+        if (flagsLow and &h0F) <> 0 then return invalid
+
+        qdCount = (bytes[4] << 8) + bytes[5]
+        anCount = (bytes[6] << 8) + bytes[7]
+        nsCount = (bytes[8] << 8) + bytes[9]
+        arCount = (bytes[10] << 8) + bytes[11]
+        totalRecords = anCount + nsCount + arCount
+        if totalRecords <= 0 then return invalid
+        if totalRecords > MAX_RECORDS_PER_PACKET then totalRecords = MAX_RECORDS_PER_PACKET
+
+        offset = 12
+        for q = 1 to qdCount
+            qname = silocontrol.mdns.readName(bytes, count, offset)
+            if qname = invalid or qname.next + 4 > count then return invalid
+            offset = qname.next + 4
+        end for
+
+        ptrs = []
+        srvs = {}
+        txts = {}
+        addrs = {}
+
+        for r = 1 to totalRecords
+            if offset >= count then exit for
+            rname = silocontrol.mdns.readName(bytes, count, offset)
+            if rname = invalid or rname.next + 10 > count then return invalid
+            offset = rname.next
+            rrtype = (bytes[offset] << 8) + bytes[offset + 1]
+            rrclass = (bytes[offset + 2] << 8) + bytes[offset + 3]
+            ttlHigh = (bytes[offset + 4] << 8) + bytes[offset + 5]
+            ttlLow = (bytes[offset + 6] << 8) + bytes[offset + 7]
+            rdlen = (bytes[offset + 8] << 8) + bytes[offset + 9]
+            rdataStart = offset + 10
+            if rdataStart + rdlen > count then return invalid
+            offset = rdataStart + rdlen
+
+            isIn = (rrclass and CLASS_MASK) = CLASS_IN
+            isFlush = (rrclass and FLUSH_BIT) <> 0
+            isGoodbye = (ttlHigh = 0 and ttlLow = 0)
+            lowerName = LCase(rname.text)
+
+            if not isIn then continue for
+
+            if rrtype = silocontrol.mdns.TYPE_PTR
+                if lowerName = SERVICE
+                    target = silocontrol.mdns.readName(bytes, count, rdataStart)
+                    if target <> invalid and target.text <> ""
+                        ptrs.Push({ instance: target.text, key: LCase(target.text), goodbye: isGoodbye })
+                    end if
+                end if
+            else if rrtype = silocontrol.mdns.TYPE_SRV
+                if rdlen >= 6
+                    port = (bytes[rdataStart + 4] << 8) + bytes[rdataStart + 5]
+                    host = silocontrol.mdns.readName(bytes, count, rdataStart + 6)
+                    if host <> invalid and host.text <> "" and port >= 1 and port <= 65535
+                        srvs[lowerName] = { host: LCase(host.text), port: port, goodbye: isGoodbye, flush: isFlush }
+                    end if
+                end if
+            else if rrtype = silocontrol.mdns.TYPE_TXT
+                txts[lowerName] = { fields: parseTxt(bytes, rdataStart, rdlen), goodbye: isGoodbye, flush: isFlush }
+            else if rrtype = silocontrol.mdns.TYPE_A
+                if rdlen = 4
+                    ip = bytes[rdataStart].ToStr() + "." + bytes[rdataStart + 1].ToStr() + "." + bytes[rdataStart + 2].ToStr() + "." + bytes[rdataStart + 3].ToStr()
+                    if isLanIpv4(ip)
+                        entry = addrs[lowerName]
+                        if entry = invalid
+                            entry = { live: [], gone: [], flush: false }
+                            addrs[lowerName] = entry
+                        end if
+                        if isGoodbye
+                            addUnique(entry.gone, ip)
+                        else
+                            if isFlush then entry.flush = true
+                            addUnique(entry.live, ip)
+                        end if
+                    end if
+                end if
+            end if
+        end for
+
+        return { ptrs: ptrs, srvs: srvs, txts: txts, addrs: addrs }
+    end function
+
+    ' Ingests one mDNS response packet at nowMs. Returns true if the known
+    ' candidate set changed.
+    function ingest(state as Object, bytes as Object, count as Integer, nowMs as Integer) as Boolean
+        parsed = parsePacket(bytes, count)
+        if parsed = invalid then return false
+        before = snapshotKey(state)
+
+        ' 1. Honor TTL=0 PTR goodbyes immediately.
+        for each ptr in parsed.ptrs
+            if ptr.goodbye then state.instances.Delete(ptr.key)
+        end for
+
+        ' 2. Honor TTL=0 SRV goodbyes immediately.
+        for each srvKey in parsed.srvs
+            if parsed.srvs[srvKey].goodbye then state.instances.Delete(srvKey)
+        end for
+
+        ' 3. Honor TTL=0 A goodbyes and cache-flush A updates for existing instances.
+        for each hostKey in parsed.addrs
+            addrEntry = parsed.addrs[hostKey]
+            for each instKey in keysOf(state.instances)
+                inst = state.instances[instKey]
+                if inst <> invalid and inst.host = hostKey
+                    if addrEntry.flush and addrEntry.live.Count() > 0
+                        inst.ips = clampIps(addrEntry.live)
+                        inst.seenAt = nowMs
+                    else
+                        if addrEntry.gone.Count() > 0
+                            inst.ips = removeIps(inst.ips, addrEntry.gone)
+                        end if
+                        for each ip in addrEntry.live
+                            if inst.ips.Count() < MAX_IPS_PER_INSTANCE then addUnique(inst.ips, ip)
+                        end for
+                        if addrEntry.live.Count() > 0 then inst.seenAt = nowMs
+                    end if
+                    if inst.ips.Count() = 0 then state.instances.Delete(instKey)
+                end if
+            end for
+        end for
+
+        ' 4. Assemble complete-packet announcements (PTR + SRV + LAN A).
+        for each ptr in parsed.ptrs
+            if ptr.goodbye then continue for
+            srv = parsed.srvs[ptr.key]
+            if srv = invalid or srv.goodbye then continue for
+            addrEntry = parsed.addrs[srv.host]
+            existing = state.instances[ptr.key]
+            ips = []
+            if addrEntry <> invalid and addrEntry.live.Count() > 0
+                if addrEntry.flush or existing = invalid or existing.host <> srv.host
+                    ips = clampIps(addrEntry.live)
+                else
+                    ips = cloneArray(existing.ips)
+                    if addrEntry.gone.Count() > 0 then ips = removeIps(ips, addrEntry.gone)
+                    for each ip in addrEntry.live
+                        if ips.Count() < MAX_IPS_PER_INSTANCE then addUnique(ips, ip)
+                    end for
+                end if
+            else if existing <> invalid and existing.host = srv.host and existing.ips.Count() > 0
+                ips = cloneArray(existing.ips)
+            end if
+            if ips.Count() = 0 then continue for
+
+            if existing = invalid
+                expire(state, nowMs)
+                if countKeys(state.instances) >= MAX_INSTANCES then continue for
+            end if
+
+            txtFields = {}
+            if existing <> invalid and existing.txt <> invalid then txtFields = cloneMap(existing.txt)
+            txtRec = parsed.txts[ptr.key]
+            if txtRec <> invalid and not txtRec.goodbye
+                if txtRec.flush or existing = invalid
+                    txtFields = txtRec.fields
+                else
+                    for each tk in txtRec.fields
+                        txtFields[tk] = txtRec.fields[tk]
+                    end for
+                end if
+            end if
+
+            state.instances[ptr.key] = {
+                key: ptr.key,
+                instance: ptr.instance,
+                host: srv.host,
+                port: srv.port,
+                ips: ips,
+                txt: txtFields,
+                seenAt: nowMs
+            }
+        end for
+
+        return snapshotKey(state) <> before
+    end function
+
+    ' Drops instances not seen within STALE_MS. Returns true if any expired.
+    function expire(state as Object, nowMs as Integer) as Boolean
+        changed = false
+        for each instKey in keysOf(state.instances)
+            inst = state.instances[instKey]
+            if inst <> invalid and nowMs - inst.seenAt > STALE_MS
+                state.instances.Delete(instKey)
+                changed = true
+            end if
+        end for
+        return changed
+    end function
+
+    ' Returns deterministic sorted candidate URLs [{ url, host, port, ip, txtName, txtId }].
+    function list(state as Object) as Object
+        out = []
+        sortedKeys = keysOf(state.instances)
+        sortedKeys.Sort("i")
+        for each instKey in sortedKeys
+            inst = state.instances[instKey]
+            if inst = invalid then continue for
+            txtName = ""
+            txtId = ""
+            if inst.txt <> invalid
+                txtName = util.text(inst.txt.name).Trim()
+                txtId = util.text(inst.txt.id).Trim()
+            end if
+            sortedIps = cloneArray(inst.ips)
+            sortedIps.Sort("i")
+            for each ip in sortedIps
+                hostPort = ip
+                if inst.port <> 80 then hostPort = ip + ":" + inst.port.ToStr()
+                out.Push({
+                    url: "http://" + hostPort,
+                    host: hostPort,
+                    ip: ip,
+                    port: inst.port,
+                    txtName: txtName,
+                    txtId: txtId
+                })
+            end for
+        end for
+        return out
+    end function
+
+    ' Parses RFC 6763 length-prefixed TXT key=value pairs into a lowercase-key map.
+    function parseTxt(bytes as Object, startOffset as Integer, rdlen as Integer) as Object
+        out = {}
+        cursor = startOffset
+        endOffset = startOffset + rdlen
+        while cursor < endOffset
+            segLen = bytes[cursor]
+            cursor = cursor + 1
+            if segLen = 0 then continue while
+            if cursor + segLen > endOffset then exit while
+            seg = CreateObject("roByteArray")
+            for i = cursor to cursor + segLen - 1
+                seg.Push(bytes[i])
+            end for
+            text = seg.ToAsciiString()
+            eq = Instr(1, text, "=")
+            if eq > 1
+                k = LCase(Left(text, eq - 1).Trim())
+                v = Mid(text, eq + 1)
+                if k <> "" then out[k] = v
+            end if
+            cursor = cursor + segLen
+        end while
+        return out
+    end function
+
+    function snapshotKey(state as Object) as String
+        items = list(state)
+        parts = []
+        for each item in items
+            parts.Push(item.url + "|" + item.txtName + "|" + item.txtId)
+        end for
+        return parts.Join(";")
+    end function
+
+    sub addUnique(arr as Object, value as String)
+        for each existing in arr
+            if existing = value then return
+        end for
+        arr.Push(value)
+    end sub
+
+    function clampIps(ips as Object) as Object
+        out = []
+        for each ip in ips
+            if out.Count() >= MAX_IPS_PER_INSTANCE then exit for
+            addUnique(out, ip)
+        end for
+        return out
+    end function
+
+    function removeIps(ips as Object, gone as Object) as Object
+        out = []
+        for each ip in ips
+            dropped = false
+            for each g in gone
+                if ip = g then dropped = true
+            end for
+            if not dropped then out.Push(ip)
+        end for
+        return out
+    end function
+
+    function cloneArray(arr as Object) as Object
+        out = []
+        for each item in arr
+            out.Push(item)
+        end for
+        return out
+    end function
+
+    function cloneMap(src as Object) as Object
+        out = {}
+        for each k in src
+            out[k] = src[k]
+        end for
+        return out
+    end function
+
+    function keysOf(table as Object) as Object
+        out = []
+        for each k in table
+            out.Push(k)
+        end for
+        return out
+    end function
+
+    function countKeys(table as Object) as Integer
+        n = 0
+        for each _k in table
+            n = n + 1
+        end for
+        return n
+    end function
+end namespace
