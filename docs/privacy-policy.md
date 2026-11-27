@@ -187,8 +187,11 @@ contains. Choosing Don't Send, or Back, sends nothing.
 - It contains no analytics, advertising, or tracking software, and sends
   nothing to the publisher or any third party except a diagnostics report
   you choose to send.
-- It does not read the Roku advertising ID, the device serial number, or your
-  Roku account details, and it uses no Roku billing.
+- It does not read the Roku advertising ID or the device serial number, and it
+  uses no Roku billing. During on-device sign-in, Roku's Request for Information
+  prompt may ask whether to pre-fill your Roku account email into the sign-in
+  form; if you approve it, the address is kept only in memory in the form and
+  sent only to the Silo server you choose to sign in to.
 - It attaches your sign-in token and profile details only to requests
   addressed to the server you entered, never to a proxy node or image host.
   Roku follows a server's redirects on its own, so a server set up to

@@ -139,10 +139,11 @@ Errors block publishing; warnings do not, today.
 - [ ] "Customer Account Requirement": the dashboard reports an error when it
   finds on-device authentication and the app record does not select "A
   customer account is required". Select it.
-- [ ] `getUserData`: Static Analysis reports an error unless "all
-  authenticated channels" call Roku's Request for Information API, citing the
-  Roku Pay rules for subscription and ad-monetized apps. Whether it fires for
-  a free app with its own accounts is **unconfirmed** (Q4).
+- [x] `getUserData`: Confirmed blocking on the public app record (`888877`)
+  when "Can users sign in to your app?" is Yes (`RP 2.1`, `RP 4.1`).
+  `SignInScreen` now invokes `ChannelStore` `getUserData` (`email`,
+  `context: "signin"`) once on an empty Username field and falls back directly
+  to `DynamicKeyboard` on decline or error.
 
 ## 4. Deep Linking Tester
 
