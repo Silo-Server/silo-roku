@@ -592,10 +592,10 @@ their existing HD/FHD assets.
   moving focus off the address field. Below the field sit Advanced options (a
   compact plain button with a gear, "Hide advanced options" while open, which
   shows the protocol Auto/HTTPS/HTTP and a 250 px Port field) and the action
-  row: Connect and Try the demo on first run (opening a demo-scoped session on
-  `https://demo.siloserver.org` via `POST /api/v2/auth/demo` after strict
-  `request_origin` verification), or Connect and Back when Change server pushed
-  the screen. Pressing Back while connecting or opening the demo cancels the
+  row: Connect and Try the demo on first run (signing in to the shared demo
+  account on `https://demo.siloserver.org` via `POST /api/v2/auth/demo` with an
+  ordinary session after strict `request_origin` verification), or Connect and
+  Back when Change server pushed the screen. Pressing Back while connecting or opening the demo cancels the
   in-flight attempt. A chosen protocol replaces a typed one; a port typed in
   the address wins over the Port field. An address without a scheme tries
   HTTPS, then HTTP. Before using plain HTTP (typed or discovered on LAN), the

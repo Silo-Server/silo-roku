@@ -27,11 +27,11 @@ you type its address into the app.
   IPv4 addresses on your LAN before you pick a server; it sends no account
   credentials during discovery.
 - The app sends nothing to the Silo project, to [the publisher], or to any
-  other company, except when you choose **Try the demo** (which connects to
-  `https://demo.siloserver.org` with a temporary demo session) or choose to
-  send a diagnostics report (see "To Silo Diagnostics" below). It contains no
-  analytics, advertising, or tracking software, and it never sends a report on
-  its own.
+  other company, except when you choose **Try the demo** (which signs in to the
+  shared demo account on `https://demo.siloserver.org` with an ordinary session
+  that lasts until you sign out or it expires) or choose to send a diagnostics
+  report (see "To Silo Diagnostics" below). It contains no analytics,
+  advertising, or tracking software, and it never sends a report on its own.
 - On the Roku device the app keeps the addresses of the servers you saved, a
   random installation ID, and the sign-in tokens each server issued. It never stores your
   password or PIN. Signing out removes the tokens at once, even when the
